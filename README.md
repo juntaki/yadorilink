@@ -95,11 +95,33 @@ steps live in the install docs linked below.
 
 ## Install
 
-### From CI artifacts
+### Latest Development Build
 
-GitHub Actions in this repo runs the full build/test matrix on Linux,
-Windows, and macOS, plus packaging and artifact publication. Every
-successful workflow run publishes downloadable artifacts:
+Prebuilt development builds are published on GitHub Releases:
+
+https://github.com/juntaki/yadorilink/releases/tag/nightly
+
+- Linux: `.deb` package or binary tarball
+- Windows: unsigned installer or binary zip
+- macOS: unsigned binary tarball
+
+YadoriLink is pre-1.0. These builds are for testing and early feedback.
+Windows builds are unsigned, so SmartScreen warnings are expected. macOS
+builds are unsigned and not notarized.
+
+Direct links:
+
+- Linux `.deb`: <https://github.com/juntaki/yadorilink/releases/download/nightly/yadorilink-linux-amd64.deb>
+- Windows installer: <https://github.com/juntaki/yadorilink/releases/download/nightly/yadorilink-setup.exe>
+- macOS tarball: <https://github.com/juntaki/yadorilink/releases/download/nightly/yadorilink-macos.tar.gz>
+
+### Development Artifacts
+
+GitHub Actions artifacts are mainly for maintainers and testers. They are CI
+outputs with limited retention, not the primary download channel for ordinary
+users. For ordinary downloads, use GitHub Releases instead.
+
+The CI workflow still publishes per-run artifacts:
 
 - `yadorilink-linux-artifacts`: a `.deb` package plus a Linux binary tarball
 - `yadorilink-windows-artifacts`: an unsigned `yadorilink-setup.exe` plus a

@@ -320,3 +320,74 @@ jobs:
           name: yadorilink-macos-artifacts
           path: release/macos
           if-no-files-found: error
+
+  nightly-release:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs:
+      - build-and-test
+      - shell-ext-windows
+      - shell-ext-macos-rust
+      - cargo-audit
+      - linux-artifacts
+      - windows-artifacts
+      - macos-artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Flatten release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find release-assets/yadorilink-linux-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
+          find release-assets/yadorilink-windows-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
+          find release-assets/yadorilink-macos-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
+          cp release-assets/yadorilink-linux-artifacts/SHA256SUMS dist/SHA256SUMS-linux
+          cp release-assets/yadorilink-windows-artifacts/SHA256SUMS dist/SHA256SUMS-windows
+          cp release-assets/yadorilink-macos-artifacts/SHA256SUMS dist/SHA256SUMS-macos
+          cp dist/yadorilink-*-linux-x86_64-binaries.tar.gz dist/yadorilink-linux-x86_64.tar.gz
+          cp dist/yadorilink_*_amd64.deb dist/yadorilink-linux-amd64.deb
+          cp dist/yadorilink-*-windows-x86_64-binaries.zip dist/yadorilink-windows-x86_64.zip
+          cp dist/yadorilink-*-macos-*-binaries.tar.gz dist/yadorilink-macos.tar.gz
+          python3 scripts/ci/generate-release-checksums.py \
+            --sidecars \
+            dist/yadorilink-linux-x86_64.tar.gz \
+            dist/yadorilink-linux-amd64.deb \
+            dist/yadorilink-windows-x86_64.zip \
+            dist/yadorilink-setup.exe \
+            dist/yadorilink-macos.tar.gz
+          ls -la dist
+
+      - name: Create or update nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f nightly "$GITHUB_SHA"
+          git push origin refs/tags/nightly --force
+
+          notes="Automatically built from main at ${GITHUB_SHA}. Pre-1.0 development build; Windows and macOS assets are unsigned."
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release edit nightly \
+              --title "Nightly build" \
+              --notes "$notes" \
+              --prerelease \
+              --target "$GITHUB_SHA"
+          else
+            gh release create nightly \
+              --title "Nightly build" \
+              --notes "$notes" \
+              --prerelease \
+              --target "$GITHUB_SHA"
+          fi
+
+          gh release upload nightly dist/* --clobber

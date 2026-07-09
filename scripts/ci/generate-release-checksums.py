@@ -23,9 +23,8 @@ Usage:
     # Verify a single artifact against its own sidecar.
     generate-release-checksums.py --verify-sidecar FILE
 
-Exits non-zero (release-blocking, per design.md's decision to treat a
-missing/mismatched checksum as release-blocking) if any input file is
-missing or any checksum fails to verify.
+Exits non-zero if any input file is missing or any checksum fails to verify,
+so release jobs can fail closed on missing or mismatched checksums.
 """
 
 from __future__ import annotations

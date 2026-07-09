@@ -61,9 +61,29 @@ yadorilink status
 
 ## インストール
 
-### CI アーティファクトから
+### 最新の開発ビルド
 
-このリポジトリの GitHub Actions は、Linux、Windows、macOS のビルド / テストマトリクスに加えて、パッケージングとアーティファクト公開を行います。成功したワークフロー実行では、次のアーティファクトをダウンロードできます。
+ビルド済みの開発版は GitHub Releases からダウンロードできます。
+
+https://github.com/juntaki/yadorilink/releases/tag/nightly
+
+- Linux: `.deb` パッケージまたはバイナリ tarball
+- Windows: 未署名インストーラーまたはバイナリ zip
+- macOS: 未署名バイナリ tarball
+
+YadoriLink は pre-1.0 です。これらのビルドはテストと早期フィードバック向けです。Windows ビルドは未署名なので SmartScreen の警告は想定内です。macOS ビルドも未署名かつ notarize されていません。
+
+直接リンク:
+
+- Linux `.deb`: <https://github.com/juntaki/yadorilink/releases/download/nightly/yadorilink-linux-amd64.deb>
+- Windows installer: <https://github.com/juntaki/yadorilink/releases/download/nightly/yadorilink-setup.exe>
+- macOS tarball: <https://github.com/juntaki/yadorilink/releases/download/nightly/yadorilink-macos.tar.gz>
+
+### 開発用アーティファクト
+
+GitHub Actions artifacts は主にメンテナーとテスター向けです。これは保持期間のある CI 出力であり、一般ユーザー向けの主なダウンロード導線ではありません。通常のダウンロードには GitHub Releases を使ってください。
+
+CI workflow は引き続き、実行ごとの artifacts も公開します。
 
 - `yadorilink-linux-artifacts`: `.deb` パッケージと Linux バイナリ tarball
 - `yadorilink-windows-artifacts`: 未署名の `yadorilink-setup.exe` と Windows バイナリ zip
