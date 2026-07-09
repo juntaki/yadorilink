@@ -198,7 +198,7 @@ jobs:
             "release/linux/yadorilink-${version}-linux-${arch}-binaries.tar.gz" \
             release/linux/*.deb
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: yadorilink-linux-artifacts
           path: release/linux
@@ -265,7 +265,7 @@ jobs:
           )
           py -3 scripts/ci/generate-release-checksums.py --out release/windows/SHA256SUMS @artifacts
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: yadorilink-windows-artifacts
           path: release/windows
@@ -315,7 +315,7 @@ jobs:
             --out release/macos/SHA256SUMS \
             "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: yadorilink-macos-artifacts
           path: release/macos
