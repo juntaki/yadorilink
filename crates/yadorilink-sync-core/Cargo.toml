@@ -45,7 +45,7 @@ zstd = { workspace = true }
 # KDF and the ECIES wrap/unwrap key derivation (HKDF-like HMAC-based expand)
 # without pulling in a whole extra `hkdf` crate for one call site. Scoped to
 # this crate only, mirroring the `zstd` precedent immediately above.
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 x25519-dalek = { version = "2.0.1", features = ["zeroize"] }
 hmac = "0.12"
 zeroize = "1"
