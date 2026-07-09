@@ -1,0 +1,61 @@
+[package]
+name = "yadorilink-shell-ext-macos-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# build-yadorilink-mvp task 10.1: the "thin Rust core" design.md D4 calls for
+# behind the Swift FIFinderSync shell (design.md D4, mirroring the Windows
+# `shell-ext/windows` crate's own rationale). Not a member of the root
+# workspace: this crate is only ever built for Apple targets (linked into
+# a macOS app-extension bundle), and the primary dev machine for this repo
+# is not macOS-Xcode-equipped, so keeping it a separate Cargo workspace
+# root (via the empty [workspace] table below) means `cargo build`/`cargo
+# check` at the repo root never tries to fold this in and fail on
+# platform-specific bits. Build directly from this directory, or
+# cross-compile-check for aarch64-apple-darwin from any macOS host.
+[workspace]
+
+[lib]
+name = "yadorilink_shell_core"
+# staticlib: linked directly into the FIFinderSync extension's own Mach-O
+# binary at build time (no separate dylib to embed/codesign/rpath inside
+# the .appex bundle — simpler for an app-extension target, which has its
+# own strict bundling/signing rules). rlib: allows `cargo test`/`cargo
+# check` to exercise this crate's Rust-side logic directly without going
+# through the C ABI.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+yadorilink-ipc-proto = { path = "../../../crates/yadorilink-ipc-proto" }
+prost = "0.13"
+# Async runtime used the same way `shell-ext/windows`'s `ipc_client.rs`
+# uses it: a single lazily-started current-thread Tokio runtime, blocked
+# on per FFI call. This is a deliberate choice over hand-rolling a
+# blocking Unix-socket client: `yadorilink_ipc_proto::framing::{read_message,
+# write_message}` are written against `tokio::io::{AsyncRead, AsyncWrite}`
+# (shared with the daemon and the Windows shell extension), and
+# reimplementing that framing as blocking I/O here would mean maintaining
+# two parallel copies of the exact same 20-line wire format. A
+# current-thread runtime blocked synchronously per call has no observable
+# downside for a shell extension: FIFinderSync's badge/menu callbacks are
+# already expected to be short, bounded, synchronous operations from
+# Finder's point of view (see the 200ms DEFAULT_TIMEOUT below), and this
+# crate never keeps the runtime running between calls.
+tokio = { version = "1", features = ["net", "rt", "time", "io-util"] }
+# Resolves the *real* user home directory via getpwuid(3) — under App
+# Sandbox, both the `HOME` environment variable and Foundation's
+# `NSHomeDirectory()`/`FileManager.homeDirectoryForCurrentUser` are
+# redirected to the sandbox container's own home
+# (~/Library/Containers/<bundle-id>/Data), not the real one, so neither
+# can be used to find the daemon's actual socket path. getpwuid reads
+# from Directory Services directly and is not subject to that
+# redirection. Confirmed via a real sandboxed build on a macOS 15.7.7 VM:
+# `std::env::var("HOME")` returned the container path, causing
+# socket_path() to compute a path that never matched the daemon's actual
+# socket, so query_status() always fell back to Unspecified/no-badge
+# even with a correct temporary-exception entitlement for the real path.
+libc = "0.2"
+
+[profile.release]
+lto = true

@@ -1,0 +1,54 @@
+# installer/linux/systemd/yadorilink-daemon.service
+#
+# add-linux-support task 2.3: a systemd --user service unit for
+# yadorilink-daemon (the sync daemon), packaged by installer/linux's .deb
+# into /usr/lib/systemd/user/ (see installer/linux/README.md).
+#
+# WHY A USER UNIT, NOT A SYSTEM UNIT: the daemon needs the interactive
+# user's own XDG data dir (~/.local/share/yadorilink — device.json, the
+# block store, sync state DB, control socket) and, per design.md, will
+# eventually need that same user's Secret Service session (gnome-keyring/
+# kwallet) for `keyring`'s linux-native credential storage — a system-wide
+# root service has neither. This mirrors exactly why the daemon runs as a
+# per-user macOS LaunchAgent rather than a root LaunchDaemon; see
+# installer/macos/scripts/postinstall's header comment for the same
+# reasoning on that platform.
+#
+# WHY Restart=on-failure: gives the crash-restart supervision analogous to
+# what the macOS LaunchAgent's KeepAlive (SuccessfulExit=false) already
+# provides for the same daemon.
+#
+# NOT enabled or started automatically by the .deb's postinst script (see
+# design.md's Open Questions: a per-user systemd unit generally shouldn't
+# be silently enabled by a package installed as root). This is a deliberate,
+# documented manual step — after installing the package, each user who
+# wants the daemon to start at login and survive crashes runs:
+#
+#   systemctl --user enable --now yadorilink-daemon
+#
+# Inspect/control it afterwards with:
+#
+#   systemctl --user status yadorilink-daemon
+#   journalctl --user -u yadorilink-daemon
+#   systemctl --user disable --now yadorilink-daemon   # stop autostart
+#
+# `systemctl --user` units also require "lingering" (`loginctl enable-linger
+# <user>`) if the daemon should keep running after the user logs out of
+# their graphical/terminal session entirely — not enabled by default here,
+# since most users run this while logged in; document as a follow-up for
+# headless/server use if that need comes up.
+
+[Unit]
+Description=YadoriLink sync daemon
+Documentation=https://github.com/juntaki/yadorilink
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/yadorilink-daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

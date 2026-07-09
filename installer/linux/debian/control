@@ -1,0 +1,21 @@
+Package: yadorilink
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCH@
+Maintainer: yadorilink project <juntaki@users.noreply.github.com>
+Homepage: https://github.com/juntaki/yadorilink
+Depends: libc6
+Description: Peer-to-peer file sync -- CLI and daemon
+ yadorilink is a peer-to-peer file synchronization tool. This package
+ installs the yadorilink CLI (`yadorilink`) and the yadorilink-daemon sync
+ daemon, plus a systemd --user service unit for the daemon
+ (/usr/lib/systemd/user/yadorilink-daemon.service).
+ .
+ This is a CLI/daemon-only build: it does not include the desktop tray
+ application (yadorilink-desktop-app), which is not built for Linux in
+ this release. See https://github.com/juntaki/yadorilink for docs.
+ .
+ The systemd user unit is installed but NOT enabled automatically; run
+ `systemctl --user enable --now yadorilink-daemon` after installing to
+ start the daemon at login with crash-restart supervision.

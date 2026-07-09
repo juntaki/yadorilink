@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="1">
+    <title>yadorilink</title>
+    <organization>com.yadorilink</organization>
+    <domains enable_localSystem="true" enable_currentUserHome="false" enable_anywhere="false"/>
+    <options customize="never" require-scripts="true" rootVolumeOnly="true"/>
+
+    <!--
+      Deliberately no notarization/Developer-ID signing of this outer
+      Distribution package — per the user's own instruction, this pass of
+      the installer is unsigned/unnotarized. Gatekeeper will show an
+      "unidentified developer" warning when this .pkg is opened; that is
+      expected for unsigned local builds. The .app bundle payload embedded
+      inside this package *is* signed for real (see build-pkg.sh's comment on why: an
+      ad-hoc-signed FinderSync/File Provider extension is proven, in this
+      repo's own history, to not actually launch under App Sandbox).
+    -->
+
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.yadorilink.installer.component"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="com.yadorilink.installer.component" visible="false">
+        <pkg-ref id="com.yadorilink.installer.component"/>
+    </choice>
+    <pkg-ref id="com.yadorilink.installer.component" version="__VERSION__" onConclusion="none">YadoriLinkComponent.pkg</pkg-ref>
+</installer-gui-script>

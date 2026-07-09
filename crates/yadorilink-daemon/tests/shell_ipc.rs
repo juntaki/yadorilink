@@ -1,0 +1,587 @@
+//! Exercises the shell-integration IPC protocol (tasks 8.2, 8.4-8.6)
+//! end-to-end over a real Unix domain socket: status queries, the
+//! daemon's proactive push, context actions, and the client's graceful
+//! behavior when the daemon isn't running. Wrapped in `#[cfg(unix)]`
+//! (windows-local-ipc-support) since it was already implicitly Unix-only
+//! (`UnixStream`, `unix_transport::serve`) before that change — now made
+//! explicit since `windows_pipe_tests` below adds a real Windows path
+//! that would otherwise collide with these Unix-specific signatures.
+#[cfg(unix)]
+mod unix_socket_tests {
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::net::UnixStream;
+    use yadorilink_daemon::daemon_state::DaemonState;
+    use yadorilink_ipc_proto::framing::{read_message, write_message};
+    use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
+    use yadorilink_ipc_proto::shellipc::{
+        ContextAction, ContextActionRequest, HydrateRequest,
+        MaterializationState as ShellMaterializationState, ShellIpcMessage, StatusQuery,
+        SyncState as ShellSyncState,
+    };
+    use yadorilink_local_storage::FsBlockStore;
+    use yadorilink_sync_core::index::SyncState;
+    use yadorilink_sync_core::types::FileRecord;
+    use yadorilink_sync_core::version_vector::VersionVector;
+
+    async fn start_daemon() -> (std::path::PathBuf, Arc<DaemonState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+        let sync_state = Arc::new(SyncState::open(dir.path().join("sync.sqlite3")).unwrap());
+        sync_state
+            .add_link(dir.path().join("photos").to_string_lossy().as_ref(), "group-1")
+            .unwrap();
+        std::fs::create_dir_all(dir.path().join("photos")).unwrap();
+
+        let state = DaemonState::new("device-a".into(), sync_state, store);
+        let socket_path = dir.path().join("shell.sock");
+        let serve_path = socket_path.clone();
+        let serve_state = state.clone();
+        tokio::spawn(async move {
+            let _ =
+                yadorilink_daemon::shell_ipc::unix_transport::serve(&serve_path, serve_state).await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        (socket_path, state, dir)
+    }
+
+    /// shell-integration spec: "Shell extension queries status via IPC".
+    #[tokio::test]
+    async fn status_query_reflects_indexed_file() {
+        let (socket_path, state, dir) = start_daemon().await;
+        state
+            .sync_state
+            .upsert_file(
+                "group-1",
+                &FileRecord {
+                    path: "vacation.jpg".into(),
+                    size: 1,
+                    mtime_unix_nanos: 0,
+                    version: VersionVector::new(),
+                    blocks: vec![],
+                    deleted: false,
+                },
+            )
+            .unwrap();
+
+        let status = yadorilink_daemon::shell_ipc::client::query_status(
+            &socket_path,
+            &dir.path().join("photos/vacation.jpg").to_string_lossy(),
+        )
+        .await;
+        assert_eq!(status, ShellSyncState::Synced);
+    }
+
+    /// task 8.6 / shell-integration spec: "Daemon not running" — the client
+    /// must time out gracefully and report no overlay, never hang.
+    #[tokio::test]
+    async fn query_against_nonexistent_daemon_times_out_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        let nonexistent_socket = dir.path().join("no-such-daemon.sock");
+
+        let status = tokio::time::timeout(
+            Duration::from_secs(2),
+            yadorilink_daemon::shell_ipc::client::query_status(&nonexistent_socket, "/some/path"),
+        )
+        .await
+        .expect("query_status must not hang when the daemon isn't running");
+        assert_eq!(status, ShellSyncState::Unspecified);
+    }
+
+    /// task 8.5: the daemon proactively pushes status updates to connected
+    /// clients, not just answering queries.
+    #[tokio::test]
+    async fn daemon_pushes_status_update_to_connected_client() {
+        let (socket_path, state, dir) = start_daemon().await;
+        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        // The server task's `push_rx.subscribe()` happens after `accept()`
+        // returns, slightly after the client's `connect()` unblocks; a
+        // broadcast channel drops sends with no subscribers yet, so give the
+        // spawned connection handler a moment to reach its subscribe call.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Simulate a local change being indexed, as `link_manager` would do.
+        let absolute_path = dir.path().join("photos/new.jpg").to_string_lossy().to_string();
+        let _ = state.status_push_tx.send(yadorilink_ipc_proto::shellipc::StatusPush {
+            path: absolute_path.clone(),
+            state: ShellSyncState::Synced as i32,
+            materialization_state: yadorilink_ipc_proto::shellipc::MaterializationState::Hydrated
+                as i32,
+            open_elsewhere_device_id: String::new(),
+        });
+
+        let msg = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_message::<ShellIpcMessage>(&mut stream),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let Some(Payload::StatusPush(push)) = msg.payload else {
+            panic!("expected a StatusPush message")
+        };
+        assert_eq!(push.path, absolute_path);
+        assert_eq!(push.state, ShellSyncState::Synced as i32);
+    }
+
+    /// shell-integration spec: "Pause sync for a single item" via the context
+    /// menu action.
+    #[tokio::test]
+    async fn pause_item_context_action_is_recorded() {
+        let (socket_path, state, dir) = start_daemon().await;
+        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let path = dir.path().join("photos/vacation.jpg").to_string_lossy().to_string();
+
+        write_message(
+            &mut stream,
+            &ShellIpcMessage {
+                payload: Some(Payload::ContextActionRequest(ContextActionRequest {
+                    path: path.clone(),
+                    action: ContextAction::PauseItem as i32,
+                })),
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp = read_message::<ShellIpcMessage>(&mut stream).await.unwrap().unwrap();
+        let Some(Payload::ContextActionResponse(r)) = resp.payload else {
+            panic!("expected a ContextActionResponse")
+        };
+        assert!(r.ok);
+        assert!(state.paused_paths.lock().unwrap().contains(&path));
+    }
+
+    /// on-demand-sync spec "Context Menu Actions Include Pin and Evict":
+    /// pinning an already-hydrated file via the shell extension's context
+    /// menu needs no peer at all — same as `yadorilink pin` (control_socket).
+    #[tokio::test]
+    async fn pin_item_context_action_pins_an_already_hydrated_file() {
+        let (socket_path, state, dir) = start_daemon().await;
+        state
+            .sync_state
+            .upsert_file(
+                "group-1",
+                &FileRecord {
+                    path: "vacation.jpg".into(),
+                    size: 5,
+                    mtime_unix_nanos: 0,
+                    version: VersionVector::new(),
+                    blocks: vec![],
+                    deleted: false,
+                },
+            )
+            .unwrap();
+
+        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let path = dir.path().join("photos/vacation.jpg").to_string_lossy().to_string();
+        write_message(
+            &mut stream,
+            &ShellIpcMessage {
+                payload: Some(Payload::ContextActionRequest(ContextActionRequest {
+                    path: path.clone(),
+                    action: ContextAction::PinItem as i32,
+                })),
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp = read_message::<ShellIpcMessage>(&mut stream).await.unwrap().unwrap();
+        let Some(Payload::ContextActionResponse(r)) = resp.payload else {
+            panic!("expected a ContextActionResponse")
+        };
+        assert!(r.ok);
+        assert!(state.sync_state.is_pinned("group-1", "vacation.jpg").unwrap());
+    }
+
+    /// Evicting an unpinned, hydrated file via the shell extension's
+    /// context menu turns it back into a placeholder.
+    #[tokio::test]
+    async fn evict_item_context_action_turns_a_hydrated_file_into_a_placeholder() {
+        let (socket_path, state, dir) = start_daemon().await;
+        let content = vec![7u8; 500];
+        std::fs::write(dir.path().join("photos/notes.txt"), &content).unwrap();
+        let mut version = VersionVector::new();
+        version.increment("device-a");
+        state
+            .sync_state
+            .upsert_file(
+                "group-1",
+                &FileRecord {
+                    path: "notes.txt".into(),
+                    size: 500,
+                    mtime_unix_nanos: 0,
+                    version,
+                    blocks: vec![yadorilink_sync_core::types::BlockInfo {
+                        hash: vec![0x22u8; 32],
+                        offset: 0,
+                        size: 500,
+                    }],
+                    deleted: false,
+                },
+            )
+            .unwrap();
+
+        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let path = dir.path().join("photos/notes.txt").to_string_lossy().to_string();
+        write_message(
+            &mut stream,
+            &ShellIpcMessage {
+                payload: Some(Payload::ContextActionRequest(ContextActionRequest {
+                    path: path.clone(),
+                    action: ContextAction::EvictItem as i32,
+                })),
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp = read_message::<ShellIpcMessage>(&mut stream).await.unwrap().unwrap();
+        let Some(Payload::ContextActionResponse(r)) = resp.payload else {
+            panic!("expected a ContextActionResponse")
+        };
+        assert!(r.ok);
+        assert_eq!(
+            state.sync_state.get_materialization_state("group-1", "notes.txt").unwrap(),
+            Some(yadorilink_sync_core::types::MaterializationState::Placeholder)
+        );
+        assert_ne!(std::fs::read(dir.path().join("photos/notes.txt")).unwrap(), content);
+    }
+
+    /// shell-integration spec: an unrelated path outside any linked folder
+    /// shows no overlay (`Unspecified`), not an error.
+    #[tokio::test]
+    async fn status_query_for_unlinked_path_is_unspecified() {
+        let (socket_path, _state, _dir) = start_daemon().await;
+        let status = yadorilink_daemon::shell_ipc::client::query_status(
+            &socket_path,
+            "/somewhere/else/file.txt",
+        )
+        .await;
+        assert_eq!(status, ShellSyncState::Unspecified);
+    }
+
+    /// on-demand-sync spec "Opening a placeholder triggers hydration" — the
+    /// OS-callback-driven path (task 4.3/4.4): a `HydrateRequest` for a path
+    /// with no reachable peer must fail with a clear, non-hanging error, not
+    /// silently succeed or block the connection forever.
+    #[tokio::test]
+    async fn hydrate_request_for_unreachable_placeholder_returns_an_error() {
+        let (socket_path, state, dir) = start_daemon().await;
+        let mut version = VersionVector::new();
+        version.increment("device-b");
+        state
+            .sync_state
+            .upsert_file(
+                "group-1",
+                &FileRecord {
+                    path: "big.zip".into(),
+                    size: 100,
+                    mtime_unix_nanos: 0,
+                    version,
+                    blocks: vec![yadorilink_sync_core::types::BlockInfo {
+                        hash: vec![0xABu8; 32],
+                        offset: 0,
+                        size: 100,
+                    }],
+                    deleted: false,
+                },
+            )
+            .unwrap();
+        state
+            .sync_state
+            .set_materialization_state(
+                "group-1",
+                "big.zip",
+                yadorilink_sync_core::types::MaterializationState::Placeholder,
+            )
+            .unwrap();
+
+        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let path = dir.path().join("photos/big.zip").to_string_lossy().to_string();
+        write_message(
+            &mut stream,
+            &ShellIpcMessage { payload: Some(Payload::HydrateRequest(HydrateRequest { path })) },
+        )
+        .await
+        .unwrap();
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_message::<ShellIpcMessage>(&mut stream),
+        )
+        .await
+        .expect("hydrate request must not hang the connection with no peer connected")
+        .unwrap()
+        .unwrap();
+        let Some(Payload::HydrateResponse(r)) = resp.payload else {
+            panic!("expected a HydrateResponse")
+        };
+        assert!(!r.ok);
+        assert!(!r.error.is_empty());
+    }
+
+    /// A status query reports the materialization state alongside sync state.
+    #[tokio::test]
+    async fn status_query_reports_materialization_state() {
+        let (socket_path, state, dir) = start_daemon().await;
+        state
+            .sync_state
+            .upsert_file(
+                "group-1",
+                &FileRecord {
+                    path: "vacation.jpg".into(),
+                    size: 1,
+                    mtime_unix_nanos: 0,
+                    version: VersionVector::new(),
+                    blocks: vec![],
+                    deleted: false,
+                },
+            )
+            .unwrap();
+
+        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+        let path = dir.path().join("photos/vacation.jpg").to_string_lossy().to_string();
+        write_message(
+            &mut stream,
+            &ShellIpcMessage { payload: Some(Payload::StatusQuery(StatusQuery { path })) },
+        )
+        .await
+        .unwrap();
+        let resp = read_message::<ShellIpcMessage>(&mut stream).await.unwrap().unwrap();
+        let Some(Payload::StatusResponse(r)) = resp.payload else {
+            panic!("expected a StatusResponse")
+        };
+        assert_eq!(r.materialization_state, ShellMaterializationState::Hydrated as i32);
+    }
+} // mod unix_socket_tests
+
+/// windows-local-ipc-support task 4.2: the shell-integration IPC protocol
+/// exercised above over a Unix socket, but over the Windows named-pipe
+/// transport — status query, hydrate request, and the daemon's proactive
+/// status push, since `windows_transport` (and now its matching client)
+/// had never been run before this change.
+#[cfg(windows)]
+mod windows_pipe_tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::net::windows::named_pipe::ClientOptions;
+    use yadorilink_daemon::daemon_state::DaemonState;
+    use yadorilink_ipc_proto::framing::{read_message, write_message};
+    use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
+    use yadorilink_ipc_proto::shellipc::{
+        HydrateRequest, ShellIpcMessage, SyncState as ShellSyncState,
+    };
+    use yadorilink_local_storage::FsBlockStore;
+    use yadorilink_sync_core::index::SyncState;
+    use yadorilink_sync_core::types::FileRecord;
+    use yadorilink_sync_core::version_vector::VersionVector;
+
+    static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn unique_pipe_name() -> String {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!(r"\\.\pipe\yadorilink-shell-test-{}-{n}", std::process::id())
+    }
+
+    async fn start_daemon() -> (String, Arc<DaemonState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
+        let sync_state = Arc::new(SyncState::open(dir.path().join("sync.sqlite3")).unwrap());
+        sync_state
+            .add_link(dir.path().join("photos").to_string_lossy().as_ref(), "group-1")
+            .unwrap();
+        std::fs::create_dir_all(dir.path().join("photos")).unwrap();
+
+        let state = DaemonState::new("device-a".into(), sync_state, store);
+        let pipe_name = unique_pipe_name();
+        let serve_name = pipe_name.clone();
+        let serve_state = state.clone();
+        tokio::spawn(async move {
+            let _ =
+                yadorilink_daemon::shell_ipc::windows_transport::serve(&serve_name, serve_state)
+                    .await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        (pipe_name, state, dir)
+    }
+
+    /// shell-integration spec: "Shell extension queries status via IPC",
+    /// exercised through `shell_ipc::client::query_status`'s Windows branch
+    /// rather than driving the pipe directly.
+    #[tokio::test]
+    async fn status_query_reflects_indexed_file_over_named_pipe() {
+        let (pipe_name, state, dir) = start_daemon().await;
+        state
+            .sync_state
+            .upsert_file(
+                "group-1",
+                &FileRecord {
+                    path: "vacation.jpg".into(),
+                    size: 1,
+                    mtime_unix_nanos: 0,
+                    version: VersionVector::new(),
+                    blocks: vec![],
+                    deleted: false,
+                },
+            )
+            .unwrap();
+
+        let status = yadorilink_daemon::shell_ipc::client::query_status(
+            &pipe_name,
+            &dir.path().join("photos/vacation.jpg").to_string_lossy(),
+        )
+        .await;
+        assert_eq!(status, ShellSyncState::Synced);
+    }
+
+    /// The client's fail-soft timeout behavior must also hold on Windows —
+    /// no daemon listening on the pipe must not hang, just report
+    /// `Unspecified`, matching the Unix client's contract exactly.
+    #[tokio::test]
+    async fn query_against_nonexistent_pipe_times_out_gracefully() {
+        let status = tokio::time::timeout(
+            Duration::from_secs(2),
+            yadorilink_daemon::shell_ipc::client::query_status(
+                r"\\.\pipe\yadorilink-shell-test-nonexistent",
+                "/some/path",
+            ),
+        )
+        .await
+        .expect("query_status must not hang when the daemon isn't running");
+        assert_eq!(status, ShellSyncState::Unspecified);
+    }
+
+    /// task 8.5 over the named-pipe transport: the daemon's proactive
+    /// status push reaches a connected Windows client.
+    #[tokio::test]
+    async fn daemon_pushes_status_update_to_connected_client_over_named_pipe() {
+        let (pipe_name, state, dir) = start_daemon().await;
+        let mut stream = ClientOptions::new().open(&pipe_name).unwrap();
+        // Same subscribe-after-accept race as the Unix test — give the
+        // spawned connection handler a moment to reach its subscribe call.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let absolute_path = dir.path().join("photos/new.jpg").to_string_lossy().to_string();
+        let _ = state.status_push_tx.send(yadorilink_ipc_proto::shellipc::StatusPush {
+            path: absolute_path.clone(),
+            state: ShellSyncState::Synced as i32,
+            materialization_state: yadorilink_ipc_proto::shellipc::MaterializationState::Hydrated
+                as i32,
+            open_elsewhere_device_id: String::new(),
+        });
+
+        let msg = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_message::<ShellIpcMessage>(&mut stream),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let Some(Payload::StatusPush(push)) = msg.payload else {
+            panic!("expected a StatusPush message")
+        };
+        assert_eq!(push.path, absolute_path);
+        assert_eq!(push.state, ShellSyncState::Synced as i32);
+    }
+
+    /// on-demand-sync's OS-callback-driven hydrate path, over the
+    /// named-pipe transport: an unreachable placeholder must fail cleanly,
+    /// not hang the connection.
+    #[tokio::test]
+    async fn hydrate_request_for_unreachable_placeholder_returns_an_error_over_named_pipe() {
+        let (pipe_name, state, dir) = start_daemon().await;
+        let mut version = VersionVector::new();
+        version.increment("device-b");
+        state
+            .sync_state
+            .upsert_file(
+                "group-1",
+                &FileRecord {
+                    path: "big.zip".into(),
+                    size: 100,
+                    mtime_unix_nanos: 0,
+                    version,
+                    blocks: vec![yadorilink_sync_core::types::BlockInfo {
+                        hash: vec![0xABu8; 32],
+                        offset: 0,
+                        size: 100,
+                    }],
+                    deleted: false,
+                },
+            )
+            .unwrap();
+        state
+            .sync_state
+            .set_materialization_state(
+                "group-1",
+                "big.zip",
+                yadorilink_sync_core::types::MaterializationState::Placeholder,
+            )
+            .unwrap();
+
+        let mut stream = ClientOptions::new().open(&pipe_name).unwrap();
+        let path = dir.path().join("photos/big.zip").to_string_lossy().to_string();
+        write_message(
+            &mut stream,
+            &ShellIpcMessage { payload: Some(Payload::HydrateRequest(HydrateRequest { path })) },
+        )
+        .await
+        .unwrap();
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_message::<ShellIpcMessage>(&mut stream),
+        )
+        .await
+        .expect("hydrate request must not hang the connection with no peer connected")
+        .unwrap()
+        .unwrap();
+        let Some(Payload::HydrateResponse(r)) = resp.payload else {
+            panic!("expected a HydrateResponse")
+        };
+        assert!(!r.ok);
+        assert!(!r.error.is_empty());
+    }
+
+    /// Regression test for the pipe-instance race
+    /// `control_socket::windows_transport`'s doc comment describes: two
+    /// clients connecting concurrently must both be served, not have one
+    /// hit `ERROR_PIPE_BUSY` because the next instance wasn't created yet.
+    #[tokio::test]
+    async fn two_concurrent_clients_are_both_served() {
+        let (pipe_name, state, dir) = start_daemon().await;
+        state
+            .sync_state
+            .upsert_file(
+                "group-1",
+                &FileRecord {
+                    path: "vacation.jpg".into(),
+                    size: 1,
+                    mtime_unix_nanos: 0,
+                    version: VersionVector::new(),
+                    blocks: vec![],
+                    deleted: false,
+                },
+            )
+            .unwrap();
+
+        let path_a = dir.path().join("photos/vacation.jpg").to_string_lossy().to_string();
+        let path_b = "/somewhere/else/file.txt".to_string();
+        let pipe_a = pipe_name.clone();
+        let pipe_b = pipe_name.clone();
+        let (status_a, status_b) = tokio::join!(
+            yadorilink_daemon::shell_ipc::client::query_status(&pipe_a, &path_a),
+            yadorilink_daemon::shell_ipc::client::query_status(&pipe_b, &path_b),
+        );
+        assert_eq!(status_a, ShellSyncState::Synced);
+        assert_eq!(status_b, ShellSyncState::Unspecified);
+    }
+}

@@ -1,0 +1,44 @@
+[package]
+name = "yadorilink-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yadorilink-relay"
+path = "src/bin/yadorilink-relay.rs"
+
+# See yadorilink-local-storage/Cargo.toml's identical section for why.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
+
+[dependencies]
+yadorilink-ipc-proto.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+boringtun = { version = "0.7", default-features = false }
+rand = "0.8"
+hex = "0.4"
+prost = "0.13"
+if-addrs = "0.15"
+zeroize = "1"
+x25519-dalek = { version = "2.0.1", features = ["zeroize"] }
+hmac = "0.12"
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+# See yadorilink-sync-core/Cargo.toml's identical section for why. This
+# crate's real networking
+# (`tokio::net::{TcpStream,UdpSocket}` in peer_channel.rs/relay_client.rs)
+# is exactly the surface the madsim tokio shim intercepts, so
+# `PeerTransport` needs no manual trait.
+[target.'cfg(not(madsim))'.dependencies]
+tokio.workspace = true
+
+[target.'cfg(madsim)'.dependencies]
+tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }

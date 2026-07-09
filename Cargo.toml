@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/yadorilink-transport",
+    "crates/yadorilink-local-storage",
+    "crates/yadorilink-sync-core",
+    "crates/yadorilink-daemon",
+    "crates/yadorilink-cli",
+    "crates/yadorilink-ipc-proto",
+    "crates/yadorilink-reporting",
+    "crates/yadorilink-desktop-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/juntaki/yadorilink"
+
+[workspace.dependencies]
+yadorilink-ipc-proto = { path = "crates/yadorilink-ipc-proto" }
+yadorilink-local-storage = { path = "crates/yadorilink-local-storage" }
+yadorilink-transport = { path = "crates/yadorilink-transport" }
+yadorilink-sync-core = { path = "crates/yadorilink-sync-core" }
+yadorilink-reporting = { path = "crates/yadorilink-reporting" }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+# Negotiated zstd compression for sync-protocol block/index payloads —
+# scoped to `yadorilink-sync-core` only, not a dependency of any other
+# crate.
+zstd = "0.13"

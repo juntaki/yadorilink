@@ -1,0 +1,323 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-public-ci
+
+      - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (Linux, desktop app excluded)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --workspace --exclude yadorilink-desktop-app --all-targets -- -D warnings
+
+      - name: Clippy
+        if: matrix.os != 'ubuntu-latest'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build (Linux, desktop app excluded)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build --workspace --exclude yadorilink-desktop-app --all-targets
+
+      - name: Build
+        if: matrix.os != 'ubuntu-latest'
+        run: cargo build --workspace --all-targets
+
+      - name: Test (Linux, desktop app excluded)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --workspace --exclude yadorilink-desktop-app
+
+      - name: Test
+        if: matrix.os == 'macos-latest'
+        run: cargo test --workspace
+
+      - name: Test
+        if: matrix.os == 'windows-latest'
+        run: cargo test --workspace -- --test-threads=4
+
+  shell-ext-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: shell-ext/windows
+
+      - name: Check formatting
+        working-directory: shell-ext/windows
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: shell-ext/windows
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        working-directory: shell-ext/windows
+        run: cargo build --release
+
+  shell-ext-macos-rust:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [core, fileprovider-core]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: shell-ext/macos/${{ matrix.crate }}
+
+      - name: Check formatting
+        working-directory: shell-ext/macos/${{ matrix.crate }}
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: shell-ext/macos/${{ matrix.crate }}
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        working-directory: shell-ext/macos/${{ matrix.crate }}
+        run: cargo build --release
+
+  cargo-audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+      - name: Audit
+        run: cargo audit
+
+  linux-artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-release
+
+      - name: Build release binaries
+        run: cargo build --workspace --release --exclude yadorilink-desktop-app
+
+      - name: Package Linux binary archive
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          arch="$(uname -m)"
+          mkdir -p release/linux/bin
+          cp target/release/yadorilink \
+             target/release/yadorilink-daemon \
+             target/release/yadorilink-relay \
+             release/linux/bin/
+          tar -C release/linux/bin -czf "release/linux/yadorilink-${version}-linux-${arch}-binaries.tar.gz" .
+          python3 scripts/ci/generate-release-checksums.py \
+            --sidecars \
+            "release/linux/yadorilink-${version}-linux-${arch}-binaries.tar.gz"
+
+      - name: Build Debian package
+        run: ./installer/linux/build-deb.sh
+
+      - name: Install lintian
+        run: sudo apt-get update && sudo apt-get install -y lintian
+
+      - name: Verify Debian package
+        run: |
+          set -euo pipefail
+          deb_file="$(find installer/linux/dist -maxdepth 1 -name '*.deb' -print -quit)"
+          if [ -z "$deb_file" ]; then
+            echo "No .deb file found under installer/linux/dist" >&2
+            exit 1
+          fi
+          ./installer/linux/verify-deb.sh "$deb_file"
+
+      - name: Collect Linux artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p release/linux
+          cp installer/linux/dist/*.deb installer/linux/dist/*.deb.sha256 release/linux/
+          version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          arch="$(uname -m)"
+          python3 scripts/ci/generate-release-checksums.py \
+            --out release/linux/SHA256SUMS \
+            "release/linux/yadorilink-${version}-linux-${arch}-binaries.tar.gz" \
+            release/linux/*.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yadorilink-linux-artifacts
+          path: release/linux
+          if-no-files-found: error
+
+  windows-artifacts:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-release
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build release binaries
+        run: cargo build --workspace --release
+
+      - name: Build Windows shell extension
+        working-directory: shell-ext/windows
+        run: cargo build --release
+
+      - name: Package Windows binary archive
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force -Path release/windows/bin | Out-Null
+          Copy-Item target/release/yadorilink.exe,
+                    target/release/yadorilink-daemon.exe,
+                    target/release/yadorilink-relay.exe,
+                    target/release/yadorilink-status-app.exe -Destination release/windows/bin
+          Copy-Item shell-ext/windows/target/release/yadorilink_shell_ext.dll,
+                    shell-ext/windows/target/release/yadorilink-cfapi-host.exe -Destination release/windows/bin
+          $zipPath = "release/windows/yadorilink-$version-windows-x86_64-binaries.zip"
+          Compress-Archive -Path release/windows/bin/* -DestinationPath $zipPath -Force
+          py -3 scripts/ci/generate-release-checksums.py --sidecars $zipPath
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File installer\windows\build-installer.ps1
+
+      - name: Verify Windows installer
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File installer\windows\verify-installer.ps1 -Path installer\windows\Output\yadorilink-setup.exe
+
+      - name: Collect Windows artifacts
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
+          Copy-Item installer/windows/Output/yadorilink-setup.exe,
+                    installer/windows/Output/yadorilink-setup.exe.sha256 -Destination release/windows
+          $artifacts = @(
+            "release/windows/yadorilink-$version-windows-x86_64-binaries.zip",
+            "release/windows/yadorilink-setup.exe"
+          )
+          py -3 scripts/ci/generate-release-checksums.py --out release/windows/SHA256SUMS @artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yadorilink-windows-artifacts
+          path: release/windows
+          if-no-files-found: error
+
+  macos-artifacts:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-release
+
+      - name: Build release binaries
+        run: cargo build --workspace --release
+
+      - name: Package macOS binary archive
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          arch="$(uname -m)"
+          mkdir -p release/macos/bin
+          cp target/release/yadorilink \
+             target/release/yadorilink-daemon \
+             target/release/yadorilink-relay \
+             target/release/yadorilink-status-app \
+             release/macos/bin/
+          cat > release/macos/README.txt <<'EOF'
+          This Actions artifact contains unsigned macOS binaries only.
+          The Finder/File Provider host app and the .pkg installer are not built in CI,
+          because the current packaging flow requires a real Apple signing identity and
+          a manually reviewed notarization path.
+          Build installer/macos/build-pkg.sh on a signing-capable Mac when you need a .pkg.
+          EOF
+          tar -C release/macos -czf "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz" bin README.txt
+          python3 scripts/ci/generate-release-checksums.py \
+            --sidecars \
+            "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz"
+          python3 scripts/ci/generate-release-checksums.py \
+            --out release/macos/SHA256SUMS \
+            "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yadorilink-macos-artifacts
+          path: release/macos
+          if-no-files-found: error

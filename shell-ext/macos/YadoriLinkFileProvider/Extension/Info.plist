@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>YadoriLink File Provider</string>
+	<key>CFBundleExecutable</key>
+	<string>YadoriLinkFileProvider</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.juntaki.yadorilink.FileProvider</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>YadoriLinkFileProvider</string>
+	<key>CFBundlePackageType</key>
+	<string>XPC!</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSExtension</key>
+	<dict>
+		<key>NSExtensionPointIdentifier</key>
+		<string>com.apple.fileprovider-nonui</string>
+		<!-- Matches the `final class FileProviderExtension` name in
+		     FileProviderExtension.swift (no @objc(...) override needed
+		     here the way FinderSync.swift uses one — Xcode's build
+		     system fills in PRODUCT_MODULE_NAME-qualified class lookup
+		     automatically for a target it generates a project for, per
+		     project.yml, unlike FinderSync's historical swiftc-direct
+		     build path). -->
+		<key>NSExtensionPrincipalClass</key>
+		<string>FileProviderExtension</string>
+		<!-- task 7.2/7.6: ties this extension to the same App Group the
+		     host app and the FinderSync extension use
+		     (group.com.juntaki.yadorilink.shared) so NSFileProviderManager can
+		     locate this extension's domain storage and so
+		     domain-registration calls from the host app reach the same
+		     provider. Required for NSFileProviderManager's domain APIs
+		     to function per NSFileProviderManager.h's own doc comment
+		     ("If the NSExtensionFileProviderDocumentGroup property is
+		     not set, calling this [API] ... "). -->
+		<key>NSExtensionFileProviderDocumentGroup</key>
+		<string>group.com.juntaki.yadorilink.shared</string>
+		<!-- Declares this as a fully replicated, enumeration-capable
+		     provider (task 7.1's NSFileProviderReplicatedExtension,
+		     not the older non-replicated NSFileProviderExtension). -->
+		<key>NSExtensionFileProviderSupportsEnumeration</key>
+		<true/>
+	</dict>
+</dict>
+</plist>

@@ -1,0 +1,50 @@
+syntax = "proto3";
+package yadorilink.relay.v1;
+
+// Wire format for the content-blind relay (design.md D6): the relay only
+// ever forwards opaque, already-WireGuard-encrypted bytes keyed by
+// destination public key. Framed as length-prefixed protobuf over TCP
+// (not gRPC) for the same latency/overhead reasons as the local
+// shell-integration IPC in design.md D3 — this is a high-frequency,
+// small-message forwarding path.
+
+message Hello {
+  bytes public_key = 1; // this client's WireGuard public key, 32 bytes
+}
+
+message HelloChallenge {
+  bytes server_public_key = 1; // relay ephemeral X25519 public key, 32 bytes
+  bytes nonce = 2;             // relay nonce covered by the proof MAC
+}
+
+message HelloProof {
+  bytes mac = 1; // HMAC-SHA256(X25519(client_secret, server_public_key), nonce)
+}
+
+// Minimal "netcheck" (task 4.4): the relay tells the client what source
+// address it observed the connection from, standing in for a STUN
+// server so yadorilink doesn't depend on third-party infrastructure.
+message HelloAck {
+  string observed_address = 1; // ip:port as seen by the relay
+}
+
+message Forward {
+  bytes dest_public_key = 1;
+  bytes payload = 2; // opaque encrypted WireGuard datagram
+}
+
+message Forwarded {
+  bytes from_public_key = 1;
+  bytes payload = 2;
+}
+
+message RelayMessage {
+  oneof payload {
+    Hello hello = 1;
+    HelloAck hello_ack = 2;
+    Forward forward = 3;
+    Forwarded forwarded = 4;
+    HelloChallenge hello_challenge = 5;
+    HelloProof hello_proof = 6;
+  }
+}

@@ -1,0 +1,82 @@
+[package]
+name = "yadorilink-shell-ext-windows"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# build-filebox-mvp task 9.1 spike: not a member of the root workspace —
+# this crate only builds on Windows (windows-rs COM bindings don't
+# typecheck on other targets), and the primary dev machine for this
+# project is not Windows. Build directly with `cargo build` from this
+# directory on a Windows machine. The empty [workspace] table below marks
+# this as its own workspace root, so Cargo doesn't try to fold it into
+# the parent repo's workspace just because it's nested under it.
+[workspace]
+
+[lib]
+name = "yadorilink_shell_ext"
+crate-type = ["cdylib", "rlib"]
+
+# on-demand-sync task 6.1-6.3: the Cloud Filter API sync-root
+# registration/placeholder/fetch-data-callback logic runs in a separate,
+# long-lived host process (`yadorilink-cfapi-host`), not inside the
+# `yadorilink_shell_ext` COM DLL (`cdylib`) that loads into every
+# Explorer.exe process. Two reasons: (a) `CfConnectSyncRoot`'s callback
+# registration needs to stay alive for as long as the sync root is meant
+# to serve fetch-data callbacks, which does not match a COM DLL's
+# load/unload lifecycle inside Explorer (`DllCanUnloadNow` here already
+# reports "always unloadable", intentionally, per the overlay identifiers'
+# stateless-per-call design — pinning it open just for cfapi would change
+# that contract for the whole DLL); (b) this mirrors how every real cfapi
+# sync provider (OneDrive, Dropbox) is structured: a background sync
+# engine process owns the sync root connection, while the shell extension
+# DLL is a thin, frequently-loaded/unloaded UI-only client. The `rlib`
+# crate-type lets this new binary reuse `ipc_client`/`cfapi` from the same
+# crate without duplicating the IPC plumbing.
+[[bin]]
+name = "yadorilink-cfapi-host"
+path = "src/bin/cfapi_host.rs"
+
+[dependencies]
+yadorilink-ipc-proto = { path = "../../crates/yadorilink-ipc-proto" }
+tokio = { version = "1", features = ["net", "rt", "time", "io-util"] }
+prost = "0.13"
+# The `#[implement]` macro's generated code references `windows_core::...`
+# at the crate root directly, not through `windows::core` — an explicit
+# dependency (not just relying on `windows`'s re-export) is required for
+# that to resolve.
+windows-core = "0.58"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+    # on-demand-sync task 6.1-6.3: Cloud Filter API (CfRegisterSyncRoot,
+    # CfCreatePlaceholders, CfConnectSyncRoot, CfExecute, the
+    # CF_CALLBACK_* family) plus its Win32_Storage_FileSystem/
+    # Win32_System_IO/Win32_System_CorrelationVector prerequisites (several
+    # cfapi structs, e.g. CF_OPERATION_INFO/CF_CALLBACK_REGISTRATION, are
+    # `#[cfg]`-gated behind these in windows-rs's generated bindings).
+    "Win32_Storage_CloudFilters",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_CorrelationVector",
+]
+
+[profile.release]
+lto = true

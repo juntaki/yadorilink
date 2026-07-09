@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  build-yadorilink-mvp task 10.4/10.6: entitlements applied by both build.sh
+  (ad-hoc, CI/headless only — see below) and the Xcode project (real
+  Apple Development signing, the path that actually works end to end).
+
+  CONFIRMED WORKING end-to-end on a real macOS 15.7.7 VM: overlay badge
+  renders in Finder, and the "yadorilink" context submenu (View sync
+  status/Pause/Resume/Pin/Evict) appears and is wired to the Rust FFI
+  core. Getting here took three fixes, all load-bearing:
+
+  1. App Sandbox must be ON. PlugInKit refuses to even discover an
+     unsandboxed FinderSync extension ("plug-ins must be sandboxed").
+  2. A real signature is required to *launch* a sandboxed extension at
+     all — ad-hoc signing (build.sh's `codesign --sign -`) lets the
+     process spawn but it dies silently right after AppSandbox init,
+     before any application code runs. Only a real "Apple Development"
+     (or better) signing identity, from a paid Apple Developer Program
+     team, fixes this. Xcode's automatic signing also requires every
+     *device that will run the build* to be registered with the team
+     (Certificates, Identifiers & Profiles → Devices) — a stale/scoped
+     provisioning profile fails with "Provisioning profile does not
+     allow this device" and the extension won't launch on an
+     unregistered machine even with valid signing.
+  3. Reaching the daemon's socket from inside the sandbox needs
+     com.apple.security.application-groups, not
+     com.apple.security.temporary-exception.files.absolute-path.
+     read-write (tried first, matching the daemon's normal
+     `~/Library/Application Support/yadorilink` socket location) — that
+     consistently failed with EPERM despite a correct path, a real
+     signature, and the entitlement being visibly present in the signed
+     binary (`codesign -d --entitlements`). Likely needs Apple's
+     case-by-case approval beyond a personal Developer Program
+     membership, unlike App Sandbox or App Groups (both standard,
+     freely available capabilities). App Groups additionally requires
+     Xcode to auto-register an App ID / group ID with the team the
+     first time it's used (may itself need `-allowProvisioningUpdates`
+     and a stale local provisioning-profile cache cleared — see
+     `~/Library/Developer/Xcode/UserData/Provisioning Profiles/` — if a
+     newly-added device or capability doesn't show up in a rebuild).
+
+  The resolved App Group container path has NO Team ID prefix — despite
+  matching the `~/Library/Containers/<TeamID>.<bundle-id>/` convention
+  App Sandbox itself uses, `FileManager.default.
+  containerURL(forSecurityApplicationGroupIdentifier:)` resolves this
+  App Group to plain `~/Library/Group Containers/group.com.yadorilink.
+  shared/` — confirmed by having the extension call that API directly
+  and write the result to a file; guessing the Team-ID-prefixed form
+  first cost real debugging time. `shell-ext/macos/core/src/ipc_client.
+  rs`'s `APP_GROUP_CONTAINER` constant must match this exactly.
+
+  The daemon itself isn't sandboxed, so it needs no entitlement to write
+  into the group container — it's just told to via
+  YADORILINK_SHELL_IPC_SOCKET, an ordinary filesystem path from its point
+  of view. Moving the daemon's *default* socket location to the group
+  container (vs. requiring this env var override) is a real product
+  decision belonging to yadorilink-daemon, not made here.
+-->
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.network.client</key>
+	<false/>
+	<key>com.apple.security.network.server</key>
+	<false/>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.juntaki.yadorilink.shared</string>
+	</array>
+</dict>
+</plist>

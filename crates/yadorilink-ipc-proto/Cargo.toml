@@ -1,0 +1,13 @@
+[package]
+name = "yadorilink-ipc-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prost = "0.13"
+tonic = "0.12"
+tokio = { version = "1", features = ["io-util"] }
+
+[build-dependencies]
+tonic-build = "0.12"

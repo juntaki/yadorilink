@@ -1,0 +1,100 @@
+[package]
+name = "yadorilink-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yadorilink-daemon"
+path = "src/main.rs"
+
+[[bin]]
+# Offline release-manifest signing tool — a maintainer-only helper, not
+# shipped to end users, so it lives as a
+# second bin target in this same crate (reusing `update::manifest`'s
+# types directly) rather than a whole new workspace member.
+name = "yadorilink-sign-manifest"
+path = "src/bin/sign_manifest.rs"
+
+# Gates the WebSocket-based netmap subscription client
+# (peer_orchestrator.rs's `run_netmap_attempt`) so the existing gRPC
+# `StreamNetmap` path keeps working unchanged while the two are validated
+# side by side. Off by default; mirrors `yadorilink-cli`'s
+# `http-coordination` feature.
+[features]
+http-coordination = ["dep:tokio-tungstenite", "dep:url"]
+
+[dependencies]
+yadorilink-sync-core = { path = "../yadorilink-sync-core" }
+yadorilink-transport = { path = "../yadorilink-transport" }
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+yadorilink-reporting = { path = "../yadorilink-reporting" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+prost = "0.13"
+tonic = { version = "0.12", features = ["tls-native-roots"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+hex = "0.4"
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+serde.workspace = true
+serde_json = "1"
+boringtun = { version = "0.7", default-features = false }
+sha2.workspace = true
+uuid = { version = "1", features = ["v4"] }
+# Signed-manifest HTTPS fetch and artifact download. Same rustls-tls +
+# minimal-features shape as `yadorilink-reporting`'s own `reqwest`
+# dependency (its own HTTPS-only submission client) — this crate already
+# depends on that pattern
+# transitively, this makes it a direct, explicit dependency for the
+# update manifest/artifact fetch path specifically.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Manifest-signature verification: Ed25519 over the exact
+# signed payload bytes, matching `yadorilink-sync-core::content_crypto`'s
+# and `yadorilink-transport`'s existing "dalek" family curve/signature
+# crate choice (x25519-dalek) rather than introducing an unrelated crypto
+# library for this one signature scheme.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Strict semantic-version parsing/comparison for manifest version fields
+# — already present in Cargo.lock as a transitive dependency elsewhere in
+# the workspace; this is its first direct use.
+semver = "1"
+base64 = "0.22"
+rand = "0.8"
+# WebSocket client for HTTP coordination service's `/netmap/subscribe`
+# route (optional, see the
+# `http-coordination` feature above). rustls-tls-webpki-roots to match
+# this workspace's existing rustls-only choice (reqwest above, and
+# yadorilink-reporting's own client) rather than pulling in native-tls.
+tokio-tungstenite = { version = "0.24", optional = true, default-features = false, features = [
+    "connect",
+    "rustls-tls-webpki-roots",
+] }
+# `peer_orchestrator.rs`'s http(s)->ws(s) URL rewrite (`netmap_ws_url`) --
+# deliberately not hand-rolled string splitting, which mishandled IPv6
+# literal addresses in an earlier version of this file. Same crate
+# `yadorilink-cli`/`yadorilink-desktop-app` use for the same reason.
+url = { version = "2", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+rand = "0.8"
+# A real local HTTP listener for the daemon-side queue-retry integration
+# tests (mirrors yadorilink-reporting's own use of the same crate).
+wiremock = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }

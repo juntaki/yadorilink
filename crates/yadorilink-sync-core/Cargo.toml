@@ -1,0 +1,84 @@
+[package]
+name = "yadorilink-sync-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# See yadorilink-local-storage/Cargo.toml's identical section for why.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
+
+[dependencies]
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+yadorilink-transport = { path = "../yadorilink-transport" }
+yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+thiserror.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json = "1"
+bytes.workspace = true
+# `FuturesUnordered` substitutes for
+# `tokio::task::JoinSet` in `peer_session.rs`'s bounded-concurrency
+# reconcile loop — `madsim`'s tokio shim has no `JoinSet` at all. Same
+# dependency shape as `yadorilink-daemon`'s existing `futures-util` use.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+prost = "0.13"
+rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
+notify = "8"
+hex = "0.4"
+walkdir = "2"
+fastcdc = "4.0.1"
+# Negotiated zstd compression for block and index-exchange payloads
+# (peer_session.rs) — scoped to this crate only.
+zstd = { workspace = true }
+# The `content_crypto` module's
+# AEAD (XChaCha20-Poly1305) and ECIES-style
+# group-key wrapping over each trusted device's existing X25519 identity key
+# (the same primitive `yadorilink-transport` already uses for WireGuard —
+# see its own `x25519-dalek`/`zeroize` deps — but not shared as a dependency
+# across crates, since `yadorilink-sync-core` has no other reason to depend
+# on `yadorilink-transport`'s key material types). `hmac`+`sha2` (`sha2`
+# already a dependency above) implement the deterministic per-block nonce
+# KDF and the ECIES wrap/unwrap key derivation (HKDF-like HMAC-based expand)
+# without pulling in a whole extra `hkdf` crate for one call site. Scoped to
+# this crate only, mirroring the `zstd` precedent immediately above.
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2.0.1", features = ["zeroize"] }
+hmac = "0.12"
+zeroize = "1"
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+boringtun = { version = "0.7", default-features = false }
+tracing-subscriber.workspace = true
+
+# `tokio` is swapped for `madsim`'s
+# tokio-compatible shim only when the deterministic-simulation test
+# binary is built with `RUSTFLAGS="--cfg madsim"` (never for a normal
+# build/test run). Real
+# `notify`-based filesystem watching still isn't simulated by this (it's
+# native OS callback machinery, not tokio); DST scenarios use
+# `watcher::FolderWatchSource`'s simulated implementation instead.
+[target.'cfg(not(madsim))'.dependencies]
+tokio.workspace = true
+
+[target.'cfg(madsim)'.dependencies]
+tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }
+# DST long-sweep hardening (index.rs `madsim_shared_thread_pool`): a single
+# process-shared r2d2 establishment thread pool instead of one fresh 3-thread
+# pool per `SyncState`. Already a transitive dependency of `r2d2` (which
+# owns the `.thread_pool(_)` builder hook and this exact type), so declaring
+# it directly here — madsim-only — pulls in no new crate. Pinned to the same
+# version r2d2 0.8 resolves so both share one build.
+scheduled_thread_pool = { package = "scheduled-thread-pool", version = "0.2" }
+
+# The simulator itself (Runtime/Config),
+# used directly by tests/dst_*.rs to drive many independently-seeded
+# simulated runs. dev-only: never needed by the library itself, only by
+# `#![cfg(madsim)]`-gated test files.
+[target.'cfg(madsim)'.dev-dependencies]
+madsim = "0.2"

@@ -1,0 +1,614 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0633E2A91E6E9143C947F625 /* YadoriLinkFinderSync.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = CF875B1FD41021C7A8472594 /* YadoriLinkFinderSync.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		61AEB212D82B731FC9CB04C0 /* FileProviderItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D88BD2C6C8A3DACDAF17E22 /* FileProviderItem.swift */; };
+		85F8DC6E1AA2DF3F2DD8B54A /* FileProviderModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70104ADC9B15018C319CD43D /* FileProviderModel.swift */; };
+		89B92D41B796CE185C7BDFBF /* DomainRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 352EBBC9C4D1263ADBC5A3FD /* DomainRegistration.swift */; };
+		8BCBDD3DAE8D5CF1B359CF38 /* FileProviderExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46E3E507F0A862932B7FB16D /* FileProviderExtension.swift */; };
+		95C14C39D926A8CC403DF332 /* YadoriLinkFileProvider.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = F47B539D9A20D96672049D5E /* YadoriLinkFileProvider.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		DAB7BBE65F3FB060FB9452C6 /* FileProviderEnumerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 943EF0F010F0BA6E951619DD /* FileProviderEnumerator.swift */; };
+		ED0C89E264106398323C16E6 /* FinderSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03C18D6B33051972D27DFB91 /* FinderSync.swift */; };
+		F9C6AA92D8255767422D0301 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAE0C369E749366C4D4789AC /* main.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		25D2211D1E76D195F7156339 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 2F68F241DC42D3E233EC0DEE /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 5BE358EB3FE3BD4E68908FB4;
+			remoteInfo = YadoriLinkFinderSync;
+		};
+		A1C0FE3CAE439C864DB81FAD /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 2F68F241DC42D3E233EC0DEE /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = AEF3F210AC22BB30E078D314;
+			remoteInfo = YadoriLinkFileProvider;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		78F67D86F2F507B39A419227 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				0633E2A91E6E9143C947F625 /* YadoriLinkFinderSync.appex in Embed Foundation Extensions */,
+				95C14C39D926A8CC403DF332 /* YadoriLinkFileProvider.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		03C18D6B33051972D27DFB91 /* FinderSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderSync.swift; sourceTree = "<group>"; };
+		352EBBC9C4D1263ADBC5A3FD /* DomainRegistration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DomainRegistration.swift; sourceTree = "<group>"; };
+		46E3E507F0A862932B7FB16D /* FileProviderExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderExtension.swift; sourceTree = "<group>"; };
+		70104ADC9B15018C319CD43D /* FileProviderModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderModel.swift; sourceTree = "<group>"; };
+		7D88BD2C6C8A3DACDAF17E22 /* FileProviderItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderItem.swift; sourceTree = "<group>"; };
+		8A566DC49C0A8C28312DBBDC /* YadoriLinkFinderSyncHost.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = YadoriLinkFinderSyncHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		943EF0F010F0BA6E951619DD /* FileProviderEnumerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileProviderEnumerator.swift; sourceTree = "<group>"; };
+		CF875B1FD41021C7A8472594 /* YadoriLinkFinderSync.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = YadoriLinkFinderSync.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		EAE0C369E749366C4D4789AC /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		F47B539D9A20D96672049D5E /* YadoriLinkFileProvider.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = YadoriLinkFileProvider.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		069E5D4EC305F5151304E8F3 /* Extension */ = {
+			isa = PBXGroup;
+			children = (
+				943EF0F010F0BA6E951619DD /* FileProviderEnumerator.swift */,
+				46E3E507F0A862932B7FB16D /* FileProviderExtension.swift */,
+				7D88BD2C6C8A3DACDAF17E22 /* FileProviderItem.swift */,
+				70104ADC9B15018C319CD43D /* FileProviderModel.swift */,
+			);
+			name = Extension;
+			path = ../YadoriLinkFileProvider/Extension;
+			sourceTree = "<group>";
+		};
+		2957D0F95A4D1D104451326C /* Extension */ = {
+			isa = PBXGroup;
+			children = (
+				03C18D6B33051972D27DFB91 /* FinderSync.swift */,
+			);
+			path = Extension;
+			sourceTree = "<group>";
+		};
+		6A6537B5611B2EE85F0D666B /* HostApp */ = {
+			isa = PBXGroup;
+			children = (
+				352EBBC9C4D1263ADBC5A3FD /* DomainRegistration.swift */,
+				EAE0C369E749366C4D4789AC /* main.swift */,
+			);
+			path = HostApp;
+			sourceTree = "<group>";
+		};
+		AC7B11FDEB8E79FAF2BB5B6F /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				F47B539D9A20D96672049D5E /* YadoriLinkFileProvider.appex */,
+				CF875B1FD41021C7A8472594 /* YadoriLinkFinderSync.appex */,
+				8A566DC49C0A8C28312DBBDC /* YadoriLinkFinderSyncHost.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		F4BC46116C195C6D7CE8FC67 = {
+			isa = PBXGroup;
+			children = (
+				2957D0F95A4D1D104451326C /* Extension */,
+				069E5D4EC305F5151304E8F3 /* Extension */,
+				6A6537B5611B2EE85F0D666B /* HostApp */,
+				AC7B11FDEB8E79FAF2BB5B6F /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		5BE358EB3FE3BD4E68908FB4 /* YadoriLinkFinderSync */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 55A7D5445C8F8E72EC84991E /* Build configuration list for PBXNativeTarget "YadoriLinkFinderSync" */;
+			buildPhases = (
+				8E1DDF5D46E2B9284F0379C8 /* Build Rust FFI core */,
+				CE3F04F11D3E1B57DDEB4105 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = YadoriLinkFinderSync;
+			packageProductDependencies = (
+			);
+			productName = YadoriLinkFinderSync;
+			productReference = CF875B1FD41021C7A8472594 /* YadoriLinkFinderSync.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		6BC4ACF7703B417A1EC86D0D /* YadoriLinkFinderSyncHost */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 5EFC9688062BA07B026347EE /* Build configuration list for PBXNativeTarget "YadoriLinkFinderSyncHost" */;
+			buildPhases = (
+				F48F3196D6498B69E2224E2A /* Build Rust FFI core (fileprovider-core) */,
+				47755D2C08ED363576155AEE /* Sources */,
+				78F67D86F2F507B39A419227 /* Embed Foundation Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				B58ACD97483D585C56FA5678 /* PBXTargetDependency */,
+				540A29A0A2E0420381942E68 /* PBXTargetDependency */,
+			);
+			name = YadoriLinkFinderSyncHost;
+			packageProductDependencies = (
+			);
+			productName = YadoriLinkFinderSyncHost;
+			productReference = 8A566DC49C0A8C28312DBBDC /* YadoriLinkFinderSyncHost.app */;
+			productType = "com.apple.product-type.application";
+		};
+		AEF3F210AC22BB30E078D314 /* YadoriLinkFileProvider */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 31A822B1931E7A59692DEF98 /* Build configuration list for PBXNativeTarget "YadoriLinkFileProvider" */;
+			buildPhases = (
+				F0C2896918ACFE193248F77B /* Build Rust FFI core (fileprovider-core) */,
+				9A970039C534B07B69C2AE1B /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = YadoriLinkFileProvider;
+			packageProductDependencies = (
+			);
+			productName = YadoriLinkFileProvider;
+			productReference = F47B539D9A20D96672049D5E /* YadoriLinkFileProvider.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		2F68F241DC42D3E233EC0DEE /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					5BE358EB3FE3BD4E68908FB4 = {
+						DevelopmentTeam = 594UQF7QX3;
+						ProvisioningStyle = Automatic;
+					};
+					6BC4ACF7703B417A1EC86D0D = {
+						DevelopmentTeam = 594UQF7QX3;
+						ProvisioningStyle = Automatic;
+					};
+					AEF3F210AC22BB30E078D314 = {
+						DevelopmentTeam = 594UQF7QX3;
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 3262B36727CC2AA47A99DAB0 /* Build configuration list for PBXProject "YadoriLinkFinderSync" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = F4BC46116C195C6D7CE8FC67;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = AC7B11FDEB8E79FAF2BB5B6F /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				AEF3F210AC22BB30E078D314 /* YadoriLinkFileProvider */,
+				5BE358EB3FE3BD4E68908FB4 /* YadoriLinkFinderSync */,
+				6BC4ACF7703B417A1EC86D0D /* YadoriLinkFinderSyncHost */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		8E1DDF5D46E2B9284F0379C8 /* Build Rust FFI core */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust FFI core";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\ncd \"$SRCROOT/../core\"\ncargo build --release --target aarch64-apple-darwin\n";
+		};
+		F0C2896918ACFE193248F77B /* Build Rust FFI core (fileprovider-core) */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust FFI core (fileprovider-core)";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\ncd \"$SRCROOT/../fileprovider-core\"\ncargo build --release --target aarch64-apple-darwin\n";
+		};
+		F48F3196D6498B69E2224E2A /* Build Rust FFI core (fileprovider-core) */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust FFI core (fileprovider-core)";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\ncd \"$SRCROOT/../fileprovider-core\"\ncargo build --release --target aarch64-apple-darwin\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		47755D2C08ED363576155AEE /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				89B92D41B796CE185C7BDFBF /* DomainRegistration.swift in Sources */,
+				F9C6AA92D8255767422D0301 /* main.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		9A970039C534B07B69C2AE1B /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				DAB7BBE65F3FB060FB9452C6 /* FileProviderEnumerator.swift in Sources */,
+				8BCBDD3DAE8D5CF1B359CF38 /* FileProviderExtension.swift in Sources */,
+				61AEB212D82B731FC9CB04C0 /* FileProviderItem.swift in Sources */,
+				85F8DC6E1AA2DF3F2DD8B54A /* FileProviderModel.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		CE3F04F11D3E1B57DDEB4105 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				ED0C89E264106398323C16E6 /* FinderSync.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		540A29A0A2E0420381942E68 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = AEF3F210AC22BB30E078D314 /* YadoriLinkFileProvider */;
+			targetProxy = A1C0FE3CAE439C864DB81FAD /* PBXContainerItemProxy */;
+		};
+		B58ACD97483D585C56FA5678 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 5BE358EB3FE3BD4E68908FB4 /* YadoriLinkFinderSync */;
+			targetProxy = 25D2211D1E76D195F7156339 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		01908AD2404B0818CC022873 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = 594UQF7QX3;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 11.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		2C2BCE3FA49A130DD63B287F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = 594UQF7QX3;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 11.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		492A1EE5DE192662977FA4CA /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				HEADER_SEARCH_PATHS = "../fileprovider-core/include";
+				INFOPLIST_FILE = HostApp/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "../fileprovider-core/target/aarch64-apple-darwin/release";
+				OTHER_LDFLAGS = "-lyadorilink_fileprovider_core -liconv";
+				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink;
+				PRODUCT_NAME = YadoriLinkFinderSyncHost;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "HostApp/YadoriLinkFinderSyncHost-Bridging-Header.h";
+			};
+			name = Debug;
+		};
+		82DEB5478C920F37F6D26852 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				HEADER_SEARCH_PATHS = "../fileprovider-core/include";
+				INFOPLIST_FILE = HostApp/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "../fileprovider-core/target/aarch64-apple-darwin/release";
+				OTHER_LDFLAGS = "-lyadorilink_fileprovider_core -liconv";
+				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink;
+				PRODUCT_NAME = YadoriLinkFinderSyncHost;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "HostApp/YadoriLinkFinderSyncHost-Bridging-Header.h";
+			};
+			name = Release;
+		};
+		9A2A852D4B8F4B41B59141C3 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ../YadoriLinkFileProvider/Extension/Extension.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				HEADER_SEARCH_PATHS = "../fileprovider-core/include";
+				INFOPLIST_FILE = ../YadoriLinkFileProvider/Extension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "../fileprovider-core/target/aarch64-apple-darwin/release";
+				OTHER_LDFLAGS = "-lyadorilink_fileprovider_core -liconv";
+				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink.FileProvider;
+				PRODUCT_NAME = YadoriLinkFileProvider;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "../YadoriLinkFileProvider/Extension/YadoriLinkFileProvider-Bridging-Header.h";
+			};
+			name = Release;
+		};
+		B141D1FFB3D32BAA4CFF9C1A /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = Extension/Extension.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				HEADER_SEARCH_PATHS = ../core/include;
+				INFOPLIST_FILE = Extension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "../core/target/aarch64-apple-darwin/release";
+				OTHER_LDFLAGS = "-lyadorilink_shell_core -liconv";
+				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink.FinderSync;
+				PRODUCT_NAME = YadoriLinkFinderSync;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "Extension/YadoriLinkFinderSync-Bridging-Header.h";
+			};
+			name = Release;
+		};
+		EC15885DF61FEFCFAE89AA3A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ../YadoriLinkFileProvider/Extension/Extension.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				HEADER_SEARCH_PATHS = "../fileprovider-core/include";
+				INFOPLIST_FILE = ../YadoriLinkFileProvider/Extension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "../fileprovider-core/target/aarch64-apple-darwin/release";
+				OTHER_LDFLAGS = "-lyadorilink_fileprovider_core -liconv";
+				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink.FileProvider;
+				PRODUCT_NAME = YadoriLinkFileProvider;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "../YadoriLinkFileProvider/Extension/YadoriLinkFileProvider-Bridging-Header.h";
+			};
+			name = Debug;
+		};
+		EF22BFB5746E56517FAEE37F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = Extension/Extension.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				HEADER_SEARCH_PATHS = ../core/include;
+				INFOPLIST_FILE = Extension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = "../core/target/aarch64-apple-darwin/release";
+				OTHER_LDFLAGS = "-lyadorilink_shell_core -liconv";
+				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink.FinderSync;
+				PRODUCT_NAME = YadoriLinkFinderSync;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "Extension/YadoriLinkFinderSync-Bridging-Header.h";
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		31A822B1931E7A59692DEF98 /* Build configuration list for PBXNativeTarget "YadoriLinkFileProvider" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				EC15885DF61FEFCFAE89AA3A /* Debug */,
+				9A2A852D4B8F4B41B59141C3 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		3262B36727CC2AA47A99DAB0 /* Build configuration list for PBXProject "YadoriLinkFinderSync" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2C2BCE3FA49A130DD63B287F /* Debug */,
+				01908AD2404B0818CC022873 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		55A7D5445C8F8E72EC84991E /* Build configuration list for PBXNativeTarget "YadoriLinkFinderSync" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				EF22BFB5746E56517FAEE37F /* Debug */,
+				B141D1FFB3D32BAA4CFF9C1A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		5EFC9688062BA07B026347EE /* Build configuration list for PBXNativeTarget "YadoriLinkFinderSyncHost" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				492A1EE5DE192662977FA4CA /* Debug */,
+				82DEB5478C920F37F6D26852 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 2F68F241DC42D3E233EC0DEE /* Project object */;
+}
