@@ -1,0 +1,43 @@
+#!/bin/bash
+#
+# installer/macos/scripts/preinstall
+#
+# Best-effort cleanup before (re)installing, so an upgrade over a running
+# install doesn't leave a stale launchd registration pointing at a
+# soon-to-be-overwritten binary, and doesn't try to overwrite a binary
+# that's currently running (the running yadorilink-daemon process itself
+# keeps its old inode open on macOS/APFS, so this isn't strictly required
+# for correctness, but stopping it first avoids a brief window where two
+# daemon processes are alive at once). Runs as root, same console-user
+# discovery as postinstall — see that script for why $HOME/whoami can't
+# be trusted here.
+
+set -uo pipefail
+
+log() { echo "[yadorilink preinstall] $*"; }
+
+AGENT_LABEL="com.yadorilink.daemon"
+
+# This script intentionally does not remove files below $USER_HOME. The
+# symlink-sensitive user-home cleanup lives in uninstall.sh, where every
+# root-run deletion is guarded before it can touch a user-writable path.
+
+CONSOLE_USER="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)"
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
+    CONSOLE_USER="$(/usr/bin/who 2>/dev/null | /usr/bin/awk '$2 == "console" { print $1; exit }')"
+fi
+
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
+    log "No GUI console user detected; nothing to stop."
+    exit 0
+fi
+
+CONSOLE_UID="$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null || true)"
+if [ -z "$CONSOLE_UID" ]; then
+    exit 0
+fi
+
+log "Stopping any existing $AGENT_LABEL for $CONSOLE_USER (uid $CONSOLE_UID), if loaded..."
+/bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl bootout "gui/${CONSOLE_UID}/${AGENT_LABEL}" >/dev/null 2>&1 || true
+
+exit 0

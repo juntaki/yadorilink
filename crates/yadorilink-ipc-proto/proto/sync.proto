@@ -1,0 +1,307 @@
+syntax = "proto3";
+package yadorilink.sync.v1;
+
+// Peer-to-peer sync protocol exchanged directly between devices over a
+// `yadorilink-transport::PeerChannel` (a raw encrypted message channel, not
+// gRPC). Peer sync traffic rides the WireGuard-encrypted PeerChannel. Every
+// message exchanged between two syncing devices is one prost-encoded
+// `SyncMessage`.
+
+message VersionVector {
+  // device_id -> monotonically increasing counter for that device's edits.
+  map<string, uint64> counters = 1;
+}
+
+message BlockInfo {
+  bytes hash = 1; // SHA-256 of block content
+  uint64 offset = 2;
+  uint32 size = 3;
+}
+
+// A decrypted view of one file's block list, addressed the way an untrusted
+// storage peer sees it. Carried *inside*
+// `EncryptedFileEntry.encrypted_file_meta` and never sent unencrypted, so this
+// message only ever appears as plaintext bytes a trusted device produces
+// before AEAD-encrypting them or consumes after AEAD-decrypting them.
+// Deliberately its own small message, not a reuse of `FileInfo`, since it
+// carries only what a storage-only exchange needs: path and each block's
+// *plaintext* hash, in order.
+message PlaintextFileMeta {
+  string path = 1;
+  repeated bytes block_hashes = 2; // plaintext content hash `h`, one per block, in order
+  bool deleted = 3;
+}
+
+// One ciphertext block as an untrusted storage peer sees it: addressed by
+// the hash of the *ciphertext* (never the plaintext hash), with the
+// ciphertext's own size. AEAD adds a fixed-size tag, so this is effectively
+// the same size signal the peer would learn from a plaintext
+// `BlockInfo.size` anyway.
+message CiphertextBlockInfo {
+  bytes ciphertext_hash = 1; // SHA-256 of the AEAD ciphertext
+  uint32 size = 2;
+}
+
+// One file's entry in an `EncryptedIndex`/`EncryptedIndexUpdate`. An
+// untrusted storage peer can see `blocks` (ciphertext hashes/sizes — enough
+// to store, dedup, and serve blocks back) and `deleted`. It cannot see
+// `encrypted_file_meta`, which decrypts only with the group content key `K_g`
+// to a `PlaintextFileMeta` carrying the real path and each block's plaintext
+// hash.
+message EncryptedFileEntry {
+  bytes encrypted_file_meta = 1; // AEAD(K_g, file_meta_nonce, serialized PlaintextFileMeta)
+  bytes file_meta_nonce = 2;
+  repeated CiphertextBlockInfo blocks = 3;
+  // Mirrors `PlaintextFileMeta.deleted` in plaintext alongside the
+  // encrypted form, so an untrusted peer (which cannot decrypt `encrypted_
+  // file_meta`) can still garbage-collect a deleted file's ciphertext
+  // blocks without needing the key — the same "coarse metadata inevitably
+  // leaks" trade-off that already exists for file counts/sizes.
+  bool deleted = 4;
+}
+
+// The kind of filesystem entry `FileInfo` describes, mirroring
+// `yadorilink_sync_core::types::RecordKind`. `RECORD_KIND_UNSPECIFIED` is the
+// proto3 zero-value. A receiver treats it identically to RECORD_KIND_FILE, so
+// an old regular-file record is never retroactively reclassified as a symlink
+// just because this field is absent.
+enum RecordKind {
+  RECORD_KIND_UNSPECIFIED = 0;
+  RECORD_KIND_FILE = 1;
+  RECORD_KIND_DIRECTORY = 2;
+  RECORD_KIND_SYMLINK = 3;
+}
+
+// Negotiated wire compression for selected sync payloads. `COMPRESSION_NONE`
+// is the proto3 zero-value so messages encoded by older peers, or by newer
+// peers that intentionally leave the field unset, decode as uncompressed.
+enum Compression {
+  COMPRESSION_NONE = 0;
+  COMPRESSION_ZSTD = 1;
+}
+
+message FileInfo {
+  string path = 1;
+  uint64 size = 2;
+  int64 mtime_unix_nanos = 3;
+  VersionVector version = 4;
+  repeated BlockInfo blocks = 5;
+  bool deleted = 6;
+  // Symlink-record and exec-bit fidelity fields. Additive (fields 7-10) —
+  // `BlockInfo` and
+  // this message's pre-existing fields 1-6 are unchanged, so an older
+  // peer decoding a message from a newer peer simply ignores these
+  // (standard proto3 forward compatibility), and a newer peer decoding a
+  // message from an older peer sees them at their zero values (see
+  // `RecordKind`'s doc comment above).
+  RecordKind record_kind = 7;
+  // Raw, unresolved symlink target path text. Never dereferenced, synced as
+  // opaque text. Meaningful only when
+  // `record_kind == RECORD_KIND_SYMLINK`; unset/empty otherwise.
+  // `optional` so "not set" is distinguishable from "empty target
+  // string" at the wire level, even though today's receivers treat a
+  // symlink record with no usable target the same way either way (see
+  // `yadorilink_sync_core::peer_session::materialize_symlink_at`).
+  optional string symlink_target = 8;
+  // Set when a symlink's target is absolute or resolves outside the sending
+  // peer's linked-folder root — flagged, never
+  // dereferenced or gated on, so a receiver has the data point even
+  // though no policy currently changes behavior based on it. Meaningless
+  // when `record_kind != RECORD_KIND_SYMLINK`.
+  bool symlink_out_of_root_or_absolute = 9;
+  // The POSIX owner-executable bit captured from the source file. Meaningless
+  // for a symlink (no content) or directory
+  // record. A change to only this bit (content/blocks unchanged) is
+  // intended to propagate as a metadata-only update — see
+  // `yadorilink_sync_core::peer_session::try_apply_metadata_only_update`.
+  bool exec_bit = 10;
+  // fix-multiway-conflict-name-content-mismatch: the device id that
+  // actually produced this record's content — set once at genuine
+  // origination (a real local edit: that device's own id; a freshly
+  // adopted remote version: the sending peer's id) and thereafter
+  // preserved as records are re-materialized (e.g. across chained
+  // pairwise conflict resolution rounds), rather than re-derived from
+  // whichever peer session happens to be doing the processing. Additive
+  // (field 11) — an older peer that doesn't send this falls back to the
+  // previous (occasionally incorrect, for a 3+-way conflict) behavior of
+  // inferring origin from the local peer-session identity; see
+  // `yadorilink_sync_core::peer_session::resolve_and_apply_conflict`'s
+  // doc comment.
+  string origin_device_id = 11;
+}
+
+message ClusterConfig {
+  repeated string folder_group_ids = 1;
+  repeated string known_peer_device_ids = 2;
+  // Compression algorithms this peer can receive on subsequent messages.
+  repeated Compression supported_compression = 3;
+  // whether this peer understands
+  // the ciphertext block-addressing/encrypted-index path at all (as
+  // opposed to: does the coordination plane say this *specific* peer is
+  // storage-only for a *specific* group — that's a separate, per-group
+  // fact learned from the netmap, not negotiated here). An old peer that
+  // predates this field leaves it `false`, exactly like `supported_
+  // compression`'s empty-list default — see `record_peer_encryption_
+  // support`'s doc comment in `peer_session.rs` for why a peer flagged
+  // storage-only that hasn't advertised this is treated as unreachable for
+  // that group rather than falling back to plaintext.
+  bool supports_encrypted_storage_peer = 4;
+  // add-reliable-message-delivery: whether this peer understands the
+  // marker-byte-framed reliable-delivery wire format (`yadorilink_
+  // transport::peer_channel`'s seq/ack DATA and standalone-ACK frames,
+  // distinguished by a leading byte a legacy `SyncMessage` encoding can
+  // never produce — see that module's doc comment). An old peer that
+  // predates this field leaves it `false`, exactly like `supported_
+  // compression`'s empty-list default; this device only starts sending
+  // the new framing to a peer once *both* sides have advertised support
+  // (mirrors `supports_encrypted_storage_peer`'s both-sides-advertise
+  // negotiation) — receiving is always format-agnostic regardless of
+  // negotiation state, so there is no race on which side flips first.
+  bool supports_reliable_delivery = 5;
+  // harden-reliable-delivery-negotiation-on-lossy-link: true once this
+  // device has itself received a `ClusterConfig` from the peer this
+  // message is addressed to. This is a genuine bidirectional-delivery
+  // confirmation, NOT the same thing as "I received something from the
+  // peer" alone: a device that has received from its peer sets this
+  // `true` on every `ClusterConfig` it sends afterward, so the peer can
+  // tell, from this flag, that *its own* earlier advertisement actually
+  // arrived. Receiving from a peer proves nothing about whether that
+  // peer received from *you* — under asymmetric datagram loss (one
+  // direction healthy, the other persistently dropped), a stop condition
+  // based only on "I received something" lets the broken direction's
+  // sender give up immediately, exactly defeating the retry loop this
+  // field supports (see `peer_session.rs`'s `spawn_cluster_config_retry`
+  // and `peer_acked_my_cluster_config`). An old peer that predates this
+  // field always leaves it `false`, so a legacy connection simply retries
+  // its bounded schedule and falls back — no different from today.
+  bool acked_peer_cluster_config = 6;
+}
+
+message Index {
+  string folder_group_id = 1;
+  repeated FileInfo files = 2;
+  Compression compression = 3;
+  // when `compression != COMPRESSION_NONE`,
+  // `files` is left empty and this instead carries the zstd-compressed
+  // encoding of a temporary `Index` submessage whose only meaningful field
+  // is `files` — the byte-carrying container needed to compress the whole
+  // (often highly repetitive) file-path list as one blob, mirroring how
+  // `BlockResponse.data` already carries a block's compressed-or-raw bytes.
+  // Unset/empty, and ignored, when `compression == COMPRESSION_NONE`; an
+  // older peer that doesn't know this field simply never sees it set.
+  bytes compressed_files = 4;
+}
+
+message IndexUpdate {
+  string folder_group_id = 1;
+  repeated FileInfo changed_files = 2;
+  Compression compression = 3;
+  // Same role as `Index.compressed_files`, for `changed_files`.
+  bytes compressed_changed_files = 4;
+}
+
+message BlockRequest {
+  string folder_group_id = 1;
+  string file_path = 2;
+  // for a session where the
+  // *requester* is flagged storage-only for `folder_group_id`, or where
+  // the requester is asking a storage-only peer for a block, this carries
+  // the *ciphertext* hash `H(ct)` instead of the plaintext content hash —
+  // same field, different address space depending on the session's
+  // negotiated/flagged role (see `peer_session.rs`'s `handle_block_
+  // request`/`fetch_block_from_storage_peer`). No wire-format change is
+  // needed for this reinterpretation: a hash is a hash either way, and
+  // which space it's drawn from is entirely a local, per-session fact
+  // never itself transmitted.
+  bytes block_hash = 3;
+}
+
+message BlockResponse {
+  bytes block_hash = 1;
+  // Plaintext bytes for an ordinary trusted-to-trusted exchange; AEAD
+  // ciphertext (see `content_crypto::EncryptedBlock`) when serving a
+  // storage-only peer's request, or when a trusted device is fetching a
+  // block that lives only as ciphertext on a storage-only peer. Which
+  // case applies is, again, a local per-session/per-request fact, not
+  // wire state — see `BlockRequest.block_hash`'s doc comment.
+  bytes data = 2;
+  // Set (with `data` empty) when the responder no longer has this block,
+  // so the requester doesn't hang waiting for a response that never comes.
+  bool not_found = 3;
+  Compression compression = 4;
+  // set (with `data` carrying AEAD
+  // ciphertext) whenever this response's `data` is ciphertext rather than
+  // plaintext-or-compressed-plaintext. `ciphertext_nonce` always carries
+  // the nonce needed to decrypt `data` in this case — always sent
+  // explicitly (even though it's *derivable* from `K_g`+the plaintext hash
+  // under convergent encryption, the relevant behavior) so a receiver never needs to
+  // know, out of band, whether this group uses convergent or random
+  // nonces (the relevant behavior) to decrypt a response; it just reads the nonce that
+  // came with the ciphertext, the same way a plaintext AEAD message
+  // normally works. Unset/empty for every plaintext response, exactly as
+  // today — an old peer that doesn't know these fields never sees them
+  // set and decodes `data` as plaintext exactly as before.
+  bool is_ciphertext = 5;
+  bytes ciphertext_nonce = 6;
+}
+
+// edit-presence-awareness (the relevant behavior): a lightweight, non-versioned signal
+// that the sender has started or stopped editing a file (per Office's own
+// `~$<name>.<ext>` lock-file convention — see `yadorilink-sync-core::presence`).
+// Advisory only: never affects `FileInfo.version` or any index state.
+// Re-sent periodically while still editing (TTL refresh, the relevant behavior); the
+// receiver treats a signal as expired if `ttl_seconds` elapses with no
+// refresh, so a crashed sender's stale "editing" state doesn't linger.
+message PresenceSignal {
+  string folder_group_id = 1;
+  string path = 2;
+  string device_id = 3;
+  bool editing = 4;
+  uint32 ttl_seconds = 5;
+}
+
+// sent instead of `Index` to a
+// peer flagged storage-only for `folder_group_id` — see `EncryptedFileEntry`'s
+// doc comment for exactly what is and isn't visible to that peer.
+message EncryptedIndex {
+  string folder_group_id = 1;
+  repeated EncryptedFileEntry files = 2;
+}
+
+// The incremental counterpart to `EncryptedIndex`, sent instead of
+// `IndexUpdate` to a storage-only peer.
+message EncryptedIndexUpdate {
+  string folder_group_id = 1;
+  repeated EncryptedFileEntry changed_files = 2;
+}
+
+// One wrapped copy of a folder group's content key `K_g`, addressed to one
+// recipient trusted device by X25519 identity public key. Exchanged directly
+// between trusted peers over this same wire protocol. This message type exists
+// only in `sync.proto`, never in `coordination.proto`, and `peer_session.rs`
+// never sends it to a peer flagged storage-only for `folder_group_id`.
+message WrappedGroupKey {
+  string folder_group_id = 1;
+  // the relevant behavior: increments on every rotation, so a recipient that receives
+  // wraps out of order (or a stale retransmit) can tell which is current
+  // without needing to attempt-unwrap every one.
+  uint32 key_epoch = 2;
+  bytes sender_identity_public = 3;
+  bytes ephemeral_public = 4;
+  bytes nonce = 5;
+  bytes ciphertext = 6;
+}
+
+message SyncMessage {
+  oneof payload {
+    ClusterConfig cluster_config = 1;
+    Index full_index = 2;
+    IndexUpdate index_update = 3;
+    BlockRequest block_request = 4;
+    BlockResponse block_response = 5;
+    PresenceSignal presence = 6;
+    EncryptedIndex encrypted_full_index = 7;
+    EncryptedIndexUpdate encrypted_index_update = 8;
+    WrappedGroupKey wrapped_group_key = 9;
+  }
+}

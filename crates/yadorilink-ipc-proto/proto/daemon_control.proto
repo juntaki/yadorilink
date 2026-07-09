@@ -1,0 +1,984 @@
+syntax = "proto3";
+package yadorilink.daemonctl.v1;
+
+// Local control protocol between `yadorilink` (CLI) and `yadorilink-daemon`,
+// framed as length-prefixed protobuf over a Unix domain socket — the same
+// lightweight pattern as the relay (relay.proto) and (eventually) the
+// shell-integration IPC (the local control protocol), rather than gRPC, since this is a
+// low-latency local-only channel.
+
+// one held file's reason and hold timestamp,
+// mirroring `yadorilink_sync_core::index::HeldState` (the local control protocol) —
+// a name-hazard file that was never materialized/overwritten and is
+// still tracked and synced normally to any peer/platform where its name
+// is valid.
+message HeldFile {
+  string path = 1;
+  string reason = 2;
+  int64 held_since_unix_nanos = 3;
+}
+
+message LinkStatus {
+  string local_path = 1;
+  string group_id = 2;
+  bool paused = 3;
+  uint64 pending_changes = 4;
+  uint64 conflict_count = 5;
+  // Materialization policy — "eager" | "ondemand".
+  string materialization_policy = 6;
+  uint64 hydrated_count = 7;
+  uint64 placeholder_count = 8;
+  uint64 hydrating_count = 9;
+  // Edit-presence awareness — how many files in this folder
+  // group are currently reported open (editing) on another device.
+  uint64 open_elsewhere_count = 10;
+  // Chunking policy — "fixed" | "content_defined".
+  string chunking_policy = 11;
+  // count and per-file detail
+  // for files in this link held due to a cross-platform name hazard
+  // (case-fold collision or platform-invalid name) — never materialized
+  // over/instead of the colliding sibling, never auto-renamed, still
+  // participating in normal index exchange and block transfer per D3/4.4.
+  uint64 held_file_count = 12;
+  repeated HeldFile held_files = 13;
+  // count of symlink
+  // records in this link that exist in the index (and sync normally to
+  // other peers) but were never materialized on this device's disk under
+  // the Windows default-skip-with-visible-status policy, i.e.
+  // `record_kind == RECORD_KIND_SYMLINK` entries neither this link's
+  // `windows_symlink_opt_in` nor a non-Windows local platform account
+  // for. Always 0 on a non-Windows daemon, since only the Windows
+  // default-skip policy ever leaves a symlink record unmaterialized.
+  uint64 skipped_symlink_count = 14;
+  // whether this link is currently
+  // in the Degraded (disk-pressure) state, and why — `degraded_reason` is
+  // the triggering `SyncError::DiskPressure`'s message text, empty when
+  // `degraded` is false. Independent of `paused` (the degraded-state rule:
+  // a link can be paused and/or degraded at once; Degraded is transient,
+  // in-memory daemon state, never persisted, and never overrides a user's
+  // explicit pause).
+  bool degraded = 15;
+  string degraded_reason = 16;
+  // Link direction mode -- "send_receive" | "send_only" |
+  // "receive_only" (mirrors `materialization_policy`/`chunking_policy`'s
+  // existing string-enum convention above). Defaults to "send_receive" for
+  // every link created before this field existed.
+  string mode = 17;
+  // Count of paths currently withheld from local application on a
+  // send-only link (divergence tracking — an incoming
+  // change that differs from local, not applied, not conflict-copied).
+  // Always 0 for a non-send-only link.
+  uint64 out_of_sync_count = 18;
+  // Count of paths with an un-sent local modification on a receive-only
+  // link. Always 0 for a non-receive-only link.
+  uint64 receive_only_changed_count = 19;
+  // per-link rollup (sum
+  // across every currently-active transfer for this link) of the same
+  // bytes/blocks-done-vs-total progress each entry in
+  // `StatusResponse.active_transfers` reports individually — a headline
+  // percent without a client needing to filter/sum the per-transfer list
+  // itself. All zero (and `has_active_transfer = false`) when this link
+  // has no active transfer right now, which is the common case and every
+  // pre-existing `LinkStatus` value before this field existed.
+  bool has_active_transfer = 20;
+  uint64 transfer_bytes_done = 21;
+  uint64 transfer_bytes_total = 22;
+  uint64 transfer_blocks_done = 23;
+  uint64 transfer_blocks_total = 24;
+  // Best-effort ETA in seconds (the design: "a simple derived estimate ...
+  // best-effort"); `0` together with `has_active_transfer = true` means
+  // not enough signal yet to estimate one, not "instant."
+  uint64 transfer_eta_seconds = 25;
+}
+
+// one in-flight file transfer's
+// progress — progress accounting: bytes/blocks done vs total,
+// source peer, started-at. Every field is a count, a project-internal
+// device id, or a sync-relative file path already exchanged between the
+// two peers over an authenticated session, matching this file's existing
+// content-blindness posture (the same kind of data `LinkStatus.local_path`/
+// `HeldFile.path` already carry).
+message ActiveTransferProgress {
+  string group_id = 1;
+  string path = 2;
+  uint64 bytes_done = 3;
+  uint64 bytes_total = 4;
+  uint64 blocks_done = 5;
+  uint64 blocks_total = 6;
+  // The most recent peer a block was actually fetched from for this
+  // transfer — a multi-peer dispatch can pull from several candidates, so
+  // this is "most recently active source," not "the only source."
+  string source_peer = 7;
+  int64 started_at_unix = 8;
+}
+
+// one bounded, pre-redacted
+// recent-error record (the recent-error ring buffer) — `category`
+// is a stable, coarse taxonomy slug (e.g. "disk_pressure",
+// "peer_unreachable", "block_integrity"; see
+// `yadorilink_sync_core::SyncError::category`), and `coarse_context` is a
+// short, fixed subsystem tag (e.g. "hydration"). Neither field is ever a
+// raw path, key, token, or peer IP (the redaction requirement).
+message RecentSyncError {
+  string category = 1;
+  int64 timestamp_unix = 2;
+  string coarse_context = 3;
+}
+
+// one volume's free-space
+// classification, shared by `StatusResponse.volumes` below and the
+// per-link `degraded`/preflight checks — `yadorilink_local_storage::
+// free_space::FreeSpaceState`'s `ok`/`low`/`critical`, serialized as its
+// `as_str()` text rather than a proto enum (matches this file's existing
+// convention for other string-typed enums, e.g. `LinkStatus.materialization_policy`).
+message VolumeFreeSpace {
+  // The link-root or block-store-root path this volume is hosting.
+  string path = 1;
+  // "ok" | "low" | "critical".
+  string state = 2;
+  uint64 available_bytes = 3;
+  uint64 headroom_bytes = 4;
+}
+
+message PeerStatus {
+  string device_id = 1;
+  bool connected = 2;
+  // "direct" | "relay" | "disconnected"
+  string path_kind = 3;
+  // set when this peer is flagged
+  // storage-only (ciphertext-only) for the folder group this status entry
+  // is under -- `yadorilink status` renders a badge for it (`cli` spec's
+  // "Status shows ciphertext-only peers"). Additive field 4; `false` for
+  // every peer that predates this change or isn't flagged.
+  bool storage_only = 4;
+}
+
+message LinkRequest {
+  string local_path = 1;
+  string group_id = 2;
+  // On-demand sync — `yadorilink link --on-demand`.
+  bool on_demand = 3;
+  // Automatic-eviction disk-usage cap (design D6); unset/zero means no cap
+  // (manual eviction only). Only meaningful when `on_demand` is set.
+  optional int64 max_local_size_bytes = 4;
+  // Content-defined chunking — `yadorilink link --content-defined-chunking`.
+  bool content_defined_chunking = 5;
+  // Link direction mode/4.3 — `yadorilink link --mode
+  // <mode>`. Empty means "use the default" (`send_receive`), the same
+  // "absent = unchanged default behavior" convention every other optional
+  // link-time setting above already follows.
+  string mode = 6;
+  // Version retention — `yadorilink link --keep-versions
+  // <n>`. Absent means "use the default" (10, design D2) — the same
+  // "absent = unchanged default behavior" convention as `mode` above.
+  optional int64 keep_versions = 7;
+  // Version retention — `yadorilink link --keep-days <t>`.
+  // Absent means "use the default" (30, design D2).
+  optional int64 keep_days = 8;
+  // set when the caller has
+  // already been shown the link preflight's risky-condition warnings and
+  // explicitly acknowledged them (an interactive "y" confirmation, or the
+  // CLI's `--yes` flag). `false` (the default for any pre-existing caller
+  // that doesn't set this field) means "not acknowledged", so the daemon's
+  // own defense-in-depth nested-link check (`control_socket::link`)
+  // rejects a risky request unless this is explicitly `true`.
+  bool acknowledge_risks = 9;
+}
+message LinkResponse {}
+
+message UnlinkRequest {
+  string local_path = 1;
+}
+message UnlinkResponse {}
+
+message ListLinksRequest {}
+message ListLinksResponse {
+  repeated LinkStatus links = 1;
+}
+
+message PauseRequest {
+  string local_path = 1;
+}
+message PauseResponse {}
+
+message ResumeRequest {
+  string local_path = 1;
+}
+message ResumeResponse {}
+
+// Link direction mode: `yadorilink link set-mode <path>
+// <mode>` — changes an existing link's directional mode and triggers the
+// rescan/reconcile `link_manager::set_link_mode_and_reconcile` performs.
+message SetModeRequest {
+  string local_path = 1;
+  // "send_receive" | "send_only" | "receive_only".
+  string mode = 2;
+}
+message SetModeResponse {}
+
+// Link direction mode: `yadorilink override <path>` — only
+// valid on a send-only link; re-asserts local state as authoritative for
+// every out-of-sync path and clears the out-of-sync set.
+message OverrideRequest {
+  string local_path = 1;
+}
+message OverrideResponse {
+  // How many out-of-sync paths were reconciled.
+  uint64 reconciled_count = 1;
+}
+
+// Link direction mode: `yadorilink revert <path>` — only
+// valid on a receive-only link; discards this device's un-sent local
+// changes for every receive-only-changed path and clears that set.
+message RevertRequest {
+  string local_path = 1;
+}
+message RevertResponse {
+  // How many receive-only-changed paths were reverted.
+  uint64 reverted_count = 1;
+}
+
+// one retained version of a file, as
+// returned by `ListVersionsResponse` — mirrors
+// `yadorilink_sync_core::index::VersionRecord`.
+message FileVersionInfo {
+  int64 version_seq = 1;
+  int64 size = 2;
+  int64 mtime_unix_nanos = 3;
+  // "current" | "superseded" | "trashed".
+  string state = 4;
+  // Empty if unknown (a version written before this change existed, or by
+  // a caller that didn't record an origin — see
+  // `SyncState::upsert_file`'s doc comment).
+  string origin_device_id = 5;
+}
+
+// `yadorilink versions <path>` (the version-list command). `absolute_path` (not
+// `local_path` + relative path) matches `HydrateRequest`/`PinRequest`/etc.
+// above — the daemon resolves which link and relative path it falls under
+// via `shell_status::resolve_group_and_rel_path`, the same helper those
+// existing per-file commands already use.
+message ListVersionsRequest {
+  string absolute_path = 1;
+}
+message ListVersionsResponse {
+  // Newest first, including the current version — see
+  // `SyncState::list_versions`'s doc comment.
+  repeated FileVersionInfo versions = 1;
+}
+
+// `yadorilink restore <path> [--version <id>]` (the restore command).
+message RestoreVersionRequest {
+  string absolute_path = 1;
+  // Absent means "restore to the most recent superseded version" (spec
+  // "Restore without a version defaults to the most recent superseded
+  // version").
+  optional int64 version_seq = 2;
+}
+message RestoreVersionResponse {}
+
+// `yadorilink trash list` (the trash command). Takes no path at all — unlike the
+// per-file requests above, this lists across *every* linked folder at
+// once (the same "no scope needed" shape as `ListLinksRequest`/
+// `StatusRequest`), since a deleted file's own path is no longer under
+// any link the caller could resolve it from.
+message ListTrashRequest {}
+
+// One recoverable trashed file, tagged with which link it belongs to
+// (`local_path`) since `ListTrashRequest` spans every link at once —
+// mirrors `yadorilink_sync_core::index::TrashedFile` plus that link
+// context.
+message TrashedFileInfo {
+  string local_path = 1;
+  string path = 2;
+  int64 version_seq = 3;
+  int64 last_known_size = 4;
+  string origin_device_id = 5;
+  int64 deleted_at_unix_nanos = 6;
+}
+message ListTrashResponse {
+  repeated TrashedFileInfo files = 1;
+}
+
+// `yadorilink trash restore <path>` (the trash command). `absolute_path` still
+// resolves correctly even though the file no longer exists on disk —
+// `resolve_group_and_rel_path` only needs the path to fall syntactically
+// under a linked folder's root, not for anything to actually be there.
+message RestoreTrashRequest {
+  string absolute_path = 1;
+}
+message RestoreTrashResponse {}
+
+// `yadorilink link retention <path> --keep-versions <n> --keep-days <t>`
+// (retention policy updates) — adjusts an already-linked folder's retention policy
+// in place, taking effect on the next retention-expiry sweep (design D2)
+// without requiring the folder to be unlinked and relinked. Addressed by
+// `local_path` (a link, not a file), matching `PauseRequest`/
+// `ResumeRequest`'s own by-`local_path` shape.
+message SetRetentionPolicyRequest {
+  string local_path = 1;
+  int64 keep_versions = 2;
+  int64 keep_days = 3;
+}
+message SetRetentionPolicyResponse {}
+
+message StatusRequest {}
+message StatusResponse {
+  repeated LinkStatus links = 1;
+  repeated PeerStatus peers = 2;
+  // configured global rate limits
+  // (bytes/sec, `0` = unlimited) and current measured aggregate transfer
+  // rates, alongside the existing per-folder/per-peer status this message
+  // already reports.
+  uint64 upload_limit_bytes_per_sec = 3;
+  uint64 download_limit_bytes_per_sec = 4;
+  uint64 current_upload_bytes_per_sec = 5;
+  uint64 current_download_bytes_per_sec = 6;
+  // Free-space state for every volume hosting a linked folder or the
+  // block store (the block-store status surface) — one entry per distinct volume path
+  // (the block store root, plus each link's local root).
+  repeated VolumeFreeSpace volumes = 7;
+  // concise update state, embedded
+  // directly in `StatusResponse` (rather than requiring a second round
+  // trip) so `yadorilink status` can render it alongside links/peers per
+  // the `cli` spec's "Status surfaces available update"/"Status surfaces
+  // failed update" scenarios. Mirrors `UpdateStatusResponse` below,
+  // field for field, kept as a flat set of fields here (rather than
+  // nesting that message) so an old CLI parsing a newer daemon's
+  // `StatusResponse` — or vice versa — never has to know about a second
+  // message type just to read `status`. Every field is additive (new
+  // field numbers) and zero-valued/empty for a daemon that predates this
+  // change, decoding as "no update info available" — this file's
+  // existing "absent = unchanged default behavior" convention (e.g.
+  // `LinkStatus.mode`).
+  string update_state = 8;
+  string update_available_version = 9;
+  bool update_mandatory = 10;
+  bool update_waiting_for_safe_point = 11;
+  string update_last_error_category = 12;
+  string update_channel = 13;
+  string update_install_source = 14;
+  string update_holdback_reason = 15;
+  // block-store usage and GC health,
+  // alongside every other status surface above. `block_store_total_bytes`/
+  // `block_store_block_count` are the incrementally-maintained counters
+  // (design D5) — O(1) to report, not a directory walk. `last_gc_unix` is
+  // 0 if a real (non-dry-run) sweep has never completed since this
+  // daemon's block store was created. `gc_reclaimable_estimate_bytes` is
+  // the most recently *computed* mark-and-sweep result: reset to 0
+  // immediately after a real sweep (everything reclaimable at that moment
+  // was just reclaimed), or set to the delete-set size after a
+  // `gc --dry-run` (see `GcResponse`) — it does not reflect blocks
+  // written or superseded since that last computation (disclosed
+  // behavior, matching design D4's dry-run semantics), and is 0 until any
+  // sweep/dry-run has ever run.
+  uint64 block_store_total_bytes = 16;
+  uint64 block_store_block_count = 17;
+  int64 last_gc_unix = 18;
+  uint64 gc_reclaimable_estimate_bytes = 19;
+  // every currently-active
+  // transfer (progress accounting) and the bounded recent-error
+  // feed (the recent-error ring buffer), alongside every other
+  // status surface above. Both empty for a healthy, idle daemon — this
+  // file's existing "additive, empty/zero unless applicable" convention.
+  repeated ActiveTransferProgress active_transfers = 20;
+  repeated RecentSyncError recent_errors = 21;
+  // a daemon-computed rollup of every
+  // field above into one glanceable state, so a UI client (the desktop
+  // status app) never has to re-derive "is anything wrong?" by scanning
+  // every link/volume/peer/error itself and risk drifting from the CLI's
+  // own notion of "healthy" (the aggregate-status design: "Add aggregate status
+  // APIs instead of scraping per-file shell state"). "healthy" | "attention"
+  // | "degraded" (see `control_socket::overall_state` for the precise
+  // precedence rules); a daemon predating this change never sets this
+  // field, decoding as an empty string on an old daemon/new CLI pairing --
+  // callers should treat empty the same as "unknown", not "healthy".
+  string overall_state = 22;
+  // Short, coarse, pre-redacted reason codes behind a non-"healthy"
+  // `overall_state` (e.g. "conflict:<group_id>", "low_disk:<path>",
+  // "peer_disconnected:<device_id>", "recent_error:<category>",
+  // "update_failed:<category>") -- same redaction discipline as
+  // `RecentSyncError.category`/`coarse_context` (never a raw path, key,
+  // token, or IP beyond what's already exposed elsewhere in this message).
+  // Always empty when `overall_state == "healthy"`.
+  repeated string attention_reasons = 23;
+}
+
+// `yadorilink gc [--dry-run]` (block-store GC): triggers
+// an immediate mark-and-sweep pass over this device's block store.
+// `dry_run` computes the identical live-set/delete-set a real sweep would
+// (design D4) and reports it without calling `delete()`; a real
+// (non-`dry_run`) request actually reclaims the space and updates
+// `StatusResponse`'s `last_gc_unix`/usage fields. Fails (surfaced via
+// `DaemonControlResponse.error`) if another sweep -- idle-triggered or a
+// second concurrent on-demand request -- is already running, or if sync
+// activity is currently in progress (never mid-burst, matching the idle
+// scheduler's own invariant).
+message GcRequest {
+  bool dry_run = 1;
+}
+message GcResponse {
+  // Under a real sweep: blocks actually deleted / bytes actually
+  // reclaimed. Under `dry_run`: blocks that *would* be deleted / bytes
+  // that *would* be reclaimed by an immediate real run.
+  uint64 blocks_deleted = 1;
+  uint64 bytes_reclaimed = 2;
+}
+
+message ShutdownRequest {}
+message ShutdownResponse {}
+
+// on-demand-sync design D4/D6: manual hydrate/pin/unpin/evict, issued by
+// the CLI over this same control socket (distinct from the shell
+// extension's synchronous OS-callback-driven hydration path in
+// shellipc.proto, which shares the same daemon-side implementation). Takes
+// an absolute local path, like the shell-IPC protocol does — the daemon
+// resolves it to a (group_id, relative path) pair against its registered
+// links, the same way it already does for shell-IPC status queries, so the
+// CLI user never needs to know a group's internal id.
+message HydrateRequest {
+  string absolute_path = 1;
+}
+message HydrateResponse {}
+
+message PinRequest {
+  string absolute_path = 1;
+}
+message PinResponse {}
+
+message UnpinRequest {
+  string absolute_path = 1;
+}
+message UnpinResponse {}
+
+message EvictRequest {
+  string absolute_path = 1;
+}
+message EvictResponse {}
+
+// daemon-reliability reliability hardening: a lightweight liveness/health surface,
+// separate from `StatusResponse` (which is about *sync* status —
+// links/peers/conflicts) so a monitoring script can poll just this and
+// get a cheap, stable-shaped answer even while links/peers churn.
+message TaskLiveness {
+  // e.g. "control-socket", "shell-ipc-server", "peer-orchestrator" —
+  // matches the essential-task names `main.rs`'s supervision JoinSet
+  // (reliability hardening) uses for its own logging, so the two are easy to cross-reference.
+  string name = 1;
+  bool alive = 2;
+}
+
+message HealthRequest {}
+message HealthResponse {
+  // Liveness of every essential task `main.rs` supervises together
+  // (reliability hardening): if any of these is `false`, the daemon is about to exit
+  // non-zero for a process supervisor to restart it.
+  repeated TaskLiveness tasks = 1;
+  // Best-effort: approximated from whether any peer session is currently
+  // connected, since the relay hub's own connection state isn't
+  // currently threaded through from `peer_orchestrator`/`yadorilink-transport`
+  // into `DaemonState` — see `control_socket.rs`'s health handler for
+  // details on this approximation.
+  bool relay_connected = 2;
+  uint32 connected_peer_count = 3;
+  // Sum of `LinkStatus.pending_changes` (reliability hardening) across every link.
+  uint64 pending_changes = 4;
+}
+
+// CLI <-> daemon reporting
+// surface, layered onto this same control protocol rather than a new one
+// — reporting is local-only (the local-only reporting design) and this socket is already the
+// CLI's one channel to daemon-owned state. Every one of these messages
+// carries a `ReportEnvelope`/`ConsentState` serialized as JSON text
+// (`report_json`/consent fields mirrored 1:1) rather than being modeled
+// field-by-field in protobuf: `yadorilink-reporting`'s schema is already
+// versioned/validated JSON (`ReportEnvelope::to_json`/`validate`), so
+// round-tripping it as an opaque string here means this proto file never
+// has to be kept in sync with that crate's payload shape, and the CLI's
+// `--preview`/`--export` output is byte-for-byte what a maintainer
+// endpoint would receive (the reporting preview contract's "preview must show the exact
+// payload").
+
+message ReportingConsentState {
+  bool usage_submission_enabled = 1;
+  bool error_submission_enabled = 2;
+  bool prompt_to_report_enabled = 3;
+  bool queue_retry_enabled = 4;
+  optional string anonymous_reporter_id = 5;
+  optional string endpoint_override = 6;
+}
+
+message ReportingStatusRequest {}
+message ReportingStatusResponse {
+  ReportingConsentState consent = 1;
+  uint32 queue_count = 2;
+  uint32 error_candidate_count = 3;
+}
+
+message GenerateUsageReportRequest {}
+message GenerateUsageReportResponse {
+  // A validated `ReportEnvelope` (schema.rs), exactly as it would be
+  // submitted/exported — see module doc comment above.
+  string report_json = 1;
+}
+
+// Absent `report_id` means "the most recently created candidate" (`yadorilink
+// report error --last`); present means a specific candidate (`--id
+// <report-id>`).
+message GenerateLastErrorReportRequest {
+  optional string report_id = 1;
+}
+message RedactionCategoryCount {
+  string category = 1;
+  uint32 count = 2;
+}
+message GenerateLastErrorReportResponse {
+  string report_id = 1;
+  string report_json = 2;
+  // The redaction summary captured when this candidate was created
+  // (the reporting preview contract) — not recomputed at preview time, since the stored
+  // payload is already redacted and re-redacting it would trivially find
+  // nothing (redaction is idempotent).
+  repeated RedactionCategoryCount redaction_summary = 3;
+}
+
+message ListQueueItemsRequest {}
+message QueueItem {
+  string report_id = 1;
+  string report_type = 2;
+  string queued_at = 3;
+  uint64 size_bytes = 4;
+  uint32 submit_attempts = 5;
+}
+message ListQueueItemsResponse {
+  repeated QueueItem items = 1;
+}
+
+message ShowQueueItemRequest {
+  string report_id = 1;
+}
+message ShowQueueItemResponse {
+  string report_json = 1;
+}
+
+message DeleteQueueItemRequest {
+  string report_id = 1;
+}
+message DeleteQueueItemResponse {
+  bool deleted = 1;
+}
+
+message FlushQueueRequest {}
+message FlushQueueResponse {
+  uint32 removed_count = 1;
+}
+
+// Submits a report envelope the caller already generated/previewed
+// (`report_json`, typically fed straight back from a `GenerateUsageReport`/
+// `GenerateLastErrorReport` call) — validated again server-side
+// (`ReportEnvelope::validate`) before anything is sent. Consent is
+// re-checked here regardless of what the caller believes: usage reports
+// require `usage_submission_enabled`, error reports require
+// `error_submission_enabled`.
+message SubmitReportRequest {
+  string report_json = 1;
+}
+message SubmitReportResponse {
+  string receipt_id = 1;
+  string submitted_at = 2;
+  // Set when submission failed but the report was queued for a later
+  // automatic retry (the retry policy: only when `queue_retry_enabled`);
+  // `receipt_id`/`submitted_at` are empty in that case.
+  bool queued_for_retry = 3;
+}
+
+enum ConsentAction {
+  CONSENT_ACTION_UNSPECIFIED = 0;
+  ENABLE_USAGE = 1;
+  ENABLE_ERROR = 2;
+  DISABLE_ALL = 3;
+  RESET_ID = 4;
+  SET_PROMPT = 5;
+  SET_QUEUE_RETRY = 6;
+  SET_ENDPOINT = 7;
+}
+message UpdateConsentRequest {
+  ConsentAction action = 1;
+  // SET_PROMPT / SET_QUEUE_RETRY.
+  optional bool bool_value = 2;
+  // SET_ENDPOINT: absent/empty clears the override back to the built-in
+  // default (none, unless a fork configures one at build time).
+  optional string string_value = 3;
+}
+message UpdateConsentResponse {
+  ReportingConsentState consent = 1;
+}
+
+// `yadorilink limits set --up
+// <RATE> --down <RATE>` — persists both rates (bytes/sec, `0` = unlimited)
+// to daemon config and applies them to the running daemon's shared rate
+// limiters without a restart (the live rate-limit update path).
+message LimitsSetRequest {
+  uint64 upload_bytes_per_sec = 1;
+  uint64 download_bytes_per_sec = 2;
+}
+message LimitsSetResponse {
+  // The values now in effect, echoed back so the CLI can report exactly
+  // what was applied without a second round trip.
+  uint64 upload_bytes_per_sec = 1;
+  uint64 download_bytes_per_sec = 2;
+}
+
+// `yadorilink limits show` — the currently configured (not measured)
+// rates.
+message LimitsShowRequest {}
+message LimitsShowResponse {
+  uint64 upload_bytes_per_sec = 1;
+  uint64 download_bytes_per_sec = 2;
+}
+
+// CLI <-> daemon surface for
+// signed-update discovery/verification/install orchestration (the design
+// "Daemon-Orchestrated Checks, Installer-Owned Replacement" — the daemon
+// owns manifest checks, download, and verification; these messages let
+// the CLI trigger a manual check/install and read status, mirroring the
+// `Reporting*`/`Limits*` request-response pairs above). `channel` and
+// `install_source` are plain strings (not proto enums), matching this
+// file's existing convention for string-typed enums elsewhere
+// (`LinkStatus.materialization_policy`, `VolumeFreeSpace.state`, ...):
+// "stable" | "beta" | "nightly" for channel; "standalone" |
+// "microsoft_store" for install_source on Windows, "standalone" on macOS.
+// `state` is likewise a string — "idle" | "checking" | "available" |
+// "downloading" | "downloaded" | "verified" | "installing" | "failed" |
+// "deferred" | "up_to_date" | "held_back" — mirroring the update-attempt states.
+message UpdateStatusRequest {}
+message UpdateStatusResponse {
+  string current_version = 1;
+  string channel = 2;
+  string install_source = 3;
+  // Unix seconds; 0 means "never checked".
+  int64 last_check_unix = 4;
+  string state = 5;
+  string available_version = 6;
+  string release_notes_url = 7;
+  bool mandatory = 8;
+  // Set (non-empty) when the update is being withheld by staged rollout
+  // or a manifest kill-switch entry — the design "Rollout holdback
+  // prevents install" / kill-switch scenarios.
+  string holdback_reason = 9;
+  bool waiting_for_safe_point = 10;
+  // Empty when there is no recorded failure. A short, stable category
+  // (never the raw error text) — mirrors `CliError::report_category`'s
+  // "coarse, stable category label" convention.
+  string last_error_category = 11;
+  string last_error_message = 12;
+  bool automatic_checks_enabled = 13;
+  // "automatic" | "manual".
+  string automatic_install_mode = 14;
+}
+
+// `yadorilink update check` (manual update checks): triggers an immediate manifest
+// check regardless of `automatic_checks_enabled` (spec "Automatic checks
+// disabled... still allows a user-initiated manual check").
+message UpdateCheckRequest {}
+message UpdateCheckResponse {
+  // Reuses `UpdateStatusResponse`'s exact shape so the CLI can render the
+  // outcome of a manual check with the same formatting code `update
+  // status` uses, without a second round trip.
+  UpdateStatusResponse status = 1;
+}
+
+// `yadorilink update install` (manual update installs): requests installation of a
+// verified, applicable update. Fails with a clear error (surfaced via
+// `DaemonControlResponse.error`) if no verified update is available yet;
+// otherwise either installs immediately (if at a safe point) or reports
+// that installation is deferred until one, or reports the platform's
+// manual-handoff requirement (e.g. Microsoft-Store-managed installs).
+message UpdateInstallRequest {}
+message UpdateInstallResponse {
+  // "installing" | "deferred" | "store_managed" | "manual_handoff_required".
+  string outcome = 1;
+  // Non-empty only for "manual_handoff_required" — platform-specific
+  // guidance text (e.g. pointing at the Microsoft Store update flow).
+  string guidance = 2;
+}
+
+// `yadorilink update config --checks <on|off> --install <automatic|manual>`
+// (update configuration). Absent (`None`) means "leave this setting unchanged" — the
+// same "absent = no change" discipline `SetRetentionPolicyRequest`'s
+// sibling commands use for optional fields, but expressed here as two
+// independent optional booleans/strings so a single call can change
+// either, both, or neither setting.
+message UpdateConfigRequest {
+  optional bool automatic_checks_enabled = 1;
+  // "automatic" | "manual".
+  optional string automatic_install_mode = 2;
+}
+message UpdateConfigResponse {
+  bool automatic_checks_enabled = 1;
+  string automatic_install_mode = 2;
+}
+
+// add-advanced-sync-operations section 2 (Folder Operations): divergence
+// summaries, dry-run resolution previews, and confirmation-gated
+// override/revert/mode-change actions for directional links — see
+// `yadorilink-daemon::folder_ops` for the daemon-side implementation this
+// wraps. `action` is a plain string ("override" | "revert" |
+// "mode_change"), matching this file's existing convention for
+// string-typed enums (`LinkStatus.materialization_policy`, ...).
+// `target_mode` is only meaningful for "mode_change" — "send_receive" |
+// "send_only" | "receive_only", matching `LinkStatus`'s own mode strings.
+message FolderDivergenceSummaryRequest {
+  string local_path = 1;
+}
+message FolderDivergenceSummaryResponse {
+  string local_path = 1;
+  string group_id = 2;
+  string mode = 3;
+  bool paused = 4;
+  uint64 out_of_sync_count = 5;
+  // Bounded sample, not the full set — see `folder_ops::AFFECTED_PATHS_SAMPLE_LIMIT`.
+  repeated string out_of_sync_sample = 6;
+  uint64 receive_only_changed_count = 7;
+  repeated string receive_only_changed_sample = 8;
+}
+
+message FolderResolutionPreviewRequest {
+  string local_path = 1;
+  string action = 2;
+  string target_mode = 3;
+}
+message FolderResolutionPreviewResponse {
+  string preview_id = 1;
+  string local_path = 2;
+  string action = 3;
+  string target_mode = 4;
+  uint64 affected_count = 5;
+  repeated string affected_paths_sample = 6;
+  int64 created_at_unix_nanos = 7;
+}
+
+// Confirms (or rejects as stale) the action named by a prior
+// `FolderResolutionPreviewResponse.preview_id` — see
+// `folder_ops::confirm_resolution`'s doc comment for the staleness check.
+// A stale/unknown/expired `preview_id` surfaces as
+// `DaemonControlResponse.error`, not a distinct response variant here.
+message FolderResolutionConfirmRequest {
+  string preview_id = 1;
+}
+message FolderResolutionConfirmResponse {
+  uint64 affected_count = 1;
+}
+
+// Empty `local_path` lists every link's recent audit entries.
+message ListFolderOperationAuditRequest {
+  string local_path = 1;
+}
+message FolderOperationAuditEntry {
+  string local_path = 1;
+  string action = 2;
+  string target_mode = 3;
+  uint64 affected_count = 4;
+  int64 resolved_at_unix_nanos = 5;
+}
+message ListFolderOperationAuditResponse {
+  repeated FolderOperationAuditEntry entries = 1;
+}
+
+// a
+// bounded recent-connection-attempt history and a connectivity-doctor
+// summary — see `yadorilink-daemon::connection_trace`. Every field is a
+// structured category or project-internal identifier, deliberately never
+// a raw socket address/hostname (the aggregate-status design).
+message ConnectionAttemptTrace {
+  string peer_device_id = 1;
+  string candidate_source = 2;
+  string address_class = 3;
+  string outcome = 4;
+  uint64 latency_ms = 5;
+  string failure_category = 6;
+  bool selected = 7;
+  string relay_identity = 8;
+  string authorization_decision = 9;
+  int64 recorded_at_unix_nanos = 10;
+}
+// Empty `peer_device_id` lists every peer's recent traces.
+message ListConnectionTracesRequest {
+  string peer_device_id = 1;
+}
+message ListConnectionTracesResponse {
+  repeated ConnectionAttemptTrace traces = 1;
+}
+
+message ConnectivityDoctorRequest {}
+message ConnectivityDoctorCategory {
+  string name = 1;
+  // "ok" | "warn" | "error".
+  string status = 2;
+  string detail = 3;
+}
+message ConnectivityDoctorResponse {
+  repeated ConnectivityDoctorCategory categories = 1;
+}
+
+// daemon-assembled diagnostics
+// support bundle -- `yadorilink diagnose preview`/`export` prefer this
+// real daemon-backed bundle whenever the daemon is reachable, falling
+// back to a limited CLI-only bundle
+// (`yadorilink-cli::commands::diagnose::limited_bundle`) only when it
+// isn't. Preview and Export request the exact same daemon-side assembly
+// (`yadorilink-daemon::diagnostics_ipc::build_bundle`) -- they differ
+// only in what the CLI does with the result afterward (print vs write to
+// a file) -- so both share one response shape; kept as two distinct
+// request messages purely to mirror this file's existing per-subcommand
+// Request/Response pairing convention (e.g. `UpdateStatusRequest`/
+// `UpdateCheckRequest` above).
+message DiagnosticsPreviewRequest {}
+message DiagnosticsExportRequest {}
+message DiagnosticsBundleResponse {
+  // The fully-assembled, already-redacted bundle, serialized as JSON text
+  // -- mirrors `GenerateUsageReportResponse.report_json`'s "opaque
+  // versioned JSON payload" convention (see this file's reporting section
+  // above) rather than modeling the bundle schema field-by-field in
+  // protobuf, since diagnostics bundle payloads use their own JSON schema.
+  string bundle_json = 1;
+  repeated RedactionCategoryCount redaction_summary = 2;
+  // "daemon" | "daemon-partial" -- "daemon-partial" means bundle
+  // generation hit its bounded time budget (or a sub-collection task
+  // panicked) before finishing, so the returned bundle is a minimal
+  // fallback rather than a fully populated one; the control socket still
+  // answers promptly either way, never hanging the connection.
+  string collection_mode = 3;
+}
+
+message DaemonControlRequest {
+  oneof payload {
+    LinkRequest link = 1;
+    UnlinkRequest unlink = 2;
+    ListLinksRequest list_links = 3;
+    PauseRequest pause = 4;
+    ResumeRequest resume = 5;
+    StatusRequest status = 6;
+    ShutdownRequest shutdown = 7;
+    HydrateRequest hydrate = 8;
+    PinRequest pin = 9;
+    UnpinRequest unpin = 10;
+    EvictRequest evict = 11;
+    HealthRequest health = 12;
+    ReportingStatusRequest reporting_status = 13;
+    GenerateUsageReportRequest generate_usage_report = 14;
+    GenerateLastErrorReportRequest generate_last_error_report = 15;
+    ListQueueItemsRequest list_queue_items = 16;
+    ShowQueueItemRequest show_queue_item = 17;
+    DeleteQueueItemRequest delete_queue_item = 18;
+    FlushQueueRequest flush_queue = 19;
+    SubmitReportRequest submit_report = 20;
+    UpdateConsentRequest update_consent = 21;
+    LimitsSetRequest limits_set = 22;
+    LimitsShowRequest limits_show = 23;
+    // Link direction mode.
+    SetModeRequest set_mode = 24;
+    OverrideRequest override = 25;
+    RevertRequest revert = 26;
+    // .
+    ListVersionsRequest list_versions = 27;
+    RestoreVersionRequest restore_version = 28;
+    ListTrashRequest list_trash = 29;
+    RestoreTrashRequest restore_trash = 30;
+    SetRetentionPolicyRequest set_retention_policy = 31;
+    // Automatic updates.
+    UpdateStatusRequest update_status = 32;
+    UpdateCheckRequest update_check = 33;
+    UpdateInstallRequest update_install = 34;
+    UpdateConfigRequest update_config = 35;
+    // add-advanced-sync-operations sections 2/4.
+    FolderDivergenceSummaryRequest folder_divergence_summary = 40;
+    FolderResolutionPreviewRequest folder_resolution_preview = 41;
+    FolderResolutionConfirmRequest folder_resolution_confirm = 42;
+    ListFolderOperationAuditRequest list_folder_operation_audit = 43;
+    ListConnectionTracesRequest list_connection_traces = 44;
+    ConnectivityDoctorRequest connectivity_doctor = 45;
+    // Diagnostics support bundle.
+    DiagnosticsPreviewRequest diagnostics_preview = 46;
+    DiagnosticsExportRequest diagnostics_export = 47;
+    // Block-store GC.
+    GcRequest gc = 48;
+  }
+  // the CLI's own control-
+  // protocol version, always set by every current CLI build. A field
+  // number far outside the `oneof`'s own growth range (deliberately, so
+  // it never collides with a new request variant landing concurrently)
+  // and a plain top-level field, not part of the oneof — it accompanies
+  // *every* request regardless of which variant is set. Absent (decodes
+  // as 0) on any request built by a CLI that predates this field, which a
+  // current daemon must treat as "an old, pre-versioning client" rather
+  // than an error (spec "Old CLI talks to newer daemon": the daemon
+  // handles the request using backward-compatible defaults) — 0 is never
+  // itself invalid.
+  uint32 protocol_version = 900;
+}
+
+message DaemonControlResponse {
+  oneof payload {
+    LinkResponse link = 1;
+    UnlinkResponse unlink = 2;
+    ListLinksResponse list_links = 3;
+    PauseResponse pause = 4;
+    ResumeResponse resume = 5;
+    StatusResponse status = 6;
+    ShutdownResponse shutdown = 7;
+    HydrateResponse hydrate = 8;
+    PinResponse pin = 9;
+    UnpinResponse unpin = 10;
+    EvictResponse evict = 11;
+    string error = 12;
+    HealthResponse health = 13;
+    ReportingStatusResponse reporting_status = 14;
+    GenerateUsageReportResponse generate_usage_report = 15;
+    GenerateLastErrorReportResponse generate_last_error_report = 16;
+    ListQueueItemsResponse list_queue_items = 17;
+    ShowQueueItemResponse show_queue_item = 18;
+    DeleteQueueItemResponse delete_queue_item = 19;
+    FlushQueueResponse flush_queue = 20;
+    SubmitReportResponse submit_report = 21;
+    UpdateConsentResponse update_consent = 22;
+    LimitsSetResponse limits_set = 23;
+    LimitsShowResponse limits_show = 24;
+    // Link direction mode.
+    SetModeResponse set_mode = 25;
+    OverrideResponse override = 26;
+    RevertResponse revert = 27;
+    // .
+    ListVersionsResponse list_versions = 28;
+    RestoreVersionResponse restore_version = 29;
+    ListTrashResponse list_trash = 30;
+    RestoreTrashResponse restore_trash = 31;
+    SetRetentionPolicyResponse set_retention_policy = 32;
+    // Automatic updates.
+    UpdateStatusResponse update_status = 33;
+    UpdateCheckResponse update_check = 34;
+    UpdateInstallResponse update_install = 35;
+    UpdateConfigResponse update_config = 36;
+    // add-advanced-sync-operations sections 2/4.
+    FolderDivergenceSummaryResponse folder_divergence_summary = 40;
+    FolderResolutionPreviewResponse folder_resolution_preview = 41;
+    FolderResolutionConfirmResponse folder_resolution_confirm = 42;
+    ListFolderOperationAuditResponse list_folder_operation_audit = 43;
+    ListConnectionTracesResponse list_connection_traces = 44;
+    ConnectivityDoctorResponse connectivity_doctor = 45;
+    // Diagnostics support bundle.
+    DiagnosticsBundleResponse diagnostics_preview = 46;
+    DiagnosticsBundleResponse diagnostics_export = 47;
+    // Block-store GC.
+    GcResponse gc = 48;
+  }
+  // mirrors
+  // `DaemonControlRequest.protocol_version` above — always set by every
+  // current daemon build, on every response regardless of payload variant.
+  // Decodes as 0 on a response from a daemon that predates this field,
+  // which the CLI treats as "an old, pre-versioning daemon" (spec "New CLI
+  // talks to older supported daemon": report that the daemon must be
+  // upgraded, rather than surfacing an ambiguous protocol error), not as a
+  // literal version number 0.
+  uint32 daemon_protocol_version = 901;
+}

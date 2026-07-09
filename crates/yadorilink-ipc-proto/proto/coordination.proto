@@ -1,0 +1,418 @@
+syntax = "proto3";
+package yadorilink.coordination.v1;
+
+// Auth: account registration/login against the coordination plane.
+// Per user-auth spec: SHALL NOT ever carry file content or file metadata.
+service AuthService {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Login(LoginRequest) returns (LoginResponse);
+  rpc RefreshToken(RefreshTokenRequest) returns (RefreshTokenResponse);
+  rpc Logout(LogoutRequest) returns (LogoutResponse);
+  // add-account-recovery: one-time recovery codes and recovery-code-based
+  // password reset. Per the zero-knowledge design, the coordination plane
+  // only ever sees/stores code *hashes* here -- never the plaintext key
+  // bundle or its passphrase (those never leave the CLI; see
+  // yadorilink-cli's export-key-bundle/import-key-bundle commands, which
+  // have no coordination-plane RPC at all).
+  rpc GenerateRecoveryCodes(GenerateRecoveryCodesRequest) returns (GenerateRecoveryCodesResponse);
+  rpc ResetPassword(ResetPasswordRequest) returns (ResetPasswordResponse);
+}
+
+message RegisterRequest {
+  string email = 1;
+  string password = 2;
+}
+
+message RegisterResponse {
+  string user_id = 1;
+}
+
+message LoginRequest {
+  string email = 1;
+  string password = 2;
+}
+
+message LoginResponse {
+  string access_token = 1;
+  string refresh_token = 2;
+  int64 access_token_expires_at_unix = 3;
+}
+
+message RefreshTokenRequest {
+  string refresh_token = 1;
+}
+
+message RefreshTokenResponse {
+  string access_token = 1;
+  int64 access_token_expires_at_unix = 2;
+}
+
+message LogoutRequest {
+  string refresh_token = 1;
+}
+
+message LogoutResponse {}
+
+// Caller must be authenticated (bearer access token). This generates a fresh
+// set of one-time codes for the calling account and immediately invalidates
+// any codes issued previously.
+message GenerateRecoveryCodesRequest {}
+
+message GenerateRecoveryCodesResponse {
+  // Plaintext codes, returned exactly once. The coordination plane stores only
+  // a hash of each code, never this plaintext value.
+  repeated string recovery_codes = 1;
+}
+
+// Unauthenticated by design: the caller has, by definition, lost the ability
+// to log in. Consumes one recovery code to set a new password. Rate-limited
+// and enumeration-safe the same way Login is.
+message ResetPasswordRequest {
+  string email = 1;
+  string recovery_code = 2;
+  string new_password = 3;
+}
+
+message ResetPasswordResponse {}
+
+// Device registry: per coordination-plane spec, devices are identified by a
+// WireGuard public key, never by file content they hold.
+service DeviceService {
+  rpc RegisterDevice(RegisterDeviceRequest) returns (RegisterDeviceResponse);
+  rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
+  rpc RemoveDevice(RemoveDeviceRequest) returns (RemoveDeviceResponse);
+  rpc ReportEndpoint(ReportEndpointRequest) returns (ReportEndpointResponse);
+}
+
+message RegisterDeviceRequest {
+  string device_name = 1;
+  bytes wireguard_public_key = 2;
+}
+
+message RegisterDeviceResponse {
+  string device_id = 1;
+}
+
+message ListDevicesRequest {}
+
+message DeviceInfo {
+  string device_id = 1;
+  string device_name = 2;
+  bytes wireguard_public_key = 3;
+  bool online = 4;
+  int64 last_seen_unix = 5;
+}
+
+message ListDevicesResponse {
+  repeated DeviceInfo devices = 1;
+}
+
+message RemoveDeviceRequest {
+  string device_id = 1;
+}
+
+message RemoveDeviceResponse {}
+
+message EndpointCandidate {
+  string address = 1; // ip:port
+  int32 priority = 2;
+}
+
+message ReportEndpointRequest {
+  string device_id = 1;
+  repeated EndpointCandidate candidates = 2;
+}
+
+message ReportEndpointResponse {}
+
+// Folder groups + ACLs: which devices may sync which folder group.
+service ShareService {
+  rpc CreateFolderGroup(CreateFolderGroupRequest) returns (CreateFolderGroupResponse);
+  rpc GrantAccess(GrantAccessRequest) returns (GrantAccessResponse);
+  rpc RevokeAccess(RevokeAccessRequest) returns (RevokeAccessResponse);
+  rpc ListFolderGroups(ListFolderGroupsRequest) returns (ListFolderGroupsResponse);
+  // flags (or unflags) a device
+  // already granted access to a group as storage-only/untrusted for that
+  // group. A separate RPC rather than a new `GrantAccess` parameter --
+  // added as a new method on the existing service, the same additive
+  // pattern `ReportEndpoint` used on `DeviceService` -- so it composes
+  // with an existing grant instead of requiring a fresh one, and so
+  // toggling it later (e.g. un-flagging) doesn't need a revoke+re-grant
+  // round trip. The plane persists only the bool (`acl.storage_only`);
+  // it has no field anywhere in this file for the group content key.
+  rpc SetStorageOnly(SetStorageOnlyRequest) returns (SetStorageOnlyResponse);
+}
+
+message CreateFolderGroupRequest {
+  string name = 1;
+}
+
+message CreateFolderGroupResponse {
+  string group_id = 1;
+}
+
+message GrantAccessRequest {
+  string group_id = 1;
+  string device_id = 2;
+}
+
+message GrantAccessResponse {}
+
+message RevokeAccessRequest {
+  string group_id = 1;
+  string device_id = 2;
+}
+
+message RevokeAccessResponse {}
+
+message SetStorageOnlyRequest {
+  string group_id = 1;
+  string device_id = 2;
+  bool storage_only = 3;
+}
+
+message SetStorageOnlyResponse {}
+
+message ListFolderGroupsRequest {}
+
+message FolderGroupInfo {
+  string group_id = 1;
+  string name = 2;
+  repeated string authorized_device_ids = 3;
+  // which of `authorized_device_ids`
+  // are flagged storage-only for this group, keyed by device_id -- lets
+  // `yadorilink status`/`share list` mark ciphertext-only peers without a
+  // second round trip. Additive (field 4); an older client simply doesn't
+  // render the badge.
+  map<string, bool> storage_only_device_ids = 4;
+}
+
+message ListFolderGroupsResponse {
+  repeated FolderGroupInfo groups = 1;
+}
+
+// Netmap distribution: streamed peer/key/endpoint updates. Never carries
+// file content or file names (per coordination-plane spec).
+service NetmapService {
+  rpc StreamNetmap(StreamNetmapRequest) returns (stream NetmapUpdate);
+}
+
+message StreamNetmapRequest {
+  string device_id = 1;
+}
+
+message PeerInfo {
+  string device_id = 1;
+  bytes wireguard_public_key = 2;
+  repeated EndpointCandidate endpoints = 3;
+  repeated string shared_group_ids = 4;
+  // add-cross-account-sharing D4: the role (read/write) this peer holds
+  // for each entry in `shared_group_ids`, keyed by group_id -- i.e. the
+  // role the *local* device granted the peer for that group (per D4's
+  // "sharer's device refuses writes" model; not necessarily symmetric
+  // with what the peer granted the local device back). Added purely
+  // additively (new field number 5) after the rest of this message and
+  // `NetmapUpdate` were already shipped, so an older peer/binary that
+  // doesn't know this field simply doesn't see per-group roles and
+  // continues to treat every shared group as full read-write, exactly
+  // its pre-existing behavior -- role *enforcement* is a peer-side
+  // addition (`yadorilink-sync-core::peer_session`), not something this
+  // field being absent/ignored can break wire compatibility over. A
+  // group_id missing from this map (e.g. from an older sender that
+  // predates this field) is treated by consumers as role
+  // SHARE_ROLE_WRITE, matching the `acl.role` column's own default (D3).
+  map<string, ShareRole> shared_group_roles = 5;
+  // whether *this* peer is flagged
+  // storage-only (untrusted) for each entry in `shared_group_ids`, keyed
+  // by group_id -- mirrors `shared_group_roles`'s exact shape/rationale
+  // (field 6, added purely additively after `shared_group_roles` (field
+  // 5) was already shipped, so an older peer/binary that doesn't know
+  // this field simply doesn't see storage-only flags and continues to
+  // treat every peer as a normal trusted peer, exactly its pre-existing
+  // behavior). The coordination plane stores and distributes only this
+  // bool -- see `coordination-plane` spec's "Storage-Only Device Flag" --
+  // never the group content key, which this proto file (peer-facing but
+  // coordination-served) never has a field for at all. A group_id missing
+  // from this map (e.g. from an older sender, or simply never marked) is
+  // treated by consumers as `false` (trusted), matching `shared_group_
+  // roles`'s own missing-key default rationale.
+  map<string, bool> storage_only_group_ids = 6;
+}
+
+message NetmapUpdate {
+  bool is_full_update = 1;
+  repeated PeerInfo peers = 2;
+  repeated string removed_peer_device_ids = 3;
+}
+
+// Cross-account folder-group sharing: an invite/accept handshake plus a
+// read/write role on ACL edges. Every message below carries only
+// account/device/group/role/expiry references — never file names or file
+// content. Appended as a separate service rather than extending
+// `ShareService` above to keep this addition purely additive.
+service ShareInviteService {
+  // Mints a one-time, expiring invite scoped to (group, role). Only the
+  // group owner may call this. Returns the plaintext code once; the plane
+  // persists only a hash of it.
+  rpc CreateShareInvite(CreateShareInviteRequest) returns (CreateShareInviteResponse);
+  // Redeems an invite code under the caller's own account, creating a
+  // cross-account ACL edge for `device_id` (which must belong to the
+  // caller) and consuming the invite.
+  rpc AcceptShareInvite(AcceptShareInviteRequest) returns (AcceptShareInviteResponse);
+  // Lists every ACL edge visible to the caller: edges for groups they own,
+  // and edges for their own devices (including cross-account edges where
+  // another account's group was shared to them).
+  rpc ListShares(ListSharesRequest) returns (ListSharesResponse);
+  // Removes one ACL edge by id. Callable by the group owner or by the
+  // account that owns the edge's device. Composes with the
+  // enforce-live-device-revocation push/teardown path rather than
+  // re-implementing it.
+  rpc RevokeShareEdge(RevokeShareEdgeRequest) returns (RevokeShareEdgeResponse);
+}
+
+enum ShareRole {
+  SHARE_ROLE_UNSPECIFIED = 0;
+  SHARE_ROLE_READ = 1;
+  SHARE_ROLE_WRITE = 2;
+}
+
+message CreateShareInviteRequest {
+  string group_id = 1;
+  ShareRole role = 2;
+  int64 expires_at_unix = 3;
+}
+
+message CreateShareInviteResponse {
+  string invite_id = 1;
+  // Plaintext one-time code; returned only here, never again (D1).
+  string code = 2;
+  int64 expires_at_unix = 3;
+}
+
+message AcceptShareInviteRequest {
+  string code = 1;
+  string device_id = 2;
+}
+
+message AcceptShareInviteResponse {
+  string group_id = 1;
+  ShareRole role = 2;
+}
+
+message ListSharesRequest {}
+
+message ShareEdgeInfo {
+  string edge_id = 1;
+  string group_id = 2;
+  string group_name = 3;
+  string device_id = 4;
+  ShareRole role = 5;
+  bool cross_account = 6;
+  // Mirrors the ACL edge's storage-only flag. Additive field 7, `false` for
+  // every edge that predates this field or was never flagged.
+  bool storage_only = 7;
+}
+
+message ListSharesResponse {
+  repeated ShareEdgeInfo edges = 1;
+}
+
+message RevokeShareEdgeRequest {
+  string edge_id = 1;
+}
+
+message RevokeShareEdgeResponse {}
+
+// Device introduction: introducer trust metadata, scoped auto-accept policy
+// storage, and introduction proposal/pending-storage/accept/reject flows.
+// Appended as its own service, mirroring `ShareInviteService`, to keep this
+// addition purely additive.
+service IntroductionService {
+  // Marks (or unmarks) one of the caller's own devices as a trusted
+  // introducer.
+  rpc SetIntroducer(SetIntroducerRequest) returns (SetIntroducerResponse);
+  // Creates a scoped auto-accept policy for the caller's account.
+  rpc SetAutoAcceptPolicy(SetAutoAcceptPolicyRequest) returns (AutoAcceptPolicyInfo);
+  rpc ListAutoAcceptPolicies(ListAutoAcceptPoliciesRequest) returns (ListAutoAcceptPoliciesResponse);
+  rpc RevokeAutoAcceptPolicy(RevokeAutoAcceptPolicyRequest) returns (RevokeAutoAcceptPolicyResponse);
+  // Proposes that `target_device_id` join `group_id` on behalf of
+  // `introducer_device_id`. Auto-accepted immediately (see
+  // `IntroductionInfo.status`) if a matching policy exists; otherwise left
+  // pending for `AcceptIntroduction`/`RejectIntroduction`.
+  rpc ProposeIntroduction(ProposeIntroductionRequest) returns (IntroductionInfo);
+  rpc ListPendingIntroductions(ListPendingIntroductionsRequest) returns (ListPendingIntroductionsResponse);
+  rpc AcceptIntroduction(AcceptIntroductionRequest) returns (IntroductionInfo);
+  rpc RejectIntroduction(RejectIntroductionRequest) returns (IntroductionInfo);
+}
+
+message SetIntroducerRequest {
+  string device_id = 1;
+  bool is_introducer = 2;
+}
+message SetIntroducerResponse {}
+
+// `introducer_device_id`/`group_id` empty means "any" on that axis (the
+// coordination-plane store's own NULL-means-wildcard convention — see
+// `introductions.rs`'s table doc comment). `allowed_mode` is
+// "send_receive" | "send_only" | "receive_only", matching
+// `add-folder-direction-modes`' own wire strings.
+message SetAutoAcceptPolicyRequest {
+  string introducer_device_id = 1;
+  string group_id = 2;
+  string destination_root_prefix = 3;
+  bool require_storage_only = 4;
+  string allowed_mode = 5;
+}
+message AutoAcceptPolicyInfo {
+  string id = 1;
+  string introducer_device_id = 2;
+  string group_id = 3;
+  string destination_root_prefix = 4;
+  bool require_storage_only = 5;
+  string allowed_mode = 6;
+  bool enabled = 7;
+}
+
+message ListAutoAcceptPoliciesRequest {}
+message ListAutoAcceptPoliciesResponse {
+  repeated AutoAcceptPolicyInfo policies = 1;
+}
+
+message RevokeAutoAcceptPolicyRequest {
+  string policy_id = 1;
+}
+message RevokeAutoAcceptPolicyResponse {}
+
+message ProposeIntroductionRequest {
+  string introducer_device_id = 1;
+  string target_device_id = 2;
+  string group_id = 3;
+}
+
+// `status` is "pending" | "accepted" | "rejected" | "auto_accepted";
+// `decided_by` is "auto", a user id, or empty (still pending).
+message IntroductionInfo {
+  string id = 1;
+  string introducer_device_id = 2;
+  string target_device_id = 3;
+  string group_id = 4;
+  string status = 5;
+  int64 created_at_unix = 6;
+  int64 decided_at_unix = 7;
+  string decided_by = 8;
+}
+
+message ListPendingIntroductionsRequest {
+  // Empty means "every pending introduction for this account".
+  string target_device_id = 1;
+}
+message ListPendingIntroductionsResponse {
+  repeated IntroductionInfo introductions = 1;
+}
+
+message AcceptIntroductionRequest {
+  string introduction_id = 1;
+}
+message RejectIntroductionRequest {
+  string introduction_id = 1;
+}

@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-04T00:00:00Z",
+  "releases": [
+    {
+      "channel": "beta",
+      "platform": "macos",
+      "arch": "aarch64",
+      "install_source": "standalone",
+      "version": "0.2.0",
+      "minimum_supported_version": "0.1.0",
+      "rollout_percentage": 100,
+      "kill_switch": false,
+      "mandatory": false,
+      "artifact_url": "https://updates.yadorilink.example/beta/yadorilink-0.2.0.pkg",
+      "artifact_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "artifact_publisher_identity": "Developer ID Installer: YadoriLink (594UQF7QX3)",
+      "release_notes_url": "https://updates.yadorilink.example/beta/0.2.0/notes.html"
+    },
+    {
+      "channel": "beta",
+      "platform": "windows",
+      "arch": "x86_64",
+      "install_source": "standalone",
+      "version": "0.2.0",
+      "minimum_supported_version": "0.1.0",
+      "rollout_percentage": 100,
+      "kill_switch": false,
+      "mandatory": false,
+      "artifact_url": "https://updates.yadorilink.example/beta/yadorilink-setup-0.2.0.exe",
+      "artifact_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "artifact_publisher_identity": "",
+      "release_notes_url": "https://updates.yadorilink.example/beta/0.2.0/notes.html"
+    }
+  ]
+}

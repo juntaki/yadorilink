@@ -1,0 +1,53 @@
+[package]
+name = "yadorilink-fileprovider-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# the small Rust FFI core behind the macOS
+# NSFileProviderReplicatedExtension (shell-ext/macos/YadoriLinkFileProvider),
+# the File-Provider-extension-point counterpart of
+# `shell-ext/macos/core` (which backs the FinderSync extension point).
+#
+# WHY A SEPARATE CRATE rather than adding these functions to
+# `shell-ext/macos/core` and sharing one staticlib across both extension
+# targets: a FinderSync `.appex` and a File Provider `.appex` are
+# different Xcode "app extension" product types with their own bundle
+# structure, entitlements, and (for the File Provider one) a materially
+# higher minimum deployment target (`NSFileProviderReplicatedExtension`
+# needs macOS 13+, vs FinderSync's existing 11.0) — linking one shared
+# staticlib into two independently-signed, independently-versioned
+# extension bundles is achievable but adds real build-graph complexity
+# (two different `--target` triples' worth of build products living
+# under one crate's `target/` dir, two different consuming Xcode
+# targets each needing their own subset of the FFI surface) for a crate
+# that is already small and cheap to duplicate. The task brief this was
+# built from explicitly calls out "reuse `ipc_client.rs`'s pattern (even
+# copy it) rather than trying to awkwardly share a crate across two
+# different extension bundle targets; consistency of pattern matters
+# more than DRY here" — this crate follows that guidance: `src/ipc_client.rs`
+# is a close copy of `core/src/ipc_client.rs`'s connection/timeout/
+# fail-soft pattern, extended with the enumeration + hydration calls this
+# extension point specifically needs.
+[workspace]
+
+[lib]
+name = "yadorilink_fileprovider_core"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+yadorilink-ipc-proto = { path = "../../../crates/yadorilink-ipc-proto" }
+prost = "0.14.4"
+tokio = { version = "1", features = ["net", "rt", "time", "io-util"] }
+libc = "0.2"
+# Item/enumerator lists cross the FFI boundary as JSON (see lib.rs's doc
+# comment) rather than hand-rolled C arrays-of-structs — the payloads are
+# small (one folder group's file list) and infrequent (enumerator
+# refresh, not a per-badge hot path like `core`'s `yadorilink_query_status`),
+# so the simplicity of `serde_json::to_string` + `JSONDecoder` on the
+# Swift side outweighs the marginal allocation cost of a text encoding.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true

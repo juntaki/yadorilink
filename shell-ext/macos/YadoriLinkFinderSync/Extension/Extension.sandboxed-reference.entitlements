@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  NOT applied by build.sh — documentation
+  only, a starting point for a real hardened/distributable build,
+  mirroring Nextcloud's own FinderSync-extension entitlement pattern
+  (the design's reference) adapted to yadorilink's actual transport.
+
+  Two alternative approaches are sketched below; pick ONE for a real
+  build, don't combine them:
+
+  (A) Keep the daemon's existing raw Unix-domain-socket transport
+      (shell_ipc.rs's unix_transport, unchanged), and grant the sandboxed
+      extension a scoped absolute-path exception for exactly that socket
+      file — the minimal-blast-radius option since it needs no daemon-side
+      change:
+
+        <key>com.apple.security.app-sandbox</key>
+        <true/>
+        <key>com.apple.security.temporary-exception.files.absolute-path.read-write</key>
+        <array>
+          <!-- Must match yadorilink_daemon::device_config::config_dir()'s
+               socket path exactly; ~ is not expanded by the sandbox
+               profile, so this needs to be the concrete resolved home
+               directory at entitlement-authoring time (or, better,
+               generated per-build from $HOME by build.sh rather than
+               hardcoded — not yet done here). -->
+          <string>/Users/USERNAME/Library/Application Support/yadorilink/shell.sock</string>
+        </array>
+
+  (B) Change the daemon (crates/yadorilink-daemon, out of this task's scope
+      to actually implement) to additionally register a real launchd
+      Mach service for shell-integration IPC, and grant the extension a
+      Mach-lookup exception instead of a filesystem exception — closer to
+      what the design's "Unix domain socket over XPC" phrase implies,
+      and the more "correct" long-term shape (Mach services compose
+      better with sandboxing than raw filesystem-path exceptions, which
+      Apple treats as a private/deprecated escape hatch):
+
+        <key>com.apple.security.app-sandbox</key>
+        <true/>
+        <key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
+        <array>
+          <string>com.yadorilink.daemon.shellipc</string>
+        </array>
+
+      This requires the daemon to additionally `xpc_connection_create_
+      mach_service` (or equivalent) and register `com.yadorilink.daemon.
+      shellipc` as a `MachServices` entry in its launchd plist — real
+      work belonging to a `yadorilink-daemon` change, not this macOS
+      shell-extension task.
+
+  Either way, an App Group entitlement is the other common pattern (share
+  a container both processes can read/write into and relocate the socket
+  there), but the daemon here already predates App Group scoping (the relevant behavior chose an XDG/Application-Support-style path independent of any
+  specific app's container), so that would also require daemon-side
+  changes to adopt.
+-->
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.network.client</key>
+	<false/>
+	<key>com.apple.security.network.server</key>
+	<false/>
+</dict>
+</plist>

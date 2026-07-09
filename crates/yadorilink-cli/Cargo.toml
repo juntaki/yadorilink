@@ -1,0 +1,83 @@
+[package]
+name = "yadorilink-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yadorilink"
+path = "src/main.rs"
+
+# Gates the HTTP+WebSocket coordination-plane client (http_client.rs) so
+# the existing gRPC path (grpc.rs) keeps working unchanged while the two
+# are validated side by side. Off by default.
+[features]
+http-coordination = ["dep:reqwest", "dep:base64", "dep:oauth2", "dep:url"]
+
+[dependencies]
+yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+yadorilink-transport = { path = "../yadorilink-transport" }
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+yadorilink-sync-core = { path = "../yadorilink-sync-core" }
+yadorilink-reporting = { path = "../yadorilink-reporting" }
+# Promoted from dev-dependency (it was already one, for this crate's own
+# daemon-backed integration tests) to a real dependency — the CLI-only
+# reporting fallback reuses
+# `yadorilink_daemon::reporting`'s `ConsentStore`/`ErrorCandidateStore`
+# directly rather than re-implementing local JSON-file storage a second
+# time (see `commands/report.rs`'s module doc comment). `yadorilink-daemon`
+# has no dependency back on `yadorilink-cli`, so this doesn't create a
+# cycle.
+yadorilink-daemon = { path = "../yadorilink-daemon" }
+tokio.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+tonic = { version = "0.14", features = ["tls-native-roots"] }
+prost = "0.14.4"
+thiserror.workspace = true
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+serde.workspace = true
+serde_json = "1"
+rpassword = "7"
+# Passphrase-encrypted key-bundle export/import is entirely client-side
+# per the zero-knowledge design -- these four are only ever used from
+# `commands/account.rs`, never sent to the coordination plane.
+argon2 = "0.5"
+chacha20poly1305 = "0.11.0"
+rand = "0.10.2"
+hex = "0.4"
+zeroize = "1"
+# Optional (see the `http-coordination` feature above) HTTP+WebSocket
+# client for the Cloudflare-hosted coordination plane, replacing tonic
+# for that transport.
+# rustls (not native-tls) matches yadorilink-reporting's existing choice
+# elsewhere in this workspace, for the same reason (no system OpenSSL dep).
+reqwest = { version = "0.12", optional = true, default-features = false, features = [
+    "rustls-tls",
+    "json",
+] }
+# OAuth 2.0 client (RFC 6749 Authorization Code + PKCE per RFC 7636,
+# RFC 8628 Device Authorization Grant) for `google_auth.rs`. Same
+# rustls-tls choice as this crate's own `reqwest` dep.
+oauth2 = { version = "5", optional = true, default-features = false, features = ["reqwest", "rustls-tls"] }
+# Matches yadorilink-daemon's existing version pin -- only needed to encode
+# WireGuard public keys as base64 for HTTP coordination service JSON routes
+# (the gRPC path sends them as raw protobuf `bytes` and needs no encoding).
+base64 = { version = "0.22", optional = true }
+# `http_client.rs`'s coordination-address validation (http(s)/loopback
+# check) -- deliberately not hand-rolled string splitting,
+# which mishandled IPv6 literal addresses (`http://[::1]:8787`) in an
+# earlier version of this file. Same crate `oauth2`/`google_login.rs` use.
+url = { version = "2", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+sha2.workspace = true
+# Mocks Google's device authorization/token endpoints for
+# `google_auth.rs`'s device-grant
+# polling/backoff test. Same version already used by `yadorilink-daemon`'s
+# and `yadorilink-reporting`'s own local-HTTP-listener integration tests.
+wiremock = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
