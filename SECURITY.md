@@ -19,7 +19,7 @@ YadoriLink is pre-1.0 and under active development. Until a 1.0 release:
 
 ## Scope
 
-This applies to the client-side code in this repository: the CLI,
-daemon, sync engine, transport/relay, local storage, and shell
-integrations. The coordination-plane service itself is operated
-separately and is out of scope for reports made here.
+This security policy covers the code published in this repository: the
+CLI, daemon, sync engine, transport/relay, local storage, installers, and
+shell integrations. Coordination-service deployments and hosted-service
+operations are outside the scope of this repository.

@@ -1,5 +1,5 @@
 /*
- * on-demand-sync task 7.1: bridging header exposing the Rust FFI core
+ * bridging header exposing the Rust FFI core
  * (`yadorilink_fileprovider_core`, see shell-ext/macos/fileprovider-core/)
  * to the Swift `NSFileProviderReplicatedExtension`. Compiled in via
  * `swiftc -import-objc-header` / Xcode's SWIFT_OBJC_BRIDGING_HEADER

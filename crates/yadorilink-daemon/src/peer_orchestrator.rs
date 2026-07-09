@@ -9,7 +9,7 @@
 //! (ACL-revocation teardown is a documented follow-up); this only ever
 //! *adds* sessions as new peers appear.
 //!
-//! daemon-reliability REL-1/REL-3: the coordination netmap subscription
+//! daemon-reliability reliability hardening/reliability hardening: the coordination netmap subscription
 //! (channel connect, RPC, stream, and — for its own first attempt — the
 //! shared relay hub) used to be one-shot: any failure, including one on
 //! the very first attempt before the network was up, permanently ended
@@ -21,7 +21,7 @@
 //! That retry loop deliberately runs *inline* in `run`'s own task rather
 //! than via `supervise::spawn_restarting`: `spawn_restarting` retries
 //! inside a second, independently `tokio::spawn`ed task, so externally
-//! aborting the task *running* `run` (as `main.rs`'s REL-4 graceful
+//! aborting the task *running* `run` (as `main.rs`'s reliability hardening graceful
 //! shutdown does, via `JoinSet::shutdown`) would only cancel `run`'s
 //! `.await` on that task's `JoinHandle` — the detached retry loop
 //! underneath would keep running past the abort (confirmed against
@@ -76,7 +76,7 @@ pub struct OrchestratorConfig {
 ///
 /// Constructed once in `run` and threaded through every
 /// `run_netmap_attempt` call (cheap to `Clone` — every field is an
-/// `Arc`) so it survives a coordination-stream reconnect (REL-1/REL-3): a
+/// `Arc`) so it survives a coordination-stream reconnect (reliability hardening/reliability hardening): a
 /// revocation observed before a stream drop must still apply after the
 /// stream reconnects, and — just as importantly — a fresh reconnect's
 /// first snapshot must be diffed against the *last real* netmap, not an
@@ -121,7 +121,7 @@ impl NetmapDiffState {
 /// Behavior contract callers (namely `main.rs`) can rely on: this is an
 /// `async fn` meant to be spawned exactly once as an essential daemon
 /// task. Under normal operation — including every kind of transient
-/// failure this module retries (REL-1/REL-3: coordination connect, the
+/// failure this module retries (reliability hardening/reliability hardening: coordination connect, the
 /// stream RPC itself, the shared relay hub's initial connect) — it does
 /// **not** return; the reconnect-with-backoff loop lives inside this
 /// function's own task (see the module doc comment for why it's inline
@@ -367,7 +367,7 @@ mod ws_netmap {
             Some(true),
         );
 
-        // REL-3: identical to the gRPC path's relay-hub connect below —
+        // reliability hardening: identical to the gRPC path's relay-hub connect below —
         // the relay hub is transport-agnostic with respect to how the
         // netmap itself was fetched.
         let relay_hub = match relay_hub_cell
@@ -494,7 +494,7 @@ mod ws_netmap {
             }
         }
         // The server closed the stream without an error — still worth
-        // retrying rather than treating as permanent (REL-1).
+        // retrying rather than treating as permanent (reliability hardening).
         Ok(())
     }
 }
@@ -545,7 +545,7 @@ async fn run_netmap_attempt(
         Some(true),
     );
 
-    // REL-3: the relay hub's own initial connect is just another attempt
+    // reliability hardening: the relay hub's own initial connect is just another attempt
     // inside this same backoff loop — `get_or_try_init` leaves the cell
     // uninitialized on error, so the next call (next reconnect attempt)
     // retries it, but never reconnects a relay hub that's already up.
@@ -664,7 +664,7 @@ async fn run_netmap_attempt(
         }
     }
     // The server closed the stream without an error — still worth
-    // retrying rather than treating as permanent (REL-1).
+    // retrying rather than treating as permanent (reliability hardening).
     Ok(())
 }
 
@@ -803,7 +803,7 @@ fn peer_already_connected(state: &DaemonState, peer_device_id: &str) -> bool {
         .contains_key(peer_device_id)
 }
 
-/// Status-transition step 1/2 (task 6.1's "status transition ordering"):
+/// Status-transition step 1/2 (the relevant behavior "status transition ordering"):
 /// a session about to attempt connecting is reported disconnected, same
 /// as one that's never been seen — there's no separate "connecting"
 /// state exposed over the control socket.
@@ -825,7 +825,7 @@ fn mark_connected(state: &DaemonState, peer_device_id: &str) {
     );
 }
 
-/// REL-5: called when a peer session ends — whether it never got past
+/// reliability hardening: called when a peer session ends — whether it never got past
 /// connecting, or ran and later errored/returned — removing *both* the
 /// `sessions` and `peer_statuses` entries, instead of the prior behavior
 /// of merely re-marking the status "disconnected" forever. Removing the
@@ -885,7 +885,7 @@ fn apply_netmap_diff(diff: &NetmapDiff, state: &Arc<DaemonState>, diff_state: &N
             session.revoke_group(group_id);
         }
         // No live session found is not a bug: the device may not have
-        // finished `PeerChannel::connect` yet (task 2.2's synchronous
+        // finished `PeerChannel::connect` yet (the relevant behavior synchronous
         // `session_tasks` insert races ahead of the session existing in
         // `state.sessions`), or its session may have just ended on its
         // own between this diff being computed and this loop running. In
@@ -899,12 +899,12 @@ fn apply_netmap_diff(diff: &NetmapDiff, state: &Arc<DaemonState>, diff_state: &N
 /// tears `device_id` down entirely — revokes its `PeerChannel`
 /// (see `PeerChannel::revoke`'s doc comment: this is what actually stops
 /// the WireGuard tunnel/actor and refuses any further handshake attempt
-/// from this key, task 2.4), aborts its `PeerSyncSession` task (so any
+/// from this key, the relevant behavior), aborts its `PeerSyncSession` task (so any
 /// in-flight request it's awaiting on is cancelled immediately rather
 /// than left to notice its channel died), and removes it from
 /// `DaemonState`.
 ///
-/// That last step is task 2.5's hydration-candidate-pruning wiring:
+/// That last step 's hydration-candidate-pruning wiring:
 /// `hydration.rs`'s `candidate_sessions` is a *live* query over
 /// `state.sessions` on every hydration attempt (not a cached/snapshotted
 /// candidate list), so removing this entry here — synchronously, in the
@@ -1086,10 +1086,10 @@ fn spawn_peer_session(
 }
 
 /// `PeerChannel` doesn't push path-change events, so this just polls
-/// `current_path()` for status reporting (task 7.7) — a reasonable
+/// `current_path()` for status reporting (the relevant behavior) — a reasonable
 /// trade-off given how infrequently the path actually changes.
 ///
-/// REL-5: exits as soon as `end_session` removes this peer's
+/// reliability hardening: exits as soon as `end_session` removes this peer's
 /// `peer_statuses` entry, which drops this task's `Arc<PeerChannel>`
 /// clone — the other clone (held by `PeerSyncSession`) is dropped at the
 /// same time via the `sessions` map, so once both this task and the
@@ -1221,7 +1221,7 @@ mod tests {
         );
     }
 
-    // --- task 6.1: peer_orchestrator tests -------------------------------
+    // --- the relevant behavior: peer_orchestrator tests -------------------------------
     //
     // `state.sessions`/`state.peer_statuses` are keyed on real
     // `Arc<PeerSyncSession>`/`PeerChannel` types from other crates, so a
@@ -1290,7 +1290,7 @@ mod tests {
         )
     }
 
-    /// REL-1/3's netmap loop skips a peer already present in
+    /// reliability hardening/3's netmap loop skips a peer already present in
     /// `state.sessions` rather than opening a second `PeerChannel` for it
     /// — the exact check `run_netmap_attempt` guards `spawn_peer_session`
     /// calls with.
@@ -1313,7 +1313,7 @@ mod tests {
         assert!(!peer_already_connected(&state, "device-c"));
     }
 
-    /// task 6.1's "status transition ordering": a peer session goes
+    /// the relevant behavior "status transition ordering": a peer session goes
     /// disconnected -> connected (never skipping straight to connected,
     /// never regressing mid-connect) as `spawn_peer_session` drives it.
     #[tokio::test]
@@ -1346,7 +1346,7 @@ mod tests {
         }
     }
 
-    /// REL-5 / task 6.1's "cleanup on session drop": ending a session
+    /// reliability hardening / the relevant behavior "cleanup on session drop": ending a session
     /// removes both the `sessions` and `peer_statuses` entries, and that
     /// removal is what makes a still-running `poll_path_status` task exit
     /// (dropping its `Arc<PeerChannel>` clone) instead of polling a dead
@@ -1456,12 +1456,12 @@ mod tests {
         channel
     }
 
-    /// task 2.2/2.5: a whole-device removal (`diff.removed_devices`) tears
+    /// the relevant behavior: a whole-device removal (`diff.removed_devices`) tears
     /// the tunnel down entirely — `PeerChannel::revoke()` is called (task
     /// 2.4's handshake-refusal primitive; exercised cryptographically for
     /// real in `yadorilink_transport::peer_channel`'s own tests) — *and*
     /// immediately drops the peer from `state.sessions`, which is exactly
-    /// what task 2.5 requires: `hydration.rs`'s `candidate_sessions` reads
+    /// requires: `hydration.rs`'s `candidate_sessions` reads
     /// `state.sessions` live, so removing it here is what makes the
     /// device stop being offered as a hydration candidate right away,
     /// not merely once its session times out on its own.
@@ -1489,7 +1489,7 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .contains_key("device-b"),
             "revoked device must be immediately gone from state.sessions, which hydration's \
-             candidate_sessions reads live (task 2.5)"
+             candidate_sessions reads live (the relevant behavior)"
         );
         assert!(!state
             .peer_statuses
@@ -1503,7 +1503,7 @@ mod tests {
             .contains_key("device-b"));
     }
 
-    /// task 2.3/2.6: a group-edge-only removal (the device is still
+    /// the relevant behavior: a group-edge-only removal (the device is still
     /// present in `removed_group_edges` but *not* in `removed_devices`,
     /// because it still shares another group per D3) must leave the
     /// tunnel/`PeerChannel` up and the session connected — distinct from
@@ -1675,7 +1675,7 @@ mod tests {
     /// reconnect loop through `supervise::spawn_restarting`, which retries
     /// inside a second, independently `tokio::spawn`ed task — externally
     /// aborting the task *running* `run` (as `main.rs`'s
-    /// `JoinSet::shutdown` does for REL-4) only cancelled `run`'s
+    /// `JoinSet::shutdown` does for reliability hardening) only cancelled `run`'s
     /// `.await` on that other task's `JoinHandle`, leaving the actual
     /// retry loop running detached and reconnecting forever past the
     /// "shutdown". This test would have failed under that design: it
@@ -1733,7 +1733,7 @@ mod tests {
         );
     }
 
-    /// daemon-reliability task 6.3 (part 1, deterministic): `reconnect_delay`
+    /// `reconnect_delay`
     /// is the pure function driving `run`'s inline backoff — test its
     /// growth/cap behavior directly rather than through live networking
     /// (fragile: real connect/RPC/relay-handshake timing on a dropped
@@ -1741,7 +1741,7 @@ mod tests {
     /// wall-clock gaps between real network attempts is not reliable).
     /// ±25% jitter means exact values aren't checked, only that
     /// consecutive attempts clearly grow and the schedule is eventually
-    /// capped at `BackoffConfig::RECONNECT.max`, matching REL-1's "cap
+    /// capped at `BackoffConfig::RECONNECT.max`, matching reliability hardening's "cap
     /// ~30-60s" — not a tight busy-retry loop (attempt 0 near-zero) and
     /// not unbounded growth (a very late attempt still near-zero from
     /// integer overflow, say).
@@ -1765,11 +1765,11 @@ mod tests {
         );
     }
 
-    /// daemon-reliability task 6.3 (part 2, live): simulates a
+    /// simulates a
     /// coordination-plane drop (a listener that accepts and immediately
     /// closes every connection, as if the server crashed or reset the
     /// TCP connection right after accept) and asserts `run` actually
-    /// re-subscribes repeatedly (REL-1/REL-3 — no permanent give-up)
+    /// re-subscribes repeatedly (reliability hardening/reliability hardening — no permanent give-up)
     /// rather than giving up after the first failure. Combined with
     /// `reconnect_delay_grows_then_caps_at_the_configured_max` above
     /// (which covers the backoff *schedule* deterministically), this
@@ -1816,8 +1816,8 @@ mod tests {
 
         // Give the reconnect loop real time to sleep out its backoff and
         // come back for another try — proves this isn't a one-shot
-        // "fail once and give up forever" path (the exact bug REL-1/
-        // REL-3 fixed).
+        // "fail once and give up forever" path (the exact bug reliability hardening/
+        // reliability hardening fixed).
         let second_batch_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while accept_count.load(Ordering::SeqCst) <= count_after_first_attempt {
             assert!(

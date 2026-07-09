@@ -186,7 +186,7 @@ fn is_final_conflict_copy(name: &str) -> bool {
 
 /// sync-engine spec: "Initial sync reconciles existing files" — device A
 /// already has a file before B ever connects; B must end up with an
-/// identical copy after the session starts (task 5.4, 6.2).
+/// identical copy after the session starts (the relevant behavior, 6.2).
 #[tokio::test]
 async fn initial_sync_replicates_existing_file_to_new_peer() {
     let relay_addr = start_relay().await;
@@ -2962,7 +2962,7 @@ async fn case_fold_collision_holds_the_second_arriving_file_without_touching_the
     // than via a real second local file on device A's own, plausibly
     // also case-insensitive, filesystem) so this test exercises exactly
     // "a second record for a case-fold-colliding path arrives", the
-    // scenario task 4.6 describes, regardless of device A's own OS.
+    // describes, regardless of device A's own OS.
     let second_bytes = b"a completely different photo";
     let hash_hex = device_a.store.put(second_bytes).unwrap();
     let second_block = yadorilink_sync_core::types::BlockInfo {
@@ -3160,7 +3160,7 @@ async fn symlink_created_on_one_device_materializes_as_a_real_symlink_on_its_pee
     assert!(
         metadata.file_type().is_symlink(),
         "device B must materialize a real symlink, not a regular (and, since a symlink record \
-         carries no blocks, empty) file — this is exactly the round-trip the task 5.1 wire gap \
+         carries no blocks, empty) file — this is exactly the round-trip wire gap \
          used to break"
     );
     assert_eq!(
@@ -3229,7 +3229,7 @@ async fn exec_bit_set_on_one_device_is_applied_to_the_real_file_on_its_peer() {
         mode & 0o100,
         0,
         "device B's real, on-disk file must carry the owner-exec bit device A advertised — \
-         before the task 5.1 fix this field never crossed the wire at all"
+         before fix this field never crossed the wire at all"
     );
 }
 
@@ -3465,11 +3465,11 @@ async fn saturated_download_bucket_never_delays_a_concurrent_presence_signal() {
 // ---------------------------------------------------------------------
 
 /// two real sessions, both advertising compression support (this
-/// build always does — task 2.4), must negotiate it and still deliver
+/// build always does — the relevant behavior), must negotiate it and still deliver
 /// byte-for-byte correct content through the real compress-on-send /
 /// decompress-on-receive path — not merely "sync still works," but sync
 /// still works *with compression actually engaged*, verified via the
-/// public `compression_negotiated()` getter (task 2.5).
+/// public `compression_negotiated()` getter (the relevant behavior).
 #[tokio::test]
 async fn compression_is_negotiated_between_two_real_sessions_and_content_round_trips() {
     let relay_addr = start_relay().await;
@@ -3497,7 +3497,7 @@ async fn compression_is_negotiated_between_two_real_sessions_and_content_round_t
     let session_b = spawn_session(channel_b, &device_b, "device-a");
 
     // Negotiation happens from the handshake `ClusterConfig` each side
-    // sends first in `run()` (task 2.4/2.5) — both sessions should observe
+    // sends first in `run()` (the relevant behavior) — both sessions should observe
     // the other as compression-capable shortly after connecting.
     wait_until(
         || session_a.compression_negotiated() && session_b.compression_negotiated(),
@@ -3515,7 +3515,7 @@ async fn compression_is_negotiated_between_two_real_sessions_and_content_round_t
     );
 }
 
-/// task 3.1/3.3: a raw, manually-driven peer that advertises compression
+/// the relevant behavior: a raw, manually-driven peer that advertises compression
 /// support must actually receive a `Compression::Zstd`-tagged, genuinely
 /// smaller `BlockResponse` for compressible content — inspecting the real
 /// wire bytes a live `PeerSyncSession::handle_block_request` produces,
@@ -3955,7 +3955,7 @@ async fn compressed_index_update_is_smaller_on_the_wire_than_uncompressed() {
     let (compressed_wire_len, compressed_update) = recv_index_update_raw_len(&observer_1).await;
 
     // Non-advertising observer — simulates an old peer, on a fresh session
-    // (negotiation is per-session, task 2.5) so its `IndexUpdate` is sent
+    // (negotiation is per-session, the relevant behavior) so its `IndexUpdate` is sent
     // uncompressed.
     let (channel_a2, observer_2) = connect_pair(relay_addr).await;
     let session_a2 = spawn_session(channel_a2, &device_a, "device-b2");
@@ -4188,7 +4188,7 @@ async fn fetch_window_grows_under_real_traffic_and_shrinks_after_timeouts_then_r
     );
 }
 
-/// improve-transfer-performance task 2.2: a real, end-to-end proof that
+/// a real, end-to-end proof that
 /// `reconcile_files`'s batched prefetch (`SyncState::get_files_by_paths` +
 /// `reconcile_needed`, see both doc comments) correctly handles the
 /// scenario it targets — a large incoming index where almost every record
@@ -4589,7 +4589,7 @@ async fn no_wire_message_to_a_flagged_storage_only_peer_carries_the_group_key_or
     session_a.set_storage_only(GROUP, true);
     let key = GroupKey::generate();
     session_a.set_group_key(GROUP, key.clone(), true);
-    // A real key-distribution call site (task 1.2) — asserting it's a
+    // A real key-distribution call site (the relevant behavior) — asserting it's a
     // deliberate, harmless no-op against a flagged peer, not merely
     // "nothing happens to call it in this test." Uses `x25519_dalek`
     // explicitly (not the `boringtun::x25519` types this file already

@@ -1,15 +1,15 @@
-//! Long-running sync daemon (task 7.1): loads persistent local state,
+//! Long-running sync daemon (the relevant behavior): loads persistent local state,
 //! opens the CLI control socket, and — once logged in and registered —
 //! connects to the coordination plane's netmap and establishes peer sync
 //! sessions.
 //!
-//! REL-8: every essential task (control socket, shell-integration IPC,
+//! reliability hardening: every essential task (control socket, shell-integration IPC,
 //! peer orchestrator) is supervised together in one `JoinSet` at the
 //! bottom of `main` — if *any* of them exits or panics, the daemon logs
 //! it clearly and exits non-zero so a process supervisor restarts it,
 //! instead of coupling liveness solely to the control socket (the old
 //! `control_socket_task.await?`) and silently continuing as a zombie with
-//! broken sync. REL-4: the same top-level `select!` also races that
+//! broken sync. reliability hardening: the same top-level `select!` also races that
 //! against SIGTERM/SIGINT (and the control socket's `Shutdown` request,
 //! routed in via `DaemonState::shutdown_tx`) to run a graceful shutdown
 //! instead.
@@ -30,7 +30,7 @@ use yadorilink_sync_core::materialization;
 use yadorilink_transport::DeviceKeyPair;
 
 /// Names used both for `essential.spawn`'s logging and for
-/// `DaemonState::task_liveness` (REL-13's health surface) — kept as
+/// `DaemonState::task_liveness` (reliability hardening's health surface) — kept as
 /// constants so the two always agree.
 const TASK_CONTROL_SOCKET: &str = "control-socket";
 const TASK_SHELL_IPC: &str = "shell-ipc-server";
@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = DaemonState::new(device_id.clone(), sync_state.clone(), block_store.clone());
     // Only the real `yadorilink-daemon` binary itself opts into
-    // disk-headroom enforcement (task 3.1/5.2) — see
+    // disk-headroom enforcement (the relevant behavior) — see
     // `DaemonState::enable_disk_headroom_enforcement`'s doc comment for why
     // this is not done inside `DaemonState::new` (which every test in this
     // crate also goes through).
@@ -147,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
     // Opt-in `/metrics` endpoint — off/localhost-only by default,
     // mirroring `yadorilink-relay`'s own `YADORILINK_RELAY_METRICS_ADDR`
     // convention exactly. The env var (if set) always wins over the persisted
-    // `metrics_config.json` toggle (`yadorilink daemon metrics`, task 4.2)
+    // `metrics_config.json` toggle (`yadorilink daemon metrics`, the relevant behavior)
     // so an operator's explicit env-based override behaves identically to
     // the relay's, with the persisted config as this binary's own
     // additional, CLI-settable fallback.
@@ -172,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Resume watching every previously-linked folder (task 7.1's "local
+    // Resume watching every previously-linked folder (the relevant behavior "local
     // state persistence across restarts": links survive, and their
     // watchers are simply restarted).
     for link in sync_state.list_links().unwrap_or_default() {
@@ -183,7 +183,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // REL-8: every essential task lives in this one `JoinSet` instead of
+    // reliability hardening: every essential task lives in this one `JoinSet` instead of
     // a bare `tokio::spawn` with its handle dropped (shell-IPC, peer
     // orchestrator) or awaited on its own at the very end (control
     // socket, coupling process liveness to just that one task). Spawning
@@ -308,7 +308,7 @@ async fn main() -> anyhow::Result<()> {
             // we've already returned. Treat any other outcome as fatal.
             let name = joined.unwrap_or("unknown-task");
             tracing::error!(task = name, "essential task died; exiting non-zero so a process supervisor restarts the daemon");
-            // An essential supervised task (REL-8) dying is exactly the
+            // An essential supervised task (reliability hardening) dying is exactly the
             // kind of severe, maintainer-actionable failure this hook
             // exists for — a local-only candidate, never submitted
             // automatically.
@@ -331,7 +331,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// Races SIGTERM/SIGINT (Unix) or Ctrl-C (Windows, which has no SIGTERM)
 /// against the control socket's `Shutdown` request signaled through
-/// `DaemonState::shutdown_tx` (REL-4) — either way, returns a short tag
+/// `DaemonState::shutdown_tx` (reliability hardening) — either way, returns a short tag
 /// naming which one fired, purely for the log line at the call site.
 async fn wait_for_shutdown_request(
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
@@ -384,7 +384,7 @@ async fn wait_for_os_signal() -> &'static str {
     "Ctrl-C"
 }
 
-/// REL-4: the one graceful-shutdown path both SIGTERM/SIGINT and the
+/// reliability hardening: the one graceful-shutdown path both SIGTERM/SIGINT and the
 /// control socket's `Shutdown` request (via `DaemonState::shutdown_tx`)
 /// funnel into — previously the latter was a second, independent path
 /// (`std::process::exit(0)` after a sleep) that skipped all of this.

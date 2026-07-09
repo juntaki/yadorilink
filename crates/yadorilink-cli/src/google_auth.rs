@@ -39,15 +39,12 @@ use crate::token_store;
 /// Google requires a distinct OAuth client *type* for the Device
 /// Authorization Grant ("TVs and Limited Input devices") than for the
 /// loopback-redirect flow ("Desktop app") -- no single client covers both,
-/// so this crate hardcodes two separate id/secret pairs (the coordination
-/// plane is not open source and not self-hosted, so one hardcoded value
-/// per flow covers every install of this CLI). Google issues a client
-/// secret even for
-/// installed-app OAuth clients (it is not treated as confidential the way
-/// a server-side web app's would be -- PKCE is the actual security
-/// mechanism for the loopback flow, per RFC 8252). Both client ids must
-/// also be listed in the HTTP coordination service's `GOOGLE_OAUTH_CLIENT_IDS` env
-/// var so the server accepts either as a valid token audience.
+/// so this crate has two configurable id/secret pairs. Google issues a
+/// client secret even for installed-app OAuth clients (it is not treated
+/// as confidential the way a server-side web app's would be -- PKCE is the
+/// actual security mechanism for the loopback flow, per RFC 8252). A
+/// compatible coordination service must accept both client ids as valid
+/// token audiences.
 const GOOGLE_OAUTH_DESKTOP_CLIENT_ID: &str = "REPLACE_WITH_GOOGLE_OAUTH_DESKTOP_CLIENT_ID";
 const GOOGLE_OAUTH_DESKTOP_CLIENT_SECRET: &str = "REPLACE_WITH_GOOGLE_OAUTH_DESKTOP_CLIENT_SECRET";
 const GOOGLE_OAUTH_DEVICE_CLIENT_ID: &str = "REPLACE_WITH_GOOGLE_OAUTH_DEVICE_CLIENT_ID";

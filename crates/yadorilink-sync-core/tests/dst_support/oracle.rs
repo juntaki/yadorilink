@@ -1,4 +1,4 @@
-//! dst-full-stack-heat-run-framework P0 task 0.2: the multi-device oracle
+//! dst-full-stack-heat-run-framework P0 the relevant behavior: the multi-device oracle
 //! library — convergence, global no-loss, no-corruption, conflict-copy
 //! accounting, and structural invariants — that a `Case`-IR-driven DST
 //! scenario checks its final (or, where cheap, incremental) state against.

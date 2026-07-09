@@ -1,6 +1,6 @@
 //! Starts/stops the background tasks that watch one linked folder
-//! (task 5.2's watcher, wired to task 5.3/6.1's chunking-and-indexing,
-//! task 5.5's broadcast to connected peers, and task 8.5's shell-extension
+//! (the relevant behavior watcher, wired 's chunking-and-indexing,
+//! the relevant behavior broadcast to connected peers, 's shell-extension
 //! status push). Two tasks per link, per batch-sync-optimizations design
 //! D7: a debounce **accumulator** that only ever reads raw filesystem
 //! events and coalesces them into windowed batches
@@ -792,7 +792,7 @@ pub fn stop_link_watch(state: &DaemonState, local_path: &str) {
 /// Resumes a paused link and re-broadcasts its currently-indexed files to
 /// connected peers. Unpausing alone only lifts the gate on *future*
 /// propagation — any change indexed *while* paused was queued locally
-/// (task 6.8's guarantee: `SyncState` itself is the backlog) but never
+/// (the relevant behavior guarantee: `SyncState` itself is the backlog) but never
 /// actually sent, since `announce_local_change` only ever checks the
 /// pause flag once, at the moment each change is first processed. Resume
 /// must therefore flush that backlog itself, not just flip the flag.
@@ -914,7 +914,7 @@ pub fn run_retention_expiry_sweep(state: &DaemonState) {
 /// that hazard — it's byte-for-byte what a live create event would have
 /// done.
 ///
-/// Skips paused links entirely (task 2.2): a paused link intentionally
+/// Skips paused links entirely (the relevant behavior): a paused link intentionally
 /// does not propagate, and indexing+broadcasting from this sweep would
 /// violate that the same way a live local change would. A link paused
 /// during a watcher-event loss is still covered once it resumes:
@@ -1136,9 +1136,9 @@ pub async fn revert_link(
 }
 
 /// Broadcasts a batch of locally-indexed changes to connected peers as one
-/// wire message per peer (unless the link is paused — task 6.8; batch
+/// wire message per peer (unless the link is paused — the relevant behavior; batch
 /// broadcast is batch-sync-optimizations ), and pushes one
-/// shell-extension status update per file regardless (task 8.5 — `StatusPush`
+/// shell-extension status update per file regardless (the relevant behavior — `StatusPush`
 /// stays per-file even when the peer-facing broadcast batches, 's
 /// explicit call-out: UI feedback and peer wire efficiency are different
 /// concerns). Shared by both the initial scan and the live watch loop.
@@ -1149,12 +1149,12 @@ pub async fn revert_link(
 /// — gated here, alongside the pre-existing `paused` gate, since this is
 /// the one place every local change (watcher-driven and initial-scan
 /// alike) funnels through on its way to `DaemonState::broadcast_change`.
-/// Gated identically to a local tombstone (task 2.3: `records` carries
+/// Gated identically to a local tombstone (the relevant behavior: `records` carries
 /// deletions the same way it carries content — nothing here branches on
 /// `record.deleted`, so a gated local deletion is recorded as
 /// receive-only-changed exactly like any other gated edit). The file is
 /// still indexed either way (`LocalChangeProcessor` already did that
-/// before this function ever runs — task 6.8's "queued backlog" applies to
+/// before this function ever runs — the relevant behavior "queued backlog" applies to
 /// mode-gating too, not just pause), so no data is lost, only marked
 /// diverged until an explicit `revert` (or `set-mode` back to
 /// `send-receive`/`send-only`) — see `revert_link`.
@@ -1176,7 +1176,7 @@ async fn announce_local_change(
     let paused = link.as_ref().map(|l| l.paused).unwrap_or(false);
     let mode = link.as_ref().map(|l| l.mode).unwrap_or(LinkMode::SendReceive);
 
-    // Local changes are always indexed (task 6.8's "queued backlog");
+    // Local changes are always indexed (the relevant behavior "queued backlog");
     // only *propagation* is gated — on pause (unchanged) and on
     // receive-only mode.
     if !paused {
@@ -1234,7 +1234,7 @@ async fn announce_local_change(
 }
 
 /// Updates this device's own active-edit tracking and broadcasts the
-/// presence signal to connected peers (task 9.3) — the mirror of
+/// presence signal to connected peers (the relevant behavior) — the mirror of
 /// `announce_local_change`, for a `LocalChangeOutcome::PresenceChanged`
 /// instead of a `FileChanged`. `path` is relative to the linked folder.
 async fn announce_presence_change(
@@ -1287,7 +1287,7 @@ mod tests {
         }
     }
 
-    /// batch-sync-optimizations task 2.3 / : `StatusPush` stays
+    ///: `StatusPush` stays
     /// one-per-file for the shell extension even when the peer-facing
     /// broadcast batches many files into a single wire message — these
     /// are different concerns (local UI feedback vs. peer wire

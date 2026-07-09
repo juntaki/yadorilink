@@ -4,7 +4,7 @@ package yadorilink.shellipc.v1;
 // Local IPC between yadorilink-daemon and the OS shell extensions
 // (Windows Explorer / macOS Finder). Framed as length-prefixed messages
 // over a local transport (named pipe / Unix domain socket), not full gRPC
-// (see design.md D3) — this schema is reused for both, only the framing
+// this schema is reused for both, only the framing
 // differs from the gRPC services above.
 
 enum SyncState {
@@ -44,7 +44,7 @@ message StatusResponse {
   string path = 1;
   SyncState state = 2;
   MaterializationState materialization_state = 3;
-  // edit-presence-awareness task 9.4 — set to the device id currently
+  // Edit-presence awareness — set to the device id currently
   // reported editing this file (Office lock-file convention), empty if
   // not open elsewhere or the signal has expired. Advisory only.
   string open_elsewhere_device_id = 4;
@@ -82,10 +82,10 @@ message ContextActionResponse {
   string error = 2;
 }
 
-// on-demand-sync task 6.1/6.2 gap: `daemon_control.proto`'s `ListLinks`
-// reports per-folder-group aggregates (task 5.4) but never a per-file
+// On-demand sync gap: `daemon_control.proto`'s `ListLinks`
+// reports per-folder-group aggregates  but never a per-file
 // listing, which a platform virtual-filesystem provider (Windows cfapi,
-// task 6.1/6.2) needs in order to know which local paths to register as
+// the shell integration) needs in order to know which local paths to register as
 // sync roots and which files to create placeholders for. Rather than
 // invent a whole new IPC surface, this reuses the existing shell-IPC
 // persistent connection (already the shell extension's channel to the

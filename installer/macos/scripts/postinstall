@@ -92,7 +92,7 @@ install_user_file() {
 APP_PATH="/Applications/YadoriLinkFinderSyncHost.app"
 DAEMON_PATH="/usr/local/bin/yadorilink-daemon"
 AGENT_LABEL="com.yadorilink.daemon"
-# add-desktop-status-app task 4.1: the menu-bar status app's own
+# The menu-bar status app's own
 # LaunchAgent, installed and loaded the same way as the daemon's just
 # above (see this script's header comment point 1 for why a LaunchAgent,
 # not a LaunchDaemon).
@@ -194,7 +194,7 @@ else
     log "It will still start automatically at the next login (RunAtLoad)."
 fi
 
-# --- 2b. Status app LaunchAgent (add-desktop-status-app task 4.1) ---------
+# --- 2b. Status app LaunchAgent ------------------------------------------
 # Unlike the daemon's plist above, this one has no `KeepAlive` — the
 # status app is a user-facing tray icon, not an essential background
 # service; if the user deliberately quits it from its own "Quit" menu item

@@ -19,7 +19,7 @@
 //! while making a same-filename collision between two different pieces
 //! of content impossible rather than merely unlikely.
 //!
-//! ## Trust boundary (SEC-SYNC-3(b))
+//! ## Trust boundary (security hardening)
 //!
 //! `mtime_unix_nanos` on an incoming `FileRecord` is peer-supplied and
 //! otherwise unvalidated. Before this fix, the winner of a genuine
@@ -38,7 +38,7 @@
 
 use sha2::{Digest, Sha256};
 
-/// SEC-SYNC-3(b): a claimed `mtime_unix_nanos` more than this far in the
+/// security hardening: a claimed `mtime_unix_nanos` more than this far in the
 /// future of wall-clock "now" is no longer trusted at face value for
 /// conflict-resolution purposes — see this module's trust-boundary doc
 /// comment. One day is generous enough that ordinary clock drift between
@@ -77,7 +77,7 @@ fn clamp_future_mtime(mtime_unix_nanos: i64, now_unix_nanos: i64) -> i64 {
 /// decisions can never disagree with each other.
 ///
 /// Both mtimes are bounded via `clamp_future_mtime` before comparison
-/// (SEC-SYNC-3(b)), so an extreme peer-supplied value can no longer win
+/// (security hardening), so an extreme peer-supplied value can no longer win
 /// outright by an unbounded margin.
 ///
 /// The tie-break (mtimes equal after clamping) is device id, not "prefer
@@ -107,7 +107,7 @@ pub fn a_is_loser(
 }
 
 /// Given the two concurrently-edited file records' paths/mtimes/device
-/// ids/content hashes (plus wall-clock "now", SEC-SYNC-3(b)), returns
+/// ids/content hashes (plus wall-clock "now", security hardening), returns
 /// `(winner_path, loser_conflict_path)` — the loser being the
 /// older-effective-mtime copy (ties broken by device id, for determinism
 /// so all peers independently compute the same result; see `a_is_loser`'s
@@ -256,7 +256,7 @@ mod tests {
     /// used throughout this test module, so `MAX_FUTURE_MTIME_SKEW_NANOS`
     /// clamping is a no-op for them — these tests exercise ordinary,
     /// non-adversarial mtime comparisons and must behave exactly as
-    /// before the SEC-SYNC-3(b) skew bound was added.
+    /// before the security hardening skew bound was added.
     const FAR_FUTURE_NOW: i64 = 2_000_000_000 * 1_000_000_000;
 
     const HASH_A: &[u8] = b"content-a-loser-bytes";
@@ -391,7 +391,7 @@ mod tests {
         assert!(re_resolved.starts_with("README (conflicted copy"), "{re_resolved}");
     }
 
-    /// Adversarial case (SEC-SYNC-3(b)): a peer advertising
+    /// Adversarial case (security hardening): a peer advertising
     /// an absurd future `mtime_unix_nanos` (`i64::MAX`) must not
     /// unconditionally win the real filename against a local file with an
     /// ordinary, plausible (near-"now") mtime — the claim gets clamped to
@@ -428,7 +428,7 @@ mod tests {
         assert!(!loser.contains("292471208677"), "must not embed i64::MAX's absurd year: {loser}");
     }
 
-    /// Plausibility bound check (SEC-SYNC-3(b)): once local's own mtime is *also*
+    /// Plausibility bound check (security hardening): once local's own mtime is *also*
     /// implausibly far in the future relative to "now" (or once the
     /// attacker's clamped value ties with it), the extreme value no
     /// longer wins outright — it degrades to the deterministic device-id
@@ -448,7 +448,7 @@ mod tests {
         assert_eq!(is_a_loser, "device-local" < "device-attacker");
     }
 
-    /// Legitimate case (SEC-SYNC-3(b)): an ordinary,
+    /// Legitimate case (security hardening): an ordinary,
     /// non-adversarial mtime comparison (both well in the past relative
     /// to "now") is completely unaffected by the skew bound — the older,
     /// real mtime loses exactly as it always did.

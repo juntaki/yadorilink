@@ -1,5 +1,5 @@
 /*
- * build-yadorilink-mvp task 10.1: hand-written C ABI header for
+ * hand-written C ABI header for
  * `yadorilink_shell_ext_macos_core` (crate name `yadorilink_shell_core`),
  * mirroring `src/lib.rs`'s `#[no_mangle] extern "C"` surface exactly.
  *

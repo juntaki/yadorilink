@@ -1,4 +1,4 @@
-//! Transport-path-agnostic per-peer channel (task 4.7): `yadorilink-sync-core`
+//! Transport-path-agnostic per-peer channel (the relevant behavior): `yadorilink-sync-core`
 //! sends/receives plain application messages here and never knows whether
 //! the underlying WireGuard session is currently relayed or direct — or
 //! which of possibly several direct candidates (LAN, NAT-traversed
@@ -24,10 +24,10 @@ use crate::udp_batching::UdpBatchingSupport;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(500);
 /// How often direct candidates are (re-)probed: all of them concurrently
-/// until one is confirmed (task 4.10's racing), then just the confirmed
-/// one as a keepalive/liveness check (task 4.6's upgrade attempts).
+/// until one is confirmed (the relevant behavior racing), then just the confirmed
+/// one as a keepalive/liveness check (the relevant behavior upgrade attempts).
 const DIRECT_PROBE_INTERVAL: Duration = Duration::from_secs(5);
-/// REL-11: how long a `Direct`-path channel can go without receiving
+/// reliability hardening: how long a `Direct`-path channel can go without receiving
 /// *any* direct-socket traffic before it's treated as dead and failed
 /// back to relay. WireGuard itself sends a keepalive roughly every 25s
 /// when otherwise idle (`tunn_wrapper::KEEPALIVE_SECS`), and this actor
@@ -46,7 +46,7 @@ const MAX_DIRECT_RECV_BATCH: usize = 16;
 /// deadline — it just bounds how finely that deadline is checked.
 const RELIABLE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
-/// SEC-TRANS-2: fixed cap on how many direct-endpoint candidates a single
+/// security hardening: fixed cap on how many direct-endpoint candidates a single
 /// `PeerChannel` will hold at once. An attacker who knows an authorized
 /// peer's public key can mint an unbounded number of distinct
 /// `(key, addr)` local-discovery candidates (SEC-30's per-source rate
@@ -58,21 +58,18 @@ const MAX_DIRECT_CANDIDATES: usize = 8;
 
 // --- Netmap-diff logic ----------------------------------------------
 //
-// The coordination plane's `stream_netmap` (see `yadorilink-coordination`'s
-// `grpc.rs`) always pushes a *full* netmap snapshot, never a delta —
-// `NetmapUpdate::removed_peer_device_ids` is defined in the proto but is
-// always sent empty, and `is_full_update` is always `true`. So the client
-// side (`yadorilink-daemon`'s `peer_orchestrator`) is the one that must
-// diff each new snapshot against whatever it held before, to find what
-// was revoked. This module owns that pure diff logic; `peer_orchestrator`
-// owns holding the "previous" snapshot across updates and acting on the
-// result (tearing down `PeerChannel`s via [`PeerChannel::revoke`]).
+// The coordination plane's `stream_netmap` currently pushes a *full* netmap
+// snapshot, never a delta. `NetmapUpdate::removed_peer_device_ids` is defined
+// in the proto but is sent empty, and `is_full_update` is `true`. So the
+// client side (`yadorilink-daemon`'s `peer_orchestrator`) must diff each new
+// snapshot against whatever it held before, to find what was revoked. This
+// module owns that pure diff logic; `peer_orchestrator` owns holding the
+// "previous" snapshot across updates and acting on the result.
 
 /// One netmap snapshot, keyed by `device_id` (stable across calls per
-/// device — `yadorilink-coordination`'s device registration only ever
-/// inserts a fresh row or marks one removed, never rotates a key under an
-/// existing `device_id`) mapping to the set of folder groups this device
-/// and the peer currently share.
+/// device; device registration inserts a fresh row or marks one removed,
+/// never rotates a key under an existing `device_id`) mapping to the set of
+/// folder groups this device and the peer currently share.
 ///
 /// A `HashSet`, not a `Vec`, deliberately: the coordination plane's
 /// `compute_netmap` has no `ORDER BY` on the group-membership query
@@ -94,20 +91,20 @@ pub struct NetmapDiff {
     /// `compute_netmap` only ever lists a peer it shares at least one
     /// group with (a peer with zero shared groups is omitted entirely,
     /// never present with an empty group set), a device's disappearance
-    /// from the snapshot *is* the signal — task 2.2 tears its
+    /// from the snapshot *is* the signal — the relevant behavior tears its
     /// `PeerChannel` down entirely for each of these.
     pub removed_devices: Vec<String>,
     /// `(device_id, group_id)` pairs present in `previous` whose device is
     /// *still* present in `current` (so at least one other shared group
     /// remains) but that specific group is no longer shared (`share
-    /// revoke` of one group among several) — task 2.3's narrower case:
+    /// revoke` of one group among several) — the relevant behavior narrower case:
     /// the tunnel/`PeerChannel` stays up, only that group's sync activity
     /// stops (enforced by `yadorilink-sync-core`'s per-request
     /// re-validation, not by this transport-level diff).
     pub removed_group_edges: Vec<(String, String)>,
 }
 
-/// Diffs `current` against `previous` (task 2.1), classifying every
+/// Diffs `current` against `previous` (the relevant behavior), classifying every
 /// device that lost at least one shared group as either a whole-device
 /// removal ([`NetmapDiff::removed_devices`]) or a narrower group-edge
 /// removal ([`NetmapDiff::removed_group_edges`]). Devices present in
@@ -144,7 +141,7 @@ pub enum PathKind {
     Direct,
 }
 
-/// Provenance of a learned direct-endpoint candidate (SEC-TRANS-2): the
+/// Provenance of a learned direct-endpoint candidate (security hardening): the
 /// coordination plane is authenticated (its candidates come from the
 /// peer's registered netmap, supplied once at `PeerChannel::connect`
 /// time), whereas local network discovery (`local_discovery`, fed in at
@@ -180,7 +177,7 @@ pub struct PeerChannel {
     current_path: Arc<AtomicU8>,
     candidate_tx: mpsc::Sender<SocketAddr>,
     /// This device's public IP:port as observed by the relay at connect
-    /// time (task 4.4's netcheck). `None` for `DirectOnly` channels, which
+    /// time (the relevant behavior netcheck). `None` for `DirectOnly` channels, which
     /// never talk to a relay. Reported to the coordination plane's
     /// `report_endpoint` by the daemon.
     observed_address: Option<String>,
@@ -287,7 +284,7 @@ impl PeerChannel {
         let udp_batching = UdpBatchingSupport::detect();
         let reliable_enabled = Arc::new(AtomicBool::new(false));
 
-        // SEC-TRANS-2: candidates supplied here come from the caller's
+        // security hardening: candidates supplied here come from the caller's
         // coordination-plane netmap (see the doc comment on `connect`'s
         // `direct_candidates` param) — highest provenance, so they are
         // inserted as `Coordination` and are never evicted to admit a
@@ -347,7 +344,7 @@ impl PeerChannel {
         self.reliable_enabled.store(true, Ordering::Relaxed);
     }
 
-    /// This device's public endpoint as observed by the relay (task 4.4).
+    /// This device's public endpoint as observed by the relay (the relevant behavior).
     pub fn observed_address(&self) -> Option<&str> {
         self.observed_address.as_deref()
     }
@@ -371,7 +368,7 @@ impl PeerChannel {
         u8_to_path(self.current_path.load(Ordering::Relaxed))
     }
 
-    /// Adds a newly-learned direct candidate at runtime (task 4.12) — e.g.
+    /// Adds a newly-learned direct candidate at runtime (the relevant behavior) — e.g.
     /// one surfaced by local broadcast discovery after this channel was
     /// already established. Ignored if the channel doesn't use a direct
     /// path at all (`RelayOnly`).
@@ -380,9 +377,9 @@ impl PeerChannel {
     }
 
     /// Tears this channel down in response to a whole-device revocation
-    /// (task 2.2) and, from this moment on, refuses to process any further
+    /// (the relevant behavior) and, from this moment on, refuses to process any further
     /// datagram on this channel — including a subsequent WireGuard
-    /// handshake attempt from this same peer's key (task 2.4), which is
+    /// handshake attempt from this same peer's key (the relevant behavior), which is
     /// otherwise cryptographically indistinguishable from a legitimate
     /// reconnect attempt by an unrevoked peer.
     ///
@@ -435,14 +432,14 @@ struct ActorState {
     direct_socket: Option<Arc<UdpSocket>>,
     /// All known direct candidates for this peer, raced concurrently until
     /// one is confirmed. Bounded at [`MAX_DIRECT_CANDIDATES`] and
-    /// provenance-ranked (SEC-TRANS-2) — always insert via
+    /// provenance-ranked (security hardening) — always insert via
     /// [`insert_candidate`], never push directly, so the cap and eviction
     /// policy actually apply.
     direct_candidates: Vec<DirectCandidate>,
     /// The candidate that has actually answered, once one has. Once set,
     /// sends target only this address instead of racing the whole list.
     confirmed_direct_addr: Option<SocketAddr>,
-    /// REL-11: when the last datagram (of any kind, including a WireGuard
+    /// reliability hardening: when the last datagram (of any kind, including a WireGuard
     /// keepalive or one that failed to decrypt) arrived on the direct
     /// socket. `None` means never — used to detect a gone-quiet direct
     /// path and fail back to relay.
@@ -510,7 +507,7 @@ async fn run_actor(mut state: ActorState) {
                 // Runtime-added candidates (`add_direct_candidate`) are
                 // local-discovery-sourced (see the doc comment on that
                 // method) — lowest provenance, subject to eviction first
-                // under SEC-TRANS-2's cap.
+                // under security hardening's cap.
                 if state.allow_direct {
                     insert_candidate(
                         &mut state.direct_candidates,
@@ -723,7 +720,7 @@ async fn handle_datagram(
 
     let result = state.tunn.handle_incoming(datagram);
     // Captured before `result.messages`/`result.to_send` are moved out by
-    // the loops below — SEC-TRANS-1's confirm/upgrade gate needs this.
+    // the loops below — security hardening's confirm/upgrade gate needs this.
     let authenticated = result.authenticated;
 
     if !result.to_send.is_empty() {
@@ -754,7 +751,7 @@ async fn handle_datagram(
         }
     }
 
-    // SEC-TRANS-1: a direct-socket datagram may confirm a candidate and
+    // security hardening: a direct-socket datagram may confirm a candidate and
     // upgrade the path only when it was cryptographically meaningful
     // (`authenticated` — decrypted WireGuard data, or an authenticated
     // handshake transition), never on mere receipt. Before this fix the
@@ -805,7 +802,7 @@ async fn handle_datagram(
 }
 
 /// Inserts `addr` into `candidates` if not already present, enforcing
-/// [`MAX_DIRECT_CANDIDATES`] (SEC-TRANS-2): when full, evicts the oldest
+/// [`MAX_DIRECT_CANDIDATES`] (security hardening): when full, evicts the oldest
 /// `Discovery`-sourced candidate that isn't `confirmed`, and refuses the
 /// insert entirely if nothing is safely evictable (every current entry is
 /// either `confirmed` or `Coordination`-sourced) — a confirmed or
@@ -853,7 +850,7 @@ fn insert_candidate(
     candidates.push(DirectCandidate { addr, source, added_at: Instant::now() });
 }
 
-/// REL-11: if this channel is currently on the Direct path but hasn't
+/// reliability hardening: if this channel is currently on the Direct path but hasn't
 /// heard anything on the direct socket in `DIRECT_LIVENESS_TIMEOUT`, the
 /// path is presumed dead (a NAT rebinding, a dropped local link, etc.)
 /// and the channel fails back to Relay so sync keeps moving instead of
@@ -969,7 +966,7 @@ mod tests {
         }
     }
 
-    /// REL-11's core behavior: a Direct-path channel that's heard nothing
+    /// reliability hardening's core behavior: a Direct-path channel that's heard nothing
     /// on its direct socket in over `DIRECT_LIVENESS_TIMEOUT` fails back
     /// to Relay and forgets the stale confirmed address.
     #[test]
@@ -1019,7 +1016,7 @@ mod tests {
     }
 
     /// Builds an `ActorState` for exercising `handle_datagram`'s
-    /// SEC-TRANS-1 confirm/upgrade gate directly: unconfirmed, starting on
+    /// security hardening confirm/upgrade gate directly: unconfirmed, starting on
     /// Relay, with `candidates` as the known direct-endpoint set. Uses the
     /// same fixed local/peer keypair as [`make_state`] so a real
     /// handshake initiation from a `WgTunnel` built with the mirrored
@@ -1056,12 +1053,12 @@ mod tests {
         }
     }
 
-    /// SEC-TRANS-1 (task 4.1): a junk datagram — not a valid WireGuard
+    /// security hardening (the relevant behavior): a junk datagram — not a valid WireGuard
     /// packet at all, so it never decrypts or advances the handshake —
     /// arriving on the direct socket from a *known* candidate address
     /// must not confirm that candidate or switch the path to Direct.
     /// Using a known candidate address isolates this test to the
-    /// authentication gate itself (task 1.1), separately from the
+    /// authentication gate itself (the relevant behavior), separately from the
     /// task-1.2 known-candidate check exercised below.
     #[tokio::test]
     async fn junk_datagram_does_not_confirm_or_switch_direct_path() {
@@ -1078,11 +1075,11 @@ mod tests {
         assert_eq!(u8_to_path(state.current_path.load(Ordering::Relaxed)), PathKind::Relay);
     }
 
-    /// SEC-TRANS-1 (task 1.2 hardening): authenticated-looking gating
+    /// security hardening (the relevant behavior hardening): authenticated-looking gating
     /// alone isn't tested here — this proves that even if a datagram
     /// *did* decrypt, an address that isn't a known candidate still can't
     /// be confirmed. Regression-tests against accidentally dropping the
-    /// candidate-membership check while fixing SEC-TRANS-1.
+    /// candidate-membership check while fixing security hardening.
     #[tokio::test]
     async fn authenticated_traffic_from_unknown_address_does_not_confirm() {
         let local_secret = StaticSecret::from([1u8; 32]);
@@ -1102,11 +1099,11 @@ mod tests {
         assert_eq!(u8_to_path(state.current_path.load(Ordering::Relaxed)), PathKind::Relay);
     }
 
-    /// SEC-TRANS-1 / REL-11 combined (task 4.2 and task 1.3): after a
+    /// security hardening / reliability hardening combined (the relevant behavior ): after a
     /// spoofed junk datagram is rejected, the channel must still be
     /// routable over Relay — no blackhole. Re-sending junk repeatedly
     /// (the exploit's "just re-send every 20s") must not eventually
-    /// succeed either, and `send_via_current_path` (task 1.3's send path)
+    /// succeed either, and `send_via_current_path` (the relevant behavior send path)
     /// still reads `current_path`, which this proves stays `Relay`.
     #[tokio::test]
     async fn spoofed_junk_datagram_leaves_channel_routable_over_relay() {
@@ -1127,10 +1124,10 @@ mod tests {
         assert!(state.allow_relay, "relay fallback must remain available");
     }
 
-    /// Positive control for the two tests above (and task 1.3): real
+    /// Positive control for the two tests above (): real
     /// WireGuard traffic from the correct peer (a genuine handshake
     /// initiation) at a known candidate address *does* confirm and
-    /// upgrade the path — proving the SEC-TRANS-1 gate distinguishes junk
+    /// upgrade the path — proving the security hardening gate distinguishes junk
     /// from authenticated traffic rather than simply never confirming
     /// anything, i.e. the legitimate relay -> direct upgrade still works.
     #[tokio::test]
@@ -1157,7 +1154,7 @@ mod tests {
         assert_eq!(u8_to_path(state.current_path.load(Ordering::Relaxed)), PathKind::Direct);
     }
 
-    /// SEC-TRANS-2 (task 4.3): a flood of distinct discovery-sourced
+    /// security hardening (the relevant behavior): a flood of distinct discovery-sourced
     /// candidates never grows the list past `MAX_DIRECT_CANDIDATES`, and
     /// confirmed / coordination-supplied candidates are never evicted to
     /// make room for a discovery-supplied one.
@@ -1181,7 +1178,7 @@ mod tests {
 
         // An attacker who knows the peer's public key mints far more
         // distinct `(key, addr)` pairs than the cap allows by varying the
-        // announced port (SEC-TRANS-2's exploit).
+        // announced port (security hardening's exploit).
         for port in 0..64u16 {
             let addr: SocketAddr = format!("10.0.2.1:{}", 50_000 + port).parse().unwrap();
             insert_candidate(&mut candidates, confirmed, addr, CandidateSource::Discovery);
@@ -1237,7 +1234,7 @@ mod tests {
             .collect()
     }
 
-    /// task 2.1/2.6: a device that disappears from the netmap entirely
+    /// the relevant behavior: a device that disappears from the netmap entirely
     /// (D3's whole-device revocation, e.g. `device remove`, or a `share
     /// revoke` of a pair's only shared group) is classified as a removed
     /// device, not a removed group edge — even though, from a pure
@@ -1260,7 +1257,7 @@ mod tests {
         );
     }
 
-    /// task 2.1/2.6: a device that's still present in the current netmap,
+    /// the relevant behavior: a device that's still present in the current netmap,
     /// but with fewer shared groups than before, is a group-edge removal
     /// (D3's narrower case, `share revoke` while another group is still
     /// shared) — the device itself must not appear in `removed_devices`,
@@ -1350,7 +1347,7 @@ mod tests {
         assert!(state.revoked.load(Ordering::Relaxed));
     }
 
-    /// task 2.2/2.4's core behavior: once a channel is revoked,
+    /// the relevant behavior core behavior: once a channel is revoked,
     /// `handle_datagram` refuses to process *any* further datagram — this
     /// specifically includes what would otherwise be a completely valid
     /// WireGuard handshake initiation from the correct (now-revoked) peer

@@ -1,4 +1,4 @@
-//! daemon-reliability REL-7/REL-12: every `tokio::spawn` in this crate
+//! daemon-reliability reliability hardening/reliability hardening: every `tokio::spawn` in this crate
 //! used to discard its `JoinHandle`, so a panic or early exit in a
 //! long-lived task (the relay connection, local discovery) went
 //! undetected, unlogged, and unrestarted. This is a small, intentionally
@@ -112,7 +112,7 @@ where
 /// Complements [`spawn_restarting`]: use for tasks whose natural end is
 /// expected (e.g. one relay server connection's lifetime) so a panic is
 /// at least visible instead of silently vanishing with the dropped
-/// `JoinHandle` (REL-7's core defect) — restarting a single finished
+/// `JoinHandle` (reliability hardening's core defect) — restarting a single finished
 /// connection handler wouldn't make sense the way restarting a
 /// reconnect loop does.
 pub fn spawn_logged<Fut>(name: &'static str, task: Fut) -> JoinHandle<()>

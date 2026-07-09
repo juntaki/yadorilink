@@ -38,7 +38,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
 
     init(domain: NSFileProviderDomain) {
         self.domain = domain
-        // task 7.2: domains are registered by the host app with
+        // the relevant behavior: domains are registered by the host app with
         // `identifier.rawValue == group_id` (see
         // HostApp/DomainRegistration.swift) — recover the matching
         // `local_path` by re-querying the daemon rather than caching it
@@ -56,7 +56,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
 
     func invalidate() {}
 
-    // MARK: - task 7.3: item(for:) — placeholder metadata
+    // MARK: - the relevant behavior: item(for:) — placeholder metadata
 
     func item(
         for identifier: NSFileProviderItemIdentifier,
@@ -82,7 +82,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         return progress
     }
 
-    // MARK: - task 7.3: fetchContents — on-open hydration
+    // MARK: - the relevant behavior: fetchContents — on-open hydration
 
     func fetchContents(
         for itemIdentifier: NSFileProviderItemIdentifier,
@@ -126,7 +126,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         return progress
     }
 
-    // MARK: - task 7.3: enumerator(for:) — placeholder tree presentation
+    // MARK: - the relevant behavior: enumerator(for:) — placeholder tree presentation
 
     func enumerator(
         for containerItemIdentifier: NSFileProviderItemIdentifier,

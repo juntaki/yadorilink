@@ -53,21 +53,20 @@ message LogoutRequest {
 
 message LogoutResponse {}
 
-// add-account-recovery: caller must be authenticated (bearer access
-// token) -- this generates a fresh set of one-time codes for the calling
-// account and immediately invalidates any codes issued previously.
+// Caller must be authenticated (bearer access token). This generates a fresh
+// set of one-time codes for the calling account and immediately invalidates
+// any codes issued previously.
 message GenerateRecoveryCodesRequest {}
 
 message GenerateRecoveryCodesResponse {
-  // Plaintext codes, returned exactly once. The coordination plane does
-  // not persist this value, only a hash of each code (see design.md).
+  // Plaintext codes, returned exactly once. The coordination plane stores only
+  // a hash of each code, never this plaintext value.
   repeated string recovery_codes = 1;
 }
 
-// add-account-recovery: unauthenticated by design (the caller has, by
-// definition, lost the ability to log in) -- consumes one recovery code
-// to set a new password. Rate-limited and enumeration-safe the same way
-// Login is (see yadorilink-coordination/src/grpc.rs).
+// Unauthenticated by design: the caller has, by definition, lost the ability
+// to log in. Consumes one recovery code to set a new password. Rate-limited
+// and enumeration-safe the same way Login is.
 message ResetPasswordRequest {
   string email = 1;
   string recovery_code = 2;
@@ -132,7 +131,7 @@ service ShareService {
   rpc GrantAccess(GrantAccessRequest) returns (GrantAccessResponse);
   rpc RevokeAccess(RevokeAccessRequest) returns (RevokeAccessResponse);
   rpc ListFolderGroups(ListFolderGroupsRequest) returns (ListFolderGroupsResponse);
-  // add-untrusted-storage-peer task 4.1/4.3: flags (or unflags) a device
+  // flags (or unflags) a device
   // already granted access to a group as storage-only/untrusted for that
   // group. A separate RPC rather than a new `GrantAccess` parameter --
   // added as a new method on the existing service, the same additive
@@ -180,7 +179,7 @@ message FolderGroupInfo {
   string group_id = 1;
   string name = 2;
   repeated string authorized_device_ids = 3;
-  // add-untrusted-storage-peer task 4.3: which of `authorized_device_ids`
+  // which of `authorized_device_ids`
   // are flagged storage-only for this group, keyed by device_id -- lets
   // `yadorilink status`/`share list` mark ciphertext-only peers without a
   // second round trip. Additive (field 4); an older client simply doesn't
@@ -223,7 +222,7 @@ message PeerInfo {
   // predates this field) is treated by consumers as role
   // SHARE_ROLE_WRITE, matching the `acl.role` column's own default (D3).
   map<string, ShareRole> shared_group_roles = 5;
-  // add-untrusted-storage-peer task 4.1: whether *this* peer is flagged
+  // whether *this* peer is flagged
   // storage-only (untrusted) for each entry in `shared_group_ids`, keyed
   // by group_id -- mirrors `shared_group_roles`'s exact shape/rationale
   // (field 6, added purely additively after `shared_group_roles` (field
@@ -246,30 +245,28 @@ message NetmapUpdate {
   repeated string removed_peer_device_ids = 3;
 }
 
-// --- add-cross-account-sharing ---
 // Cross-account folder-group sharing: an invite/accept handshake plus a
-// read/write role on ACL edges (design.md D1-D6). Every message below
-// carries only account/device/group/role/expiry references — never file
-// names or file content (D6 content-blindness). Appended as a separate
-// service (rather than extending `ShareService` above) to keep this
-// addition purely additive.
+// read/write role on ACL edges. Every message below carries only
+// account/device/group/role/expiry references — never file names or file
+// content. Appended as a separate service rather than extending
+// `ShareService` above to keep this addition purely additive.
 service ShareInviteService {
   // Mints a one-time, expiring invite scoped to (group, role). Only the
   // group owner may call this. Returns the plaintext code once; the plane
-  // persists only a hash of it (D1).
+  // persists only a hash of it.
   rpc CreateShareInvite(CreateShareInviteRequest) returns (CreateShareInviteResponse);
   // Redeems an invite code under the caller's own account, creating a
   // cross-account ACL edge for `device_id` (which must belong to the
-  // caller) and consuming the invite (D2).
+  // caller) and consuming the invite.
   rpc AcceptShareInvite(AcceptShareInviteRequest) returns (AcceptShareInviteResponse);
   // Lists every ACL edge visible to the caller: edges for groups they own,
   // and edges for their own devices (including cross-account edges where
   // another account's group was shared to them).
   rpc ListShares(ListSharesRequest) returns (ListSharesResponse);
   // Removes one ACL edge by id. Callable by the group owner or by the
-  // account that owns the edge's device (D2). Composes with the
+  // account that owns the edge's device. Composes with the
   // enforce-live-device-revocation push/teardown path rather than
-  // re-implementing it (D5).
+  // re-implementing it.
   rpc RevokeShareEdge(RevokeShareEdgeRequest) returns (RevokeShareEdgeResponse);
 }
 
@@ -311,9 +308,8 @@ message ShareEdgeInfo {
   string device_id = 4;
   ShareRole role = 5;
   bool cross_account = 6;
-  // add-untrusted-storage-peer task 4.3: mirrors `acl.storage_only` for
-  // this edge -- additive field 7, `false` for every edge that predates
-  // this change or was never flagged.
+  // Mirrors the ACL edge's storage-only flag. Additive field 7, `false` for
+  // every edge that predates this field or was never flagged.
   bool storage_only = 7;
 }
 
@@ -327,14 +323,10 @@ message RevokeShareEdgeRequest {
 
 message RevokeShareEdgeResponse {}
 
-// add-advanced-sync-operations section 3 (Device Introduction): introducer
-// trust metadata, scoped auto-accept policy storage, and introduction
-// proposal/pending-storage/accept/reject flows — see
-// `yadorilink-coordination::introductions` for the full semantics this
-// wraps, including the module doc comment's explanation of why this never
-// spans account boundaries. Appended as its own service (mirroring
-// `ShareInviteService`'s own precedent) to keep this addition purely
-// additive.
+// Device introduction: introducer trust metadata, scoped auto-accept policy
+// storage, and introduction proposal/pending-storage/accept/reject flows.
+// Appended as its own service, mirroring `ShareInviteService`, to keep this
+// addition purely additive.
 service IntroductionService {
   // Marks (or unmarks) one of the caller's own devices as a trusted
   // introducer.

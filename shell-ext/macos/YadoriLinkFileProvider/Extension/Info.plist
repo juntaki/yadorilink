@@ -35,7 +35,7 @@
 		     build path). -->
 		<key>NSExtensionPrincipalClass</key>
 		<string>FileProviderExtension</string>
-		<!-- task 7.2/7.6: ties this extension to the same App Group the
+		<!-- the relevant behavior: ties this extension to the same App Group the
 		     host app and the FinderSync extension use
 		     (group.com.juntaki.yadorilink.shared) so NSFileProviderManager can
 		     locate this extension's domain storage and so
@@ -47,7 +47,7 @@
 		<key>NSExtensionFileProviderDocumentGroup</key>
 		<string>group.com.juntaki.yadorilink.shared</string>
 		<!-- Declares this as a fully replicated, enumeration-capable
-		     provider (task 7.1's NSFileProviderReplicatedExtension,
+		     provider (the relevant behavior NSFileProviderReplicatedExtension,
 		     not the older non-replicated NSFileProviderExtension). -->
 		<key>NSExtensionFileProviderSupportsEnumeration</key>
 		<true/>

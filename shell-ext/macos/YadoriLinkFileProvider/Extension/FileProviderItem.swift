@@ -1,5 +1,5 @@
 //
-//  FileProviderItem.swift — on-demand-sync task 7.3.
+//  FileProviderItem.swift — .
 //
 //  `NSFileProviderItem` conformance for both synthesized directories and
 //  real files (`CatalogNode`, see FileProviderModel.swift). Required
@@ -8,7 +8,7 @@
 //  protocol but implemented here for real behavior rather than Finder's
 //  fallback defaults — in particular `isDownloaded`/
 //  `isMostRecentVersionDownloaded` are what drives Finder's *native*
-//  cloud-download-icon overlay from `MaterializationState` (task 7.4's
+//  cloud-download-icon overlay from `MaterializationState` (the relevant behavior
 //  "online-only" state doesn't need FinderSync's custom badge under
 //  `~/Library/CloudStorage/yadorilink/`; that overlay is native to File
 //  Provider items on macOS, unlike FinderSync's Eager-folder path where
@@ -74,7 +74,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
 
     var creationDate: Date? { contentModificationDate }
 
-    /// Native File-Provider "downloaded"/"cloud" state (task 7.4).
+    /// Native File-Provider "downloaded"/"cloud" state (the relevant behavior).
     /// Directories are always considered "downloaded" (there's no
     /// separate placeholder concept for a directory itself — only its
     /// children are placeholders); a file is downloaded exactly when the

@@ -235,7 +235,7 @@ impl FsBlockStore {
     }
 }
 
-/// SEC-SYNC-1: appends a collision-free `.yadorilink-tmp` suffix to `path`'s
+/// security hardening: appends a collision-free `.yadorilink-tmp` suffix to `path`'s
 /// full filename — never `with_extension`, which *replaces* the extension
 /// and previously produced a single **fixed** `<hash>.tmp` path shared by
 /// every concurrent writer of that same hash. Also mixes in the current
@@ -285,7 +285,7 @@ impl BlockStore for FsBlockStore {
         self.check_headroom(&path, data.len() as u64)?;
         // Write to a unique-per-writer temp file then rename, so a crash
         // never leaves a partially-written block visible under its final
-        // content-hash path, *and* (SEC-SYNC-1) two concurrent `put()`s of
+        // content-hash path, *and* (security hardening) two concurrent `put()`s of
         // the same hash never share a temp path and clobber each other —
         // see `unique_tmp_path`'s doc comment.
         let tmp_path = unique_tmp_path(&path);
@@ -333,7 +333,7 @@ impl BlockStore for FsBlockStore {
         })?;
         let actual = Self::hash_bytes(&data);
         if actual != hash {
-            // SEC-SYNC-1 self-heal: a checksum mismatch here proves the
+            // security hardening self-heal: a checksum mismatch here proves the
             // on-disk file is torn/corrupt garbage that does not match its
             // own content-addressed name — never valid content a caller
             // could legitimately want. Content-addressed storage makes

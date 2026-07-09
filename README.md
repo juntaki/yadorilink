@@ -7,7 +7,8 @@ convenience without storing file contents on a central server.**
 [How is this different?](#how-is-this-different) ·
 [Status](#status) ·
 [Quick start](#quick-start) ·
-[Building from source](#building-from-source)
+[Building from source](#building-from-source) ·
+[日本語](README.ja.md)
 
 YadoriLink keeps folders in sync across your devices and shared groups. File
 contents move directly between devices over an authenticated, encrypted
@@ -60,13 +61,13 @@ YadoriLink is pre-1.0 and under active development. Concretely, today:
 - **Windows Explorer shell extension** builds and runs on x86_64; `arm64`
   support across the project is untested and should be treated as
   experimental.
-- **Coordination service**: this repository is the open-source client/sync/
-  transport/encryption stack. The coordination-plane service itself
-  (accounts, device identities, share membership) is not part of this
-  repository, and **a public hosted coordination service is not available
-  yet** — so an end-to-end sync setup isn't runnable purely from a clone of
-  this repo today. If you want to self-host or need a hosted option, please
-  open an issue.
+- **Coordination service**: this repository currently focuses on the client,
+  sync engine, transport, relay, installers, and shell integrations. A
+  complete end-to-end deployment also needs a coordination service for
+  accounts, device identities, and share membership. A public hosted
+  coordination service is not available yet, so an end-to-end sync setup
+  isn't runnable purely from a clone of this repo today. If you want to
+  self-host or need a hosted option, please open an issue.
 
 ## Quick start
 
@@ -195,6 +196,13 @@ YadoriLink is pre-1.0, and its cryptographic design has not had an
 independent third-party audit — review the source yourself before relying
 on it for sensitive data. See [SECURITY.md](SECURITY.md) for how to report
 a vulnerability.
+
+## Contributing
+
+Issues and pull requests are welcome. Please read
+[CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR, and report
+vulnerabilities privately through [SECURITY.md](SECURITY.md) instead of a
+public issue.
 
 ## License
 

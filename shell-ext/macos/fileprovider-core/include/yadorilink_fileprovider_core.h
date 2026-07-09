@@ -1,5 +1,5 @@
 /*
- * on-demand-sync task 7.1: hand-written C ABI header for
+ * hand-written C ABI header for
  * `yadorilink_fileprovider_core`, mirroring `src/lib.rs`'s
  * `#[no_mangle] extern "C"` surface exactly. Hand-written for the same
  * reason `shell-ext/macos/core/include/yadorilink_shell_core.h` is
@@ -10,7 +10,7 @@
  * (YadoriLinkFileProvider/Extension/YadoriLinkFileProvider-Bridging-Header.h)
  * and the host app's bridging header (HostApp needs
  * yadorilink_fp_list_on_demand_folders / yadorilink_fp_real_home_dir for
- * domain registration, task 7.2).
+ * domain registration, the relevant behavior).
  */
 
 #ifndef YADORILINK_FILEPROVIDER_CORE_H

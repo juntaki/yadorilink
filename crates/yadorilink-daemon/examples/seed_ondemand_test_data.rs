@@ -1,4 +1,4 @@
-//! on-demand-sync task 7.8 manual verification helper: seeds an
+//! manual verification helper: seeds an
 //! OnDemand-policy folder link + one Placeholder-state file record
 //! directly into the daemon's SQLite state, bypassing the CLI's
 //! coordination-plane-dependent `link` command (which needs a

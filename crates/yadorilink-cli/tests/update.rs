@@ -164,7 +164,7 @@ async fn update_status_reflects_a_failed_check() {
     assert_eq!(status.last_error_category, "update_manifest_fetch_failed");
 }
 
-/// task 5.4/5.6: `update config` persists and is reflected by a
+/// the relevant behavior: `update config` persists and is reflected by a
 /// subsequent `update status` read, without a daemon restart.
 #[tokio::test]
 async fn update_config_persists_and_is_reflected_by_status() {

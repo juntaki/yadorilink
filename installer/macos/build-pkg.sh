@@ -12,7 +12,7 @@
 #   - shell-ext/macos/YadoriLinkFinderSync (host app + both extensions)
 #                                -> /Applications/YadoriLinkFinderSyncHost.app
 #
-# Server-side binaries (yadorilink-coordination, yadorilink-relay) are
+# Server-side relay and coordination-service deployment components are
 # deliberately NOT included — this is an end-user desktop installer, not
 # a server deployment artifact.
 #

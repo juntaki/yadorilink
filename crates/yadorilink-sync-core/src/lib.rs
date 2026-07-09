@@ -1,4 +1,4 @@
-//! Peer-to-peer folder replication engine (see openspec `sync-engine` spec).
+//! Peer-to-peer folder replication engine.
 //!
 //! Layering:
 //! - [`version_vector`]: causality tracking for conflict detection.

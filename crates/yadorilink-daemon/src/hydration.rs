@@ -280,7 +280,7 @@ async fn fetch_blocks_from_sessions(
     // across every hydration so far — a fast/healthy peer gets more
     // concurrent lanes, a slow/lossy one gets fewer, and neither can ever
     // exceed the fixed security ceiling `fetch_window` itself is clamped
-    // to (task 1.2). Extra lanes beyond what a given candidate actually
+    // to (the relevant behavior). Extra lanes beyond what a given candidate actually
     // has work for are harmless: `pop_for` returning `(None, false)`
     // (queue empty, nothing outstanding anywhere) makes an idle lane exit
     // immediately, same as before.
@@ -559,7 +559,7 @@ async fn hydrate_inner(
     reconstruct_file(state.block_store.as_ref(), &out_path, &record.blocks)?;
     state.sync_state.set_materialization_state(group_id, path, MaterializationState::Hydrated)?;
     // A snappier recovery signal beyond the periodic backoff re-check
-    // (task 3.5) — any successful hydration on this link proves its
+    // (the relevant behavior) — any successful hydration on this link proves its
     // volume currently has headroom, so a stale Degraded entry (if any)
     // can clear immediately rather than waiting out the next scheduled
     // re-check. A no-op if the link wasn't degraded.
@@ -573,13 +573,13 @@ async fn hydrate_inner(
 }
 
 /// Fails cleanly with `SyncError::DiskPressure` (and marks `group_id`'s
-/// link Degraded, task 3.4) if hydrating `path` (a write of
+/// link Degraded, the relevant behavior) if hydrating `path` (a write of
 /// `required_bytes`, the file's full size) would breach the configured
 /// headroom on the volume hosting `root`. Before failing, if `group_id`'s
 /// link is `OnDemand`, runs the disk-pressure-triggered eviction sweep
-/// (task 4.1) and re-checks once — giving it a chance to free enough
+/// (the relevant behavior) and re-checks once — giving it a chance to free enough
 /// space for the operation to still succeed: the sweep runs and completes
-/// before a pending hydration/materialization is failed (task 4.2).
+/// before a pending hydration/materialization is failed (the relevant behavior).
 fn preflight_disk_pressure(
     state: &DaemonState,
     group_id: &str,
@@ -672,12 +672,12 @@ pub fn evict(state: &DaemonState, group_id: &str, path: &str) -> Result<(), Sync
 /// compare-write section `LocalChangeProcessor::process_event`/
 /// `PeerSyncSession::reconcile_one_file` already use, so it resolves via
 /// the existing version-vector conflict machinery with no restore-
-/// specific special-casing (task 3.5).
+/// specific special-casing (the relevant behavior).
 ///
 /// Fails with `SyncError::VersionContentUnavailable` (never a generic I/O
 /// or not-found error) and makes no index or on-disk change if some block
 /// the version needs is missing locally and unavailable from every
-/// currently-reachable, authorized peer within the timeout (task 3.3).
+/// currently-reachable, authorized peer within the timeout (the relevant behavior).
 pub async fn restore_to_version(
     state: &Arc<DaemonState>,
     group_id: &str,
@@ -777,7 +777,7 @@ async fn restore_to_version_inner(
 
     // Content is fully resolved locally now — write it to disk and adopt
     // it as an ordinary new local version. No index or on-disk change was
-    // made above this point, matching task 3.3's "no partial change on
+    // made above this point, 's "no partial change on
     // failure" requirement.
     let out_path = root.join(path);
     reconstruct_file(state.block_store.as_ref(), &out_path, &version.blocks)?;
@@ -829,7 +829,7 @@ pub async fn restore_trashed(
 
 /// spec "Restore without a version defaults to the most recent superseded
 /// version": the `--version`-omitted default for `yadorilink restore
-/// <path>` (task 6.2). `None` if the path has no superseded version to
+/// <path>` (the relevant behavior). `None` if the path has no superseded version to
 /// restore to (only ever a `current` row, or no row at all).
 pub fn most_recent_superseded_version_seq(
     state: &DaemonState,
@@ -1042,7 +1042,7 @@ mod tests {
         assert_eq!(result, missing, "with no candidate sessions, nothing can be fetched");
     }
 
-    // --- disk-space preflight tests (task 3.6) ---
+    // --- disk-space preflight tests (the relevant behavior) ---
 
     const GROUP: &str = "group-1";
     const PATH: &str = "big.bin";
@@ -1124,13 +1124,13 @@ mod tests {
         assert!(!state.is_link_degraded(&root.path().to_string_lossy()));
     }
 
-    /// task 4.1/4.2: under disk pressure, an `OnDemand` link's eviction
+    /// the relevant behavior: under disk pressure, an `OnDemand` link's eviction
     /// sweep runs *before* the preflight fails — evicting an
     /// already-hydrated, unpinned file back to a placeholder. Doesn't
     /// assert the overall preflight then succeeds (that depends on freeing
     /// enough *real* bytes to satisfy an intentionally enormous forced
     /// headroom, not practical to stage in a test); asserts the sweep
-    /// itself ran, which is the behavior task 4.1/4.2 actually adds.
+    /// itself ran, which is the actually adds.
     #[tokio::test]
     async fn preflight_disk_pressure_runs_eviction_sweep_for_on_demand_link_first() {
         let (state, _store_dir) = test_state();
@@ -1191,7 +1191,7 @@ mod tests {
         );
     }
 
-    /// task 3.3/3.6: a `DiskPressure` rejection leaves no partial temp file
+    /// the relevant behavior: a `DiskPressure` rejection leaves no partial temp file
     /// under the link root — the preflight runs (and fails) before
     /// `reconstruct_file`'s temp-path-then-rename write ever begins.
     #[tokio::test]
@@ -1318,7 +1318,7 @@ mod tests {
         assert_eq!(original_v1.size, 20);
     }
 
-    /// task 3.3/3.6: a version whose blocks are missing locally and
+    /// the relevant behavior: a version whose blocks are missing locally and
     /// unavailable from any peer (none connected here) fails with the
     /// specific `VersionContentUnavailable` error — not a generic
     /// I/O/not-found error — and leaves both the index and the on-disk
@@ -1361,7 +1361,7 @@ mod tests {
         assert_eq!(versions.len(), 1, "a failed restore must not add or change any version row");
     }
 
-    /// task 3.4/3.6: restoring a trashed file recovers its last version
+    /// the relevant behavior: restoring a trashed file recovers its last version
     /// before deletion as a new current version, and the file is live
     /// again — the `trash restore` path (`SyncState::mark_deleted` is this
     /// crate's local-delete primitive, exercised directly here rather than

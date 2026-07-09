@@ -74,7 +74,7 @@ pub async fn start_local_discovery(
     let socket = Arc::new(socket);
 
     let (tx, rx) = mpsc::channel(32);
-    // daemon-reliability REL-7/REL-12: materialize the authorized-key set
+    // daemon-reliability reliability hardening/reliability hardening: materialize the authorized-key set
     // once so a restart (below) can rebuild fresh `DiscoveryFilters` —
     // starting clean (empty rate-limit/dedup state) is fine since
     // restarts are rare and the filters exist to bound noise, not to

@@ -1,5 +1,5 @@
 //! Thin, blocking-from-the-caller's-perspective IPC client for the
-//! shell-integration protocol (build-yadorilink-mvp task 10.1/10.2/10.3),
+//! shell-integration protocol (/10.3),
 //! following the exact pattern `yadorilink_daemon::shell_ipc::client`
 //! documents as the reference implementation for native shell-extension
 //! shims (bounded timeout, fail-soft to `Unspecified`/`false` on any
@@ -68,7 +68,7 @@ fn real_home_dir() -> PathBuf {
     }
 }
 
-/// build-yadorilink-mvp task 10.4/10.6: the App Group shared container this
+/// the App Group shared container this
 /// sandboxed extension and the (unsandboxed) daemon both use to exchange
 /// the Unix socket — see `Extension.entitlements`'s doc comment for why
 /// App Groups was used instead of a `temporary-exception.files.*`

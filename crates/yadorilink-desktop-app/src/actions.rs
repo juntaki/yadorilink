@@ -4,7 +4,7 @@
 //! explicit commands to the daemon — this module invents no new sync
 //! behavior, it only calls the same requests `yadorilink-cli`'s
 //! `commands/` already send, so mutating settings are validated and
-//! persisted by the daemon, not only by this UI (task 3.4).
+//! persisted by the daemon, not only by this UI (the relevant behavior).
 
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
@@ -86,7 +86,7 @@ pub enum AddFolderError {
     GroupResolution(String, String),
 }
 
-/// task 3.1/3.2: the full "Add Synced Folder" flow — resolves the group
+/// the relevant behavior: the full "Add Synced Folder" flow — resolves the group
 /// name to a `group_id` via `yadorilink-cli`'s own already-tested
 /// coordination-plane call (`grpc::require_access_token`/
 /// `resolve_group_id`, see this crate's `Cargo.toml` doc comment for why
@@ -271,7 +271,7 @@ pub async fn set_bandwidth_limit(preset: BandwidthPreset) -> Result<(), IpcError
     Ok(())
 }
 
-/// task 3.1/3.2 "folder selection": a native folder-picker dialog.
+/// the relevant behavior "folder selection": a native folder-picker dialog.
 /// macOS-only for now (via a short-lived `osascript` invocation of
 /// `choose folder` — no extra Rust dependency needed for one dialog);
 /// Windows has no implementation yet (returns `None`, same honest
@@ -296,7 +296,7 @@ pub fn pick_folder() -> Option<std::path::PathBuf> {
     None
 }
 
-/// task 3.1/3.2: a native single-line text prompt, used to ask for the
+/// the relevant behavior: a native single-line text prompt, used to ask for the
 /// folder-group name to link into (`add_synced_folder` above) — same
 /// macOS-only-for-now scope as `pick_folder`.
 #[cfg(target_os = "macos")]

@@ -13,9 +13,9 @@ This is a **CLI/daemon-only** package:
 `yadorilink-desktop-app` (the tray/menu-bar status GUI, macOS/Windows only)
 and a Linux file-manager shell integration are explicitly out of scope.
 There is no GTK/appindicator dependency anywhere in this
-package as a result. `yadorilink-coordination` and `yadorilink-relay` are
-server-side binaries and, as on the other platforms' installers, are
-**not** part of this package — deploy those to your own server instead.
+package as a result. The relay and any coordination-service deployment
+are server-side components and are **not** installed by this
+desktop/client package.
 
 ## Packaging approach: hand-authored `control`/`postinst` + `dpkg-deb`, not `cargo-deb`
 

@@ -19,7 +19,7 @@
 //! - AEAD: XChaCha20-Poly1305 — chosen
 //!   over AES-256-GCM-SIV specifically because its 24-byte extended nonce
 //!   gives comfortable collision margin for the *deterministic*
-//!   convergent-mode nonce (task 1.1/2.1: `nonce = KDF(K_g, h)`), which by
+//!   convergent-mode nonce (the relevant behavior: `nonce = KDF(K_g, h)`), which by
 //!   construction repeats across peers/devices that independently encrypt
 //!   the same block — a 12-byte GCM-style nonce would carry meaningfully
 //!   more birthday-bound risk under that reuse-by-design scheme.
@@ -96,7 +96,7 @@ impl std::fmt::Debug for GroupKey {
 
 impl GroupKey {
     /// generates a fresh, uniformly-random `K_g`. Also the
-    /// function task 1.3's key rotation calls to mint `K_g'` — rotation is
+    /// 's key rotation calls to mint `K_g'` — rotation is
     /// "generate a new key the same way as the first one, then re-wrap and
     /// re-encrypt with it," not a distinct code path.
     pub fn generate() -> Self {
@@ -138,7 +138,7 @@ pub fn derive_block_nonce(key: &GroupKey, plaintext_hash: &[u8]) -> [u8; NONCE_L
 /// a group has convergent encryption disabled (so identical plaintext
 /// blocks get *distinct* ciphertext and don't cross-dedup on the untrusted
 /// peer — see `encrypt_block`), and also used for encrypting index path/
-/// metadata entries (task 3.1), which have no dedup requirement to justify
+/// metadata entries (the relevant behavior), which have no dedup requirement to justify
 /// a deterministic nonce and should not leak equal-path correlation the way
 /// deterministic block nonces intentionally trade off for dedup.
 pub fn random_nonce() -> [u8; NONCE_LEN] {
@@ -194,11 +194,11 @@ impl EncryptedBlock {
 /// exactly as already computed by `peer_session::block_data_matches`'s
 /// caller.
 ///
-/// `convergent = true` (the default, task 1.1) derives the nonce
+/// `convergent = true` (the default, the relevant behavior) derives the nonce
 /// deterministically from `(K_g, h)`, so identical plaintext anywhere in
 /// the group produces identical ciphertext and dedups on the untrusted
 /// peer — a disclosed equal-block-correlation trade-off.
-/// `convergent = false` (task 1.4, a per-group opt-out for higher-
+/// `convergent = false` (the relevant behavior, a per-group opt-out for higher-
 /// sensitivity groups) uses a fresh random nonce every call instead, so the
 /// same plaintext block encrypted twice produces two unrelated ciphertexts
 /// and the untrusted peer cannot tell they're equal.
@@ -430,7 +430,7 @@ mod tests {
         assert_eq!(dec, b"round trip");
     }
 
-    /// The AEAD-authentication half of task 5.1: a bit-flipped ciphertext
+    /// The AEAD-authentication half a bit-flipped ciphertext
     /// (as a malicious storage peer might return) fails to decrypt at all,
     /// rather than silently producing garbage plaintext.
     #[test]
@@ -443,7 +443,7 @@ mod tests {
         assert!(decrypt_block(&k, &enc.nonce, &enc.ciphertext).is_err());
     }
 
-    /// The plaintext-hash-substitution half of task 5.1: a malicious peer
+    /// The plaintext-hash-substitution half a malicious peer
     /// that returns a *different*, validly-encrypted block (correctly
     /// AEAD-authenticated under its own correct nonce) decrypts cleanly —
     /// AEAD alone cannot catch this, which is exactly why
@@ -510,7 +510,7 @@ mod tests {
         assert!(unwrap_group_key(&wrapped, &recipient_secret).is_err());
     }
 
-    /// task 1.3/5.4: rotation mints a new key distinct from the old one and
+    /// the relevant behavior: rotation mints a new key distinct from the old one and
     /// re-wraps it to every remaining recipient; each remaining recipient
     /// can unwrap and gets the *same* new key.
     #[test]

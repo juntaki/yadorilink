@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the manifest schema's field set changes in a way that
 /// could change how a daemon interprets it. A manifest declaring any
-/// other value is rejected outright (task 1.2's "rejecting ... unsupported
+/// other value is rejected outright (the relevant behavior "rejecting ... unsupported
 /// schema versions") rather than best-effort parsed, since a future
 /// schema change might repurpose a field this version would otherwise
 /// silently misinterpret.
@@ -207,7 +207,7 @@ pub fn verify_and_parse_with_keys(
 }
 
 /// This installation's coarse identity for manifest-entry matching
-/// (task 1.2) — deliberately nothing more identifying than this (see
+/// (the relevant behavior) — deliberately nothing more identifying than this (see
 /// update privacy rule): no device id, no
 /// account id.
 #[derive(Debug, Clone)]
@@ -247,7 +247,7 @@ pub enum Applicability {
 /// Selects the best applicable release entry for `ctx` out of an already
 /// signature-verified `manifest`, or reports why none is currently
 /// installable. Never selects a version `<=` `ctx.current_version`
-/// (task 1.2's downgrade and minimum-version protection requirement) —
+/// (the relevant behavior downgrade and minimum-version protection requirement) —
 /// an entry whose `version`
 /// fails to parse as semver, or that doesn't match the local
 /// channel/platform/arch/install_source, is excluded from consideration
@@ -296,7 +296,7 @@ pub fn select_applicable(manifest: &UpdateManifest, ctx: &LocalContext) -> Appli
 }
 
 /// Tolerates a leading `v` (e.g. `v1.2.3`) since that's a common release
-/// tag convention, but otherwise requires strict semver — task 1.2's
+/// tag convention, but otherwise requires strict semver — the relevant behavior
 /// "rejecting malformed versions".
 fn parse_semver(raw: &str) -> Result<semver::Version, semver::Error> {
     semver::Version::parse(raw.strip_prefix('v').unwrap_or(raw))

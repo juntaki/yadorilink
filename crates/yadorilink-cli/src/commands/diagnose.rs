@@ -34,7 +34,7 @@ enum BundleRequest {
 }
 
 /// Fetches a diagnostics bundle plus a human-readable label describing
-/// where it came from — `"daemon"` / `"daemon-partial"` (task 2.3's
+/// where it came from — `"daemon"` / `"daemon-partial"` (the relevant behavior
 /// bounded-generation fallback) when the daemon answered, or
 /// `"cli-only-fallback"` when it wasn't reachable at all.
 async fn collect_bundle(request: BundleRequest) -> Result<(Value, usize, String), CliError> {

@@ -77,7 +77,7 @@ pub async fn connect(
         }
     };
     let server_public_key = PublicKey::from(server_public_key);
-    // SEC-TRANS-3: `proof_mac` refuses to sign over a non-contributory
+    // security hardening: `proof_mac` refuses to sign over a non-contributory
     // (low-order) shared secret; a relay handing out such a challenge
     // key is either broken or malicious, either way not worth completing
     // the handshake against.

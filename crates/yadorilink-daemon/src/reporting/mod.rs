@@ -6,24 +6,24 @@
 //! `QueuedReportMetadata`, `RetentionPolicy`, ...) plus `std`/`serde_json`
 //! — never `yadorilink-sync-core::index::SyncState` or anything else that
 //! touches the sync-critical SQLite database, so a reporting-storage bug
-//! can never corrupt or block sync (task 2.6).
+//! can never corrupt or block sync (the relevant behavior).
 //!
 //! Submodules:
 //! - `error`: `ReportingStorageError`/`ReportingResult`, used only within
 //!   this module tree — never converted into `crate::error::DaemonError`.
 //! - `time`: dependency-free RFC 3339 formatting.
-//! - `consent_store`: task 2.1/2.2, `<config_dir>/reporting/consent.json`.
-//! - `counters`: task 2.3, `<config_dir>/reporting/counters.json`.
+//! - `consent_store`: the relevant behavior, `<config_dir>/reporting/consent.json`.
+//! - `counters`: the relevant behavior, `<config_dir>/reporting/counters.json`.
 //! - `entry_store`: shared engine behind the next two.
-//! - `error_candidates`: task 2.4, `<config_dir>/reporting/error-candidates/`.
-//! - `queue`: task 2.5, `<config_dir>/reporting/queue/`.
+//! - `error_candidates`: the relevant behavior, `<config_dir>/reporting/error-candidates/`.
+//! - `queue`: the relevant behavior, `<config_dir>/reporting/queue/`.
 //!
 //! `ReportingStorage` below is the facade that bundles all four stores
 //! together and is the type `DaemonState`/section 3's IPC dispatch will
 //! actually hold — its `note_*`/`*_best_effort` methods are the
 //! infallible surface arbitrary daemon call sites (a command handler, a
 //! sync-state transition, an error path) are meant to call directly,
-//! satisfying task 2.6 by construction: there is no `Result` for such a
+//! by construction: there is no `Result` for such a
 //! call site to mishandle. The individual stores' own `Result`-returning
 //! methods remain available (via `ReportingStorage::{consent,queue,error_candidates}`
 //! accessors) for reporting-specific code (future CLI/IPC handlers in
@@ -99,7 +99,7 @@ impl ReportingStorage {
         &self.queue
     }
 
-    // -- Infallible, "safe for any call site" surface (task 2.6) --------
+    // -- Infallible, "safe for any call site" surface (the relevant behavior) --------
 
     /// Best-effort consent read: reporting-disabled default on any
     /// storage failure, for call sites that just need to decide "is

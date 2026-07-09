@@ -1,7 +1,7 @@
 //! Small local config file recording this device's identity and the
 //! coordination-plane/relay addresses to use, written by `yadorilink device
 //! register` (CLI) and read by the daemon on startup — shared local state
-//! that must persist across daemon restarts (task 7.1).
+//! that must persist across daemon restarts (the relevant behavior).
 
 use std::path::PathBuf;
 
@@ -119,7 +119,7 @@ mod tests {
         result
     }
 
-    /// task 1.1/2.2: a `device.json` from before `config_version` existed
+    /// the relevant behavior: a `device.json` from before `config_version` existed
     /// still loads, defaulting to version 0 rather than being treated as
     /// unreadable (which would make the daemon start up as if this device
     /// were never registered — a real behavior regression this task must

@@ -195,7 +195,7 @@ mod tests {
     #[test]
     fn two_envelopes_built_from_the_same_logical_data_serialize_identically_regardless_of_transport(
     ) {
-        // "Transport-independent payload equality" (task 1.6): the same
+        // "Transport-independent payload equality" (the relevant behavior): the same
         // envelope, built twice, must produce byte-identical JSON — no
         // transport-specific field (e.g. an HTTP header, a CLI flag)
         // leaks into the payload itself.
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn serialized_usage_report_never_contains_field_names_associated_with_internal_identity() {
-        // Structural proof of the allowlist principle (task 1.6): the
+        // Structural proof of the allowlist principle (the relevant behavior): the
         // JSON text can never contain these substrings, because
         // UsagePayload/ErrorPayload simply have no field that could hold
         // them — this isn't a redaction check (see redact.rs for that),

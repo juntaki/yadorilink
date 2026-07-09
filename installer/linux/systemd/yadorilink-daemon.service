@@ -1,12 +1,12 @@
 # installer/linux/systemd/yadorilink-daemon.service
 #
-# add-linux-support task 2.3: a systemd --user service unit for
+# a systemd --user service unit for
 # yadorilink-daemon (the sync daemon), packaged by installer/linux's .deb
 # into /usr/lib/systemd/user/ (see installer/linux/README.md).
 #
 # WHY A USER UNIT, NOT A SYSTEM UNIT: the daemon needs the interactive
 # user's own XDG data dir (~/.local/share/yadorilink — device.json, the
-# block store, sync state DB, control socket) and, per design.md, will
+# block store, sync state DB, control socket) and will
 # eventually need that same user's Secret Service session (gnome-keyring/
 # kwallet) for `keyring`'s linux-native credential storage — a system-wide
 # root service has neither. This mirrors exactly why the daemon runs as a
@@ -19,7 +19,7 @@
 # provides for the same daemon.
 #
 # NOT enabled or started automatically by the .deb's postinst script (see
-# design.md's Open Questions: a per-user systemd unit generally shouldn't
+# a per-user systemd unit generally shouldn't
 # be silently enabled by a package installed as root). This is a deliberate,
 # documented manual step — after installing the package, each user who
 # wants the daemon to start at login and survive crashes runs:

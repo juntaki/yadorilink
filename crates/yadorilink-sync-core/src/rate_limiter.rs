@@ -13,14 +13,14 @@
 //! multi-peer hydration dispatcher (which calls `PeerSyncSession::fetch_block`
 //! directly, the same single choke point this module gates), all draw down
 //! one global ceiling rather than each session/peer getting its own
-//! full-rate allowance (task 2.3).
+//! full-rate allowance (the relevant behavior).
 //!
 //! `0` bytes/sec means unlimited: `acquire` takes a fast path of a single
 //! relaxed atomic load and returns immediately without ever touching the
 //! bucket's `Mutex`, so the default (unlimited) configuration imposes no
-//! measurable delay on the hot block-transfer path (task 2.1/2.6).
+//! measurable delay on the hot block-transfer path (the relevant behavior).
 //!
-//! Rates are live-reloadable (task 2.5): `set_rate_bytes_per_sec` updates
+//! Rates are live-reloadable (the relevant behavior): `set_rate_bytes_per_sec` updates
 //! the same atomic `acquire` reads from, so a rate change is visible to the
 //! very next `acquire` call — including a call already sleeping, awaiting
 //! refill, when the change lands — with no daemon restart and no
@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-/// task 5.2/5.4: how recent a window `TokenBucket::current_rate_bytes_per_sec`
+/// the relevant behavior: how recent a window `TokenBucket::current_rate_bytes_per_sec`
 /// averages over — short enough that `yadorilink status` reflects genuinely
 /// *current* activity (not an all-time average since daemon start, which
 /// would understate an ongoing burst after a long idle period), long enough
@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 const MEASURED_RATE_WINDOW: Duration = Duration::from_secs(5);
 
 /// A byte-denominated token bucket. `rate_bytes_per_sec == 0` means
-/// unlimited (bypassed entirely — task 2.1).
+/// unlimited (bypassed entirely — the relevant behavior).
 pub struct TokenBucket {
     rate_bytes_per_sec: AtomicU64,
     state: StdMutex<BucketState>,
@@ -55,7 +55,7 @@ struct BucketState {
     last_refill: Instant,
 }
 
-/// task 5.2/5.4: a simple trailing-window byte counter, independent of the
+/// the relevant behavior: a simple trailing-window byte counter, independent of the
 /// rate-limiting bucket state above — tracks real throughput for
 /// `yadorilink status` regardless of whether a limit is even configured
 /// (an unlimited transfer still has a real, worth-reporting current rate).
@@ -83,11 +83,11 @@ impl TokenBucket {
         Self::new(0)
     }
 
-    /// task 5.2/5.4: bytes/sec transferred through this bucket in roughly
+    /// the relevant behavior: bytes/sec transferred through this bucket in roughly
     /// the last `MEASURED_RATE_WINDOW` — independent of the configured
     /// rate limit (tracked even when unlimited). Not itself gated by
     /// `acquire`'s zero-overhead bypass: this is a separate, deliberately
-    /// lightweight (single mutex, no allocation) counter task 2.1's
+    /// lightweight (single mutex, no allocation) 's
     /// "zero overhead" refers to the *throttling* behavior, not this O(1)
     /// bookkeeping addition.
     pub fn current_rate_bytes_per_sec(&self) -> u64 {
@@ -118,18 +118,18 @@ impl TokenBucket {
 
     /// Consumes `bytes` worth of tokens, awaiting bucket refill if none are
     /// currently available. A no-op (immediate return, no lock taken) when
-    /// the configured rate is `0` (unlimited) — task 2.1/2.6.
+    /// the configured rate is `0` (unlimited) — the relevant behavior.
     pub async fn acquire(&self, bytes: u64) {
         if bytes == 0 {
             return;
         }
-        // task 5.2/5.4: recorded unconditionally, including the unlimited
+        // the relevant behavior: recorded unconditionally, including the unlimited
         // (rate == 0) fast path below — a bucket with no configured limit
         // still has a real current transfer rate worth reporting.
         self.record_measured_bytes(bytes);
         loop {
             // Re-read the rate on every loop iteration (not just once at
-            // entry) so a rate change applied mid-wait (task 2.5) is
+            // entry) so a rate change applied mid-wait (the relevant behavior) is
             // honored on the very next refill computation.
             let rate = self.rate_bytes_per_sec.load(Ordering::Relaxed);
             if rate == 0 {
@@ -168,7 +168,7 @@ impl TokenBucket {
                 None => return,
                 Some(d) => {
                     // Cap each individual sleep so a live rate change
-                    // (task 2.5) — including one applied while this call is
+                    // (the relevant behavior) — including one applied while this call is
                     // already waiting — is picked up on the *next* loop
                     // iteration's rate re-read within a bounded interval,
                     // rather than only after however long the deficit
@@ -182,7 +182,7 @@ impl TokenBucket {
 }
 
 /// The upload/download bucket pair a `PeerSyncSession` gates block transfer
-/// on (task 2.2/2.3). `unlimited()` is the default a session starts with
+/// on (the relevant behavior). `unlimited()` is the default a session starts with
 /// before the daemon injects its shared, config-driven pair via
 /// `PeerSyncSession::set_rate_limiters`.
 pub struct RateLimiters {
@@ -228,7 +228,7 @@ mod tests {
         );
     }
 
-    /// task 5.2/5.4: `current_rate_bytes_per_sec` reports real throughput
+    /// the relevant behavior: `current_rate_bytes_per_sec` reports real throughput
     /// even on an *unlimited* bucket (no configured rate) — `status`
     /// reporting shouldn't show `0` current rate just because nothing is
     /// throttling.

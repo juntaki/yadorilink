@@ -12,7 +12,7 @@ settings:
     CODE_SIGN_STYLE: Automatic
 
 targets:
-  # NOTE (on-demand-sync task 7.7): this .xcodeproj/project.yml keeps its
+  # NOTE (): this .xcodeproj/project.yml keeps its
   # original name/directory (YadoriLinkFinderSync) even though it now also
   # hosts the YadoriLinkFileProvider extension target below — one host app
   # embedding both extensions was chosen over a second host app because
@@ -33,7 +33,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.juntaki.yadorilink
         INFOPLIST_FILE: HostApp/Info.plist
         PRODUCT_NAME: YadoriLinkFinderSyncHost
-        # task 7.2: HostApp/DomainRegistration.swift needs the
+        # the relevant behavior: HostApp/DomainRegistration.swift needs the
         # fileprovider-core FFI (yadorilink_fp_list_on_demand_folders) to
         # discover which OnDemand folder groups to register as File
         # Provider domains, and the FileProvider.framework for
@@ -84,7 +84,7 @@ targets:
       - Cocoa.framework
       - FinderSync.framework
 
-  # on-demand-sync task 7.1/7.2/7.3: NSFileProviderReplicatedExtension
+  # /7.3: NSFileProviderReplicatedExtension
   # target. Deployment target deliberately left at the project-wide 11.0
   # base (NOT bumped, despite the task brief's expectation that it would
   # need to be higher) — verified directly against this build machine's

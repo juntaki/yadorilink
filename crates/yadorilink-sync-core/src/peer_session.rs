@@ -15,12 +15,12 @@
 //! claim, what presence to report, what path to name — are adversarial
 //! input, not trusted metadata. `reconcile_one_file`/`reconcile_files_if_
 //! authorized` bound version-vector counter growth and incoming-index
-//! cardinality (SEC-SYNC-2, SEC-SYNC-3(a)); `resolve_and_apply_conflict`
-//! bounds the accepted `mtime` skew (SEC-SYNC-3(b));
+//! cardinality (security hardening, security hardening); `resolve_and_apply_conflict`
+//! bounds the accepted `mtime` skew (security hardening);
 //! `handle_presence_signal` binds a presence signal to the authenticated
-//! `peer_device_id` and validates its path (SEC-SYNC-4); `materialize`/
+//! `peer_device_id` and validates its path (security hardening); `materialize`/
 //! `hydrate_file_with_timeout` re-verify the resolved write target stays
-//! under the sync root (SEC-SYNC-5). See `version_vector.rs`'s and
+//! under the sync root (security hardening). See `version_vector.rs`'s and
 //! `conflict.rs`'s doc comments for why the version-vector and mtime
 //! mitigations are explicitly **partial**, not a claim of full prevention
 //! — a mutually-untrusted peer can always lie about its own causal
@@ -105,7 +105,7 @@ const ADAPTIVE_WINDOW_INITIAL: usize = 4;
 /// "peer is unusable, stop trying" decision this controller doesn't make).
 const ADAPTIVE_WINDOW_MIN: usize = 1;
 
-/// SEC-SYNC-2: caps on how many `FileRecord`s, and how many total blocks
+/// security hardening: caps on how many `FileRecord`s, and how many total blocks
 /// across all of them, a single incoming `FullIndex`/`IndexUpdate` message
 /// may carry. Without this, a malicious/compromised group member can
 /// advertise an index of arbitrarily many / arbitrarily large files —
@@ -232,7 +232,7 @@ fn decompress_block(
     }
 }
 
-/// SEC-SYNC-2: the cardinality-cap check behind
+/// security hardening: the cardinality-cap check behind
 /// `reconcile_files_if_authorized`, factored out as a free function taking
 /// explicit `max_files`/`max_blocks` so it's unit-testable
 /// (`cardinality_cap_tests` below) against small synthetic caps instead of
@@ -249,7 +249,7 @@ fn index_message_exceeds_cardinality_cap(
     files.len() > max_files || total_blocks > max_blocks
 }
 
-/// SEC-SYNC-2: a per-(session, group) ceiling on how many blocks this
+/// security hardening: a per-(session, group) ceiling on how many blocks this
 /// session will *eagerly* fetch and write for one folder group over its
 /// lifetime — independent of, and in addition to, the per-message caps
 /// above (those bound one large message; this bounds cumulative eager
@@ -268,7 +268,7 @@ fn index_message_exceeds_cardinality_cap(
 /// the separate free-space headroom mechanism).
 const MAX_EAGER_BLOCKS_PER_GROUP_PER_SESSION: u64 = 200_000;
 
-/// SEC-SYNC-2: the actual admission bookkeeping behind
+/// security hardening: the actual admission bookkeeping behind
 /// `PeerSyncSession::admit_eager_blocks`, factored out as a free function
 /// over an explicit `admission` map and `max_per_group` ceiling so it's
 /// unit-testable (`eager_admission_tests` below) without constructing a
@@ -467,7 +467,7 @@ fn materialize_symlink_at(
 ) -> Result<(), SyncError> {
     state.upsert_file_with_origin(group_id, record, origin_device_id)?;
     let out_path = root.join(&record.path);
-    // SEC-SYNC-5 defense-in-depth, same as every other materialization
+    // security hardening defense-in-depth, same as every other materialization
     // write path in this module — see `verify_write_target_within_root`'s
     // doc comment.
     verify_write_target_within_root(&out_path, root)?;
@@ -1023,13 +1023,9 @@ impl LiveGroupAuthorization {
 
 /// The permission this (local) device has
 /// granted its peer for one shared folder group. Kept as a small
-/// crate-local enum — mirroring `yadorilink-coordination::shares::ShareRole`
-/// in spirit but deliberately *not* a shared type: this crate has no
-/// dependency on `yadorilink-coordination` (it doesn't know about ACLs,
-/// accounts, or the coordination plane at all — see `shared_group_ids`'s
-/// doc comment), so the caller (eventually, the daemon's netmap-diff
-/// reaction, mirroring how `revoke_group`/`grant_group`/
-/// `set_authorized_groups` are already fed group-id strings computed
+/// crate-local enum rather than a shared coordination type: this crate only
+/// knows about authorized folder groups, not accounts or ACL storage. The
+/// caller feeds it group ids and roles computed
 /// elsewhere) is expected to translate a `coordination.proto`
 /// `ShareRole`/`PeerInfo.shared_group_roles` entry into this before calling
 /// `set_peer_role`/`set_peer_roles` below.
@@ -1331,7 +1327,7 @@ pub struct PeerSyncSession {
     ciphertext_nonces: StdMutex<CiphertextNonceCache>,
     /// group_id -> local linked directory, for the shared groups above.
     sync_roots: HashMap<String, PathBuf>,
-    /// SEC-SYNC-5: `sync_roots`, pre-canonicalized once at construction —
+    /// security hardening: `sync_roots`, pre-canonicalized once at construction —
     /// `verify_write_target_within_canonical_root` is called on every
     /// eager materialize/hydrate, a per-peer-message-concurrency-bounded
     /// hot path (see that function's doc comment), so resolving each
@@ -1374,7 +1370,7 @@ pub struct PeerSyncSession {
     /// open, by which device" and surfacing it, since that's in-memory,
     /// per-device state, not something `yadorilink-sync-core` itself persists.
     presence_tx: Option<mpsc::UnboundedSender<PresenceEvent>>,
-    /// SEC-SYNC-2: group_id -> cumulative blocks admitted to eager fetch
+    /// security hardening: group_id -> cumulative blocks admitted to eager fetch
     /// so far this session — see `MAX_EAGER_BLOCKS_PER_GROUP_PER_SESSION`.
     eager_admission: StdMutex<HashMap<String, u64>>,
     /// This session's upload/
@@ -1487,7 +1483,7 @@ impl PeerSyncSession {
         forward_tx: Option<mpsc::UnboundedSender<(String, FileRecord)>>,
         presence_tx: Option<mpsc::UnboundedSender<PresenceEvent>>,
     ) -> Arc<Self> {
-        // SEC-SYNC-5: best-effort pre-canonicalize each sync root once —
+        // security hardening: best-effort pre-canonicalize each sync root once —
         // see `canonical_sync_roots`'s doc comment. A group whose root
         // can't be created/canonicalized right now (rare — a missing
         // parent, a permissions issue) is simply left out of the cache;
@@ -2044,7 +2040,7 @@ impl PeerSyncSession {
         }
     }
 
-    /// SEC-SYNC-2: attempts to admit `block_count` more blocks to eager
+    /// security hardening: attempts to admit `block_count` more blocks to eager
     /// fetch for `group_id` under this session's cumulative budget
     /// (`MAX_EAGER_BLOCKS_PER_GROUP_PER_SESSION`), returning whether the
     /// admission succeeded. On success, the group's counter is
@@ -2834,7 +2830,7 @@ impl PeerSyncSession {
     ///   storage_peer` directly with a specific `(ciphertext_hash,
     ///   plaintext_hash)` pair it already knows about — eagerly walking
     ///   every entry this handler sees and fetching it would defeat this
-    ///   crate's existing eager-admission bounds (SEC-SYNC-2). Decrypting
+    ///   crate's existing eager-admission bounds (security hardening). Decrypting
     ///   `encrypted_file_meta` here to learn per-block plaintext hashes for
     ///   that lookup, so a trusted device can locate ciphertext for a block
     ///   it doesn't yet have `ciphertext_hash` for by any other means, is a
@@ -3093,7 +3089,7 @@ impl PeerSyncSession {
         }
     }
 
-    /// SEC-SYNC-4: an authorized peer's session is only ever authenticated
+    /// security hardening: an authorized peer's session is only ever authenticated
     /// as *itself* (`self.peer_device_id`) — sharing a folder group grants
     /// no authority to speak for any other device, so a signal claiming a
     /// different `device_id` is spoofing "who is editing", and a signal
@@ -3206,7 +3202,7 @@ impl PeerSyncSession {
             );
             return Ok(());
         }
-        // SEC-SYNC-2: bound the cardinality of a single incoming index
+        // security hardening: bound the cardinality of a single incoming index
         // message before doing any work on it — see
         // `MAX_FILES_PER_INDEX_MESSAGE`/`MAX_BLOCKS_PER_INDEX_MESSAGE`'s
         // doc comment. Rejected wholesale (not truncated to the cap):
@@ -4121,7 +4117,7 @@ impl PeerSyncSession {
         self.state.clear_held(group_id, path)?;
 
         let out_path = self.local_file_path(group_id, path);
-        // SEC-SYNC-5 defense-in-depth — see `materialize`'s matching call
+        // security hardening defense-in-depth — see `materialize`'s matching call
         // for what this does and does not close.
         self.verify_write_target(group_id, &out_path)?;
         // Preflight before the
@@ -4460,7 +4456,7 @@ impl PeerSyncSession {
             return Ok(());
         };
 
-        // SEC-SYNC-3(a): sanitize the peer-supplied version vector against
+        // security hardening: sanitize the peer-supplied version vector against
         // the last version this device actually accepted for this file
         // *before* using it for a causality comparison — see
         // `version_vector.rs`'s trust-boundary doc comment and
@@ -4558,7 +4554,7 @@ impl PeerSyncSession {
         meta: IncomingWireMeta,
         policy: MaterializationPolicy,
     ) -> Result<(), SyncError> {
-        // SEC-SYNC-3(b): both the canonical-name decision
+        // security hardening: both the canonical-name decision
         // (`resolve_conflict_names`) and the content-winner decision
         // (`local_is_loser` below) must agree on which side wins, so both
         // go through the same `now_unix_nanos`-bounded `a_is_loser` — see
@@ -4935,7 +4931,7 @@ impl PeerSyncSession {
         // adoption or an update to a path already in the index.
         let pinned = self.state.is_pinned(group_id, &record.path)?;
 
-        // SEC-SYNC-2: an explicit pin always fetches (a deliberate,
+        // security hardening: an explicit pin always fetches (a deliberate,
         // user-initiated request bypasses the eager-fetch admission
         // budget, same as it already bypasses the materialization policy
         // check itself). Plain policy-driven eager fetch is additionally
@@ -5008,7 +5004,7 @@ impl PeerSyncSession {
             self.state.upsert_file_with_origin(group_id, record, origin_device_id)?;
             self.state.clear_held(group_id, &record.path)?;
             let out_path = self.local_file_path(group_id, &record.path);
-            // SEC-SYNC-5 defense-in-depth: `is_safe_relative_path` (in
+            // security hardening defense-in-depth: `is_safe_relative_path` (in
             // `reconcile_files`) already blocks `..`/absolute components,
             // but a *symlink* at an intermediate path component is
             // followed by the plain `create`/`rename` calls inside
@@ -5046,7 +5042,7 @@ impl PeerSyncSession {
                 MaterializationState::Placeholder,
             )?;
             let out_path = self.local_file_path(group_id, &record.path);
-            // SEC-SYNC-5 defense-in-depth — see the comment above.
+            // security hardening defense-in-depth — see the comment above.
             self.verify_write_target(group_id, &out_path)?;
             write_placeholder(&out_path, record.size, record.mtime_unix_nanos)?;
             // A placeholder still gets the recorded exec bit
@@ -5086,13 +5082,13 @@ impl PeerSyncSession {
         Ok(on_disk_size != Some(record.size))
     }
 
-    /// `group_id`'s local linked directory (SEC-SYNC-5: the root
+    /// `group_id`'s local linked directory (security hardening: the root
     /// `verify_write_target` checks resolved write targets stay under).
     fn sync_root(&self, group_id: &str) -> PathBuf {
         self.sync_roots.get(group_id).cloned().unwrap_or_default()
     }
 
-    /// SEC-SYNC-5 defense-in-depth check before writing through `out_path`
+    /// security hardening defense-in-depth check before writing through `out_path`
     /// — see `chunker::verify_write_target_within_canonical_root`'s doc
     /// comment. Uses the cached canonical root (`canonical_sync_roots`)
     /// when available (the common case, avoiding a repeated
@@ -5101,7 +5097,7 @@ impl PeerSyncSession {
     /// rare case it wasn't cached at session construction time.
     fn verify_write_target(&self, group_id: &str, out_path: &Path) -> Result<(), SyncError> {
         let raw_root = self.sync_root(group_id);
-        // Fast path: SEC-SYNC-5 is specifically about a symlink at an
+        // Fast path: security hardening is specifically about a symlink at an
         // *intermediate* directory component between the sync root and
         // the file — when `out_path`'s parent *is* the sync root itself
         // (an ordinary top-level file, no subdirectory in `record.path`
@@ -5453,7 +5449,7 @@ mod path_safety_tests {
     }
 }
 
-/// SEC-SYNC-2: the incoming-index cardinality cap
+/// security hardening: the incoming-index cardinality cap
 /// (`index_message_exceeds_cardinality_cap`, wired into
 /// `reconcile_files_if_authorized`) — exercised against small synthetic
 /// `max_files`/`max_blocks` rather than the real (deliberately huge)
@@ -5514,7 +5510,7 @@ mod cardinality_cap_tests {
     }
 }
 
-/// SEC-SYNC-2: the per-(session, group) eager-fetch admission
+/// security hardening: the per-(session, group) eager-fetch admission
 /// budget (`admit_eager_blocks_impl`, wired into
 /// `PeerSyncSession::admit_eager_blocks`) — exercised against a small
 /// synthetic `max_per_group` rather than the real (deliberately huge)
@@ -5906,7 +5902,7 @@ mod hazard_reason_tests {
         .unwrap();
 
         let stored = state.get_file("group-1", "CON.txt").unwrap();
-        assert!(stored.is_some(), "task 4.4: a held record must still be indexed");
+        assert!(stored.is_some(), "the relevant behavior: a held record must still be indexed");
         assert!(!stored.unwrap().deleted);
 
         let held = state.get_held_state("group-1", "CON.txt").unwrap().unwrap();

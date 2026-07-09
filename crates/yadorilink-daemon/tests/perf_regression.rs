@@ -1,4 +1,4 @@
-//! sync-performance task 5.1: before/after-style regression coverage for
+//! before/after-style regression coverage for
 //! the two PERF-1 scenarios not already covered by a dedicated benchmark
 //! in another crate — "large-file scan" and "large-file hydration" must
 //! not block the tokio runtime (`link_manager.rs`'s `spawn_blocking`/

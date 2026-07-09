@@ -13,7 +13,7 @@ use crate::control_client;
 use crate::error::CliError;
 
 /// Shared by `status`/`check` — both end up printing the exact same
-/// shape of information (task 5.1's "current version, channel, install
+/// shape of information (the relevant behavior "current version, channel, install
 /// source, last check time, available version if any, rollout/holdback
 /// state, and last update error if any").
 fn print_status(status: &UpdateStatusResponse) {

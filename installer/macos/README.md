@@ -8,8 +8,8 @@ Builds a macOS `.pkg` that installs:
 | `yadorilink-daemon` | `/usr/local/bin/yadorilink-daemon` |
 | `YadoriLinkFinderSyncHost.app` (FinderSync + File Provider extensions) | `/Applications/YadoriLinkFinderSyncHost.app` |
 
-`yadorilink-coordination` and `yadorilink-relay` are server-side binaries and are
-**not** part of this installer — deploy those to your own server instead.
+The relay and any coordination-service deployment are server-side components and
+are **not** installed by this desktop/client package.
 
 This file covers building, signing, verifying, and uninstalling the `.pkg`.
 

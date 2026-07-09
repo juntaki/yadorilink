@@ -184,7 +184,7 @@ begin
              'it manually with "yadorilink daemon start" or by running yadorilink-daemon.exe directly.',
              mbError, MB_OK);
 
-    // add-desktop-status-app task 4.2: register the status app's own logon
+    // register the status app's own logon
     // Scheduled Task the same way, as a separate (non-fatal-to-the-rest-
     // of-setup) step — a user who declines/can't get the tray icon
     // running can still use the CLI and daemon fully, matching the

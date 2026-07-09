@@ -1,4 +1,4 @@
-//! build-filebox-mvp task 9.1 spike: a pure-Rust `windows-rs` COM
+//! spike: a pure-Rust `windows-rs` COM
 //! implementation of `IShellIconOverlayIdentifier` for Windows Explorer's
 //! icon-overlay system (the first-choice approach, before
 //! falling back to a C++/COM shim if this proves unstable).
@@ -10,7 +10,7 @@
 //! error dialog or a hang) whenever the daemon isn't reachable.
 
 mod context_menu;
-// on-demand-sync task 6.1-6.3: `pub` so the `yadorilink-cfapi-host` binary
+// -6.3: `pub` so the `yadorilink-cfapi-host` binary
 // target (see Cargo.toml's doc comment on `[[bin]]`) can reuse the same
 // IPC client/cfapi wrapper code via this crate's `rlib` output, instead
 // of duplicating the shell-IPC protocol handling in a second place.

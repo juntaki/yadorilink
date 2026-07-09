@@ -65,7 +65,7 @@ fn backdate_past_grace_window(path: &std::path::Path) {
     file.set_modified(SystemTime::now() - yadorilink_daemon::gc::GC_GRACE_WINDOW * 2).unwrap();
 }
 
-/// task 4.3/5.3: a real `gc` reclaims an orphaned block and reports
+/// the relevant behavior: a real `gc` reclaims an orphaned block and reports
 /// counts matching the block store's actual before/after contents.
 #[tokio::test]
 async fn gc_reclaims_an_orphaned_block_and_reports_matching_counts() {
@@ -90,7 +90,7 @@ async fn gc_reclaims_an_orphaned_block_and_reports_matching_counts() {
     yadorilink_cli::commands::gc::run(false).await.unwrap();
 }
 
-/// task 4.3: `--dry-run` reports the same delete-set size a real
+/// the relevant behavior: `--dry-run` reports the same delete-set size a real
 /// run would, but performs zero deletions.
 #[tokio::test]
 async fn gc_dry_run_matches_a_real_runs_estimate_without_deleting() {
@@ -126,7 +126,7 @@ async fn gc_dry_run_matches_a_real_runs_estimate_without_deleting() {
     yadorilink_cli::commands::gc::run(true).await.unwrap();
 }
 
-/// task 4.1/4.3/5.3: `status` reports non-zero block-store usage after a
+/// the relevant behavior/5.3: `status` reports non-zero block-store usage after a
 /// block is written, and lower usage (plus a recorded `last_gc_unix`)
 /// after a GC run reclaims it.
 #[tokio::test]

@@ -93,7 +93,7 @@ async fn limits_set_is_reflected_by_status() {
     assert_eq!(status.download_limit_bytes_per_sec, 0);
 }
 
-/// task 2.5/5.5: a live daemon picks up a `limits set` change without a
+/// the relevant behavior: a live daemon picks up a `limits set` change without a
 /// restart — the *same* `DaemonState` (never reconstructed) reflects the
 /// new rate immediately on its shared `rate_limiters`.
 #[tokio::test]

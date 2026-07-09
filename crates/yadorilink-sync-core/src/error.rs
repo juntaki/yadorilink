@@ -93,7 +93,7 @@ pub enum SyncError {
     #[error("{0}")]
     InvalidLinkMode(String),
 
-    /// SEC-SYNC-5 defense-in-depth: after resolving a peer-advertised path
+    /// security hardening defense-in-depth: after resolving a peer-advertised path
     /// under a folder group's sync root, canonicalizing the resolved
     /// parent directory landed outside that root — most likely because a
     /// pre-existing symlink at an intermediate path component was
@@ -112,7 +112,7 @@ pub enum SyncError {
     /// `yadorilink_local_storage::StorageError::DiskPressure` by the `From`
     /// impl below when the block store's own preflight rejects a write.
     /// Never produced via a generic `?`-conversion from an ordinary I/O
-    /// error — task 1.5 requires this stay distinguishable from a
+    /// error — the relevant behavior requires this stay distinguishable from a
     /// transient/network failure so callers (the daemon's Degraded-state
     /// tracking, in particular) can back off differently for "disk is
     /// full" than for "peer/network blip, just retry".

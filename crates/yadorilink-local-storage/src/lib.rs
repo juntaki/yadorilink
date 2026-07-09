@@ -1,4 +1,4 @@
-//! On-device content-addressed block store (see openspec `local-storage` spec).
+//! On-device content-addressed block store.
 
 mod ciphertext_store;
 mod error;

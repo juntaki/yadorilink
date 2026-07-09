@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <!--
-  on-demand-sync task 7.6: entitlements for the File Provider extension
+  entitlements for the File Provider extension
   point (com.apple.fileprovider-nonui), same App Sandbox + App Group
   shape as ../../YadoriLinkFinderSync/Extension/Extension.entitlements
   (read that file's doc comment in full for the hard-won reasoning this
@@ -29,7 +29,7 @@
      this specific extension point in this session (only FinderSync's
      use of the same entitlement was confirmed via a real Finder
      badge/menu render) — flagged as a residual verification gap in
-     tasks.md 7.8, not assumed proven by analogy alone.
+     the task notes 7.8, not assumed proven by analogy alone.
 
   This extension additionally needs no entitlement for the File Provider
   domain mechanism itself (NSFileProviderManager/domain registration is

@@ -2,10 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <!--
-  build-yadorilink-mvp task 10.4: NOT applied by build.sh — documentation
+  NOT applied by build.sh — documentation
   only, a starting point for a real hardened/distributable build,
   mirroring Nextcloud's own FinderSync-extension entitlement pattern
-  (design.md D3's reference) adapted to yadorilink's actual transport.
+  (the design's reference) adapted to yadorilink's actual transport.
 
   Two alternative approaches are sketched below; pick ONE for a real
   build, don't combine them:
@@ -33,7 +33,7 @@
       to actually implement) to additionally register a real launchd
       Mach service for shell-integration IPC, and grant the extension a
       Mach-lookup exception instead of a filesystem exception — closer to
-      what design.md D3's "Unix domain socket over XPC" phrase implies,
+      what the design's "Unix domain socket over XPC" phrase implies,
       and the more "correct" long-term shape (Mach services compose
       better with sandboxing than raw filesystem-path exceptions, which
       Apple treats as a private/deprecated escape hatch):
@@ -53,8 +53,7 @@
 
   Either way, an App Group entitlement is the other common pattern (share
   a container both processes can read/write into and relocate the socket
-  there), but the daemon here already predates App Group scoping (task
-  8.4 chose an XDG/Application-Support-style path independent of any
+  there), but the daemon here already predates App Group scoping (the relevant behavior chose an XDG/Application-Support-style path independent of any
   specific app's container), so that would also require daemon-side
   changes to adopt.
 -->

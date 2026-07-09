@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 use crate::device_config::{self, DeviceConfig};
 use crate::error::CliError;
 
-/// Bundle file format version (task 3.1/3.2): bumping this on any future
+/// Bundle file format version (the relevant behavior): bumping this on any future
 /// change to `KeyBundlePlaintext`'s shape lets `import_key_bundle` reject an
 /// incompatible bundle up front with a clear error instead of a confusing
 /// deserialization failure after a successful decrypt.
@@ -248,10 +248,9 @@ pub async fn import_key_bundle(input_path: PathBuf, passphrase: String) -> Resul
 }
 
 /// Derives a 32-byte symmetric key from `passphrase` and `salt` with
-/// Argon2id (same algorithm family `yadorilink-coordination` uses for
-/// password/recovery-code hashing, applied here as a raw KDF instead of a
-/// storable password hash). Runs entirely client-side -- neither the
-/// passphrase nor the derived key is ever sent anywhere.
+/// Argon2id, applied here as a raw KDF instead of a storable password hash.
+/// Runs entirely client-side -- neither the passphrase nor the derived key is
+/// ever sent anywhere.
 fn derive_bundle_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>, CliError> {
     let mut key = Zeroizing::new([0u8; KEY_LEN]);
     Argon2::default()

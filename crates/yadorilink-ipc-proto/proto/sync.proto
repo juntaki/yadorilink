@@ -3,10 +3,9 @@ package yadorilink.sync.v1;
 
 // Peer-to-peer sync protocol exchanged directly between devices over a
 // `yadorilink-transport::PeerChannel` (a raw encrypted message channel, not
-// gRPC — see design.md D2's note that only the coordination plane uses
-// gRPC; peer sync traffic rides the WireGuard-encrypted PeerChannel
-// established per design.md D6/D10). Every message exchanged between two
-// syncing devices is one prost-encoded `SyncMessage`.
+// gRPC). Peer sync traffic rides the WireGuard-encrypted PeerChannel. Every
+// message exchanged between two syncing devices is one prost-encoded
+// `SyncMessage`.
 
 message VersionVector {
   // device_id -> monotonically increasing counter for that device's edits.
@@ -19,17 +18,14 @@ message BlockInfo {
   uint32 size = 3;
 }
 
-// add-untrusted-storage-peer task 3.1: a decrypted view of one file's
-// block list, addressed the way an untrusted storage peer sees it —
-// carried *inside* `EncryptedFileEntry.encrypted_file_meta` (never sent
-// unencrypted), so this message only ever appears as plaintext bytes a
-// trusted device produces before AEAD-encrypting them or consumes after
-// AEAD-decrypting them (see `yadorilink_sync_core::content_crypto` and
-// `peer_session`'s `EncryptedFileMeta`). Deliberately its own small
-// message (not a reuse of `FileInfo`) since it carries only what a
-// storage-only exchange needs — path and each block's *plaintext* hash,
-// in order — not version vectors, mtimes, or the other `FileInfo` fields
-// that have no meaning for a passive ciphertext-storage relationship.
+// A decrypted view of one file's block list, addressed the way an untrusted
+// storage peer sees it. Carried *inside*
+// `EncryptedFileEntry.encrypted_file_meta` and never sent unencrypted, so this
+// message only ever appears as plaintext bytes a trusted device produces
+// before AEAD-encrypting them or consumes after AEAD-decrypting them.
+// Deliberately its own small message, not a reuse of `FileInfo`, since it
+// carries only what a storage-only exchange needs: path and each block's
+// *plaintext* hash, in order.
 message PlaintextFileMeta {
   string path = 1;
   repeated bytes block_hashes = 2; // plaintext content hash `h`, one per block, in order
@@ -38,23 +34,20 @@ message PlaintextFileMeta {
 
 // One ciphertext block as an untrusted storage peer sees it: addressed by
 // the hash of the *ciphertext* (never the plaintext hash), with the
-// ciphertext's own size (which, per design.md's disclosed metadata-leak
-// section, differs negligibly from the plaintext block size — AEAD adds a
-// fixed-size tag — so this is effectively the same size signal the peer
-// would learn from a plaintext `BlockInfo.size` anyway).
+// ciphertext's own size. AEAD adds a fixed-size tag, so this is effectively
+// the same size signal the peer would learn from a plaintext
+// `BlockInfo.size` anyway.
 message CiphertextBlockInfo {
   bytes ciphertext_hash = 1; // SHA-256 of the AEAD ciphertext
   uint32 size = 2;
 }
 
-// add-untrusted-storage-peer task 3.1: one file's entry in an
-// `EncryptedIndex`/`EncryptedIndexUpdate`. What an untrusted storage peer
-// can see: `blocks` (ciphertext hashes/sizes — enough to store, dedup, and
-// serve blocks back) and `deleted`. What it cannot see: `encrypted_file_
-// meta` decrypts (only with the group content key `K_g`) to a
-// `PlaintextFileMeta` carrying the real path and each block's plaintext
-// hash — see that message's doc comment. This is the encrypted-peer spec's
-// "Index shared with an untrusted peer hides names" requirement.
+// One file's entry in an `EncryptedIndex`/`EncryptedIndexUpdate`. An
+// untrusted storage peer can see `blocks` (ciphertext hashes/sizes — enough
+// to store, dedup, and serve blocks back) and `deleted`. It cannot see
+// `encrypted_file_meta`, which decrypts only with the group content key `K_g`
+// to a `PlaintextFileMeta` carrying the real path and each block's plaintext
+// hash.
 message EncryptedFileEntry {
   bytes encrypted_file_meta = 1; // AEAD(K_g, file_meta_nonce, serialized PlaintextFileMeta)
   bytes file_meta_nonce = 2;
@@ -63,20 +56,15 @@ message EncryptedFileEntry {
   // encrypted form, so an untrusted peer (which cannot decrypt `encrypted_
   // file_meta`) can still garbage-collect a deleted file's ciphertext
   // blocks without needing the key — the same "coarse metadata inevitably
-  // leaks" trade-off design.md already documents for file counts/sizes.
+  // leaks" trade-off that already exists for file counts/sizes.
   bool deleted = 4;
 }
 
-// add-sync-fidelity task 5.1: the kind of filesystem entry `FileInfo`
-// describes, mirroring `yadorilink_sync_core::types::RecordKind`
-// (design.md D1, task 1.1). `RECORD_KIND_UNSPECIFIED` is the proto3
-// zero-value — a message from a peer build that predates this change
-// (and any FileInfo this build itself doesn't set the field on) decodes
-// as UNSPECIFIED, which a receiver treats identically to
-// RECORD_KIND_FILE (the pre-existing, only-possible-before-this-change
-// behavior) per proposal.md's BREAKING note: an old regular-file record
-// is never retroactively reclassified as a symlink just because this
-// field happens to be absent.
+// The kind of filesystem entry `FileInfo` describes, mirroring
+// `yadorilink_sync_core::types::RecordKind`. `RECORD_KIND_UNSPECIFIED` is the
+// proto3 zero-value. A receiver treats it identically to RECORD_KIND_FILE, so
+// an old regular-file record is never retroactively reclassified as a symlink
+// just because this field is absent.
 enum RecordKind {
   RECORD_KIND_UNSPECIFIED = 0;
   RECORD_KIND_FILE = 1;
@@ -84,10 +72,9 @@ enum RecordKind {
   RECORD_KIND_SYMLINK = 3;
 }
 
-// add-transfer-compression task 1.1: negotiated wire compression for
-// selected sync payloads. `COMPRESSION_NONE` is the proto3 zero-value so
-// messages encoded by older peers, or by newer peers that intentionally
-// leave the field unset, decode as uncompressed.
+// Negotiated wire compression for selected sync payloads. `COMPRESSION_NONE`
+// is the proto3 zero-value so messages encoded by older peers, or by newer
+// peers that intentionally leave the field unset, decode as uncompressed.
 enum Compression {
   COMPRESSION_NONE = 0;
   COMPRESSION_ZSTD = 1;
@@ -100,30 +87,30 @@ message FileInfo {
   VersionVector version = 4;
   repeated BlockInfo blocks = 5;
   bool deleted = 6;
-  // add-sync-fidelity task 5.1: symlink-record and exec-bit fidelity
-  // fields (design.md D1/D2). Additive (fields 7-10) — `BlockInfo` and
+  // Symlink-record and exec-bit fidelity fields. Additive (fields 7-10) —
+  // `BlockInfo` and
   // this message's pre-existing fields 1-6 are unchanged, so an older
   // peer decoding a message from a newer peer simply ignores these
   // (standard proto3 forward compatibility), and a newer peer decoding a
   // message from an older peer sees them at their zero values (see
   // `RecordKind`'s doc comment above).
   RecordKind record_kind = 7;
-  // Raw, unresolved symlink target path text (design.md D1 — never
-  // dereferenced, synced as opaque text). Meaningful only when
+  // Raw, unresolved symlink target path text. Never dereferenced, synced as
+  // opaque text. Meaningful only when
   // `record_kind == RECORD_KIND_SYMLINK`; unset/empty otherwise.
   // `optional` so "not set" is distinguishable from "empty target
   // string" at the wire level, even though today's receivers treat a
   // symlink record with no usable target the same way either way (see
   // `yadorilink_sync_core::peer_session::materialize_symlink_at`).
   optional string symlink_target = 8;
-  // design.md D1: set when a symlink's target is absolute or resolves
-  // outside the sending peer's linked-folder root — flagged, never
+  // Set when a symlink's target is absolute or resolves outside the sending
+  // peer's linked-folder root — flagged, never
   // dereferenced or gated on, so a receiver has the data point even
   // though no policy currently changes behavior based on it. Meaningless
   // when `record_kind != RECORD_KIND_SYMLINK`.
   bool symlink_out_of_root_or_absolute = 9;
-  // design.md D2: the POSIX owner-executable bit captured from the
-  // source file. Meaningless for a symlink (no content) or directory
+  // The POSIX owner-executable bit captured from the source file. Meaningless
+  // for a symlink (no content) or directory
   // record. A change to only this bit (content/blocks unchanged) is
   // intended to propagate as a metadata-only update — see
   // `yadorilink_sync_core::peer_session::try_apply_metadata_only_update`.
@@ -148,7 +135,7 @@ message ClusterConfig {
   repeated string known_peer_device_ids = 2;
   // Compression algorithms this peer can receive on subsequent messages.
   repeated Compression supported_compression = 3;
-  // add-untrusted-storage-peer task 2.1/3.2: whether this peer understands
+  // whether this peer understands
   // the ciphertext block-addressing/encrypted-index path at all (as
   // opposed to: does the coordination plane say this *specific* peer is
   // storage-only for a *specific* group — that's a separate, per-group
@@ -194,7 +181,7 @@ message Index {
   string folder_group_id = 1;
   repeated FileInfo files = 2;
   Compression compression = 3;
-  // add-transfer-compression task 4.1: when `compression != COMPRESSION_NONE`,
+  // when `compression != COMPRESSION_NONE`,
   // `files` is left empty and this instead carries the zstd-compressed
   // encoding of a temporary `Index` submessage whose only meaningful field
   // is `files` — the byte-carrying container needed to compress the whole
@@ -216,7 +203,7 @@ message IndexUpdate {
 message BlockRequest {
   string folder_group_id = 1;
   string file_path = 2;
-  // add-untrusted-storage-peer task 2.1/2.2: for a session where the
+  // for a session where the
   // *requester* is flagged storage-only for `folder_group_id`, or where
   // the requester is asking a storage-only peer for a block, this carries
   // the *ciphertext* hash `H(ct)` instead of the plaintext content hash —
@@ -242,14 +229,14 @@ message BlockResponse {
   // so the requester doesn't hang waiting for a response that never comes.
   bool not_found = 3;
   Compression compression = 4;
-  // add-untrusted-storage-peer task 2.1: set (with `data` carrying AEAD
+  // set (with `data` carrying AEAD
   // ciphertext) whenever this response's `data` is ciphertext rather than
   // plaintext-or-compressed-plaintext. `ciphertext_nonce` always carries
   // the nonce needed to decrypt `data` in this case — always sent
   // explicitly (even though it's *derivable* from `K_g`+the plaintext hash
-  // under convergent encryption, task 1.1) so a receiver never needs to
+  // under convergent encryption, the relevant behavior) so a receiver never needs to
   // know, out of band, whether this group uses convergent or random
-  // nonces (task 1.4) to decrypt a response; it just reads the nonce that
+  // nonces (the relevant behavior) to decrypt a response; it just reads the nonce that
   // came with the ciphertext, the same way a plaintext AEAD message
   // normally works. Unset/empty for every plaintext response, exactly as
   // today — an old peer that doesn't know these fields never sees them
@@ -258,11 +245,11 @@ message BlockResponse {
   bytes ciphertext_nonce = 6;
 }
 
-// edit-presence-awareness (task 9.2): a lightweight, non-versioned signal
+// edit-presence-awareness (the relevant behavior): a lightweight, non-versioned signal
 // that the sender has started or stopped editing a file (per Office's own
 // `~$<name>.<ext>` lock-file convention — see `yadorilink-sync-core::presence`).
 // Advisory only: never affects `FileInfo.version` or any index state.
-// Re-sent periodically while still editing (TTL refresh, task 9.3); the
+// Re-sent periodically while still editing (TTL refresh, the relevant behavior); the
 // receiver treats a signal as expired if `ttl_seconds` elapses with no
 // refresh, so a crashed sender's stale "editing" state doesn't linger.
 message PresenceSignal {
@@ -273,7 +260,7 @@ message PresenceSignal {
   uint32 ttl_seconds = 5;
 }
 
-// add-untrusted-storage-peer task 3.1/3.2: sent instead of `Index` to a
+// sent instead of `Index` to a
 // peer flagged storage-only for `folder_group_id` — see `EncryptedFileEntry`'s
 // doc comment for exactly what is and isn't visible to that peer.
 message EncryptedIndex {
@@ -288,19 +275,14 @@ message EncryptedIndexUpdate {
   repeated EncryptedFileEntry changed_files = 2;
 }
 
-// add-untrusted-storage-peer task 1.2: one wrapped copy of a folder
-// group's content key `K_g`, addressed to one recipient trusted device by
-// X25519 identity public key (see `yadorilink_sync_core::content_crypto::
-// WrappedGroupKey`). Exchanged directly between trusted peers over this
-// same wire protocol — design.md is explicit that wrapped copies "may
-// transit via peers" but must never go through the coordination plane
-// (this message type exists only in `sync.proto`, never in
-// `coordination.proto`). `peer_session.rs` never sends this to a peer
-// flagged storage-only for `folder_group_id` (encrypted-peer spec's "Key
-// is never sent to an untrusted peer").
+// One wrapped copy of a folder group's content key `K_g`, addressed to one
+// recipient trusted device by X25519 identity public key. Exchanged directly
+// between trusted peers over this same wire protocol. This message type exists
+// only in `sync.proto`, never in `coordination.proto`, and `peer_session.rs`
+// never sends it to a peer flagged storage-only for `folder_group_id`.
 message WrappedGroupKey {
   string folder_group_id = 1;
-  // task 1.3: increments on every rotation, so a recipient that receives
+  // the relevant behavior: increments on every rotation, so a recipient that receives
   // wraps out of order (or a stale retransmit) can tell which is current
   // without needing to attempt-unwrap every one.
   uint32 key_epoch = 2;

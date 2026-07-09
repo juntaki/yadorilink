@@ -9,7 +9,7 @@
 #
 # Deliberately does NOT run `systemctl --user enable --now
 # yadorilink-daemon` here -- see systemd/yadorilink-daemon.service's header
-# comment and design.md's Open Questions: this script runs as root with no
+# comment: this script runs as root with no
 # specific logged-in user's session to target (unlike a `postinst` that
 # manages a *system* unit), and a per-user unit generally shouldn't be
 # silently enabled by a package install. This is only a printed reminder;

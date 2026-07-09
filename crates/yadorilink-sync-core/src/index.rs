@@ -1,6 +1,6 @@
-//! Local daemon state: the per-device file index (task 5.3) and folder-link
-//! registration (task 5.1) with pause/resume (task 6.8). Both live in one
-//! SQLite database, mirroring the pattern used by `yadorilink-coordination`.
+//! Local daemon state: the per-device file index (the relevant behavior) and folder-link
+//! registration (the relevant behavior) with pause/resume (the relevant behavior). Both live in one
+//! SQLite database, mirroring the pattern used by `coordination service`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -812,7 +812,7 @@ impl SyncState {
         Ok(())
     }
 
-    // --- File index (task 5.3) ---
+    // --- File index (the relevant behavior) ---
 
     /// Plain, origin-agnostic upsert — delegates to
     /// `upsert_file_with_origin` with an empty (unknown) origin. Kept for
@@ -1591,7 +1591,7 @@ impl SyncState {
     }
 
     /// Counts of non-deleted files in `group_id` by materialization state
-    /// — `yadorilink status`'s per-folder summary (task 5.4), avoiding
+    /// — `yadorilink status`'s per-folder summary (the relevant behavior), avoiding
     /// dumping every individual file path for what's meant to be a
     /// glance-able overview (matching how `conflict_count` already
     /// summarizes rather than lists).
@@ -1658,7 +1658,7 @@ impl SyncState {
         Ok(policy.as_deref().map(ChunkingPolicy::from_db_str))
     }
 
-    // --- Folder links (task 5.1, 6.8) ---
+    // --- Folder links (the relevant behavior, 6.8) ---
 
     pub fn add_link(&self, local_path: &str, group_id: &str) -> Result<(), SyncError> {
         self.pool.get()?.execute(
@@ -1788,7 +1788,7 @@ impl SyncState {
     }
 
     /// A single retained version by its exact `version_seq` — the restore
-    /// engine's lookup (task 3.1) for `yadorilink restore <path> --version
+    /// engine's lookup (the relevant behavior) for `yadorilink restore <path> --version
     /// <id>`. `None` if no row exists at all for this exact
     /// `(group_id, path, version_seq)`.
     pub fn get_version(
@@ -1915,7 +1915,7 @@ impl SyncState {
     }
 
     /// Sets a folder link's per-link opt-in for attempting real Windows
-    /// symlink materialization (task 3.2) — mirrors
+    /// symlink materialization (the relevant behavior) — mirrors
     /// `set_materialization_policy`'s by-`local_path` shape (every other
     /// per-link setting here is addressed by local path, the same surface
     /// a future CLI flag, section 6, would use). Device-local, like every
@@ -2025,7 +2025,7 @@ impl SyncState {
     // link records an out-of-sync item instead of applying a differing
     // incoming change; a receive-only link records a receive-only-changed
     // item instead of sending a local modification. Both sets are cleared
-    // only by an explicit `override`/`revert` action (task 3), never
+    // only by an explicit `override`/`revert` action (the relevant behavior), never
     // automatically. `INSERT OR REPLACE` on `(group_id, path)` — a path
     // already recorded just gets a fresher timestamp, not a second row;
     // there is exactly one outstanding divergence entry per path, not a
@@ -2045,7 +2045,7 @@ impl SyncState {
         Ok(())
     }
 
-    /// Clears one path's out-of-sync entry (`override`, task 3.1). A no-op,
+    /// Clears one path's out-of-sync entry (`override`, the relevant behavior). A no-op,
     /// not an error, if the path wasn't recorded — mirrors `clear_held`'s
     /// same "callers don't need to check first" contract.
     pub fn clear_out_of_sync(&self, group_id: &str, path: &str) -> Result<(), SyncError> {
@@ -2057,7 +2057,7 @@ impl SyncState {
     }
 
     /// Every currently out-of-sync path for `group_id`, in recorded order —
-    /// `override`'s worklist (task 3.1: "re-assert local records for
+    /// `override`'s worklist (the relevant behavior: "re-assert local records for
     /// out-of-sync paths").
     pub fn list_out_of_sync(&self, group_id: &str) -> Result<Vec<String>, SyncError> {
         let conn = self.pool.get()?;
@@ -2068,7 +2068,7 @@ impl SyncState {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// `yadorilink status`/`link list`'s out-of-sync count (task 4.3).
+    /// `yadorilink status`/`link list`'s out-of-sync count (the relevant behavior).
     pub fn count_out_of_sync(&self, group_id: &str) -> Result<u64, SyncError> {
         let conn = self.pool.get()?;
         let count: i64 = conn.query_row(
@@ -2093,7 +2093,7 @@ impl SyncState {
         Ok(())
     }
 
-    /// Clears one path's receive-only-changed entry (`revert`, task 3.2).
+    /// Clears one path's receive-only-changed entry (`revert`, the relevant behavior).
     /// A no-op, not an error, if the path wasn't recorded.
     pub fn clear_receive_only_changed(&self, group_id: &str, path: &str) -> Result<(), SyncError> {
         self.pool.get()?.execute(
@@ -2104,7 +2104,7 @@ impl SyncState {
     }
 
     /// Every currently receive-only-changed path for `group_id`, in
-    /// recorded order — `revert`'s worklist (task 3.2).
+    /// recorded order — `revert`'s worklist (the relevant behavior).
     pub fn list_receive_only_changed(&self, group_id: &str) -> Result<Vec<String>, SyncError> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
@@ -2115,7 +2115,7 @@ impl SyncState {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// `yadorilink status`/`link list`'s receive-only-changed count (task 4.3).
+    /// `yadorilink status`/`link list`'s receive-only-changed count (the relevant behavior).
     pub fn count_receive_only_changed(&self, group_id: &str) -> Result<u64, SyncError> {
         let conn = self.pool.get()?;
         let count: i64 = conn.query_row(
@@ -2732,11 +2732,7 @@ mod tests {
         let link = &state.list_links().unwrap()[0];
         assert_eq!(link.materialization_policy, MaterializationPolicy::Eager);
         assert_eq!(link.max_local_size_bytes, None);
-        assert_eq!(
-            link.chunking_policy,
-            ChunkingPolicy::Fixed,
-            "content-defined-chunking task 2.4: new links default to Fixed"
-        );
+        assert_eq!(link.chunking_policy, ChunkingPolicy::Fixed, "new links default to Fixed");
     }
 
     #[test]
@@ -2754,7 +2750,7 @@ mod tests {
         assert_eq!(link.max_local_size_bytes, Some(10_000_000));
     }
 
-    /// content-defined-chunking task 2.4: setting/reading the chunking
+    /// setting/reading the chunking
     /// policy round-trips correctly, independent of materialization policy.
     #[test]
     fn chunking_policy_round_trips() {
@@ -3181,7 +3177,7 @@ mod tests {
         }
     }
 
-    /// task 1.2/1.3: a row that existed *before* this task's columns were
+    /// the relevant behavior: a row that existed *before* this task's columns were
     /// added (inserted directly against `OLD_SCHEMA_SQL`, bypassing
     /// `upsert_file` entirely) gets exactly the documented defaults once
     /// the migration runs: `record_kind = 'file'`, no symlink target,
@@ -3215,7 +3211,10 @@ mod tests {
         assert_eq!(row.2, 0);
         assert_eq!(row.3, None);
         assert_eq!(row.4, None);
-        assert_eq!(row.5, 0, "symlink_out_of_root (task 2.4) must also default to unflagged");
+        assert_eq!(
+            row.5, 0,
+            "symlink_out_of_root (the relevant behavior) must also default to unflagged"
+        );
     }
 
     // --- Schema-version
@@ -3473,7 +3472,7 @@ mod tests {
 
     /// `clear_held` on a file that was never held (or doesn't exist) is a
     /// deliberate no-op, not an error — 's tombstone-clears-held
-    /// -state requirement (task 3.5, a later section) needs to clear held
+    /// -state requirement (the relevant behavior, a later section) needs to clear held
     /// state unconditionally when applying a tombstone, without first
     /// checking whether the record was ever held.
     #[test]
@@ -3509,7 +3508,7 @@ mod tests {
         }
     }
 
-    /// task 1.3/1.6: three sequential edits to the same path leave exactly
+    /// the relevant behavior: three sequential edits to the same path leave exactly
     /// one `current` row and two correctly-ordered `superseded` rows, each
     /// with the `version_seq`/`origin_device_id` `list_versions` promises.
     #[test]
@@ -3746,7 +3745,7 @@ mod tests {
 
     const ONE_DAY_NANOS: i64 = 86_400 * 1_000_000_000;
 
-    /// 's union-retain/intersection-expire rule (task 2.5): a
+    /// 's union-retain/intersection-expire rule (the relevant behavior): a
     /// version within either bound survives; one exceeding both is swept;
     /// the current row is never a candidate regardless of policy.
     #[test]
@@ -3813,7 +3812,7 @@ mod tests {
         assert_eq!(state.list_versions("group-1", "a.txt").unwrap().len(), 3);
     }
 
-    /// task 4.1-4.3: the live-block-hash root set includes
+    /// the relevant behavior-4.3: the live-block-hash root set includes
     /// blocks referenced only by a superseded or trashed version, not just
     /// the current one — the contract a future block-store GC must honor.
     #[test]

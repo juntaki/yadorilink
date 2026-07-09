@@ -1,4 +1,4 @@
-//! Integration tests for the reporting IPC surface (task 3.1/3.2)
+//! Integration tests for the reporting IPC surface (the relevant behavior)
 //! exercised over a real control
 //! socket, the same pattern `tests/control_socket.rs` already uses for
 //! link/status/etc. Covers: report generation, queue management, consent

@@ -1,4 +1,4 @@
-//! CLI error taxonomy (task 7.8): distinct categories so the exit code and
+//! CLI error taxonomy (the relevant behavior): distinct categories so the exit code and
 //! message tell the user what kind of thing went wrong, not just that
 //! something did.
 

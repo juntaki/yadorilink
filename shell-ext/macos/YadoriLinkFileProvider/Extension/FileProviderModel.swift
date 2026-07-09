@@ -1,5 +1,5 @@
 //
-//  FileProviderModel.swift — on-demand-sync task 7.3.
+//  FileProviderModel.swift — .
 //
 //  Decodes the JSON the Rust FFI core (`yadorilink_fileprovider_core`)
 //  returns and builds the directory tree `NSFileProviderEnumerator` needs
@@ -10,7 +10,7 @@
 //  this extension's job to bucket that into directory levels for
 //  `enumerateItems(for:startingAt:)`).
 //
-//  KNOWN PERFORMANCE GAP (documented honestly, task 7.8): every call
+//  KNOWN PERFORMANCE GAP (documented honestly, the relevant behavior): every call
 //  here re-fetches the *entire* folder's file list from the daemon —
 //  there is no per-path "look up just this one item" RPC on the
 //  shell-IPC protocol (only `StatusQuery`, which reports sync/

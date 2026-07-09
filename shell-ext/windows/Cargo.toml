@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
-# build-filebox-mvp task 9.1 spike: not a member of the root workspace —
+# spike: not a member of the root workspace —
 # this crate only builds on Windows (windows-rs COM bindings don't
 # typecheck on other targets), and the primary dev machine for this
 # project is not Windows. Build directly with `cargo build` from this
@@ -17,7 +17,7 @@ license = "MIT OR Apache-2.0"
 name = "yadorilink_shell_ext"
 crate-type = ["cdylib", "rlib"]
 
-# on-demand-sync task 6.1-6.3: the Cloud Filter API sync-root
+# the Cloud Filter API sync-root
 # registration/placeholder/fetch-data-callback logic runs in a separate,
 # long-lived host process (`yadorilink-cfapi-host`), not inside the
 # `yadorilink_shell_ext` COM DLL (`cdylib`) that loads into every
@@ -66,7 +66,7 @@ features = [
     "Win32_UI_Shell_Common",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
-    # on-demand-sync task 6.1-6.3: Cloud Filter API (CfRegisterSyncRoot,
+    # Cloud Filter API (CfRegisterSyncRoot,
     # CfCreatePlaceholders, CfConnectSyncRoot, CfExecute, the
     # CF_CALLBACK_* family) plus its Win32_Storage_FileSystem/
     # Win32_System_IO/Win32_System_CorrelationVector prerequisites (several

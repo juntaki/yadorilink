@@ -1,5 +1,5 @@
 //! Thin, blocking-from-the-caller's-perspective IPC client for the
-//! shell-integration protocol (build-filebox-mvp task 9.3/9.4), following
+//! shell-integration protocol (), following
 //! the exact pattern `yadorilink_daemon::shell_ipc::client` documents as the
 //! reference implementation for native shell-extension shims — but
 //! implemented directly against `yadorilink-ipc-proto` rather than
@@ -44,7 +44,7 @@ const RETRY_DELAY: Duration = Duration::from_millis(50);
 /// the one shell-IPC call expected to involve real peer network I/O.
 const HYDRATE_TIMEOUT: Duration = Duration::from_secs(31);
 
-/// Folder/file enumeration (task 6.1/6.2's `ListOnDemandFolders`/
+/// Folder/file enumeration (the relevant behavior `ListOnDemandFolders`/
 /// `ListFolderFiles`) runs at cfapi host startup, not on Explorer's UI
 /// thread, so it can afford a more generous bound than the interactive
 /// calls above without risking a visible hang anywhere.
@@ -211,10 +211,10 @@ async fn is_placeholder_inner(path: &str) -> bool {
     }
 }
 
-/// on-demand-sync task 6.4: edit-presence awareness's () "open
+/// edit-presence awareness's () "open
 /// elsewhere" overlay — `true` when a peer device currently has this file
 /// open for editing (Office's `~$*` lock-file convention, detected and
-/// broadcast entirely daemon-side per task 9.x; this is purely a render
+/// broadcast entirely daemon-side .x; this is purely a render
 /// of `StatusResponse.open_elsewhere_device_id`). Advisory only, same
 /// fail-soft-to-`false` contract as `is_placeholder`.
 pub fn is_open_elsewhere(path: &str) -> bool {
@@ -253,7 +253,7 @@ pub fn send_context_action(path: &str, action: ContextAction) -> bool {
     })
 }
 
-/// Requests synchronous hydration of `path` (on-demand-sync task 6.3):
+/// Requests synchronous hydration of `path` ():
 /// the Cloud Filter API `CF_CALLBACK_TYPE_FETCH_DATA` handler calls this
 /// and blocks on the result before completing the OS callback via
 /// `CfExecute`. Returns `false` on any failure, timeout, or unreachable
@@ -281,7 +281,7 @@ async fn hydrate_inner(path: &str) -> bool {
 }
 
 /// Lists every OnDemand-policy linked folder the daemon currently knows
-/// about (on-demand-sync task 6.1's gap: `daemon_control.proto`'s
+/// about ('s gap: `daemon_control.proto`'s
 /// `ListLinks` reports per-group aggregates, not enough for a cfapi host
 /// to know which local paths to register as sync roots). Empty on any
 /// failure or if the daemon isn't reachable — the cfapi host's caller is
@@ -310,7 +310,7 @@ async fn list_on_demand_folders_inner() -> Vec<OnDemandFolder> {
 }
 
 /// Lists every non-deleted file the daemon has indexed under the OnDemand
-/// folder rooted at `local_path` (task 6.2's gap, same reasoning as
+/// folder rooted at `local_path` (the relevant behavior gap, same reasoning as
 /// `list_on_demand_folders`), with enough metadata (`size`,
 /// `mtime_unix_nanos`, `materialization_state`) to create or update a
 /// cfapi placeholder per file. `local_path` must match a `local_path`

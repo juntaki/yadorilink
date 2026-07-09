@@ -1,4 +1,4 @@
-# build-filebox-mvp task 9.5 / on-demand-sync task 6.6: registers the
+# / registers the
 # yadorilink shell icon overlay identifiers (COM, regsvr32) and the
 # yadorilink-cfapi-host process (Cloud Filter API sync-root
 # registration/placeholders/fetch-data callbacks, tasks 6.1-6.3) as a
@@ -193,7 +193,7 @@ if ($Uninstall) {
     }
 
     # Unregister every Cloud Filter API sync root this host has ever
-    # registered (task 6.6) — this call reads its own on-disk record of
+    # registered (the relevant behavior) — this call reads its own on-disk record of
     # registered roots (%LOCALAPPDATA%\yadorilink\cfapi_sync_roots.txt) and
     # does not require yadorilink-daemon to be running.
     if ($cfapiHost) {

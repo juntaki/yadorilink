@@ -1,5 +1,5 @@
 //
-//  FileProviderEnumerator.swift — on-demand-sync task 7.3.
+//  FileProviderEnumerator.swift — .
 //
 //  `NSFileProviderEnumerator` for one container (the root, or a
 //  synthesized subdirectory — see FileProviderModel.swift). Only the two
@@ -11,7 +11,7 @@
 //  scratch (e.g. on a manual Finder refresh or the next domain
 //  signal) rather than receiving live delta pushes. Given the daemon
 //  already has a live push mechanism for badges (`StatusPush` over the
-//  same shell-IPC connection, task 4), a real follow-up would listen for
+//  same shell-IPC connection, the relevant behavior), a real follow-up would listen for
 //  that and call `NSFileProviderManager.signalEnumerator(for:)` to
 //  trigger a live re-enumeration — out of scope for this task.
 
@@ -33,7 +33,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     func invalidate() {}
 
     func enumerateItems(for observer: NSFileProviderEnumerationObserver, startingAt page: NSFileProviderPage) {
-        // Single-page enumeration (task 7.3's minimal-but-correct scope
+        // Single-page enumeration (the relevant behavior minimal-but-correct scope
         // — shellipc.proto's `ListFolderFilesResponse` is itself
         // unpaginated, so there is nothing to page through on our end
         // either; a very large folder group would want real paging on

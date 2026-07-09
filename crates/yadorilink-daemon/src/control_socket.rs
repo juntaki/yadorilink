@@ -261,7 +261,7 @@ async fn handle_request(
             }
         }
 
-        // `yadorilink restore <path> [--version <id>]` (task 6.2). An
+        // `yadorilink restore <path> [--version <id>]` (the relevant behavior). An
         // absent `version_seq` resolves to the most recent superseded
         // version (spec "Restore without a version defaults to the most
         // recent superseded version") via `hydration::most_recent_superseded_
@@ -300,7 +300,7 @@ async fn handle_request(
             }
         }
 
-        // `yadorilink trash list` (task 6.3). Unlike the per-file requests
+        // `yadorilink trash list` (the relevant behavior). Unlike the per-file requests
         // above, this spans every linked folder at once (no `absolute_path`
         // to resolve) — mirrors `list_link_statuses`'s own per-link
         // iteration below.
@@ -309,7 +309,7 @@ async fn handle_request(
             Err(e) => RespPayload::Error(e.to_string()),
         },
 
-        // `yadorilink trash restore <path>` (task 6.3).
+        // `yadorilink trash restore <path>` (the relevant behavior).
         Some(ReqPayload::RestoreTrash(r)) => {
             match resolve_group_and_rel_path(state, &r.absolute_path) {
                 Some((group_id, path)) => {
@@ -323,7 +323,7 @@ async fn handle_request(
         }
 
         // `yadorilink link retention <path> --keep-versions <n> --keep-days
-        // <t>` (task 6.4) — adjusts an already-linked folder's retention
+        // <t>` (the relevant behavior) — adjusts an already-linked folder's retention
         // policy in place; takes effect on the next retention-expiry sweep
         // (), no restart needed since `link_manager::run_
         // retention_expiry_sweep` re-reads the policy from `SyncState` on
@@ -507,7 +507,7 @@ async fn handle_request(
 
         Some(ReqPayload::Shutdown(_)) => {
             tracing::info!("shutdown requested via control socket");
-            // REL-4: route through the same graceful-shutdown path
+            // reliability hardening: route through the same graceful-shutdown path
             // `main.rs` uses for SIGTERM/SIGINT instead of calling
             // `std::process::exit` directly here — that used to skip
             // aborting watcher tasks, draining in-flight broadcasts, and
@@ -759,8 +759,8 @@ async fn handle_request(
     }
 }
 
-/// Registers a new link (task 7.5), plus on-demand-sync's materialization
-/// policy/cap (task 5.1) — set *after* `add_link` so the row those setters
+/// Registers a new link (the relevant behavior), plus on-demand-sync's materialization
+/// policy/cap (the relevant behavior) — set *after* `add_link` so the row those setters
 /// update-by-`local_path` already exists; `start_link_watch` itself
 /// doesn't depend on the ordering (it never queries the links table for
 /// the path it's given directly).
@@ -881,7 +881,7 @@ fn version_to_proto(v: yadorilink_sync_core::index::VersionRecord) -> FileVersio
     }
 }
 
-/// `yadorilink trash list` (task 6.3): flattens every linked folder's
+/// `yadorilink trash list` (the relevant behavior): flattens every linked folder's
 /// trashed files into one list, each tagged with the link's own
 /// `local_path` since `ListTrashRequest` spans every link at once — mirrors
 /// `list_link_statuses`'s own per-link iteration.
@@ -904,7 +904,7 @@ fn list_trashed_files(
     Ok(out)
 }
 
-/// REL-13: a lightweight health surface distinct from `StatusResponse`
+/// reliability hardening: a lightweight health surface distinct from `StatusResponse`
 /// (see `daemon_control.proto`'s `HealthResponse` doc comment) — task
 /// liveness, relay connectivity, connected-peer count, and a process-wide
 /// pending-changes total, all cheap to compute from state already held in
@@ -1003,7 +1003,7 @@ pub(crate) fn list_link_statuses(
             local_path: link.local_path.clone(),
             group_id: link.group_id.clone(),
             paused: link.paused,
-            // REL-10: records still queued for retry (see
+            // reliability hardening: records still queued for retry (see
             // `DaemonState::pending_changes_count`'s doc comment) after a
             // failed per-peer broadcast — previously always hardcoded 0.
             pending_changes: state.pending_changes_count(&link.group_id),
@@ -1296,7 +1296,7 @@ mod overall_status_tests {
         assert_eq!(reasons, vec!["peer_disconnected:device-b".to_string()]);
     }
 
-    /// A degraded link (disk-pressure, task 5.4 elsewhere) takes
+    /// A degraded link (disk-pressure, the relevant behavior elsewhere) takes
     /// precedence over -- and is reported alongside -- an unrelated
     /// attention-level issue.
     #[test]

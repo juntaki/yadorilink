@@ -1,4 +1,4 @@
-//! daemon-reliability REL-7/REL-8/REL-12: every `tokio::spawn` in the
+//! daemon-reliability reliability hardening/reliability hardening/reliability hardening: every `tokio::spawn` in the
 //! daemon and transport used to discard its `JoinHandle` — a panic or
 //! early exit in a critical task (peer orchestrator, relay I/O,
 //! mesh-forward/presence/TTL loops) went undetected, unlogged, and
@@ -6,7 +6,7 @@
 //! This module gives every long-lived task two things: (1) a name for
 //! logging, and (2) an explicit policy for what happens when it exits —
 //! restart with backoff, or propagate the exit to whoever's supervising
-//! essential tasks together (`main.rs`'s `JoinSet`, REL-8).
+//! essential tasks together (`main.rs`'s `JoinSet`, reliability hardening).
 
 use std::future::Future;
 use std::time::Duration;
@@ -105,15 +105,15 @@ fn fastrand_unit_interval() -> f64 {
 /// meant to run forever, like a reconnect-and-stream loop, only return
 /// on a real error) or panics, this logs it at `warn` with `name` and
 /// the attempt count, waits out `backoff`, and calls `make_task` again —
-/// forever. Use for tasks that should never permanently give up (REL-1/
-/// REL-2/REL-3's reconnect loops): there is no "stop trying" state,
+/// forever. Use for tasks that should never permanently give up (reliability hardening/
+/// reliability hardening/reliability hardening's reconnect loops): there is no "stop trying" state,
 /// since the daemon is meant to recover from an arbitrarily long outage
 /// on its own.
 ///
 /// Returns the supervising task's own `JoinHandle` — awaiting it never
 /// completes under normal operation (the loop is intentionally
 /// infinite); it exists so callers can still hold/abort the handle like
-/// any other spawned task (e.g. for shutdown, REL-4).
+/// any other spawned task (e.g. for shutdown, reliability hardening).
 pub fn spawn_restarting<F, Fut>(
     name: &'static str,
     backoff: BackoffConfig,
@@ -136,7 +136,7 @@ where
                 }
                 Err(join_err) => {
                     // Cancelled (aborted) — the caller is shutting this
-                    // down on purpose (REL-4); stop restarting rather
+                    // down on purpose (reliability hardening); stop restarting rather
                     // than fighting an intentional abort.
                     tracing::info!(task = name, error = %join_err, "supervised task was cancelled; not restarting");
                     return;
@@ -152,11 +152,11 @@ where
 
 /// Spawns a one-shot essential task: logs at `error` if it exits with an
 /// `Err` or panics, but does not restart it. Pair with `main.rs`'s
-/// essential-task `JoinSet`/`select!` (REL-8): when *any* essential
+/// essential-task `JoinSet`/`select!` (reliability hardening): when *any* essential
 /// task's handle resolves, the daemon should treat that as fatal (log
 /// and exit non-zero) rather than silently continuing as a zombie with
 /// broken sync — restarting individual essential tasks in place papers
-/// over exactly the failure mode REL-8 exists to surface to a process
+/// over exactly the failure mode reliability hardening exists to surface to a process
 /// supervisor instead.
 pub fn spawn_logged<Fut>(name: &'static str, task: Fut) -> JoinHandle<()>
 where

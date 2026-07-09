@@ -95,7 +95,7 @@ impl RelayRuntime {
             };
             let registry = self.registry.clone();
             let global_outbound_bytes = self.global_outbound_bytes.clone();
-            // daemon-reliability REL-7/REL-12: previously a bare `tokio::spawn`
+            // daemon-reliability reliability hardening/reliability hardening: previously a bare `tokio::spawn`
             // whose `JoinHandle` was dropped — a panic inside
             // `handle_connection` (e.g. in an untested edge case of the wire
             // parsing) would vanish silently instead of being logged.
@@ -859,7 +859,7 @@ mod tests {
     /// by `idle_registered_connection_times_out_and_unregisters`), its
     /// route must be removed from the registry so a stale entry doesn't
     /// keep pointing at a dead connection (the exact leak this whole
-    /// change targets — REL-2/REL-5's theme applied to the relay).
+    /// change targets — reliability hardening/reliability hardening's theme applied to the relay).
     #[tokio::test]
     async fn route_is_removed_when_connection_disconnects_cleanly() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

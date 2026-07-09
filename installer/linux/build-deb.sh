@@ -5,7 +5,7 @@
 # Builds a Debian .deb package for yadorilink:
 #   - crates/yadorilink-cli        -> /usr/bin/yadorilink
 #   - crates/yadorilink-daemon     -> /usr/bin/yadorilink-daemon
-#   - systemd/yadorilink-daemon.service (task 2.3)
+#   - systemd/yadorilink-daemon.service (the relevant behavior)
 #                                  -> /usr/lib/systemd/user/yadorilink-daemon.service
 #   - LICENSE-MIT                  -> /usr/share/doc/yadorilink/
 #

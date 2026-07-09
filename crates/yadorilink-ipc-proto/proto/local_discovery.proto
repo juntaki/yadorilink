@@ -1,7 +1,7 @@
 syntax = "proto3";
 package yadorilink.local_discovery.v1;
 
-// Local LAN broadcast announcement (design.md D10). Intentionally
+// Local LAN broadcast announcement. Intentionally
 // unauthenticated at this level — matching Syncthing's own local-discovery
 // design — since a forged announcement still can't complete a real
 // WireGuard handshake without the corresponding private key. MVP discovery

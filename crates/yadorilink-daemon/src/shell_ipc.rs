@@ -7,14 +7,14 @@
 //!
 //! Unlike the daemon control socket (one request/response per connection),
 //! this is a persistent duplex connection: the daemon proactively pushes
-//! `StatusPush` updates (task 8.5) while continuing to answer the client's
+//! `StatusPush` updates (the relevant behavior) while continuing to answer the client's
 //! `StatusQuery`/`ContextActionRequest` messages on the same connection.
 //!
-//! Transport: Unix domain socket on macOS/Linux (task 8.4 — the "over
+//! Transport: Unix domain socket on macOS/Linux (the relevant behavior — the "over
 //! XPC" sandbox bridging for a real macOS Finder Sync extension is
-//! properly section 10's job, specifically task 10.4; what's implemented
+//! properly section 10's job, ; what's implemented
 //! here is the daemon-side socket those XPC-relayed bytes would ultimately
-//! reach). Windows named pipe (task 8.3) is implemented behind
+//! reach). Windows named pipe (the relevant behavior) is implemented behind
 //! `#[cfg(windows)]` and has not been compiled or run on this
 //! (non-Windows) development machine; verify on real Windows hardware
 //! before relying on it.
@@ -178,7 +178,7 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
             };
             Some(ShellIpcMessage { payload: Some(Payload::ContextActionResponse(response)) })
         }
-        // on-demand-sync task 6.1/6.2 gap (see shellipc.proto's doc comment
+        // gap (see shellipc.proto's doc comment
         // on these two messages): lets a platform virtual-filesystem
         // provider (Windows cfapi) discover which linked folders are
         // OnDemand and enumerate their files to register sync roots and
@@ -243,7 +243,7 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
     }
 }
 
-/// Reference client implementation (task 8.6): the shell extension's
+/// Reference client implementation (the relevant behavior): the shell extension's
 /// native shim (Rust via `windows-rs` on Windows per or an FFI
 /// core called from the Swift `FinderSync` extension on macOS) follows
 /// this exact pattern — bounded timeout, `Unspecified` (no overlay) on

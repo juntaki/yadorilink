@@ -67,7 +67,7 @@ fn missing_block_is_not_found() {
     assert!(matches!(err, yadorilink_local_storage::StorageError::NotFound(_)));
 }
 
-/// on-demand-sync task 3.1/3.3: batch presence query correctly reports a
+/// batch presence query correctly reports a
 /// mixed present/missing block list, in the same order as the input.
 #[test]
 fn present_blocks_reports_a_mixed_present_missing_list() {
@@ -155,7 +155,7 @@ fn present_blocks_batches_shard_reads_for_many_hashes_in_few_shards() {
     }
 }
 
-/// Before/after-style timing comparison (task 5.1's spirit): the trait's
+/// Before/after-style timing comparison (the relevant behavior spirit): the trait's
 /// *default* N-`exists`-calls implementation versus `FsBlockStore`'s
 /// batched override, over a query set where every hash shares one shard
 /// directory (the case the batching is designed for — e.g. probing many
@@ -237,7 +237,7 @@ fn get_unchecked_does_not_detect_corruption_unlike_get() {
     std::fs::write(&path, b"tampered bytes!!").unwrap();
 
     // `get_unchecked` intentionally does not detect corruption — checked
-    // *before* `get`, since (SEC-SYNC-1) `get`'s checksum-mismatch path now
+    // *before* `get`, since (security hardening) `get`'s checksum-mismatch path now
     // self-heals by deleting the corrupt file as a side effect, which would
     // otherwise make this assertion order-dependent.
     assert_eq!(store.get_unchecked(&hash).unwrap(), b"tampered bytes!!");
@@ -248,7 +248,7 @@ fn get_unchecked_does_not_detect_corruption_unlike_get() {
     ));
 }
 
-/// SEC-SYNC-1 (task 4.1) regression: concurrently `put()`-ing the exact
+/// security hardening (the relevant behavior) regression: concurrently `put()`-ing the exact
 /// same block content from many threads at once (simulating multi-peer
 /// fetch + up-to-16-way concurrent `reconcile_files` writing the same
 /// hash) must never produce a torn block. Before the fix, every writer
@@ -289,7 +289,7 @@ fn concurrent_put_of_the_same_block_never_tears_the_stored_content() {
     assert_eq!(read_back, data);
 }
 
-/// SEC-SYNC-1 (task 4.1) regression: a torn/corrupted block self-heals on
+/// security hardening (the relevant behavior) regression: a torn/corrupted block self-heals on
 /// the next correct `put()` instead of staying permanently un-hydratable.
 /// Simulates the post-corruption state directly (truncating a stored
 /// block so it fails its own checksum), confirms `get()` reports the
@@ -304,7 +304,7 @@ fn a_torn_block_self_heals_on_a_subsequent_correct_put() {
     let data = b"the correct, complete content of this block";
     let hash = store.put(data).unwrap();
 
-    // Simulate the SEC-SYNC-1 torn-block scenario: truncate the stored
+    // Simulate the security hardening torn-block scenario: truncate the stored
     // file in place so its bytes no longer hash to its own filename.
     let path = dir.path().join(&hash[0..2]).join(&hash[2..4]).join(&hash);
     std::fs::write(&path, &data[..data.len() / 2]).unwrap();

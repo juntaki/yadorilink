@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
-# on-demand-sync task 7.1: the small Rust FFI core behind the macOS
+# the small Rust FFI core behind the macOS
 # NSFileProviderReplicatedExtension (shell-ext/macos/YadoriLinkFileProvider),
 # the File-Provider-extension-point counterpart of
 # `shell-ext/macos/core` (which backs the FinderSync extension point).

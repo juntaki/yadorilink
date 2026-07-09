@@ -1,5 +1,5 @@
 //
-//  main.swift — build-yadorilink-mvp task 10.5.
+//  main.swift — .
 //
 //  A FIFinderSync extension cannot run standalone; it must be embedded in
 //  a host application bundle's PlugIns/ directory (build.sh assembles
@@ -23,7 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // on-demand-sync task 7.2: register a File Provider domain for
+        // register a File Provider domain for
         // every OnDemand-linked folder group the daemon currently knows
         // about, every launch (see DomainRegistration.swift's doc
         // comment for why this runs from the host app rather than the

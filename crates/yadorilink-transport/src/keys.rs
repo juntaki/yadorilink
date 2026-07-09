@@ -8,7 +8,7 @@ use zeroize::Zeroizing;
 
 use crate::error::TransportError;
 
-/// A device's WireGuard identity (task 4.1: "generate/persist per-device keypairs").
+/// A device's WireGuard identity (the relevant behavior: "generate/persist per-device keypairs").
 pub struct DeviceKeyPair {
     pub secret: StaticSecret,
     pub public: PublicKey,

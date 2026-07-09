@@ -1,5 +1,5 @@
-//! Shared bounded-storage engine behind `queue.rs` (task 2.5) and
-//! `error_candidates.rs` (task 2.4). Both are "a directory of JSON files,
+//! Shared bounded-storage engine behind `queue.rs` (the relevant behavior) and
+//! `error_candidates.rs` (the relevant behavior). Both are "a directory of JSON files,
 //! each a full `ReportEnvelope` plus small metadata, bounded by a
 //! `RetentionPolicy`" — the only real differences are the directory name
 //! and the default caps, so the file-scanning/retention logic lives here

@@ -168,7 +168,7 @@ fn build_menu(status: Option<&StatusResponse>) -> Menu {
             }
             let _ = menu.append(&folders);
         }
-        // task 3.1/3.2: only offered once a device identity exists — see
+        // the relevant behavior: only offered once a device identity exists — see
         // this function's "setup_device" section above; linking a folder
         // needs a resolvable access token, which needs that setup first.
         if ipc_client::is_device_registered() {
@@ -285,7 +285,7 @@ fn handle_menu_event(id: &str) {
         // this app has no native sign-in/
         // device-registration UI of its own — that flow already exists,
         // fully working, as `yadorilink device register`/`yadorilink
-        // login` (task 4.3-style scope discipline: keep the first beta
+        // login` (the relevant behavior-style scope discipline: keep the first beta
         // scope small). Reveals a Terminal with the right first command
         // pre-typed rather than silently doing nothing, so the tray icon
         // is still a genuine, working discoverable entry point into

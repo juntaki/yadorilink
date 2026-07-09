@@ -18,7 +18,7 @@
 //  `FIFinderSyncController.directoryURLs` is how Finder learns which
 //  folders this extension instruments (driving
 //  beginObservingDirectory/endObservingDirectory below). The daemon's
-//  shell-integration protocol (shellipc.proto, what task 10 bridges to
+//  shell-integration protocol (shellipc.proto, bridges to
 //  per the task brief) only exposes per-path StatusQuery/ContextAction —
 //  there is no "list linked folders" message on that protocol. (A
 //  `ListLinksRequest`/`ListLinksResponse` pair does exist, but on the
@@ -93,7 +93,7 @@ class FinderSync: FIFinderSync {
         }
         NSLog("yadorilink: FinderSync extension launched, watching \(String(describing: controller.directoryURLs))")
 
-        // on-demand-sync task 7.4/7.5: OnDemand folders live under a
+        // OnDemand folders live under a
         // File-Provider-managed location this extension does not choose
         // — created/populated by the YadoriLinkFileProvider
         // extension via NSFileProviderManager domain registration (task
@@ -105,7 +105,7 @@ class FinderSync: FIFinderSync {
         // (pin/evict) mechanism covers both Eager and OnDemand folders
         // without a second, File-Provider-native decoration API.
         //
-        // BUG FOUND AND FIXED (task 7.4, real VM verification): the
+        // BUG FOUND AND FIXED (the relevant behavior, real VM verification): the
         // originally-shipped approach guessed the mount path as a fixed
         // `~/Library/CloudStorage/yadorilink` (`cloud_storage_root()` in
         // core/src/ipc_client.rs) — this is WRONG. A real registered
@@ -164,7 +164,7 @@ class FinderSync: FIFinderSync {
         return [fallback]
     }
 
-    // MARK: - task 10.1: directory lifecycle
+    // MARK: - the relevant behavior: directory lifecycle
 
     override func beginObservingDirectory(at url: URL) {
         NSLog("yadorilink: beginObservingDirectory \(url.path)")
@@ -174,7 +174,7 @@ class FinderSync: FIFinderSync {
         NSLog("yadorilink: endObservingDirectory \(url.path)")
     }
 
-    // MARK: - task 10.2: badge rendering via the Rust FFI core
+    // MARK: - the relevant behavior: badge rendering via the Rust FFI core
 
     override func requestBadgeIdentifier(for url: URL) {
         let controller = FIFinderSyncController.default()
@@ -200,7 +200,7 @@ class FinderSync: FIFinderSync {
         controller.setBadgeIdentifier(identifier, for: url)
     }
 
-    // MARK: - task 10.3: context menu wired to daemon actions
+    // MARK: - the relevant behavior: context menu wired to daemon actions
 
     override func menu(for menuKind: FIMenuKind) -> NSMenu {
         let menu = NSMenu(title: "")

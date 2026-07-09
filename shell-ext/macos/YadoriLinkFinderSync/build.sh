@@ -61,7 +61,7 @@ echo "SDK: $SDK"
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
-# --- 1. Rust FFI core (task 10.1) -------------------------------------
+# --- 1. Rust FFI core (the relevant behavior) -------------------------------------
 echo "-- building yadorilink-shell-ext-macos-core (release, $RUST_TARGET) --"
 ( cd "$CORE_DIR" && cargo build --release --target "$RUST_TARGET" )
 CORE_LIB_DIR="$CORE_DIR/target/$RUST_TARGET/release"
@@ -99,7 +99,7 @@ xcrun swiftc \
 
 cp "$EXT_DIR/Info.plist" "$APPEX_BUNDLE/Contents/Info.plist"
 
-# --- 3. Host app binary (task 10.5) ------------------------------------
+# --- 3. Host app binary (the relevant behavior) ------------------------------------
 echo "-- compiling host app --"
 APP_BUNDLE="$BUILD_DIR/$HOST_APP_NAME.app"
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
@@ -115,12 +115,12 @@ xcrun swiftc \
 
 cp "$HOST_DIR/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 
-# --- 4. Assemble: embed the extension in the host app (task 10.5) -----
+# --- 4. Assemble: embed the extension in the host app (the relevant behavior) -----
 echo "-- embedding extension in host app bundle --"
 rm -rf "$APP_BUNDLE/Contents/PlugIns/$EXT_NAME.appex"
 cp -R "$APPEX_BUNDLE" "$APP_BUNDLE/Contents/PlugIns/$EXT_NAME.appex"
 
-# --- 5. Ad-hoc codesign (task 10.4/10.5) -------------------------------
+# --- 5. Ad-hoc codesign (the relevant behavior) -------------------------------
 # No real Apple Developer ID / provisioning profile is available in this
 # environment, so both bundles are ad-hoc signed (`--sign -`) for local
 # development/testing only. Real distribution would additionally need:
@@ -133,7 +133,7 @@ cp -R "$APPEX_BUNDLE" "$APP_BUNDLE/Contents/PlugIns/$EXT_NAME.appex"
 #   - `xcrun notarytool submit` notarization of the signed, zipped app,
 #     then `xcrun stapler staple` — requires an Apple Developer account
 #     and network access to Apple's notary service, neither available in
-#     this session. Tracked as a follow-up per task 10.5, not blocking.
+#     this session. Tracked as a follow-up , not blocking.
 #   - Proper (non-ad-hoc) entitlements per
 #     Extension.sandboxed-reference.entitlements's documented options, if
 #     shipping with App Sandbox enabled.

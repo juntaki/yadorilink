@@ -63,7 +63,7 @@ impl VolumeFreeSpace {
     }
 
     /// Would writing `additional_bytes` more bring available space to at or
-    /// below the configured headroom? (task 3.1/3.2's preflight predicate —
+    /// below the configured headroom? (the relevant behavior preflight predicate —
     /// deliberately the same `<=` boundary `classify`'s `Critical` uses, so
     /// "would breach" and "would become critical" are the same condition.)
     pub fn would_breach(&self, additional_bytes: u64) -> bool {

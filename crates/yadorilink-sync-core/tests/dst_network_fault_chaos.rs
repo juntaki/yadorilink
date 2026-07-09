@@ -360,7 +360,7 @@ const CONVERGENCE_PROMPTNESS_SLA: Duration = Duration::from_secs(3);
 /// can have observed the other), exactly `dst_peer_reconcile_race.rs`'s
 /// one-time baseline-adoption wait, just repeated before every round
 /// here since this scenario reuses a small path pool across many rounds
-/// (task 4.2's still-open "superseded by a causally-later *remote*
+/// (the relevant behavior still-open "superseded by a causally-later *remote*
 /// write" checker gap, closed *for this scenario* the same way task
 /// 5.1/5.2 closed it: proving a converged base rather than generalizing
 /// `dst_support`'s checker to compare version vectors directly). Without
@@ -1070,7 +1070,7 @@ async fn run_scenario(
     // this is exactly the "measure it, show it, don't hide it" signal
     // `ROUND_PROGRESSION_GATE`'s own doc comment promises -- a slow-but-
     // eventually-consistent round must stay visible somewhere, or
-    // loosening the gate quietly reintroduces the thing task 0.3 fixed
+    // loosening the gate quietly reintroduces the fixed
     // (a real cost hidden as a silent pass).
     for slow in oracle.check_convergence_promptness(CONVERGENCE_PROMPTNESS_SLA) {
         eprintln!("  PROMPTNESS: {slow}");
@@ -1082,7 +1082,7 @@ async fn run_scenario(
         }
     }
     if !violations.is_empty() {
-        // dst-full-stack-heat-run-framework task 0.4: persist the full
+        // persist the full
         // Case (not just the seed) so this failure survives generator
         // evolution in the corpus -- see `record_failing_case`'s doc
         // comment.
@@ -1237,7 +1237,7 @@ fn network_fault_chaos_scenario() {
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
 
-    // dst-full-stack-heat-run-framework task 0.3: `CONVERGENCE_TIMEOUT_
+    // `CONVERGENCE_TIMEOUT_
     // MARKER` and its `skipped_convergence` skip-classification are
     // retired -- oracle #1 requirement ("a convergence
     // timeout is a FAILURE, not a skip"). A convergence timeout now falls
@@ -1252,7 +1252,7 @@ fn network_fault_chaos_scenario() {
     let mut skipped_resource_exhaustion = 0;
     let mut failures = Vec::new();
 
-    // dst-full-stack-heat-run-framework task 0.4: replay every corpus case
+    // replay every corpus case
     // first, same reasoning as `monkey_chaos.rs`'s `replay_known_failing_
     // seeds` -- a previously-found bug must always be re-checked, not only
     // surface once on whichever sweep happened to find it. One `#[test]`

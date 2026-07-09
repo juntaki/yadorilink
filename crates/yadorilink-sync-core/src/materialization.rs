@@ -80,7 +80,7 @@ pub fn evict_file(
 
     state.set_materialization_state(group_id, path, MaterializationState::Placeholder)?;
     let out_path = root.join(path);
-    // SEC-SYNC-5 defense-in-depth — see `verify_write_target_within_root`'s
+    // security hardening defense-in-depth — see `verify_write_target_within_root`'s
     // doc comment; applied here too for consistency with the other
     // materialization write paths, even though eviction writes through an
     // already-indexed path rather than fresh peer input.
@@ -154,7 +154,7 @@ pub fn run_eviction_sweep(
 /// Best-effort refresh of `last_accessed_unix` from on-disk `atime` for
 /// evictable candidates that have never recorded one — the same fallback
 /// `run_eviction_sweep` performs (see its doc comment), factored out so the
-/// disk-pressure-triggered sweep below reuses it verbatim (task 4.3: reuse,
+/// disk-pressure-triggered sweep below reuses it verbatim (the relevant behavior: reuse,
 /// not reimplementation) instead of duplicating the LRU-freshening logic.
 fn refresh_missing_last_accessed(
     state: &SyncState,
@@ -180,7 +180,7 @@ fn refresh_missing_last_accessed(
 /// above's cap-based one doesn't cover, per the `on-demand-sync` spec's
 /// "disk-space pressure triggers a sweep regardless of configured cap".
 ///
-/// Reuses (task 4.3), rather than reimplements, the exact same
+/// Reuses (the relevant behavior), rather than reimplements, the exact same
 /// `list_evictable_files` LRU-ordering and pinned-file exclusion
 /// `run_eviction_sweep` already relies on — the only difference is the
 /// stopping condition (volume free-space classification instead of a
@@ -191,7 +191,7 @@ fn refresh_missing_last_accessed(
 /// candidates. A no-op (`Ok(vec![])`) if the volume is already `Ok`, or if
 /// its free space can't currently be determined at all (e.g. `root` doesn't
 /// exist yet) — nothing to evict for in either case. Returns the paths
-/// evicted, in eviction order, so a caller (task 4.2: the daemon's
+/// evicted, in eviction order, so a caller (the relevant behavior: the daemon's
 /// hydration/materialization preflight) can re-check headroom afterward and
 /// let the original operation proceed if enough space was reclaimed.
 pub fn run_disk_pressure_eviction_sweep(
@@ -669,7 +669,7 @@ mod tests {
 
     /// pinned files are never evicted by the disk-pressure
     /// trigger, exactly as they're already excluded from the cap trigger
-    /// (reused, not reimplemented — task 4.3).
+    /// (reused, not reimplemented — the relevant behavior).
     #[test]
     fn disk_pressure_sweep_never_evicts_pinned_files() {
         let state = SyncState::open_in_memory().unwrap();

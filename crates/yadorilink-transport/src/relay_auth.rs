@@ -6,7 +6,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Computes this client's proof-of-possession MAC for a relay registration
 /// challenge. Returns `None` if the resulting client/server shared secret
-/// is non-contributory (SEC-TRANS-3): X25519 has a small set of low-order
+/// is non-contributory (security hardening): X25519 has a small set of low-order
 /// points whose Diffie-Hellman output is a known, fixed value (e.g.
 /// all-zeros) regardless of the other side's secret, so a MAC computed
 /// from it would prove nothing. `verify_proof` performs the same check on
@@ -28,7 +28,7 @@ pub fn proof_mac(
 
 /// Verifies a relay registration proof-of-possession.
 ///
-/// SEC-TRANS-3: rejects a non-contributory (low-order) client public key
+/// security hardening: rejects a non-contributory (low-order) client public key
 /// *before* verifying the MAC. Without this check, a client registering
 /// such a key gets a known all-zeros Diffie-Hellman shared secret and can
 /// compute `HMAC(all-zeros, nonce)` — a valid-looking proof — without ever
@@ -75,7 +75,7 @@ mod tests {
         assert!(!verify_proof(&client_public, &server_secret, &[4u8; 32], &proof));
     }
 
-    /// SEC-TRANS-3 (task 4.4): a client registering the all-zeros X25519
+    /// security hardening (the relevant behavior): a client registering the all-zeros X25519
     /// public key — a well-known low-order (non-contributory) point —
     /// gets a known all-zeros Diffie-Hellman shared secret independent of
     /// the server's actual secret key, so it could otherwise compute a

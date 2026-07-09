@@ -1,4 +1,4 @@
-//! on-demand-sync task 7.1: the "thin Rust core" behind
+//! the "thin Rust core" behind
 //! `NSFileProviderReplicatedExtension` (`YadoriLinkFileProvider`), the File
 //! Provider extension-point counterpart of `shell-ext/macos/core` (which
 //! backs the FinderSync extension point — see this crate's Cargo.toml
@@ -62,7 +62,7 @@ pub unsafe extern "C" fn yadorilink_fp_free_string(ptr: *mut c_char) {
     });
 }
 
-/// Returns the real user home directory (task 7.2's `~/Library/
+/// Returns the real user home directory (the relevant behavior `~/Library/
 /// CloudStorage/yadorilink/<group-name>` managed-path computation needs
 /// this — see `ipc_client::real_home_dir_string`'s doc comment for why
 /// it's resolved via `getpwuid(3)` rather than Foundation APIs even
@@ -94,7 +94,7 @@ pub extern "C" fn yadorilink_fp_list_on_demand_folders() -> *mut c_char {
 
 /// Lists every (non-deleted) file in the folder group rooted at
 /// `local_path`, as a JSON array of `{"relative_path", "size",
-/// "mtime_unix_nanos", "materialization_state"}` objects (task 7.3's
+/// "mtime_unix_nanos", "materialization_state"}` objects (the relevant behavior
 /// `NSFileProviderEnumerator` data source). Empty JSON array on a null
 /// path or any failure. Caller must free with `yadorilink_fp_free_string`.
 ///
@@ -114,7 +114,7 @@ pub unsafe extern "C" fn yadorilink_fp_list_folder_files(local_path: *const c_ch
 
 /// Queries combined sync/materialization/open-elsewhere status for
 /// `path`, as a JSON object `{"sync_state", "materialization_state",
-/// "open_elsewhere_device_id"}` (task 7.3's `item(for:request:
+/// "open_elsewhere_device_id"}` (the relevant behavior `item(for:request:
 /// completionHandler:)` data source). Falls back to all-"unspecified"/
 /// empty-string JSON on a null path or any failure. Caller must free
 /// with `yadorilink_fp_free_string`.

@@ -22,14 +22,14 @@ use yadorilink_local_storage::free_space::{self, FreeSpaceState, VolumeFreeSpace
 
 use crate::ignore_patterns::EffectiveIgnoreSet;
 
-/// Directory-scan cap (task 1.1's "huge folder" handling — deep scans can
+/// Directory-scan cap (the relevant behavior "huge folder" handling — deep scans can
 /// be optional for huge folders): once this many entries
 /// (ignored or not) have been visited, the scan stops early and
 /// `scan_truncated` is set, rather than walking an arbitrarily large tree
 /// before a first-run user even sees a preflight result.
 pub const SCAN_ENTRY_CAP: u64 = 50_000;
 
-/// Well-known cloud-provider-managed folder names (task 1.1's "Risky
+/// Well-known cloud-provider-managed folder names (the relevant behavior "Risky
 /// folder location" scenario). Matched case-insensitively against
 /// any path component, not just the last one, since the marker folder is
 /// often an ancestor of the folder actually being linked (e.g. linking
@@ -68,7 +68,7 @@ pub struct NestedLinkConflict {
     pub relation: NestedLinkRelation,
 }
 
-/// Risky/unsupported first-run environment conditions (task 1.1's "risky
+/// Risky/unsupported first-run environment conditions (the relevant behavior "risky
 /// location detection" and the `first-run-safety` spec's "Unsupported
 /// Environment Warning").
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,7 +84,7 @@ pub enum RiskyLocation {
     HomeDirectory,
 }
 
-/// task 1.1's full preflight model: folder existence, empty/non-empty
+/// the relevant behavior full preflight model: folder existence, empty/non-empty
 /// state, free-space state, ignored-file summary, and risky-location
 /// detection, plus nested-link conflicts against the caller-supplied list
 /// of already-linked paths.
@@ -98,7 +98,7 @@ pub struct LinkPreflightReport {
     /// scenario.
     pub entry_count: u64,
     /// Count of entries matched by the effective ignore rules (built-in
-    /// defaults plus any `.yadorilinkignore`) — task 1.1's "ignored-file
+    /// defaults plus any `.yadorilinkignore`) — the relevant behavior "ignored-file
     /// summary".
     pub ignored_entry_count: u64,
     /// Sum of file sizes among the non-ignored entries counted above.
@@ -138,8 +138,8 @@ impl LinkPreflightReport {
     }
 
     /// Human-readable warning lines, one per risky condition found — used
-    /// both for the CLI's printed preflight output (task 2.1/2.2) and for
-    /// the daemon's rejection message (task 2.3).
+    /// both for the CLI's printed preflight output (the relevant behavior) and for
+    /// the daemon's rejection message (the relevant behavior).
     pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
         if !self.path_exists {
@@ -199,11 +199,11 @@ impl LinkPreflightReport {
     }
 }
 
-/// task 1.1/1.2: runs the local, fast preflight checks for linking
+/// the relevant behavior: runs the local, fast preflight checks for linking
 /// `local_path`, given the already-linked paths known to the caller (the
 /// CLI fetches these via `ListLinks`; the daemon already owns them). Pure
 /// read-only inspection — never creates, modifies, or deletes anything, so
-/// it is safe to call for `--dry-run` (task 1.2's "no persisted writes")
+/// it is safe to call for `--dry-run` (the relevant behavior "no persisted writes")
 /// simply by never following it with an actual link registration.
 pub fn run_preflight(
     local_path: &Path,
@@ -370,7 +370,7 @@ mod tests {
         assert!(!report.is_risky(), "warnings: {:?}", report.warnings());
     }
 
-    /// task 1.1's ignored-file summary: built-in-ignored entries (e.g.
+    /// the relevant behavior ignored-file summary: built-in-ignored entries (e.g.
     /// `.DS_Store`) don't count toward "non-empty", but are reported
     /// separately.
     #[test]
@@ -473,7 +473,7 @@ mod tests {
         assert!(report.warnings().is_empty());
     }
 
-    /// A nonexistent path is itself reported as risky (task 1.1's "folder
+    /// A nonexistent path is itself reported as risky (the relevant behavior "folder
     /// existence" check) with a clear warning, rather than silently
     /// reporting an empty folder.
     #[test]
