@@ -22,7 +22,7 @@ bytes.workspace = true
 boringtun = { version = "0.7", default-features = false }
 rand = "0.8"
 hex = "0.4"
-prost = "0.13"
+prost = "0.14"
 if-addrs = "0.15"
 zeroize = "1"
 x25519-dalek = { version = "2.0.1", features = ["zeroize"] }

@@ -35,7 +35,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
-prost = "0.13"
+prost = "0.14"
 tonic = { version = "0.12", features = ["tls-native-roots"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 hex = "0.4"

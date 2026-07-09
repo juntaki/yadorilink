@@ -23,7 +23,7 @@ bytes.workspace = true
 # reconcile loop — `madsim`'s tokio shim has no `JoinSet` at all. Same
 # dependency shape as `yadorilink-daemon`'s existing `futures-util` use.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-prost = "0.13"
+prost = "0.14"
 rusqlite = { version = "0.31", features = ["bundled"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.24"

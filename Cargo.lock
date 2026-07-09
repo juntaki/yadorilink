@@ -3068,7 +3068,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
 dependencies = [
  "bytes",
- "prost-derive",
+ "prost-derive 0.13.5",
+]
+
+[[package]]
+name = "prost"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
+dependencies = [
+ "bytes",
+ "prost-derive 0.14.4",
 ]
 
 [[package]]
@@ -3084,7 +3094,7 @@ dependencies = [
  "once_cell",
  "petgraph",
  "prettyplease",
- "prost",
+ "prost 0.13.5",
  "prost-types",
  "regex",
  "syn 2.0.118",
@@ -3105,12 +3115,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost-derive"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
+dependencies = [
+ "anyhow",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "prost-types"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
 dependencies = [
- "prost",
+ "prost 0.13.5",
 ]
 
 [[package]]
@@ -4247,7 +4270,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
- "prost",
+ "prost 0.13.5",
  "rustls-native-certs",
  "rustls-pemfile",
  "socket2 0.5.10",
@@ -5192,7 +5215,7 @@ dependencies = [
  "hex",
  "keyring",
  "oauth2",
- "prost",
+ "prost 0.14.4",
  "rand 0.8.6",
  "reqwest",
  "rpassword",
@@ -5226,7 +5249,7 @@ dependencies = [
  "futures-util",
  "hex",
  "keyring",
- "prost",
+ "prost 0.14.4",
  "rand 0.8.6",
  "reqwest",
  "semver",
@@ -5278,7 +5301,7 @@ dependencies = [
 name = "yadorilink-ipc-proto"
 version = "0.1.0"
 dependencies = [
- "prost",
+ "prost 0.14.4",
  "tokio",
  "tonic",
  "tonic-build",
@@ -5325,7 +5348,7 @@ dependencies = [
  "madsim",
  "madsim-tokio",
  "notify",
- "prost",
+ "prost 0.14.4",
  "r2d2",
  "r2d2_sqlite",
  "rand 0.8.6",
@@ -5359,7 +5382,7 @@ dependencies = [
  "hmac",
  "if-addrs",
  "madsim-tokio",
- "prost",
+ "prost 0.14.4",
  "rand 0.8.6",
  "sha2",
  "tempfile",

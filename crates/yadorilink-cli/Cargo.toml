@@ -33,7 +33,7 @@ tokio.workspace = true
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
 tonic = { version = "0.12", features = ["tls-native-roots"] }
-prost = "0.13"
+prost = "0.14"
 thiserror.workspace = true
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
 serde.workspace = true
