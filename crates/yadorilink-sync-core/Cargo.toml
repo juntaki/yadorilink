@@ -46,7 +46,7 @@ zstd = { workspace = true }
 # without pulling in a whole extra `hkdf` crate for one call site. Scoped to
 # this crate only, mirroring the `zstd` precedent immediately above.
 chacha20poly1305 = "0.10"
-x25519-dalek = { version = "2.0.1", features = ["zeroize"] }
+x25519-dalek = { version = "3.0.0", features = ["zeroize"] }
 hmac = "0.12"
 zeroize = "1"
 rand = "0.8"
