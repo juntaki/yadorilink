@@ -1,7 +1,7 @@
-//! add-observability-and-metrics section 2 (design.md "Recent-error ring
-//! buffer"): a bounded, in-memory, in-process-only history of reporting-safe
-//! sync errors, surfaced by `yadorilink status` so a stuck or failing sync
-//! is diagnosable without reading logs.
+//! A bounded, in-memory, in-process-only history of reporting-safe sync
+//! errors — the "Recent-error ring buffer" — surfaced by `yadorilink
+//! status` so a stuck or failing sync is diagnosable without reading
+//! logs.
 //!
 //! Deliberately mirrors `connection_trace::ConnectionTraceLog` field for
 //! field (bounded `VecDeque`, oldest dropped once the cap is reached, never
@@ -13,7 +13,7 @@
 //! involved, so it gets the same "purely in-memory" treatment as
 //! `ConnectionTraceLog` and `daemon_state`'s `degraded_links`/`folder_ops`.
 //!
-//! Every record is `{category, timestamp, coarse_context}` only (design.md):
+//! Every record is `{category, timestamp, coarse_context}` only:
 //! `category` is one of `SyncError::category`'s stable slugs (or a handful
 //! of daemon-observed categories with no dedicated `SyncError` variant, e.g.
 //! `"block_integrity"`), and `coarse_context` is a short, fixed subsystem
@@ -23,7 +23,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// design.md: "last N, e.g. 64".
+/// Bounded ring buffer size — last N entries, e.g. 64.
 pub const MAX_RECENT_ERRORS: usize = 64;
 
 fn now_unix() -> i64 {
@@ -44,9 +44,9 @@ struct Inner {
     entries: Mutex<VecDeque<RecentErrorRecord>>,
     /// Monotonic per-category counts, never shrinking even as old entries
     /// roll off `entries` — the `/metrics` endpoint's
-    /// `yadorilink_sync_errors_total{category}` counter (task 3.2) must
-    /// never decrease just because the bounded ring buffer above evicted
-    /// an old entry, mirroring `reporting::counters`'s own
+    /// `yadorilink_sync_errors_total{category}` counter must never
+    /// decrease just because the bounded ring buffer above evicted an
+    /// old entry, mirroring `reporting::counters`'s own
     /// `error_category_counts` "counts, never rewritten down" contract.
     category_counts: Mutex<HashMap<&'static str, u64>>,
 }
@@ -73,7 +73,7 @@ impl RecentErrorLog {
 
     /// Records one error. `coarse_context` must already be a short, fixed
     /// subsystem tag (e.g. `"hydration"`) — callers must never pass a raw
-    /// path/key/token/IP here (task 2.1's redaction requirement).
+    /// path/key/token/IP here.
     pub fn record(&self, category: &'static str, coarse_context: impl Into<String>) {
         let record = RecentErrorRecord {
             category,
@@ -101,8 +101,8 @@ impl RecentErrorLog {
         self.0.entries.lock().unwrap_or_else(|p| p.into_inner()).iter().rev().cloned().collect()
     }
 
-    /// task 3.2: a snapshot of the monotonic per-category totals, for
-    /// `/metrics`' `yadorilink_sync_errors_total{category}` counter family.
+    /// A snapshot of the monotonic per-category totals, for `/metrics`'
+    /// `yadorilink_sync_errors_total{category}` counter family.
     pub fn category_counts(&self) -> Vec<(&'static str, u64)> {
         self.0
             .category_counts
@@ -118,8 +118,8 @@ impl RecentErrorLog {
 mod tests {
     use super::*;
 
-    /// task 5.1: the ring buffer is bounded — recording past
-    /// `MAX_RECENT_ERRORS` drops the oldest, not the newest.
+    /// The ring buffer is bounded — recording past `MAX_RECENT_ERRORS`
+    /// drops the oldest, not the newest.
     #[test]
     fn ring_buffer_is_bounded_and_drops_oldest_first() {
         let log = RecentErrorLog::new();
@@ -132,11 +132,12 @@ mod tests {
         assert_eq!(recent[0].coarse_context, format!("sweep-{}", MAX_RECENT_ERRORS + 9));
     }
 
-    /// task 5.1: the recent-error buffer is redacted — every field is a
-    /// stable category, a timestamp, or whatever fixed context string the
-    /// caller passed; this test exists as a structural guard (an exhaustive
-    /// match with named bindings) so a future field addition can't quietly
-    /// smuggle in a raw path/key/token/IP without updating this note.
+    /// The recent-error buffer is redacted — every field is a stable
+    /// category, a timestamp, or whatever fixed context string the
+    /// caller passed; this test exists as a structural guard (an
+    /// exhaustive match with named bindings) so a future field addition
+    /// can't quietly smuggle in a raw path/key/token/IP without updating
+    /// this note.
     #[test]
     fn record_shape_never_carries_more_than_category_timestamp_and_context() {
         let record = RecentErrorRecord {
@@ -147,8 +148,8 @@ mod tests {
         let RecentErrorRecord { category: _, timestamp_unix: _, coarse_context: _ } = record;
     }
 
-    /// task 3.2: per-category counts are monotonic even once the bounded
-    /// ring buffer starts evicting old entries.
+    /// Per-category counts are monotonic even once the bounded ring
+    /// buffer starts evicting old entries.
     #[test]
     fn category_counts_stay_monotonic_across_ring_buffer_eviction() {
         let log = RecentErrorLog::new();

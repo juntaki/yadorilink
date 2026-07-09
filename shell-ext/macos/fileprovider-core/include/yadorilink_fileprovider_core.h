@@ -62,7 +62,7 @@ char *yadorilink_fp_list_folder_files(const char *local_path);
  * Returns a JSON object {"sync_state": string, "materialization_state":
  * string, "open_elsewhere_device_id": string} for `path`.
  * `open_elsewhere_device_id` is empty if the file is not currently
- * reported open elsewhere (design.md D7, advisory only). Falls back to
+ * reported open elsewhere (an advisory-only signal). Falls back to
  * an all-"unspecified"/empty-string object on a NULL path or any
  * failure. Caller must free with yadorilink_fp_free_string.
  *
@@ -72,9 +72,9 @@ char *yadorilink_fp_query_status(const char *path);
 
 /*
  * Requests hydration of `path` from the daemon, blocking the calling
- * thread up to ~35s (design.md D5's bounded-timeout decision — long
- * enough to cover the daemon-side 30s hydration deadline plus IPC
- * overhead). Returns true only on a confirmed successful hydration;
+ * thread up to ~35s (a bounded-timeout decision — long enough to cover
+ * the daemon-side 30s hydration deadline plus IPC overhead). Returns
+ * true only on a confirmed successful hydration;
  * false for a NULL path, timeout, unreachable daemon, or a
  * daemon-reported failure. Callers with a synchronous OS callback to
  * satisfy (fetchContents(for:...)) must complete that callback with a

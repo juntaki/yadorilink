@@ -1,12 +1,11 @@
-//! The peer-to-peer sync protocol driver (tasks 5.4, 5.5, 6.2-6.4, 6.6):
-//! runs over one `yadorilink_transport::PeerChannel`, exchanging file indexes
+//! The peer-to-peer sync protocol driver: runs over one
+//! `yadorilink_transport::PeerChannel`, exchanging file indexes
 //! and blocks directly with one peer device, with no central server
-//! involved. One `PeerSyncSession` per connected peer (task 6.9: a peer
+//! involved. One `PeerSyncSession` per connected peer (a peer
 //! being offline only affects its own session, never blocks sync with
 //! other reachable peers).
 //!
 //! ## Trust boundary: an authorized peer is not necessarily benign
-//! (`harden-untrusted-peer-data`)
 //!
 //! Every function in this module that handles data from `self.channel`
 //! treats the connected peer as **authorized but untrusted**: it has
@@ -70,15 +69,15 @@ use crate::version_vector::{VvOrdering, MAX_VV_COUNTER_JUMP_PER_MESSAGE};
 
 /// SEC-13 (see `run`'s recv loop, where this actually gates
 /// concurrently-spawned inbound message handlers): the fixed, non-adaptive
-/// per-peer concurrency ceiling. improve-transfer-performance task 1.2:
-/// `AdaptiveWindow`'s `max` is constructed to never exceed this — the
+/// per-peer concurrency ceiling. `AdaptiveWindow`'s `max` is constructed
+/// to never exceed this — the
 /// adaptive in-flight fetch window (`adaptive_window` field below) grows
 /// and shrinks freely below it, but this remains the hard upper bound
 /// nothing in this module can adapt past, so the new controller composes
 /// with (rather than reintroduces a way around) the existing DoS bound.
 const MAX_IN_FLIGHT_MESSAGES_PER_PEER: usize = 64;
 
-/// fix-recv-loop-head-of-line-deadlock-on-catchup: purely observational —
+/// Purely observational —
 /// logged once (on the transition across this size, not repeatedly) when
 /// `run`'s recv-loop's permit-wait queue (`pending`) grows past it, so a
 /// peer sending faster than this device can drain becomes visible rather
@@ -91,7 +90,7 @@ const MAX_IN_FLIGHT_MESSAGES_PER_PEER: usize = 64;
 /// against a specific measurement.
 const PENDING_QUEUE_WARN_THRESHOLD: usize = 10_000;
 
-/// improve-transfer-performance task 1.1: the adaptive window's starting
+/// The adaptive window's starting
 /// point for a fresh session — matches the pre-adaptive fixed lane count
 /// `yadorilink-daemon::hydration`'s multi-peer dispatcher used
 /// unconditionally before this change (`PER_PEER_IN_FLIGHT_WINDOW`), so
@@ -100,7 +99,7 @@ const PENDING_QUEUE_WARN_THRESHOLD: usize = 10_000;
 /// session.
 const ADAPTIVE_WINDOW_INITIAL: usize = 4;
 
-/// improve-transfer-performance task 1.2: the adaptive window's floor —
+/// The adaptive window's floor —
 /// even a badly degraded peer keeps at least one in-flight `fetch_block`
 /// slot, rather than being starved to zero (which would need a separate
 /// "peer is unusable, stop trying" decision this controller doesn't make).
@@ -128,25 +127,25 @@ const ADAPTIVE_WINDOW_MIN: usize = 1;
 /// against a malicious advertisement, not a tuned-for-typical-workload
 /// limit. Raw free-space enforcement itself is intentionally **not**
 /// re-specified here; a minimum free-space headroom checked before every
-/// write is owned by the concurrent `add-resource-governance` change —
+/// write is owned by a separate, concurrent resource-governance mechanism —
 /// this is the orthogonal, upstream control that limits how much a single
 /// advertisement can demand before that guard even comes into play.
 const MAX_FILES_PER_INDEX_MESSAGE: usize = 100_000;
 const MAX_BLOCKS_PER_INDEX_MESSAGE: usize = 2_000_000;
 
-/// add-transfer-compression design.md D5: zstd's low/fast level, used for
+/// zstd's low/fast compression level, used for
 /// every trial/send compression pass in this module (block payloads and
 /// index-exchange payloads alike) — chosen because the compression pass
 /// runs synchronously in the send path (albeit off the async runtime, via
 /// `spawn_blocking`) for every candidate payload and must not become the
-/// sync engine's bottleneck. See design.md D5 for the full rationale.
+/// sync engine's bottleneck.
 const COMPRESSION_LEVEL: i32 = 3;
 
-/// design.md D3: the sender always performs one low-level (`COMPRESSION_
+/// The sender always performs one low-level (`COMPRESSION_
 /// LEVEL`) trial compression pass on a candidate payload, then keeps the
 /// compressed form only if it beats this fraction of the raw size — a
 /// "try-compress-and-compare" heuristic, not a separate entropy-sampling
-/// pre-pass. D3 explicitly rejects that alternative (sampling first): it
+/// pre-pass. This deliberately rejects that alternative (sampling first): it
 /// would add a second full pass over the data for marginal savings over
 /// just running the cheap level-3 pass once and checking the result size.
 /// Already-compressed/incompressible content (media, archives, encrypted
@@ -154,7 +153,7 @@ const COMPRESSION_LEVEL: i32 = 3;
 /// cheap compression attempt — never a second, wasted full-ratio pass.
 const COMPRESSION_SKIP_THRESHOLD: f64 = 0.95;
 
-/// add-transfer-compression task 4.x: a documented (not precisely derived)
+/// A documented (not precisely derived)
 /// ceiling on how large a decompressed `Index`/`IndexUpdate` payload may
 /// be. Index messages aren't bounded by `MAX_BLOCK_SIZE` (that's a
 /// per-block cap) the way `BlockResponse.data` is, so this exists purely
@@ -169,9 +168,9 @@ const COMPRESSION_SKIP_THRESHOLD: f64 = 0.95;
 /// those constants' own doc comment.
 const MAX_DECOMPRESSED_INDEX_SIZE: usize = 256 * 1024 * 1024;
 
-/// add-transfer-compression task 2.2: compresses `data` at `COMPRESSION_
+/// Compresses `data` at `COMPRESSION_
 /// LEVEL` and keeps the compressed form only when it beats `COMPRESSION_
-/// SKIP_THRESHOLD` of the raw size (D3) — otherwise (including on an
+/// SKIP_THRESHOLD` of the raw size — otherwise (including on an
 /// encoder error, or empty input, both treated as "not worth compressing"
 /// rather than propagated, since sending raw bytes is always a safe
 /// fallback) returns the original bytes tagged `Compression::None`. Pure
@@ -193,7 +192,7 @@ fn compress_block(data: &[u8]) -> (Vec<u8>, proto::Compression) {
     }
 }
 
-/// add-transfer-compression task 2.3 / proposal.md's decompression-bomb
+/// A decompression-bomb
 /// bound: decompresses `data` per `declared_compression`, never
 /// materializing more than `max_size + 1` bytes regardless of what the
 /// compressed payload claims to expand to. This reads through a
@@ -233,7 +232,7 @@ fn decompress_block(
     }
 }
 
-/// SEC-SYNC-2 / task 4.2: the cardinality-cap check behind
+/// SEC-SYNC-2: the cardinality-cap check behind
 /// `reconcile_files_if_authorized`, factored out as a free function taking
 /// explicit `max_files`/`max_blocks` so it's unit-testable
 /// (`cardinality_cap_tests` below) against small synthetic caps instead of
@@ -266,10 +265,10 @@ fn index_message_exceeds_cardinality_cap(
 /// starts a fresh budget) — bounding how much any *one* session can push
 /// onto local disk eagerly, not a permanent per-group ceiling (that's
 /// `max_local_size_bytes`, reactive eviction, and (out of scope here)
-/// `add-resource-governance`'s free-space headroom).
+/// the separate free-space headroom mechanism).
 const MAX_EAGER_BLOCKS_PER_GROUP_PER_SESSION: u64 = 200_000;
 
-/// SEC-SYNC-2 / task 4.2: the actual admission bookkeeping behind
+/// SEC-SYNC-2: the actual admission bookkeeping behind
 /// `PeerSyncSession::admit_eager_blocks`, factored out as a free function
 /// over an explicit `admission` map and `max_per_group` ceiling so it's
 /// unit-testable (`eager_admission_tests` below) without constructing a
@@ -317,7 +316,7 @@ const MAX_CONCURRENT_RECONCILES: usize = 16;
 // each getting an owned copy.
 type PendingBlockRequests = StdMutex<HashMap<Vec<u8>, Vec<oneshot::Sender<FetchOutcome>>>>;
 
-/// fix-conflict-resolution-block-race: `handle_block_response` already
+/// `handle_block_response` already
 /// knows, in the moment, whether a peer's response was an explicit
 /// `not_found` versus received-but-rejected (decompression failure, a
 /// decompression-bomb bound exceeded) — this preserves that distinction
@@ -386,7 +385,7 @@ impl Drop for PendingBlockGuard<'_> {
     }
 }
 
-/// add-untrusted-storage-peer task 2.1/2.3: what a ciphertext `BlockRequest`
+/// What a ciphertext `BlockRequest`
 /// waiter (`fetch_block_from_storage_peer`) receives once a matching
 /// `BlockResponse` with `is_ciphertext = true` arrives — the raw
 /// ciphertext bytes plus the nonce needed to decrypt them (`content_
@@ -410,7 +409,7 @@ struct CiphertextBlockPayload {
 type PendingCiphertextBlockRequests =
     StdMutex<HashMap<Vec<u8>, Vec<oneshot::Sender<Option<CiphertextBlockPayload>>>>>;
 
-/// task 2.2: ciphertext_hash -> the AEAD nonce it was stored with, shared
+/// ciphertext_hash -> the AEAD nonce it was stored with, shared
 /// across every `PeerSyncSession` a storage-only device runs — see
 /// `PeerSyncSession::set_ciphertext_nonce_cache`'s doc comment.
 pub type CiphertextNonceCache = Arc<StdMutex<HashMap<Vec<u8>, [u8; content_crypto::NONCE_LEN]>>>;
@@ -434,7 +433,7 @@ impl Drop for PendingCiphertextBlockGuard<'_> {
     }
 }
 
-/// add-sync-fidelity task 3.1/3.2: materializes a non-deleted symlink
+/// Materializes a non-deleted symlink
 /// record at `group_id`/`record.path` under `root`. Factored out as a
 /// free function (explicit `state`/`root`/`group_id`/`record` rather than
 /// a `PeerSyncSession` receiver) purely for direct unit-testability — the
@@ -445,14 +444,14 @@ impl Drop for PendingCiphertextBlockGuard<'_> {
 /// materialization/hydration.
 ///
 /// **Wire-schema gap, documented rather than papered over**: today's
-/// `proto::FileInfo` (`yadorilink-ipc-proto`, section 5 of this change,
-/// not yet implemented) carries no `record_kind`/`symlink_target` field,
+/// `proto::FileInfo` (`yadorilink-ipc-proto`, not yet implemented) carries
+/// no `record_kind`/`symlink_target` field,
 /// so a peer's incoming index message cannot yet actually tell this
 /// device "this path is a symlink" — `PeerSyncSession::materialize`
 /// (this function's only caller) decides whether to route a given path
 /// through here by consulting `SyncState::get_record_kind`, i.e. *this
 /// device's own already-recorded* classification for that path. That is
-/// correct and sufficient once section 5 wires a peer's advertised kind
+/// correct and sufficient once a peer's advertised kind is wired
 /// through to a `set_record_kind` call before reconciliation reaches this
 /// point (the natural extension seam); until then, this function is real,
 /// tested, and ready, but a symlink genuinely cannot cross the wire from
@@ -493,7 +492,7 @@ fn materialize_symlink_at(
     }
     #[cfg(windows)]
     {
-        // task 3.2: default is skip-with-visible-status — the record was
+        // Default is skip-with-visible-status — the record was
         // already adopted into the index above (so it still syncs
         // correctly onward to a POSIX peer), but nothing is written to
         // disk here unless this link explicitly opted in.
@@ -510,7 +509,7 @@ fn materialize_symlink_at(
     }
 }
 
-/// add-sync-fidelity task 3.4: if `record`'s block list is byte-identical
+/// If `record`'s block list is byte-identical
 /// to what's already indexed locally for this path (content provably
 /// unchanged — the same block hashes, in the same order, describe both),
 /// this applies just the owner-executable bit currently recorded in the
@@ -521,10 +520,10 @@ fn materialize_symlink_at(
 /// applied; `false` means the caller must fall through to ordinary
 /// fetch/reconstruct handling (no local record existed yet for this path,
 /// the content actually changed, or the file is unexpectedly missing from
-/// disk — see fix-materialization-disk-index-divergence below).
+/// disk — see the disk/index divergence note below).
 ///
 /// See `materialize_symlink_at`'s doc comment for the same wire-schema
-/// caveat: `proto::FileInfo` has no exec-bit field yet (section 5), so
+/// caveat: `proto::FileInfo` has no exec-bit field yet, so
 /// "the bit this applies" is this device's own already-recorded value for
 /// the path, not literally something read off the incoming wire message.
 /// This is still exactly the mechanism the receiving side needs — once a
@@ -532,7 +531,7 @@ fn materialize_symlink_at(
 /// of reconciliation, this fast path picks it up correctly with no
 /// further changes.
 ///
-/// fix-materialization-disk-index-divergence: this fast path assumes the
+/// This fast path assumes the
 /// file is still sitting on disk from whenever it was last actually
 /// written (this function itself never writes content) — that assumption
 /// can be false (e.g. a real local deletion raced this incoming record,
@@ -571,8 +570,7 @@ fn try_apply_metadata_only_update(
     Ok(true)
 }
 
-/// dst-full-stack-heat-run-framework P0 (agmsg investigation, 2026-07-09):
-/// under `madsim`, `SystemTime::now()` reads a per-seed *virtual* clock
+/// Under `madsim`, `SystemTime::now()` reads a per-seed *virtual* clock
 /// (madsim intercepts `gettimeofday`/`clock_gettime`) — but a real
 /// filesystem's `mtime` does not go through that interception (the kernel
 /// stamps it independently at write time), so a real-fs write during a
@@ -609,7 +607,7 @@ pub fn set_test_clock_override(nanos: i64) {
         .store(nanos, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// add-sync-fidelity task 4.3: the current wall-clock time as
+/// The current wall-clock time as
 /// `held_since_unix_nanos` — same shape as `resolve_and_apply_conflict`'s
 /// own `now_unix_nanos` need (kept as a small shared free function rather
 /// than duplicated further, since `hold_record`'s and `hydrate_file_with_
@@ -625,14 +623,14 @@ fn now_unix_nanos() -> i64 {
         .unwrap_or(0)
 }
 
-/// add-deterministic-sync-testing: thin wrapper so every call site below
+/// A thin wrapper so every call site below
 /// needs only one `#[allow(deprecated)]`, not nine. `madsim`'s tokio
 /// shim marks `spawn_blocking` deprecated ("blocking function is not
 /// allowed in simulation") because it still runs on a real, non-
 /// simulated OS thread under madsim rather than being scheduled
 /// deterministically — a known, tracked gap (disk/CPU-bound block-store
-/// I/O determinism is deferred to task 6.1's `MaterializeIo`, see
-/// design.md D2), not something this wrapper is meant to silently paper
+/// I/O determinism is deferred to a future `MaterializeIo` abstraction),
+/// not something this wrapper is meant to silently paper
 /// over for good.
 #[allow(deprecated)]
 fn spawn_blocking<F, R>(f: F) -> tokio::task::JoinHandle<R>
@@ -643,11 +641,11 @@ where
     tokio::task::spawn_blocking(f)
 }
 
-/// fix-materialization-disk-index-divergence (Bug 4): bounded retry
+/// Bounded retry
 /// parameters for a `reconcile_one_file` call failing transiently — see
 /// its call site's doc comment (the `in_flight.spawn` dispatch loop) for
-/// the specific race this is sized for. Same shape as
-/// fix-conflict-resolution-block-race's `NOT_FOUND_RETRY_*` constants
+/// the specific race this is sized for. Same shape as the
+/// `NOT_FOUND_RETRY_*` constants used for block-fetch retries
 /// (bounded attempts, fixed delay with jitter to avoid synchronized retry
 /// bursts) — free functions/constants rather than `PeerSyncSession`
 /// associated items since the retry loop lives inside a `'static`
@@ -663,14 +661,14 @@ fn reconcile_retry_delay() -> std::time::Duration {
     RECONCILE_RETRY_BASE_DELAY.mul_f64(1.0 + jitter)
 }
 
-/// fix-local-edit-swallowed-by-self-echo-race: lets `reconcile_one_file`
+/// Lets `reconcile_one_file`
 /// ask whether the path it's about to reconcile against a peer's update
 /// has a local change still sitting, undispatched, in that link's debounce
 /// accumulator (`debounce::run_debouncer`'s `FlushPathRequest` handling) —
 /// and if so, force it to flush and be captured into the index *before*
 /// `reconcile_one_file`'s version-vector `compare()` runs or `materialize`
 /// writes to the path, so a peer's write or tombstone for the same path
-/// can never race ahead of it (design.md's chosen fix).
+/// can never race ahead of it.
 ///
 /// `yadorilink-sync-core` has no concept of the debounce accumulator or its
 /// channels at all (`debounce.rs` knows nothing about indexing/peers, and
@@ -694,8 +692,7 @@ pub trait PendingLocalChangeFlush: Send + Sync {
         rel_path: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
-    /// fix-case-fold-sibling-local-change-not-flushed-before-reconcile:
-    /// like `flush_pending_local_change`, but for the *other* case-variant
+    /// Like `flush_pending_local_change`, but for the *other* case-variant
     /// path that would collide with `rel_path` on a case-insensitive
     /// filesystem, rather than `rel_path` itself — see
     /// `PeerSyncSession::flush_case_fold_sibling_before_reconcile`'s doc
@@ -707,7 +704,7 @@ pub trait PendingLocalChangeFlush: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
-/// add-sync-fidelity task 4.1-4.3: the actual hazard-detection logic
+/// The actual hazard-detection logic
 /// behind `PeerSyncSession::hazard_reason_for`, factored out as a free
 /// function (explicit `state`/`root`/`group_id`/`record`/`policy` rather
 /// than a `PeerSyncSession` receiver) for the same reason
@@ -715,13 +712,13 @@ pub trait PendingLocalChangeFlush: Send + Sync {
 /// free functions: direct unit-testability with just a `SyncState` +
 /// tempdir, no live `PeerChannel` needed (`hazard_reason_tests` below).
 ///
-/// Composes `hazard::invalid_name_reason` (task 4.2) and
-/// `hazard::case_fold_collision` (task 4.1, only even queried when
+/// Composes `hazard::invalid_name_reason` and
+/// `hazard::case_fold_collision` (only even queried when
 /// `hazard::is_case_insensitive_filesystem` says `root`'s filesystem
 /// actually needs the check) — `None` means safe to materialize normally.
 ///
 /// Taking an explicit `policy` (rather than hardcoding `NamePolicy::
-/// local()` here) is what makes task 4.6's "held on a Windows-policy test
+/// local()` here) is what makes a "held on a Windows-policy test
 /// target, materializes normally on a POSIX-policy test target, from the
 /// same index state" scenario directly testable in one process regardless
 /// of which platform actually runs the test suite —
@@ -736,8 +733,7 @@ pub trait PendingLocalChangeFlush: Send + Sync {
 /// reconciled. A peer's periodic full-index resend (already relied on
 /// elsewhere for eventual consistency) is what actually triggers that next
 /// reconcile — this crate has no separate "re-check every held file"
-/// sweep; documented as a gap, not an oversight, in this section's
-/// `tasks.md` notes.
+/// sweep; documented as a gap, not an oversight.
 fn hazard_reason_for_policy(
     state: &SyncState,
     root: &Path,
@@ -761,16 +757,16 @@ fn hazard_reason_for_policy(
     Ok(None)
 }
 
-/// add-sync-fidelity task 4.3/4.4/4.5: the actual held-state bookkeeping
+/// The actual held-state bookkeeping
 /// behind `PeerSyncSession::hold`, factored out the same way as
 /// `hazard_reason_for_policy` above for direct unit-testability. Adopts
-/// `record` into the index (`upsert_file` — task 4.4: a held record keeps
+/// `record` into the index (`upsert_file` — a held record keeps
 /// participating in ordinary index exchange/forwarding, since
 /// `reconcile_one_file`'s callers `forward` a record regardless of what
 /// `materialize` itself did with it) and marks it held with `reason`
 /// (`SyncState::set_held`), without ever reaching an atomic on-disk write
 /// step for this path. Never renames, never writes under any alternate
-/// name (design D3, task 4.5) — the only two effects this has are an
+/// name — the only two effects this has are an
 /// index upsert and a held-state write; see
 /// `no_hazard_ever_writes_under_any_alternate_name` (in
 /// `tests/peer_session.rs`) for a regression test asserting exactly that
@@ -794,7 +790,7 @@ fn hold_record(
     Ok(())
 }
 
-/// Closes the add-sync-fidelity task 5.1 wire-serialization gap (see
+/// Closes a wire-serialization gap (see
 /// `types.rs`'s doc comments on both `FileRecord`/`proto::FileInfo` `From`
 /// impls for the full story): maps the wire enum's raw `i32` (an unknown
 /// or absent value decodes as `Unspecified`, proto3's zero value) onto this
@@ -822,7 +818,7 @@ fn proto_record_kind_from_domain(kind: RecordKind) -> proto::RecordKind {
 }
 
 /// The four symlink/exec-bit fields carried on an incoming peer's
-/// `proto::FileInfo` (task 5.1, fields 7-10) that `FileRecord`'s
+/// `proto::FileInfo` (fields 7-10) that `FileRecord`'s
 /// `From<proto::FileInfo>` conversion structurally cannot carry (see
 /// `types.rs`). Captured from the *original* `proto::FileInfo` before that
 /// conversion runs (`reconcile_files` does this), and threaded alongside
@@ -839,7 +835,7 @@ struct IncomingWireMeta {
     symlink_target: Option<String>,
     symlink_out_of_root: bool,
     exec_bit: bool,
-    /// fix-multiway-conflict-name-content-mismatch: the device that
+    /// The device that
     /// actually produced this incoming record's content, per the sending
     /// peer's own `SyncState::get_origin_device_id` lookup (see
     /// `file_info_for_record`). `None` when absent/empty on the wire — an
@@ -862,8 +858,8 @@ impl From<&proto::FileInfo> for IncomingWireMeta {
     }
 }
 
-/// Closes the add-sync-fidelity task 5.1 handoff (see `types.rs`'s and
-/// section 5's `tasks.md` notes for the precise gap this fills):
+/// Closes a wire-serialization handoff gap (see `types.rs`'s doc comments
+/// for the precise gap this fills):
 /// persists an incoming peer's advertised `record_kind`/`symlink_target`/
 /// `symlink_out_of_root`/`exec_bit` into `SyncState` at `record.path`,
 /// which must be `record`'s *final* target path (post-conflict-rename, if
@@ -878,7 +874,7 @@ impl From<&proto::FileInfo> for IncomingWireMeta {
 /// `state.upsert_file(group_id, record)` unconditionally to guarantee
 /// that — which introduced a real regression, caught by this change's own
 /// two-peer wire test (`tests/peer_session.rs`): `materialize`'s
-/// `try_apply_metadata_only_update` (task 3.4) fast-paths whenever the
+/// `try_apply_metadata_only_update` fast-paths whenever the
 /// path's *already-indexed* blocks equal the incoming record's blocks,
 /// skipping the real fetch/write and just chmod'ing the (assumed
 /// already-on-disk) file. Pre-upserting `record` here made that
@@ -906,10 +902,10 @@ fn apply_incoming_wire_metadata(
     record: &FileRecord,
     meta: &IncomingWireMeta,
 ) -> Result<(), SyncError> {
-    // add-file-version-history: was `state.upsert_file(group_id, &FileRecord
+    // This was `state.upsert_file(group_id, &FileRecord
     // { blocks: Vec::new(), ..record.clone() })` guarded by the same
     // `is_none()` check — that call now goes through the version-retaining
-    // `upsert_file_in_tx` path (task 1.3), which would otherwise record
+    // `upsert_file_in_tx` path, which would otherwise record
     // this empty bootstrap row as a genuine (if short-lived) superseded
     // version once `materialize` immediately upserts the real content
     // moments later, leaving every peer-adopted file's history with a
@@ -926,10 +922,10 @@ fn apply_incoming_wire_metadata(
     Ok(())
 }
 
-/// On-demand-sync design D5's default hydration timeout.
+/// On-demand sync's default hydration timeout.
 pub const DEFAULT_HYDRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// fix-burst-sync-permanent-stall task 1.1/1.2: default interval between
+/// Default interval between
 /// this session's periodic, self-initiated full-index resends to its peer
 /// (see `run`'s independent resync task, and `send_full_index`, which this
 /// reuses verbatim). Exists because `ClusterConfig`/the initial
@@ -942,24 +938,24 @@ pub const DEFAULT_HYDRATION_TIMEOUT: std::time::Duration = std::time::Duration::
 /// permits are queued behind it on the same connection), nothing else ever
 /// revisits that path — the device silently never converges until a daemon
 /// restart, which re-triggers the identical race under the same burst
-/// (`stabilize-beta-test-suite`'s verification, corroborated independently
-/// in this change: `load_many_small_files`/`live_burst_batching` reproduced
+/// (verified via `load_many_small_files`/`live_burst_batching`, which
+/// reproduced
 /// a genuinely *permanent* stall, file counts flat for 5+ minutes past the
 /// old 180s timeout). A periodic resync is self-healing by construction —
 /// it re-discovers and re-reconciles ANY path that fell out of sync for ANY
-/// reason, not just this specific failure mode (design.md's "ride an
-/// existing mechanism" decision) — at the cost of re-sending the *entire*
+/// reason, not just this specific failure mode (deliberately riding an
+/// existing mechanism) — at the cost of re-sending the *entire*
 /// index (bandwidth proportional to total linked-folder file count, not
 /// just the burst size) every interval, for the life of the session.
 ///
-/// design.md's Open Question left the exact value to whoever implemented
+/// The exact value was left to whoever implemented
 /// this, explicitly prioritizing "keeps `live_burst_batching`/
 /// `load_many_small_files` genuinely (not just accidentally) passing within
-/// their current test timeouts" over the conservative 10-15 minute figure
-/// floated as an example in that doc: those two daemon E2E tests exercise
+/// their current test timeouts" over a conservative 10-15 minute figure:
+/// those two daemon E2E tests exercise
 /// this exact stall through the real `yadorilink-daemon` stack with no way
 /// to inject a shorter test-only interval, and their `CONVERGENCE_TIMEOUT`
-/// is 180s (`stabilize-beta-test-suite`, already loosened once for
+/// is 180s (already loosened once for
 /// environmental slowness — raising it again to accommodate a
 /// double-digit-minutes interval would just be re-hiding this same bug
 /// under a bigger number). 90 seconds leaves roughly half of that 180s
@@ -973,7 +969,7 @@ pub const DEFAULT_HYDRATION_TIMEOUT: std::time::Duration = std::time::Duration::
 pub const DEFAULT_FULL_INDEX_RESYNC_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(90);
 
-/// enforce-live-device-revocation task 4.1/4.2: this session's *current*
+/// This session's *current*
 /// view of which folder groups its peer is authorized for, as distinct
 /// from `PeerSyncSession::shared_group_ids` (the snapshot captured once at
 /// construction from whatever netmap/ACL state was available at connect
@@ -981,12 +977,12 @@ pub const DEFAULT_FULL_INDEX_RESYNC_INTERVAL: std::time::Duration =
 /// in `run`, since which groups to open a session for at all is a
 /// connect-time decision, not a per-request one).
 ///
-/// design.md D2 (push model, not per-request coordination-plane checks):
+/// Push model, not per-request coordination-plane checks:
 /// nothing in this crate ever calls back to the coordination plane to
 /// populate or consult this. It is a purely local, cheaply-read cache — a
 /// `Mutex`-guarded `HashSet` lookup per request, no I/O, no network round
 /// trip — that a caller outside this crate (the daemon's netmap-diff-driven
-/// teardown reaction, tasks.md sections 2/5) is expected to keep in sync
+/// teardown reaction) is expected to keep in sync
 /// with the actual current netmap/ACL state via
 /// `PeerSyncSession::revoke_group`/`grant_group`/`set_authorized_groups`
 /// whenever a netmap update changes this peer's authorized groups. Until
@@ -1025,7 +1021,7 @@ impl LiveGroupAuthorization {
     }
 }
 
-/// add-cross-account-sharing D4: the permission this (local) device has
+/// The permission this (local) device has
 /// granted its peer for one shared folder group. Kept as a small
 /// crate-local enum — mirroring `yadorilink-coordination::shares::ShareRole`
 /// in spirit but deliberately *not* a shared type: this crate has no
@@ -1043,7 +1039,7 @@ pub enum PeerRole {
     Write,
 }
 
-/// add-cross-account-sharing D4: this session's current view of the role
+/// This session's current view of the role
 /// (`PeerRole::Read` or `PeerRole::Write`) this peer holds for each shared
 /// folder group — i.e. the permission *this* (local, sharer) device
 /// granted the peer, consulted by `reconcile_files_if_authorized` to
@@ -1054,13 +1050,12 @@ pub enum PeerRole {
 /// expected to keep in sync with the current ACL/netmap role state via
 /// `PeerSyncSession::set_peer_role`/`set_peer_roles` whenever a netmap
 /// update changes this peer's role for a group (a `read`/`write` role
-/// change takes effect on the very next message, per design.md D4's "a
-/// role that is downgraded ... takes effect on the next message, not only
-/// at session setup").
+/// change takes effect on the very next message, not only
+/// at session setup).
 ///
 /// A group with no entry defaults to `PeerRole::Write` (`role_for`) —
 /// matching the `acl.role` column's own default for pre-existing,
-/// same-account edges (D3) — so every existing caller that never touches
+/// same-account edges — so every existing caller that never touches
 /// `set_peer_role`/`set_peer_roles` sees exactly the pre-existing (full
 /// read-write) behavior, the same backward-compatibility guarantee
 /// `LiveGroupAuthorization` documents for `shares_group`.
@@ -1096,7 +1091,7 @@ impl LiveGroupRoles {
     }
 }
 
-/// add-untrusted-storage-peer task 4.1/4.2: this session's current view of
+/// This session's current view of
 /// whether *this peer* is flagged storage-only (untrusted) for each shared
 /// folder group — populated from the coordination plane's ACL/netmap the
 /// same way `LiveGroupRoles` is (see that struct's doc comment for the
@@ -1141,7 +1136,7 @@ impl LiveStorageOnlyFlags {
     }
 }
 
-/// task 1.1/1.4: the group content-encryption key this device holds for one
+/// The group content-encryption key this device holds for one
 /// folder group, plus whether that group uses convergent (deterministic
 /// nonce, cross-device/cross-file dedup on the untrusted peer) or
 /// non-convergent (random nonce, no dedup — the per-group opt-out for
@@ -1169,7 +1164,7 @@ pub struct PeerSyncSession {
     /// (determined by the caller from the coordination plane's ACLs —
     /// this crate has no concept of authorization itself).
     shared_group_ids: Vec<String>,
-    /// enforce-live-device-revocation task 4.1/4.2/4.3: the session's live,
+    /// The session's live,
     /// mutable-after-construction view of peer authorization, consulted by
     /// `shares_group` (and therefore by every per-request authorization
     /// check that calls it — `handle_block_request`,
@@ -1178,7 +1173,7 @@ pub struct PeerSyncSession {
     /// comment for why this is a separate field rather than a replacement
     /// for `shared_group_ids`.
     live_authorized_groups: LiveGroupAuthorization,
-    /// add-cross-account-sharing D4: this session's live, mutable-after-
+    /// This session's live, mutable-after-
     /// construction view of the *role* (read/write) this peer holds per
     /// shared group — consulted by `reconcile_files_if_authorized`
     /// alongside (not instead of) `live_authorized_groups`: a group must
@@ -1186,14 +1181,14 @@ pub struct PeerSyncSession {
     /// `PeerRole::Read` for this session to accept an inbound index update
     /// for it. See `LiveGroupRoles`'s doc comment.
     live_group_roles: LiveGroupRoles,
-    /// add-untrusted-storage-peer task 4.1/4.2: this session's live view of
+    /// This session's live view of
     /// whether *this peer* is flagged storage-only for each shared group —
     /// see `LiveStorageOnlyFlags`'s doc comment. Consulted by `send_full_
     /// index`/`send_index_update` (switch to the encrypted-index wire
     /// shape and never plaintext) and `handle_block_request` (switch to
     /// re-encrypting on the fly and never serving plaintext).
     live_storage_only_flags: LiveStorageOnlyFlags,
-    /// task 4.1's *other* half: whether *this* (local) device is itself
+    /// The complementary local-side fact: whether *this* (local) device is itself
     /// the storage-only device for a group — i.e. holds no group content
     /// key and no plaintext/`FileRecord`s for it at all, only whatever
     /// opaque `EncryptedFileEntry`/ciphertext-block bytes peers hand it.
@@ -1201,11 +1196,11 @@ pub struct PeerSyncSession {
     /// inferred from "no entry in `group_keys`", which a perfectly ordinary
     /// trusted device also has for any group with no untrusted peer
     /// configured at all) — set once by whatever constructs this session
-    /// for a device provisioned as a storage-only node (design.md: "an
+    /// for a device provisioned as a storage-only node ("an
     /// always-on backup/availability node on hardware you do not fully
     /// trust"), never inferred.
     local_storage_only_groups: StdMutex<std::collections::HashSet<String>>,
-    /// task 1.1-1.4: this device's own group content key (`K_g`) and
+    /// This device's own group content key (`K_g`) and
     /// convergent-mode setting, per shared group it holds one for — see
     /// `GroupKeyState`'s doc comment. Populated by `set_group_key` (a
     /// caller-driven setter, mirroring `set_rate_limiters`'s "daemon
@@ -1216,7 +1211,7 @@ pub struct PeerSyncSession {
     /// client at all (see `shared_group_ids`'s doc comment for the
     /// existing precedent of this crate's coordination-plane-blindness).
     group_keys: StdMutex<HashMap<String, GroupKeyState>>,
-    /// task 1.2: this device's own X25519 identity secret, used to unwrap
+    /// This device's own X25519 identity secret, used to unwrap
     /// an incoming `WrappedGroupKey` (`content_crypto::unwrap_group_key`)
     /// and to wrap outgoing ones (`send_wrapped_group_key`). `None` until
     /// a caller sets it (`set_local_identity_secret`) — a session with no
@@ -1225,10 +1220,9 @@ pub struct PeerSyncSession {
     /// down the session), which is the documented, honest scope limit for
     /// this pass: wiring a real device's actual WireGuard identity secret
     /// into every constructed session is daemon-level orchestration this
-    /// change does not attempt (see `openspec/changes/
-    /// add-untrusted-storage-peer/tasks.md`'s notes on task 1.2).
+    /// crate does not attempt.
     local_identity_secret: StdMutex<Option<StaticSecret>>,
-    /// task 2.1/3.2: whether this peer has advertised understanding of the
+    /// Whether this peer has advertised understanding of the
     /// ciphertext block-addressing/encrypted-index wire shapes at all —
     /// see `record_peer_encryption_support`'s doc comment. Distinct from
     /// `live_storage_only_flags` (which is a per-group ACL fact about the
@@ -1239,7 +1233,7 @@ pub struct PeerSyncSession {
     /// still never falls back to sending it plaintext — it simply cannot
     /// usefully sync that group with it.
     peer_supports_encrypted_storage_peer: std::sync::atomic::AtomicBool,
-    /// add-reliable-message-delivery: this peer's advertised `supports_
+    /// This peer's advertised `supports_
     /// reliable_delivery` from its handshake `ClusterConfig` — mirrors
     /// `peer_supports_encrypted_storage_peer`'s pattern exactly. This
     /// build always supports it (there is no local equivalent of
@@ -1248,7 +1242,7 @@ pub struct PeerSyncSession {
     /// so once this flips true, `record_peer_reliable_delivery_support`
     /// immediately calls `self.channel.enable_reliable_delivery()`.
     peer_supports_reliable_delivery: std::sync::atomic::AtomicBool,
-    /// harden-reliable-delivery-negotiation-on-lossy-link: set (never
+    /// Set (never
     /// cleared) the first time *any* `ClusterConfig` is received from this
     /// peer, regardless of what it advertises — distinct from `peer_
     /// supports_reliable_delivery` (which only reflects an old peer's or
@@ -1264,7 +1258,7 @@ pub struct PeerSyncSession {
     /// handshake" — which is a different claim from "you've received
     /// mine."
     peer_handshake_received: std::sync::atomic::AtomicBool,
-    /// harden-reliable-delivery-negotiation-on-lossy-link: paired with
+    /// Paired with
     /// `peer_handshake_received` — `notify_one`'d right after the flag is
     /// stored, so `spawn_cluster_config_retry`'s backoff wait can race a
     /// `notified()` against its `sleep` and return as soon as the
@@ -1280,8 +1274,7 @@ pub struct PeerSyncSession {
     /// `reliable_tick` seed590 regression (a timer's mere *presence*, not
     /// its logic, was perturbing scheduling).
     handshake_notify: tokio::sync::Notify,
-    /// harden-reliable-delivery-negotiation-on-lossy-link (spec correction,
-    /// 2026-07-09): the real stop condition for `spawn_cluster_config_
+    /// The real stop condition for `spawn_cluster_config_
     /// retry` and the periodic-resync re-offer. Set true only when an
     /// incoming `ClusterConfig` carries `acked_peer_cluster_config: true`
     /// — i.e. the peer has *itself* received a `ClusterConfig` from this
@@ -1296,7 +1289,7 @@ pub struct PeerSyncSession {
     /// This flag only flips once the peer has explicitly echoed back
     /// proof that this device's own advertisement got through.
     peer_acked_my_cluster_config: std::sync::atomic::AtomicBool,
-    /// task 3.1/3.2: the last `EncryptedIndex`/`EncryptedIndexUpdate`
+    /// The last `EncryptedIndex`/`EncryptedIndexUpdate`
     /// entries learned from this peer for each group, cached verbatim
     /// (never decrypted or re-derived) — used two ways: (a) when this
     /// device is itself storage-only for the group (`local_storage_only_
@@ -1309,7 +1302,7 @@ pub struct PeerSyncSession {
     /// this way yet in this pass — see `handle_encrypted_index`'s doc
     /// comment on scope).
     storage_peer_index_cache: StdMutex<HashMap<String, Vec<proto::EncryptedFileEntry>>>,
-    /// task 2.2: ciphertext_hash -> the AEAD nonce it was originally
+    /// ciphertext_hash -> the AEAD nonce it was originally
     /// received with, for ciphertext blocks this device stored while
     /// acting as a storage-only device (`local_storage_only_groups`). The
     /// `BlockStore` trait only stores raw bytes keyed by content hash —
@@ -1320,7 +1313,7 @@ pub struct PeerSyncSession {
     ///
     /// A storage-only device runs one `PeerSyncSession` per connected
     /// peer, but a block it *learns* via one peer's session must be
-    /// re-servable to a *different* peer's session later (design.md's
+    /// re-servable to a *different* peer's session later (the
     /// "relay" role is meaningless otherwise) — so this cannot be purely
     /// per-session state. Mirrors `rate_limiters`'s `StdMutex<Arc<_>>`
     /// shape exactly: defaults to a private, per-session cache (fine for a
@@ -1334,7 +1327,7 @@ pub struct PeerSyncSession {
     /// durable across a process restart — a real storage-only device
     /// deployment would need the nonce persisted next to its ciphertext
     /// (e.g. a sidecar file/column in `yadorilink-local-storage`), which
-    /// this pass does not implement (see tasks.md's notes on task 2.2).
+    /// this crate does not implement.
     ciphertext_nonces: StdMutex<CiphertextNonceCache>,
     /// group_id -> local linked directory, for the shared groups above.
     sync_roots: HashMap<String, PathBuf>,
@@ -1350,10 +1343,10 @@ pub struct PeerSyncSession {
     /// correctly in that case, just without the caching benefit until a
     /// later call succeeds in creating it.
     canonical_sync_roots: HashMap<String, PathBuf>,
-    /// add-ignore-patterns task 3.3: this device's own effective ignore
+    /// This device's own effective ignore
     /// pattern set for each shared group, keyed the same way as
-    /// `sync_roots`. Ignore patterns are device-local and unsynced
-    /// (design.md D1) — this is *this* device's filter on what it accepts
+    /// `sync_roots`. Ignore patterns are device-local and unsynced —
+    /// this is *this* device's filter on what it accepts
     /// from a peer, entirely independent of whatever the sending peer (or
     /// this device's other peers) chooses to do with the same path.
     /// Loaded once at construction, the same way `canonical_sync_roots` is
@@ -1361,10 +1354,10 @@ pub struct PeerSyncSession {
     /// effect for incoming records on this peer's *next* session (a fresh
     /// `PeerSyncSession`), not live mid-session; local scanning/watching
     /// (`link_manager`'s executor) picks up the edit immediately, which is
-    /// the primary path `add-ignore-patterns` task 4 covers.
+    /// the primary path this covers.
     ignore_sets: HashMap<String, Arc<EffectiveIgnoreSet>>,
     pending_block_requests: PendingBlockRequests,
-    /// task 2.1/2.3: the ciphertext-fetch analogue of `pending_block_
+    /// The ciphertext-fetch analogue of `pending_block_
     /// requests` — see `PendingCiphertextBlockRequests`'s doc comment for
     /// why this is a separate map rather than sharing the plaintext one.
     pending_ciphertext_block_requests: PendingCiphertextBlockRequests,
@@ -1376,15 +1369,15 @@ pub struct PeerSyncSession {
     /// mainly) that don't need multi-peer forwarding.
     forward_tx: Option<mpsc::UnboundedSender<(String, FileRecord)>>,
     /// Edit-presence signals received from *this* peer, handed off here
-    /// the same way `forward_tx` hands off adopted file records (task
-    /// 9.4) — the daemon layer owns tracking "which files are reported
+    /// the same way `forward_tx` hands off adopted file records —
+    /// the daemon layer owns tracking "which files are reported
     /// open, by which device" and surfacing it, since that's in-memory,
     /// per-device state, not something `yadorilink-sync-core` itself persists.
     presence_tx: Option<mpsc::UnboundedSender<PresenceEvent>>,
     /// SEC-SYNC-2: group_id -> cumulative blocks admitted to eager fetch
     /// so far this session — see `MAX_EAGER_BLOCKS_PER_GROUP_PER_SESSION`.
     eager_admission: StdMutex<HashMap<String, u64>>,
-    /// add-resource-governance task 2.2/2.3/2.5: this session's upload/
+    /// This session's upload/
     /// download token buckets, gating `handle_block_request`'s outbound
     /// send and `fetch_block`'s inbound receive respectively. Starts
     /// unlimited (mirroring every other field here that needs a
@@ -1394,10 +1387,10 @@ pub struct PeerSyncSession {
     /// the daemon's hydration dispatcher (which calls `fetch_block`
     /// directly — the same choke point), draw down one ceiling per
     /// direction rather than each getting an independent full-rate
-    /// allowance (task 2.3). Wrapped in a mutex (not `ArcSwap`) since this
+    /// allowance. Wrapped in a mutex (not `ArcSwap`) since this
     /// is only read once per block send/receive, not a hot per-byte path.
     rate_limiters: StdMutex<Arc<RateLimiters>>,
-    /// add-resource-governance task 3.2: explicit disk-space headroom
+    /// Explicit disk-space headroom
     /// override for this session's own hydration/materialization preflight
     /// (`materialize`'s eager-fetch branch) — `None` means "use the default
     /// `max(1 GiB, 5%)` formula" once `headroom_enforced` (below) is set.
@@ -1409,14 +1402,14 @@ pub struct PeerSyncSession {
     /// construct a session directly against a tempdir (entirely unrelated
     /// to disk-pressure behavior) aren't newly exposed to this real
     /// machine's actual free space via the default formula. Only
-    /// `yadorilink-daemon` (`peer_orchestrator.rs`, section 5 wiring) turns
+    /// `yadorilink-daemon` (`peer_orchestrator.rs`) turns
     /// this on for real sessions.
     headroom_enforced: std::sync::atomic::AtomicBool,
-    /// add-transfer-compression task 2.5: whether this session's peer has
-    /// advertised zstd support in its handshake `ClusterConfig` (task 2.4).
+    /// Whether this session's peer has
+    /// advertised zstd support in its handshake `ClusterConfig`.
     /// The local device always advertises support once this code exists
     /// (see `run`'s handshake send), so negotiation reduces to "has the
-    /// peer said it can receive compressed payloads too" (design.md D2:
+    /// peer said it can receive compressed payloads too" (
     /// both sides must advertise). Starts `false` — matching every other
     /// mutable-after-construction session field's safe default, see
     /// `headroom_enforced`'s doc comment for the same pattern — so nothing
@@ -1426,14 +1419,14 @@ pub struct PeerSyncSession {
     /// `false` for the session's whole lifetime, which is exactly "always
     /// send this peer uncompressed data."
     peer_supports_compression: std::sync::atomic::AtomicBool,
-    /// improve-transfer-performance task 1: this session's AIMD in-flight
+    /// This session's AIMD in-flight
     /// block-fetch window controller — see `adaptive_window` module doc
     /// comment. Fed real outcomes by `fetch_block` (success + observed
     /// RTT) and by `record_fetch_timeout` (a caller-observed missing
     /// reply); read by `fetch_window` — the daemon's multi-peer dispatcher
     /// consults this in place of the old fixed per-candidate lane count.
     adaptive_window: AdaptiveWindow,
-    /// fix-burst-sync-permanent-stall task 1.2: the interval `run`'s
+    /// The interval `run`'s
     /// independent periodic-resync task waits between re-sending a full
     /// index to this peer for each shared group -- see
     /// `DEFAULT_FULL_INDEX_RESYNC_INTERVAL`'s doc comment for why this
@@ -1443,7 +1436,7 @@ pub struct PeerSyncSession {
     /// construction site) keeps compiling and behaving identically --
     /// `set_full_index_resync_interval` is the opt-in override.
     full_index_resync_interval: StdMutex<std::time::Duration>,
-    /// fix-local-edit-swallowed-by-self-echo-race: this session's
+    /// This session's
     /// caller-injected way to force-flush a path's pending local debounce
     /// entry before reconciling it against a peer update — see
     /// `PendingLocalChangeFlush`'s doc comment. `None` (the default for
@@ -1509,7 +1502,7 @@ impl PeerSyncSession {
                 Some((group_id.clone(), canonical))
             })
             .collect();
-        // add-ignore-patterns task 3.3: load each shared group's effective
+        // Load each shared group's effective
         // ignore set from its link root — same source `link_manager`'s
         // watcher/scanner already read `.yadorilinkignore` from
         // (`EffectiveIgnoreSet::load_for_link_root`). A load failure (rare
@@ -1571,11 +1564,11 @@ impl PeerSyncSession {
         })
     }
 
-    /// task 2.5: replaces this session's upload/download token buckets with
+    /// Replaces this session's upload/download token buckets with
     /// the daemon's shared, global pair (see `RateLimiters`'s doc comment)
     /// so this session's block sends/receives draw down the same ceiling
     /// every other session — and the daemon's hydration dispatcher, which
-    /// calls `fetch_block` directly — shares (task 2.3), rather than
+    /// calls `fetch_block` directly — shares, rather than
     /// getting an independent full-rate allowance. Mirrors
     /// `set_authorized_groups`'s mutable-after-construction pattern:
     /// existing constructors are unchanged, and the daemon injects the
@@ -1588,7 +1581,7 @@ impl PeerSyncSession {
         self.rate_limiters.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    /// task 3.2/1.2: sets this session's disk-headroom override (`None` =
+    /// Sets this session's disk-headroom override (`None` =
     /// default formula) — live-reloadable, applied on the next preflight
     /// check.
     pub fn set_headroom_override_bytes(&self, headroom_bytes: Option<u64>) {
@@ -1599,7 +1592,7 @@ impl PeerSyncSession {
         *self.headroom_override_bytes.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// fix-burst-sync-permanent-stall task 1.2: overrides this session's
+    /// Overrides this session's
     /// periodic full-index resync interval (default
     /// `DEFAULT_FULL_INDEX_RESYNC_INTERVAL`) -- mirrors
     /// `set_headroom_override_bytes`'s "mutable-after-construction,
@@ -1628,7 +1621,7 @@ impl PeerSyncSession {
         self.headroom_enforced.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// fix-local-edit-swallowed-by-self-echo-race: injects this session's
+    /// Injects this session's
     /// real way to force-flush a path's pending local debounce entry
     /// (`PendingLocalChangeFlush`'s doc comment) — mirrors
     /// `set_rate_limiters`'s "daemon injects real behavior after
@@ -1651,7 +1644,7 @@ impl PeerSyncSession {
     /// downstream of it) would deadlock. Because every `materialize` call
     /// in this module happens from within `reconcile_one_file`'s
     /// already-locked body, this single guard — run once, up front —
-    /// covers both design.md's "materialize-side" and
+    /// covers both the "materialize-side" and
     /// "`reconcile_one_file`-side" serialization requirements: by the time
     /// any downstream `materialize` call writes to disk, a local change
     /// that was still pending here has already been indexed.
@@ -1668,8 +1661,7 @@ impl PeerSyncSession {
         handle.flush_pending_local_change(group_id, rel_path).await;
     }
 
-    /// fix-case-fold-sibling-local-change-not-flushed-before-reconcile:
-    /// like `flush_pending_local_change_before_reconcile` above, but for
+    /// Like `flush_pending_local_change_before_reconcile` above, but for
     /// the *other* case-variant path that would collide with `rel_path` on
     /// a case-insensitive filesystem.
     ///
@@ -1706,7 +1698,7 @@ impl PeerSyncSession {
         handle.flush_case_fold_sibling(group_id, rel_path).await;
     }
 
-    /// add-transfer-compression task 2.5: records this peer's advertised
+    /// Records this peer's advertised
     /// compression support from its handshake `ClusterConfig` — called
     /// from `handle_message`'s `ClusterConfig` arm (previously a
     /// receipt-only no-op; see this module's doc comment). A `ClusterConfig`
@@ -1721,7 +1713,7 @@ impl PeerSyncSession {
     }
 
     /// Whether this session should compress outgoing block/index payloads
-    /// to this peer. Both sides must support compression (design.md D2);
+    /// to this peer. Both sides must support compression;
     /// the local device always does once this code exists (`run` always
     /// advertises `Compression::Zstd`), so this reduces to exactly "has the
     /// peer advertised support" — `record_peer_compression_support`'s
@@ -1732,7 +1724,7 @@ impl PeerSyncSession {
         self.peer_supports_compression.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// add-untrusted-storage-peer task 2.1/3.2: records this peer's
+    /// Records this peer's
     /// advertised `supports_encrypted_storage_peer` from its handshake
     /// `ClusterConfig` — mirrors `record_peer_compression_support`'s
     /// pattern exactly. An old peer, or one that doesn't set the field,
@@ -1751,7 +1743,7 @@ impl PeerSyncSession {
         self.peer_supports_encrypted_storage_peer.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// add-reliable-message-delivery: records this peer's advertised
+    /// Records this peer's advertised
     /// `supports_reliable_delivery` from its handshake `ClusterConfig` —
     /// mirrors `record_peer_encryption_support`'s pattern. This build
     /// always supports it, so confirming the peer does too is the whole
@@ -1773,7 +1765,7 @@ impl PeerSyncSession {
         self.peer_supports_reliable_delivery.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// task 4.1/4.2: marks (or clears) whether *this session's peer* is
+    /// Marks (or clears) whether *this session's peer* is
     /// flagged storage-only for `group_id`, effective for the very next
     /// index/block exchange — the storage-only analogue of `set_peer_role`,
     /// expected to be driven the same way (a daemon-level netmap-diff
@@ -1797,7 +1789,7 @@ impl PeerSyncSession {
         self.live_storage_only_flags.is_storage_only(group_id)
     }
 
-    /// task 4.1: marks (or clears) whether *this local device* is itself
+    /// Marks (or clears) whether *this local device* is itself
     /// the storage-only device for `group_id` — see `local_storage_only_
     /// groups`'s doc comment for why this is explicit rather than inferred.
     /// Expected to be set once, at construction/provisioning time, by
@@ -1819,7 +1811,7 @@ impl PeerSyncSession {
         self.local_storage_only_groups.lock().unwrap_or_else(|p| p.into_inner()).contains(group_id)
     }
 
-    /// task 1.1-1.4: installs this device's group content key for
+    /// Installs this device's group content key for
     /// `group_id` (and its convergent-mode setting), replacing any
     /// previous key for that group — called by a caller-driven setter
     /// (mirroring `set_rate_limiters`), or by `handle_wrapped_group_key`
@@ -1836,7 +1828,7 @@ impl PeerSyncSession {
         self.group_keys.lock().unwrap_or_else(|p| p.into_inner()).get(group_id).cloned()
     }
 
-    /// task 2.2: installs a *shared* ciphertext-nonce cache, replacing this
+    /// Installs a *shared* ciphertext-nonce cache, replacing this
     /// session's private default one — see `ciphertext_nonces`'s doc
     /// comment. Call this with the same `Arc` on every `PeerSyncSession`
     /// constructed for the same physical storage-only device (across all
@@ -1850,7 +1842,7 @@ impl PeerSyncSession {
         self.ciphertext_nonces.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    /// task 1.2: installs this device's own X25519 identity secret, needed
+    /// Installs this device's own X25519 identity secret, needed
     /// to send (`send_wrapped_group_key`) or receive (`handle_wrapped_
     /// group_key`) a wrapped group key. See `local_identity_secret`'s doc
     /// comment for the documented scope limit on how this gets populated
@@ -1863,9 +1855,9 @@ impl PeerSyncSession {
         self.local_identity_secret.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    /// task 1.2: wraps this device's `group_id` content key to `peer_
+    /// Wraps this device's `group_id` content key to `peer_
     /// identity_public` (this session's peer's X25519 identity key) and
-    /// sends it — the peer-to-peer key-distribution path design.md
+    /// sends it — the peer-to-peer key-distribution path this system
     /// requires ("wrapped copies may transit via peers", never the
     /// coordination plane; this type, `proto::WrappedGroupKey`, lives only
     /// in `sync.proto`, never `coordination.proto`). Refuses outright, and
@@ -1918,12 +1910,11 @@ impl PeerSyncSession {
         .await
     }
 
-    /// task 1.2: the receive side of `send_wrapped_group_key` — unwraps an
+    /// The receive side of `send_wrapped_group_key` — unwraps an
     /// incoming `WrappedGroupKey` with this device's own identity secret
     /// and, on success, installs it via `set_group_key` (defaulting to
-    /// convergent mode; task 1.4's per-group non-convergent opt-out is not
-    /// itself carried on this wire message in this pass — see tasks.md's
-    /// notes). Silently ignored (logged, not an error) if no local
+    /// convergent mode; the per-group non-convergent opt-out is not
+    /// itself carried on this wire message in this pass). Silently ignored (logged, not an error) if no local
     /// identity secret is configured, or unwrap fails (wrong recipient, a
     /// tampered/foreign wrap, or a genuinely malformed message) — never a
     /// panic, and never treated as a reason to tear down the session.
@@ -1973,7 +1964,7 @@ impl PeerSyncSession {
         };
         match content_crypto::unwrap_group_key(&content_wrapped, &secret) {
             Ok(key) => {
-                // task 1.4: defaults to convergent — see this function's
+                // Defaults to convergent — see this function's
                 // doc comment on the documented scope limit.
                 self.set_group_key(&wrapped.folder_group_id, key, true);
                 Ok(())
@@ -1990,7 +1981,7 @@ impl PeerSyncSession {
         }
     }
 
-    /// improve-transfer-performance task 1: the current recommended number
+    /// The current recommended number
     /// of concurrent in-flight `fetch_block` requests to this peer, per
     /// this session's `AdaptiveWindow` (see that module's doc comment).
     /// `yadorilink-daemon::hydration`'s multi-peer dispatcher calls this
@@ -1998,14 +1989,14 @@ impl PeerSyncSession {
     /// `PER_PEER_IN_FLIGHT_WINDOW` lane count, so a fast/healthy session
     /// gets more concurrent lanes and a slow/lossy one gets fewer — always
     /// within `[ADAPTIVE_WINDOW_MIN, MAX_IN_FLIGHT_MESSAGES_PER_PEER]`
-    /// (task 1.2's clamp). Public for the same reason
+    /// (the window's clamp). Public for the same reason
     /// `compression_negotiated` is: an observable piece of session state a
     /// caller outside this module needs to act on.
     pub fn fetch_window(&self) -> usize {
         self.adaptive_window.current()
     }
 
-    /// improve-transfer-performance task 1: records that a `fetch_block`
+    /// Records that a `fetch_block`
     /// request to this peer went unanswered within the *caller's* own
     /// timeout — an AIMD loss/timeout signal, backing this session's
     /// adaptive window off multiplicatively (`AdaptiveWindow::on_timeout`).
@@ -2026,7 +2017,7 @@ impl PeerSyncSession {
         self.adaptive_window.on_timeout();
     }
 
-    /// add-ignore-patterns task 3.3: whether `path` matches this device's
+    /// Whether `path` matches this device's
     /// own effective ignore pattern set for `group_id` (built-in defaults
     /// plus this device's `.yadorilinkignore`, if any). A group with no
     /// entry in `ignore_sets` (not one of `sync_roots`) is never ignored
@@ -2034,7 +2025,7 @@ impl PeerSyncSession {
     /// actually shares, since `ignore_sets` is derived from the same
     /// `sync_roots` map `shares_group`'s caller relies on.
     ///
-    /// This is a purely local filter (design.md D1: ignore patterns are
+    /// This is a purely local filter (ignore patterns are
     /// device-local, never synced) — it decides what *this* device does
     /// with an incoming record (skip materializing/indexing/forwarding
     /// it), and has no effect on what the sending peer, or this device's
@@ -2071,7 +2062,7 @@ impl PeerSyncSession {
         )
     }
 
-    /// Sends a presence signal to this peer (task 9.3) — the caller
+    /// Sends a presence signal to this peer — the caller
     /// (`link_manager`) is responsible for periodic TTL refresh while
     /// still editing.
     pub async fn send_presence_signal(
@@ -2093,7 +2084,7 @@ impl PeerSyncSession {
         .await
     }
 
-    /// harden-reliable-delivery-negotiation-on-lossy-link: builds this
+    /// Builds this
     /// device's `ClusterConfig` handshake message fresh each call (cheap —
     /// no state beyond cloning `shared_group_ids`) so both the initial
     /// retransmit loop (`send_cluster_config_until_peer_seen`) and the
@@ -2104,27 +2095,25 @@ impl PeerSyncSession {
             payload: Some(proto::sync_message::Payload::ClusterConfig(proto::ClusterConfig {
                 folder_group_ids: self.shared_group_ids.clone(),
                 known_peer_device_ids: vec![self.local_device_id.clone()],
-                // add-transfer-compression task 2.4: this build always
+                // This build always
                 // supports zstd, so it always advertises it — the peer's
                 // own advertisement (recorded in `handle_message`'s
-                // `ClusterConfig` arm) is the other half of D2's
+                // `ClusterConfig` arm) is the other half of the
                 // both-sides-must-advertise negotiation.
                 supported_compression: vec![proto::Compression::Zstd as i32],
-                // add-untrusted-storage-peer task 2.1/3.2: this build
+                // This build
                 // always understands the ciphertext/encrypted-index wire
                 // shapes, so it always advertises that too — mirrors the
                 // compression advertisement immediately above exactly.
                 supports_encrypted_storage_peer: true,
-                // add-reliable-message-delivery: this build always
+                // This build always
                 // understands the marker-byte reliable-delivery framing,
                 // so it always advertises that too. `run`'s handshake
-                // retransmit loop (harden-reliable-delivery-negotiation-
-                // on-lossy-link) is what makes this actually likely to
+                // retransmit loop below is what makes this actually likely to
                 // reach the peer on a lossy link, rather than depending on
                 // a single fire-and-forget send surviving.
                 supports_reliable_delivery: true,
-                // harden-reliable-delivery-negotiation-on-lossy-link (spec
-                // correction, 2026-07-09): true once this device has
+                // True once this device has
                 // itself received a `ClusterConfig` from this peer —
                 // lets the peer distinguish "you received from me" from
                 // "I received from you" instead of conflating them. See
@@ -2136,7 +2125,7 @@ impl PeerSyncSession {
         }
     }
 
-    /// harden-reliable-delivery-negotiation-on-lossy-link: bounded,
+    /// Bounded,
     /// exponentially-backed-off re-sends of this device's `ClusterConfig`,
     /// run in the background (spawned by `run`, holding only a `Weak`
     /// reference — same lifetime story as the periodic resync task below,
@@ -2211,12 +2200,12 @@ impl PeerSyncSession {
     }
 
     /// Runs the session: sends the initial handshake + full index for each
-    /// shared folder group (task 5.4), then dispatches incoming messages
+    /// shared folder group, then dispatches incoming messages
     /// until the channel closes. Intended to run for the session's whole
     /// lifetime as a background task.
     pub async fn run(self: Arc<Self>) -> Result<(), SyncError> {
         self.send(self.cluster_config_message()).await?;
-        // harden-reliable-delivery-negotiation-on-lossy-link: the above is
+        // The above is
         // this device's *first* handshake attempt, sent synchronously
         // (unchanged timing from before this hardening — `send_full_index`
         // right below is never delayed by it). `spawn_cluster_config_retry`
@@ -2230,7 +2219,7 @@ impl PeerSyncSession {
             self.send_full_index(group_id).await?;
         }
 
-        // fix-burst-sync-permanent-stall task 1.1: an independent task, not
+        // An independent task, not
         // another branch of this function's own recv loop. This is
         // deliberate, not just a style choice: the whole reason a resync is
         // needed is that this session's recv loop can itself be stuck (see
@@ -2269,8 +2258,7 @@ impl PeerSyncSession {
                     };
                     tokio::time::sleep(interval).await;
                     let Some(session) = weak_self.upgrade() else { return };
-                    // harden-reliable-delivery-negotiation-on-lossy-link:
-                    // the initial bounded handshake retry
+                    // The initial bounded handshake retry
                     // (`send_cluster_config_until_peer_seen`) is a
                     // best-effort bootstrap over a span of a few seconds —
                     // a peer that was unreachable for that whole window
@@ -2298,7 +2286,7 @@ impl PeerSyncSession {
                         }
                     }
                     for group_id in &session.shared_group_ids {
-                        // task 1.4: skip a group this peer's authorization
+                        // Skip a group this peer's authorization
                         // was revoked for mid-session -- the initial
                         // handshake above sends unconditionally (a
                         // construction-time decision already vetted by
@@ -2331,7 +2319,7 @@ impl PeerSyncSession {
         };
 
         let message_slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT_MESSAGES_PER_PEER));
-        // fix-recv-loop-head-of-line-deadlock-on-catchup: a message that's
+        // A message that's
         // been read off the wire but can't get a `message_slots` permit yet
         // queues here instead of the recv loop blocking on `acquire_owned`
         // in-line. This is the fix for a real, confirmed-permanent deadlock
@@ -2356,7 +2344,7 @@ impl PeerSyncSession {
         // waiting their turn, never a running task or a held permit.
         // Unbounded growth under a deliberately hostile flood is a
         // different, pre-existing concern already owned by other layers
-        // (per-message size caps, rate limiting, `add-resource-governance`)
+        // (per-message size caps, rate limiting, resource governance)
         // — this change's job is only to make permit exhaustion transient
         // instead of a permanent deadlock, not to re-derive those bounds.
         let mut pending: VecDeque<proto::SyncMessage> = VecDeque::new();
@@ -2448,7 +2436,7 @@ impl PeerSyncSession {
                 }
             }
         }
-        // fix-burst-sync-permanent-stall task 1.1: the recv loop above is
+        // The recv loop above is
         // this session's whole reason to exist -- once it's done (channel
         // closed), the periodic resync task has nothing left to resync
         // towards and must not keep running (and keep this `Arc` alive via
@@ -2456,7 +2444,7 @@ impl PeerSyncSession {
         // owners, e.g. the daemon's `sessions` map, for up to one more full
         // interval after this session is otherwise finished).
         resync_handle.abort();
-        // harden-reliable-delivery-negotiation-on-lossy-link: same
+        // Same
         // reasoning as `resync_handle.abort()` immediately above -- a
         // finished session has nothing left to bootstrap negotiation for.
         // A no-op if the retry loop already finished on its own (peer
@@ -2470,7 +2458,7 @@ impl PeerSyncSession {
         Ok(())
     }
 
-    /// Closes the add-sync-fidelity task 5.1 wire-serialization gap on the
+    /// Closes a wire-serialization gap on the
     /// *sending* side: `FileRecord::into()` alone can't populate
     /// `proto::FileInfo`'s `record_kind`/`symlink_target`/
     /// `symlink_out_of_root_or_absolute`/`exec_bit` fields (see
@@ -2493,7 +2481,7 @@ impl PeerSyncSession {
         let symlink_target = self.state.get_symlink_target(group_id, &record.path)?;
         let symlink_out_of_root = self.state.get_symlink_out_of_root(group_id, &record.path)?;
         let exec_bit = self.state.get_exec_bit(group_id, &record.path)?;
-        // fix-multiway-conflict-name-content-mismatch: this device's own
+        // This device's own
         // record of who actually produced this path's current content —
         // see `IncomingWireMeta`'s doc comment for how the receiving side
         // uses this.
@@ -2508,7 +2496,7 @@ impl PeerSyncSession {
     }
 
     async fn send_full_index(&self, group_id: &str) -> Result<(), SyncError> {
-        // add-untrusted-storage-peer task 3.2: everything below this
+        // Everything below this
         // branch — the entire pre-existing plaintext `Index` path — is
         // untouched; a group with no untrusted peer, and a session where
         // this local device isn't itself storage-only, takes exactly the
@@ -2543,14 +2531,14 @@ impl PeerSyncSession {
         .await
     }
 
-    /// Sends only the changed files (task 5.5), rather than a full index —
+    /// Sends only the changed files, rather than a full index —
     /// called by the local-change pipeline after a watched-folder edit.
     pub async fn send_index_update(
         &self,
         group_id: &str,
         changed: Vec<FileRecord>,
     ) -> Result<(), SyncError> {
-        // add-untrusted-storage-peer task 3.2: same additive branch as
+        // Same additive branch as
         // `send_full_index` above — see its comment.
         if let Some(entries) = self.encrypted_index_entries_for_send(group_id).await? {
             return self
@@ -2581,7 +2569,7 @@ impl PeerSyncSession {
         .await
     }
 
-    /// add-untrusted-storage-peer task 3.1/3.2: the shared "should this
+    /// The shared "should this
     /// group's index go out encrypted to this peer, and if so, what?"
     /// decision for both `send_full_index` and `send_index_update`.
     /// Returns `None` to mean "no, use the ordinary plaintext path
@@ -2592,12 +2580,12 @@ impl PeerSyncSession {
     /// - This local device is itself storage-only for `group_id`
     ///   (`is_locally_storage_only`): it has no `FileRecord`s to build a
     ///   plaintext index from at all — it re-serves whatever it has cached
-    ///   from `storage_peer_index_cache` verbatim (design.md's "relay"
+    ///   from `storage_peer_index_cache` verbatim (the "relay"
     ///   role; possibly empty if it hasn't learned anything about this
     ///   group yet).
     /// - This session's peer is flagged storage-only for `group_id` and a
     ///   group content key is available: builds a fresh `EncryptedIndex`
-    ///   from this device's own current plaintext state (task 3.1).
+    ///   from this device's own current plaintext state.
     ///
     /// If the peer is flagged storage-only but **no** group content key is
     /// available, this logs a warning and returns `Some(vec![])` — an
@@ -2640,7 +2628,7 @@ impl PeerSyncSession {
         Ok(Some(self.build_encrypted_index_entries(group_id, &key_state)?))
     }
 
-    /// task 3.1: builds this device's current plaintext state for
+    /// Builds this device's current plaintext state for
     /// `group_id` into `EncryptedFileEntry`s, one per `FileRecord`. Reads
     /// and encrypts every referenced block's plaintext content from this
     /// device's own store — a real, disclosed cost (see `content_crypto`'s
@@ -2651,8 +2639,8 @@ impl PeerSyncSession {
     /// is O(total bytes in the group), not O(file count), since a
     /// ciphertext's hash cannot be known without actually encrypting the
     /// real bytes. Accepted for this pass (correctness first; no caching
-    /// of previously-computed ciphertext hashes — tasks.md does not ask for
-    /// one), and disclosed here rather than hidden.
+    /// of previously-computed ciphertext hashes — not required for this
+    /// pass), and disclosed here rather than hidden.
     fn build_encrypted_index_entries(
         &self,
         group_id: &str,
@@ -2662,11 +2650,11 @@ impl PeerSyncSession {
         records.iter().map(|record| self.encrypt_file_record(record, key_state)).collect()
     }
 
-    /// task 3.1: encrypts one `FileRecord` into an `EncryptedFileEntry` —
+    /// Encrypts one `FileRecord` into an `EncryptedFileEntry` —
     /// the path and ordered plaintext block-hash list under `encrypted_
     /// file_meta` (only a trusted device holding `key_state.key` can
     /// decrypt this back to a `proto::PlaintextFileMeta`), and each block
-    /// re-encrypted individually (task 2.1's `content_crypto::encrypt_
+    /// re-encrypted individually (`content_crypto::encrypt_
     /// block`) purely to learn its ciphertext hash/size for the visible
     /// `CiphertextBlockInfo` list — the untrusted peer never sees the
     /// ciphertext bytes themselves until it later requests one by hash
@@ -2710,7 +2698,7 @@ impl PeerSyncSession {
         })
     }
 
-    /// add-transfer-compression task 4.1: turns an outgoing `Vec<proto::
+    /// Turns an outgoing `Vec<proto::
     /// FileInfo>` into the `(files, compressed_files, compression)` triple
     /// `send_full_index`/`send_index_update` each fold into their own
     /// message shape (`Index.files`/`compressed_files` and
@@ -2725,7 +2713,7 @@ impl PeerSyncSession {
     /// on (its own `folder_group_id`/`compression` are irrelevant — only
     /// its `files` list is ever read back out, by `decode_index_files`),
     /// then compressed off the async runtime exactly like a block payload
-    /// (task 3.1's same `spawn_blocking` pattern). `files` is cloned before
+    /// (the same `spawn_blocking` pattern used elsewhere). `files` is cloned before
     /// that move so the original, uncompressed list is still on hand
     /// afterward if `compress_block` decides compression wasn't worth it
     /// (D3's adaptive skip) or the blocking task panics — this never loses
@@ -2759,7 +2747,7 @@ impl PeerSyncSession {
         }
     }
 
-    /// add-transfer-compression task 4.2: recovers the real `Vec<proto::
+    /// Recovers the real `Vec<proto::
     /// FileInfo>` for an incoming `Index`/`IndexUpdate`, decompressing
     /// `compressed_bytes` (off the async runtime — the same `spawn_blocking`
     /// pattern as every other compress/decompress call in this module)
@@ -2825,7 +2813,7 @@ impl PeerSyncSession {
         }
     }
 
-    /// task 3.1/3.2: handles an incoming `EncryptedIndex`/`EncryptedIndexUpdate`
+    /// Handles an incoming `EncryptedIndex`/`EncryptedIndexUpdate`
     /// from this session's peer. Always caches the entries verbatim (never
     /// decrypted or re-derived) in `storage_peer_index_cache`, for two
     /// reasons depending on this local device's own role:
@@ -2835,7 +2823,7 @@ impl PeerSyncSession {
     ///   `FileRecord`s at all, so this cache *is* its own index for the
     ///   group — the same entries get re-served verbatim on this device's
     ///   own next `send_full_index`/`send_index_update` for a *different*
-    ///   peer (design.md's "relay" role). This branch also fetches any
+    ///   peer (the "relay" role). This branch also fetches any
     ///   referenced ciphertext block this device doesn't already hold,
     ///   verifying only the ciphertext's own content hash (it has no
     ///   plaintext hash to check against — it never decrypts anything).
@@ -2850,8 +2838,7 @@ impl PeerSyncSession {
     ///   `encrypted_file_meta` here to learn per-block plaintext hashes for
     ///   that lookup, so a trusted device can locate ciphertext for a block
     ///   it doesn't yet have `ciphertext_hash` for by any other means, is a
-    ///   documented follow-up (see `openspec/changes/
-    ///   add-untrusted-storage-peer/tasks.md`'s notes on task 3.2) — not
+    ///   documented follow-up — not
     ///   implemented in this pass.
     ///
     /// Guarded by `shares_group` exactly like `reconcile_files_if_authorized`
@@ -2943,7 +2930,7 @@ impl PeerSyncSession {
     /// authorized (per the coordination plane's ACL) to sync with us.
     ///
     /// sync-engine spec "Block Requests Are Authorized Against Actual Group
-    /// Membership" (enforce-live-device-revocation, task 4.1/4.2/4.3):
+    /// Membership":
     /// reads `live_authorized_groups`, not the `shared_group_ids` snapshot
     /// captured once at session construction — every caller of this method
     /// (`handle_block_request`, `reconcile_files_if_authorized`,
@@ -2953,23 +2940,23 @@ impl PeerSyncSession {
     /// into "re-validated against current state at processing time" for
     /// all of them, with no change needed at any call site. Cheap on the
     /// common (still-authorized) path — one `Mutex`-guarded `HashSet`
-    /// lookup, no coordination-plane round trip — consistent with design.md
-    /// D2's push model.
+    /// lookup, no coordination-plane round trip — consistent with a
+    /// push model.
     pub fn shares_group(&self, group_id: &str) -> bool {
         self.live_authorized_groups.contains(group_id)
     }
 
-    /// enforce-live-device-revocation task 4.1/4.2: withdraws this peer's
+    /// Withdraws this peer's
     /// authorization for `group_id`, effective for the very next request
     /// `shares_group` is asked about — called by daemon-level
-    /// netmap-diff-driven teardown (tasks.md section 2/5) when a netmap
+    /// netmap-diff-driven teardown when a netmap
     /// update removes this peer's edge for `group_id` (`share revoke`), or
     /// once per remaining shared group when the peer is removed entirely
     /// (`device remove`). Does not touch `shared_group_ids` (the
     /// construction-time snapshot `run` already used for its one-time
     /// initial handshake) or tear down the underlying `PeerChannel` — that
     /// transport-level teardown is a separate, independent reaction to the
-    /// same netmap update (design.md D2/D3), not this method's job.
+    /// same netmap update, not this method's job.
     pub fn revoke_group(&self, group_id: &str) {
         self.live_authorized_groups.revoke(group_id);
     }
@@ -2990,7 +2977,7 @@ impl PeerSyncSession {
         self.live_authorized_groups.set(group_ids);
     }
 
-    /// add-cross-account-sharing D4: this peer's *current* role
+    /// This peer's *current* role
     /// (`PeerRole::Read` or `PeerRole::Write`) for `group_id`, as granted
     /// by this (local) device — defaults to `PeerRole::Write` for a group
     /// with no role set (see `LiveGroupRoles`'s doc comment on why that's
@@ -3004,9 +2991,9 @@ impl PeerSyncSession {
     /// Sets (or changes) this peer's role for `group_id`, effective for the
     /// very next message `reconcile_files_if_authorized` processes for it —
     /// mirrors `grant_group`/`revoke_group`'s "effective immediately, no
-    /// transport teardown required" contract (D4: "a role that is
-    /// downgraded ... takes effect on the next message, not only at
-    /// session setup"). The hook a daemon-level netmap-diff reaction is
+    /// transport teardown required" contract (a role that is
+    /// downgraded takes effect on the next message, not only at
+    /// session setup). The hook a daemon-level netmap-diff reaction is
     /// expected to call when a netmap update changes this peer's role for
     /// an already-shared group.
     pub fn set_peer_role(&self, group_id: &str, role: PeerRole) {
@@ -3034,10 +3021,10 @@ impl PeerSyncSession {
     async fn handle_message(self: Arc<Self>, msg: proto::SyncMessage) -> Result<(), SyncError> {
         use proto::sync_message::Payload;
         match msg.payload {
-            // add-transfer-compression task 2.5: no longer informational
+            // No longer informational
             // only — records the peer's advertised compression support.
             Some(Payload::ClusterConfig(config)) => {
-                // harden-reliable-delivery-negotiation-on-lossy-link: set
+                // Set
                 // unconditionally, regardless of what this specific
                 // `ClusterConfig` advertises — used only to compute this
                 // device's own outgoing `acked_peer_cluster_config` (see
@@ -3097,8 +3084,8 @@ impl PeerSyncSession {
                 Ok(())
             }
             // Also covers a peer running a *newer* protocol version that
-            // added a oneof variant this build doesn't know about yet
-            // (task 9.5): prost decodes an unrecognized oneof case as an
+            // added a oneof variant this build doesn't know about yet:
+            // prost decodes an unrecognized oneof case as an
             // unset `payload`, landing here rather than failing to
             // decode — so a peer this build can't fully understand is
             // simply ignored, never an error.
@@ -3154,7 +3141,7 @@ impl PeerSyncSession {
 
     /// Guards every incoming index message against a peer sending data for
     /// a folder group it (or we) aren't actually authorized to share —
-    /// `shares_group` (task 4.2) checks this session's *current*
+    /// `shares_group` checks this session's *current*
     /// `live_authorized_groups`, not just the ACL-verified intersection
     /// established at session construction time, so an index update from a
     /// peer whose authorization for `group_id` was revoked mid-session is
@@ -3172,10 +3159,10 @@ impl PeerSyncSession {
             tracing::warn!(group_id, peer = %self.peer_device_id, "ignoring index message for unauthorized/unshared folder group");
             return Ok(());
         }
-        // add-cross-account-sharing D4: a peer this device has shared
+        // A peer this device has shared
         // `group_id` to at role `read` is a consumer only — it may
         // receive our index/blocks (`send_full_index`/`send_index_update`/
-        // `handle_block_request` are unaffected by role, per D4's "serve
+        // `handle_block_request` are unaffected by role, per the spec's "serve
         // index and block reads to that peer"), but its own inbound index
         // updates/writes must never be accepted into our copy, since a
         // read-only sharee shouldn't be able to push changes into the
@@ -3184,7 +3171,7 @@ impl PeerSyncSession {
         // the live, mutable-after-construction `live_group_roles`, so a
         // role downgraded write -> read mid-session is enforced starting
         // with the very next `FullIndex`/`IndexUpdate`, not only for
-        // sessions established after the downgrade (D4's "takes effect on
+        // sessions established after the downgrade ("takes effect on
         // the next message, not only at session setup"). Dropped the same
         // way an unauthorized-group message is dropped above — logged, no
         // partial application, no error surfaced back to the peer (a
@@ -3199,8 +3186,8 @@ impl PeerSyncSession {
             );
             return Ok(());
         }
-        // add-folder-direction-modes task 2.1: pause "trumps everything
-        // regardless of mode" (design.md) — a paused link neither sends
+        // Pause "trumps everything
+        // regardless of mode" — a paused link neither sends
         // (the daemon's pre-existing `announce_local_change` gate) nor
         // applies (this gate, new: nothing in this module previously
         // consulted `paused` at all on the incoming-apply path). Dropped
@@ -3249,13 +3236,13 @@ impl PeerSyncSession {
     }
 
     async fn handle_block_request(&self, req: proto::BlockRequest) -> Result<(), SyncError> {
-        // A block store is shared across all folder groups on this device
-        // (design.md D8), so a hash by itself doesn't imply group
+        // A block store is shared across all folder groups on this device,
+        // so a hash by itself doesn't imply group
         // membership — without this check a peer could fetch any block
         // this device holds, from any group, by guessing/observing a
         // hash, regardless of what it's actually authorized to sync.
         //
-        // enforce-live-device-revocation task 4.1/4.3: `shares_group` is
+        // `shares_group` is
         // called fresh on every single incoming `BlockRequest` (this
         // function has no per-session cache of its own answer), and reads
         // `live_authorized_groups` rather than the construction-time
@@ -3264,10 +3251,10 @@ impl PeerSyncSession {
         // *before* this particular request is processed, is already
         // reflected here, even though the transport-level tunnel/peer
         // channel this request arrived over has not been torn down (that's
-        // a separate, independent reaction to the same netmap update —
-        // design.md D2/D3). The lookup itself stays a local, in-memory
+        // a separate, independent reaction to the same netmap update).
+        // The lookup itself stays a local, in-memory
         // `Mutex`-guarded `HashSet` check — no coordination-plane round
-        // trip is made per request, consistent with D2's push model.
+        // trip is made per request, consistent with a push model.
         if !self.shares_group(&req.folder_group_id) {
             tracing::warn!(group_id = %req.folder_group_id, peer = %self.peer_device_id, "ignoring block request for unauthorized/unshared folder group");
             let response = proto::BlockResponse {
@@ -3283,7 +3270,7 @@ impl PeerSyncSession {
                 })
                 .await;
         }
-        // add-untrusted-storage-peer task 2.1: this peer's own request for
+        // This peer's own request for
         // `req.block_hash` is only meaningful as a *ciphertext* hash when
         // it's flagged storage-only for the group — `block_request_is_
         // referenced` below checks a *plaintext* block's presence in a
@@ -3295,7 +3282,7 @@ impl PeerSyncSession {
         if self.live_storage_only_flags.is_storage_only(&req.folder_group_id) {
             return self.handle_ciphertext_block_request(req).await;
         }
-        // task 2.2: the other direction — *this local device* is itself
+        // The other direction — *this local device* is itself
         // storage-only for the group, so it holds no `FileRecord`s to
         // check `req.block_hash` against at all (it only ever has
         // whatever opaque ciphertext blobs peers handed it, addressed by
@@ -3303,7 +3290,7 @@ impl PeerSyncSession {
         // would incorrectly refuse every request in this role. Serving
         // directly by content hash (skipping that plaintext-specific
         // check) is exactly the untrusted peer's designed role: "still
-        // content-address, dedup, and serve" (design.md) to any authorized
+        // content-address, dedup, and serve" to any authorized
         // requester, without ever decrypting or knowing what the bytes are.
         if self.is_locally_storage_only(&req.folder_group_id) {
             return self.serve_stored_ciphertext_block(req).await;
@@ -3346,12 +3333,12 @@ impl PeerSyncSession {
         let get_result = spawn_blocking(move || store.get(&hash_hex)).await;
         let response = match get_result {
             Ok(Ok(data)) => {
-                // add-transfer-compression task 3.1: compress the fetched
+                // Compress the fetched
                 // bytes off the async runtime — `spawn_blocking`, the same
                 // PERF-1 reasoning as the `store.get` call just above,
                 // since zstd compression of a multi-hundred-KB block is
                 // real CPU work — but only when this session's peer has
-                // negotiated compression support (task 2.5); `compress_
+                // negotiated compression support; `compress_
                 // block` itself decides whether compression was actually
                 // worth sending (D3's adaptive skip).
                 let compress_result = if self.compression_negotiated() {
@@ -3389,13 +3376,13 @@ impl PeerSyncSession {
                 ..Default::default()
             },
         };
-        // add-resource-governance task 2.2: gate the outbound block
+        // Gate the outbound block
         // *payload* on the upload bucket, consuming tokens for the actual
-        // bytes about to be transmitted, before the send proceeds (task
-        // 2.1's "awaiting bucket refill rather than dropping or erroring").
+        // bytes about to be transmitted, before the send proceeds
+        // ("awaiting bucket refill rather than dropping or erroring").
         // A `not_found` response carries no data (`acquire(0)` is a no-op
         // fast path — see `TokenBucket::acquire`), so this never delays the
-        // control-flow-shaped "no, I don't have it" replies (task 2.4).
+        // control-flow-shaped "no, I don't have it" replies.
         if !response.not_found {
             self.rate_limiters().upload.acquire(response.data.len() as u64).await;
         }
@@ -3405,19 +3392,19 @@ impl PeerSyncSession {
         .await
     }
 
-    /// task 2.1: serves a storage-only peer's request for `req.block_hash`
+    /// Serves a storage-only peer's request for `req.block_hash`
     /// (a *ciphertext* hash) by re-encrypting the matching plaintext block
     /// on the fly from this device's own plaintext store and replying with
     /// `data` carrying AEAD ciphertext, `is_ciphertext = true`, and the
     /// nonce needed to decrypt it. Never persists ciphertext locally (this
-    /// device is trusted — it keeps only its ordinary plaintext store; see
-    /// design.md's "Non-goals": this is not a general encrypt-at-rest
+    /// device is trusted — it keeps only its ordinary plaintext store; this
+    /// is not a general encrypt-at-rest
     /// feature for trusted devices) and never falls back to plaintext on
     /// any failure: with no group content key available, or no matching
     /// block found, this replies `not_found` exactly like an ordinary
     /// missing-block response, never the plaintext bytes.
     ///
-    /// Convergent encryption (task 1.1) is what makes re-deriving `H(ct)`
+    /// Convergent encryption is what makes re-deriving `H(ct)`
     /// on every request tractable at all: `ct = AEAD(K_g, KDF(K_g, h),
     /// plaintext)` is a pure function of `(K_g, h, plaintext)`, so this
     /// device never needs a persisted `h -> ciphertext_hash` index — it
@@ -3427,7 +3414,7 @@ impl PeerSyncSession {
     /// of every file in the group and re-encrypts each until one's
     /// ciphertext hash matches (or none do) — O(group size) per single
     /// ciphertext block request, not O(1). Acceptable for this pass
-    /// (correctness first; tasks.md does not ask for a persisted index),
+    /// (correctness first; a persisted index isn't required for this pass),
     /// and disclosed here plainly rather than hidden, matching this
     /// change's other disclosed trade-offs (metadata leakage, equal-block
     /// correlation, rotation cost).
@@ -3501,15 +3488,15 @@ impl PeerSyncSession {
         .await
     }
 
-    /// task 2.2: serves `req.block_hash` (a ciphertext hash) directly from
+    /// Serves `req.block_hash` (a ciphertext hash) directly from
     /// this device's own store, for when *this local device* is itself the
     /// storage-only device for the group — see `handle_block_request`'s
     /// branch immediately above for why this skips `block_request_is_
     /// referenced` (there are no `FileRecord`s to check here at all). Never
     /// decrypts anything (this device may hold no group key at all) — it
     /// just serves back whatever ciphertext bytes and nonce it has on
-    /// file, exactly design.md's "storage peer serves blocks back to
-    /// trusted devices who decrypt and verify them locally."
+    /// file, exactly matching the "storage peer serves blocks back to
+    /// trusted devices who decrypt and verify them locally" design.
     async fn serve_stored_ciphertext_block(
         &self,
         req: proto::BlockRequest,
@@ -3566,21 +3553,21 @@ impl PeerSyncSession {
         Ok(record.blocks.iter().any(|block| block.hash == req.block_hash))
     }
 
-    /// add-transfer-compression task 3.2: decompresses `resp.data` per its
+    /// Decompresses `resp.data` per its
     /// declared `compression` (off the async runtime — `spawn_blocking`,
-    /// the same PERF-1/task-3.1 reasoning as every other compress/
+    /// the same PERF-1 reasoning as every other compress/
     /// decompress call in this module) before waking any waiter, so
-    /// `ensure_blocks_present`'s existing hash/size check (D4) always
+    /// `ensure_blocks_present`'s existing hash/size check always
     /// verifies against decompressed bytes, and `fetch_block`'s callers
     /// (this crate's own `hydrate_file`/`ensure_blocks_present`, and the
     /// daemon's multi-peer hydration dispatcher — see `fetch_block`'s doc
     /// comment) never see a still-compressed payload; compression stays
-    /// completely invisible past this point, exactly as D4 requires.
+    /// completely invisible past this point.
     ///
     /// On a decompression failure (corrupt payload, or the decompression-
-    /// bomb bound — task 2.3 — exceeded), every waiter is woken with
+    /// bomb bound exceeded), every waiter is woken with
     /// `FetchOutcome::Unusable`, not `FetchOutcome::NotFound` — see that
-    /// enum's own doc comment (fix-conflict-resolution-block-race) for why
+    /// enum's own doc comment for why
     /// this distinction now matters to `ensure_blocks_present` specifically,
     /// even though every *other* consumer of a fetch result (the plain
     /// `fetch_block` wrapper, and the daemon's `fetch_blocks_from_sessions`
@@ -3588,7 +3575,7 @@ impl PeerSyncSession {
     /// the same "this peer did not supply a usable block" outcome, exactly
     /// as before this change.
     async fn handle_block_response(&self, resp: proto::BlockResponse) {
-        // add-untrusted-storage-peer task 2.1/2.3: a ciphertext response
+        // A ciphertext response
         // resolves against the separate `pending_ciphertext_block_requests`
         // waiter map, carrying its nonce through — see
         // `PendingCiphertextBlockRequests`'s doc comment for why this is a
@@ -3609,7 +3596,7 @@ impl PeerSyncSession {
         } else {
             let compression =
                 proto::Compression::try_from(resp.compression).unwrap_or(proto::Compression::None);
-            // add-transfer-compression: only route through `spawn_blocking`
+            // Only route through `spawn_blocking`
             // when there's real decompression work to do. `Compression::
             // None` is a trivial passthrough (`decompress_block` itself
             // just clones the bytes for that case) — forcing every single
@@ -3618,7 +3605,7 @@ impl PeerSyncSession {
             // be an immediate, synchronous fast path, for the overwhelming
             // majority of responses (an unnegotiated peer, or a block
             // `compress_block` decided wasn't worth compressing). The
-            // PERF-1/task-3.1 "off the async runtime" reasoning applies to
+            // PERF-1 "off the async runtime" reasoning applies to
             // actual CPU-bound zstd work, not a no-op passthrough.
             if compression == proto::Compression::None {
                 FetchOutcome::Found(Bytes::from(resp.data))
@@ -3657,8 +3644,8 @@ impl PeerSyncSession {
 
     /// Requests a block from the peer and awaits the matching response,
     /// fulfilled by `handle_block_response` running concurrently on the
-    /// same session's recv loop. Public (parallel-multi-peer-fetch design
-    /// D1): the low-level per-block fetch primitive the daemon's
+    /// same session's recv loop. Public: the low-level per-block fetch
+    /// primitive the daemon's
     /// multi-session hydration dispatcher (`yadorilink-daemon::hydration`)
     /// calls directly across several sessions concurrently, rather than
     /// each session fetching a whole file's blocks sequentially on its
@@ -3669,7 +3656,7 @@ impl PeerSyncSession {
     /// doc comment for why: it's a cheap, refcounted clone of the same
     /// underlying data `handle_block_response` already holds, not a copy.
     ///
-    /// fix-conflict-resolution-block-race: this collapses `FetchOutcome::
+    /// This collapses `FetchOutcome::
     /// NotFound`/`Unusable` into the same `None` as before this change —
     /// unchanged for this function's existing callers (the daemon's
     /// multi-peer dispatcher, which already has its own "try a different
@@ -3701,9 +3688,9 @@ impl PeerSyncSession {
             .push(tx);
         let _guard =
             PendingBlockGuard { pending: &self.pending_block_requests, hash: hash.to_vec() };
-        // improve-transfer-performance task 1.1: measured from just before
+        // Measured from just before
         // the request goes out to the response actually arriving — the
-        // real block-request-to-response round trip design.md's adaptive
+        // real block-request-to-response round trip the adaptive
         // window is driven by.
         let started_at = std::time::Instant::now();
         self.send(proto::SyncMessage {
@@ -3714,7 +3701,7 @@ impl PeerSyncSession {
             })),
         })
         .await?;
-        // improve-transfer-performance task 1.1: only an actual reply from
+        // Only an actual reply from
         // the peer (a real block, or an explicit not_found) is fed to the
         // adaptive window as an RTT sample — `rx.await` returning `Err`
         // means the sender was dropped without ever answering (e.g. this
@@ -3729,15 +3716,15 @@ impl PeerSyncSession {
             }
             Err(_recv_error) => FetchOutcome::NotFound,
         };
-        // add-resource-governance task 2.2/2.3: gate the received block
+        // Gate the received block
         // *payload* on the download bucket. The bytes have already crossed
-        // the wire by this point (D2: gating happens at the session/
+        // the wire by this point (gating happens at the session/
         // transfer layer, not the transport itself — this can't literally
         // delay wire bytes without deep transport hooks), but debiting here
         // throttles the *pace* of subsequent fetches: every caller of this
         // function — `ensure_blocks_present`'s eager-fetch loop below, and
         // the daemon's multi-peer hydration dispatcher, which calls this
-        // directly as its single per-block choke point (task 2.3's "one
+        // directly as its single per-block choke point ("one
         // global ceiling") — awaits this call before issuing its next
         // request, so a saturated download bucket naturally caps aggregate
         // throughput across every concurrent peer/lane sharing it. Neither
@@ -3749,7 +3736,7 @@ impl PeerSyncSession {
         Ok(result)
     }
 
-    /// task 2.1/2.3: resolves a waiter registered by `fetch_block_from_
+    /// Resolves a waiter registered by `fetch_block_from_
     /// storage_peer` against a `BlockResponse` with `is_ciphertext = true`
     /// — the ciphertext-fetch analogue of the plaintext-path resolution
     /// just above, kept entirely separate (see `PendingCiphertextBlockRequests`'s
@@ -3787,7 +3774,7 @@ impl PeerSyncSession {
         }
     }
 
-    /// task 2.1/2.3: fetches a ciphertext block (by `H(ciphertext)`) from
+    /// Fetches a ciphertext block (by `H(ciphertext)`) from
     /// this session's peer — which must be flagged storage-only for
     /// `group_id` in the caller's own bookkeeping (this method itself does
     /// not check that; it is meaningful to call whenever the peer is known
@@ -3812,7 +3799,7 @@ impl PeerSyncSession {
     /// multi-peer hydration dispatcher) can react to this the identical
     /// way — the existing reject-and-reassign path, reused rather than
     /// replaced.
-    /// task 2.1/2.2: the low-level ciphertext fetch primitive — requests
+    /// The low-level ciphertext fetch primitive — requests
     /// `ciphertext_hash` from this session's peer and returns the raw
     /// ciphertext bytes plus nonce, with **no decryption or plaintext-hash
     /// verification** (that's `fetch_block_from_storage_peer`'s job, for a
@@ -3889,7 +3876,7 @@ impl PeerSyncSession {
                     return Ok(None);
                 }
             };
-        // task 2.3: the critical post-decrypt check — AEAD authentication
+        // The critical post-decrypt check — AEAD authentication
         // alone only proves this ciphertext was produced under this
         // group's key with this nonce, not that it's the block actually
         // requested (see `content_crypto::decrypt_block`'s doc comment).
@@ -3904,14 +3891,14 @@ impl PeerSyncSession {
             );
             return Ok(None);
         }
-        // add-resource-governance parity: gate the received (decrypted)
+        // Gate the received (decrypted)
         // payload on the download bucket, mirroring `fetch_block`'s
         // identical accounting for the plaintext path.
         self.rate_limiters().download.acquire(plaintext.len() as u64).await;
         Ok(Some(Bytes::from(plaintext)))
     }
 
-    /// fix-conflict-resolution-block-race: bounded retry for a "peer did
+    /// Bounded retry for a "peer did
     /// not supply a usable block" response inside `ensure_blocks_present`
     /// (not inside `fetch_block` itself, and not with a finer-grained
     /// retry-reason taxonomy — see that function's doc comment for both
@@ -3934,14 +3921,14 @@ impl PeerSyncSession {
         Self::NOT_FOUND_RETRY_BASE_DELAY.mul_f64(1.0 + jitter)
     }
 
-    /// Fetches only the blocks not already held locally (task 6.2's
-    /// missing-block computation; task 6.3's local dedup — a block already
+    /// Fetches only the blocks not already held locally (
+    /// missing-block computation; local dedup — a block already
     /// present, from any file/version, is never re-requested). Returns
     /// whether every block ended up present locally — `false` if this
-    /// peer reported any as not found, which `hydrate_file` (on-demand-sync
-    /// task 2.1) uses to know a fetch is incomplete, not just to log it.
+    /// peer reported any as not found, which `hydrate_file` uses to know a
+    /// fetch is incomplete, not just to log it.
     ///
-    /// fix-conflict-resolution-block-race: retries a bounded number of
+    /// Retries a bounded number of
     /// times (`NOT_FOUND_RETRY_ATTEMPTS`) before accepting a
     /// `FetchOutcome::NotFound` as final — see `FetchOutcome`'s own doc
     /// comment for why this specifically retries `NotFound` and not
@@ -3976,7 +3963,7 @@ impl PeerSyncSession {
         file_path: &str,
         blocks: &[BlockInfo],
     ) -> Result<bool, SyncError> {
-        // Batched presence check (task 3.1/3.2) rather than probing one
+        // Batched presence check rather than probing one
         // hash at a time — most of a hydration's blocks are typically
         // already-known-missing (that's the point of a placeholder), so
         // this collapses what would otherwise be N separate local-storage
@@ -4043,10 +4030,10 @@ impl PeerSyncSession {
         Ok(all_present)
     }
 
-    /// On-access hydration (on-demand-sync design D4/task 2.1): fetches a
+    /// On-access hydration: fetches a
     /// placeholder file's blocks from this peer and materializes its full
     /// content, transitioning `Placeholder → Hydrating → Hydrated`. Bounded
-    /// by a fixed timeout (design D5) so a caller blocked on this (e.g. an
+    /// by a fixed timeout so a caller blocked on this (e.g. an
     /// OS read callback) never hangs indefinitely on an unresponsive peer.
     ///
     /// Returns `Ok(())` once content is fully written; `Err(HydrationFailed)`
@@ -4058,7 +4045,7 @@ impl PeerSyncSession {
     }
 
     /// Like `hydrate_file`, with an explicit timeout — production callers
-    /// use the default (30s, design D5); tests use a much shorter one so
+    /// use the default (30s); tests use a much shorter one so
     /// the "no reachable peer" case doesn't make the suite slow.
     pub async fn hydrate_file_with_timeout(
         &self,
@@ -4106,10 +4093,10 @@ impl PeerSyncSession {
             return Err(SyncError::HydrationFailed(path.to_string()));
         }
 
-        // add-sync-fidelity task 4.3: same hazard short-circuit as
+        // Same hazard short-circuit as
         // `materialize` — every block was just fetched into this device's
         // block store above regardless (so it can still serve them onward
-        // to another peer, task 4.4), but the atomic reconstruct-to-disk
+        // to another peer), but the atomic reconstruct-to-disk
         // write below must never run for a hazardous name. Reverts back
         // to `Placeholder` (content genuinely isn't on disk under this
         // name) rather than leaving the row stuck at `Hydrating`, and
@@ -4137,12 +4124,12 @@ impl PeerSyncSession {
         // SEC-SYNC-5 defense-in-depth — see `materialize`'s matching call
         // for what this does and does not close.
         self.verify_write_target(group_id, &out_path)?;
-        // add-resource-governance task 3.2: preflight before the
+        // Preflight before the
         // temp-then-rename write below begins — see
         // `preflight_disk_headroom`'s doc comment.
         self.preflight_disk_headroom(group_id, &out_path, record.size)?;
         reconstruct_file(self.store.as_ref(), &out_path, &record.blocks)?;
-        // add-sync-fidelity task 3.3: apply the owner-executable bit
+        // Apply the owner-executable bit
         // currently recorded for this path (POSIX: real chmod; no-op,
         // no error, on Windows) — hydration is a materialization path
         // just like `materialize` below, so it gets the same treatment.
@@ -4157,8 +4144,8 @@ impl PeerSyncSession {
     }
 
     /// Pins `path` and, if it isn't already `Hydrated`, hydrates it from
-    /// this peer — `on-demand-sync` spec "Pinning forces hydration"
-    /// (task 2.3). Unpinning (task 2.4) needs no peer at all and is just
+    /// this peer — the spec's "Pinning forces hydration".
+    /// Unpinning needs no peer at all and is just
     /// `SyncState::set_pinned(..., false)`, called directly by callers
     /// that have a `SyncState` handle.
     pub async fn pin_and_hydrate_file(&self, group_id: &str, path: &str) -> Result<(), SyncError> {
@@ -4203,7 +4190,7 @@ impl PeerSyncSession {
     /// identically for every single record in a large `FullIndex` was a
     /// redundant DB round-trip per file.
     ///
-    /// improve-transfer-performance task 2.1: a single batched
+    /// A single batched
     /// `SyncState::get_files_by_paths` call (see this function's body)
     /// replaces what used to be a `get_file` point query per record
     /// inside `reconcile_one_file` — but only as a *skip-eligibility*
@@ -4231,14 +4218,14 @@ impl PeerSyncSession {
             .state
             .materialization_policy_for_group(group_id)?
             .unwrap_or(MaterializationPolicy::Eager);
-        // add-folder-direction-modes task 2.1: looked up once for the whole
+        // Looked up once for the whole
         // batch, PERF-3 style, same reasoning as `policy` immediately
         // above — this is per-*group* config, not per-record state, so
         // re-reading it once per record inside `reconcile_one_file` would
         // be a redundant DB round-trip per file.
         let mode = self.state.link_mode_for_group(group_id)?.unwrap_or(LinkMode::SendReceive);
 
-        // improve-transfer-performance task 2.1: decode and apply the
+        // Decode and apply the
         // cheap, purely-local path-safety/ignore filters for the whole
         // incoming batch first (unchanged from before — neither check
         // touches `SyncState`), then issue *one* batched index lookup
@@ -4257,7 +4244,7 @@ impl PeerSyncSession {
         // incorrect one).
         let mut retained: Vec<(FileRecord, IncomingWireMeta)> = Vec::with_capacity(incoming.len());
         for file_info in incoming {
-            // add-sync-fidelity task 5.1 gap closure: captured from the
+            // Captured from the
             // original `proto::FileInfo` before `.into()` below drops it —
             // see `IncomingWireMeta`'s doc comment.
             let incoming_meta = IncomingWireMeta::from(&file_info);
@@ -4272,7 +4259,7 @@ impl PeerSyncSession {
                 continue;
             }
 
-            // add-ignore-patterns task 3.3: a record for a path matching
+            // A record for a path matching
             // this device's own ignore patterns is dropped here, before
             // any materialization/indexing/forwarding work — it is never
             // written to disk, never added to the local index, and never
@@ -4296,9 +4283,10 @@ impl PeerSyncSession {
         let paths: Vec<String> = retained.iter().map(|(record, _)| record.path.clone()).collect();
         let prefetched = self.state.get_files_by_paths(group_id, &paths)?;
 
-        // add-deterministic-sync-testing: `FuturesUnordered<JoinHandle<_>>`
-        // rather than `tokio::task::JoinSet` — `madsim`'s tokio shim has
-        // no `JoinSet` at all. Each pushed `tokio::spawn(..)` still runs
+        // `FuturesUnordered<JoinHandle<_>>`
+        // rather than `tokio::task::JoinSet` — needed for compatibility with
+        // the deterministic-simulation test setup, whose `madsim`-based
+        // tokio shim has no `JoinSet` at all. Each pushed `tokio::spawn(..)` still runs
         // as its own independently-scheduled task exactly as `JoinSet`
         // would; `FuturesUnordered` here only replaces `JoinSet`'s
         // "poll whichever join handle finishes first" bookkeeping.
@@ -4329,7 +4317,7 @@ impl PeerSyncSession {
             let this = self.clone();
             let group_id = group_id.to_string();
             in_flight.push(tokio::spawn(async move {
-                // fix-materialization-disk-index-divergence (Bug 4): a
+                // A
                 // transient error here — most commonly a `SyncState`
                 // write hitting `SQLITE_BUSY`/`DatabaseLocked` under real
                 // concurrent load (this reconcile loop's own
@@ -4342,8 +4330,8 @@ impl PeerSyncSession {
                 // specific incoming record would simply never be applied,
                 // with no retry and no requeue, leaving this device's
                 // index permanently stuck at whatever it had before. Same
-                // shape as `fix-conflict-resolution-block-race`'s
-                // `ensure_blocks_present` fix: a bounded retry with jitter
+                // shape as `ensure_blocks_present`'s own
+                // bounded-retry fix: a bounded retry with jitter
                 // for a transient condition that resolves shortly after,
                 // not an indefinite one.
                 let mut attempt = 0;
@@ -4397,7 +4385,7 @@ impl PeerSyncSession {
         policy: MaterializationPolicy,
         mode: LinkMode,
     ) -> Result<(), SyncError> {
-        // fix-local-edit-swallowed-by-self-echo-race: must run *before*
+        // Must run *before*
         // `path_lock` below is acquired (see
         // `flush_pending_local_change_before_reconcile`'s doc comment for
         // why) — this is what makes sure `local` (read further down, once
@@ -4409,8 +4397,7 @@ impl PeerSyncSession {
         // function never overwrites its on-disk content ahead of it being
         // captured.
         self.flush_pending_local_change_before_reconcile(group_id, &incoming.path).await;
-        // fix-case-fold-sibling-local-change-not-flushed-before-reconcile:
-        // same rationale and timing as the call above, but for a
+        // Same rationale and timing as the call above, but for a
         // differently-cased sibling path this device may have its own
         // not-yet-indexed local write for — see this method's own doc
         // comment for why the exact-path flush above isn't enough on a
@@ -4428,7 +4415,7 @@ impl PeerSyncSession {
         let path_lock = self.state.path_lock(group_id, &incoming.path);
         let _guard = path_lock.lock().await;
 
-        // fix-multiway-conflict-name-content-mismatch: the device that
+        // The device that
         // actually produced `incoming`'s content, per the sending peer's
         // own `SyncState::get_origin_device_id` lookup (`file_info_for_
         // record`) — not necessarily `self.peer_device_id` if this peer
@@ -4441,11 +4428,11 @@ impl PeerSyncSession {
         let local = self.state.get_file(group_id, &incoming.path)?;
 
         let Some(local) = local else {
-            // add-folder-direction-modes task 2.1/2.3: a send-only link
+            // A send-only link
             // never applies an incoming change — including the "never seen
             // this path before" case, and including a tombstone for a path
             // this device never had (`incoming.deleted`; gated identically
-            // to content per design.md's "Tombstones" section, since
+            // to content per the "Tombstones" handling, since
             // nothing branches on `deleted` before this point). Recorded as
             // out-of-sync rather than adopted; no conflict copy, no write
             // to disk, no forward to this device's other peers — local
@@ -4455,7 +4442,7 @@ impl PeerSyncSession {
                 self.state.record_out_of_sync(group_id, &incoming.path, now_unix_nanos())?;
                 return Ok(());
             }
-            // add-sync-fidelity task 5.1 gap closure: persist the peer's
+            // Persist the peer's
             // advertised kind/target/exec-bit into the index *before*
             // `materialize` runs — its own symlink dispatch reads
             // `SyncState::get_record_kind` for this exact path, so this
@@ -4511,13 +4498,13 @@ impl PeerSyncSession {
                 Ok(())
             }
             VvOrdering::Before => {
-                // add-folder-direction-modes task 2.1/2.3: peer has new
+                // Peer has new
                 // information for a path this device already has — on a
-                // send-only link this is exactly the divergence design.md
+                // send-only link this is exactly the divergence this system
                 // describes ("an incoming index update that differs from
                 // local is not applied ... recorded as an out-of-sync
                 // item"), including when `incoming.deleted` (a gated
-                // tombstone, task 2.3). Local content, and the local index
+                // tombstone). Local content, and the local index
                 // row, are left completely untouched.
                 if mode == LinkMode::SendOnly {
                     self.state.record_out_of_sync(group_id, &incoming.path, now_unix_nanos())?;
@@ -4535,7 +4522,7 @@ impl PeerSyncSession {
                 // surfaces a real removal failure as an error instead of
                 // silently discarding it.
                 //
-                // add-sync-fidelity task 5.1 gap closure: same as the
+                // Same as the
                 // never-seen branch above — must land before `materialize`.
                 apply_incoming_wire_metadata(&self.state, group_id, &incoming, &meta)?;
                 self.materialize(group_id, &incoming, policy, &incoming_origin).await?;
@@ -4543,7 +4530,7 @@ impl PeerSyncSession {
                 Ok(())
             }
             VvOrdering::Concurrent => {
-                // add-folder-direction-modes task 2.1: design.md is
+                // The design is
                 // explicit that "send-only never conflict-copies an
                 // incoming change" — a genuine concurrent edit is still
                 // divergence (the incoming record differs from local), just
@@ -4560,7 +4547,7 @@ impl PeerSyncSession {
         }
     }
 
-    /// Task 6.7: on a genuine concurrent edit, keep both copies —
+    /// On a genuine concurrent edit, keep both copies —
     /// deterministically rename the older-mtime one to a conflict-marked
     /// filename, which then propagates to all peers as an ordinary file.
     async fn resolve_and_apply_conflict(
@@ -4583,7 +4570,7 @@ impl PeerSyncSession {
         // so a DST harness's `set_test_clock_override` reaches this call
         // site too -- see that function's doc comment.
         let now_unix_nanos = now_unix_nanos();
-        // fix-multiway-conflict-name-content-mismatch: `local`/`incoming`
+        // `local`/`incoming`
         // do not always genuinely originate from `self.local_device_id`/
         // `self.peer_device_id` — under a 3-or-more-way concurrent edit,
         // either side can already be a *previous* pairwise resolution
@@ -4601,7 +4588,7 @@ impl PeerSyncSession {
             .unwrap_or_else(|| self.local_device_id.clone());
         let incoming_origin =
             meta.origin_device_id.clone().unwrap_or_else(|| self.peer_device_id.clone());
-        // fix-conflict-copy-filename-collision: the loser's content hash
+        // The loser's content hash
         // is threaded in alongside its mtime/device-id so `conflict_copy_path`
         // can append a collision-proof disambiguator — see `conflict.rs`'s
         // top-level doc comment for why a truncated-second timestamp plus
@@ -4654,8 +4641,8 @@ impl PeerSyncSession {
         let incoming_record =
             FileRecord { path: incoming_final_path, version: merged_version, ..incoming };
 
-        // PROTOTYPE guard (agmsg investigation, 2026-07-08 -- verifying a
-        // hypothesis before this becomes a properly-specced fix). Root
+        // PROTOTYPE guard -- verifying a
+        // hypothesis before this becomes a properly-specced fix. Root
         // cause: this function has no idempotency check against a
         // conflict-copy it already wrote for this exact losing content.
         // `resolve_conflict_names`/`conflict_copy_path` derive the
@@ -4724,7 +4711,7 @@ impl PeerSyncSession {
             && (incoming_deleted
                 || loser_already_conflict_copied(&original_path, &incoming_record.blocks));
         if !skip_local {
-            // add-sync-fidelity task 5.1 gap closure, **documented partial
+            // **Documented partial
             // coverage**: `local_record` keeps whatever kind/target/exec-bit
             // is already indexed under `local.path` today, but if this
             // side lost the conflict its final path (`local_final_path`
@@ -4740,7 +4727,7 @@ impl PeerSyncSession {
             // and a write under the new path, which is straightforward but
             // out of this fix's tested scope — left as a known gap rather
             // than silently assumed correct.
-            // fix-multiway-conflict-name-content-mismatch: `local_origin`
+            // `local_origin`
             // (not unconditionally `self.local_device_id` — see this
             // function's own doc comment above) is whichever device
             // actually produced `local_record`'s content, so the stored
@@ -4755,7 +4742,7 @@ impl PeerSyncSession {
             self.forward(group_id, &local_record);
         }
         if !skip_incoming {
-            // add-sync-fidelity task 5.1 gap closure: `incoming_record`'s
+            // `incoming_record`'s
             // final path may differ from the original wire path (a
             // conflict rename), so this applies `meta` — captured from the
             // peer's original `proto::FileInfo` — at that final path,
@@ -4771,8 +4758,8 @@ impl PeerSyncSession {
 
     /// Adopts `record` (already at its final target path/version) into the
     /// local index, and either fetches its full content or writes a
-    /// placeholder, depending on the folder group's materialization policy
-    /// (`on-demand-sync` design D3) — `Eager` always fetches; `OnDemand`
+    /// placeholder, depending on the folder group's materialization
+    /// policy — `Eager` always fetches; `OnDemand`
     /// writes a placeholder unless this exact path is individually pinned.
     ///
     /// Order matters: this device's *own* local watcher will see the write
@@ -4784,8 +4771,8 @@ impl PeerSyncSession {
     /// watcher's task processes the event before `upsert_file` (a separate
     /// task) has run, finds nothing indexed yet, and misindexes this as a
     /// brand-new local file under this device's own version, which then
-    /// looks like a concurrent edit to every peer (found via tasks.md
-    /// 11.2's load test, intermittently, exactly this race).
+    /// looks like a concurrent edit to every peer (found via a
+    /// load test, intermittently, exactly this race).
     ///
     /// `policy` (PERF-3) is looked up once by the caller's batch
     /// (`reconcile_files`) rather than re-read here per record — see that
@@ -4794,7 +4781,7 @@ impl PeerSyncSession {
     /// group's policy doesn't vary per-file), only how many times it's
     /// fetched from the index.
     ///
-    /// add-sync-fidelity task 4.1-4.3: the free-form `held_reason`
+    /// The free-form `held_reason`
     /// `record.path` must be held under right now, or `None` if
     /// materializing it is safe. Thin wrapper over `hazard_reason_for_
     /// policy` (see that free function's doc comment for the actual
@@ -4814,7 +4801,7 @@ impl PeerSyncSession {
         )
     }
 
-    /// add-sync-fidelity task 4.3/4.4/4.5: thin wrapper over `hold_record`
+    /// Thin wrapper over `hold_record`
     /// (see that free function's doc comment) using this session's own
     /// `SyncState`.
     fn hold(
@@ -4827,14 +4814,14 @@ impl PeerSyncSession {
         hold_record(&self.state, group_id, record, reason, origin_device_id)
     }
 
-    /// add-file-version-history task 2.1/2.2: `origin_device_id` (design
-    /// D4) is the local device id for a local record being re-materialized
+    /// `origin_device_id` is the local device id for a local record being
+    /// re-materialized
     /// (`resolve_and_apply_conflict`'s `local_record` side of a conflict)
     /// or the sending peer's device id for a genuinely adopted remote
     /// version — always supplied by the caller (`reconcile_one_file`/
-    /// `resolve_and_apply_conflict`), never inferred here, matching design
-    /// D4's "recorded directly at write time rather than inferred from a
-    /// version-vector diff".
+    /// `resolve_and_apply_conflict`), never inferred here, matching the
+    /// principle of "recorded directly at write time rather than inferred
+    /// from a version-vector diff".
     async fn materialize(
         &self,
         group_id: &str,
@@ -4859,7 +4846,7 @@ impl PeerSyncSession {
         // here surfaces as a real error without corrupting the index.
         if record.deleted {
             let out_path = self.local_file_path(group_id, &record.path);
-            // add-sync-fidelity task 3.5: `std::fs::remove_file` on a
+            // `std::fs::remove_file` on a
             // symlink path is a plain `unlink()` of that directory entry
             // — it removes the link itself and never follows it to
             // touch whatever the link points at, symlink or not. This is
@@ -4875,7 +4862,7 @@ impl PeerSyncSession {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(SyncError::from(e)),
             }
-            // add-sync-fidelity task 3.5: a held file that's later
+            // A held file that's later
             // tombstoned must not leave an orphaned held entry once its
             // index row no longer represents a live, on-disk file —
             // `clear_held` is documented as a safe no-op when the path
@@ -4884,19 +4871,19 @@ impl PeerSyncSession {
             return self.state.upsert_file_with_origin(group_id, record, origin_device_id);
         }
 
-        // add-sync-fidelity task 4.1-4.3: computed once, ahead of every
+        // Computed once, ahead of every
         // dispatch branch below (symlink, metadata-only fast path, eager
         // fetch, placeholder) — a hazard must short-circuit before *any*
         // of those reach their own atomic temp-write step, not just the
         // ordinary-file ones. See `hazard_reason_for`'s doc comment.
         let hazard_reason = self.hazard_reason_for(group_id, record)?;
 
-        // add-sync-fidelity task 3.1/3.2: a path this device's own index
+        // A path this device's own index
         // already classifies as a symlink (`SyncState::get_record_kind`
         // — see `materialize_symlink_at`'s doc comment for why this,
         // not a wire-carried kind, is the correct source today) never
         // goes through the ordinary block-fetch/reconstruct path below —
-        // it carries no content blocks at all (D1).
+        // it carries no content blocks at all.
         if self.state.get_record_kind(group_id, &record.path)?.unwrap_or_default()
             == RecordKind::Symlink
         {
@@ -4919,7 +4906,7 @@ impl PeerSyncSession {
             );
         }
 
-        // add-sync-fidelity task 3.4/4.3: content-identical fast path — if
+        // Content-identical fast path — if
         // this exact block list is already what's indexed locally for
         // this path, skip the whole fetch/reconstruct cycle below
         // entirely and just make sure the on-disk exec bit matches the
@@ -4984,13 +4971,12 @@ impl PeerSyncSession {
             // still-queued `BlockResponse`s (and everything after them)
             // through.
             //
-            // fix-burst-sync-permanent-stall: "simply retried on the peer's
+            // "simply retried on the peer's
             // next full-index resend" above was aspirational, not actually
-            // true, until that change added `run`'s periodic resync task —
+            // true, until `run`'s periodic resync task was added —
             // before it, `send_full_index` was only ever called once per
             // session, so a reconcile that timed out here this way was
             // dropped for the life of the session, not retried at all (see
-            // that change's design.md for the full incident writeup and
             // `DEFAULT_FULL_INDEX_RESYNC_INTERVAL`'s doc comment for why 90s
             // was chosen). The periodic resync is a safety net around this
             // contention, not a fix to it — a possible, separate follow-up
@@ -5002,7 +4988,7 @@ impl PeerSyncSession {
             // separate reservation carved out for control messages, so the
             // recv loop can never be head-of-line-blocked behind eager
             // fetches on its own connection in the first place, matching
-            // `add-resource-governance`'s "control messages must never be
+            // resource governance's "control messages must never be
             // delayed even while both buckets are saturated" precedent.
             tokio::time::timeout(
                 DEFAULT_HYDRATION_TIMEOUT,
@@ -5010,11 +4996,11 @@ impl PeerSyncSession {
             )
             .await
             .map_err(|_elapsed| SyncError::HydrationFailed(record.path.clone()))??;
-            // add-sync-fidelity task 4.3/4.4: the block fetch above always
+            // The block fetch above always
             // runs, hazardous or not — this device may be another peer's
             // only currently-reachable source for these blocks even
             // though it can't write them to disk under this name itself
-            // (task 4.4's "blocks still requested/served to peers"). Only
+            // ("blocks still requested/served to peers"). Only
             // the write step below is skipped for a held record.
             if let Some(reason) = &hazard_reason {
                 return self.hold(group_id, record, reason, origin_device_id);
@@ -5031,20 +5017,20 @@ impl PeerSyncSession {
             // within_root`'s doc comment for what this does and does not
             // close.
             self.verify_write_target(group_id, &out_path)?;
-            // add-resource-governance task 3.2: preflight before the
+            // Preflight before the
             // temp-then-rename write below begins — see
             // `preflight_disk_headroom`'s doc comment.
             self.preflight_disk_headroom(group_id, &out_path, record.size)?;
             reconstruct_file(self.store.as_ref(), &out_path, &record.blocks)?;
-            // add-sync-fidelity task 3.3: apply the owner-executable bit
+            // Apply the owner-executable bit
             // currently recorded for this path (POSIX: real chmod;
             // no-op, no error, on Windows).
             apply_exec_bit(&out_path, self.state.get_exec_bit(group_id, &record.path)?)
         } else {
-            // add-sync-fidelity task 4.3/4.5: OnDemand/not-pinned is the
+            // OnDemand/not-pinned is the
             // placeholder path — but a placeholder is still a real
             // on-disk artifact created *under this path's exact name*, so
-            // a hazardous record must not get one either (design D3: held
+            // a hazardous record must not get one either (held
             // means no on-disk artifact under this name at all, full
             // content or placeholder alike; never any alternate name).
             if let Some(reason) = &hazard_reason {
@@ -5063,7 +5049,7 @@ impl PeerSyncSession {
             // SEC-SYNC-5 defense-in-depth — see the comment above.
             self.verify_write_target(group_id, &out_path)?;
             write_placeholder(&out_path, record.size, record.mtime_unix_nanos)?;
-            // task 3.3: a placeholder still gets the recorded exec bit
+            // A placeholder still gets the recorded exec bit
             // applied now — `hydrate_file_with_timeout` re-applies it
             // again once real content lands, so this is never lost
             // across the placeholder → hydrated transition either.
@@ -5138,7 +5124,7 @@ impl PeerSyncSession {
         }
     }
 
-    /// add-resource-governance task 3.2: disk-space headroom preflight
+    /// Disk-space headroom preflight
     /// before a hydration fetch or a materialize-to-temp-and-rename write
     /// begins, scoped to the volume hosting `group_id`'s local sync root —
     /// called from both of this session's write paths that reach
@@ -5191,7 +5177,7 @@ fn is_safe_relative_path(path: &str) -> bool {
     std::path::Path::new(path).components().all(|c| matches!(c, Component::Normal(_)))
 }
 
-/// improve-transfer-performance task 2.1: whether `incoming` might
+/// Whether `incoming` might
 /// actually need `reconcile_one_file`'s real, `path_lock`-guarded
 /// read-compare-write, given `prefetched_local` — a *possibly stale*
 /// snapshot of this device's local record for the same path, taken by one
@@ -5397,7 +5383,7 @@ mod pending_block_guard_tests {
     }
 }
 
-/// security-hardening SEC-5 / sync-correctness-fixes task 4.1: a peer
+/// SEC-5: a peer
 /// could return data for a block that doesn't actually match what was
 /// requested (wrong content, truncated, or an outright malicious/corrupt
 /// response) — `ensure_blocks_present` must never accept and persist it
@@ -5467,7 +5453,7 @@ mod path_safety_tests {
     }
 }
 
-/// SEC-SYNC-2 / task 4.2: the incoming-index cardinality cap
+/// SEC-SYNC-2: the incoming-index cardinality cap
 /// (`index_message_exceeds_cardinality_cap`, wired into
 /// `reconcile_files_if_authorized`) — exercised against small synthetic
 /// `max_files`/`max_blocks` rather than the real (deliberately huge)
@@ -5506,7 +5492,7 @@ mod cardinality_cap_tests {
     #[test]
     fn one_block_over_the_total_block_cap_is_rejected() {
         // A single file whose own block count alone exceeds max_blocks —
-        // the real attack shape design.md describes (arbitrarily many
+        // the real attack shape this guards against (arbitrarily many
         // blocks doesn't require arbitrarily many files).
         let files = vec![file_with_blocks(11)];
         assert!(index_message_exceeds_cardinality_cap(&files, 1000, 10));
@@ -5528,7 +5514,7 @@ mod cardinality_cap_tests {
     }
 }
 
-/// SEC-SYNC-2 / task 4.2: the per-(session, group) eager-fetch admission
+/// SEC-SYNC-2: the per-(session, group) eager-fetch admission
 /// budget (`admit_eager_blocks_impl`, wired into
 /// `PeerSyncSession::admit_eager_blocks`) — exercised against a small
 /// synthetic `max_per_group` rather than the real (deliberately huge)
@@ -5593,7 +5579,7 @@ mod eager_admission_tests {
     }
 }
 
-/// add-sync-fidelity task 3.1/3.4: `materialize_symlink_at` and
+/// `materialize_symlink_at` and
 /// `try_apply_metadata_only_update`, exercised directly against a
 /// `SyncState` + tempdir — no `PeerSyncSession`/channel needed, since
 /// neither function touches the network (see both functions' doc
@@ -5632,7 +5618,7 @@ mod symlink_and_metadata_only_update_tests {
         }
     }
 
-    /// task 3.1: given a path this device's own index already classifies
+    /// Given a path this device's own index already classifies
     /// as a symlink with a recorded target, `materialize_symlink_at`
     /// creates a real on-disk symlink and keeps the index row in sync.
     #[cfg(unix)]
@@ -5681,7 +5667,7 @@ mod symlink_and_metadata_only_update_tests {
         );
     }
 
-    /// task 3.4: when the incoming record's block list is byte-identical
+    /// When the incoming record's block list is byte-identical
     /// to what's already indexed locally, the fast path applies just the
     /// exec bit (via a real chmod) and index bookkeeping (mtime/version),
     /// leaving the file's actual content bytes completely untouched.
@@ -5772,7 +5758,7 @@ mod symlink_and_metadata_only_update_tests {
     }
 }
 
-/// add-sync-fidelity task 4.1-4.6: `hazard_reason_for_policy` and
+/// `hazard_reason_for_policy` and
 /// `hold_record`, exercised directly against a `SyncState` + tempdir — no
 /// `PeerSyncSession`/channel needed, same reasoning as
 /// `symlink_and_metadata_only_update_tests` above. Real,
@@ -5799,7 +5785,7 @@ mod hazard_reason_tests {
         }
     }
 
-    /// task 4.1: an incoming record whose path case-folds identically to
+    /// An incoming record whose path case-folds identically to
     /// an already-indexed sibling, but isn't byte-identical to it, is a
     /// case-fold-collision hazard on a case-insensitive filesystem --
     /// `hazard_reason_for_policy` itself only even runs this check when
@@ -5870,7 +5856,7 @@ mod hazard_reason_tests {
         }
     }
 
-    /// task 4.2/4.6: the exact scenario the task calls for — the *same*
+    /// The exact scenario this test targets — the *same*
     /// index state (a record named after a Windows-reserved device name)
     /// is held under `NamePolicy::Windows` and materializes normally
     /// (`None`, i.e. not a hazard) under `NamePolicy::Posix`, proving the
@@ -5901,7 +5887,7 @@ mod hazard_reason_tests {
         );
     }
 
-    /// task 4.3/4.4: `hold_record` upserts the record (so it keeps
+    /// `hold_record` upserts the record (so it keeps
     /// participating in index exchange) and sets held state, without
     /// creating anything on disk.
     #[test]
@@ -5933,7 +5919,7 @@ mod hazard_reason_tests {
         );
     }
 
-    /// task 4.5 (design D3): the regression test the task explicitly
+    /// The regression test this explicitly
     /// calls for — a real, pre-existing sibling is already on disk;
     /// holding a case-fold-colliding incoming record for it must never
     /// produce a written file under any name at all, not the hazardous
@@ -5977,7 +5963,7 @@ mod hazard_reason_tests {
     }
 }
 
-/// add-transfer-compression task 2.6: `compress_block`/`decompress_block`
+/// `compress_block`/`decompress_block`
 /// exercised directly — no `PeerSyncSession`/channel needed, mirroring
 /// every other free-function test module above.
 #[cfg(test)]
@@ -6010,7 +5996,7 @@ mod compression_codec_tests {
 
     /// Already-zstd-compressed content is itself close to incompressible
     /// (compressed bytes look like high-entropy noise to a second pass) —
-    /// proposal.md's "already-compressed content is sent raw, spending
+    /// matching the design's "already-compressed content is sent raw, spending
     /// only the one cheap trial-compression pass."
     #[test]
     fn already_compressed_bytes_are_sent_raw() {
@@ -6024,7 +6010,7 @@ mod compression_codec_tests {
     }
 
     /// The positive case: highly repetitive synthetic text (the shape of
-    /// real source-tree/log/DB-dump content proposal.md targets) compresses
+    /// real source-tree/log/DB-dump content this feature targets) compresses
     /// well past the 95% threshold and must be sent compressed.
     #[test]
     fn highly_repetitive_text_is_compressed() {
@@ -6073,7 +6059,7 @@ mod compression_codec_tests {
         assert_eq!(recovered, data, "None must pass bytes through even past `max_size`");
     }
 
-    /// The decompression-bomb bound (task 2.3 / proposal.md): a small
+    /// The decompression-bomb bound: a small
     /// compressed payload that *claims* to expand far past `max_size` must
     /// be rejected, not decompressed into memory. Compresses 64 MiB of
     /// zeros (a classic zstd bomb shape — trivially compressible) down to
@@ -6133,14 +6119,14 @@ mod compression_codec_tests {
     }
 }
 
-/// add-transfer-compression tasks 5.1/5.2: bytes-on-wire and wall-clock
+/// Bytes-on-wire and wall-clock
 /// cost for `compress_block` — the exact codec `handle_block_request`/
 /// `send_full_index`/`send_index_update` all call — against two
 /// representative workloads: a source-tree-like text corpus (compression's
-/// target case per proposal.md's "Why") and a photo/media-like
-/// incompressible corpus (the adaptive-skip heuristic's target case, task
-/// 5.2's "confirming the adaptive skip heuristic keeps the regression
-/// negligible"). `#[ignore]`d, matching this crate's convention for
+/// target case) and a photo/media-like
+/// incompressible corpus (the adaptive-skip heuristic's target case,
+/// confirming the adaptive skip heuristic keeps the regression
+/// negligible). `#[ignore]`d, matching this crate's convention for
 /// cost-heavy checks that don't belong in the default `cargo test` run —
 /// invoke explicitly with:
 ///
@@ -6148,8 +6134,8 @@ mod compression_codec_tests {
 /// cargo test -p yadorilink-sync-core --lib -- --ignored --nocapture bytes_on_wire_and_cost_source_tree_vs_media
 /// ```
 ///
-/// task 5.3's `tasks.md` notes record one real run's printed output as the
-/// acceptance evidence for this proposal's "Why."
+/// One real run's printed output was recorded as the
+/// acceptance evidence for this feature.
 #[cfg(test)]
 mod compression_benchmark {
     use super::compress_block;
@@ -6158,8 +6144,8 @@ mod compression_benchmark {
     #[ignore]
     fn bytes_on_wire_and_cost_source_tree_vs_media() {
         // "source tree" stand-in: many small, highly repetitive Rust-like
-        // source files concatenated into one corpus — proposal.md's "Why"
-        // names source trees, documents, logs, and DB dumps as the target
+        // source files concatenated into one corpus — representative of
+        // source trees, documents, logs, and DB dumps as the target
         // workload shape.
         let mut source_tree = Vec::new();
         for i in 0..2000 {

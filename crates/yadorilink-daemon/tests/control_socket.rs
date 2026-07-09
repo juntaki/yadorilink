@@ -1,4 +1,4 @@
-//! Exercises the CLI ↔ daemon control protocol (tasks 7.1, 7.5-7.7)
+//! Exercises the CLI ↔ daemon control protocol
 //! end-to-end over a real Unix domain socket, without needing a live
 //! coordination plane or relay — link/unlink/pause/resume/status/shutdown
 //! only ever talk to the local daemon. Wrapped in `#[cfg(unix)]`
@@ -98,11 +98,10 @@ mod unix_socket_tests {
         assert!(!list.links[0].paused);
     }
 
-    /// add-first-run-safety-onboarding task 2.3: the daemon rejects linking
-    /// a folder that overlaps an already-linked folder unless
-    /// `acknowledge_risks` is set -- defense-in-depth independent of
-    /// whatever the CLI already showed/gated, since the daemon alone knows
-    /// every existing link's path.
+    /// The daemon rejects linking a folder that overlaps an already-linked
+    /// folder unless `acknowledge_risks` is set -- defense-in-depth
+    /// independent of whatever the CLI already showed/gated, since the
+    /// daemon alone knows every existing link's path.
     #[tokio::test]
     async fn link_rejects_unacknowledged_nested_conflict() {
         let (socket_path, dir) = start_daemon().await;
@@ -206,7 +205,7 @@ mod unix_socket_tests {
         assert_eq!(list.links.len(), 2);
     }
 
-    /// content-defined-chunking task 4.5: `yadorilink link
+    /// `yadorilink link
     /// --content-defined-chunking` round-trips the policy through the control
     /// socket and is reflected in `yadorilink link`/`yadorilink status`-equivalent
     /// list output (`chunking_policy` on `LinkStatus`).
@@ -275,7 +274,7 @@ mod unix_socket_tests {
     }
 
     /// sync-engine spec: "Pause halts sync activity" / "Resume processes
-    /// queued changes" — exercised at the control-protocol level (task 6.8).
+    /// queued changes" — exercised at the control-protocol level.
     #[tokio::test]
     async fn pause_then_resume_round_trips_through_status() {
         let (socket_path, dir) = start_daemon().await;
@@ -319,9 +318,9 @@ mod unix_socket_tests {
         assert!(!status.links[0].paused);
     }
 
-    /// add-folder-direction-modes task 4.2/4.3: `set-mode` round-trips
-    /// through `status` (mode + divergence counts), and `override`/
-    /// `revert` each clear their respective divergence set and report how
+    /// `set-mode` round-trips through `status` (mode + divergence counts),
+    /// and `override`/`revert` each clear their respective divergence set
+    /// and report how
     /// many paths they reconciled — exercised end-to-end over the real
     /// control socket, the same level `pause_then_resume_round_trips_
     /// through_status` above exercises pause/resume at. Divergence items
@@ -441,9 +440,9 @@ mod unix_socket_tests {
         assert_eq!(status.links[0].receive_only_changed_count, 0);
     }
 
-    /// add-folder-direction-modes task 3.1/3.2: `override` on a
-    /// send-receive link, and `revert` on a send-only link, are both
-    /// rejected — each action is valid against exactly one mode.
+    /// `override` on a send-receive link, and `revert` on a send-only
+    /// link, are both rejected — each action is valid against exactly one
+    /// mode.
     #[tokio::test]
     async fn override_and_revert_reject_the_wrong_mode() {
         let (socket_path, dir) = start_daemon().await;
@@ -541,10 +540,10 @@ mod unix_socket_tests {
         assert_eq!(status.links[0].conflict_count, 0);
     }
 
-    /// add-sync-fidelity task 5.4: a held file (design.md D3 — a
-    /// cross-platform name hazard, held rather than materialized or
-    /// auto-renamed) is surfaced over the control socket with its count,
-    /// path, reason, and hold timestamp, sourced from section 1's
+    /// A held file (a cross-platform name hazard, held rather than
+    /// materialized or auto-renamed) is surfaced over the control socket
+    /// with its count, path, reason, and hold timestamp, sourced from
+    /// section 1's
     /// `held_reason`/`held_since_unix_nanos` columns via
     /// `SyncState::set_held`/`get_held_state`.
     #[tokio::test]
@@ -605,8 +604,8 @@ mod unix_socket_tests {
         assert_eq!(status.links[0].held_files[0].held_since_unix_nanos, 123);
     }
 
-    /// add-sync-fidelity task 5.4: an unheld, non-symlink file never
-    /// contributes to `held_file_count`/`held_files` — the field is
+    /// An unheld, non-symlink file never contributes to
+    /// `held_file_count`/`held_files` — the field is
     /// absent (zero/empty), not merely unpopulated, when nothing in the
     /// link is actually held.
     #[tokio::test]
@@ -640,10 +639,10 @@ mod unix_socket_tests {
         assert_eq!(status.links[0].skipped_symlink_count, 0);
     }
 
-    /// add-sync-fidelity task 5.4: a symlink record with the Windows
-    /// default-skip-with-visible-status policy in effect (task 3.2 —
-    /// `windows_symlink_opt_in` left at its default `false`) counts
-    /// toward `skipped_symlink_count` when the daemon itself is running
+    /// A symlink record with the Windows default-skip-with-visible-status
+    /// policy in effect (`windows_symlink_opt_in` left at its default
+    /// `false`) counts toward `skipped_symlink_count` when the daemon
+    /// itself is running
     /// on Windows, the only platform where a symlink record is ever left
     /// unmaterialized by policy. **Not exercised on this development
     /// machine** (macOS/Linux only, matching section 3.2's own
@@ -706,7 +705,7 @@ mod unix_socket_tests {
     }
 
     /// Same setup as `status_reports_skipped_windows_symlink_count`, but a
-    /// per-link opt-in (task 3.2) takes the symlink out of the
+    /// per-link opt-in takes the symlink out of the
     /// default-skip policy — it no longer counts as skipped, since a real
     /// materialization attempt (success or failure) is made instead of a
     /// policy-driven skip. Windows-only for the same reason as its sibling
@@ -821,7 +820,7 @@ mod unix_socket_tests {
         assert_eq!(status.links[0].skipped_symlink_count, 0);
     }
 
-    /// on-demand-sync task 4.2/4.5 — manual eviction round-trips through the
+    /// Manual eviction round-trips through the
     /// control socket: a hydrated file becomes a placeholder, its sync state
     /// (blocks) untouched.
     #[tokio::test]
@@ -860,7 +859,7 @@ mod unix_socket_tests {
         assert!(matches!(resp.payload, Some(RespPayload::Error(_))));
     }
 
-    /// on-demand-sync task 4.2/4.5 — evicting a genuinely-indexed, hydrated
+    /// Evicting a genuinely-indexed, hydrated
     /// file turns it into a correctly-sized placeholder, over the control
     /// socket end to end.
     #[tokio::test]
@@ -926,7 +925,7 @@ mod unix_socket_tests {
         assert_ne!(std::fs::read(folder.join("report.pdf")).unwrap(), content);
     }
 
-    /// on-demand-sync task 4.2/4.5 — hydrate/pin with no peer connected must
+    /// Hydrate/pin with no peer connected must
     /// return a clear error over the control socket, not hang the connection.
     #[tokio::test]
     async fn hydrate_and_pin_without_a_connected_peer_return_a_clear_error() {
@@ -970,11 +969,11 @@ mod unix_socket_tests {
             send(&socket_path, ReqPayload::Unpin(UnpinRequest { absolute_path: nope_path })).await;
         assert!(matches!(resp.payload, Some(RespPayload::Error(_))));
     }
-    /// add-file-version-history task 5.4: `ListVersions`/`RestoreVersion`
-    /// round-trip against a running daemon — an edit produces a superseded
-    /// version, `versions` lists both (newest first, including current),
-    /// and restoring the superseded version writes its content back to disk
-    /// as a brand-new current version (design D3: never rewrites history).
+    /// `ListVersions`/`RestoreVersion` round-trip against a running
+    /// daemon — an edit produces a superseded version, `versions` lists
+    /// both (newest first, including current), and restoring the
+    /// superseded version writes its content back to disk as a brand-new
+    /// current version (never rewrites history).
     #[tokio::test]
     async fn list_versions_then_restore_version_round_trips_through_control_socket() {
         let (socket_path, dir, state) = start_daemon_with_state().await;
@@ -1079,7 +1078,7 @@ mod unix_socket_tests {
         assert_eq!(versions[0].blocks, vec![v1_block]);
     }
 
-    /// task 5.4: `RestoreVersion` with no `version_seq` defaults to the most
+    /// `RestoreVersion` with no `version_seq` defaults to the most
     /// recent superseded version (spec "Restore without a version defaults
     /// to the most recent superseded version").
     #[tokio::test]
@@ -1212,7 +1211,7 @@ mod unix_socket_tests {
         assert!(msg.contains("superseded"), "expected a clear message, got {msg:?}");
     }
 
-    /// task 5.4: the missing-blocks restore failure path surfaces
+    /// the missing-blocks restore failure path surfaces
     /// `SyncError::VersionContentUnavailable` specifically over IPC, not a
     /// generic error message — `RespPayload::Error` is just `e.to_string()`,
     /// so this checks the text actually identifies unavailable version
@@ -1285,7 +1284,7 @@ mod unix_socket_tests {
         assert!(!folder.join("phantom.bin").exists(), "a failed restore must not create a file");
     }
 
-    /// task 5.4: `ListTrash`/`RestoreTrash` round-trip — a deleted file
+    /// `ListTrash`/`RestoreTrash` round-trip — a deleted file
     /// shows up in `trash list`, and `trash restore` recovers it as a new
     /// live current version.
     #[tokio::test]
@@ -1359,11 +1358,11 @@ mod unix_socket_tests {
         assert!(!current.deleted, "the file must be live again after a trash restore");
     }
 
-    /// task 5.4/6.4: `SetRetentionPolicy` persists and is reflected via
+    /// `SetRetentionPolicy` persists and is reflected via
     /// `SyncState::retention_policy_for_group` and `list_links` — the same
     /// source `link_manager::run_retention_expiry_sweep` reads on its next
     /// pass, so this is exactly the effect that makes a policy change take
-    /// hold without a daemon restart (design D2).
+    /// hold without a daemon restart ().
     #[tokio::test]
     async fn set_retention_policy_persists_and_is_reflected_via_list_links() {
         let (socket_path, dir, state) = start_daemon_with_state().await;
@@ -1409,7 +1408,7 @@ mod unix_socket_tests {
         assert_eq!(link.retention_policy.max_age_days, 7);
     }
 
-    /// task 6.4: `--keep-versions`/`--keep-days` at link time persist
+    /// `--keep-versions`/`--keep-days` at link time persist
     /// through to the retention policy `SyncState` stores (verified
     /// directly, since `LinkStatus` doesn't surface retention policy).
     #[tokio::test]
@@ -1440,7 +1439,7 @@ mod unix_socket_tests {
             Some(yadorilink_sync_core::index::RetentionPolicy { max_versions: 3, max_age_days: 7 })
         );
 
-        // Omitting both flags keeps the schema default (10/30, design D2).
+        // Omitting both flags keeps the schema default (10/30, ).
         let folder2 = dir.path().join("defaults");
         std::fs::create_dir_all(&folder2).unwrap();
         send(
@@ -1470,10 +1469,10 @@ mod unix_socket_tests {
     }
 } // mod unix_socket_tests
 
-/// windows-local-ipc-support task 4.1: the same control protocol exercised
+/// The same control protocol exercised
 /// above over a Unix socket, but over the Windows named-pipe transport —
 /// only compiled/run on Windows, where `unix_transport` isn't available at
-/// all. Uses a per-test unique pipe name (design D5): named pipes live in
+/// all. Uses a per-test unique pipe name: named pipes live in
 /// the `\\.\pipe\` namespace, not the filesystem, so `tempfile::tempdir()`
 /// isolation doesn't apply the way it does for the Unix-socket tests above.
 #[cfg(windows)]
@@ -1605,7 +1604,7 @@ mod windows_pipe_tests {
 
     /// A second, concurrent client connecting while the first is mid-flight
     /// must not be refused — the daemon's next-instance-pre-created pattern
-    /// (design D1/D3) exists specifically so this works.
+    /// exists specifically so this works.
     #[tokio::test]
     async fn two_concurrent_clients_are_both_served() {
         let (pipe_name, dir) = start_daemon().await;

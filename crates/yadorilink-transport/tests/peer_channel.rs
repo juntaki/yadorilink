@@ -225,8 +225,9 @@ async fn large_message_is_fragmented_and_reassembled() {
 }
 
 /// p2p-transport spec: "Unreachable local candidate does not block other
-/// candidates" — a bogus first candidate (design.md D10's racing) must not
-/// prevent connecting via a working one listed alongside it.
+/// candidates" — a bogus first candidate (part of the concurrent
+/// candidate-racing scheme) must not prevent connecting via a working
+/// one listed alongside it.
 #[tokio::test]
 async fn unreachable_candidate_does_not_block_a_working_one() {
     let (secret_a, public_a) = gen_keypair();
@@ -349,9 +350,9 @@ async fn one_device_can_relay_to_two_peers_simultaneously() {
     assert_eq!(recv_within(&a_to_c, Duration::from_secs(5)).await, b"from C");
 }
 
-/// add-reliable-message-delivery task 1.2: two upgraded peers (both call
-/// `enable_reliable_delivery`) still exchange ordinary application messages
-/// correctly — the marker-byte framing is transparent to the caller on
+/// Two upgraded peers (both call `enable_reliable_delivery`) still
+/// exchange ordinary application messages correctly — the marker-byte
+/// framing is transparent to the caller on
 /// both sides (`PeerChannel::send`/`recv`'s signatures are unchanged).
 #[tokio::test]
 async fn two_reliable_delivery_enabled_peers_exchange_messages_normally() {
@@ -404,11 +405,10 @@ async fn two_reliable_delivery_enabled_peers_exchange_messages_normally() {
     assert_eq!(recv_within(&a, Duration::from_secs(5)).await, b"reliable reply 2");
 }
 
-/// add-reliable-message-delivery task 1.2 (wire-compat): the asymmetric
-/// negotiation window this change's design.md calls out explicitly —
-/// device A has confirmed B's capability and enabled reliable delivery
-/// (so its sends are now marker-framed), while device B has NOT yet
-/// enabled its own (simulating B's `ClusterConfig` round-trip not having
+/// The asymmetric negotiation window: device A has confirmed B's
+/// capability and enabled reliable delivery (so its sends are now
+/// marker-framed), while device B has NOT yet enabled its own
+/// (simulating B's `ClusterConfig` round-trip not having
 /// completed, or a genuinely un-upgraded peer that never will). B must
 /// still correctly receive A's framed messages (decoding is always
 /// format-agnostic — see `reliable.rs`'s module doc comment) and B's own

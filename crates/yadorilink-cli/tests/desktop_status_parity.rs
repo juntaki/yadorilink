@@ -1,4 +1,4 @@
-//! add-desktop-status-app task 1.3/1.4: end-to-end coverage for
+//! End-to-end coverage for
 //! `StatusResponse.overall_state`/`attention_reasons` (the daemon-computed
 //! rollup a UI client like `yadorilink-desktop-app` reads instead of
 //! re-deriving "is anything wrong?" itself) through the *real* control
@@ -96,7 +96,7 @@ async fn fetch_status() -> yadorilink_ipc_proto::daemonctl::StatusResponse {
     }
 }
 
-/// task 1.4 "daemon-unavailable": pointing the control socket at a path
+/// pointing the control socket at a path
 /// nothing is listening on fails clearly via the CLI's own `status`
 /// command, mirroring `tests/update.rs`'s identical case for `update
 /// status`.
@@ -111,7 +111,7 @@ async fn status_reports_daemon_not_running_clearly() {
     assert_eq!(err.exit_code(), yadorilink_cli::error::CliError::DaemonNotRunning.exit_code());
 }
 
-/// task 1.4 "healthy": a freshly-started daemon with no links, no peers,
+/// a freshly-started daemon with no links, no peers,
 /// and no recorded errors reports `overall_state == "healthy"` with no
 /// reasons, over the real control socket — not just the pure-function unit
 /// test in `yadorilink_daemon::control_socket`.
@@ -134,7 +134,7 @@ async fn fresh_daemon_reports_healthy_over_the_real_socket() {
         .expect("status command should succeed against a healthy daemon");
 }
 
-/// task 1.4 "error"/"needs attention" (spec: "a ... disconnected
+/// "error"/"needs attention" (spec: "a ... disconnected
 /// account/device state" needs attention): a peer recorded as
 /// disconnected drives `overall_state` to `"attention"` with a
 /// `peer_disconnected:<device_id>` reason, over the real socket.
@@ -156,7 +156,7 @@ async fn disconnected_peer_reports_attention_over_the_real_socket() {
     );
 }
 
-/// task 1.4 "degraded": a headroom override pinned above the block
+/// a headroom override pinned above the block
 /// store's actual free space drives `overall_state` to `"degraded"` with a
 /// `low_disk_critical:<block store>` reason, over the real socket --
 /// same headroom-override technique `tests/limits.rs` uses, in the
@@ -176,7 +176,7 @@ async fn low_disk_reports_degraded_over_the_real_socket() {
     );
 }
 
-/// task 1.4 "paused": pausing a link does not, by itself, flip
+/// pausing a link does not, by itself, flip
 /// `overall_state` away from `"healthy"` — pausing is a deliberate user
 /// action, not an error condition (see `control_socket::overall_status`'s
 /// doc comment). Exercised through the real `Link`/`Pause`/`Status` IPC

@@ -32,7 +32,7 @@ const ERROR_PIPE_BUSY: i32 = 231;
 const MAX_ATTEMPTS: u32 = 5;
 const RETRY_DELAY: Duration = Duration::from_millis(50);
 
-/// on-demand-sync design D5's bounded hydration timeout is 30s
+/// on-demand-sync 's bounded hydration timeout is 30s
 /// daemon-side (the time budget for the actual peer block fetch); this
 /// client-side bound is set a little above that so the daemon's own
 /// timeout has a chance to fire first and report a clean
@@ -211,7 +211,7 @@ async fn is_placeholder_inner(path: &str) -> bool {
     }
 }
 
-/// on-demand-sync task 6.4: edit-presence awareness's (design D7) "open
+/// on-demand-sync task 6.4: edit-presence awareness's () "open
 /// elsewhere" overlay — `true` when a peer device currently has this file
 /// open for editing (Office's `~$*` lock-file convention, detected and
 /// broadcast entirely daemon-side per task 9.x; this is purely a render
@@ -258,7 +258,7 @@ pub fn send_context_action(path: &str, action: ContextAction) -> bool {
 /// and blocks on the result before completing the OS callback via
 /// `CfExecute`. Returns `false` on any failure, timeout, or unreachable
 /// daemon — the caller is expected to complete the pending cfapi callback
-/// with an I/O error in that case (design D5), never hang the calling
+/// with an I/O error in that case (), never hang the calling
 /// application's read.
 pub fn hydrate(path: &str) -> bool {
     runtime().block_on(async {

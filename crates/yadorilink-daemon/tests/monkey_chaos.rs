@@ -308,8 +308,8 @@ async fn run_chaos(seed: u64) {
             // require 1100 (110s, to clear DEFAULT_FULL_INDEX_RESYNC_
             // INTERVAL's 90s) on the theory that reaching a correct final
             // state might depend on the periodic full-index resync firing
-            // as a recovery mechanism -- but that reasoning predated
-            // fix-materialization-disk-index-divergence's actual fixes
+            // as a recovery mechanism -- but that reasoning predated later
+            // fixes to materialization/disk-index divergence handling
             // (which mean ordinary incremental sync, not the 90s resync,
             // is what's expected to converge this promptly in practice).
             // A 110s-of-perfect-quiescence bar, combined with

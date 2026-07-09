@@ -21,22 +21,15 @@ path = "src/main.rs"
 
 [dependencies]
 yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
-# Folder selection and link management reuses
-# `yadorilink-cli`'s already-tested coordination-plane access-token/group-
-# resolution code (`grpc::require_access_token`/`resolve_group_id`) for
-# "Add Synced Folder" rather than re-implementing gRPC/keyring/auth calls
-# a second, independent way in this crate — the identical reasoning
-# `yadorilink-cli`'s own Cargo.toml gives for depending on
-# `yadorilink-daemon` (a security-sensitive code path should have exactly
-# one implementation, not two that could silently drift). Everything else
-# in this crate (control-socket IPC, config paths) still deliberately
-# duplicates rather than depends on `yadorilink-cli`, per `ipc_client.rs`'s
-# doc comment — only this one auth-resolution path is reused.
-# `google_login.rs`'s loopback-
-# redirect flow calls `yadorilink_cli::google_auth` directly (only
-# compiled under `yadorilink-cli`'s `http-coordination` feature), so that
-# feature is enabled unconditionally here -- this app's own login action
-# only makes sense against the Cloudflare-hosted coordination plane.
+# Reuses `yadorilink-cli`'s already-tested coordination-plane
+# access-token/group-resolution code (`grpc::require_access_token`/
+# `resolve_group_id`) for "Add Synced Folder" rather than re-implementing
+# gRPC/keyring/auth calls a second, independent way in this crate — a
+# security-sensitive code path should have exactly one implementation.
+# `google_login.rs`'s loopback-redirect flow also calls
+# `yadorilink_cli::google_auth` directly (only compiled under
+# `yadorilink-cli`'s `http-coordination` feature), so that feature is
+# enabled unconditionally here.
 yadorilink-cli = { path = "../yadorilink-cli", features = ["http-coordination"] }
 tokio.workspace = true
 anyhow.workspace = true

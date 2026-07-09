@@ -1,10 +1,10 @@
-//! Bridges a raw filesystem event (task 5.2's watcher) into an indexed,
-//! chunked `FileRecord` (tasks 5.3, 6.1). Local changes are always
+//! Bridges a raw filesystem event (the watcher) into an indexed,
+//! chunked `FileRecord` . Local changes are always
 //! indexed immediately regardless of the link's pause state — pausing
-//! (task 6.8) only stops *propagating* changes to peers, so nothing is
+//! only stops *propagating* changes to peers, so nothing is
 //! lost while paused; `SyncState` itself is the queued-change backlog.
 //!
-//! Task 6.4's "rename doesn't re-transfer content" falls out of this
+//! The "rename doesn't re-transfer content" falls out of this
 //! design for free: chunking is content-addressed, so renaming a file
 //! without editing it re-derives the exact same block hashes the local
 //! store (and any peer that already synced the old path) already holds —
@@ -28,10 +28,10 @@ use crate::types::{
 };
 use crate::watcher::{FsChangeEvent, FsChangeKind};
 
-/// fix-local-edit-swallowed-by-self-echo-race: same shape as this crate's
-/// other private `now_unix_nanos` helpers — the default `process_event_
-/// with_ignore_at`'s `Removed` branch falls back to when the caller has no
-/// better (debounce-observed) timestamp to supply.
+/// Same shape as this crate's other private `now_unix_nanos` helpers —
+/// the default `process_event_with_ignore_at`'s `Removed` branch falls
+/// back to when the caller has no better (debounce-observed) timestamp
+/// to supply.
 fn now_unix_nanos() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -53,16 +53,16 @@ pub enum LocalChangeOutcome {
     None,
     /// An ordinary file was created, modified, or deleted.
     FileChanged(FileRecord),
-    /// fix-directory-rename-orphans-child-index-rows: a `Removed` event
-    /// for a path with no index row of its own (directories are never
-    /// tracked as their own row — see `build_record_for_created_or_
-    /// modified`'s doc comment) turned out to have live child records
-    /// still indexed underneath it as a directory prefix (i.e. `path` used
-    /// to be a directory that was deleted, or renamed away, and this
-    /// device never received/synthesized an individual event for each
-    /// child inside it — see `watcher.rs`'s `RenameMode::From` handling).
-    /// Every such child has now been tombstoned; each is reported here so
-    /// the caller broadcasts all of them, not just one.
+    /// A `Removed` event for a path with no index row of its own
+    /// (directories are never tracked as their own row — see
+    /// `build_record_for_created_or_modified`'s doc comment) turned out
+    /// to have live child records still indexed underneath it as a
+    /// directory prefix (i.e. `path` used to be a directory that was
+    /// deleted, or renamed away, and this device never
+    /// received/synthesized an individual event for each child inside
+    /// it — see `watcher.rs`'s `RenameMode::From` handling). Every such
+    /// child has now been tombstoned; each is reported here so the
+    /// caller broadcasts all of them, not just one.
     FilesChanged(Vec<FileRecord>),
     /// This device started (`editing: true`) or stopped (`false`) editing
     /// `path` (relative to the linked folder — the *original* file's
@@ -71,7 +71,7 @@ pub enum LocalChangeOutcome {
 }
 
 /// Extra classification produced when `build_record_for_created_or_modified`
-/// determines a path is a symlink (add-sync-fidelity task 2.1) — carried
+/// determines a path is a symlink — carried
 /// alongside, not inside, the `FileRecord` it returns. Like
 /// `types::RecordKind` itself (see its doc comment), this is index-local
 /// metadata surfaced through dedicated `SyncState` columns
@@ -84,9 +84,9 @@ pub enum LocalChangeOutcome {
 #[derive(Debug, Clone, PartialEq)]
 struct SymlinkClassification {
     /// The raw, unresolved target text exactly as returned by
-    /// `std::fs::read_link` — never dereferenced (task 2.1).
+    /// `std::fs::read_link` — never dereferenced.
     target: String,
-    /// Task 2.4: `true` when the target is an absolute path, or —
+    /// `true` when the target is an absolute path, or —
     /// resolved syntactically (never touching the filesystem) against the
     /// symlink's own parent directory — lands outside the linked folder's
     /// root.
@@ -99,8 +99,8 @@ pub struct LocalChangeProcessor {
     device_id: String,
 }
 
-/// add-disk-reconcile-backstop: how much of a disk-vs-index reconciliation
-/// scan is allowed to mutate the index.
+/// How much of a disk-vs-index reconciliation scan is allowed to mutate
+/// the index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReconcileScope {
     /// The full startup / burst-fallback reconciliation: index new files,
@@ -111,9 +111,9 @@ enum ReconcileScope {
     /// row. Never re-versions a file that already has a row and never
     /// tombstones a row whose path isn't on disk. This is the sole
     /// disk-reconcile shape safe to run on a frequent, unconditional
-    /// schedule (the periodic backstop for OS-watcher event loss — see
-    /// `openspec/changes/add-disk-reconcile-backstop`): a file with no
-    /// index row has never been broadcast and so cannot collide with a
+    /// schedule (the periodic backstop for OS-watcher event loss): a
+    /// file with no index row has never been broadcast and so cannot
+    /// collide with a
     /// concurrent mid-conflict resolution the way re-versioning or
     /// tombstoning an already-known path can (the hazard `watcher.rs`'s
     /// module doc documents as "found unsafe").
@@ -141,7 +141,7 @@ impl LocalChangeProcessor {
     /// index entry, so restarting the daemon doesn't spuriously bump every
     /// unchanged file's version vector on every scan.
     ///
-    /// batch-sync-optimizations design D4: the existing index and
+    /// batch-sync-optimizations : the existing index and
     /// materialization states are bulk-loaded once up front (rather than
     /// one `get_file`/`get_materialization_state` query per walked entry),
     /// and every newly-indexed or changed record is committed in a single
@@ -166,12 +166,12 @@ impl LocalChangeProcessor {
         self.reconcile_disk_with_ignore(group_id, root, ignore_set, ReconcileScope::Full)
     }
 
-    /// add-disk-reconcile-backstop: the add-only disk reconcile the periodic
-    /// backstop runs. Walks `root` and returns/indexes a `FileRecord` only
-    /// for a regular file or symlink that is present on disk but has **no**
-    /// existing index row — recovering a local write whose OS filesystem-
-    /// watcher event was never delivered (e.g. it fell into an FSEvents
-    /// stream-recreate blind window, see `watcher.rs`'s module doc). It
+    /// The add-only disk reconcile the periodic backstop runs. Walks
+    /// `root` and returns/indexes a `FileRecord` only for a regular file
+    /// or symlink that is present on disk but has **no** existing index
+    /// row — recovering a local write whose OS filesystem-watcher event
+    /// was never delivered (e.g. it fell into an FSEvents stream-recreate
+    /// blind window, see `watcher.rs`'s module doc). It
     /// never re-versions an already-indexed file whose on-disk content
     /// changed and never tombstones an indexed file missing from disk (both
     /// of which `scan_existing_files_with_ignore` does): those mutate an
@@ -224,13 +224,12 @@ impl LocalChangeProcessor {
             .collect();
         let materialization_by_path = self.state.list_materialization_states(group_id)?;
 
-        // add-ignore-patterns design D2: becoming ignored is not a
-        // deletion. Drop this device's local index row so future sync
-        // work no longer considers the path, but do not emit a tombstone
-        // and do not touch the on-disk file. add-disk-reconcile-backstop:
-        // this mutates an existing index row, so it is a `Full`-scope-only
-        // step — the add-only backstop never removes or re-versions a
-        // known path.
+        // Becoming ignored is not a deletion. Drop this device's local
+        // index row so future sync work no longer considers the path,
+        // but do not emit a tombstone and do not touch the on-disk file.
+        // This mutates an existing index row, so it is a
+        // `Full`-scope-only step — the add-only backstop never removes
+        // or re-versions a known path.
         if scope == ReconcileScope::Full {
             let ignored_existing_paths: Vec<String> = existing_by_path
                 .keys()
@@ -244,18 +243,18 @@ impl LocalChangeProcessor {
 
         let mut records = Vec::new();
         let mut seen_paths = std::collections::HashSet::new();
-        // add-sync-fidelity task 2.1/2.4: classification info for any
-        // symlink discovered this scan, applied via `SyncState` setters
-        // once the corresponding `FileRecord` rows are actually written
-        // below (those setters require the row to already exist).
+        // Classification info for any symlink discovered this scan,
+        // applied via `SyncState` setters once the corresponding
+        // `FileRecord` rows are actually written below (those setters
+        // require the row to already exist).
         let mut pending_symlinks: Vec<(String, SymlinkClassification)> = Vec::new();
-        // wire-local-exec-bit-capture task 3.1: exec-bit updates for paths
+        // Exec-bit updates for paths
         // whose content (size) is unchanged this scan, applied after the
         // batch write below for the same reason `pending_symlinks` is —
         // `SyncState::set_exec_bit` is `UPDATE`-only and requires the row
         // to already exist.
         let mut pending_exec_bits: Vec<(String, bool)> = Vec::new();
-        // task 2.2: `follow_links(false)` is walkdir's default, but stated
+        // `follow_links(false)` is walkdir's default, but stated
         // explicitly here — verified (not assumed) that this default is
         // what makes a symlinked directory get enumerated as a single
         // leaf entry rather than descended into; see
@@ -274,7 +273,7 @@ impl LocalChangeProcessor {
                 !is_excluded_from_sync(rel_path, entry.file_type().is_dir(), ignore_set)
             });
         for entry in walker.filter_map(Result::ok) {
-            // task 2.1/2.2: a symlink (whatever it points to) is admitted
+            // A symlink (whatever it points to) is admitted
             // here as its own leaf entry — `entry.file_type()` reflects
             // lstat metadata (never follows) since `follow_links(false)`
             // is in effect, so a symlink to a directory shows up here as
@@ -312,14 +311,14 @@ impl LocalChangeProcessor {
 
             let existing = existing_by_path.get(&rel_path).cloned();
 
-            // add-disk-reconcile-backstop: in add-only scope, a path that
-            // already has an index row is left entirely untouched — no
-            // re-hash, no re-version, no exec-bit update. The backstop only
-            // recovers files the index has never seen (whose live watcher
-            // event was lost); anything already indexed is the live
-            // watcher's / conflict-resolution's business, and re-deriving it
-            // here is exactly the unsafe re-versioning `watcher.rs`'s module
-            // doc warns about.
+            // In add-only scope, a path that already has an index row is
+            // left entirely untouched — no re-hash, no re-version, no
+            // exec-bit update. The backstop only recovers files the
+            // index has never seen (whose live watcher event was lost);
+            // anything already indexed is the live watcher's /
+            // conflict-resolution's business, and re-deriving it here is
+            // exactly the unsafe re-versioning `watcher.rs`'s module doc
+            // warns about.
             if scope == ReconcileScope::AddOnly && existing.is_some() {
                 continue;
             }
@@ -332,7 +331,7 @@ impl LocalChangeProcessor {
                 _ => false,
             };
             if already_current {
-                // wire-local-exec-bit-capture task 3.1: content (size) is
+                // Content (size) is
                 // unchanged, but this file's exec bit may never have been
                 // captured at all (it predates this change and the
                 // `exec_bit` column defaults to `false`), or may have been
@@ -343,7 +342,7 @@ impl LocalChangeProcessor {
                 // comparison — no extra syscall — rather than falling
                 // through to that function's full machinery for what is,
                 // by definition here, an unchanged-content file. Symlinks
-                // carry no exec bit (design.md Non-Goals), so this only
+                // carry no exec bit, so this only
                 // applies to a genuine regular file.
                 if file_type.is_file() {
                     if let (Some(existing), Some(metadata)) = (&existing, &entry_metadata) {
@@ -388,10 +387,10 @@ impl LocalChangeProcessor {
         // even the "full reconciliation" this function IS the recovery
         // path for can't fix it. Tombstone any indexed, not-already-
         // deleted file whose path wasn't observed in this walk.
-        // add-disk-reconcile-backstop: tombstoning increments an existing
-        // row's version, so it is `Full`-scope only — the add-only backstop
-        // never deletes a known path (a file missing from disk this pass
-        // might be mid-materialization or mid-conflict-resolution; only the
+        // Tombstoning increments an existing row's version, so it is
+        // `Full`-scope only — the add-only backstop never deletes a
+        // known path (a file missing from disk this pass might be
+        // mid-materialization or mid-conflict-resolution; only the
         // deliberate full reconciliation is allowed to tombstone).
         if scope == ReconcileScope::Full {
             for (path, existing) in &existing_by_path {
@@ -408,11 +407,10 @@ impl LocalChangeProcessor {
             }
         }
 
-        // add-file-version-history task 2.1: a scan is always this device's
-        // own local content — same origin as `process_event`'s single-file
-        // write path below.
+        // A scan is always this device's own local content — same origin
+        // as `process_event`'s single-file write path below.
         self.state.upsert_files_batch(group_id, &records, &self.device_id)?;
-        // task 2.1/2.4: applied after the batch write above, since
+        // Applied after the batch write above, since
         // `set_record_kind`/`set_symlink_target`/`set_symlink_out_of_root`
         // all require the row to already exist.
         for (path, classification) in &pending_symlinks {
@@ -493,7 +491,7 @@ impl LocalChangeProcessor {
             return Ok(LocalChangeOutcome::None);
         }
 
-        // Office lock-file convention (task 9.1): recognized before any
+        // Office lock-file convention: recognized before any
         // ordinary indexing logic runs — per spec, `~$<name>.<ext>` is
         // never indexed, versioned, or propagated as a normal file.
         // Appearance/disappearance instead signals this device starting
@@ -521,8 +519,8 @@ impl LocalChangeProcessor {
         let path_lock = self.state.path_lock(group_id, &rel_path);
         let _guard = path_lock.lock().await;
 
-        // fix-materialization-disk-index-divergence (Bug 5): `event.kind`
-        // reflects whatever `debounce.rs`'s per-path coalescing last saw
+        // `event.kind` reflects whatever `debounce.rs`'s per-path
+        // coalescing last saw
         // -- a `HashMap<PathBuf, FsChangeKind>` where a later event for
         // the same path simply overwrites an earlier one. A genuine local
         // deletion's `Removed` event can be overwritten within the same
@@ -569,7 +567,6 @@ impl LocalChangeProcessor {
                 // saves. Only mark-deleted (and broadcast) a path that
                 // already has an index entry.
                 if self.state.get_file(group_id, &rel_path)?.is_none() {
-                    // fix-directory-rename-orphans-child-index-rows:
                     // `rel_path` itself was never a tracked file (a
                     // directory is never its own index row), but it may
                     // just have been a directory that disappeared —
@@ -636,10 +633,9 @@ impl LocalChangeProcessor {
                         materialization_state,
                     )?;
                 if let LocalChangeOutcome::FileChanged(record) = &outcome {
-                    // add-file-version-history task 2.1: a local edit's
-                    // origin is this device itself.
+                    // A local edit's origin is this device itself.
                     self.state.upsert_file_with_origin(group_id, record, &self.device_id)?;
-                    // task 2.1/2.4: applied after the write above, since
+                    // Applied after the write above, since
                     // the setters require the row to already exist.
                     if let Some(classification) = &classification {
                         self.apply_symlink_classification(group_id, &rel_path, classification)?;
@@ -661,7 +657,7 @@ impl LocalChangeProcessor {
     /// writing it to the index — shared by `process_event` (which writes
     /// immediately, one file at a time) and `scan_existing_files` (which
     /// batches writes via `upsert_files_batch`, batch-sync-optimizations
-    /// design D4). `existing` and `materialization_state` are supplied by
+    /// ). `existing` and `materialization_state` are supplied by
     /// the caller rather than looked up here, so a bulk-loading caller
     /// (`scan_existing_files`) never issues a per-file query for them.
     ///
@@ -683,7 +679,7 @@ impl LocalChangeProcessor {
         existing: Option<FileRecord>,
         materialization_state: Option<MaterializationState>,
     ) -> Result<(LocalChangeOutcome, Option<SymlinkClassification>, Option<bool>), SyncError> {
-        // task 2.1: classify via an lstat-equivalent check first —
+        // classify via an lstat-equivalent check first —
         // `symlink_metadata` never follows the final path component,
         // unlike `Path::is_file`/`std::fs::metadata` (used further below,
         // now only reached once a symlink has already been ruled out
@@ -752,7 +748,7 @@ impl LocalChangeProcessor {
                         .map(|d| d.as_nanos() as i64)
                         == Some(existing.mtime_unix_nanos);
                     if existing.size == metadata.len() && current_mtime_matches {
-                        // wire-local-exec-bit-capture task 1.1/1.2: size and
+                        // Size and
                         // mtime matching isn't the whole "nothing changed"
                         // story — a `chmod` (owner-exec bit toggle) touches
                         // neither, so compare the exec bit too, off the
@@ -768,7 +764,7 @@ impl LocalChangeProcessor {
                         let on_disk_exec_bit = owner_exec_bit_from_metadata(&metadata);
                         let indexed_exec_bit = self.state.get_exec_bit(group_id, &rel_path)?;
                         if on_disk_exec_bit == indexed_exec_bit {
-                            // task 1.3: size, mtime, AND exec bit all
+                            // size, mtime, AND exec bit all
                             // unchanged — preserve the existing no-op
                             // behavior exactly.
                             return Ok((LocalChangeOutcome::None, None, None));
@@ -785,13 +781,13 @@ impl LocalChangeProcessor {
             }
         }
 
-        // content-defined-chunking design D3: content-defined chunking
+        // content-defined-chunking : content-defined chunking
         // only applies when the link opted in *and* the file is at or
         // above the size threshold — everything else uses the original
         // fixed-size chunker unchanged, so self-echo suppression below
         // (which just compares whatever this device's chunker just
         // produced against what's indexed) needs no algorithm-awareness
-        // either way (design D4).
+        // either way ().
         let use_cdc = self.state.chunking_policy_for_group(group_id)?
             == Some(ChunkingPolicy::ContentDefined)
             && std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) >= CDC_SIZE_THRESHOLD;
@@ -807,7 +803,7 @@ impl LocalChangeProcessor {
         // this *same* watcher would otherwise see as a brand-new local
         // edit, increment the version for, and rebroadcast, which the
         // peer's own watcher then does right back, forever, racing into
-        // spurious conflicts (found via tasks.md 11.2's load test). If the
+        // spurious conflicts. If the
         // freshly chunked content hashes to exactly the blocks already
         // indexed, nothing actually changed — regardless of *why* the fs
         // event fired — so there is nothing to re-index.
@@ -824,7 +820,7 @@ impl LocalChangeProcessor {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
-        // wire-local-exec-bit-capture task 2.1: content genuinely changed
+        // Content genuinely changed
         // (or this is a brand-new file), reached below the fast path above
         // — capture the exec bit here too, off the same `Metadata` already
         // fetched for `mtime_unix_nanos`, so a brand-new executable file's
@@ -846,10 +842,10 @@ impl LocalChangeProcessor {
         Ok((LocalChangeOutcome::FileChanged(record), None, Some(exec_bit)))
     }
 
-    /// Builds a symlink leaf record (task 2.1/2.4): the target's raw text
+    /// Builds a symlink leaf record: the target's raw text
     /// and the out-of-root/absolute flag, never dereferencing the target
     /// to decide either. No content is read or chunked — a symlink record
-    /// carries no blocks (design D1).
+    /// carries no blocks ().
     fn build_symlink_record(
         &self,
         group_id: &str,
@@ -861,7 +857,7 @@ impl LocalChangeProcessor {
     ) -> Result<(LocalChangeOutcome, Option<SymlinkClassification>), SyncError> {
         // `read_link` reads the raw target text without dereferencing it —
         // safe, unlike `metadata`/`canonicalize`, which is exactly the
-        // dereference task 2.4 forbids.
+        // dereference forbids.
         let raw_target = std::fs::read_link(path)?;
         let target_text = raw_target.to_string_lossy().into_owned();
         let out_of_root = symlink_target_is_out_of_root(root, path, &raw_target);
@@ -906,7 +902,7 @@ impl LocalChangeProcessor {
         Ok((LocalChangeOutcome::FileChanged(record), Some(classification)))
     }
 
-    /// Applies a symlink's classification (task 2.1/2.4) to its already-
+    /// Applies a symlink's classification to its already-
     /// written index row — `SyncState::set_record_kind`/
     /// `set_symlink_target`/`set_symlink_out_of_root` all require the row
     /// to exist, so this must run strictly after the caller's
@@ -924,7 +920,7 @@ impl LocalChangeProcessor {
     }
 
     /// Turns one debounce-window flush (`debounce::DebounceFlush`) into
-    /// indexed records — the executor half of design D7's accumulator/executor
+    /// indexed records — the executor half of 's accumulator/executor
     /// split. `DebounceFlush::Paths` is processed one path at a time via
     /// `process_event` (each individually indexed and self-echo-checked,
     /// exactly as a live single-event call would be); `DebounceFlush::BurstFallback`
@@ -933,7 +929,7 @@ impl LocalChangeProcessor {
     /// from `records` since they aren't `FileRecord`s and don't belong on
     /// the batch-broadcast path.
     ///
-    /// fix-materialization-disk-index-divergence: each path in a
+    /// Each path in a
     /// `DebounceFlush::Paths` batch is processed independently — one
     /// path's error (logged, not silently dropped) does not prevent the
     /// batch's other, unrelated paths from still being processed. A
@@ -1015,7 +1011,7 @@ fn is_excluded_from_sync(
     is_ignore_file_relative_path(relative_path) || ignore_set.is_ignored(relative_path, is_dir)
 }
 
-/// Task 2.4: path-string analysis only — never dereferences `raw_target`
+/// path-string analysis only — never dereferences `raw_target`
 /// (no `canonicalize`, no `metadata`, no filesystem read of the target at
 /// all) to decide whether it escapes `root`. `link_path` is the symlink's
 /// own absolute path (used only for its parent directory, to resolve a
@@ -1034,7 +1030,7 @@ fn symlink_target_is_out_of_root(root: &Path, link_path: &Path, raw_target: &Pat
 
 /// Syntactic (non-filesystem-touching) `.`/`..` normalization — NOT
 /// `Path::canonicalize`, which resolves symlinks and touches the
-/// filesystem (exactly what task 2.4 forbids here: dereferencing the
+/// filesystem (exactly what is forbidden here: dereferencing the
 /// target is the one thing this check must not do). A `..` that has
 /// nothing left to pop (already at the start of an absolute path) is kept
 /// literally rather than dropped, so the caller's `starts_with(root)`
@@ -1139,8 +1135,8 @@ mod tests {
         ) -> Result<Vec<String>, yadorilink_local_storage::StorageError> {
             self.inner.list_by_prefix(prefix)
         }
-        // add-block-store-gc: this test double's whole job is counting
-        // `put` calls (see its own doc comment) — every other method,
+        // This test double's whole job is counting `put` calls (see its
+        // own doc comment) — every other method,
         // this one included, is a pure passthrough to the wrapped real
         // `FsBlockStore`, not something these PERF-2 tests exercise.
         fn sweep(
@@ -1366,8 +1362,8 @@ mod tests {
         .await
         .unwrap();
 
-        // fix-materialization-disk-index-divergence (Bug 5): `process_event`
-        // now derives Removed-vs-CreatedOrModified from the path's actual
+        // `process_event` now derives Removed-vs-CreatedOrModified from
+        // the path's actual
         // current disk state rather than trusting `event.kind` verbatim
         // (closing a race where a debounce-coalesced `Removed` could be
         // silently overwritten by an unrelated later write to the same
@@ -1422,7 +1418,7 @@ mod tests {
         assert!(proc.state.get_file("group-1", ".DS_Store").unwrap().is_none());
     }
 
-    /// task 1.6 / on-demand-sync spec "Placeholder creation is not treated
+    /// / on-demand-sync spec "Placeholder creation is not treated
     /// as a local edit": a placeholder's own write must not be indexed as
     /// a genuine local change, or chunked (which would index wrong content
     /// — the placeholder's sparse bytes, not the file's real ones).
@@ -1482,7 +1478,7 @@ mod tests {
         assert_eq!(record.version.get("device-a"), 0, "no spurious local version bump");
     }
 
-    /// task 9.1 / edit-presence-awareness spec "Lock file appearance is
+    /// / edit-presence-awareness spec "Lock file appearance is
     /// detected" and "Lock file is never treated as a synced file itself".
     #[tokio::test]
     async fn office_lock_file_appearance_signals_presence_not_a_file_change() {
@@ -1509,7 +1505,7 @@ mod tests {
         assert!(proc.state.get_file("group-1", "report.docx").unwrap().is_none());
     }
 
-    /// task 9.1 / spec "Lock file removal is detected".
+    /// / spec "Lock file removal is detected".
     #[tokio::test]
     async fn office_lock_file_removal_signals_presence_stopped() {
         let (proc, _store_dir, root_dir) = processor();
@@ -1563,7 +1559,7 @@ mod tests {
         );
     }
 
-    /// task 9.1: `scan_existing_files` must never index a stale lock file
+    /// `scan_existing_files` must never index a stale lock file
     /// left over from a prior crash.
     #[test]
     fn scan_existing_files_skips_lock_files() {
@@ -1637,10 +1633,10 @@ mod tests {
         assert!(proc.state.get_file("group-1", "build.log").unwrap().is_some());
     }
 
-    /// batch-sync-optimizations task 1.4: a single scan correctly handles
+    /// A single scan correctly handles
     /// a mix of already-current, changed, and brand-new files together,
     /// using the bulk-loaded `list_files`/`list_materialization_states`
-    /// maps (design D4) rather than a per-file lookup for any of them.
+    /// maps () rather than a per-file lookup for any of them.
     #[test]
     fn scan_existing_files_handles_a_mix_of_unchanged_changed_and_new_files() {
         let (proc, _store_dir, root_dir) = processor();
@@ -1672,9 +1668,9 @@ mod tests {
         assert_eq!(changed.size, "v2, now longer".len() as u64);
     }
 
-    /// batch-sync-optimizations task 1.4/1.5: `scan_existing_files` must
+    /// `scan_existing_files` must
     /// not skip a genuine placeholder (OnDemand sync) during a bulk scan —
-    /// the bulk-loaded materialization-state map (design D4) must still
+    /// the bulk-loaded materialization-state map () must still
     /// correctly prevent chunking a placeholder's sparse bytes, exactly as
     /// the old per-file `get_materialization_state` lookup did.
     #[test]
@@ -1728,14 +1724,14 @@ mod tests {
         );
     }
 
-    /// batch-sync-optimizations task 1.5: scanning a folder with a large
+    /// Scanning a folder with a large
     /// number of small pre-existing files completes well within a bound
     /// that would be blown by an O(file count) synchronous SQLite
     /// round-trip pattern (the pre-D4 behavior) — a smoke check for the
     /// bulk-load-and-batch-commit approach without needing to instrument
     /// individual query counts.
     ///
-    /// stabilize-beta-test-suite task 1.4: this is deliberately a *coarse*
+    /// This is deliberately a *coarse*
     /// regression guard, not a micro-performance gate. The bulk-load
     /// approach normally finishes in well under a second; the pre-D4
     /// per-file synchronous round-trip pattern this guards against would
@@ -1780,7 +1776,7 @@ mod tests {
         assert!(second_scan.is_empty(), "an unchanged folder must not be re-indexed on rescan");
     }
 
-    /// batch-sync-optimizations design D7 (executor half): a `Paths` flush
+    /// batch-sync-optimizations (executor half): a `Paths` flush
     /// indexes every listed path and returns the resulting records,
     /// exactly as individual `process_event` calls would.
     #[tokio::test]
@@ -1869,7 +1865,7 @@ mod tests {
         assert_eq!(outcome.presence_changes, vec![("report.docx".to_string(), true)]);
     }
 
-    /// batch-sync-optimizations task 3.9 (regression): self-echo
+    /// Self-echo
     /// suppression still applies per-path when processing a `Paths`
     /// flush — a path whose content already matches what's indexed
     /// (as if a peer-applied write's own resulting event landed in this
@@ -1905,7 +1901,7 @@ mod tests {
         assert!(second.records.is_empty(), "unchanged content must not be re-indexed");
     }
 
-    /// batch-sync-optimizations task 3.9 (regression): the
+    /// The
     /// placeholder/hydrating skip still applies when processing a `Paths`
     /// flush, exactly as `process_event` does directly — a placeholder's
     /// own on-disk representation is never chunked as if it were real
@@ -1956,7 +1952,7 @@ mod tests {
         assert_eq!(record.version.get("device-a"), 0, "no spurious local version bump");
     }
 
-    /// batch-sync-optimizations task 4.7: an overflow signal (as a real
+    /// An overflow signal (as a real
     /// watcher would set on a dropped event, simulated here by setting
     /// the flag directly — see `watcher::watch_folder_with_capacity`'s
     /// own tests for proof the flag is set correctly under a genuine
@@ -2013,7 +2009,7 @@ mod tests {
         }
     }
 
-    /// sync-correctness-fixes task 3.4 (guards COR-1/COR-2/COR-6): a
+    /// A
     /// rename whose watcher event is missed entirely (the scenario a
     /// dropped/overflowed event stream produces, or simply a device that
     /// was offline while the rename happened) must be fully recovered by
@@ -2066,7 +2062,7 @@ mod tests {
         assert!(proc.state.get_file("group-1", "original.txt").unwrap().unwrap().deleted);
     }
 
-    /// add-disk-reconcile-backstop task 1.2: the add-only reconcile
+    /// The add-only reconcile
     /// (`reconcile_added_files`) indexes only a disk file with no existing
     /// index row — an already-indexed file whose on-disk content changed,
     /// and an indexed file missing from disk, are both left byte-identical
@@ -2148,8 +2144,8 @@ mod tests {
         );
     }
 
-    /// batch-sync-optimizations task 4.8: once the accumulator's internal
-    /// delivery queue is forced past capacity by a backlog (design D7/D4.4
+    /// Once the accumulator's internal
+    /// delivery queue is forced past capacity by a backlog (D4.4
     /// — see `debounce`'s own `executor_backlog_trigger_...` test for the
     /// queue-collapse mechanism in isolation), the resulting
     /// `BurstFallback` still recovers a fully-correct index end to end,
@@ -2236,7 +2232,7 @@ mod tests {
         }
     }
 
-    /// content-defined-chunking task 3.3: a link with no registered
+    /// A link with no registered
     /// chunking policy (the state every pre-existing test in this module
     /// already exercises, and every link before this change existed)
     /// continues to use fixed-size chunking exactly as before — no
@@ -2270,7 +2266,7 @@ mod tests {
         assert_eq!(record.blocks[0].size, expected[0].size, "must match chunk_file's fixed sizing");
     }
 
-    /// content-defined-chunking task 3.3: even with a `ContentDefined`
+    /// Even with a `ContentDefined`
     /// policy set, a file below `CDC_SIZE_THRESHOLD` still uses fixed-size
     /// chunking — the size gate applies regardless of policy.
     #[tokio::test]
@@ -2304,7 +2300,7 @@ mod tests {
         assert_eq!(record.blocks[0].size, "well below the CDC size threshold".len() as u32);
     }
 
-    /// content-defined-chunking task 3.3: a `ContentDefined`-policy link's
+    /// A `ContentDefined`-policy link's
     /// file at or above the size threshold is actually chunked with CDC —
     /// verified by comparing against `chunk_file_content_defined`'s direct
     /// output (deterministic for the same content/parameters), and
@@ -2351,9 +2347,9 @@ mod tests {
         );
     }
 
-    // --- add-sync-fidelity task 2.5: symlink pruning and cycle safety ---
+    // --- Symlink pruning and cycle safety ---
 
-    /// task 2.1/2.5: a symlink inside the folder is recorded as a symlink
+    /// A symlink inside the folder is recorded as a symlink
     /// record — correct raw target text, no content blocks, and
     /// `record_kind = Symlink` in the index (not folded into `FileRecord`
     /// — see `types::RecordKind`'s doc comment).
@@ -2393,7 +2389,7 @@ mod tests {
         assert!(target_record.is_none(), "target wasn't scanned in this single-event test");
     }
 
-    /// task 2.1/2.5: `scan_existing_files` classifies a pre-existing
+    /// `scan_existing_files` classifies a pre-existing
     /// symlink the same way a live watcher event does.
     #[cfg(unix)]
     #[test]
@@ -2422,7 +2418,7 @@ mod tests {
         assert!(!target_record.blocks.is_empty());
     }
 
-    /// task 2.2/2.5: a symlinked directory's contents never appear as
+    /// A symlinked directory's contents never appear as
     /// separate scanned records — only the symlink itself is enumerated,
     /// as a single leaf entry, never descended into as a subtree.
     #[cfg(unix)]
@@ -2451,7 +2447,7 @@ mod tests {
         assert!(paths.contains(&"real_dir/secret.txt"));
     }
 
-    /// task 2.3/2.5: the same "never descend into a symlinked directory"
+    /// The same "never descend into a symlinked directory"
     /// guarantee holds for the watcher's directory-registration path, not
     /// just the scanner — a `CreatedOrModified` event for a freshly
     /// created symlink-to-directory must not cause the watcher to start
@@ -2524,7 +2520,7 @@ mod tests {
         );
     }
 
-    /// task 2.4/2.5: a symlink with an absolute target is flagged.
+    /// A symlink with an absolute target is flagged.
     #[cfg(unix)]
     #[tokio::test]
     async fn absolute_target_symlink_is_flagged() {
@@ -2551,7 +2547,7 @@ mod tests {
         );
     }
 
-    /// task 2.4/2.5: a relative symlink target that syntactically resolves
+    /// A relative symlink target that syntactically resolves
     /// outside the linked folder's root (via `..`) is flagged too, without
     /// ever dereferencing the target (the target need not even exist).
     #[cfg(unix)]
@@ -2577,7 +2573,7 @@ mod tests {
         assert!(proc.state.get_symlink_out_of_root("group-1", "subdir/escape_link").unwrap());
     }
 
-    /// task 2.4/2.5: a relative target that stays inside the folder root
+    /// A relative target that stays inside the folder root
     /// (even via a `..` that doesn't actually escape) is NOT flagged.
     #[cfg(unix)]
     #[tokio::test]
@@ -2603,12 +2599,12 @@ mod tests {
         assert!(!proc.state.get_symlink_out_of_root("group-1", "subdir/in_root_link").unwrap());
     }
 
-    /// task 2.5: a self-referential symlinked-directory cycle (`a -> a`)
+    /// a self-referential symlinked-directory cycle (`a -> a`)
     /// must not hang or recurse when scanned — proven with a real
     /// wall-clock timeout around the scan (run on a background thread,
     /// since `scan_existing_files` is synchronous) so a genuine infinite
     /// loop fails the test loudly instead of hanging the suite forever.
-    /// This is expected to pass structurally, not by luck: task 2.2 means
+    /// This is expected to pass structurally, not by luck: the design means
     /// the scanner never descends into ANY symlinked directory, cyclic or
     /// not, so there is no recursive call into the cycle to bound in the
     /// first place — this test exists to confirm that reasoning against
@@ -2646,7 +2642,7 @@ mod tests {
         );
     }
 
-    /// task 2.5: a two-hop symlinked-directory cycle (`a/b -> a`, i.e. a
+    /// a two-hop symlinked-directory cycle (`a/b -> a`, i.e. a
     /// directory containing a symlink back to one of its own ancestors)
     /// also must not hang or recurse.
     #[cfg(unix)]
@@ -2679,7 +2675,7 @@ mod tests {
         );
     }
 
-    /// task 2.1: `normalize_syntactic`/`symlink_target_is_out_of_root`
+    /// `normalize_syntactic`/`symlink_target_is_out_of_root`
     /// never touch the filesystem — proven by pointing at a target that
     /// does not exist at all (`read_link`-based classification must not
     /// require or attempt to resolve it).

@@ -14,7 +14,7 @@
 //! serializes tests within the same file — not against each other. That
 //! gap was real, not theoretical: adding
 //! `daemon_state::tests::daemon_startup_discards_an_unverified_download_left_by_a_crash`
-//! (add-crash-power-loss-recovery task 3.4) reproduced it directly — the
+//! reproduced it directly — the
 //! test passed reliably when run in isolation but failed once under a
 //! full `cargo test --workspace` run, because a concurrently-running test
 //! in one of the *other* two modules changed `YADORILINK_CONFIG_DIR`

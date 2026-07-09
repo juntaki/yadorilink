@@ -1,9 +1,8 @@
-//! add-block-store-gc tasks 4.3/5.3: `yadorilink gc [--dry-run]` and
-//! `status`'s block-store usage fields, end-to-end against a real daemon
-//! over the actual control socket — same pattern as
-//! `tests/limits.rs`/`tests/materialization.rs` (a real
-//! `unix_transport::serve` daemon, no coordination-plane/auth setup
-//! needed).
+//! Tests `yadorilink gc [--dry-run]` and `status`'s block-store usage
+//! fields, end-to-end against a real daemon over the actual control
+//! socket — same pattern as `tests/limits.rs`/`tests/materialization.rs`
+//! (a real `unix_transport::serve` daemon, no coordination-plane/auth
+//! setup needed).
 //!
 //! Every test here writes an orphaned block (never referenced by any
 //! file/link record) and then backdates its on-disk mtime past
@@ -91,7 +90,7 @@ async fn gc_reclaims_an_orphaned_block_and_reports_matching_counts() {
     yadorilink_cli::commands::gc::run(false).await.unwrap();
 }
 
-/// design D4/task 4.3: `--dry-run` reports the same delete-set size a real
+/// task 4.3: `--dry-run` reports the same delete-set size a real
 /// run would, but performs zero deletions.
 #[tokio::test]
 async fn gc_dry_run_matches_a_real_runs_estimate_without_deleting() {
@@ -160,7 +159,7 @@ async fn status_reports_usage_and_lower_usage_after_gc() {
     assert!(after.last_gc_unix > 0, "a completed real sweep must be recorded");
 }
 
-/// task 3.5-equivalent at the IPC layer: a `gc` request while sync
+/// equivalent at the IPC layer: a `gc` request while sync
 /// activity is in progress is rejected with a clear error, not silently
 /// run mid-burst — see `yadorilink-daemon`'s own `gc::tests` for the
 /// scheduling/concurrency unit tests this integration test complements.

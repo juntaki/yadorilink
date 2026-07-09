@@ -1,5 +1,5 @@
-//! add-oss-usage-error-reporting task 4.7: CLI-level reporting tests,
-//! following the same "drive a real daemon over the real control socket"
+//! CLI-level reporting tests, following the same "drive a real daemon
+//! over the real control socket"
 //! pattern as `tests/materialization.rs`. Covers: preview shows the exact
 //! payload, export writes JSON without submitting, consent controls
 //! persist, queue commands operate, prompts can be disabled, and
@@ -49,7 +49,7 @@ fn point_at_unreachable_daemon() -> tempfile::TempDir {
     dir
 }
 
-/// Task 4.7 "preview exact payload": the JSON `report usage --preview`
+/// the JSON `report usage --preview`
 /// would print is byte-identical to what the daemon's
 /// `GenerateUsageReport` IPC call returns — proven here by generating it
 /// the same way `commands::report::usage` does (via the daemon) and
@@ -90,7 +90,7 @@ async fn usage_preview_reflects_seeded_counters_exactly() {
     yadorilink_cli::commands::report::usage(true, None, false, false).await.unwrap();
 }
 
-/// Task 4.7 "export writes JSON without submission": `--export` writes a
+/// `--export` writes a
 /// parseable envelope to disk, and (since `--submit` was not given) never
 /// touches the daemon's submission path — checked here by never enabling
 /// consent or configuring an endpoint, so any accidental submit attempt
@@ -111,7 +111,7 @@ async fn usage_export_writes_valid_json_and_does_not_submit() {
     assert_eq!(envelope.report_type, yadorilink_reporting::schema::ReportType::Usage);
 }
 
-/// Task 4.7 "submit asks for confirmation": with `--yes` (the CLI's
+/// with `--yes` (the CLI's
 /// confirmation bypass) but consent left disabled, submission still
 /// fails — proving the confirmation bypass and the consent gate are two
 /// independent checks, not the same one (a submit can be "confirmed" and
@@ -131,7 +131,7 @@ async fn submit_with_yes_flag_still_enforces_consent() {
     );
 }
 
-/// Task 4.7 "consent controls persist": enabling usage submission via the
+/// enabling usage submission via the
 /// CLI command function is visible in the daemon's own consent store
 /// afterward.
 #[tokio::test]
@@ -163,7 +163,7 @@ async fn consent_reset_id_changes_the_reporter_id() {
     assert_ne!(first_id, second_id);
 }
 
-/// Task 4.7 "queue commands operate": show/delete via the CLI command
+/// show/delete via the CLI command
 /// functions against an entry seeded directly into the daemon's queue.
 #[tokio::test]
 async fn queue_show_and_delete_operate_via_cli_commands() {
@@ -189,7 +189,7 @@ async fn queue_show_and_delete_operate_via_cli_commands() {
     assert!(state.reporting.queue().list().unwrap().is_empty());
 }
 
-/// Task 4.7 "prompts can be disabled": with `prompt_to_report_enabled`
+/// with `prompt_to_report_enabled`
 /// turned off, `handle_reportable_error` creates no candidate and (since
 /// this is best-effort/local-only either way) still never panics.
 #[tokio::test]
@@ -225,8 +225,8 @@ async fn reportable_error_hook_creates_a_candidate_when_prompts_are_enabled() {
     assert!(!envelope.to_json().contains("alice"), "the candidate must already be redacted");
 }
 
-/// Task 4.7 "daemon-unavailable behavior is clear": `report usage
-/// --preview`/`--export` still work (task 4.6's limited CLI-only report),
+/// `report usage
+/// --preview`/`--export` still work via the limited CLI-only reporting path,
 /// while `report queue list` fails with the specific
 /// `ReportingDaemonRequired` error rather than a generic failure or a
 /// silently empty list.
@@ -269,8 +269,7 @@ async fn daemon_unavailable_error_last_with_nothing_captured_is_clear() {
 }
 
 /// `report error --last` without a daemon, but with a candidate this same
-/// CLI process already captured locally (task 4.5's hook, task 4.6's
-/// "the specific error it just hit"), finds it directly.
+/// CLI process already captured locally, finds it directly.
 #[tokio::test]
 async fn daemon_unavailable_error_last_finds_a_locally_captured_candidate() {
     let _guard = TEST_MUTEX.lock().await;

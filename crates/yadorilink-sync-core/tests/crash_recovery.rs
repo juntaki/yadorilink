@@ -1,5 +1,5 @@
-//! add-crash-power-loss-recovery task 3.2: a daemon-restart integration
-//! test proving a local change already committed to this device's
+//! A daemon-restart integration test proving a local change already
+//! committed to this device's
 //! `SyncState` (as it would be by `LocalChangeProcessor` processing a
 //! real filesystem event) but never yet broadcast to a connected peer —
 //! exactly what a crash right after the DB commit but before the
@@ -163,7 +163,7 @@ fn record_with_content(path: &str, content: &[u8], hash_hex: &str) -> FileRecord
     }
 }
 
-/// task 3.2: the core restart-retry scenario. Device A commits a local
+/// the core restart-retry scenario. Device A commits a local
 /// change directly to its own `SyncState`/block store/disk — simulating
 /// exactly what `LocalChangeProcessor` would have already durably done
 /// for a real filesystem event — but its first session with device B is

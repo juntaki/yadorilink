@@ -1,5 +1,5 @@
 //! Shell-integration IPC client for the File Provider extension point
-//! (on-demand-sync task 7.1-7.3). A close copy of
+//! (on-demand-sync). A close copy of
 //! `shell-ext/macos/core/src/ipc_client.rs`'s connect/timeout/fail-soft
 //! pattern (see this crate's Cargo.toml doc comment for why it's a copy
 //! rather than a shared dependency), extended with the three calls
@@ -33,8 +33,8 @@ const STATUS_TIMEOUT: Duration = Duration::from_millis(200);
 /// real work" 2s figure `core::ipc_client::ACTION_TIMEOUT` uses as its
 /// own reference point.
 const ENUMERATION_TIMEOUT: Duration = Duration::from_secs(5);
-/// Hydration is real network I/O against a remote peer — design.md D5's
-/// bounded-timeout decision gives the *daemon-side* dispatch a 30s budget
+/// Hydration is real network I/O against a remote peer — a bounded-timeout
+/// decision gives the *daemon-side* dispatch a 30s budget
 /// (`yadorilink_daemon::hydration::HYDRATION_TIMEOUT`). The client-side wait
 /// here must be at least that long (otherwise we'd time out the IPC
 /// round trip before the daemon's own deadline fires and gets a chance to
@@ -42,8 +42,7 @@ const ENUMERATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// for the extra hop's own overhead. `fetchContents(for:...)` is
 /// synchronous from the *opening application's* point of view, so this
 /// is still a bounded wait, just a much longer tier than status/action —
-/// exactly the "longer timeout than the status-query default... e.g. a
-/// multi-second timeout vs. ~200ms for status" the task brief calls for.
+/// a multi-second timeout vs. ~200ms for status.
 const HYDRATION_TIMEOUT: Duration = Duration::from_secs(35);
 
 fn runtime() -> &'static Runtime {
@@ -106,7 +105,7 @@ async fn connect() -> std::io::Result<UnixStream> {
 }
 
 /// The real, real-user-visible home directory, exposed to Swift so the
-/// host app can compute `~/Library/CloudStorage/yadorilink` (design.md D1's
+/// host app can compute `~/Library/CloudStorage/yadorilink` (the
 /// managed location) without hitting the same sandbox-redirection trap
 /// `real_home_dir`'s doc comment describes — the host app itself is
 /// currently unsandboxed (see `YadoriLinkFinderSyncHost`'s lack of an
@@ -125,7 +124,7 @@ pub struct OnDemandFolderInfo {
     pub group_id: String,
 }
 
-/// Discovers every OnDemand-linked folder group (task 7.2's "how does the
+/// Discovers every OnDemand-linked folder group (answering the "how does the
 /// extension learn which OnDemand folder groups exist" question) via the
 /// `ListOnDemandFoldersRequest`/`Response` pair already added to
 /// shellipc.proto (see this crate's module doc — added by the parallel
@@ -231,8 +230,8 @@ async fn list_folder_files_inner(local_path: &str) -> Vec<FileEntryInfo> {
 pub struct StatusInfo {
     pub sync_state: String,
     pub materialization_state: String,
-    /// Empty if not open elsewhere or the signal has expired (design.md
-    /// D7) — a non-empty device id here is what drives the
+    /// Empty if not open elsewhere or the signal has expired —
+    /// a non-empty device id here is what drives the
     /// `YadoriLinkBadgeStatusOpenElsewhere` badge in `core::lib` and, for a
     /// File-Provider item, is folded into `NSFileProviderItem`'s
     /// `tagData`/label to surface the same advisory signal.
@@ -296,8 +295,8 @@ fn sync_state_str(s: SyncState) -> &'static str {
 }
 
 /// Requests hydration of `path` (backs `fetchContents(for:version:
-/// request:completionHandler:)`). Bounded to `HYDRATION_TIMEOUT` (design.md
-/// D5); returns `false` on timeout, an unreachable daemon, or a
+/// request:completionHandler:)`). Bounded to `HYDRATION_TIMEOUT`;
+/// returns `false` on timeout, an unreachable daemon, or a
 /// `HydrateResponse{ok: false, ..}` — the caller is expected to complete
 /// the OS callback with a clear I/O error in that case, never hang.
 pub fn hydrate(path: &str) -> bool {

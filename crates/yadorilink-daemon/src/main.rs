@@ -61,9 +61,9 @@ async fn main() -> anyhow::Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| dir.join("wg_key"));
 
-    // add-oss-usage-error-reporting task 3.3: a severe-error hook for the
-    // two fallible startup calls that would otherwise abort `main` before
-    // `DaemonState` (and therefore `state.reporting`) exists — opens a
+    // A severe-error hook for the two fallible startup calls that would
+    // otherwise abort `main` before `DaemonState` (and therefore
+    // `state.reporting`) exists — opens a
     // throwaway `ReportingStorage` over the same config directory rather
     // than waiting for `DaemonState::new`, since a failure here is exactly
     // the kind of thing a maintainer would want a local candidate for.
@@ -83,8 +83,8 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, "failed to reset stale Hydrating rows on startup"),
     }
 
-    // add-crash-power-loss-recovery task 2.1/2.3: run before any link
-    // watcher starts or any new write happens, so nothing new can be
+    // Run before any link watcher starts or any new write happens, so
+    // nothing new can be
     // mistaken for one of last run's orphaned temp files, and no on-demand
     // hydration/materialize can race the repair pass below. Order matters:
     // the block-store root's own stale temp files are cleaned first
@@ -137,17 +137,16 @@ async fn main() -> anyhow::Result<()> {
     let device_id = device_config.as_ref().map(|c| c.device_id.clone()).unwrap_or_default();
 
     let state = DaemonState::new(device_id.clone(), sync_state.clone(), block_store.clone());
-    // add-resource-governance task 3.1/5.2: only the real `yadorilink-daemon`
-    // binary itself opts into disk-headroom enforcement — see
+    // Only the real `yadorilink-daemon` binary itself opts into
+    // disk-headroom enforcement (task 3.1/5.2) — see
     // `DaemonState::enable_disk_headroom_enforcement`'s doc comment for why
     // this is not done inside `DaemonState::new` (which every test in this
     // crate also goes through).
     state.enable_disk_headroom_enforcement();
 
-    // add-observability-and-metrics task 3.1/4.2: opt-in `/metrics`
-    // endpoint — off/localhost-only by default (design.md), mirroring
-    // `yadorilink-relay`'s own `YADORILINK_RELAY_METRICS_ADDR` convention
-    // exactly. The env var (if set) always wins over the persisted
+    // Opt-in `/metrics` endpoint — off/localhost-only by default,
+    // mirroring `yadorilink-relay`'s own `YADORILINK_RELAY_METRICS_ADDR`
+    // convention exactly. The env var (if set) always wins over the persisted
     // `metrics_config.json` toggle (`yadorilink daemon metrics`, task 4.2)
     // so an operator's explicit env-based override behaves identically to
     // the relay's, with the persisted config as this binary's own
@@ -309,10 +308,10 @@ async fn main() -> anyhow::Result<()> {
             // we've already returned. Treat any other outcome as fatal.
             let name = joined.unwrap_or("unknown-task");
             tracing::error!(task = name, "essential task died; exiting non-zero so a process supervisor restarts the daemon");
-            // add-oss-usage-error-reporting task 3.3: an essential
-            // supervised task (REL-8) dying is exactly the kind of severe,
-            // maintainer-actionable failure this hook exists for — a
-            // local-only candidate, never submitted automatically.
+            // An essential supervised task (REL-8) dying is exactly the
+            // kind of severe, maintainer-actionable failure this hook
+            // exists for — a local-only candidate, never submitted
+            // automatically.
             yadorilink_daemon::reporting::hooks::record_severe_error(
                 &state.reporting,
                 "essential_task_died",
@@ -359,8 +358,8 @@ async fn wait_for_os_signal() -> &'static str {
     }
 }
 
-/// add-oss-usage-error-reporting task 3.3: records a severe-error
-/// candidate for a startup failure that happens before `DaemonState`
+/// Records a severe-error candidate for a startup failure that happens
+/// before `DaemonState`
 /// exists. Opens its own short-lived `ReportingStorage` handle (cheap —
 /// see that type's doc comment on not writing anything just by opening)
 /// rather than restructuring startup to build `DaemonState` earlier.
@@ -377,8 +376,8 @@ fn record_startup_error_best_effort(category: &str, subsystem: &str, message: St
 /// Windows has no SIGTERM; a process supervisor there typically stops a
 /// service via `Ctrl-C`/service-control events, which `tokio::signal::ctrl_c`
 /// already covers cross-platform — no Windows-specific signal API needed
-/// for this MVP (windows-local-ipc-support's precedent: cfg-split only
-/// where the platforms genuinely differ, e.g. named pipes vs Unix sockets).
+/// for this MVP (cfg-split only where the platforms genuinely differ, e.g.
+/// named pipes vs Unix sockets).
 #[cfg(windows)]
 async fn wait_for_os_signal() -> &'static str {
     let _ = tokio::signal::ctrl_c().await;
@@ -403,8 +402,8 @@ async fn graceful_shutdown(
 
     // Stop generating new local changes first: abort every link's
     // watcher/executor tasks (the debounce accumulator and the flush
-    // executor, batch-sync-optimizations design D7) before anything else,
-    // so nothing new gets queued while the rest of shutdown runs.
+    // executor, ) before anything else, so nothing new gets
+    // queued while the rest of shutdown runs.
     let link_tasks: Vec<_> =
         state.link_tasks.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).drain().collect();
     for (local_path, handles) in link_tasks {
@@ -425,9 +424,9 @@ async fn graceful_shutdown(
     // beyond the default) — there is nothing in this crate's scope to
     // call here. Every write already goes through normal SQLite commits
     // (see `SyncState`'s per-call `Connection` usage), so this is a
-    // WAL-checkpoint-on-clean-exit gap, not a durability gap; flagged as
-    // a follow-up in `openspec/changes/daemon-reliability/tasks.md`
-    // rather than inventing new `yadorilink-sync-core` API from here.
+    // WAL-checkpoint-on-clean-exit gap, not a durability gap; flagged as a
+    // follow-up rather than inventing new `yadorilink-sync-core` API from
+    // here.
 
     // Remove the socket files last, once nothing should be listening
     // through them anymore — a stale socket left behind after an
@@ -445,12 +444,12 @@ async fn graceful_shutdown(
     essential.shutdown().await;
 }
 
-/// add-observability-and-metrics task 3.1: the daemon's `/metrics`
-/// listener loop — deliberately the same minimal, dependency-free raw-HTTP
-/// responder as `yadorilink-relay`'s own `serve_metrics`
+/// The daemon's `/metrics` listener loop — deliberately the same minimal,
+/// dependency-free raw-HTTP responder as `yadorilink-relay`'s own
+/// `serve_metrics`
 /// (`crates/yadorilink-transport/src/bin/yadorilink-relay.rs`), not a new
-/// framework, matching design.md's "don't invent a different metrics
-/// framework" for this change's daemon/coordination endpoints.
+/// framework: "don't invent a different metrics framework" for this
+/// change's daemon/coordination endpoints.
 async fn serve_metrics(
     listener: tokio::net::TcpListener,
     metrics: yadorilink_daemon::metrics::DaemonMetrics,

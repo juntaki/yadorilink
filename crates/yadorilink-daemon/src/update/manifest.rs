@@ -1,9 +1,8 @@
-//! add-automatic-updates task 1: the signed update manifest — data
-//! structures, strict parsing, semantic-version comparison/applicability,
-//! and Ed25519 signature verification against a pinned trust root.
+//! The signed update manifest — data structures, strict parsing,
+//! semantic-version comparison/applicability, and Ed25519 signature
+//! verification against a pinned trust root.
 //!
-//! Design.md's "Signed Manifest Plus Platform Signature" decision: the
-//! manifest signature protects metadata (rollout, minimum supported
+//! The manifest signature protects metadata (rollout, minimum supported
 //! version, artifact URL/checksum) end-to-end over HTTPS *and* against a
 //! compromised hosting/CDN — verified here, before anything is
 //! downloaded. `verify::verify_artifact` (sibling module) separately
@@ -30,18 +29,16 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 /// One pinned release-signing public key, identified by a stable
 /// `key_id` so keys can be rotated without breaking older clients that
-/// still only trust the previous one (design.md's "support key rotation
-/// with pinned key IDs").
+/// still only trust the previous one.
 pub struct TrustedKey {
     pub key_id: &'static str,
     pub public_key_hex: &'static str,
 }
 
-/// Pinned release-signing trust root (design.md's "Manifest key
-/// compromise" risk: rotation is handled by *adding* a new `TrustedKey`
-/// entry here and shipping it in a client release before the new key is
-/// ever used to sign a manifest, never by replacing this list in a way
-/// that invalidates a key still in use).
+/// Pinned release-signing trust root. Key-compromise rotation is handled
+/// by *adding* a new `TrustedKey` entry here and shipping it in a client
+/// release before the new key is ever used to sign a manifest, never by
+/// replacing this list in a way that invalidates a key still in use.
 ///
 /// **This is a beta/development placeholder keypair**, generated locally
 /// for update-manifest signing — it is not a secret held by any real
@@ -76,8 +73,8 @@ pub enum ManifestError {
     UnsupportedSchemaVersion { found: u32, expected: u32 },
 }
 
-/// One release entry within a manifest — design.md's manifest field list
-/// plus this file's own `rollout_percentage`/`kill_switch`/`mandatory`
+/// One release entry within a manifest — the manifest field list plus
+/// this file's own `rollout_percentage`/`kill_switch`/`mandatory`
 /// controls. Scoped to exactly one (channel, platform, arch,
 /// install_source) combination; a manifest lists one entry per
 /// applicable combination, matching `LinkStatus`'s established
@@ -100,14 +97,14 @@ pub struct ReleaseEntry {
     /// `rollout_selected`.
     #[serde(default)]
     pub rollout_percentage: u8,
-    /// Design.md's kill switch: when set, this entry is never installed
+    /// Kill switch: when set, this entry is never installed
     /// (automatically or manually) regardless of rollout/mandatory
     /// status — the release-operations equivalent of a fail-closed
     /// override for a bad release still being staged out.
     #[serde(default)]
     pub kill_switch: bool,
-    /// Explicit mandatory flag (design.md "Mandatory update abuse" —
-    /// reserved for security/protocol-compatibility fixes). A version
+    /// Explicit mandatory flag — reserved for security/
+    /// protocol-compatibility fixes, to guard against abuse. A version
     /// below `minimum_supported_version` is *also* treated as mandatory
     /// regardless of this flag — see `select_applicable`.
     #[serde(default)]
@@ -250,8 +247,8 @@ pub enum Applicability {
 /// Selects the best applicable release entry for `ctx` out of an already
 /// signature-verified `manifest`, or reports why none is currently
 /// installable. Never selects a version `<=` `ctx.current_version`
-/// (task 1.2's downgrade rejection / design.md's "Downgrade And
-/// Minimum-Version Protection" requirement) — an entry whose `version`
+/// (task 1.2's downgrade and minimum-version protection requirement) —
+/// an entry whose `version`
 /// fails to parse as semver, or that doesn't match the local
 /// channel/platform/arch/install_source, is excluded from consideration
 /// entirely rather than causing an error.
@@ -399,8 +396,7 @@ mod tests {
             .collect()
     }
 
-    /// design.md scenario "Valid manifest exposes an applicable update":
-    /// a validly-signed manifest with a newer, fully-rolled-out entry is
+    /// A validly-signed manifest with a newer, fully-rolled-out entry is
     /// selected as available.
     #[test]
     fn valid_manifest_selects_an_applicable_update() {
@@ -421,10 +417,9 @@ mod tests {
         }
     }
 
-    /// design.md scenario "Invalid manifest is rejected": a tampered
-    /// payload (one changed byte) fails signature verification and is
-    /// never parsed into a usable manifest — this is the fail-closed
-    /// "tampered manifest is genuinely rejected" proof.
+    /// A tampered payload (one changed byte) fails signature
+    /// verification and is never parsed into a usable manifest — this is
+    /// the fail-closed "tampered manifest is genuinely rejected" proof.
     #[test]
     fn tampered_manifest_body_fails_signature_verification() {
         let manifest = sample_manifest(vec![sample_entry("0.2.0")]);
@@ -451,8 +446,7 @@ mod tests {
         assert_eq!(result, Err(ManifestError::UnknownKey("some-other-key".into())));
     }
 
-    /// design.md scenario's schema-version half of "Invalid manifest is
-    /// rejected".
+    /// The schema-version half of "invalid manifest is rejected".
     #[test]
     fn unsupported_schema_version_is_rejected() {
         let mut manifest = sample_manifest(vec![sample_entry("0.2.0")]);
@@ -470,10 +464,9 @@ mod tests {
         );
     }
 
-    /// design.md scenario "Downgrade is rejected": an entry offering a
-    /// version lower than (or equal to) the running version is never
-    /// selected, even though it's otherwise a perfectly well-formed,
-    /// validly-signed, applicable-platform entry.
+    /// An entry offering a version lower than (or equal to) the running
+    /// version is never selected, even though it's otherwise a perfectly
+    /// well-formed, validly-signed, applicable-platform entry.
     #[test]
     fn downgrade_entry_is_never_selected() {
         let manifest = sample_manifest(vec![sample_entry("0.0.9"), sample_entry("0.1.0")]);
@@ -498,9 +491,8 @@ mod tests {
         }
     }
 
-    /// design.md scenario "Rollout holdback prevents install": a rollout
-    /// percentage of 0 never selects any install (bucket is always
-    /// `>= 0`), and is reported as held back rather than available.
+    /// A rollout percentage of 0 never selects any install (bucket is
+    /// always `>= 0`), and is reported as held back rather than available.
     #[test]
     fn rollout_holdback_prevents_selection() {
         let mut entry = sample_entry("0.5.0");
@@ -525,10 +517,9 @@ mod tests {
         assert!(matches!(select_applicable(&manifest, &ctx), Applicability::Available { .. }));
     }
 
-    /// design.md scenario's kill-switch half: an entry marked
-    /// `kill_switch: true` is reported distinctly and is never treated as
-    /// installable even though it's otherwise a valid, newer, fully
-    /// rolled-out entry.
+    /// An entry marked `kill_switch: true` is reported distinctly and is
+    /// never treated as installable even though it's otherwise a valid,
+    /// newer, fully rolled-out entry.
     #[test]
     fn kill_switch_entry_is_never_available() {
         let mut entry = sample_entry("0.9.0");
@@ -542,8 +533,7 @@ mod tests {
         }
     }
 
-    /// design.md scenario "Mandatory security update is surfaced": a
-    /// version below `minimum_supported_version` is mandatory even
+    /// A version below `minimum_supported_version` is mandatory even
     /// without the explicit `mandatory` flag, and bypasses rollout
     /// holdback (a mandatory security fix must not be gated behind a
     /// staged percentage).

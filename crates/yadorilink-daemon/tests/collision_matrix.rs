@@ -441,7 +441,7 @@ async fn rename_then_immediate_delete_leaves_nothing_on_either_device() {
 
 /// Two devices concurrently create differently-cased names for the same
 /// logical file with different content. On a case-insensitive filesystem
-/// (macOS default, Windows), this is a genuine hazard (design D3): one
+/// (macOS default, Windows), this is a genuine hazard (): one
 /// device's sync root can only ever hold one of the two names on disk.
 /// Skipped outright on a case-sensitive filesystem (Linux ext4), where
 /// this isn't a collision at all -- matching this session's earlier

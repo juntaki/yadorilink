@@ -1,7 +1,7 @@
 //! `yadorilink-cfapi-host`: the long-lived process that owns every OnDemand
 //! folder's Cloud Filter API sync-root registration/connection and serves
-//! `CF_CALLBACK_TYPE_FETCH_DATA` callbacks (on-demand-sync tasks
-//! 6.1-6.3). See `cfapi.rs`'s module doc and `Cargo.toml`'s `[[bin]]` doc
+//! `CF_CALLBACK_TYPE_FETCH_DATA` callbacks. See `cfapi.rs`'s module doc
+//! and `Cargo.toml`'s `[[bin]]` doc
 //! comment for why this is a separate process from the
 //! `yadorilink_shell_ext` COM DLL.
 //!
@@ -9,7 +9,7 @@
 //!   yadorilink-cfapi-host              run the poll loop (default)
 //!   yadorilink-cfapi-host --unregister-all
 //!                                   unregister every sync root this host
-//!                                   has ever registered (task 6.6's
+//!                                   has ever registered (for the
 //!                                   uninstall path), then exit; does not
 //!                                   require the daemon to be running
 //!
@@ -19,7 +19,7 @@
 //! before, and creates placeholders for any file the daemon reports as
 //! still a placeholder that doesn't already have one on disk. This is
 //! polling rather than push-driven because `ListOnDemandFolders`/
-//! `ListFolderFiles` (task 6.1/6.2's protocol extension) are simple
+//! `ListFolderFiles` are simple
 //! request/response messages on the existing shell-IPC connection, not
 //! wired into the daemon's `StatusPush` broadcast — acceptable for this
 //! MVP since sync-root registration only needs to happen once per folder
@@ -38,7 +38,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Where the set of every sync root this machine has ever registered is
 /// recorded, so `--unregister-all` can clean up without needing the
-/// daemon reachable (task 6.6: the uninstaller must work even if the
+/// daemon reachable (the uninstaller must work even if the
 /// daemon has already been stopped).
 fn registry_file_path() -> PathBuf {
     let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());

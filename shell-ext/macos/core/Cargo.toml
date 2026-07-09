@@ -4,9 +4,8 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
-# build-yadorilink-mvp task 10.1: the "thin Rust core" design.md D4 calls for
-# behind the Swift FIFinderSync shell (design.md D4, mirroring the Windows
-# `shell-ext/windows` crate's own rationale). Not a member of the root
+# The "thin Rust core" behind the Swift FIFinderSync shell (mirroring the
+# Windows `shell-ext/windows` crate's own rationale). Not a member of the root
 # workspace: this crate is only ever built for Apple targets (linked into
 # a macOS app-extension bundle), and the primary dev machine for this repo
 # is not macOS-Xcode-equipped, so keeping it a separate Cargo workspace

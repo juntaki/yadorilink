@@ -62,7 +62,7 @@ pub trait BlockStore: Send + Sync {
     /// overrides it to skip verification (as `FsBlockStore` does). No
     /// call site in this repository calls `get_unchecked` yet as of this
     /// change — it is added for a future, deliberate opt-in at specific
-    /// call sites (see `openspec/changes/sync-performance/tasks.md` 2.2).
+    /// call sites.
     fn get_unchecked(&self, hash: &str) -> Result<Vec<u8>, StorageError> {
         self.get(hash)
     }
@@ -87,13 +87,13 @@ pub trait BlockStore: Send + Sync {
         Ok(usage)
     }
 
-    /// add-block-store-gc task 2.3/3.2: mark-and-sweep — deletes every
-    /// stored block not in `live` and older (by on-disk mtime) than
-    /// `grace_cutoff`, or (`dry_run`) reports what would be deleted without
-    /// calling [`delete`](Self::delete). No default implementation: the
-    /// grace-window check is inherently backend-specific (design.md D2 keys
-    /// it off on-disk mtime, which only a real filesystem backend has), so
-    /// unlike `usage` above there is no generically-correct fallback. This
+    /// Mark-and-sweep — deletes every stored block not in `live` and older
+    /// (by on-disk mtime) than `grace_cutoff`, or (`dry_run`) reports what
+    /// would be deleted without calling [`delete`](Self::delete). No
+    /// default implementation: the grace-window check is inherently
+    /// backend-specific (it keys off on-disk mtime, which only a real
+    /// filesystem backend has), so unlike `usage` above there is no
+    /// generically-correct fallback. This
     /// lives on the trait — mirroring `set_headroom_enforced`'s doc
     /// comment's own precedent — because `yadorilink-daemon`'s
     /// `DaemonState` only ever holds an `Arc<dyn BlockStore>`, never the
@@ -107,7 +107,7 @@ pub trait BlockStore: Send + Sync {
     ) -> Result<GcReport, StorageError>;
 
     /// Reports, for each of `hashes` (in the same order), whether it's
-    /// already present locally — `on-demand-sync` task 3.1: lets a caller
+    /// already present locally — lets a caller
     /// (hydration, in particular) know which of a file's blocks it still
     /// needs to fetch from a peer without probing them one at a time.
     /// Default implementation checks each hash individually via `exists`;
@@ -127,9 +127,9 @@ pub trait BlockStore: Send + Sync {
         hashes.iter().map(|h| self.exists(h.as_str())).collect()
     }
 
-    /// add-resource-governance task 3.1/5.2: turns this backend's
-    /// disk-space headroom preflight on `put()` on or off. Exposed on the
-    /// trait (rather than only on the concrete `FsBlockStore`) so
+    /// Turns this backend's disk-space headroom preflight on `put()` on or
+    /// off. Exposed on the trait (rather than only on the concrete
+    /// `FsBlockStore`) so
     /// `yadorilink-daemon`'s `DaemonState`, which only ever holds an
     /// `Arc<dyn BlockStore>` (not the concrete type), can wire governance
     /// config into whatever backend is actually running. Default: a no-op
@@ -146,7 +146,7 @@ pub trait BlockStore: Send + Sync {
 
     /// This backend's current free-space snapshot (available/total/headroom
     /// bytes, from which the caller can derive the ok/low/critical
-    /// classification via `VolumeFreeSpace::classify` — task 1.3), for
+    /// classification via `VolumeFreeSpace::classify`), for
     /// `yadorilink status`'s per-volume reporting. `None` when this backend
     /// has no real underlying volume to report on. Default: `None` — an
     /// in-memory/test double has no real disk concept; only `FsBlockStore`

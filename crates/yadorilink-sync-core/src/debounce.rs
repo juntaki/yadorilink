@@ -1,10 +1,10 @@
 //! Coalesces raw filesystem events into windowed batches
-//! (`batch-sync-optimizations` design D1-D3) before they reach
+//! (D3) before they reach
 //! `LocalChangeProcessor`. Deliberately knows nothing about indexing,
 //! chunking, or peers — it only decides *when* a set of paths should be
 //! considered "one batch," leaving the caller (typically
 //! `yadorilink-daemon::link_manager`) to turn that batch into actual work via
-//! a separate executor task (design D7), so this module owns none of that
+//! a separate executor task (), so this module owns none of that
 //! I/O and stays cheaply unit-testable in isolation.
 
 use std::collections::HashMap;
@@ -16,7 +16,7 @@ use tokio::time::Instant;
 
 use crate::watcher::{FsChangeEvent, FsChangeKind};
 
-/// Default quiet period: short (not Syncthing's ~10s default, design D3)
+/// Default quiet period: short (not Syncthing's ~10s default, )
 /// because local-change detection is also relied on for the
 /// edit-presence-awareness capability's lock-file responsiveness, which a
 /// multi-second default would visibly regress.
@@ -25,15 +25,15 @@ pub const DEFAULT_QUIET_PERIOD: Duration = Duration::from_millis(300);
 /// long-running burst of activity doesn't delay every change indefinitely.
 pub const DEFAULT_MAX_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 /// Distinct paths changing within one window above this count switches
-/// from per-path tracking to the full-rescan fallback (design D2).
+/// from per-path tracking to the full-rescan fallback ().
 pub const DEFAULT_BURST_THRESHOLD: usize = 500;
 /// Default capacity of the channel connecting the accumulator to its
-/// executor (design D7) — small, since a flush is already a coalesced
+/// executor () — small, since a flush is already a coalesced
 /// unit of work; a handful of pending flushes is enough buffer that a
 /// single slow flush never blocks the accumulator from continuing to
-/// observe new events (see `batch-sync-optimizations` task 3.7's test).
-/// batch-sync-optimizations task 4.4 hardens what happens once even this
-/// buffer is exhausted by a sustained backlog.
+/// observe new events. What happens once even this
+/// buffer is exhausted by a sustained backlog is hardened separately
+/// (see `push_ready`).
 pub const DEFAULT_EXECUTOR_CHANNEL_CAPACITY: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,24 +59,24 @@ pub enum DebounceFlush {
     /// Distinct paths that changed in this window, each with the last
     /// `FsChangeKind` observed for it (a path modified then removed
     /// within the window is reported as `Removed`, matching final
-    /// on-disk state — design D1), and the wall-clock time (unix nanos)
+    /// on-disk state — ), and the wall-clock time (unix nanos)
     /// this accumulator last observed an event for that path — i.e. when
     /// the *raw* event was received here, not when this flush is finally
     /// dispatched (which can lag by up to `quiet_period`/
-    /// `max_flush_interval`). fix-local-edit-swallowed-by-self-echo-race:
-    /// `local_change.rs`'s `Removed` dispatch needs this real observed
+    /// `max_flush_interval`). `local_change.rs`'s `Removed` dispatch needs
+    /// this real observed
     /// time for `SyncState::mark_deleted_at` — a tombstone stamped with
     /// dispatch time instead would be systematically later than a
     /// concurrent edit's own (never debounce-delayed) file mtime,
     /// regardless of which genuinely happened first.
     Paths(Vec<(PathBuf, FsChangeKind, i64)>),
     /// The number of distinct paths in this window exceeded
-    /// `burst_threshold`; per-path tracking was discarded (design D2) —
+    /// `burst_threshold`; per-path tracking was discarded () —
     /// the caller should run a full reconciliation scan instead.
     BurstFallback,
 }
 
-/// fix-local-edit-swallowed-by-self-echo-race: same shape as this crate's
+/// Same shape as this crate's
 /// other private `now_unix_nanos` helpers (`index.rs`, `peer_session.rs`,
 /// `yadorilink-daemon::link_manager`) — captures the wall-clock time a raw
 /// event is received here, for `DebounceFlush::Paths`'s third tuple
@@ -107,8 +107,7 @@ enum State {
 pub enum FlushMode {
     /// Look up `FlushPathRequest::path` itself, exactly.
     ExactPath,
-    /// fix-case-fold-sibling-local-change-not-flushed-before-reconcile:
-    /// look up a *different* pending entry that shares `path`'s parent
+    /// Look up a *different* pending entry that shares `path`'s parent
     /// directory and case-folded final path component (but not its exact
     /// bytes) — i.e. the other name a case-insensitive filesystem would
     /// treat as colliding with `path`. Only ever meaningful for a caller
@@ -119,8 +118,7 @@ pub enum FlushMode {
     CaseFoldSibling,
 }
 
-/// fix-local-edit-swallowed-by-self-echo-race task 1.1's chosen plumbing:
-/// a targeted request to immediately hand back (and remove, so it is not
+/// A targeted request to immediately hand back (and remove, so it is not
 /// flushed a second time when its window's own timer later elapses) one
 /// specific path's pending, undispatched entry, bypassing the normal
 /// quiet-period/max-flush-interval timing entirely. This lets a caller
@@ -145,15 +143,13 @@ pub struct FlushPathRequest {
     /// two, the same as for any other already-dispatched change), or
     /// because no `FsChangeEvent` for it has ever reached this accumulator
     /// at all — a path can still be genuinely undiscovered by the watcher
-    /// subsystem at this point (fix-local-change-lost-under-registration-
-    /// mutex-contention, scope widened during scenario 5's investigation:
-    /// see `yadorilink-daemon::link_manager::LinkFlushHandle::
-    /// capture_undiscovered_local_change`, the caller's fallback for this
-    /// third case).
+    /// subsystem at this point — see `yadorilink-daemon::link_manager::
+    /// LinkFlushHandle::capture_undiscovered_local_change`, the caller's
+    /// fallback for this third case).
     pub reply: tokio::sync::oneshot::Sender<Option<(PathBuf, FsChangeKind, i64)>>,
 }
 
-/// fix-resume-does-not-flush-pending-local-changes: a request to
+/// A request to
 /// immediately drain and hand back *every* currently-pending, undispatched
 /// entry in this accumulator (not just one path), bypassing the normal
 /// quiet-period/max-flush-interval timing entirely -- same rationale as
@@ -181,14 +177,14 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
     }
 }
 
-/// Runs the debounce accumulator (design D1's accumulator half, D7):
+/// Runs the debounce accumulator ('s accumulator half, D7):
 /// reads raw events from `events`, and delivers completed window batches
 /// to `flush_tx`. Returns once `events` closes (the watcher stopped) or
 /// `flush_tx` closes (the executor side is gone). Does no I/O beyond
 /// these two channels — see the module doc comment for why.
 ///
 /// Delivery to `flush_tx` races against continuing to read `events`
-/// (design D7): a completed window joins an internal delivery queue
+/// (): a completed window joins an internal delivery queue
 /// rather than being sent with a blocking `.await` directly in the same
 /// `select!` as event intake, so a slow or backed-up executor (not
 /// draining `flush_tx` quickly) never stalls this task's ability to keep
@@ -196,16 +192,16 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
 /// window in the meantime. Per-link delivery order is still preserved —
 /// the queue is drained strictly front-to-back, one send at a time.
 ///
-/// `overflowed` is `watcher::FolderWatcher`'s overflow flag (design D6):
+/// `overflowed` is `watcher::FolderWatcher`'s overflow flag ():
 /// checked (and cleared) on every loop iteration. A set flag means the
 /// watcher's own channel dropped at least one raw event since it was last
 /// checked — precise per-path tracking is no longer trustworthy for
 /// whatever window is in progress, so it's routed into the exact same
 /// `Bursting` state and full-reconciliation recovery as an oversized
-/// debounce burst (design D2), rather than a second, separate fallback
+/// debounce burst (), rather than a second, separate fallback
 /// mechanism.
 ///
-/// `flush_requests` is fix-local-edit-swallowed-by-self-echo-race's
+/// `flush_requests` is the
 /// targeted "flush now" channel (`FlushPathRequest`'s doc comment) —
 /// serviced with higher priority than continuing to accumulate new events,
 /// so a caller waiting on the reply is never stuck behind an unrelated
@@ -230,8 +226,8 @@ pub async fn run_debouncer(
 
     loop {
         if overflowed.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            // design D8: each of the three fallback triggers logs a
-            // distinguishable reason (batch-sync-optimizations task 4.9).
+            // : each of the three fallback triggers logs a
+            // distinguishable reason.
             tracing::warn!(
                 reason = "watcher_channel_overflow",
                 "filesystem watcher channel overflowed; falling back to full reconciliation"
@@ -362,8 +358,8 @@ pub async fn run_debouncer(
 
 /// Pushes a completed window onto the delivery queue, collapsing it into
 /// a single `BurstFallback` if the executor has fallen far enough behind
-/// that the queue would otherwise grow without bound (batch-sync-optimizations
-/// task 4.4) — this is the same "too much changed to track precisely,
+/// that the queue would otherwise grow without bound — this is the same
+/// "too much changed to track precisely,
 /// reconcile from scratch instead" recovery as the burst-threshold and
 /// watcher-overflow triggers, applied to a third place bounded memory
 /// matters: the queue between this accumulator and its executor.
@@ -402,7 +398,7 @@ mod tests {
     }
 
     /// A `flush_requests` receiver for tests that don't exercise
-    /// fix-local-edit-swallowed-by-self-echo-race's targeted-flush
+    /// the targeted-flush
     /// mechanism — the sender is simply dropped, so `run_debouncer` sees a
     /// closed channel and stops polling it (see `flush_requests_open`).
     fn no_flush_requests() -> mpsc::Receiver<FlushPathRequest> {
@@ -468,7 +464,7 @@ mod tests {
         assert!(elapsed < Duration::from_millis(500), "flush latency too high: {elapsed:?}");
     }
 
-    /// fix-local-edit-swallowed-by-self-echo-race task 1.1's targeted
+    /// The targeted
     /// "flush now" mechanism: a path with a pending, undispatched entry is
     /// handed back (and removed) immediately, well before the normal quiet
     /// period would otherwise flush it — and is never flushed a second
@@ -551,7 +547,6 @@ mod tests {
         assert_eq!(found_again, None);
     }
 
-    /// fix-case-fold-sibling-local-change-not-flushed-before-reconcile:
     /// `FlushMode::CaseFoldSibling` finds and removes a *different*
     /// pending path in the same directory whose final component is
     /// case-fold-equal to the requested one, leaving an exact-byte match
@@ -613,7 +608,7 @@ mod tests {
         assert_eq!(found_again, None);
     }
 
-    /// fix-resume-does-not-flush-pending-local-changes: `FlushAllRequest`
+    /// `FlushAllRequest`
     /// drains every pending entry at once (not just one path), leaving the
     /// accumulator empty and back in `Idle` afterward.
     #[tokio::test]
@@ -684,7 +679,7 @@ mod tests {
     }
 
     /// Multiple events for the same path within one window coalesce into
-    /// one flush entry using the last-observed kind (design D1).
+    /// one flush entry using the last-observed kind ().
     #[tokio::test]
     async fn repeated_events_for_the_same_path_coalesce_to_the_latest_kind() {
         let (events_tx, events_rx) = mpsc::channel(16);
@@ -840,7 +835,7 @@ mod tests {
     }
 
     /// Exceeding the burst threshold within one window switches to
-    /// `BurstFallback` instead of a `Paths` batch (design D2).
+    /// `BurstFallback` instead of a `Paths` batch ().
     #[tokio::test]
     async fn exceeding_burst_threshold_triggers_burst_fallback() {
         let (events_tx, events_rx) = mpsc::channel(64);
@@ -893,7 +888,7 @@ mod tests {
         assert!(flush_rx.recv().await.is_none());
     }
 
-    /// batch-sync-optimizations task 3.7 / design D7: an artificially slow
+    /// : an artificially slow
     /// executor (here, a test task that only calls `flush_rx.recv()` after
     /// a deliberate delay) does not prevent the accumulator from
     /// continuing to observe and accumulate new events during that delay —
@@ -963,7 +958,7 @@ mod tests {
         }
     }
 
-    /// batch-sync-optimizations task 4.9: each of the three fallback
+    /// Each of the three fallback
     /// triggers logs a distinguishable reason. One `#[tokio::test]` (the
     /// default current-thread flavor) keeps everything on one OS thread,
     /// so a thread-local-default subscriber captures the debouncer task's
@@ -1042,7 +1037,7 @@ mod tests {
         );
     }
 
-    /// batch-sync-optimizations task 4.4/4.8/4.9: once the delivery queue
+    /// Once the delivery queue
     /// reaches capacity (executor never drains), further completed
     /// windows collapse into a single `BurstFallback` instead of growing
     /// the queue without bound, and the collapse is logged with its own

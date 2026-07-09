@@ -1,5 +1,4 @@
-//! Deterministic simulation testing (DST) harness skeleton
-//! (add-deterministic-sync-testing task group 3): runs the real
+//! Deterministic simulation testing (DST) harness skeleton: runs the real
 //! watcher-boundary/debounce/local-change-indexing code (unmodified in
 //! its logic) under `madsim`'s simulated, seed-controlled scheduler,
 //! substituting `watcher::SimulatedFolderWatchSource` for a real OS
@@ -55,18 +54,17 @@ const PARALLEL_VARIATIONS: usize = 500;
 /// (`link_manager::start_link_watch_with_source`'s production wiring,
 /// reproduced directly against `yadorilink-sync-core` here since that
 /// production entry point lives in `yadorilink-daemon`, whose coordination-
-/// plane dependency isn't part of this change's madsim scope -- see
-/// design.md's Non-Goals), then asserts the shared no-silent-data-loss
-/// invariant checker (`dst_support::check_no_silent_data_loss`, design.md
-/// D3) finds no violation.
+/// plane dependency isn't part of this crate's madsim scope), then
+/// asserts the shared no-silent-data-loss invariant checker
+/// (`dst_support::check_no_silent_data_loss`) finds no violation.
 fn run_scenario(seed: u64) -> Result<(), String> {
     let mut rt = madsim::runtime::Runtime::with_seed_and_config(seed, madsim::Config::default());
     rt.set_time_limit(Duration::from_secs(60));
     // r2d2 (SyncState's sqlite connection pool) spawns a real background
     // maintenance thread -- unrelated to the scheduling determinism this
-    // harness cares about (disk/DB determinism is deferred to task 6.1's
-    // `MaterializeIo`, see design.md D2), so allow it rather than
-    // reimplementing connection pooling to avoid a background thread.
+    // harness cares about (disk/DB determinism via `MaterializeIo` is
+    // deferred), so allow it rather than reimplementing connection
+    // pooling to avoid a background thread.
     rt.set_allow_system_thread(true);
     rt.block_on(scenario_body(seed))
 }
@@ -166,7 +164,7 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
 /// `DST_VARIATIONS` overrides how many seeds this run explores (default
 /// `PARALLEL_VARIATIONS`) — a small fixed count is enough for a fast
 /// per-PR check, a much larger one (thousands) for a heat-run/nightly
-/// sweep (design.md's task 7 CI-vs-heat-run split); each simulated run
+/// sweep; each simulated run
 /// costs low-single-digit milliseconds since simulated time is
 /// fast-forwarded, so scaling this up is cheap. Bounded to
 /// `available_parallelism` concurrent OS threads (a shared work queue,

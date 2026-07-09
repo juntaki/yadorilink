@@ -1,14 +1,14 @@
-//! Filename hazard detection (`add-sync-fidelity` design D3, task 4): pure
-//! detection logic for the two name-based hazards a materialization/
+//! Filename hazard detection: pure detection logic for the two
+//! name-based hazards a materialization/
 //! hydration write must never proceed past —
 //!
 //! - a **case-fold collision** with an existing sibling on a
-//!   case-insensitive filesystem (task 4.1): two paths that differ only by
+//!   case-insensitive filesystem: two paths that differ only by
 //!   case (`Photo.jpg` vs. `photo.jpg`) can coexist in the index (two
 //!   peers, or a case-sensitive filesystem, can legally hold both), but
 //!   writing both to the same case-insensitive directory clobbers one with
 //!   the other.
-//! - a **platform-invalid name** (task 4.2): the documented Windows-
+//! - a **platform-invalid name**: the documented Windows-
 //!   reserved device basenames, a trailing `.`/` `, or any of `<>:"|?*`.
 //!
 //! Kept in its own module rather than folded into `peer_session.rs` because
@@ -20,11 +20,10 @@
 //! `peer_session::PeerSyncSession::hazard_reason_for` is the only caller:
 //! it composes both checks and turns a hazard into the free-form
 //! `held_reason` string `SyncState::set_held` (section 1's schema) records.
-//! Per design D3, a hazard here **never** produces an automatic rename or
+//! Per a hazard here **never** produces an automatic rename or
 //! escape — the record is held, exactly as-is, under its original path, or
 //! not held at all. See `peer_session.rs`'s
-//! `no_hazard_ever_writes_under_any_alternate_name` regression test (task
-//! 4.5).
+//! `no_hazard_ever_writes_under_any_alternate_name` regression test.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,7 +31,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::types::FileRecord;
 
-/// design D3 / `SyncState::set_held`'s own doc comment in `index.rs`
+/// `SyncState::set_held`'s own doc comment in `index.rs`
 /// already documents these two exact reason-string prefixes as its
 /// canonical examples (`"case_collision"`, `"invalid_name"`) — this module
 /// is what actually produces them, so the constants live here as the
@@ -45,12 +44,12 @@ use crate::types::FileRecord;
 pub const HELD_REASON_CASE_COLLISION: &str = "case_collision";
 pub const HELD_REASON_INVALID_NAME: &str = "invalid_name";
 
-/// Which platform's filename rules gate materialization (task 4.2: "gated
-/// on the local platform" — a Windows peer holds a `CON.txt`, a POSIX peer
+/// Which platform's filename rules gate materialization (gated
+/// on the local platform — a Windows peer holds a `CON.txt`, a POSIX peer
 /// materializing the exact same index record does not, since the name is
 /// completely valid there). A real materializing device always uses
 /// [`NamePolicy::local`]; tests exercise both variants directly against
-/// identical index state to prove exactly that asymmetry (task 4.6).
+/// identical index state to prove exactly that asymmetry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NamePolicy {
     Posix,
@@ -71,7 +70,7 @@ impl NamePolicy {
     }
 }
 
-/// The documented Windows-reserved device basenames (task 4.2), compared
+/// The documented Windows-reserved device basenames, compared
 /// case-insensitively against a filename's stem (the part before its
 /// *first* `.` — see `windows_invalid_name_detail`'s doc comment for why
 /// `CON.txt` is still reserved).
@@ -80,10 +79,10 @@ const RESERVED_BASENAMES: &[&str] = &[
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
-/// The documented forbidden-character set (task 4.2).
+/// The documented forbidden-character set.
 const FORBIDDEN_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
 
-/// Task 4.2: the Windows-invalid-name reason `final_component` (a single
+/// the Windows-invalid-name reason `final_component` (a single
 /// path component — the file's own name, not a full path) would be held
 /// for, or `None` if it's fine under Windows' documented naming rules.
 /// Pure string analysis; never touches the filesystem. Checks, in order:
@@ -110,13 +109,13 @@ fn windows_invalid_name_detail(final_component: &str) -> Option<String> {
     None
 }
 
-/// Task 4.2/4.3: `path`'s held reason under `policy`, or `None` if
+/// `path`'s held reason under `policy`, or `None` if
 /// materializing it under `policy` is safe. Always `None` under
 /// [`NamePolicy::Posix`] — the Windows-only rule set never gates a POSIX
 /// materialization, since a name like `CON.txt` is completely valid on a
-/// POSIX filesystem (task 4.2's "gated on the local platform"). Only the
+/// POSIX filesystem (gated on the local platform). Only the
 /// *final* path component (`path`'s own filename) is checked, matching the
-/// task's framing ("checked against the filename") — an intermediate
+/// requirement to check against the filename — an intermediate
 /// directory component happening to be named `CON` is out of scope here,
 /// same as `case_fold_collision` below only ever compares siblings within
 /// one directory.
@@ -145,7 +144,7 @@ fn final_component_of(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// Task 4.1: the already-indexed sibling in `siblings` that `path` collides
+/// the already-indexed sibling in `siblings` that `path` collides
 /// with case-insensitively, if any — a non-deleted record living in the
 /// same parent directory whose final path component case-folds
 /// identically to `path`'s own but is not byte-identical to it (so
@@ -157,10 +156,9 @@ fn final_component_of(path: &str) -> &str {
 /// function with no `SyncState` dependency of its own.
 ///
 /// O(siblings.len()) per call — this module doesn't index siblings by
-/// parent directory or case-folded name, since section 4 isn't scoped as a
-/// performance-sensitive path the way, e.g., `PERF-3`/`PERF-5` in
-/// `peer_session.rs` are; a large single folder group could make this a
-/// real cost worth revisiting, but that's a follow-on, not this section's
+/// parent directory or case-folded name, since this isn't scoped as a
+/// performance-sensitive path; a large single folder group could make this a
+/// real cost worth revisiting, but that's a follow-on, not this function's
 /// job.
 pub fn case_fold_collision<'a>(path: &str, siblings: &'a [FileRecord]) -> Option<&'a FileRecord> {
     let parent = parent_of(path);
@@ -173,7 +171,7 @@ pub fn case_fold_collision<'a>(path: &str, siblings: &'a [FileRecord]) -> Option
     })
 }
 
-/// Task 4.1: process-wide cache of "is this canonicalized directory's
+/// process-wide cache of "is this canonicalized directory's
 /// filesystem case-insensitive", keyed by the canonicalized directory path
 /// that was actually probed. `probe_case_insensitive_filesystem` performs
 /// a real filesystem round trip (creates and removes a small temp file) —
@@ -185,7 +183,7 @@ pub fn case_fold_collision<'a>(path: &str, siblings: &'a [FileRecord]) -> Option
 /// for no behavioral benefit.
 static CASE_SENSITIVITY_CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
 
-/// Task 4.1: whether `dir`'s filesystem is case-insensitive. Probed for
+/// whether `dir`'s filesystem is case-insensitive. Probed for
 /// real rather than assumed from `cfg!(target_os = ...)`, since neither
 /// direction of that assumption holds: macOS APFS can be formatted either
 /// case-sensitive or case-insensitive (case-insensitive is only the
@@ -203,7 +201,7 @@ static CASE_SENSITIVITY_CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLoc
 /// of the two answers, since it never lets a possible collision through
 /// unheld — the opposite default (case-sensitive) would let a real
 /// collision through unheld on a filesystem this device simply couldn't
-/// successfully probe, which is the failure mode design D3 exists to
+/// successfully probe, which is the failure mode exists to
 /// prevent.
 pub fn is_case_insensitive_filesystem(dir: &Path) -> bool {
     let cache = CASE_SENSITIVITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));

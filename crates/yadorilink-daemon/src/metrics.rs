@@ -1,16 +1,15 @@
-//! add-observability-and-metrics section 3: the daemon's opt-in
-//! Prometheus/OpenMetrics `/metrics` endpoint (task 3.1/3.2) — same manual,
-//! no-framework text rendering as
+//! The daemon's opt-in Prometheus/OpenMetrics `/metrics` endpoint —
+//! same manual, no-framework text rendering as
 //! `yadorilink_transport::relay_server::RelayMetrics::render_openmetrics`
 //! (this change's own already-landed relay-side precedent), reaching
 //! directly into the same shared `DaemonState` the control socket's
 //! `status` handler already reads, rather than a parallel bookkeeping path.
 //!
-//! Metric families (design.md): `yadorilink_transfer_bytes_total` (counter),
+//! Metric families: `yadorilink_transfer_bytes_total` (counter),
 //! `yadorilink_active_transfers` (gauge), `yadorilink_active_peers` (gauge),
 //! `yadorilink_sync_errors_total{category}` (counter),
 //! `yadorilink_block_fetch_seconds` (histogram). Every label/value here is a
-//! count or a bounded-cardinality category string — task 3.3's test
+//! count or a bounded-cardinality category string. The privacy test
 //! (`tests::privacy_safe_metrics_never_contain_content_paths_keys_tokens_or_ips`)
 //! asserts none of them ever carries content, a file name, an absolute
 //! path, a key, a token, or a peer IP.
@@ -120,7 +119,7 @@ mod tests {
         assert!(rendered.contains("yadorilink_sync_errors_total{category=\"disk_pressure\"} 2"));
     }
 
-    /// task 3.3: the exact same privacy assertion
+    /// the exact same privacy assertion
     /// `relay_server::tests::relay_metrics_render_coarse_privacy_safe_values`
     /// makes for the relay's own metrics, applied to the daemon's richer
     /// metric set — no label or value may contain a device id, a path, a

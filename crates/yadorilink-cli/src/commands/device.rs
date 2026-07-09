@@ -4,8 +4,7 @@ fn keypair_path() -> std::path::PathBuf {
 
 #[cfg(feature = "http-coordination")]
 mod http {
-    //! migrate-coordination-plane-to-cloudflare task 7.1: HTTP client for
-    //! the HTTP coordination service's `/devices/*` routes.
+    //! HTTP client for the HTTP coordination service's `/devices/*` routes.
 
     use base64::Engine;
     use serde::{Deserialize, Serialize};
@@ -123,8 +122,7 @@ mod grpc_impl {
             coordination_addr: coordination_addr(),
             relay_addr: relay_addr(),
             // `save` always overwrites this with the current `CONFIG_VERSION`
-            // (add-update-migration-safety task 1.1) — the value here is never
-            // persisted.
+            // — the value here is never persisted.
             config_version: 0,
         })?;
         println!("Registered device: {}", resp.device_id);

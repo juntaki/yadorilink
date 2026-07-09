@@ -1,5 +1,5 @@
-//! add-automatic-updates task 2.1: on-disk persistence for the daemon's
-//! update policy and last-known update-attempt state — mirrors
+//! On-disk persistence for the daemon's update policy and last-known
+//! update-attempt state — mirrors
 //! `governance_config::GovernanceConfigStore`'s exact pattern (a small,
 //! independent JSON file under the config directory, `#[serde(default)]`
 //! plus a hand-written `Default` so an old/missing file always resolves
@@ -9,25 +9,24 @@
 //!
 //! Living in its own file (not bolted onto `device_config::DeviceConfig`)
 //! means an existing install with no `update_policy.json` at all — every
-//! device that existed before this change shipped — loads the documented
-//! safe default (checks/installs enabled, `Idle` state, nothing
-//! downloaded) with no migration step, the same "version-safe defaulting
-//! for existing installs" property `GovernanceConfigStore`'s own doc
-//! comment calls out.
+//! device that existed before this update-policy feature shipped —
+//! loads the documented safe default (checks/installs enabled, `Idle`
+//! state, nothing downloaded) with no migration step, the same
+//! "version-safe defaulting for existing installs" property
+//! `GovernanceConfigStore`'s own doc comment calls out.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// design.md's Migration Plan / Recovery and Idempotency: one state per
-/// update attempt, persisted so a restart after crash can tell what was
-/// in flight. `Idle` is the steady state between checks; `UpToDate` means
-/// the most recent check found nothing newer; `HeldBack`/`KillSwitched`
-/// mean an applicable-looking newer version exists but isn't currently
-/// installable (rollout holdback or a manifest kill-switch entry) —
-/// tracked as distinct states (not folded into `Available`) so
-/// `yadorilink update status`/`yadorilink status` can say *why* nothing
-/// is happening.
+/// One state per update attempt, persisted so a restart after crash can
+/// tell what was in flight. `Idle` is the steady state between checks;
+/// `UpToDate` means the most recent check found nothing newer;
+/// `HeldBack`/`KillSwitched` mean an applicable-looking newer version
+/// exists but isn't currently installable (rollout holdback or a
+/// manifest kill-switch entry) — tracked as distinct states (not folded
+/// into `Available`) so `yadorilink update status`/`yadorilink status`
+/// can say *why* nothing is happening.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateState {
@@ -65,17 +64,16 @@ impl UpdateState {
     }
 }
 
-/// design.md Migration Plan step 5: automatic install is enabled by
-/// default only once rollback/interrupted-update tests pass, "for beta
-/// builds" specifically. This code doesn't know at compile time whether
-/// it's a beta or production build, and shipping "automatic install on
-/// by default" as this crate's own hardcoded default before that
-/// migration-plan gate is a policy decision that belongs in release
-/// configuration, not here. `Manual` is therefore the safe, conservative
-/// default an unset config file resolves to; `main.rs`/packaging is
-/// expected to write an explicit `automatic` policy file for a beta
-/// build once that gate is satisfied (documented in
-/// the update policy).
+/// Automatic install is enabled by default only once
+/// rollback/interrupted-update tests pass, "for beta builds"
+/// specifically. This code doesn't know at compile time whether it's a
+/// beta or production build, and shipping "automatic install on by
+/// default" as this crate's own hardcoded default before that gate is
+/// a policy decision that belongs in release configuration, not here.
+/// `Manual` is therefore the safe, conservative default an unset
+/// config file resolves to; `main.rs`/packaging is expected to write
+/// an explicit `automatic` policy file for a beta build once that gate
+/// is satisfied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoInstallMode {
@@ -140,12 +138,10 @@ pub struct UpdatePolicy {
 impl Default for UpdatePolicy {
     fn default() -> Self {
         UpdatePolicy {
-            // design.md "Channel-Aware Updates": "Public beta builds
-            // default to `beta`". This crate has no separate
-            // beta/production build flag today, so `beta` is this
-            // change's default for every install until release
-            // packaging introduces one (documented as a follow-up in
-            // the update policy).
+            // Public beta builds default to the `beta` channel. This
+            // crate has no separate beta/production build flag today,
+            // so `beta` is this crate's default for every install
+            // until release packaging introduces one.
             channel: "beta".to_string(),
             automatic_checks_enabled: true,
             automatic_install_mode: AutoInstallMode::default(),
@@ -244,8 +240,8 @@ mod tests {
         (dir, store)
     }
 
-    /// task 2.6/1.5-style test: a fresh install (no file yet) reports the
-    /// documented safe defaults without writing anything to disk.
+    /// A fresh install (no file yet) reports the documented safe
+    /// defaults without writing anything to disk.
     #[test]
     fn fresh_store_reports_defaults_without_writing_a_file() {
         let (dir, store) = store();
@@ -297,7 +293,7 @@ mod tests {
         assert_eq!(policy.state, UpdateState::Idle);
     }
 
-    /// task 2.5's crash-recovery precondition: an artifact path can be
+    /// Crash-recovery precondition: an artifact path can be
     /// recorded without `downloaded_artifact_verified` ever being set,
     /// and that round-trips faithfully (the flag is never implicitly
     /// upgraded to `true` just because a path is present).

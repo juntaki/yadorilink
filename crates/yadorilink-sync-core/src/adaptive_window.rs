@@ -1,4 +1,4 @@
-//! improve-transfer-performance task 1: an AIMD-style, per-peer adaptive
+//! An AIMD-style, per-peer adaptive
 //! in-flight block-fetch window.
 //!
 //! Before this change, the number of concurrently outstanding
@@ -9,19 +9,17 @@
 //! fetch dispatcher, PERF-5's fixed lane count). Fast, low-RTT links never
 //! got to pipeline past that fixed count; slow/lossy ones got pushed to
 //! send that many requests regardless of whether the link could sustain
-//! them (proposal.md's "Why").
+//! them.
 //!
 //! `AdaptiveWindow` replaces the *lane-count* half of that (the daemon's
 //! per-candidate fetch concurrency) with a controller driven by real
 //! observed conditions on this session: smoothed RTT (EWMA) and explicit
-//! timeout/loss signals, per design.md's "Adaptive in-flight window"
-//! section. It does **not** touch `MAX_IN_FLIGHT_MESSAGES_PER_PEER` —
+//! timeout/loss signals. It does **not** touch `MAX_IN_FLIGHT_MESSAGES_PER_PEER` —
 //! that constant remains the fixed security ceiling (SEC-13's DoS bound
 //! on *inbound* message handling) this controller's own `max` is
 //! constructed to never exceed, so the adaptive window composes with,
-//! rather than replaces, the existing security hardening (design.md:
-//! "max never exceeds the per-peer concurrency bound set by the security
-//! hardening").
+//! rather than replaces, the existing security hardening: max never
+//! exceeds the per-peer concurrency bound set by that hardening.
 //!
 //! Pure and synchronous (no I/O, no async) so it's directly unit-testable
 //! — see the `tests` module below for the grow/shrink/ceiling/floor
@@ -52,8 +50,8 @@ const RTT_EWMA_ALPHA: f64 = 0.25;
 
 /// A fresh RTT sample counts as "inflated" (and triggers a multiplicative
 /// back-off, same as an explicit timeout) once it exceeds the smoothed
-/// baseline by this factor — design.md: "multiplicatively back off on
-/// timeouts/loss or RTT inflation." Chosen loosely (50% worse than
+/// baseline by this factor — multiplicatively backing off on
+/// timeouts/loss or RTT inflation. Chosen loosely (50% worse than
 /// baseline) so ordinary jitter on a real network doesn't itself look like
 /// congestion; only a genuine, sustained latency increase does.
 const RTT_INFLATION_FACTOR: f64 = 1.5;
@@ -68,8 +66,8 @@ struct WindowState {
 }
 
 /// Per-peer AIMD in-flight window controller. `min`/`max` are fixed for
-/// the controller's lifetime (task 1.2: `max` is clamped at construction
-/// to never exceed the caller-supplied hard ceiling).
+/// the controller's lifetime (`max` is clamped at construction to never
+/// exceed the caller-supplied hard ceiling).
 pub struct AdaptiveWindow {
     min: usize,
     max: usize,
@@ -79,7 +77,7 @@ pub struct AdaptiveWindow {
 impl AdaptiveWindow {
     /// `initial`/`min` are the controller's starting point and floor;
     /// `hard_ceiling` is the pre-existing, non-adaptive per-peer
-    /// concurrency bound (task 1.2 — `PeerSyncSession` passes
+    /// concurrency bound (`PeerSyncSession` passes
     /// `MAX_IN_FLIGHT_MESSAGES_PER_PEER`) that `max` is clamped to never
     /// exceed, regardless of what's passed as `max`. `initial` is itself
     /// clamped into the resulting `[min, max]` range.
@@ -95,16 +93,16 @@ impl AdaptiveWindow {
     }
 
     /// The current recommended number of concurrent in-flight requests —
-    /// always within `[min, max]` (task 1.2's clamp), regardless of how
-    /// many `on_success`/`on_timeout` calls have run.
+    /// always within `[min, max]`, regardless of how many
+    /// `on_success`/`on_timeout` calls have run.
     pub fn current(&self) -> usize {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         (state.window.round() as i64).clamp(self.min as i64, self.max as i64) as usize
     }
 
     /// Records a successful, answered `fetch_block` round trip and its
-    /// observed latency (design.md: "smoothed RTT ... EWMA of
-    /// block-request-response"). Grows the window additively unless this
+    /// observed latency (a smoothed RTT — an EWMA of
+    /// block-request-response latency). Grows the window additively unless this
     /// sample itself shows RTT inflation relative to the smoothed
     /// baseline, in which case it backs off multiplicatively instead —
     /// the same "or RTT inflation" back-off trigger `on_timeout` also
@@ -139,8 +137,8 @@ impl AdaptiveWindow {
     /// `PeerSyncSession::record_fetch_timeout`'s doc comment for why this
     /// can't be observed from inside `fetch_block` itself). Always backs
     /// off multiplicatively, floored at `min` — this controller never lets
-    /// a sustained-bad-link peer starve completely (task 1.2: still bounded
-    /// below, not just above).
+    /// a sustained-bad-link peer starve completely (still bounded below,
+    /// not just above).
     pub fn on_timeout(&self) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.window = (state.window * MULTIPLICATIVE_DECREASE_FACTOR).max(self.min as f64);
@@ -165,14 +163,14 @@ mod tests {
 
     #[test]
     fn max_is_clamped_to_the_hard_ceiling_even_if_a_larger_max_is_requested() {
-        // task 1.2: even a caller-requested `max` above the pre-existing
-        // hard security ceiling never actually takes effect.
+        // A caller-requested `max` above the pre-existing hard security
+        // ceiling never actually takes effect.
         let w = AdaptiveWindow::new(4, 1, 1_000_000, /* hard_ceiling */ 64);
         assert_eq!(w.max, 64);
     }
 
-    /// design.md: "additively grow the in-flight window while RTT is
-    /// stable ... Clamp to [min, max]". Real proof, not just the math in
+    /// Additively grows the in-flight window while RTT is
+    /// stable, clamped to [min, max]. Real proof, not just the math in
     /// isolation: repeated fast, stable-RTT successes must move the
     /// window up, one step at a time, and never past `max` even under a
     /// long burst of perfect conditions.
@@ -205,7 +203,7 @@ mod tests {
         );
     }
 
-    /// design.md: "multiplicatively back off on timeouts/loss". Real
+    /// Multiplicatively backs off on timeouts/loss. Real
     /// proof: grow the window under good conditions, then inject
     /// timeouts (simulating packet loss / an unresponsive peer) and show
     /// the window actually shrinks, floored at `min`.
@@ -229,7 +227,7 @@ mod tests {
         assert_eq!(shrunk, 1, "sustained loss should floor the window at min, got {shrunk}");
     }
 
-    /// design.md: back off "on ... RTT inflation" too, not just an
+    /// Backs off on RTT inflation too, not just an
     /// outright missing reply — a real degraded-but-still-answering link
     /// (rising latency, no explicit loss/timeout) must still shrink the
     /// window.
@@ -255,7 +253,7 @@ mod tests {
         );
     }
 
-    /// design.md: "grows and shrinks within bounds" — a full
+    /// Grows and shrinks within bounds — a full
     /// degrade-then-recover cycle, proving the window is not a one-way
     /// ratchet in either direction.
     #[test]

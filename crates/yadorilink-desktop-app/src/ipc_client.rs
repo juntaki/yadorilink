@@ -1,13 +1,12 @@
-//! add-desktop-status-app task 2.1/2.2/2.3: this crate's own control-socket
-//! client. Deliberately duplicated from `yadorilink-cli`'s
-//! `control_client.rs`/`device_config.rs` rather than shared — that's this
-//! codebase's own established precedent (see `yadorilink-cli`'s
-//! `device_config.rs` doc comment: "duplicated rather than shared... the
-//! same reason `config_dir()` is already duplicated between the two
-//! crates"), and a research pass over this workspace found no existing
-//! client library crate a new binary could depend on instead. Only
-//! `yadorilink-ipc-proto` (wire messages + framing) is a project-internal
-//! dependency here.
+//! This crate's own control-socket client. Deliberately duplicated from
+//! `yadorilink-cli`'s `control_client.rs`/`device_config.rs` rather than
+//! shared — that's this codebase's own established precedent (see
+//! `yadorilink-cli`'s `device_config.rs` doc comment: "duplicated rather
+//! than shared... the same reason `config_dir()` is already duplicated
+//! between the two crates"), and a research pass over this workspace
+//! found no existing client library crate a new binary could depend on
+//! instead. Only `yadorilink-ipc-proto` (wire messages + framing) is a
+//! project-internal dependency here.
 
 use std::path::PathBuf;
 
@@ -96,7 +95,7 @@ async fn connect() -> std::io::Result<tokio::net::UnixStream> {
     tokio::net::UnixStream::connect(control_socket_path()).await
 }
 
-/// windows-local-ipc-support: same busy-pipe retry `yadorilink-cli`'s own
+/// Same busy-pipe retry `yadorilink-cli`'s own
 /// `connect()` uses (see that module's doc comment for why) -- unverified
 /// in this environment (no Windows toolchain/machine available here), kept
 /// identical to the already-Windows-VM-verified CLI implementation rather
@@ -125,15 +124,15 @@ async fn connect() -> std::io::Result<tokio::net::windows::named_pipe::NamedPipe
 }
 
 /// Whether a device has already been registered locally (`device.json`
-/// written by a prior `yadorilink device register`) -- read directly from
-/// the local config file rather than over IPC, matching the codebase's
-/// established pattern for this exact question (`yadorilink-cli`'s
-/// `commands/link.rs`::`share accept` reads `device_config` directly for
-/// the same reason: this is local client identity, not daemon-owned sync
-/// state, so there's no aggregate-status API for it — see design.md's
-/// "thin status-app" decision: it queries daemon state and reads its own
-/// local config, it does not invent new daemon surface for information
-/// that's already a local file).
+/// written by a prior `yadorilink device register`) -- read directly
+/// from the local config file rather than over IPC, matching the
+/// codebase's established pattern for this exact question
+/// (`yadorilink-cli`'s `commands/link.rs`::`share accept` reads
+/// `device_config` directly for the same reason: this is local client
+/// identity, not daemon-owned sync state, so there's no aggregate-status
+/// API for it). This app stays a thin status-app: it queries daemon
+/// state and reads its own local config, it does not invent new daemon
+/// surface for information that's already a local file.
 pub fn is_device_registered() -> bool {
     config_dir().join("device.json").is_file()
 }

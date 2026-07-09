@@ -7,15 +7,15 @@ use yadorilink_ipc_proto::daemonctl::{
 use crate::control_client;
 use crate::error::CliError;
 
-/// add-sync-fidelity task 6.1: the `  held=N` suffix appended to a link's
-/// summary line — empty (rendering no suffix at all) when the link has no
-/// held files, so an unaffected link's `status` output is byte-for-byte
-/// unchanged from before this task (task 6.3's "no new fields rendered
-/// when a link has none"). Factored out as a pure function (matching
-/// `yadorilink_daemon`'s and `yadorilink_sync_core`'s established pattern
-/// of pulling formatting/decision logic out of the `println!`-driven
-/// command body — see `report.rs`'s `confirm_with_reader`) so it's
-/// directly unit-testable without capturing real process stdout.
+/// The `  held=N` suffix appended to a link's summary line — empty
+/// (rendering no suffix at all) when the link has no held files, so an
+/// unaffected link's `status` output is byte-for-byte unchanged from
+/// before this change, ensuring no new fields are rendered when a link has
+/// none. Factored out as a pure function (matching `yadorilink_daemon`'s
+/// and `yadorilink_sync_core`'s established pattern of pulling
+/// formatting/decision logic out of the `println!`-driven command body —
+/// see `report.rs`'s `confirm_with_reader`) so it's directly
+/// unit-testable without capturing real process stdout.
 fn held_summary_suffix(link: &LinkStatus) -> String {
     if link.held_file_count == 0 {
         String::new()
@@ -24,16 +24,16 @@ fn held_summary_suffix(link: &LinkStatus) -> String {
     }
 }
 
-/// add-sync-fidelity task 6.1: one indented detail line per held file
-/// (path and reason), printed directly beneath a link's summary line.
-/// Empty when the link has no held files (task 6.3).
+/// One indented detail line per held file (path and reason), printed
+/// directly beneath a link's summary line. Empty when the link has no
+/// held files.
 fn held_file_detail_lines(link: &LinkStatus) -> Vec<String> {
     link.held_files.iter().map(|h| format!("    held: {}  ({})", h.path, h.reason)).collect()
 }
 
-/// add-resource-governance task 5.4: the `  degraded (<reason>)` suffix —
-/// same "empty unless applicable" discipline as `held_summary_suffix`, so
-/// a healthy link's output line is unaffected by this feature existing.
+/// The `  degraded (<reason>)` suffix — same "empty unless applicable"
+/// discipline as `held_summary_suffix`, so a healthy link's output line
+/// is unaffected by this feature existing.
 fn degraded_suffix(link: &LinkStatus) -> String {
     if link.degraded {
         format!("  degraded ({})", link.degraded_reason)
@@ -42,13 +42,13 @@ fn degraded_suffix(link: &LinkStatus) -> String {
     }
 }
 
-/// add-folder-direction-modes task 4.3: same rendering `link.rs`'s `list`
-/// command uses (kept as separate free functions per-module rather than a
-/// shared helper, matching this pair's own existing precedent —
-/// `held_summary_suffix` here vs. `skipped_symlink_suffix` there are
-/// likewise independent, module-local implementations of the same "empty
-/// unless applicable" idea, not something this codebase currently
-/// factors into a shared crate-level formatting module).
+/// Same rendering `link.rs`'s `list` command uses (kept as separate free
+/// functions per-module rather than a shared helper, matching this
+/// pair's own existing precedent — `held_summary_suffix` here vs.
+/// `skipped_symlink_suffix` there are likewise independent, module-local
+/// implementations of the same "empty unless applicable" idea, not
+/// something this codebase currently factors into a shared crate-level
+/// formatting module).
 fn mode_suffix(link: &LinkStatus) -> String {
     if link.mode.is_empty() || link.mode == "send_receive" {
         String::new()
@@ -72,9 +72,9 @@ fn divergence_suffix(link: &LinkStatus) -> String {
     }
 }
 
-/// add-resource-governance task 5.4: `0` reads as "unlimited" (matching
-/// `limits show`'s own convention — task 5.3); otherwise a human-scaled
-/// `B/s`/`KiB/s`/`MiB/s`/`GiB/s` value.
+/// `0` reads as "unlimited" (matching `limits show`'s own convention);
+/// otherwise a human-scaled `B/s`/`KiB/s`/`MiB/s`/`GiB/s`
+/// value.
 pub(crate) fn format_rate_bytes_per_sec(bytes_per_sec: u64) -> String {
     if bytes_per_sec == 0 {
         return "unlimited".to_string();
@@ -93,16 +93,16 @@ pub(crate) fn format_rate_bytes_per_sec(bytes_per_sec: u64) -> String {
     }
 }
 
-/// add-desktop-status-app task 1.3: renders `StatusResponse.overall_state`/
-/// `attention_reasons` — the same daemon-computed rollup the desktop
-/// status app's tray label reads (`yadorilink-desktop-app`'s
-/// `status_model::headline` calls the identical fields) — as `status`'s
-/// first line, giving the CLI parity the desktop-status-app spec's
-/// "App status is testable without UI automation" scenario asks for: an
-/// automated test (or a user) can read the same aggregate state from the
-/// CLI without any UI. Empty `overall_state` (an old daemon predating this
-/// field) renders nothing at all, matching this file's "absent = no new
-/// output" convention for every other additive field.
+/// Renders `StatusResponse.overall_state`/`attention_reasons` — the same
+/// daemon-computed rollup the desktop status app's tray label reads
+/// (`yadorilink-desktop-app`'s `status_model::headline` calls the
+/// identical fields) — as `status`'s first line, giving the CLI parity
+/// the desktop-status-app spec's "App status is testable without UI
+/// automation" scenario asks for: an automated test (or a user) can read
+/// the same aggregate state from the CLI without any UI. Empty
+/// `overall_state` (an old daemon predating this field) renders nothing
+/// at all, matching this file's "absent = no new output" convention for
+/// every other additive field.
 fn overall_state_line(status: &StatusResponse) -> Option<String> {
     if status.overall_state.is_empty() {
         return None;
@@ -118,7 +118,7 @@ fn overall_state_line(status: &StatusResponse) -> Option<String> {
     }
 }
 
-/// task 5.4: `yadorilink status`'s configured-limits/current-rate summary
+/// `yadorilink status`'s configured-limits/current-rate summary
 /// line.
 fn limits_summary_line(status: &StatusResponse) -> String {
     format!(
@@ -130,17 +130,17 @@ fn limits_summary_line(status: &StatusResponse) -> String {
     )
 }
 
-/// add-untrusted-storage-peer task 4.3: the ` [storage-only]` suffix for a
-/// peer flagged ciphertext-only (`PeerStatus.storage_only`) — same "empty
-/// unless applicable" discipline as `held_summary_suffix`, so an unflagged
-/// peer's line is unaffected by this feature existing. Forward-compatible
-/// rendering only: the daemon does not populate `storage_only` yet (a
-/// documented, out-of-scope-for-this-change follow-up — the coordination
-/// plane and wire type already carry the flag, but nothing on the daemon
-/// side threads a peer's flag into `PeerStatus` yet), so every existing
-/// `status` output renders this as empty/false today; only a future
-/// daemon-side change will actually cause the badge to appear, with no CLI
-/// change needed at that point.
+/// The ` [storage-only]` suffix for a peer flagged ciphertext-only
+/// (`PeerStatus.storage_only`) — same "empty unless applicable"
+/// discipline as `held_summary_suffix`, so an unflagged peer's line is
+/// unaffected by this feature existing. Forward-compatible rendering
+/// only: the daemon does not populate `storage_only` yet (a documented,
+/// out-of-scope follow-up — the coordination plane and wire type already
+/// carry the flag, but nothing on the daemon side threads a peer's flag
+/// into `PeerStatus` yet), so every existing `status` output renders
+/// this as empty/false today; only a future daemon-side change will
+/// actually cause the badge to appear, with no CLI change needed at that
+/// point.
 fn storage_only_suffix(peer: &PeerStatus) -> String {
     if peer.storage_only {
         "  [storage-only]".to_string()
@@ -149,7 +149,7 @@ fn storage_only_suffix(peer: &PeerStatus) -> String {
     }
 }
 
-/// task 5.4: one line per volume's free-space state.
+/// one line per volume's free-space state.
 fn volume_line(volume: &VolumeFreeSpace) -> String {
     format!(
         "  {}  {}  (available={} headroom={})",
@@ -157,9 +157,9 @@ fn volume_line(volume: &VolumeFreeSpace) -> String {
     )
 }
 
-/// add-block-store-gc task 5.2: byte-count formatter, shared in shape with
-/// `format_rate_bytes_per_sec` above minus the `/s` suffix — block-store
-/// usage and the reclaimable estimate are point-in-time totals, not rates.
+/// Byte-count formatter, shared in shape with `format_rate_bytes_per_sec`
+/// above minus the `/s` suffix — block-store usage and the reclaimable
+/// estimate are point-in-time totals, not rates.
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut value = bytes as f64;
@@ -175,7 +175,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// task 5.2: a relative "how long ago" for `StatusResponse.last_gc_unix` —
+/// a relative "how long ago" for `StatusResponse.last_gc_unix` —
 /// "never" if a real (non-dry-run) sweep has never completed since this
 /// daemon's block store was created (`0`, matching `GcState`'s own "0 = no
 /// completed sweep" convention).
@@ -199,7 +199,7 @@ fn last_gc_summary(last_gc_unix: i64) -> String {
     }
 }
 
-/// task 5.2: `yadorilink status`'s block-store usage/GC-health summary
+/// `yadorilink status`'s block-store usage/GC-health summary
 /// line — always rendered (unlike this file's "empty unless applicable"
 /// suffixes), since usage/last-GC-time is always meaningful, matching
 /// `limits_summary_line`'s own "always shown" precedent immediately above.
@@ -213,11 +213,11 @@ fn block_store_summary_line(status: &StatusResponse) -> String {
     )
 }
 
-/// add-observability-and-metrics task 1.2/4.1: this link's active-transfer
-/// headline — empty unless `has_active_transfer` (this file's established
-/// "empty unless applicable" discipline, matching `degraded_suffix`/
-/// `held_summary_suffix`). The ETA is explicitly labelled `~` (best-effort,
-/// design.md) rather than presented as precise.
+/// This link's active-transfer headline — empty unless
+/// `has_active_transfer` (this file's established "empty unless
+/// applicable" discipline, matching `degraded_suffix`/
+/// `held_summary_suffix`). The ETA is explicitly labelled `~`
+/// (best-effort) rather than presented as precise.
 fn transfer_progress_suffix(link: &LinkStatus) -> String {
     if !link.has_active_transfer {
         return String::new();
@@ -241,7 +241,7 @@ fn transfer_progress_suffix(link: &LinkStatus) -> String {
     )
 }
 
-/// task 1.3/4.1: one line per currently-active transfer — the per-file
+/// One line per currently-active transfer — the per-file
 /// detail underlying every link's headline `transfer_progress_suffix`.
 fn active_transfer_detail_lines(status: &StatusResponse) -> Vec<String> {
     status
@@ -261,10 +261,10 @@ fn active_transfer_detail_lines(status: &StatusResponse) -> Vec<String> {
         .collect()
 }
 
-/// task 2.2/4.1: the bounded recent-error feed, newest first (matching the
+/// The bounded recent-error feed, newest first (matching the
 /// daemon's own `RecentErrorLog::recent` ordering) — every field here is
 /// already a coarse category/timestamp/context string (never a path/key/
-/// token/IP, task 2.1's redaction requirement), so this renders it as-is.
+/// token/IP, per our redaction requirement), so this renders it as-is.
 fn recent_errors_summary_lines(status: &StatusResponse) -> Vec<String> {
     status
         .recent_errors
@@ -273,13 +273,12 @@ fn recent_errors_summary_lines(status: &StatusResponse) -> Vec<String> {
         .collect()
 }
 
-/// add-automatic-updates task 5.5: concise update-state lines for
-/// `yadorilink status`, only rendered when there's something worth
-/// surfacing (spec "Status surfaces available update"/"Status surfaces
-/// failed update") — a healthy, up-to-date daemon's `status` output is
-/// otherwise unaffected by this feature existing, matching this file's
-/// own "empty unless applicable" convention (`held_summary_suffix`,
-/// `degraded_suffix`, ...).
+/// Concise update-state lines for `yadorilink status`, only rendered
+/// when there's something worth surfacing (spec "Status surfaces
+/// available update"/"Status surfaces failed update") — a healthy,
+/// up-to-date daemon's `status` output is otherwise unaffected by this
+/// feature existing, matching this file's own "empty unless applicable"
+/// convention (`held_summary_suffix`, `degraded_suffix`, ...).
 fn update_summary_lines(status: &StatusResponse) -> Vec<String> {
     let mut lines = Vec::new();
     if !status.update_available_version.is_empty() {
@@ -306,12 +305,12 @@ fn update_summary_lines(status: &StatusResponse) -> Vec<String> {
     lines
 }
 
-/// add-observability-and-metrics task 4.1: `yadorilink status`, optionally
-/// re-polling and re-rendering on an interval (`--watch`) instead of
-/// printing one snapshot and exiting — useful for watching a big sync's
-/// per-transfer progress live rather than re-running the command by hand.
-/// A plain `yadorilink status` (`watch = false`) is byte-for-byte the same
-/// single-snapshot behavior as before this flag existed.
+/// `yadorilink status`, optionally re-polling and re-rendering on an
+/// interval (`--watch`) instead of printing one snapshot and exiting —
+/// useful for watching a big sync's per-transfer progress live rather
+/// than re-running the command by hand. A plain `yadorilink status`
+/// (`watch = false`) is byte-for-byte the same single-snapshot behavior
+/// as before this flag existed.
 pub async fn status(watch: bool) -> Result<(), CliError> {
     if !watch {
         return render_status_once().await;
@@ -448,8 +447,8 @@ mod tests {
         }
     }
 
-    /// add-folder-direction-modes task 4.3: mode/divergence rendering
-    /// mirrors `link.rs`'s own tests for the identical formatting logic.
+    /// Mode/divergence rendering mirrors `link.rs`'s own tests for the
+    /// identical formatting logic.
     #[test]
     fn send_receive_mode_and_no_divergence_render_no_new_output() {
         let link = base_link();
@@ -466,7 +465,7 @@ mod tests {
         assert_eq!(divergence_suffix(&link), "  out_of_sync=4");
     }
 
-    /// task 6.3: a link with no held files renders no held-related output
+    /// a link with no held files renders no held-related output
     /// at all — no `held=0` suffix, no detail lines.
     #[test]
     fn no_held_files_renders_no_new_output() {
@@ -475,7 +474,7 @@ mod tests {
         assert!(held_file_detail_lines(&link).is_empty());
     }
 
-    /// task 6.1: a link with held files shows the count and, for each
+    /// a link with held files shows the count and, for each
     /// held file, its path and reason.
     #[test]
     fn held_files_render_count_and_per_file_reason() {
@@ -503,14 +502,14 @@ mod tests {
         assert!(lines[1].contains("invalid_name"));
     }
 
-    /// add-resource-governance task 5.4/task 6.3-style discipline: a
-    /// healthy (non-degraded) link renders no degraded-related output.
+    /// A healthy (non-degraded) link renders no degraded-related output,
+    /// matching this file's "empty unless applicable" discipline.
     #[test]
     fn no_degraded_state_renders_no_new_output() {
         assert_eq!(degraded_suffix(&base_link()), "");
     }
 
-    /// task 5.4: a degraded link shows its reason.
+    /// a degraded link shows its reason.
     #[test]
     fn degraded_link_shows_its_reason() {
         let mut link = base_link();
@@ -519,14 +518,14 @@ mod tests {
         assert_eq!(degraded_suffix(&link), "  degraded (insufficient free space to write big.bin)");
     }
 
-    /// task 5.3/5.4: `0` reads as "unlimited" — the shared convention
+    /// `0` reads as "unlimited" — the shared convention
     /// between `status` and `limits show`.
     #[test]
     fn format_rate_zero_is_unlimited() {
         assert_eq!(format_rate_bytes_per_sec(0), "unlimited");
     }
 
-    /// task 5.4: non-zero rates scale to a human-readable unit.
+    /// non-zero rates scale to a human-readable unit.
     #[test]
     fn format_rate_scales_to_a_human_readable_unit() {
         assert_eq!(format_rate_bytes_per_sec(500), "500 B/s");
@@ -544,17 +543,17 @@ mod tests {
             current_upload_bytes_per_sec: 0,
             current_download_bytes_per_sec: 0,
             volumes: vec![],
-            // add-automatic-updates: `..Default::default()` rather than
-            // listing every new field explicitly, since this struct
-            // literal predates those fields and most tests using this
-            // helper don't care about them.
+            // `..Default::default()` rather than listing every new field
+            // explicitly, since this struct literal predates those
+            // fields and most tests using this helper don't care about
+            // them.
             ..Default::default()
         }
     }
 
-    /// add-automatic-updates task 5.5/5.6: a healthy, up-to-date status
-    /// (the pre-this-change default) renders no update-related output at
-    /// all — matches this file's own "empty unless applicable" discipline.
+    /// A healthy, up-to-date status (the default) renders no
+    /// update-related output at all — matches this file's own "empty
+    /// unless applicable" discipline.
     #[test]
     fn no_update_available_renders_no_new_output() {
         assert_eq!(update_summary_lines(&base_status()), Vec::<String>::new());
@@ -572,8 +571,8 @@ mod tests {
         assert!(lines[0].contains("available"));
     }
 
-    /// design.md "Mandatory security update is surfaced": a mandatory
-    /// update's line says so explicitly, distinct from a merely-available one.
+    /// A mandatory update's line says so explicitly, distinct from a
+    /// merely-available one.
     #[test]
     fn mandatory_update_says_so() {
         let mut status = base_status();
@@ -583,8 +582,7 @@ mod tests {
         assert!(lines[0].contains("mandatory"));
     }
 
-    /// design.md "Rollout holdback prevents install": a held-back update
-    /// shows the holdback reason as a second line.
+    /// A held-back update shows the holdback reason as a second line.
     #[test]
     fn held_back_update_shows_its_reason() {
         let mut status = base_status();
@@ -596,7 +594,7 @@ mod tests {
         assert!(lines[1].contains("staged rollout at 10%"));
     }
 
-    /// design.md "Install waits for safe point".
+    /// Install waits for a safe point.
     #[test]
     fn update_waiting_for_safe_point_says_so() {
         let mut status = base_status();
@@ -619,7 +617,7 @@ mod tests {
         assert!(lines[0].contains("yadorilink update status"));
     }
 
-    // --- add-desktop-status-app task 1.3: overall-state rendering ---
+    // --- overall-state rendering ---
 
     /// An old daemon that predates `overall_state` (empty string) renders
     /// no new output at all.
@@ -646,7 +644,7 @@ mod tests {
         );
     }
 
-    /// task 5.4: the limits summary line reports both configured and
+    /// the limits summary line reports both configured and
     /// current rates, `unlimited` when unconfigured.
     #[test]
     fn limits_summary_line_reports_configured_and_current_rates() {
@@ -673,9 +671,8 @@ mod tests {
         }
     }
 
-    /// add-untrusted-storage-peer task 4.3: an unflagged peer (today's
-    /// only real case, since the daemon doesn't populate the field yet)
-    /// renders no new output.
+    /// An unflagged peer (today's only real case, since the daemon
+    /// doesn't populate the field yet) renders no new output.
     #[test]
     fn no_storage_only_flag_renders_no_new_output() {
         assert_eq!(storage_only_suffix(&base_peer()), "");
@@ -691,7 +688,7 @@ mod tests {
         assert_eq!(storage_only_suffix(&peer), "  [storage-only]");
     }
 
-    /// task 5.4: a volume line reports path, state, and byte counts.
+    /// a volume line reports path, state, and byte counts.
     #[test]
     fn volume_line_reports_path_state_and_bytes() {
         let volume = VolumeFreeSpace {
@@ -703,8 +700,8 @@ mod tests {
         assert_eq!(volume_line(&volume), "  /tmp/photos  low  (available=1500 headroom=1000)");
     }
 
-    /// add-block-store-gc task 5.2/5.3: byte formatting scales the same
-    /// way `format_rate_bytes_per_sec` does, minus the `/s` suffix.
+    /// Byte formatting scales the same way `format_rate_bytes_per_sec`
+    /// does, minus the `/s` suffix.
     #[test]
     fn format_bytes_scales_to_a_human_readable_unit() {
         assert_eq!(format_bytes(500), "500 B");
@@ -712,14 +709,14 @@ mod tests {
         assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MiB");
     }
 
-    /// task 5.2: `0`/negative means "never run" — never rendered as a
+    /// `0`/negative means "never run" — never rendered as a
     /// literal unix-epoch timestamp.
     #[test]
     fn last_gc_summary_reports_never_when_no_sweep_has_completed() {
         assert_eq!(last_gc_summary(0), "never");
     }
 
-    /// task 5.2: a recent completion renders as a short relative bucket.
+    /// a recent completion renders as a short relative bucket.
     #[test]
     fn last_gc_summary_reports_a_relative_bucket_for_a_recent_sweep() {
         let now =
@@ -731,7 +728,7 @@ mod tests {
         assert_eq!(last_gc_summary(now - 2 * 86400), "2d ago");
     }
 
-    /// task 5.2/5.3: `status` shows non-zero usage after files are synced
+    /// `status` shows non-zero usage after files are synced
     /// (block/byte counts) and reports the last-GC time / reclaimable
     /// estimate alongside it — this is the pure-formatting half; the
     /// daemon-side wiring is exercised by `control_socket.rs`'s own tests
@@ -752,16 +749,16 @@ mod tests {
         assert!(line.contains("~1.0 KiB reclaimable"));
     }
 
-    // --- add-observability-and-metrics task 1.3/2.2/4.1: progress + recent-error rendering ---
+    // --- progress + recent-error rendering ---
 
-    /// task 4.1's "empty unless applicable" discipline: a link with no
+    /// Following the "empty unless applicable" discipline: a link with no
     /// active transfer renders no transfer-related suffix at all.
     #[test]
     fn no_active_transfer_renders_no_new_output() {
         assert_eq!(transfer_progress_suffix(&base_link()), "");
     }
 
-    /// task 1.2/4.1: an active transfer's headline reports a percent,
+    /// An active transfer's headline reports a percent,
     /// byte/block counts, and a best-effort, explicitly-labelled ETA.
     #[test]
     fn active_transfer_renders_percent_bytes_blocks_and_eta() {
@@ -780,8 +777,8 @@ mod tests {
         assert!(suffix.contains("eta~30s"));
     }
 
-    /// task 4.1: an active transfer with no ETA signal yet (design.md:
-    /// "best-effort") omits the `eta~` fragment rather than claiming `0s`.
+    /// an active transfer with no ETA signal yet (best-effort)
+    /// omits the `eta~` fragment rather than claiming `0s`.
     #[test]
     fn active_transfer_with_no_eta_signal_omits_the_eta_fragment() {
         let mut link = base_link();
@@ -792,7 +789,7 @@ mod tests {
         assert!(!transfer_progress_suffix(&link).contains("eta~"));
     }
 
-    /// task 1.3/4.1: the per-file active-transfer detail list renders one
+    /// The per-file active-transfer detail list renders one
     /// line per entry, including its source peer.
     #[test]
     fn active_transfer_detail_lines_render_one_line_per_transfer() {
@@ -815,14 +812,14 @@ mod tests {
         assert!(lines[0].contains("device-b"));
     }
 
-    /// task 4.1: no active transfers renders no "Active transfers:" detail
+    /// no active transfers renders no "Active transfers:" detail
     /// at all.
     #[test]
     fn no_active_transfers_renders_no_detail_lines() {
         assert!(active_transfer_detail_lines(&base_status()).is_empty());
     }
 
-    /// task 2.2/4.1: recent errors render their category and coarse
+    /// Recent errors render their category and coarse
     /// context — never anything beyond what the daemon already redacted.
     #[test]
     fn recent_errors_render_category_and_coarse_context() {

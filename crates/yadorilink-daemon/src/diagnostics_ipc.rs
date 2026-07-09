@@ -1,31 +1,29 @@
-//! add-diagnostics-support-bundle task 2.1/2.2/2.3: daemon-side handlers
-//! for the diagnostics IPC surface added to `daemon_control.proto` (task
-//! 2.1). Kept in its own module, mirroring `reporting_ipc.rs`/
-//! `update_ipc.rs`'s precedent, rather than inlined into
-//! `control_socket.rs`'s match arms.
+//! Daemon-side handlers for the diagnostics IPC surface added to
+//! `daemon_control.proto`. Kept in its own module, mirroring
+//! `reporting_ipc.rs`/`update_ipc.rs`'s precedent, rather than inlined
+//! into `control_socket.rs`'s match arms.
 //!
 //! Bundle assembly deliberately reuses existing daemon state readers
 //! (`control_socket::list_link_statuses`/`volumes_free_space`/
 //! `health_snapshot`, `update_ipc::status_response`, the reporting error-
-//! candidate store) rather than re-deriving them a second way -- design.md
-//! decision "Export through the daemon so daemon-owned state files do not
-//! need to be read directly by the CLI." Redaction is likewise never
+//! candidate store) rather than re-deriving them a second way: the goal
+//! is to export through the daemon so daemon-owned state files do not
+//! need to be read directly by the CLI. Redaction is likewise never
 //! reimplemented here: every assembled bundle, including the bounded-
 //! timeout fallback, is passed through `yadorilink_reporting::
 //! redact_diagnostics_value` (the same daemon-independent helper
 //! `yadorilink-cli`'s CLI-only fallback bundle already uses) before it
 //! ever leaves this module.
 //!
-//! Task 2.3 ("bounded generation time and failure handling"): bundle
-//! assembly runs on a `spawn_blocking` worker thread (mirroring
-//! `hydration.rs`'s "move synchronous I/O off the tokio worker" precedent
-//! for `BlockStore::put`), wrapped in `tokio::time::timeout`
-//! (`hydration::hydrate_with_timeout`'s own established pattern) so a
-//! slow or stuck sub-collection (e.g. an unexpectedly large number of
-//! files/links to walk) can never hang the control-socket connection --
-//! the caller always gets a response within `DIAGNOSTICS_BUNDLE_TIMEOUT`,
-//! either the real bundle or a minimal, still schema-valid
-//! `"daemon-partial"` fallback.
+//! Bounded generation time and failure handling: bundle assembly runs on
+//! a `spawn_blocking` worker thread (mirroring `hydration.rs`'s "move
+//! synchronous I/O off the tokio worker" precedent for `BlockStore::put`),
+//! wrapped in `tokio::time::timeout` (`hydration::hydrate_with_timeout`'s
+//! own established pattern) so a slow or stuck sub-collection (e.g. an
+//! unexpectedly large number of files/links to walk) can never hang the
+//! control-socket connection -- the caller always gets a response within
+//! `DIAGNOSTICS_BUNDLE_TIMEOUT`, either the real bundle or a minimal,
+//! still schema-valid `"daemon-partial"` fallback.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,7 +34,7 @@ use yadorilink_reporting::schema::ReportPayload;
 
 use crate::daemon_state::DaemonState;
 
-/// Task 2.3: the overall time budget for one bundle-assembly call.
+/// The overall time budget for one bundle-assembly call.
 /// Chosen to match `PER_BLOCK_FETCH_TIMEOUT` (`hydration.rs`) -- long
 /// enough for a large number of links/files to be walked even on a
 /// loaded daemon, short enough that a CLI `diagnose preview`/`export`
@@ -61,13 +59,12 @@ pub async fn build_bundle(state: &Arc<DaemonState>) -> DiagnosticsBundleResponse
     run_bounded(DIAGNOSTICS_BUNDLE_TIMEOUT, move || assemble_bundle_sync(&assemble_state)).await
 }
 
-/// Task 2.3's actual bound: runs `work` on a `spawn_blocking` thread and
-/// gives it `timeout` to finish. A `work` closure that never returns
-/// (the "stuck sub-collection" case this task is about) leaves its
-/// thread running in the background -- synchronous code can't be forcibly
-/// preempted -- but the control socket itself always gets an answer by
-/// `timeout`, which is the actual guarantee this task calls for ("cannot
-/// hang indefinitely").
+/// The actual bound: runs `work` on a `spawn_blocking` thread and gives
+/// it `timeout` to finish. A `work` closure that never returns (the
+/// "stuck sub-collection" case) leaves its thread running in the
+/// background -- synchronous code can't be forcibly preempted -- but the
+/// control socket itself always gets an answer by `timeout`, which is
+/// the actual guarantee here ("cannot hang indefinitely").
 async fn run_bounded(
     timeout: Duration,
     work: impl FnOnce() -> serde_json::Value + Send + 'static,
@@ -138,10 +135,10 @@ fn assemble_bundle_sync(state: &DaemonState) -> serde_json::Value {
             let (path, _) = yadorilink_reporting::redact_diagnostics_text(&link.local_path);
             json!({
                 // Sequential, per-bundle pseudonyms -- not a hash of the
-                // real group_id/local_path -- deliberately: design.md's
-                // risk note calls for "stable pseudonymous IDs ... over
-                // category-level context" so a support engineer can tell
-                // "link 1" apart from "link 2" across the *same* bundle's
+                // real group_id/local_path -- deliberately, to give
+                // "stable pseudonymous IDs ... over category-level
+                // context" so a support engineer can tell "link 1" apart
+                // from "link 2" across the *same* bundle's
                 // `links`/`recent_errors` sections without ever seeing the
                 // real identifier.
                 "link_id": format!("link:{:03}", i + 1),
@@ -204,12 +201,12 @@ fn assemble_bundle_sync(state: &DaemonState) -> serde_json::Value {
     })
 }
 
-/// Task 2.3's fallback shape: a minimal bundle that still satisfies
-/// diagnostics bundle required top-level keys, used whenever
-/// `run_bounded` can't produce the real one in time (or the assembly task
-/// panicked). Its one `recent_errors` entry is synthesized here, not read
-/// from the error-candidate store, precisely so the user/support engineer
-/// can see that generation was incomplete rather than silently getting an
+/// The fallback shape: a minimal bundle that still satisfies diagnostics
+/// bundle required top-level keys, used whenever `run_bounded` can't
+/// produce the real one in time (or the assembly task panicked). Its one
+/// `recent_errors` entry is synthesized here, not read from the
+/// error-candidate store, precisely so the user/support engineer can see
+/// that generation was incomplete rather than silently getting an
 /// empty-looking-but-actually-fine bundle.
 fn timeout_fallback_bundle() -> serde_json::Value {
     let now = crate::reporting::time::now_rfc3339();
@@ -258,7 +255,7 @@ fn uptime_bucket(uptime: Duration) -> &'static str {
 }
 
 /// Worst-case classification across every volume `StatusResponse.volumes`
-/// reports (task 1.3/5.4's own `"ok" | "low" | "critical"` convention) --
+/// reports (using the same `"ok" | "low" | "critical"` convention) --
 /// "unknown" when there's nothing to classify (no links, no block-store
 /// volume resolvable).
 fn worst_volume_state<'a>(states: impl Iterator<Item = &'a str>) -> &'static str {
@@ -279,15 +276,12 @@ fn worst_volume_state<'a>(states: impl Iterator<Item = &'a str>) -> &'static str
     worst
 }
 
-/// Recent error categories/timestamps/context (design.md's "recent
-/// errors" bundle section), sourced from the same error-candidate store
-/// `reporting_ipc::generate_last_error_report` already reads -- this
-/// change's Codex-authored companion task (1.1) noted that
-/// `add-observability-and-metrics`'s dedicated recent-error ring buffer
-/// hadn't landed yet (`openspec list` still shows it at 0/13 tasks at the
-/// time of this change), so this reuses the existing error-candidate
-/// store (`add-oss-usage-error-reporting`) as the best available "recent
-/// errors" source rather than blocking on that sibling change.
+/// Recent error categories/timestamps/context (the "recent errors"
+/// bundle section), sourced from the same error-candidate store
+/// `reporting_ipc::generate_last_error_report` already reads. A
+/// dedicated recent-error ring buffer hadn't landed yet at the time this
+/// was written, so this reuses the existing error-candidate store as the
+/// best available "recent errors" source rather than blocking on that.
 fn recent_error_entries(state: &DaemonState) -> Vec<serde_json::Value> {
     let candidates = state.reporting.error_candidates();
     let Ok(metas) = candidates.list() else { return Vec::new() };
@@ -324,13 +318,12 @@ mod tests {
         DaemonState::new("device-a".into(), sync_state, store)
     }
 
-    /// Task 2.2 + diagnostics-specific redaction: a link whose local path
-    /// carries a real home-directory fragment must never appear verbatim
-    /// in the daemon-assembled bundle -- proves the daemon-side assembly
-    /// actually calls into `yadorilink_reporting`'s redaction helpers
-    /// (task 2.2's requirement), not just that the CLI-only fallback does
-    /// (already covered by `yadorilink-reporting::diagnostics`'s own
-    /// tests).
+    /// Diagnostics-specific redaction: a link whose local path carries a
+    /// real home-directory fragment must never appear verbatim in the
+    /// daemon-assembled bundle -- proves the daemon-side assembly
+    /// actually calls into `yadorilink_reporting`'s redaction helpers,
+    /// not just that the CLI-only fallback does (already covered by
+    /// `yadorilink-reporting::diagnostics`'s own tests).
     #[tokio::test]
     async fn daemon_bundle_redacts_a_real_linked_folder_path() {
         let state = test_state();
@@ -370,7 +363,7 @@ mod tests {
         assert!(resp.bundle_json.contains("link:001"));
     }
 
-    /// Task 2.3: bundle generation is bounded -- even if the underlying
+    /// Bundle generation is bounded -- even if the underlying
     /// sub-collection work is stuck (simulated here with a `thread::sleep`
     /// well longer than the timeout, standing in for e.g. an unexpectedly
     /// huge link/file walk), `run_bounded` still returns within its

@@ -11,7 +11,7 @@ pub struct DeviceConfig {
     pub device_id: String,
     pub coordination_addr: String,
     pub relay_addr: String,
-    /// add-update-migration-safety task 1.1: mirrors
+    /// Mirrors
     /// `yadorilink_daemon::device_config::DeviceConfig::config_version` —
     /// see that field's doc comment for the full rationale. `#[serde(default)]`
     /// so a `device.json` from before this field existed decodes as
@@ -45,7 +45,7 @@ pub fn control_socket_path() -> PathBuf {
     config_dir().join("daemon.sock")
 }
 
-/// windows-local-ipc-support design D4: the Windows equivalent of
+/// windows-local-ipc-support : the Windows equivalent of
 /// `control_socket_path()` — a pipe name, not a filesystem path. Mirrors
 /// `yadorilink_daemon::device_config::control_pipe_name()` exactly (same env
 /// var, same derivation); duplicated rather than shared because
@@ -66,27 +66,26 @@ pub fn save(cfg: &DeviceConfig) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // add-update-migration-safety task 1.1: always stamp the current
-    // version on write, regardless of what `cfg.config_version` the caller
-    // happened to pass in — mirrors the DB migrations' "stamp
-    // unconditionally" idempotency (see `SyncState::init`'s doc comment on
-    // its own `pragma_update` call).
+    // Always stamp the current version on write, regardless of what
+    // `cfg.config_version` the caller happened to pass in — mirrors the DB
+    // migrations' "stamp unconditionally" idempotency (see
+    // `SyncState::init`'s doc comment on its own `pragma_update` call).
     let cfg = DeviceConfig { config_version: CONFIG_VERSION, ..cfg.clone() };
     write_config_file(&path, &serde_json::to_string_pretty(&cfg)?)
 }
 
 /// Reads back this device's local identity, written by a prior successful
-/// `yadorilink device register` (see `save` above). add-cross-account-sharing:
-/// used by `share accept` so the invitee doesn't have to pass an explicit
-/// `--device-id` — "which device am I" is already recorded locally.
+/// `yadorilink device register` (see `save` above). Used by `share accept`
+/// so the invitee doesn't have to pass an explicit `--device-id` — "which
+/// device am I" is already recorded locally.
 pub fn load() -> std::io::Result<DeviceConfig> {
     let contents = std::fs::read_to_string(config_path())?;
     let config: DeviceConfig = serde_json::from_str(&contents)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    // add-update-migration-safety task 1.3, spec "Downgrade blocked": this
-    // `device.json` was written by a newer CLI/daemon than this one —
-    // refuse it with a clear message rather than silently using a config
-    // this build may not fully understand. Mirrors
+    // Downgrade blocked: this `device.json` was written by a newer
+    // CLI/daemon than this one — refuse it with a clear message rather
+    // than silently using a config this build may not fully understand.
+    // Mirrors
     // `SyncState::init`'s `check_schema_not_newer_than_supported`/
     // `SyncError::UnsupportedSchemaDowngrade` for the DB case.
     if config.config_version > CONFIG_VERSION {
@@ -123,17 +122,16 @@ fn write_config_file(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::write(path, contents)
 }
 
-/// add-update-migration-safety tasks 1.1/1.3/2.2: `YADORILINK_CONFIG_DIR` is
-/// process-global and Rust runs `#[test]` functions concurrently by
-/// default, so *every* test anywhere in this crate that sets it (this
-/// module's own version-safety tests below, and
+/// `YADORILINK_CONFIG_DIR` is process-global and Rust runs `#[test]`
+/// functions concurrently by default, so *every* test anywhere in this
+/// crate that sets it (this module's own version-safety tests below, and
 /// `commands::account`'s pre-existing `export_then_import_round_trips_
 /// through_real_files`) must serialize on this lock — otherwise two of
 /// them race and one reads back a directory the other wrote (or removed a
 /// file from), exactly what surfaced as a spurious
 /// `std::fs::remove_file(...).unwrap()` "No such file or directory" panic
-/// in `commands::account`'s test once this task added more tests that
-/// touch the same env var. `pub(crate)` (not private to this module's own
+/// in `commands::account`'s test once more tests were added that touch
+/// the same env var. `pub(crate)` (not private to this module's own
 /// `#[cfg(test)]` block) specifically so `commands::account`'s test can
 /// share it.
 #[cfg(test)]
@@ -152,7 +150,7 @@ mod tests {
         result
     }
 
-    /// task 1.1: `save` always writes the current `CONFIG_VERSION`, even
+    /// `save` always writes the current `CONFIG_VERSION`, even
     /// if the caller (as every real call site does — `save` always
     /// overwrites it) passed a different value — mirrors the DB
     /// migrations' unconditional version-stamping idempotency.
@@ -172,7 +170,7 @@ mod tests {
         });
     }
 
-    /// task 1.1/2.2 (rerun/upgrade): a `device.json` written before this
+    /// A `device.json` written before this
     /// field existed (no `config_version` key at all) still parses, with
     /// `config_version` defaulting to 0, not a deserialization error —
     /// the same "no behavior change without opt-in" guarantee the DB
@@ -192,7 +190,7 @@ mod tests {
         });
     }
 
-    /// task 1.3, spec "Downgrade blocked": a `device.json` stamped with a
+    /// spec "Downgrade blocked": a `device.json` stamped with a
     /// version newer than this build supports must make `load` fail
     /// clearly, not silently return a config this build doesn't fully
     /// understand.

@@ -1,5 +1,4 @@
-//! OSS usage/error reporting local storage (openspec change
-//! `add-oss-usage-error-reporting`, tasks.md section 2). This module owns
+//! OSS usage/error reporting local storage. This module owns
 //! everything under `<config_dir>/reporting/` — consent/config state,
 //! aggregate usage counters, bounded error-candidate persistence, and the
 //! bounded unsent-report queue. It deliberately depends only on
@@ -54,7 +53,7 @@ use error_candidates::ErrorCandidateStore;
 use queue::QueueStore;
 
 /// `<config_dir>/reporting` — a sibling of `device.json`/the block store,
-/// never inside a linked/synced folder (design.md D3/D7).
+/// never inside a linked/synced folder.
 pub fn reporting_dir() -> PathBuf {
     crate::device_config::config_dir().join("reporting")
 }
@@ -213,7 +212,7 @@ mod tests {
         assert_eq!(payload.command_category_counts.get("link"), Some(&1));
     }
 
-    /// Task 2.7: reporting-storage failure isolation. Points the
+    /// reporting-storage failure isolation. Points the
     /// reporting directory at a path that can never be created (a plain
     /// file already sits where the directory needs to go — portable
     /// across Unix and Windows, unlike chmod-based read-only tricks) and

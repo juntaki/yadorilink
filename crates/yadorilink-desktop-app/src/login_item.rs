@@ -1,14 +1,14 @@
-//! add-desktop-status-app task 3.3 "launch-at-login": toggles this app's
-//! own login-item registration. Mirrors the *mechanism* `installer/macos/
-//! scripts/postinstall` already uses for `yadorilink-daemon` itself (a
-//! per-user `LaunchAgent` plist under `~/Library/LaunchAgents`, loaded via
-//! `launchctl bootstrap gui/$UID`) rather than the newer `SMAppService`
-//! API, since that mechanism is already proven end-to-end in this
-//! codebase (real-VM-verified per the daemon's own postinstall step) and
-//! this app's `Info.plist`/bundle story isn't set up for `SMAppService`'s
-//! bundle-identifier-based registration. Windows equivalent (a Scheduled
-//! Task, mirroring `installer/windows/daemon-task.ps1`) is not implemented
-//! here — see this file's Windows stub for why.
+//! Toggles this app's own login-item registration. Mirrors the
+//! *mechanism* `installer/macos/scripts/postinstall` already uses for
+//! `yadorilink-daemon` itself (a per-user `LaunchAgent` plist under
+//! `~/Library/LaunchAgents`, loaded via `launchctl bootstrap gui/$UID`)
+//! rather than the newer `SMAppService` API, since that mechanism is
+//! already proven end-to-end in this codebase (real-VM-verified per the
+//! daemon's own postinstall step) and this app's `Info.plist`/bundle
+//! story isn't set up for `SMAppService`'s bundle-identifier-based
+//! registration. Windows equivalent (a Scheduled Task, mirroring
+//! `installer/windows/daemon-task.ps1`) is not implemented here — see
+//! this file's Windows stub for why.
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoginItemError {
@@ -105,7 +105,7 @@ mod macos {
 #[cfg(target_os = "macos")]
 pub use macos::{disable, enable, is_enabled};
 
-/// task 4.2 notes an equivalent Windows startup-registration story
+/// notes an equivalent Windows startup-registration story
 /// (mirroring `installer/windows/daemon-task.ps1`'s per-user Scheduled
 /// Task) is the natural next step, but this change was implemented and
 /// verified only on macOS (this environment has no Windows machine/VM to

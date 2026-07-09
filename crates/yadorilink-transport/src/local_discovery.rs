@@ -1,6 +1,6 @@
-//! Local UDP broadcast and mDNS multicast discovery (task 4.11 / design.md D10):
-//! finds already-authorized peers on the local network independent of the
-//! coordination plane, matching Syncthing's local-discovery pattern
+//! Local UDP broadcast and mDNS multicast discovery: finds already
+//! authorized peers on the local network independent of the coordination
+//! plane, matching Syncthing's local-discovery pattern
 //! (studied for architecture only — MPL-2.0, not copied).
 //!
 //! Deliberately unauthenticated at this layer: a forged announcement can't
@@ -52,10 +52,10 @@ pub async fn start_local_discovery(
     authorized_public_keys: impl IntoIterator<Item = PublicKeyBytes>,
 ) -> Result<(SocketAddr, mpsc::Receiver<PeerAnnouncement>), TransportError> {
     let socket = UdpSocket::bind(("0.0.0.0", broadcast_port)).await?;
-    // add-deterministic-sync-testing: broadcast/multicast are LAN
-    // peer-discovery mechanics with no meaning under a deterministic
-    // single-process simulation (a DST scenario connects simulated peers
-    // directly, never via real broadcast/mDNS) — `madsim`'s simulated
+    // Broadcast/multicast are LAN peer-discovery mechanics with no
+    // meaning under a deterministic single-process simulation (a DST
+    // scenario connects simulated peers directly, never via real
+    // broadcast/mDNS) — `madsim`'s simulated
     // `UdpSocket` doesn't implement these OS-socket-option methods at
     // all, so this whole step is skipped under `--cfg madsim` rather
     // than attempting to fake OS multicast semantics in a simulator that
@@ -121,9 +121,9 @@ async fn run_discovery(
                 };
                 let bytes = msg.encode_to_vec();
                 for dest in &announcement_dests {
-                    // add-deterministic-sync-testing: `madsim`'s simulated
-                    // `UdpSocket::send_to` takes `(dst, buf)`, the reverse
-                    // of real tokio's `(buf, dst)` — see this module's
+                    // `madsim`'s simulated `UdpSocket::send_to` takes
+                    // `(dst, buf)`, the reverse of real tokio's
+                    // `(buf, dst)` — see this module's
                     // `#[cfg(not(madsim))]` broadcast/multicast setup
                     // above for the broader context.
                     #[cfg(not(madsim))]

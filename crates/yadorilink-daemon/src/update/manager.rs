@@ -1,7 +1,6 @@
-//! add-automatic-updates task 2: orchestrates manifest checks, artifact
-//! download/verification, and install dispatch on top of `manifest`,
-//! `verify`, and `policy`; also owns interrupted-update recovery on
-//! daemon startup (task 2.5).
+//! Orchestrates manifest checks, artifact download/verification, and
+//! install dispatch on top of `manifest`, `verify`, and `policy`; also
+//! owns interrupted-update recovery on daemon startup.
 //!
 //! Nothing in this module ever installs or trusts an artifact except
 //! through the exact sequence: fetch manifest -> `manifest::verify_and_parse`
@@ -64,7 +63,7 @@ impl UpdateError {
 }
 
 /// This install's coarse platform identity — never anything more
-/// identifying (device id, account id) — task 1's `LocalContext` plus the
+/// identifying (device id, account id) — `LocalContext` plus the
 /// Windows install-source distinction from `install_windows`.
 #[derive(Debug, Clone)]
 pub struct PlatformInfo {
@@ -169,7 +168,7 @@ impl UpdateManager {
         }
     }
 
-    /// task 2.2/2.3: fetches and verifies the manifest, decides
+    /// Fetches and verifies the manifest, decides
     /// applicability, and persists the resulting state — never downloads
     /// or installs anything itself. Callable both from the periodic
     /// scheduler and directly from `yadorilink update check`.
@@ -270,7 +269,7 @@ impl UpdateManager {
         Ok(())
     }
 
-    /// task 2.2/2.6: downloads `entry`'s artifact to a `.partial` path,
+    /// Downloads `entry`'s artifact to a `.partial` path,
     /// verifies checksum + platform publisher signature, and only on
     /// full success renames it into place and marks the policy verified.
     /// Any failure at any step deletes the partial artifact and records
@@ -367,7 +366,7 @@ impl UpdateManager {
         }
     }
 
-    /// task 2.4/4: dispatches installation of an already-verified
+    /// Dispatches installation of an already-verified
     /// artifact, gated on `safe_point` (the caller — `daemon_state`'s
     /// safe-point check — decides whether sync-critical writes are in
     /// progress; this function never guesses). Fails closed if the
@@ -442,7 +441,7 @@ impl UpdateManager {
         }
     }
 
-    /// task 2.5: interrupted-update recovery, run once at daemon startup
+    /// interrupted-update recovery, run once at daemon startup
     /// (before the periodic scheduler starts). Any artifact that hadn't
     /// completed verification when the daemon last stopped — whatever
     /// the reason (crash, kill -9, power loss) — is discarded rather than
@@ -522,7 +521,7 @@ fn artifact_filename(entry: &ReleaseEntry) -> String {
         .to_string()
 }
 
-/// task 5.4: applies a `yadorilink update config` change, leaving any
+/// applies a `yadorilink update config` change, leaving any
 /// field the caller passed `None` for unchanged.
 pub fn apply_config(
     store: &UpdatePolicyStore,
@@ -553,8 +552,8 @@ mod tests {
         UpdateManager::new(config_dir, semver::Version::parse("0.1.0").unwrap())
     }
 
-    /// design.md's Update Privacy requirement / spec "Update check uses
-    /// coarse metadata only": exercises the *real* HTTP request
+    /// Update Privacy requirement / spec "Update check uses coarse
+    /// metadata only": exercises the *real* HTTP request
     /// `check_now` sends (via a real local mock server, not just a code
     /// inspection) and asserts its query string carries exactly the six
     /// documented coarse fields — schema_version, current_version,
@@ -603,8 +602,7 @@ mod tests {
         std::env::remove_var("YADORILINK_UPDATE_MANIFEST_URL");
     }
 
-    /// task 2.6 "crash/restart before verification never installs a
-    /// partial artifact": a policy left in `Downloading` with a stray
+    /// a policy left in `Downloading` with a stray
     /// `.partial` file on disk is cleaned up and reset to `Failed`, never
     /// left pointing at a trusted artifact.
     #[test]
@@ -659,7 +657,7 @@ mod tests {
         assert!(policy.downloaded_artifact_verified);
     }
 
-    /// task 2.6: a daemon that crashed mid-install never claims success —
+    /// a daemon that crashed mid-install never claims success —
     /// `Installing` becomes `Failed` with a diagnostic, not `UpToDate`.
     #[test]
     fn recover_on_startup_marks_interrupted_install_as_failed_not_successful() {
@@ -685,7 +683,7 @@ mod tests {
         assert!(matches!(result, Err(UpdateError::NoVerifiedUpdate)));
     }
 
-    /// task 2.4 "install waits for safe point": a verified artifact is
+    /// a verified artifact is
     /// not installed when `safe_point` is false — the policy state moves
     /// to `Deferred`, not `Installing`.
     #[tokio::test]

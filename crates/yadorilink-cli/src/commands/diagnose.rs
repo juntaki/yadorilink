@@ -1,12 +1,12 @@
 //! CLI diagnostics bundle preview/export.
 //!
-//! task 2.1/3.3: prefers the real daemon-assembled bundle
-//! (`control_client::send`'s `DiagnosticsPreview`/`DiagnosticsExport`,
-//! answered by `yadorilink-daemon::diagnostics_ipc::build_bundle`) whenever
-//! the daemon is reachable — it has access to daemon-owned status/config/
-//! recent-error state this CLI process never reads directly (design.md
-//! decision "Export through the daemon so daemon-owned state files do not
-//! need to be read directly by the CLI"). Falls back to `limited_bundle()`
+//! Prefers the real daemon-assembled bundle (`control_client::send`'s
+//! `DiagnosticsPreview`/`DiagnosticsExport`, answered by
+//! `yadorilink-daemon::diagnostics_ipc::build_bundle`) whenever the daemon
+//! is reachable — it has access to daemon-owned status/config/recent-error
+//! state this CLI process never reads directly, so daemon-owned state
+//! files do not need to be read directly by the CLI. Falls back to
+//! `limited_bundle()`
 //! (the original CLI-only bundle) only when the daemon itself isn't
 //! reachable at all (`CliError::DaemonNotRunning`) — any other daemon-side
 //! failure (a malformed response, a genuine `RespPayload::Error`) is

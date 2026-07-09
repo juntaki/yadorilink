@@ -1,7 +1,6 @@
-//! build-yadorilink-mvp task 10.1: the "thin Rust core" design.md D4 calls
-//! for behind the Swift `FIFinderSync` extension — a C-ABI FFI surface
-//! over `ipc_client`'s IPC logic, callable from Swift via a bridging
-//! header (`include/yadorilink_shell_core.h`).
+//! The "thin Rust core" behind the Swift `FIFinderSync` extension — a
+//! C-ABI FFI surface over `ipc_client`'s IPC logic, callable from Swift
+//! via a bridging header (`include/yadorilink_shell_core.h`).
 //!
 //! Contract mirrored from the Windows shell extension and the daemon's
 //! own reference client (`yadorilink_daemon::shell_ipc::client`): every
@@ -18,8 +17,8 @@ use std::panic::catch_unwind;
 use yadorilink_ipc_proto::shellipc::{ContextAction, MaterializationState, SyncState};
 
 /// Mirrors the four spec'd overlay states plus on-demand-sync's
-/// "online-only" placeholder overlay and (task 7.4) design.md D7's
-/// advisory "open elsewhere" signal, as a flat C enum Swift can switch
+/// "online-only" placeholder overlay and an advisory "open elsewhere"
+/// signal, as a flat C enum Swift can switch
 /// on directly. `open_elsewhere_device_id` non-empty takes priority over
 /// everything else in `yadorilink_query_status` below — it's a warning
 /// about a *different device* actively editing the file right now, which
@@ -122,7 +121,7 @@ fn combine_status(info: ipc_client::StatusInfo) -> YadoriLinkBadgeStatus {
     }
 }
 
-/// Queries the daemon for `path`'s combined badge status (task 10.2).
+/// Queries the daemon for `path`'s combined badge status.
 /// Fails soft to `YadoriLinkBadgeStatus::Unspecified` (Finder shows no
 /// overlay) on a null/invalid path, an unreachable daemon, or any other
 /// error — never blocks longer than the bounded timeout in `ipc_client`.
@@ -139,7 +138,7 @@ pub unsafe extern "C" fn yadorilink_query_status(path: *const c_char) -> c_int {
     result.unwrap_or(YadoriLinkBadgeStatus::Unspecified) as c_int
 }
 
-/// Sends a context-menu action for `path` to the daemon (task 10.3).
+/// Sends a context-menu action for `path` to the daemon.
 /// `action` is a `YadoriLinkContextAction` discriminant (0-4); passed as a
 /// plain `c_int` rather than the enum type itself so the C/Swift ABI
 /// doesn't depend on how Rust happens to lay out a `#[repr(C)]`

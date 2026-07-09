@@ -1,14 +1,14 @@
-//! Metadata for a locally-queued, not-yet-submitted report (design.md
-//! D4/D7). Like `consent.rs`, this module defines the shape only —
-//! actual on-disk storage/retention enforcement lives in
-//! `yadorilink-daemon` (section 2), outside any linked folder.
+//! Metadata for a locally-queued, not-yet-submitted report. Like
+//! `consent.rs`, this module defines the shape only — actual on-disk
+//! storage/retention enforcement lives in `yadorilink-daemon`, outside
+//! any linked folder.
 
 use serde::{Deserialize, Serialize};
 
 use crate::schema::ReportType;
 
-/// What a successful HTTPS submission (design.md D6) hands back. Defined
-/// here rather than in a future submission-client module since it's
+/// What a successful HTTPS submission hands back. Defined here rather
+/// than in a future submission-client module since it's
 /// part of the shared local record of "this report was sent" — the
 /// queue needs to be able to mark an entry submitted and show the user
 /// the receipt without any HTTPS-specific code being involved.
@@ -16,8 +16,7 @@ use crate::schema::ReportType;
 pub struct SubmissionReceipt {
     pub report_id: String,
     /// Opaque, endpoint-assigned — never fed back into sync/auth
-    /// behavior, per D6's "avoid feeding any response back into sync
-    /// behavior."
+    /// behavior.
     pub receipt_id: String,
     pub submitted_at: String,
 }

@@ -1,4 +1,4 @@
-//! Regression coverage for `fix-multiway-conflict-name-content-mismatch`:
+//! Regression coverage for a multiway-conflict name/content mismatch bug:
 //! when three or more devices concurrently edit the same path, a
 //! conflict-copy's deterministic name must always match the content
 //! actually materialized under it, and every device must independently
@@ -8,10 +8,9 @@
 //! (`taguchi_collision_matrix.rs`), which surfaced 2/16 failing rows, both
 //! at the "simultaneous" timing level with 3+ devices editing the same
 //! path. This file is the deterministic, minimal reproduction that let the
-//! bug be root-caused and fixed (`resolve_and_apply_conflict`'s naming was
+//! bug be root-caused and fixed: `resolve_and_apply_conflict`'s naming was
 //! attributing a conflict-copy's identity to whichever peer session
-//! happened to process it, rather than the content's true origin device
-//! -- see `openspec/changes/fix-multiway-conflict-name-content-mismatch`).
+//! happened to process it, rather than the content's true origin device.
 
 mod support;
 
@@ -158,9 +157,8 @@ async fn three_devices_editing_the_same_new_file_simultaneously_never_mismatches
         assert_eq!(
             snap, reference,
             "device-{i} diverged from device-0 -- a conflict-copy name matching on both devices but \
-             holding different content indicates the fix-multiway-conflict-name-content-mismatch bug \
-             has resurfaced (resolve_and_apply_conflict attributing a conflict copy's identity to the \
-             wrong origin device)"
+             holding different content indicates that resolve_and_apply_conflict has regressed to \
+             attributing a conflict copy's identity to the wrong origin device"
         );
     }
 }

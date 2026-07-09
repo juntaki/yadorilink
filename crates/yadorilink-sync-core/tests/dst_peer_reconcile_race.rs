@@ -1,8 +1,6 @@
-//! DST regression scenario (add-deterministic-sync-testing task group 5):
-//! reproduces the self-echo-race data-loss shape
-//! (`fix-local-edit-swallowed-by-self-echo-race`) with two real,
-//! simulated devices exchanging real wire messages over a real (loopback,
-//! `madsim`-simulated) `PeerChannel`, driven by the real
+//! DST regression scenario: reproduces the self-echo-race data-loss shape
+//! with two real, simulated devices exchanging real wire messages over a
+//! real (loopback, `madsim`-simulated) `PeerChannel`, driven by the real
 //! `PeerSyncSession::run()` production loop -- not a fabricated message
 //! handed directly to internal reconcile logic (`reconcile_one_file` is
 //! private and reachable only through the real receive loop).
@@ -22,11 +20,11 @@
 //! `VvOrdering::Concurrent` instead -- resolved via `conflict.rs`'s
 //! rename-the-loser machinery rather than silently discarded.
 //!
-//! Task 5.2 adds a second variant (`BEdit::Tombstone`,
-//! `self_echo_race_scenario_tombstone`): the same race, but B's
-//! causally-later change is a delete rather than a content update --
-//! exercising `materialize`'s "apply a tombstone over content about to
-//! be force-flushed" path instead of "overwrite content with content".
+//! A second variant (`BEdit::Tombstone`, `self_echo_race_scenario_tombstone`)
+//! covers the same race, but B's causally-later change is a delete rather
+//! than a content update -- exercising `materialize`'s "apply a tombstone
+//! over content about to be force-flushed" path instead of "overwrite
+//! content with content".
 
 #![cfg(madsim)]
 
@@ -312,8 +310,8 @@ async fn connect_sessions(
 }
 
 /// What device B's causally-later, independent change is. `ContentUpdate`
-/// is the original race shape; `Tombstone` (task 5.2) exercises the same
-/// race for a delete instead of a content overwrite -- worth testing
+/// is the original race shape; `Tombstone` exercises the same race for a
+/// delete instead of a content overwrite -- worth testing
 /// separately because `reconcile_one_file`'s `Some(local)` branch (see
 /// `peer_session.rs`) reaches the same version-vector `compare()` this
 /// race depends on regardless of `incoming.deleted`, but `materialize`'s
@@ -330,7 +328,7 @@ enum BEdit {
 /// `PendingLocalChangeFlush` is wired -- `false` reproduces the
 /// pre-fix bug (this device's edit is silently lost), `true` exercises
 /// the real fix. `b_edit` selects whether device B's causally-later
-/// change is a content update or a tombstone (task 5.2).
+/// change is a content update or a tombstone.
 async fn run_scenario(seed: u64, guard_enabled: bool, b_edit: BEdit) -> Result<(), String> {
     let _ = tracing_subscriber::fmt::try_init();
     let mut rng = StdRng::seed_from_u64(seed);
@@ -411,7 +409,7 @@ async fn run_scenario(seed: u64, guard_enabled: bool, b_edit: BEdit) -> Result<(
                  timeout (index row: {indexed:?}): {e} -- separately discovered: this can mean a \
                  genuine WireGuard handshake livelock under simulated time (both peers' \
                  direct-path retries landing in lockstep), not a bug in this scenario or the \
-                 guard under test; see tasks.md task 5.1's notes"
+                 guard under test; "
         )
     })?;
     if baseline_on_b != b"baseline" {
@@ -508,8 +506,8 @@ async fn device_b_process_event(
 /// naming convention) -- the two ways a genuine concurrent edit is
 /// legitimately allowed to end up, per the no-silent-data-loss
 /// invariant's "conflict-copy" branch (documented as an extension point,
-/// not yet generalized into `dst_support::check_no_silent_data_loss`,
-/// in task group 4 -- this scenario is the first real exercise of it).
+/// not yet generalized into `dst_support::check_no_silent_data_loss` --
+/// this scenario is the first real exercise of it).
 fn a_edit_survives(root: &Path, expected_content: &str) -> bool {
     let live = root.join(RACE_PATH);
     if std::fs::read(&live).map(|c| c == expected_content.as_bytes()).unwrap_or(false) {
@@ -589,8 +587,8 @@ fn run_self_echo_race_checks(b_edit: BEdit) {
     );
 }
 
-/// Runs both `BEdit` variants (content update, then tombstone --
-/// task 5.2) sequentially in *one* `#[test]` function.
+/// Runs both `BEdit` variants (content update, then tombstone)
+/// sequentially in *one* `#[test]` function.
 ///
 /// Discovered while adding the tombstone variant: splitting it into its
 /// own `#[test]` function (even alongside the original as two separate

@@ -18,9 +18,9 @@ pub fn test(path: PathBuf) -> Result<(), CliError> {
     Ok(())
 }
 
-/// add-advanced-sync-operations task 5.2: `yadorilink ignore explain
-/// <path>` — a richer sibling of `test` (kept separate rather than
-/// changing `test`'s output, since `test_path_output`'s exact wording has
+/// `yadorilink ignore explain <path>` — a richer sibling of `test` (kept
+/// separate rather than changing `test`'s output, since
+/// `test_path_output`'s exact wording has
 /// its own fixture tests in `tests/ignore.rs`): the winning rule's source
 /// file, `#include` chain, line number, and case-sensitivity mode, using
 /// the exact same `EffectiveIgnoreSet` evaluator `test`/`list` use.

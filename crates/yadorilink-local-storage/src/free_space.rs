@@ -1,18 +1,17 @@
-//! add-resource-governance section 1/3 (design.md D3): free-space
-//! classification shared by every disk-pressure decision in the system —
-//! the local-storage block-store preflight (`FsBlockStore::put`), the
-//! sync-core hydration/materialization preflight
+//! Free-space classification shared by every disk-pressure decision in the
+//! system — the local-storage block-store preflight (`FsBlockStore::put`),
+//! the sync-core hydration/materialization preflight
 //! (`yadorilink_sync_core::materialization::check_disk_headroom`), the
 //! disk-pressure eviction trigger, and `yadorilink status`'s per-volume
-//! reporting all call through this one module (task 1.3), so a single
-//! computed classification always backs both the preflight decision and
-//! what's reported — never two independently-computed answers that could
+//! reporting all call through this one module, so a single computed
+//! classification always backs both the preflight decision and what's
+//! reported — never two independently-computed answers that could
 //! disagree.
 
 use std::path::Path;
 
-/// Minimum headroom floor when no explicit override is configured
-/// (design.md D3): `max(1 GiB, 5% of the hosting volume)`.
+/// Minimum headroom floor when no explicit override is configured:
+/// `max(1 GiB, 5% of the hosting volume)`.
 pub const DEFAULT_MIN_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
 /// The percentage half of the same default formula.
 pub const DEFAULT_HEADROOM_PERCENT: f64 = 0.05;
@@ -51,7 +50,7 @@ pub struct VolumeFreeSpace {
 }
 
 impl VolumeFreeSpace {
-    /// task 1.3: `critical` at or below headroom, `low` up to double
+    /// `critical` at or below headroom, `low` up to double
     /// headroom, `ok` beyond that.
     pub fn classify(&self) -> FreeSpaceState {
         if self.available_bytes <= self.headroom_bytes {
@@ -73,8 +72,7 @@ impl VolumeFreeSpace {
 }
 
 /// The effective headroom for a volume of `total_bytes`: the explicit
-/// `configured_override` if set, else `max(1 GiB, 5%)` of the volume
-/// (design.md D3, task 1.2).
+/// `configured_override` if set, else `max(1 GiB, 5%)` of the volume.
 pub fn effective_headroom_bytes(total_bytes: u64, configured_override: Option<u64>) -> u64 {
     configured_override.unwrap_or_else(|| {
         let percent = (total_bytes as f64 * DEFAULT_HEADROOM_PERCENT) as u64;
@@ -99,7 +97,7 @@ pub fn classify_volume(
 mod tests {
     use super::*;
 
-    /// task 1.5: config defaults when unset — the 1 GiB floor wins on a
+    /// config defaults when unset — the 1 GiB floor wins on a
     /// small volume, the 5% figure wins on a large one.
     #[test]
     fn default_headroom_is_max_of_1gib_and_5_percent() {
@@ -112,7 +110,7 @@ mod tests {
         assert_eq!(effective_headroom_bytes(large_volume, None), expected);
     }
 
-    /// task 1.5: config round-trip after an explicit override — the
+    /// config round-trip after an explicit override — the
     /// override always wins over the formula, regardless of volume size.
     #[test]
     fn explicit_override_wins_regardless_of_volume_size() {
@@ -120,7 +118,7 @@ mod tests {
         assert_eq!(effective_headroom_bytes(0, Some(0)), 0);
     }
 
-    /// task 1.5: classification boundary behavior at the ok/low/critical
+    /// classification boundary behavior at the ok/low/critical
     /// thresholds — exercised directly against constructed `VolumeFreeSpace`
     /// values (not real disk state) so the boundaries themselves are
     /// deterministic.

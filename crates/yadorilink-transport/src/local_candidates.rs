@@ -1,8 +1,8 @@
-//! Local network interface enumeration (task 4.9 / design.md D10): a
-//! device's own LAN addresses are reported as high-priority endpoint
-//! candidates alongside its relay-observed public address, so peers on
-//! the same network connect over the low-latency local path automatically
-//! via candidate racing rather than explicit same-network detection.
+//! Local network interface enumeration: a device's own LAN addresses are
+//! reported as high-priority endpoint candidates alongside its
+//! relay-observed public address, so peers on the same network connect
+//! over the low-latency local path automatically via candidate racing
+//! rather than explicit same-network detection.
 
 use std::net::IpAddr;
 

@@ -1,9 +1,8 @@
-//! Per-file version vectors (design.md D7 / `sync-engine` spec's
-//! version-vector requirements): one counter per contributing device,
-//! used to distinguish causally-ordered edits from genuine concurrent
-//! conflicts — never wall-clock timestamps, which can't tell the two apart.
+//! Per-file version vectors: one counter per contributing device, used to
+//! distinguish causally-ordered edits from genuine concurrent conflicts —
+//! never wall-clock timestamps, which can't tell the two apart.
 //!
-//! ## Trust boundary (SEC-SYNC-3, `harden-untrusted-peer-data`)
+//! ## Trust boundary
 //!
 //! Version-vector sync assumes every contributing device reports its own
 //! causal history honestly. Among **mutually-untrusted** group members —
@@ -17,10 +16,9 @@
 //! dominating), which makes `PeerSyncSession::reconcile_one_file` silently
 //! *adopt* the peer's version — overwriting the honest local edit with no
 //! `Concurrent` result and therefore no conflict copy. That is a real,
-//! reachable data-loss path, not a hypothetical one (see design.md's
-//! SEC-SYNC-3(a) for the exact exploit shape:
-//! `{local:5, peer:999}` advertised against a local vector the peer
-//! previously observed as `{local:5}`).
+//! reachable data-loss path, not a hypothetical one — the exact exploit
+//! shape: `{local:5, peer:999}` advertised against a local vector the peer
+//! previously observed as `{local:5}`.
 //!
 //! **This module does not claim to fully close that gap** — no local
 //! check can, since a lying peer is indistinguishable from a peer that
@@ -36,16 +34,16 @@
 
 use std::collections::BTreeMap;
 
-/// SEC-SYNC-3(a): the maximum amount a single incoming message is allowed
-/// to advance any *foreign* device's counter beyond what this device last
-/// recorded for the file in question (see `VersionVector::sanitize_against`
-/// and this module's trust-boundary doc comment above). Chosen generously
-/// so ordinary legitimate behavior — a peer that was offline for a long
+/// The maximum amount a single incoming message is allowed to advance any
+/// *foreign* device's counter beyond what this device last recorded for the
+/// file in question (see `VersionVector::sanitize_against` and this
+/// module's trust-boundary doc comment above). Chosen generously so
+/// ordinary legitimate behavior — a peer that was offline for a long
 /// stretch and batches many real edits into its next sync — is extremely
 /// unlikely to be affected: at one counter increment per edit, this
 /// tolerates thousands of un-synced edits to the same file arriving in a
 /// single message before the bound engages. An adversarial peer trying to
-/// force an implausible one-shot jump (design.md's `peer:999` example) is
+/// force an implausible one-shot jump (the `peer:999` example above) is
 /// blocked outright; a peer trying to force it gradually is still bounded
 /// per-message and remains subject to every other rate limit already in
 /// place on this connection (`MAX_IN_FLIGHT_MESSAGES_PER_PEER`,
@@ -101,8 +99,8 @@ impl VersionVector {
         VersionVector(merged)
     }
 
-    /// SEC-SYNC-3(a): returns a copy of `incoming` (a peer-supplied version
-    /// vector) with every counter clamped to a plausible bound relative to
+    /// Returns a copy of `incoming` (a peer-supplied version vector) with
+    /// every counter clamped to a plausible bound relative to
     /// `self` — the last version vector *this device* actually accepted
     /// for the file in question (from its own edits or a previously
     /// adopted peer update), read from its own index, never peer-supplied.
@@ -123,8 +121,7 @@ impl VersionVector {
     ///   `MAX_VV_COUNTER_JUMP_PER_MESSAGE`'s doc comment for why this bound
     ///   is generous enough to leave ordinary multi-edit-while-offline
     ///   batches unaffected while still closing the one-shot "advertise an
-    ///   arbitrarily large foreign counter" attack (design.md
-    ///   SEC-SYNC-3(a)).
+    ///   arbitrarily large foreign counter" attack.
     pub fn sanitize_against(
         &self,
         incoming: &VersionVector,
@@ -215,7 +212,7 @@ mod tests {
         assert_eq!(merged.compare(&b), VvOrdering::After);
     }
 
-    /// sync-correctness-fixes task 3.1: dominance-vs-true-concurrency
+    /// Dominance-vs-true-concurrency
     /// across 3 devices — a case a simple 2-device test can't
     /// distinguish, since with only 2 devices "not equal, not before,
     /// not after" always means Concurrent trivially. With 3, two
@@ -257,7 +254,7 @@ mod tests {
         assert_eq!(branch2.compare(&merged), VvOrdering::Before);
     }
 
-    /// sync-correctness-fixes task 3.1: merging a vector with itself (or
+    /// Merging a vector with itself (or
     /// re-merging an already-merged pair) must be idempotent — a
     /// resolved conflict re-processed (e.g. a duplicate/retried message)
     /// must not double-count or otherwise change the result.
@@ -277,7 +274,7 @@ mod tests {
         assert_eq!(merged_once, merged_with_self);
     }
 
-    /// sync-correctness-fixes task 3.1: merging two equal vectors is a
+    /// Merging two equal vectors is a
     /// true no-op (identical result, not just an equal-under-`compare`
     /// one) — guards against a merge implementation that could otherwise
     /// introduce spurious drift even when there's nothing new to
@@ -293,11 +290,10 @@ mod tests {
         assert_eq!(a.merge(&b), a);
     }
 
-    /// SEC-SYNC-3(a) / task 4.3(a) — adversarial case: a peer that has
-    /// observed local's `{local:5}` cannot force `Before` (and therefore a
-    /// silent overwrite) by advertising an arbitrarily large foreign
-    /// counter (design.md's `{local:5, peer:999}` example). After
-    /// sanitizing against local's last-known-good vector, the peer's
+    /// Adversarial case: a peer that has observed local's `{local:5}` cannot
+    /// force `Before` (and therefore a silent overwrite) by advertising an
+    /// arbitrarily large foreign counter (a `{local:5, peer:999}` example).
+    /// After sanitizing against local's last-known-good vector, the peer's
     /// counter is clamped to `local:5's peer-counter (0) + max_jump`, which
     /// stays well below a value that could dominate a genuinely newer
     /// local edit.
@@ -345,11 +341,10 @@ mod tests {
         assert_eq!(sanitized2.get("peer"), 10);
     }
 
-    /// SEC-SYNC-3(a) / task 4.3(a) — legitimate case: sanitizing must be a
-    /// no-op for ordinary, honest version-vector growth (a peer that made
-    /// a handful of real edits since the last sync), so normal
-    /// non-adversarial conflict resolution is unaffected by this
-    /// mitigation.
+    /// Legitimate case: sanitizing must be a no-op for ordinary, honest
+    /// version-vector growth (a peer that made a handful of real edits
+    /// since the last sync), so normal non-adversarial conflict resolution
+    /// is unaffected by this mitigation.
     #[test]
     fn sanitize_against_is_a_no_op_for_plausible_honest_growth() {
         let mut local = VersionVector::new();
@@ -374,8 +369,7 @@ mod tests {
         assert_eq!(local.compare(&sanitized), VvOrdering::Before);
     }
 
-    /// fix-vv-plausibility-clamp-corrupts-honest-long-offline-jump:
-    /// plausibility clamping may still inform the conflict decision, but
+    /// Plausibility clamping may still inform the conflict decision, but
     /// once an honest newer record is adopted its stored version vector
     /// must remain the honest incoming one, not the clamped one.
     #[test]
@@ -413,10 +407,10 @@ mod tests {
         assert_eq!(clamped_after_adopt.compare(&peer_next), VvOrdering::Concurrent);
     }
 
-    /// SEC-SYNC-3(a): a peer can never legitimately claim to know a higher
-    /// counter for *our own* device than we ourselves have recorded — this
-    /// is a hard invariant (not a heuristic bound), so it must hold
-    /// regardless of `max_jump`, including `max_jump = 0`.
+    /// A peer can never legitimately claim to know a higher counter for
+    /// *our own* device than we ourselves have recorded — this is a hard
+    /// invariant (not a heuristic bound), so it must hold regardless of
+    /// `max_jump`, including `max_jump = 0`.
     #[test]
     fn sanitize_against_caps_local_devices_own_counter_at_its_true_value_even_with_zero_jump() {
         let mut local = VersionVector::new();

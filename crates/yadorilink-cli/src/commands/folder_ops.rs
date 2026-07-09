@@ -1,9 +1,7 @@
-//! `add-advanced-sync-operations` section 2 (Folder Operations): CLI
-//! surface for divergence summaries, dry-run resolution previews, and
+//! CLI surface for divergence summaries, dry-run resolution previews, and
 //! confirmation-gated override/revert/mode-change actions — every call
 //! goes through the daemon control socket (`yadorilink_daemon::folder_ops`
-//! owns the actual logic), matching design.md decision 1 ("operations
-//! daemon-authoritative").
+//! owns the actual logic), keeping operations daemon-authoritative.
 
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;

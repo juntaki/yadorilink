@@ -12,11 +12,11 @@ pub struct DeviceConfig {
     pub device_id: String,
     pub coordination_addr: String,
     pub relay_addr: String,
-    /// add-update-migration-safety task 1.1: this config file's version —
-    /// mirrors the DB `SCHEMA_VERSION` marker's rationale
-    /// (`yadorilink_sync_core::index::SCHEMA_VERSION`'s doc comment), but
-    /// for `device.json` rather than SQLite (no `PRAGMA user_version`
-    /// equivalent for a plain JSON file, hence a real field here instead).
+    /// This config file's version — mirrors the DB `SCHEMA_VERSION`
+    /// marker's rationale (`yadorilink_sync_core::index::SCHEMA_VERSION`'s
+    /// doc comment), but for `device.json` rather than SQLite (no
+    /// `PRAGMA user_version` equivalent for a plain JSON file, hence a
+    /// real field here instead).
     /// `#[serde(default)]` makes an on-disk file from before this field
     /// existed decode as `config_version: 0` rather than failing to parse
     /// — that's also the correct "pre-versioning" sentinel value, always
@@ -43,7 +43,7 @@ pub fn config_path() -> PathBuf {
     config_dir().join("device.json")
 }
 
-/// windows-local-ipc-support design D4: the Windows equivalent of a Unix
+/// windows-local-ipc-support : the Windows equivalent of a Unix
 /// socket path for the CLI-daemon control protocol — named pipes live in
 /// the `\\.\pipe\` namespace, not the filesystem, so this returns a pipe
 /// name rather than a path. `yadorilink-cli` depends on `yadorilink-daemon` (not
@@ -59,7 +59,7 @@ pub fn control_pipe_name() -> String {
     format!(r"\\.\pipe\yadorilink-ctl-{user}")
 }
 
-/// windows-local-ipc-support design D4: the Windows equivalent of the
+/// windows-local-ipc-support : the Windows equivalent of the
 /// shell-integration IPC socket path, mirroring `control_pipe_name()`.
 #[cfg(windows)]
 pub fn shell_ipc_pipe_name() -> String {
@@ -73,11 +73,11 @@ pub fn shell_ipc_pipe_name() -> String {
 pub fn load() -> Option<DeviceConfig> {
     let contents = std::fs::read_to_string(config_path()).ok()?;
     let config: DeviceConfig = serde_json::from_str(&contents).ok()?;
-    // add-update-migration-safety task 1.3: a config written by a newer
-    // build than this one is exactly the same "unsupported downgrade"
-    // shape as a too-new DB schema (see `SyncState::init`'s
-    // `check_schema_not_newer_than_supported`) — refuse to use it rather
-    // than risk this older daemon misinterpreting a field it predates.
+    // A config written by a newer build than this one is exactly the same
+    // "unsupported downgrade" shape as a too-new DB schema (see
+    // `SyncState::init`'s `check_schema_not_newer_than_supported`) —
+    // refuse to use it rather than risk this older daemon misinterpreting
+    // a field it predates.
     // `load()`'s existing signature already collapses every failure mode
     // (missing file, unreadable, unparseable) to `None` — "keep behaving
     // as if this device were never registered" is the daemon's own
@@ -139,7 +139,7 @@ mod tests {
         });
     }
 
-    /// task 1.3, spec "Downgrade blocked": a `device.json` stamped newer
+    /// spec "Downgrade blocked": a `device.json` stamped newer
     /// than this build supports must not be used — `load()`'s existing
     /// `Option` signature (every other failure mode already collapses to
     /// `None`) means this surfaces as "behave as if never registered"

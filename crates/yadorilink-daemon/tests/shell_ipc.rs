@@ -1,4 +1,4 @@
-//! Exercises the shell-integration IPC protocol (tasks 8.2, 8.4-8.6)
+//! Exercises the shell-integration IPC protocol
 //! end-to-end over a real Unix domain socket: status queries, the
 //! daemon's proactive push, context actions, and the client's graceful
 //! behavior when the daemon isn't running. Wrapped in `#[cfg(unix)]`
@@ -74,7 +74,7 @@ mod unix_socket_tests {
         assert_eq!(status, ShellSyncState::Synced);
     }
 
-    /// task 8.6 / shell-integration spec: "Daemon not running" — the client
+    /// / shell-integration spec: "Daemon not running" — the client
     /// must time out gracefully and report no overlay, never hang.
     #[tokio::test]
     async fn query_against_nonexistent_daemon_times_out_gracefully() {
@@ -90,7 +90,7 @@ mod unix_socket_tests {
         assert_eq!(status, ShellSyncState::Unspecified);
     }
 
-    /// task 8.5: the daemon proactively pushes status updates to connected
+    /// the daemon proactively pushes status updates to connected
     /// clients, not just answering queries.
     #[tokio::test]
     async fn daemon_pushes_status_update_to_connected_client() {
@@ -266,7 +266,7 @@ mod unix_socket_tests {
     }
 
     /// on-demand-sync spec "Opening a placeholder triggers hydration" — the
-    /// OS-callback-driven path (task 4.3/4.4): a `HydrateRequest` for a path
+    /// OS-callback-driven path: a `HydrateRequest` for a path
     /// with no reachable peer must fail with a clear, non-hanging error, not
     /// silently succeed or block the connection forever.
     #[tokio::test]
@@ -360,7 +360,7 @@ mod unix_socket_tests {
     }
 } // mod unix_socket_tests
 
-/// windows-local-ipc-support task 4.2: the shell-integration IPC protocol
+/// The shell-integration IPC protocol
 /// exercised above over a Unix socket, but over the Windows named-pipe
 /// transport — status query, hydrate request, and the daemon's proactive
 /// status push, since `windows_transport` (and now its matching client)
@@ -458,7 +458,7 @@ mod windows_pipe_tests {
         assert_eq!(status, ShellSyncState::Unspecified);
     }
 
-    /// task 8.5 over the named-pipe transport: the daemon's proactive
+    /// over the named-pipe transport: the daemon's proactive
     /// status push reaches a connected Windows client.
     #[tokio::test]
     async fn daemon_pushes_status_update_to_connected_client_over_named_pipe() {

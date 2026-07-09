@@ -1,15 +1,15 @@
 //! Per-link `.yadorilinkignore` parsing and matching.
 //!
-//! This module is intentionally self-contained: it parses the small
-//! gitignore-style subset from `add-ignore-patterns` section 1 and answers
-//! whether a root-relative path is ignored.
+//! This module is intentionally self-contained: it parses a small
+//! gitignore-style pattern subset and answers whether a root-relative path
+//! is ignored.
 //!
-//! `add-advanced-sync-operations` section 5 extends this with `#include`
-//! directives (cycle-checked and root-confined), a `(?i)` case-insensitive
-//! marker, and an `explain_path` evaluator that reports the winning rule's
-//! source file, include chain, line number, and case-sensitivity mode —
-//! the same evaluator `EffectiveIgnoreSet::match_path`/`is_ignored` already
-//! use, so explanations can never disagree with actual match behavior.
+//! It also supports `#include` directives (cycle-checked and
+//! root-confined), a `(?i)` case-insensitive marker, and an `explain_path`
+//! evaluator that reports the winning rule's source file, include chain,
+//! line number, and case-sensitivity mode — the same evaluator
+//! `EffectiveIgnoreSet::match_path`/`is_ignored` already use, so
+//! explanations can never disagree with actual match behavior.
 
 use std::fs;
 use std::io;
@@ -25,7 +25,7 @@ pub const BUILT_IN_DEFAULT_PATTERNS: &[&str] =
 const BUILT_IN_SOURCE_LABEL: &str = "<built-in>";
 
 /// Maximum `#include` nesting depth, as a defense-in-depth backstop behind
-/// the ancestor-chain cycle check below (task 5.1's "cycle detection"):
+/// the ancestor-chain cycle check below:
 /// the chain check alone already rejects any include graph that revisits
 /// an ancestor, so this only guards against pathologically long (but
 /// acyclic) include chains.
@@ -37,7 +37,7 @@ pub enum IgnorePatternSource {
     User,
 }
 
-/// task 5.1: why loading a link root's effective ignore configuration
+/// why loading a link root's effective ignore configuration
 /// failed. Distinct from a plain `io::Error` so callers that want
 /// last-valid-config fallback behavior (`EffectiveIgnoreSet::reload_for_link_root`)
 /// can describe the failure to a human without losing structure, and so
@@ -52,7 +52,7 @@ pub enum IgnoreConfigError {
     /// forever.
     IncludeCycle(String),
     /// An `#include` directive's target is absolute or escapes the link
-    /// root via `..` — root confinement (task 5.1) forbids both.
+    /// root via `..` — root confinement forbids both.
     IncludeEscapesRoot(String),
     /// An `#include` directive's target does not exist.
     MissingInclude(String),
@@ -164,7 +164,7 @@ impl IgnorePattern {
             return None;
         }
 
-        // task 5.1 "case behavior": a leading `(?i)` marker (Syncthing's
+        // a leading `(?i)` marker (Syncthing's
         // own convention) makes this single line case-insensitive,
         // independent of every other line in the same file.
         let (case_insensitive, trimmed) =
@@ -265,7 +265,7 @@ pub struct IgnoreMatch<'a> {
     pub ignored: bool,
 }
 
-/// task 5.2/5.3: the full explanation for why a path matched (or didn't
+/// The full explanation for why a path matched (or didn't
 /// match) an `EffectiveIgnoreSet` — built from the exact same winning
 /// `IgnorePattern` `match_path`/`is_ignored` use, so a human-facing
 /// explanation can never disagree with actual ignore behavior.
@@ -368,7 +368,7 @@ impl EffectiveIgnoreSet {
     }
 
     /// Same as `load_for_link_root`, but returns the structured
-    /// `IgnoreConfigError` (task 5.1) instead of collapsing it into a
+    /// `IgnoreConfigError` instead of collapsing it into a
     /// generic `io::Error`.
     pub fn load_for_link_root_checked(root: impl AsRef<Path>) -> Result<Self, IgnoreConfigError> {
         let root = root.as_ref();
@@ -388,7 +388,7 @@ impl EffectiveIgnoreSet {
         }
     }
 
-    /// task 5.1 "last-valid-config fallback": reloads `root`, but on any
+    /// reloads `root`, but on any
     /// `IgnoreConfigError` (bad encoding, include cycle, escaping include,
     /// missing include, too-deep nesting, other I/O) keeps `previous`
     /// instead of leaving the caller with no usable ignore set at all —
@@ -428,7 +428,7 @@ impl EffectiveIgnoreSet {
         result
     }
 
-    /// task 5.2: explains why `relative_path` is (or isn't) ignored, using
+    /// explains why `relative_path` is (or isn't) ignored, using
     /// the exact same evaluator `match_path`/`is_ignored` use — the winning
     /// rule's text, source file, include chain, line number, and
     /// case-sensitivity mode. `None` only when `relative_path` itself can't
@@ -491,7 +491,7 @@ fn strip_include_directive(trimmed: &str) -> Option<&str> {
     }
 }
 
-/// task 5.1 "root confinement": an `#include` target must normalize to a
+/// an `#include` target must normalize to a
 /// relative, non-escaping path — same rule `normalize_relative_segments`
 /// already enforces for the paths being tested against ignore rules.
 fn normalize_include_path(target: &str) -> Option<String> {
@@ -516,8 +516,8 @@ fn read_include_contents(root: &Path, relative_path: &str) -> Result<String, Ign
 
 /// Parses `contents` (already read from `relative_path`) into patterns,
 /// recursively splicing in any `#include`d file's patterns at the exact
-/// point of the directive — this is what makes precedence deterministic
-/// (task 5.1): the merged list's document order exactly matches what a
+/// point of the directive — this is what makes precedence deterministic:
+/// the merged list's document order exactly matches what a
 /// human reading the top-level file top-to-bottom, jumping into includes
 /// as they're reached, would see, and `match_path`'s existing
 /// last-match-wins loop needs no special-casing for includes at all.
@@ -700,7 +700,7 @@ mod tests {
         assert!(!ignored(&set, "/tmp/debug.log", false));
     }
 
-    // -- add-advanced-sync-operations section 5 --------------------------
+    // -- include directives -----------------------------------------------
 
     #[test]
     fn include_directive_splices_patterns_at_the_directive_point() {

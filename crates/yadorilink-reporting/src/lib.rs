@@ -1,6 +1,5 @@
 //! Shared report schema, redaction, consent, and queue types for
-//! YadoriLink's opt-in OSS usage/error reporting (design.md at
-//! `openspec/changes/add-oss-usage-error-reporting/`). This crate holds
+//! YadoriLink's opt-in OSS usage/error reporting. This crate holds
 //! only the shared shape and safety logic — actual persistence (config
 //! storage, the on-disk queue) lives in `yadorilink-daemon`, and the
 //! optional HTTPS submission client is a separate concern layered on
@@ -14,7 +13,7 @@
 //! testable in isolation.
 //!
 //! `submission` is the one exception: it's the optional HTTPS
-//! submission client (design.md D6), so it necessarily depends on a
+//! submission client, so it necessarily depends on a
 //! minimal-feature `tokio` + `reqwest` for real async I/O — but it's
 //! still self-contained, taking only a `&ReportEnvelope` and a plain
 //! `Option<&str>` endpoint, with no daemon/CLI/sync/auth types reachable

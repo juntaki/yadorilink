@@ -1,15 +1,13 @@
-//! add-automatic-updates task 4.2/4.3: Windows install source detection
-//! (Microsoft Store vs. standalone) and the standalone signed-installer
-//! handoff.
+//! Windows install source detection (Microsoft Store vs. standalone)
+//! and the standalone signed-installer handoff.
 //!
 //! **Not yet verified against a real Windows machine** — unlike
 //! `control_socket.rs`'s `windows_transport` module (explicitly verified
 //! on a real Windows 11 VM), this code has only been checked for
 //! compiling/unit-testable logic on this development machine (macOS).
-//! This remains an open verification item
-//! before this path ships in a release build, per this change's own
-//! scoping guidance to be honest about what's actually buildable/testable
-//! here versus aspirational.
+//! This remains an open verification item before this path ships in a
+//! release build — being honest about what's actually
+//! buildable/testable here versus aspirational.
 
 use std::path::Path;
 
@@ -159,7 +157,7 @@ mod tests {
         assert_eq!(source, InstallSource::Standalone);
     }
 
-    /// tasks.md 4.4: "Store install never runs standalone installer" —
+    /// "Store install never runs standalone installer" —
     /// even with a perfectly valid installer artifact, a detected Store
     /// install must refuse to run it.
     #[test]
@@ -177,7 +175,7 @@ mod tests {
         assert_eq!(result, Ok(InstallOutcome::Installed));
     }
 
-    /// tasks.md 4.4: "failed installer leaves current version usable" —
+    /// "failed installer leaves current version usable" —
     /// this crate's own responsibility here is just to report the
     /// failure honestly rather than claim success.
     #[test]

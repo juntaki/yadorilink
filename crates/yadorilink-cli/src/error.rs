@@ -27,13 +27,13 @@ pub enum CliError {
     #[error("{0}")]
     Other(String),
 
-    // add-oss-usage-error-reporting task 4.6: distinct from the generic
-    // `DaemonNotRunning` — this fires specifically when a *reporting*
-    // command needed the daemon (the report queue, or `--submit`) and it
-    // wasn't reachable, so the message can explain *why* (daemon-owned
-    // storage / the one network path) rather than just "start the
-    // daemon" with no context for why a reporting command in particular
-    // needs it when so many other reporting commands don't.
+    // Distinct from the generic `DaemonNotRunning` — this fires
+    // specifically when a *reporting* command needed the daemon (the
+    // report queue, or `--submit`) and it wasn't reachable, so the
+    // message can explain *why* (daemon-owned storage / the one network
+    // path) rather than just "start the daemon" with no context for why
+    // a reporting command in particular needs it when so many other
+    // reporting commands don't.
     #[error("{0}")]
     ReportingDaemonRequired(String),
 }
@@ -50,14 +50,13 @@ impl CliError {
         }
     }
 
-    /// add-oss-usage-error-reporting task 4.5: whether this failure is
-    /// worth surfacing to local error reporting at all. Excludes the
-    /// purely user-actionable categories (not logged in, bad credentials,
-    /// daemon not started) where the next step is already obvious from
-    /// the error message itself and a maintainer-facing report would add
-    /// noise, not signal; includes categories more likely to indicate a
-    /// real environment/connectivity/bug condition worth a maintainer
-    /// seeing.
+    /// Whether this failure is worth surfacing to local error reporting at
+    /// all. Excludes the purely user-actionable categories (not logged in,
+    /// bad credentials, daemon not started) where the next step is already
+    /// obvious from the error message itself and a maintainer-facing
+    /// report would add noise, not signal; includes categories more likely
+    /// to indicate a real environment/connectivity/bug condition worth a
+    /// maintainer seeing.
     pub fn is_reportable(&self) -> bool {
         matches!(
             self,
@@ -96,12 +95,12 @@ impl From<std::io::Error> for CliError {
     }
 }
 
-// Unrelated hotfix (not part of add-untrusted-storage-peer): `commands/
-// diagnose.rs`'s `preview`/`export` (from a separately-committed "cli
-// diagnostics fallback" change) use `?` on `serde_json::to_string_pretty`,
-// which needs this conversion and was missing it, breaking `cargo build
-// --workspace` for every crate downstream of `yadorilink-cli`. Minimal,
-// same-shape fix as every other blanket conversion here.
+// Unrelated hotfix: `commands/diagnose.rs`'s `preview`/`export` (from a
+// separately-committed "cli diagnostics fallback" change) use `?` on
+// `serde_json::to_string_pretty`, which needs this conversion and was
+// missing it, breaking `cargo build --workspace` for every crate
+// downstream of `yadorilink-cli`. Minimal, same-shape fix as every other
+// blanket conversion here.
 impl From<serde_json::Error> for CliError {
     fn from(e: serde_json::Error) -> Self {
         CliError::Other(e.to_string())

@@ -1,19 +1,19 @@
-//! Task 2.1/2.2: on-disk persistence for `yadorilink_reporting::ConsentState`
+//! On-disk persistence for `yadorilink_reporting::ConsentState`
 //! ("shape only, persistence lives in yadorilink-daemon" per that module's
 //! doc comment). This is also where "local reporting config storage"
 //! lives — `ConsentState` already carries `prompt_to_report_enabled` and
 //! `endpoint_override`, so one JSON file covers consent *and* the
-//! configurable knobs task 2.1 asks for; there's no separate config file.
+//! configurable knobs; there's no separate config file.
 //!
 //! Two invariants this module exists to uphold:
 //! - A fresh install must never eagerly write a non-default consent file,
 //!   and must never generate an anonymous reporter ID before the user
-//!   opts in (design.md D1/D2). `load()` returns `ConsentState::default()`
+//!   opts in. `load()` returns `ConsentState::default()`
 //!   without touching disk when no file exists yet; `save()` is only ever
 //!   called from an explicit mutation method.
 //! - The anonymous reporter ID is a fresh random UUID (`new_reporter_id`),
 //!   never derived from this device's `device_id` or any coordination-plane
-//!   account identifier (task 2.2) — this module has no access to either
+//!   account identifier — this module has no access to either
 //!   of those anyway, by construction (`ConsentStore` only ever sees a
 //!   directory path).
 
@@ -105,7 +105,7 @@ impl ConsentStore {
         self.mutate(|state| state.disable_all_submission())
     }
 
-    /// Task 2.2's reset half: always mints a brand new ID, severing any
+    /// Always mints a brand new ID, severing any
     /// correlation with previously-submitted reports, without touching
     /// the submission-enabled flags.
     pub fn reset_reporter_id(&self) -> ReportingResult<ConsentState> {
@@ -135,7 +135,7 @@ mod tests {
         (dir, store)
     }
 
-    /// Task 2.7: default disabled consent, and no file written just by
+    /// default disabled consent, and no file written just by
     /// reading it.
     #[test]
     fn fresh_store_reports_default_disabled_state_without_writing_a_file() {
@@ -146,7 +146,7 @@ mod tests {
         assert!(!dir.path().join("reporting").exists());
     }
 
-    /// Task 2.7: opt-in state persistence.
+    /// opt-in state persistence.
     #[test]
     fn opt_in_usage_persists_across_a_new_store_instance() {
         let (dir, store) = store();
@@ -159,7 +159,7 @@ mod tests {
         assert_eq!(reloaded, state);
     }
 
-    /// Task 2.7: ID reset.
+    /// ID reset.
     #[test]
     fn reset_reporter_id_changes_the_id_and_persists_the_change() {
         let (_dir, store) = store();
@@ -173,7 +173,7 @@ mod tests {
         assert_eq!(store.load().unwrap().anonymous_reporter_id, Some(second_id));
     }
 
-    /// Task 2.2: the generated ID must never look like (or be derived
+    /// the generated ID must never look like (or be derived
     /// from) a device ID passed around elsewhere in the daemon — this is
     /// mostly structural (this module never receives one), but assert the
     /// generator produces a real random UUID each time as a sanity check.

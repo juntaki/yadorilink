@@ -1,5 +1,5 @@
-//! Minimal content-blind relay server (task 4.2 / design.md D6): forwards
-//! opaque, already-WireGuard-encrypted bytes between two registered public
+//! Minimal content-blind relay server: forwards opaque,
+//! already-WireGuard-encrypted bytes between two registered public
 //! keys. The relay never decrypts anything — it only reads the `Forward`
 //! envelope's destination key, never the WireGuard payload inside it.
 
@@ -27,13 +27,12 @@ type SourceConnectionCounts = Arc<Mutex<HashMap<IpAddr, usize>>>;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(120);
-/// Bounded lifetime of a peer-key registration (task 3.1, design.md D4): a
-/// registration must be renewed via a fresh proof-of-key-ownership exchange
-/// (the same Hello/HelloChallenge/HelloProof messages used at initial
-/// registration, re-run over the already-open connection) before this
-/// elapses, or the relay drops the registration and treats the key as
-/// unregistered — independent of any revocation signal (the relay has
-/// none), per task 3.2.
+/// Bounded lifetime of a peer-key registration: a registration must be
+/// renewed via a fresh proof-of-key-ownership exchange (the same
+/// Hello/HelloChallenge/HelloProof messages used at initial registration,
+/// re-run over the already-open connection) before this elapses, or the
+/// relay drops the registration and treats the key as unregistered —
+/// independent of any revocation signal (the relay has none).
 ///
 /// Chosen well above `IDLE_READ_TIMEOUT` (2 minutes) so it only bounds a
 /// connection that is *actively* exchanging traffic and would otherwise
@@ -233,9 +232,8 @@ async fn handle_connection_with_timeouts(
     idle_timeout: Duration,
     registration_ttl: Duration,
 ) -> std::io::Result<()> {
-    // add-deterministic-sync-testing: see relay_client.rs's `connect` doc
-    // comment for why this is the generic `tokio::io::split`, not
-    // `TcpStream::into_split`.
+    // See relay_client.rs's `connect` doc comment for why this is the
+    // generic `tokio::io::split`, not `TcpStream::into_split`.
     let (mut read_half, write_half) = tokio::io::split(stream);
 
     let connection_outbound_bytes = Arc::new(AtomicUsize::new(0));
@@ -318,7 +316,7 @@ async fn handle_connection_with_timeouts(
         return Err(io::Error::new(io::ErrorKind::WouldBlock, "relay outbound queue full"));
     }
 
-    // Registration TTL bookkeeping (task 3.1): the deadline starts at
+    // Registration TTL bookkeeping: the deadline starts at
     // successful registration and is pushed out by `registration_ttl` on
     // every successfully re-proved renewal below. `pending_renewal` holds
     // the challenge secret/nonce between a renewal `Hello` and the
@@ -330,7 +328,7 @@ async fn handle_connection_with_timeouts(
 
     let result = loop {
         tokio::select! {
-            // Task 3.2: this fires purely from elapsed time since
+            // this fires purely from elapsed time since
             // registration/last renewal — the relay never consults ACL or
             // revocation state to decide this.
             _ = tokio::time::sleep_until(registration_deadline) => {
@@ -373,7 +371,7 @@ async fn handle_connection_with_timeouts(
                         }
                     }
                     Ok(Some(RelayMessage { payload: Some(Payload::Hello(hello)) })) => {
-                        // Registration renewal request (task 3.1): re-run
+                        // Registration renewal request: re-run
                         // the exact same proof-of-key-ownership challenge
                         // as initial registration, reusing `relay_auth`'s
                         // hardened `verify_proof` rather than a separate,
@@ -738,7 +736,7 @@ mod tests {
         assert!(registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty());
     }
 
-    /// task 6.2: a `Forward` sent by a registered device to another
+    /// a `Forward` sent by a registered device to another
     /// registered device's public key must be delivered as a `Forwarded`
     /// frame with the sender's key attached.
     #[tokio::test]
@@ -792,7 +790,7 @@ mod tests {
         }
     }
 
-    /// task 6.2's "absent-dest behavior": a `Forward` addressed to a
+    /// Absent-dest behavior: a `Forward` addressed to a
     /// public key nobody has registered must be silently dropped —
     /// neither erroring nor killing the sender's connection — matching
     /// the documented behavior at the point the destination lookup
@@ -856,7 +854,7 @@ mod tests {
         assert!(matches!(received, Some(RelayMessage { payload: Some(Payload::Forwarded(_)) })));
     }
 
-    /// task 6.2's "removal-on-disconnect": once a registered connection
+    /// Removal-on-disconnect: once a registered connection
     /// disconnects cleanly (not just via the idle timeout already covered
     /// by `idle_registered_connection_times_out_and_unregisters`), its
     /// route must be removed from the registry so a stale entry doesn't
@@ -923,7 +921,7 @@ mod tests {
         });
     }
 
-    /// Task 3.4: a registration that isn't renewed within its TTL is
+    /// a registration that isn't renewed within its TTL is
     /// dropped — the connection is closed (distinct error from the
     /// pre-existing idle-read timeout, proven here by using a TTL far
     /// shorter than the generous idle timeout) and the registry entry is
@@ -961,7 +959,7 @@ mod tests {
         );
     }
 
-    /// Task 3.4: a client that re-proves key ownership (renews) before its
+    /// a client that re-proves key ownership (renews) before its
     /// registration's TTL elapses stays registered — proven by waiting past
     /// what the *original* (pre-renewal) deadline would have been and
     /// confirming traffic is still routed to it.
@@ -1050,7 +1048,7 @@ mod tests {
         }
     }
 
-    /// Task 3.4: once a registration's TTL has lapsed without renewal, the
+    /// once a registration's TTL has lapsed without renewal, the
     /// relay's dispatch behavior for that (now-expired) key must be
     /// identical to its behavior for a key that was never registered at
     /// all — both silently dropped, neither disrupting the sender's
@@ -1143,7 +1141,7 @@ mod tests {
     /// A renewal proof that doesn't verify (wrong key/secret) must fail
     /// closed — the connection is dropped and the registration removed —
     /// reusing `relay_auth::verify_proof`'s hardened checks rather than a
-    /// separate, less-scrutinized renewal path (task 3.1's rationale for
+    /// separate, less-scrutinized renewal path (the rationale for
     /// reusing the existing proof mechanism).
     #[tokio::test]
     async fn renewal_with_invalid_proof_drops_the_connection_and_registration() {

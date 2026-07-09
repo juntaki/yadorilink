@@ -18,9 +18,9 @@
 //! more special-cased: `watcher.rs`'s `RenameMode::From` reports only the
 //! vacated *directory* path as a single `Removed` event (nothing
 //! synthesizes one event per child), and `local_change.rs`'s
-//! `LocalChangeOutcome::FilesChanged` cascade — "fix-directory-rename-
-//! orphans-child-index-rows" — is what turns that single event into a
-//! tombstone for every live index row nested under it. None of this is
+//! `LocalChangeOutcome::FilesChanged` cascade is what turns that single
+//! event into a tombstone for every live index row nested under it. None
+//! of this is
 //! exercised anywhere in the existing DST suite. This file drives it
 //! directly, both solo (uncontested) and racing (concurrent with a peer's
 //! independent change to the same file/directory), looking for the
@@ -516,9 +516,9 @@ async fn deliver_local_rename(
 
 /// Renames a whole directory (`old_dir` -> `new_dir`) on disk, then
 /// delivers `Removed(old_dir)` (the single event a real watcher produces
-/// for the vacated directory itself -- `local_change.rs`'s orphan cascade,
-/// "fix-directory-rename-orphans-child-index-rows", is what turns this
-/// into a tombstone for every live index row nested under it) followed by
+/// for the vacated directory itself -- `local_change.rs`'s orphan cascade
+/// is what turns this into a tombstone for every live index row nested
+/// under it) followed by
 /// one `CreatedOrModified` per `children` (their basenames under
 /// `old_dir`) at their new location under `new_dir`.
 async fn deliver_local_dir_rename(

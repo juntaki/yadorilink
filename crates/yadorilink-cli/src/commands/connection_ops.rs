@@ -1,5 +1,4 @@
-//! `add-advanced-sync-operations` section 4 (Connection Operations): CLI
-//! surface for the connectivity doctor and recent connection-attempt
+//! CLI surface for the connectivity doctor and recent connection-attempt
 //! traces — mirrors `yadorilink_daemon::connection_trace`'s wire shape
 //! exactly.
 

@@ -1,8 +1,7 @@
-//! add-diagnostics-support-bundle task 2.1/2.2/3.3: `yadorilink diagnose
-//! preview|export` end-to-end against a real daemon over the actual
-//! control socket — same harness pattern as `tests/update.rs`/
-//! `tests/limits.rs` (a real `unix_transport::serve` daemon, no
-//! coordination-plane/auth setup needed).
+//! Tests `yadorilink diagnose preview|export` end-to-end against a real
+//! daemon over the actual control socket — same harness pattern as
+//! `tests/update.rs`/`tests/limits.rs` (a real `unix_transport::serve`
+//! daemon, no coordination-plane/auth setup needed).
 #![cfg(unix)]
 
 use std::sync::Arc;

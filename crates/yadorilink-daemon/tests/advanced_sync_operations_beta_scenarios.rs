@@ -1,4 +1,4 @@
-//! `add-advanced-sync-operations` task 6.3: beta acceptance scenarios for
+//! Beta acceptance scenarios for
 //! non-technical recovery from an out-of-sync folder and a failed peer
 //! connection, exercised end-to-end over the real control socket (mirrors
 //! `tests/control_socket.rs`/`tests/reporting_ipc.rs`'s own pattern). The

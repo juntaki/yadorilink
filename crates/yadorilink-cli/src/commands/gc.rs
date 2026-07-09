@@ -1,7 +1,7 @@
-//! `yadorilink gc [--dry-run]` (add-block-store-gc tasks 4.1/5.1): triggers
-//! an immediate block-store mark-and-sweep over the daemon control socket
-//! — the same round-trip shape `limits.rs`/`materialization.rs` already
-//! establish for a simple single-request-response daemon command.
+//! `yadorilink gc [--dry-run]`: triggers an immediate block-store
+//! mark-and-sweep over the daemon control socket — the same round-trip
+//! shape `limits.rs`/`materialization.rs` already establish for a simple
+//! single-request-response daemon command.
 
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
@@ -10,7 +10,7 @@ use yadorilink_ipc_proto::daemonctl::GcRequest;
 use crate::control_client;
 use crate::error::CliError;
 
-/// task 5.1: prints blocks/bytes actually deleted under a real sweep, or
+/// prints blocks/bytes actually deleted under a real sweep, or
 /// blocks/bytes that *would* be deleted under `--dry-run` — see
 /// `GcResponse`'s doc comment for why both share the same two fields.
 pub async fn run(dry_run: bool) -> Result<(), CliError> {

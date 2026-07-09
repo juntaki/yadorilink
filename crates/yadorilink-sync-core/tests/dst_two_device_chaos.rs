@@ -1,13 +1,12 @@
-//! Broad randomized two-device DST fuzzer (add-deterministic-sync-testing,
-//! extending task groups 3-5): unlike `dst_peer_reconcile_race.rs`, which
-//! reproduces one specific, hand-crafted historical race, this scenario
+//! Broad randomized two-device DST fuzzer: unlike `dst_peer_reconcile_race.rs`,
+//! which reproduces one specific, hand-crafted historical race, this scenario
 //! drives many randomized rounds of local writes/deletes on *both* real,
 //! simulated devices — solo (uncontested) and racing (concurrent,
 //! undispatched-vs-incoming) — over a small pool of shared paths, looking
-//! for *new*, not-yet-known instances of the same bug class design.md
+//! for *new*, not-yet-known instances of the same bug class this suite
 //! targets: "a durably observed local write is never silently discarded
-//! except by a causally-later write/delete." Per design.md's Non-Goals:
-//! any violation this scenario finds is filed and fixed as its own
+//! except by a causally-later write/delete." Any violation this scenario
+//! finds is filed and fixed as its own
 //! follow-up change, not folded into this one.
 //!
 //! Both devices run the real watcher-boundary/debounce/`LocalChangeProcessor`
@@ -281,17 +280,14 @@ async fn poll_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
     }
 }
 
-/// PF (fidelity/artifact-reduction) gate relaxation, agmsg investigation
-/// 2026-07-09: this bound used to be 5s, which false-failed round
-/// progression against a real recovery delay this scenario reliably
-/// reproduces: a `BlockRequest` datagram lost at the transport layer
-/// during conflict resolution recovers only via `DEFAULT_HYDRATION_
-/// TIMEOUT` (30s) plus `reconcile_one_file`'s own bounded retry -- see
-/// `fix-duplicate-conflict-copy-on-reresolution`'s design doc, corrected
-/// 2026-07-09 (originally misattributed to a self-echo watcher
+/// This bound used to be 5s, which false-failed round progression against
+/// a real recovery delay this scenario reliably reproduces: a
+/// `BlockRequest` datagram lost at the transport layer during conflict
+/// resolution recovers only via `DEFAULT_HYDRATION_TIMEOUT` (30s) plus
+/// `reconcile_one_file`'s own bounded retry -- not a self-echo watcher
 /// re-observation, which dynamic tracing plus an independent static read
 /// ruled out -- this DST harness's simulated watcher cannot re-observe
-/// `materialize`'s own writes at all). Production has no "N seconds or
+/// `materialize`'s own writes at all. Production has no "N seconds or
 /// fail" gate at all -- only eventual consistency -- so this bound only
 /// needs to be "comfortably above the slowest legitimate settle path this
 /// scenario can hit", not tight. Loosening it does *not* hide the delay's
@@ -317,10 +313,10 @@ const CONVERGENCE_PROMPTNESS_SLA: Duration = Duration::from_secs(3);
 /// can have observed the other), exactly `dst_peer_reconcile_race.rs`'s
 /// one-time baseline-adoption wait, just repeated before every round
 /// here since this scenario reuses a small path pool across many rounds
-/// (task 4.2's still-open "superseded by a causally-later *remote*
-/// write" checker gap, closed *for this scenario* the same way task
-/// 5.1/5.2 closed it: proving a converged base rather than generalizing
-/// `dst_support`'s checker to compare version vectors directly). Without
+/// (a still-open "superseded by a causally-later *remote* write" checker
+/// gap, closed *for this scenario* the same way it was closed elsewhere:
+/// proving a converged base rather than generalizing `dst_support`'s
+/// checker to compare version vectors directly). Without
 /// this, a round can legitimately race from two *already-diverged*
 /// bases (a prior round's propagation hadn't finished settling), making
 /// a genuine, correct `VvOrdering::Before` outcome indistinguishable
@@ -400,18 +396,16 @@ async fn connect_sessions(
         .unwrap(),
     );
 
-    // dst-full-stack-heat-run-framework PF (fidelity/artifact-reduction),
-    // F.3: production's `DaemonState::broadcast_change` (`daemon_state.rs`)
+    // Production's `DaemonState::broadcast_change` (`daemon_state.rs`)
     // is the consumer of `forward_tx` -- it re-`send_index_update`s a
     // record `resolve_and_apply_conflict` materialized (e.g. a brand-new
     // conflict-copy the peer that triggered the conflict has never seen
     // under this path/name) to every session sharing the group, no
     // source-exclusion. This bare-`PeerSyncSession` harness never had that
     // consumer wired up at all, so `forward()`'s calls were silent no-ops
-    // here -- the immediate-propagation gap `fix-duplicate-conflict-copy-
-    // on-reresolution`'s investigation (seed 3298840588) surfaced was, at
-    // least in part, this harness-fidelity gap rather than solely a
-    // production one. Wired here as a minimal single-peer version of
+    // here -- the immediate-propagation gap this surfaced was, at least
+    // in part, this harness-fidelity gap rather than solely a production
+    // one. Wired here as a minimal single-peer version of
     // `broadcast_change`: forward a record straight back out over this
     // same session (the only "other" session in a two-device topology).
     let mut sync_roots_a = HashMap::new();
@@ -470,13 +464,13 @@ fn device_has_live_record(device: &ChaosDevice, path: &str) -> bool {
     device.state.get_file(GROUP_ID, path).ok().flatten().map(|r| !r.deleted).unwrap_or(false)
 }
 
-/// agmsg investigation, 2026-07-09 (dst-full-stack-heat-run-framework
-/// P0): stamps `path`'s mtime to the same `virtual_now_nanos` value this
-/// round's `set_test_clock_override` call put `now_unix_nanos()` at --
-/// see that function's doc comment in `peer_session.rs` for why a real
-/// filesystem write's kernel-stamped mtime and madsim's virtual clock are
-/// otherwise on two different timelines. `std::fs::File::set_times`
-/// (stable since Rust 1.75) needs no extra crate.
+/// Stamps `path`'s mtime to the same
+/// `virtual_now_nanos` value this round's `set_test_clock_override` call
+/// put `now_unix_nanos()` at -- see that function's doc comment in
+/// `peer_session.rs` for why a real filesystem write's kernel-stamped
+/// mtime and madsim's virtual clock are otherwise on two different
+/// timelines. `std::fs::File::set_times` (stable since Rust 1.75) needs
+/// no extra crate.
 fn stamp_deterministic_mtime(path: &Path, virtual_now_nanos: i64) -> Result<(), String> {
     let modified = std::time::UNIX_EPOCH + Duration::from_nanos(virtual_now_nanos as u64);
     let file = std::fs::File::options().write(true).open(path).map_err(|e| e.to_string())?;
@@ -557,14 +551,14 @@ fn content_for(seed: u64, round: usize, device_id: &str, tag: &str) -> Vec<u8> {
     format!("seed {seed} round {round} {tag} {device_id}").into_bytes()
 }
 
-/// dst-full-stack-heat-run-framework task 0.4: one serialized `Case` per
-/// line (JSON Lines -- simple to append, simple to read back one Case at
-/// a time without parsing the whole file as one JSON array). Mirrors
+/// One serialized `Case` per line (JSON Lines -- simple to append, simple
+/// to read back one Case at a time without parsing the whole file as one
+/// JSON array). Mirrors
 /// `monkey_chaos.rs`'s `tests/dst_corpus/monkey_chaos_seeds.txt` pattern
 /// one level up: that corpus persists bare seeds (fine, since `monkey_
 /// chaos.rs`'s generator has stayed stable); this one persists the full
 /// `Case` so a promoted failure survives *this* file's generator
-/// evolving, per design.md's stated rationale for the IR.
+/// evolving.
 fn corpus_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/dst_corpus/two_device_chaos_cases.jsonl")
@@ -627,7 +621,7 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
 
     let device_a = setup_device("device-a", root_a.clone(), state_a.clone(), store_a.clone());
     let device_b = setup_device("device-b", root_b.clone(), state_b.clone(), store_b.clone());
-    // PF (fidelity/artifact-reduction) F.2, agmsg investigation 2026-07-09:
+    // Fidelity and artifact-reduction investigation 2026-07-09:
     // held past `connect_sessions` moving its own clones, for the recovery
     // sweep at this scenario's quiescence point (see that call site).
     let recovery_store_a = store_a.clone();
@@ -659,9 +653,9 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
         ));
     }
 
-    // dst-full-stack-heat-run-framework task 0.3: retrofit onto the Case
-    // IR's `ContentTable` + the multi-device `GlobalOracle` (`dst_support::
-    // oracle`), replacing the old device-local `ChaosRun`/`Event`/
+    // Retrofit onto the Case IR's `ContentTable` + the multi-device
+    // `GlobalOracle` (`dst_support::oracle`), replacing the old
+    // device-local `ChaosRun`/`Event`/
     // `EventKind` bookkeeping and its own ad hoc final `write_survives`/
     // `delete_survives` loop entirely -- the oracle's `check_no_loss`
     // supersedes it with a causal-supersession-aware, cross-device check
@@ -691,12 +685,11 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
     content_table.insert(next_content_id, b"canary".to_vec());
     next_content_id += 1;
     let mut oracle = GlobalOracle::new();
-    // dst-full-stack-heat-run-framework task 0.4: recorded alongside the
-    // oracle bookkeeping above so a failing run can be serialized as a
-    // full `Case` (not just a bare seed) for the corpus -- a serialized
+    // Recorded alongside the oracle bookkeeping above so a failing run
+    // can be serialized as a full `Case` (not just a bare seed) for the
+    // corpus -- a serialized
     // Case survives generator evolution; a bare seed only replays as long
-    // as this file's generator logic is unchanged (design.md's own
-    // rationale for the IR).
+    // as this file's generator logic is unchanged.
     let mut recorded_ops: Vec<(usize, u64, Op)> = Vec::new();
     let mut path_baseline: HashMap<
         &'static str,
@@ -711,7 +704,7 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
         }
     };
 
-    // agmsg investigation, 2026-07-09: a monotonically-increasing,
+    // A monotonically-increasing,
     // seed-derived synthetic "now" -- see `stamp_deterministic_mtime`'s
     // and `set_test_clock_override`'s doc comments for why this needs to
     // be the *same* value a round's writes stamp onto their own files'
@@ -741,11 +734,10 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
             converge_path(&device_a, &device_b, path).await;
         oracle.record_round_convergence_latency(path, round_convergence_elapsed);
         if !round_converged {
-            // dst-full-stack-heat-run-framework task 0.3: a convergence
+            // A convergence
             // timeout is now a genuine scenario FAILURE, not a skip --
-            // design.md's oracle #1 requirement ("a convergence timeout
-            // is a FAILURE, not a skip -- today dst skips it, and that
-            // hides data loss"). Deliberately still returned as a plain
+            // previously it was skipped, which hid real data loss.
+            // Deliberately still returned as a plain
             // `Err` (no marker prefix): `BASELINE_TIMEOUT_MARKER` above
             // and `TIME_LIMIT_MARKER`/`RESOURCE_EXHAUSTION_MARKER` below
             // stay classified as skips (genuine simulated-runtime/session-
@@ -927,25 +919,24 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
         (device_b.root.as_path(), device_b.state.as_ref()),
     ];
 
-    // dst-full-stack-heat-run-framework task 0.3 fix (agmsg review,
-    // 2026-07-08): the oracle must only ever run at a genuinely converged,
-    // quiescent point -- a fixed `FINAL_SETTLE` sleep before the last
-    // round's propagation has actually finished produces exactly the same
-    // "looks like a violation, is really mid-flight" false signal this
+    // The oracle must only ever run at a genuinely converged, quiescent
+    // point -- a fixed `FINAL_SETTLE` sleep before the last round's
+    // propagation has actually finished produces exactly the same "looks
+    // like a violation, is really mid-flight" false signal this
     // scenario's own `converge_path` was written to close for the
     // *per-round* gate (see its doc comment's "confirmed the hard way"
     // account) -- this is that same gap, at the *final* check instead of
     // a mid-run one. Poll `check_convergence` itself as the condition
-    // (bounded, generous -- design.md's oracle #1 wants a real timeout to
-    // be a failure, not silently ignored, but also wants the virtual time
-    // it took recorded: a few virtual seconds is normal settle, a bound
-    // anywhere near `DEFAULT_FULL_INDEX_RESYNC_INTERVAL`'s (~90s) scale is
-    // itself a real, separate latency finding worth surfacing, not an
+    // (bounded, generous -- a real timeout should be a failure, not
+    // silently ignored, but the virtual time it took should also be
+    // recorded: a few virtual seconds is normal settle, a bound anywhere
+    // near `DEFAULT_FULL_INDEX_RESYNC_INTERVAL`'s (~90s) scale is itself
+    // a real, separate latency finding worth surfacing, not an
     // artifact).
     // 60s, not a few seconds: `ensure_blocks_present`'s `DEFAULT_HYDRATION_
     // TIMEOUT` (`peer_session.rs`, 30s) is a legitimate, production
     // latency this scenario can hit (confirmed root cause of a real
-    // dedup-guard gap in `resolve_and_apply_conflict`, agmsg investigation
+    // dedup-guard gap in `resolve_and_apply_conflict`, investigation
     // 2026-07-08) -- convergence taking up to ~30s after that fires is
     // expected, not itself a bug; the bound just needs comfortable margin
     // above it, not to suppress it.
@@ -974,7 +965,7 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
     // the rest of the oracle reads the same disk state.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // PF (fidelity/artifact-reduction) F.2, agmsg investigation 2026-07-09:
+    // Fidelity and artifact-reduction investigation 2026-07-09:
     // a real daemon runs `repair_interrupted_materializations` +
     // `cleanup_stale_temp_files` at startup and periodically
     // (`link_manager.rs`) -- this bare-`PeerSyncSession` harness never
@@ -984,12 +975,11 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
     // row + an orphaned `.yadorilink-tmp.*` file permanently, surfacing as
     // `StructuralIndexDiskMismatch`/`Corruption` violations the same
     // production self-healing sweep would have already cleared before any
-    // health check ran against it (seed 3298840595's finding). Run once
-    // per device at this scenario's own genuinely-quiescent point --
-    // matching daemon fidelity, not masking the underlying materialize-
-    // ordering gap (task 0.5's design.md doc records that as a separate,
-    // low-priority hardening item; this only stops it from producing
-    // harness-only oracle noise).
+    // health check ran against it. Run once per device at this
+    // scenario's own genuinely-quiescent point -- matching daemon
+    // fidelity, not masking the underlying materialize-ordering gap (a
+    // separate, low-priority hardening item; this only stops it from
+    // producing harness-only oracle noise).
     for (device, store) in [(&device_a, &recovery_store_a), (&device_b, &recovery_store_b)] {
         let _ = repair_interrupted_materializations(
             &device.state,
@@ -1034,7 +1024,7 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
     violations.extend(oracle.check_no_corruption(&content_table, &devices));
     violations.extend(oracle.check_structural(GROUP_ID, &devices));
 
-    // PF promptness oracle, agmsg investigation 2026-07-09: deliberately
+    // Promptness oracle, investigation 2026-07-09: deliberately
     // *not* folded into `violations` above -- these never gate this run's
     // pass/fail (`ROUND_PROGRESSION_GATE` above already tolerates the
     // lost-block-fetch/hydration-timeout recovery cycle; failing the run
@@ -1043,8 +1033,8 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
     // exactly the "measure it, show it, don't hide it" signal
     // `ROUND_PROGRESSION_GATE`'s own doc comment promises -- a slow-but-
     // eventually-consistent round must stay visible somewhere, or
-    // loosening the gate quietly reintroduces the thing task 0.3 fixed
-    // (a real cost hidden as a silent pass).
+    // loosening the gate quietly reintroduces a real cost hidden as a
+    // silent pass.
     for slow in oracle.check_convergence_promptness(CONVERGENCE_PROMPTNESS_SLA) {
         eprintln!("  PROMPTNESS: {slow}");
     }
@@ -1055,7 +1045,7 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
         }
     }
     if !violations.is_empty() {
-        // dst-full-stack-heat-run-framework task 0.4: persist the full
+        // Persist the full
         // Case (not just the seed) so this failure survives generator
         // evolution in the corpus -- see `record_failing_case`'s doc
         // comment.
@@ -1209,11 +1199,10 @@ fn two_device_chaos_scenario() {
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
 
-    // dst-full-stack-heat-run-framework task 0.3: `CONVERGENCE_TIMEOUT_
-    // MARKER` and its `skipped_convergence` skip-classification are
-    // retired -- design.md's oracle #1 requirement ("a convergence
-    // timeout is a FAILURE, not a skip"). A convergence timeout now falls
-    // straight through to the `failures` arm below, same as any other
+    // `CONVERGENCE_TIMEOUT_MARKER` and its `skipped_convergence`
+    // skip-classification are retired -- a convergence timeout is a
+    // FAILURE, not a skip. A convergence timeout now falls straight
+    // through to the `failures` arm below, same as any other
     // scenario error. `BASELINE_TIMEOUT_MARKER`/`TIME_LIMIT_MARKER`/
     // `RESOURCE_EXHAUSTION_MARKER` remain genuine skip categories -- each
     // is a simulated-runtime/session-establishment infra condition
@@ -1224,10 +1213,10 @@ fn two_device_chaos_scenario() {
     let mut skipped_resource_exhaustion = 0;
     let mut failures = Vec::new();
 
-    // dst-full-stack-heat-run-framework task 0.4: replay every corpus case
-    // first, same reasoning as `monkey_chaos.rs`'s `replay_known_failing_
-    // seeds` -- a previously-found bug must always be re-checked, not only
-    // surface once on whichever sweep happened to find it. One `#[test]`
+    // Replay every corpus case first, same reasoning as
+    // `monkey_chaos.rs`'s `replay_known_failing_seeds` -- a
+    // previously-found bug must always be re-checked, not only surface
+    // once on whichever sweep happened to find it. One `#[test]`
     // fn per binary (this file's own documented madsim network-isolation
     // constraint), so this can't be a separate test like `monkey_chaos.rs`
     // has room for -- folded into this same sweep instead, using each

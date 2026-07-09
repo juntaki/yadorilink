@@ -33,9 +33,8 @@ fn ignore_test_reports_matching_pattern_or_explicit_no_match() {
     assert_eq!(no_match, "not ignored: notes.md (no matching pattern)");
 }
 
-/// add-advanced-sync-operations task 5.2/5.3: `ignore explain` reports the
-/// winning rule's source file and line number, distinct from `test`'s
-/// plainer "matched user pattern" wording.
+/// `ignore explain` reports the winning rule's source file and line
+/// number, distinct from `test`'s plainer "matched user pattern" wording.
 #[test]
 fn ignore_explain_reports_source_file_and_line_number() {
     let dir = tempfile::tempdir().unwrap();

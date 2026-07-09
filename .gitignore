@@ -29,12 +29,7 @@ DerivedData/
 **/*.xcworkspace/xcuserdata/
 **/*.xcworkspace/xcshareddata/
 
-# Local AI coding assistant configuration (machine/user-specific
-# permission overrides, not shared project config)
 .claude/settings.local.json
-
-# Local AI coding assistant's scheduled-wake job artifacts (plist + shell
-# script + logs) -- generated per machine, not shared project config.
 .codex/timers/
 
 # Machine-specific cargo target-dir override (redirects build output to

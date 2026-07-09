@@ -1,4 +1,4 @@
-//! add-automatic-updates task 6.1: proves the sample beta manifest fixture
+//! Proves the sample beta manifest fixture
 //! (`tests/fixtures/sample-beta-manifest.signed.json`, produced by
 //! `yadorilink-sign-manifest sign` against the real pinned dev trust root)
 //! actually verifies through the production `manifest::verify_and_parse`

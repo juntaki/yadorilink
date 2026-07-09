@@ -1,4 +1,4 @@
-//! Minimal standalone relay server binary (task 4.2). Content-blind:
+//! Minimal standalone relay server binary. Content-blind:
 //! forwards opaque encrypted WireGuard datagrams by destination public key.
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

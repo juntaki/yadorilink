@@ -1,5 +1,5 @@
-//! add-oss-usage-error-reporting task 3.6: integration tests for the
-//! reporting IPC surface (task 3.1/3.2) exercised over a real control
+//! Integration tests for the reporting IPC surface (task 3.1/3.2)
+//! exercised over a real control
 //! socket, the same pattern `tests/control_socket.rs` already uses for
 //! link/status/etc. Covers: report generation, queue management, consent
 //! updates, last-error candidate generation, and — the task's explicit
@@ -81,7 +81,7 @@ fn sample_usage_envelope() -> ReportEnvelope {
     )
 }
 
-/// Task 3.6: default consent is fully disabled and the queue/candidate
+/// default consent is fully disabled and the queue/candidate
 /// counts start at zero, all reachable over the real control socket.
 #[tokio::test]
 async fn reporting_status_reports_default_disabled_consent() {
@@ -100,7 +100,7 @@ async fn reporting_status_reports_default_disabled_consent() {
     assert_eq!(status.error_candidate_count, 0);
 }
 
-/// Task 3.4: the generated usage report is a valid, parseable envelope —
+/// the generated usage report is a valid, parseable envelope —
 /// exactly the payload a preview/export/submit would use.
 #[tokio::test]
 async fn generate_usage_report_returns_a_valid_envelope() {
@@ -117,7 +117,7 @@ async fn generate_usage_report_returns_a_valid_envelope() {
     assert_eq!(envelope.report_type, yadorilink_reporting::schema::ReportType::Usage);
 }
 
-/// Task 3.2: consent updates round-trip through the control socket and
+/// consent updates round-trip through the control socket and
 /// are reflected by a subsequent `ReportingStatus` call.
 #[tokio::test]
 async fn update_consent_enable_usage_is_reflected_in_status() {
@@ -191,7 +191,7 @@ async fn generate_last_error_report_with_no_candidates_is_an_error() {
     assert!(matches!(resp.payload, Some(RespPayload::Error(_))));
 }
 
-/// Task 3.6 "queue management": list/show/delete/flush round-trip over
+/// list/show/delete/flush round-trip over
 /// the control socket against an entry seeded directly into
 /// `state.reporting.queue()` (there is no "just enqueue" IPC message —
 /// entries reach the queue either via a failed-but-retryable `--submit`

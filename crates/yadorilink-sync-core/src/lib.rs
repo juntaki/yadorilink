@@ -2,7 +2,7 @@
 //!
 //! Layering:
 //! - [`version_vector`]: causality tracking for conflict detection.
-//! - [`chunker`]: fixed-size content-addressed block splitting (design D7).
+//! - [`chunker`]: fixed-size content-addressed block splitting ().
 //! - [`index`]: durable local state — the per-device file index and
 //!   folder-link registration.
 //! - [`ignore_patterns`]: per-link `.yadorilinkignore` parsing and matching.
@@ -21,10 +21,10 @@ mod error;
 pub mod hazard;
 pub mod ignore_patterns;
 pub mod index;
-/// add-first-run-safety-onboarding task 1.1: shared link preflight model
-/// (folder existence/empty-state/free-space/ignored-summary/risky-location
-/// checks) used by both `yadorilink-cli`'s client-side dry-run/confirmation
-/// gate and `yadorilink-daemon`'s defense-in-depth re-check.
+/// Shared link preflight model (folder existence/empty-state/free-space/
+/// ignored-summary/risky-location checks) used by both `yadorilink-cli`'s
+/// client-side dry-run/confirmation gate and `yadorilink-daemon`'s
+/// defense-in-depth re-check.
 pub mod link_preflight;
 pub mod local_change;
 pub mod materialization;

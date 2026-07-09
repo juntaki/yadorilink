@@ -1,4 +1,4 @@
-//! OS-native credential store access (design.md D9) for the coordination
+//! OS-native credential store access for the coordination
 //! plane session token — written by `yadorilink login` (the CLI), read here
 //! so the daemon can authenticate its own netmap stream without a
 //! separate login step.

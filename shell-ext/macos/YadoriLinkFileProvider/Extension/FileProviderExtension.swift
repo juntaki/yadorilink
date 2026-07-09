@@ -101,14 +101,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             let relativePath = itemIdentifier.rawValue
             let absolutePath = (localPath as NSString).appendingPathComponent(relativePath)
 
-            // design.md D4/D5: calls the daemon's HydrateRequest via the
-            // Rust core, bounded to ~35s (see fileprovider-core's
-            // HYDRATION_TIMEOUT doc comment) — synchronous from the
-            // opening application's point of view, exactly the
-            // "bounded timeout on synchronous OS callback" this task
-            // requires. `false` covers both "timed out" and "daemon
-            // reported hydration failure (no reachable peer had this
-            // block)" — either way the OS callback completes with a
+            // Calls the daemon's HydrateRequest via the Rust core, bounded
+            // to ~35s (see fileprovider-core's HYDRATION_TIMEOUT doc
+            // comment) — synchronous from the opening application's point
+            // of view, exactly the bounded timeout a synchronous OS
+            // callback requires. `false` covers both "timed out" and
+            // "daemon reported hydration failure (no reachable peer had
+            // this block)" — either way the OS callback completes with a
             // clear error rather than hanging.
             let ok = absolutePath.withCString { yadorilink_fp_hydrate($0) }
             guard ok else {
@@ -138,15 +137,15 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
 
     // MARK: - Write path: NOT IMPLEMENTED (documented, tracked gap)
     //
-    // design.md's tasks 1-5 (daemon-side) only implement read-direction
-    // materialization/hydration — there is no daemon IPC surface yet for
-    // "a File Provider client created/modified/deleted a file, apply
-    // this to the index and queue it for upload." Wiring that up is real
-    // scope beyond task 7.1-7.3 (it would need a new shellipc.proto
-    // request analogous to how `local_change::process_event` handles a
-    // *filesystem watcher's* view of a local edit, but sourced from the
-    // File Provider system's create/modify/delete calls instead of
-    // `notify`). `FileProviderItem.capabilities` is deliberately
+    // The daemon side only implements read-direction materialization/
+    // hydration so far — there is no daemon IPC surface yet for "a File
+    // Provider client created/modified/deleted a file, apply this to the
+    // index and queue it for upload." Wiring that up is real scope (it
+    // would need a new shellipc.proto request analogous to how
+    // `local_change::process_event` handles a *filesystem watcher's*
+    // view of a local edit, but sourced from the File Provider system's
+    // create/modify/delete calls instead of `notify`).
+    // `FileProviderItem.capabilities` is deliberately
     // `.allowsReading`-only (no `.allowsWriting`/`.allowsAddingSubItems`)
     // specifically so Finder does not offer drag-and-drop-in/edit-in-place
     // UI that would dead-end here — these three methods exist only to

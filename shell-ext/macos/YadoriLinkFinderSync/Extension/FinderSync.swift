@@ -1,9 +1,8 @@
 //
 //  FinderSync.swift
-//  build-yadorilink-mvp tasks 10.1-10.3.
 //
-//  The thin Swift `FIFinderSync` shell design.md D4 calls for: all sync
-//  status/context-action *logic* lives in the Rust FFI core
+//  The thin Swift `FIFinderSync` shell: all sync status/context-action
+//  *logic* lives in the Rust FFI core
 //  (`yadorilink_shell_core`, shell-ext/macos/core/src/lib.rs), which speaks
 //  the daemon's shell-integration IPC protocol (shellipc.proto) with a
 //  bounded 200ms timeout and fails soft to "no badge" per the
@@ -50,8 +49,8 @@ class FinderSync: FIFinderSync {
         case pending = "com.yadorilink.badge.pending"
         case error = "com.yadorilink.badge.error"
         case onlineOnly = "com.yadorilink.badge.onlineOnly"
-        // on-demand-sync task 7.4: design.md D7's advisory "open
-        // elsewhere" signal (an Office-style `~$*` lock file seen on a
+        // on-demand-sync's advisory "open elsewhere" signal (an
+        // Office-style `~$*` lock file seen on a
         // peer, relayed over PeerChannel) — a sixth badge identifier
         // following the exact pattern of the five above.
         case openElsewhere = "com.yadorilink.badge.openElsewhere"
@@ -96,7 +95,7 @@ class FinderSync: FIFinderSync {
 
         // on-demand-sync task 7.4/7.5: OnDemand folders live under a
         // File-Provider-managed location this extension does not choose
-        // (design.md D1) — created/populated by the YadoriLinkFileProvider
+        // — created/populated by the YadoriLinkFileProvider
         // extension via NSFileProviderManager domain registration (task
         // 7.2). Apple documents FinderSync as able to observe a
         // File-Provider-managed directory concurrently with the File
@@ -225,8 +224,8 @@ class FinderSync: FIFinderSync {
             submenu.addItem(item)
         }
 
-        // add-desktop-status-app task 4.3 (shell-integration spec's "Shell
-        // Actions Can Open Desktop Status App"): unlike the actions above,
+        // Per the shell-integration spec's "Shell Actions Can Open
+        // Desktop Status App": unlike the actions above,
         // this is a pure UI action -- it launches a separate companion
         // process (the menu-bar status app), it does not round-trip
         // through `yadorilink_send_context_action`/the daemon's shell IPC
@@ -266,13 +265,13 @@ class FinderSync: FIFinderSync {
     @objc func pinItem(_ sender: NSMenuItem) { sendAction(sender.tag) }
     @objc func evictItem(_ sender: NSMenuItem) { sendAction(sender.tag) }
 
-    /// add-desktop-status-app task 4.3: launches the menu-bar status app
+    /// Launches the menu-bar status app
     /// (`yadorilink-status-app`, installed by `installer/macos/build-pkg.sh`
     /// alongside `yadorilink`/`yadorilink-daemon`), passing the selected
     /// item's path as an argument so the app *could* focus on it -- the
     /// status app doesn't parse an argv path yet (tracked as a documented
-    /// follow-up in this change's `tasks.md`, since the app is normally
-    /// already running as a login item and a second invocation's argv
+    /// follow-up, since the app is normally already running as a login
+    /// item and a second invocation's argv
     /// isn't otherwise delivered to it), so today this only guarantees the
     /// app is running/visible, not that it's focused on this specific
     /// item. Uses `Process` rather than `NSWorkspace.shared.open`/

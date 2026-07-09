@@ -1,6 +1,6 @@
-//! add-automatic-updates task 5.6: `yadorilink update status|check|install|config`
-//! end-to-end against a real daemon over the actual control socket — same
-//! pattern as `tests/limits.rs` (a real `unix_transport::serve` daemon, no
+//! Tests `yadorilink update status|check|install|config` end-to-end
+//! against a real daemon over the actual control socket — same pattern
+//! as `tests/limits.rs` (a real `unix_transport::serve` daemon, no
 //! coordination-plane/auth setup needed).
 #![cfg(unix)]
 
@@ -18,11 +18,11 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
     // `DaemonState::new` spawns the periodic update-check scheduler
-    // immediately (design.md 2.2), which would otherwise try a real DNS
-    // lookup against the built-in placeholder manifest URL from every
-    // test in this file. Pointing it at a local port nothing listens on
-    // fails fast and deterministically (connection refused) instead of
-    // depending on network/DNS behavior in a test.
+    // immediately, which would otherwise try a real DNS lookup against
+    // the built-in placeholder manifest URL from every test in this
+    // file. Pointing it at a local port nothing listens on fails fast
+    // and deterministically (connection refused) instead of depending
+    // on network/DNS behavior in a test.
     std::env::set_var("YADORILINK_UPDATE_MANIFEST_URL", "http://127.0.0.1:1/manifest.json");
 
     let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
@@ -47,8 +47,8 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
 /// `tests/limits.rs`'s own `TEST_MUTEX`.
 static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// task 5.6 "update commands handle daemon-not-running": pointing the
-/// control socket at a path nothing is listening on must fail clearly as
+/// "Update commands handle daemon-not-running": pointing the control
+/// socket at a path nothing is listening on must fail clearly as
 /// `DaemonNotRunning`, not hang or panic.
 #[tokio::test]
 async fn update_status_reports_daemon_not_running_clearly() {
@@ -61,12 +61,12 @@ async fn update_status_reports_daemon_not_running_clearly() {
     assert_eq!(err.exit_code(), yadorilink_cli::error::CliError::DaemonNotRunning.exit_code());
 }
 
-/// task 5.6 "no-update" case: a freshly-started daemon reports the
-/// documented safe defaults (checks enabled, manual install, no available
-/// version) via the real IPC round trip. Deliberately does *not* assert
+/// "No-update" case: a freshly-started daemon reports the documented
+/// safe defaults (checks enabled, manual install, no available version)
+/// via the real IPC round trip. Deliberately does *not* assert
 /// `state == "idle"`: `DaemonState::new` spawns the periodic update-check
-/// scheduler immediately (design.md 2.2's "checks at daemon startup"),
-/// and this test's daemon has no reachable manifest endpoint configured,
+/// scheduler immediately (it checks at daemon startup), and this test's
+/// daemon has no reachable manifest endpoint configured,
 /// so by the time this reads status the real startup check has usually
 /// already run and failed fast (a nonexistent-domain DNS lookup) --
 /// `state` can legitimately be `"checking"` or `"failed"` depending on
@@ -89,7 +89,7 @@ async fn update_status_reflects_fresh_daemon_defaults() {
     assert!(status.available_version.is_empty(), "no update should ever appear out of nowhere");
 }
 
-/// task 5.6 "update-available"/"held-back"/"failed" cases: `yadorilink
+/// "update-available"/"held-back"/"failed" cases: `yadorilink
 /// status`'s embedded update fields and `update status`'s own response
 /// reflect whatever the daemon's update policy currently records --
 /// directly manipulated here (mirrors `tests/limits.rs`'s own
@@ -137,7 +137,7 @@ async fn update_status_reflects_an_available_held_back_update() {
     assert_eq!(status.update_holdback_reason, "staged rollout at 10%");
 }
 
-/// task 5.6 "failed" case.
+/// case.
 #[tokio::test]
 async fn update_status_reflects_a_failed_check() {
     let _guard = TEST_MUTEX.lock().await;
@@ -190,7 +190,7 @@ async fn update_config_persists_and_is_reflected_by_status() {
     assert_eq!(status.automatic_install_mode, "automatic");
 }
 
-/// task 5.6 "install" case with nothing verified yet: `update install`
+/// case with nothing verified yet: `update install`
 /// against a fresh daemon (no verified artifact) surfaces a clear error
 /// rather than hanging or silently no-op'ing.
 #[tokio::test]

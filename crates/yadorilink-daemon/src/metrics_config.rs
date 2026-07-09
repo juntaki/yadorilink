@@ -1,29 +1,28 @@
-//! add-observability-and-metrics task 4.2: on-disk persistence for the
-//! daemon's opt-in `/metrics` endpoint toggle — mirrors
-//! `governance_config::GovernanceConfigStore` exactly (small, independent
-//! JSON file under the config directory, `#[serde(default)]` +
-//! `#[derive(Default)]`, tempfile-then-rename writes), so a pre-existing
-//! install with no `metrics_config.json` at all loads the safe,
-//! spec-mandated default (**disabled**, design.md's "Default off /
-//! localhost-only") with no migration step.
+//! On-disk persistence for the daemon's opt-in `/metrics` endpoint
+//! toggle — mirrors `governance_config::GovernanceConfigStore` exactly
+//! (small, independent JSON file under the config directory,
+//! `#[serde(default)]` + `#[derive(Default)]`, tempfile-then-rename
+//! writes), so a pre-existing install with no `metrics_config.json` at
+//! all loads the safe, spec-mandated default (**disabled**, "Default off
+//! / localhost-only") with no migration step.
 //!
 //! Unlike `GovernanceConfigStore` (whose rate/headroom changes must apply
-//! to an already-running daemon without a restart, task 2.5), enabling or
-//! changing the metrics bind address only takes effect on the *next* daemon
-//! start (binding a new listener isn't something a running process can do
-//! to itself mid-flight) — `main.rs` reads this once at startup, and
-//! `yadorilink daemon metrics` (the CLI command that writes this file) says
-//! so explicitly.
+//! to an already-running daemon without a restart), enabling or changing
+//! the metrics bind address only takes effect on the *next* daemon start
+//! (binding a new listener isn't something a running process can do to
+//! itself mid-flight) — `main.rs` reads this once at startup, and
+//! `yadorilink daemon metrics` (the CLI command that writes this file)
+//! says so explicitly.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// design.md "Default off / localhost-only; bind address configurable.
-/// Never exposed publicly by default." `bind_addr` deliberately defaults to
-/// a loopback-only address (never a wildcard) so an operator who enables
-/// this without also overriding the address still gets the "never exposed
-/// publicly by default" guarantee.
+/// Default off / localhost-only; bind address configurable. Never
+/// exposed publicly by default. `bind_addr` deliberately defaults to a
+/// loopback-only address (never a wildcard) so an operator who enables
+/// this without also overriding the address still gets the "never
+/// exposed publicly by default" guarantee.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:9184";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,8 +105,8 @@ mod tests {
         (dir, store)
     }
 
-    /// task 3.1/5.1: default off, and loopback-only if ever enabled without
-    /// an explicit address override.
+    /// Default off, and loopback-only if ever enabled without an
+    /// explicit address override.
     #[test]
     fn fresh_store_defaults_to_disabled_and_loopback_only() {
         let (dir, store) = store();

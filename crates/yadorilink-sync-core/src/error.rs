@@ -6,7 +6,7 @@ pub enum SyncError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    // add-resource-governance task 1.4: no longer `#[from]`-derived — see
+    // No longer `#[from]`-derived — see
     // the manual `From<StorageError>` impl below, which special-cases
     // `StorageError::DiskPressure` into `SyncError::DiskPressure` instead of
     // burying it in this generic variant, so a caller can still tell "disk
@@ -54,14 +54,14 @@ pub enum SyncError {
     #[error("not found: {0}")]
     NotFound(String),
 
-    /// on-demand-sync design D5: a hydration request that couldn't obtain
+    /// on-demand-sync : a hydration request that couldn't obtain
     /// all of a file's blocks within the bounded timeout, either because
     /// the peer never responded or explicitly reported some as not found.
     #[error("hydration of {0:?} timed out or failed: no reachable peer holds all required blocks")]
     HydrationFailed(String),
 
-    /// add-file-version-history spec "Restore With Missing Blocks Fails
-    /// Clearly": a restore (`yadorilink restore`/`trash restore`) whose
+    /// The "Restore With Missing Blocks Fails
+    /// Clearly" spec requirement: a restore (`yadorilink restore`/`trash restore`) whose
     /// chosen version needs blocks that are missing locally and
     /// unavailable from every currently-reachable, authorized peer.
     /// Deliberately a distinct variant from `HydrationFailed` — both are
@@ -84,11 +84,10 @@ pub enum SyncError {
     #[error("cannot evict {0:?}: it is pinned")]
     EvictionRejected(String),
 
-    /// add-folder-direction-modes task 3.1/3.2: `override`/`revert` are
+    /// `override`/`revert` are
     /// each valid against exactly one mode (`override` only reconciles a
-    /// `send-only` link, `revert` only a `receive-only` one — design.md's
-    /// "Override / revert" section) and neither reconciles a paused link
-    /// (design.md: "pause still trumps everything"). Carries a
+    /// `send-only` link, `revert` only a `receive-only` one) and neither
+    /// reconciles a paused link ("pause still trumps everything"). Carries a
     /// human-readable explanation of which precondition failed, surfaced
     /// to the CLI user as-is.
     #[error("{0}")]
@@ -106,7 +105,7 @@ pub enum SyncError {
     )]
     PathEscapesRoot(String),
 
-    /// add-resource-governance task 1.4: a distinct disk-pressure error,
+    /// A distinct disk-pressure error,
     /// carrying the affected path and volume — constructed directly by this
     /// crate's own hydration/materialization preflight
     /// (`materialization::check_disk_headroom`), or converted from
@@ -123,7 +122,7 @@ pub enum SyncError {
     )]
     DiskPressure { path: String, volume: String, available_bytes: u64, headroom_bytes: u64 },
 
-    /// add-update-migration-safety task 1.3: this local database's stamped
+    /// This local database's stamped
     /// `PRAGMA user_version` is newer than the schema version this binary
     /// supports — it was opened (and migrated) by a newer build. Refusing
     /// to proceed here is deliberate: an older binary blindly continuing
@@ -140,17 +139,17 @@ pub enum SyncError {
 }
 
 impl SyncError {
-    /// add-observability-and-metrics section 2: a coarse, stable,
+    /// A coarse, stable,
     /// privacy-safe category slug for this error — the recent-error
     /// ring buffer's (`yadorilink-daemon::recent_errors`) and the
     /// `/metrics` endpoint's `yadorilink_sync_errors_total{category}`
-    /// taxonomy, mirroring design.md's "Categories mirror the sync
+    /// taxonomy, mirroring the sync
     /// engine's error taxonomy (e.g. peer-unreachable, block-integrity,
-    /// disk-pressure, permission)". Deliberately derived only from the
+    /// disk-pressure, permission). Deliberately derived only from the
     /// variant/kind itself, never from `Display`/`to_string()` — this
     /// crate's error messages can embed a path, volume, or hash (see e.g.
     /// `DiskPressure`'s own fields), exactly what the recent-error buffer
-    /// and metrics labels must never carry (task 2.1/3.3's redaction
+    /// and metrics labels must never carry (a redaction
     /// requirement). "block_integrity" (a peer returning block data that
     /// fails its expected hash/size) has no dedicated variant here — it's
     /// recorded directly by the daemon's hydration dispatcher at the point
@@ -209,7 +208,7 @@ impl From<yadorilink_local_storage::StorageError> for SyncError {
 mod tests {
     use super::*;
 
-    /// task 1.5: a `StorageError::DiskPressure` from the block store
+    /// a `StorageError::DiskPressure` from the block store
     /// converts to `SyncError::DiskPressure`, not the generic `Storage`
     /// wrapper — a caller matching on `SyncError` alone (not reaching into
     /// the wrapped `StorageError`) can still tell disk pressure apart from
@@ -237,7 +236,7 @@ mod tests {
         assert!(!matches!(sync_err, SyncError::DiskPressure { .. }));
     }
 
-    /// add-observability-and-metrics task 2.1: spot-checks the category
+    /// Spot-checks the category
     /// taxonomy's coarse, stable slugs for a representative sample of
     /// variants — these are exactly the strings the recent-error ring
     /// buffer and `/metrics` labels surface, so a typo here is a
@@ -268,7 +267,7 @@ mod tests {
         assert_eq!(SyncError::Io(std::io::Error::other("transient")).category(), "io");
     }
 
-    /// task 1.5: `DiskPressure` must never be confused with `Io` — a plain
+    /// `DiskPressure` must never be confused with `Io` — a plain
     /// transient I/O error stays `Io`, never `DiskPressure`, so callers can
     /// branch on "disk full, back off differently" versus "network/I/O
     /// blip, just retry" by matching the `SyncError` variant alone.

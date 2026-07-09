@@ -1,8 +1,8 @@
-//! add-resource-governance task 5.5: `yadorilink limits set`/`limits show`
-//! end-to-end against a real daemon over the actual control socket — same
-//! pattern as `tests/materialization.rs` (a real `unix_transport::serve`
-//! daemon, no coordination-plane/auth setup needed). Verifies side effects
-//! on `DaemonState` (`governance_config`, `rate_limiters`) rather than
+//! Tests `yadorilink limits set`/`limits show` end-to-end against a real
+//! daemon over the actual control socket — same pattern as
+//! `tests/materialization.rs` (a real `unix_transport::serve` daemon, no
+//! coordination-plane/auth setup needed). Verifies side effects on
+//! `DaemonState` (`governance_config`, `rate_limiters`) rather than
 //! captured stdout, matching this file's established convention.
 #![cfg(unix)]
 
@@ -48,7 +48,7 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
 /// so only tests *within this file* need to coordinate.
 static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// task 5.5: `limits set` persists to the daemon's governance config and
+/// `limits set` persists to the daemon's governance config and
 /// is reflected by a subsequent `limits show`-equivalent read.
 #[tokio::test]
 async fn limits_set_persists_and_is_reflected_by_a_subsequent_read() {
@@ -74,7 +74,7 @@ async fn limits_set_persists_and_is_reflected_by_a_subsequent_read() {
     assert_eq!(shown.download_bytes_per_sec, 2_000_000);
 }
 
-/// task 5.5: `status` reports the same configured limits `limits set` just
+/// `status` reports the same configured limits `limits set` just
 /// applied — the single source of truth (`governance_config`) backs both
 /// surfaces.
 #[tokio::test]
@@ -111,7 +111,7 @@ async fn live_daemon_applies_limits_without_restart() {
     assert_eq!(state.rate_limiters.download.rate_bytes_per_sec(), 4_000_000);
 }
 
-/// task 5.5: `status` reports free-space state that reflects the
+/// `status` reports free-space state that reflects the
 /// local-storage classification — forced deterministically via a headroom
 /// override far larger than any real disk's free space, same technique
 /// used throughout this change's other tests.

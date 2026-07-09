@@ -4,7 +4,7 @@
 //!
 //! Deliberately owns no long-lived tasks or reconnect logic — see
 //! `relay_hub.rs`'s `RelayHub`, the one place a relay connection's
-//! lifetime (including reconnects, REL-2) is managed. [`connect`] is
+//! lifetime (including reconnects) is managed. [`connect`] is
 //! called once for the initial connection *and* once per reconnect
 //! attempt, so every reconnect re-runs this exact same handshake
 //! ("re-Hello"): the relay server drops a device's route registry entry
@@ -24,20 +24,20 @@ use crate::error::TransportError;
 /// One successfully-authenticated relay TCP connection, split for
 /// independent read/write tasks.
 ///
-/// add-deterministic-sync-testing: split via the generic
-/// `tokio::io::split` (a `Mutex`-backed `ReadHalf`/`WriteHalf` pair over
-/// any `AsyncRead + AsyncWrite`), not `TcpStream::into_split` (a
-/// lock-free `BiLock`-based split specific to real tokio's own
-/// `TcpStream`) — `madsim`'s simulated `TcpStream` implements real
-/// tokio's `AsyncRead`/`AsyncWrite` traits but has no `into_split`
-/// method of its own, so the generic split is the one form that works
-/// unmodified under both the real and `madsim`-simulated runtime.
+/// Split via the generic `tokio::io::split` (a `Mutex`-backed
+/// `ReadHalf`/`WriteHalf` pair over any `AsyncRead + AsyncWrite`), not
+/// `TcpStream::into_split` (a lock-free `BiLock`-based split specific to
+/// real tokio's own `TcpStream`) — `madsim`'s simulated `TcpStream`
+/// implements real tokio's `AsyncRead`/`AsyncWrite` traits but has no
+/// `into_split` method of its own, so the generic split is the one form
+/// that works unmodified under both the real and `madsim`-simulated
+/// runtime.
 #[derive(Debug)]
 pub struct RelayConnection {
     pub read_half: ReadHalf<TcpStream>,
     pub write_half: WriteHalf<TcpStream>,
     /// This device's public IP:port as observed by the relay for *this*
-    /// connection — a minimal STUN-like "netcheck" (task 4.4).
+    /// connection — a minimal STUN-like "netcheck".
     pub observed_address: String,
 }
 
@@ -111,7 +111,7 @@ mod tests {
 
     /// The handshake this module performs must succeed end-to-end against
     /// a real relay server and report an observed address — the
-    /// foundation every reconnect attempt in `relay_hub.rs` (REL-2)
+    /// foundation every reconnect attempt in `relay_hub.rs`
     /// repeats verbatim.
     #[tokio::test]
     async fn connect_completes_handshake_and_reports_observed_address() {

@@ -48,7 +48,7 @@ impl From<FileRecord> for proto::FileInfo {
             }),
             blocks: f.blocks.into_iter().map(Into::into).collect(),
             deleted: f.deleted,
-            // add-sync-fidelity task 5.1 wire-schema gap (documented, not
+            // Wire-schema gap (documented, not
             // hidden — see `peer_session::materialize_symlink_at`'s and
             // `try_apply_metadata_only_update`'s doc comments for the full
             // story): `FileRecord` deliberately does not carry
@@ -75,7 +75,7 @@ impl From<FileRecord> for proto::FileInfo {
     }
 }
 
-/// **Same add-sync-fidelity task 5.1 gap as the `From<FileRecord>` impl
+/// **Same gap as the `From<FileRecord>` impl
 /// above, mirrored on the receive side**: `f.record_kind`/
 /// `f.symlink_target`/`f.symlink_out_of_root_or_absolute`/`f.exec_bit`
 /// (now present on the wire — see `sync.proto`) are read by nothing here,
@@ -105,7 +105,7 @@ impl From<proto::FileInfo> for FileRecord {
 }
 
 /// Whether a file's content is actually present on disk. Purely local —
-/// never sent to peers (see `on-demand-sync` design D2): two devices can
+/// never sent to peers (see `on-demand-sync` ): two devices can
 /// disagree about a file's materialization state while agreeing on its
 /// version and content, so this deliberately isn't a `FileRecord` field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,7 +137,7 @@ impl MaterializationState {
 }
 
 /// A folder group's default materialization behavior for newly-adopted
-/// files (`on-demand-sync` design D3).
+/// files (`on-demand-sync` ).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MaterializationPolicy {
     /// Fetch and write full content immediately — the original MVP behavior.
@@ -163,7 +163,7 @@ impl MaterializationPolicy {
 }
 
 /// The kind of filesystem entry a file-index row represents
-/// (`add-sync-fidelity` design D1, task 1.1) — deliberately **not** a
+/// () — deliberately **not** a
 /// `FileRecord` field: like `MaterializationState`/`pinned` before it, this
 /// is index-local metadata surfaced through dedicated `SyncState`
 /// getters/setters (`SyncState::get_record_kind`/`set_record_kind`) rather
@@ -176,7 +176,7 @@ impl MaterializationPolicy {
 /// Deliberately **orthogonal to `FileRecord::deleted`**, not a superset of
 /// it: there is no `Tombstone` variant here. A tombstoned symlink keeps
 /// `record_kind = Symlink` (`deleted` is set separately) so that
-/// tombstone-application code (design.md's symlink-tombstone requirement)
+/// tombstone-application code (the symlink-tombstone requirement)
 /// can tell "remove the symlink itself" apart from "remove a regular
 /// file/directory" — collapsing that into a single `Tombstone` variant
 /// would destroy exactly the information that distinction needs. `deleted`
@@ -217,8 +217,9 @@ impl RecordKind {
     }
 }
 
-/// A folder link's directional propagation mode (`add-folder-direction-modes`
-/// design.md's "Propagation gating" table) — persisted alongside `paused` on
+/// A folder link's directional propagation mode, governed by a
+/// "Propagation gating" table (see each variant below) — persisted
+/// alongside `paused` on
 /// `links`, device-local like `chunking_policy`/`materialization_policy`
 /// above (each side of a link independently chooses its own mode; there is
 /// no requirement that both peers of a link agree, matching those two
@@ -232,8 +233,7 @@ pub enum LinkMode {
     #[default]
     SendReceive,
     /// Sends local changes; an incoming peer change is never applied —
-    /// recorded as an out-of-sync item instead (design.md's propagation
-    /// gating table).
+    /// recorded as an out-of-sync item instead.
     SendOnly,
     /// Applies incoming peer changes; a local modification is never sent —
     /// recorded as a receive-only-changed item instead.
@@ -259,11 +259,11 @@ impl LinkMode {
 }
 
 /// A folder link's chunking algorithm (`content-defined-chunking` design
-/// D3) — device-local, opt-in; see design D4 for why this doesn't need
+/// D3) — device-local, opt-in; see for why this doesn't need
 /// cross-device agreement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChunkingPolicy {
-    /// The original fixed-size chunking (design.md D7's default).
+    /// The original fixed-size chunking ('s default).
     Fixed,
     /// Content-defined chunking for files at or above the size threshold
     /// (`chunker::CDC_SIZE_THRESHOLD`); smaller files still use `Fixed`.
@@ -286,10 +286,10 @@ impl ChunkingPolicy {
     }
 }
 
-/// add-sync-fidelity task 3.3: reads the POSIX owner-executable bit off
+/// Reads the POSIX owner-executable bit off
 /// `metadata` — the capture-side counterpart to `chunker::apply_exec_bit`'s
-/// materialization-side apply. Always `false` on non-Unix platforms (task
-/// 3.3: no error, no attempted read of a bit that doesn't exist there).
+/// materialization-side apply. Always `false` on non-Unix platforms (no error,
+/// no attempted read of a bit that doesn't exist there).
 ///
 /// **Cross-section call-site note**: this needs to be called from
 /// `local_change.rs`'s record-building code — the scanner's per-entry
@@ -303,9 +303,7 @@ impl ChunkingPolicy {
 /// symlink classification), developed in parallel with this section —
 /// this function is the ready-to-call capture primitive; wiring the
 /// actual call site is intentionally left to whoever lands it, to avoid
-/// two agents editing `local_change.rs` at once. See this crate's
-/// `add-sync-fidelity` implementation notes for the full coordination
-/// story.
+/// two agents editing `local_change.rs` at once.
 #[cfg(unix)]
 pub fn owner_exec_bit_from_metadata(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -313,8 +311,8 @@ pub fn owner_exec_bit_from_metadata(metadata: &std::fs::Metadata) -> bool {
 }
 
 /// See the `#[cfg(unix)]` `owner_exec_bit_from_metadata` above — the
-/// no-op-and-always-`false` Windows/other-platform counterpart task 3.3
-/// explicitly requires (Windows has no owner-exec permission bit to read).
+/// no-op-and-always-`false` Windows/other-platform counterpart explicitly
+/// requires (Windows has no owner-exec permission bit to read).
 #[cfg(not(unix))]
 pub fn owner_exec_bit_from_metadata(_metadata: &std::fs::Metadata) -> bool {
     false
@@ -324,7 +322,7 @@ pub fn owner_exec_bit_from_metadata(_metadata: &std::fs::Metadata) -> bool {
 mod owner_exec_bit_tests {
     use super::owner_exec_bit_from_metadata;
 
-    /// task 3.3: a freshly-created file (default create mode, no exec
+    /// a freshly-created file (default create mode, no exec
     /// bits) reads as not executable, and setting the owner-exec bit via
     /// `chunker::apply_exec_bit` (exercised indirectly here through a
     /// plain `set_permissions`, to keep this test self-contained within
@@ -346,7 +344,7 @@ mod owner_exec_bit_tests {
         assert!(owner_exec_bit_from_metadata(&std::fs::metadata(&path).unwrap()));
     }
 
-    /// task 3.3: this must never error or panic, on any platform, for an
+    /// this must never error or panic, on any platform, for an
     /// ordinary file's metadata — the only branch actually reachable on a
     /// non-Unix build always returns `false` unconditionally.
     #[test]

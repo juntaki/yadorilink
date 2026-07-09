@@ -7,8 +7,7 @@
 //! Deliberately simple for this MVP: once a peer session is established
 //! it is never torn down here even if later removed from the netmap
 //! (ACL-revocation teardown is a documented follow-up); this only ever
-//! *adds* sessions as new peers appear, matching the migration-plan note
-//! in design.md.
+//! *adds* sessions as new peers appear.
 //!
 //! daemon-reliability REL-1/REL-3: the coordination netmap subscription
 //! (channel connect, RPC, stream, and — for its own first attempt — the
@@ -67,14 +66,13 @@ pub struct OrchestratorConfig {
     pub device_id: String,
 }
 
-/// enforce-live-device-revocation tasks 2.1/2.2/2.5: auxiliary,
-/// netmap-diff-only bookkeeping that doesn't belong on `DaemonState`
-/// (which tracks *connected* sessions, not "the netmap" as such) —
-/// the previously-held netmap snapshot to diff each new push against
-/// (`yadorilink_transport::diff_netmap`), plus enough of a handle on each
-/// peer's live transport channel and session task to actually tear a
-/// revoked one down immediately rather than waiting for it to notice on
-/// its own.
+/// Auxiliary, netmap-diff-only bookkeeping that doesn't belong on
+/// `DaemonState` (which tracks *connected* sessions, not "the netmap"
+/// as such) — the previously-held netmap snapshot to diff each new
+/// push against (`yadorilink_transport::diff_netmap`), plus enough of
+/// a handle on each peer's live transport channel and session task to
+/// actually tear a revoked one down immediately rather than waiting
+/// for it to notice on its own.
 ///
 /// Constructed once in `run` and threaded through every
 /// `run_netmap_attempt` call (cheap to `Clone` — every field is an
@@ -144,9 +142,9 @@ pub async fn run(
     // cached here so a later netmap-stream reconnect reuses it rather
     // than opening a second relay connection under the same key.
     let relay_hub_cell: OnceCell<Arc<RelayHub>> = OnceCell::new();
-    // enforce-live-device-revocation tasks 2.1/2.2/2.5: created once here
-    // (not per-attempt) so it survives a coordination-stream reconnect —
-    // see `NetmapDiffState`'s doc comment.
+    // Created once here (not per-attempt) so it survives a
+    // coordination-stream reconnect — see `NetmapDiffState`'s doc
+    // comment.
     let diff_state = NetmapDiffState::new();
 
     let mut attempt: u32 = 0;
@@ -163,10 +161,9 @@ pub async fn run(
         {
             Ok(()) => {
                 tracing::warn!(attempt, "coordination netmap stream ended; reconnecting");
-                // add-advanced-sync-operations task 4.1: a clean stream end
-                // still means the coordination-plane connection is no
-                // longer up (`run` is about to redial), not a per-peer
-                // attempt so `peer_device_id` is empty.
+                // A clean stream end still means the coordination-plane
+                // connection is no longer up (`run` is about to redial),
+                // not a per-peer attempt so `peer_device_id` is empty.
                 state.connection_traces.record(
                     "",
                     CandidateSource::CoordinationPlane,
@@ -242,9 +239,9 @@ fn jitter_unit_interval() -> f64 {
     (z >> 11) as f64 / (1u64 << 53) as f64
 }
 
-/// migrate-coordination-plane-to-cloudflare task 7.2: `run_netmap_attempt`'s
-/// WebSocket-based counterpart, talking to the HTTP coordination service's
-/// `/netmap/subscribe` route (`src/routes/netmap.ts` forwarding to
+/// `run_netmap_attempt`'s WebSocket-based counterpart, talking to the
+/// HTTP coordination service's `/netmap/subscribe` route
+/// (`src/routes/netmap.ts` forwarding to
 /// `src/durable-objects/netmap-device.ts`) instead of the gRPC
 /// `StreamNetmap` RPC. Same signature, same reconnect contract (`run`'s
 /// inline backoff loop calls this exactly the way it calls the gRPC
@@ -284,9 +281,9 @@ mod ws_netmap {
     /// `config.coordination_addr` is the same http(s) base URL used for
     /// HTTP coordination service's unary routes; the netmap subscription is
     /// just a `wss://`/`ws://` upgrade of the same host at a fixed path,
-    /// per design.md's "the client-facing endpoint is a plain WebSocket"
-    /// decision. Uses the `url` crate to parse/rewrite the address rather
-    /// than hand-rolled string splitting -- an earlier hand-rolled version
+    /// since the client-facing endpoint is a plain WebSocket. Uses the
+    /// `url` crate to parse/rewrite the address rather than hand-rolled
+    /// string splitting -- an earlier hand-rolled version
     /// of this function split on `:` to find the host, which silently
     /// mangled IPv6 literal addresses like `http://[::1]:8787` (the same
     /// bug class `yadorilink-cli`'s `http_client.rs`/`yadorilink-desktop-app`'s
@@ -426,9 +423,9 @@ mod ws_netmap {
                 continue;
             };
 
-            // enforce-live-device-revocation task 2.1: diff this snapshot
-            // against the previously-held one *before* acting on the new
-            // peer list below — identical to the gRPC path.
+            // Diff this snapshot against the previously-held one *before*
+            // acting on the new peer list below — identical to the gRPC
+            // path.
             let current_netmap: NetmapSnapshot = update
                 .peers
                 .iter()
@@ -531,12 +528,11 @@ async fn run_netmap_attempt(
     request.metadata_mut().insert("authorization", auth_value);
 
     let mut stream = client.stream_netmap(request).await?.into_inner();
-    // add-advanced-sync-operations task 4.1: the `StreamNetmap` RPC just
-    // opened successfully — record it as a connected coordination-plane
-    // attempt before this function moves on to the (possibly also
-    // failing) relay-hub connect below, so a doctor read mid-outage can
-    // still see "coordination plane itself is reachable" separately from
-    // "relay is reachable".
+    // The `StreamNetmap` RPC just opened successfully — record it as a
+    // connected coordination-plane attempt before this function moves on
+    // to the (possibly also failing) relay-hub connect below, so a
+    // doctor read mid-outage can still see "coordination plane itself is
+    // reachable" separately from "relay is reachable".
     state.connection_traces.record(
         "",
         CandidateSource::CoordinationPlane,
@@ -594,11 +590,10 @@ async fn run_netmap_attempt(
     let mut peer_key_pins = load_peer_key_pins()?;
 
     while let Some(update) = stream.message().await? {
-        // enforce-live-device-revocation task 2.1: diff this snapshot
-        // against the previously-held one *before* acting on the new
-        // peer list below, so a device that dropped out of this exact
-        // update is torn down in the same pass it's noticed missing,
-        // rather than only on some later update.
+        // Diff this snapshot against the previously-held one *before*
+        // acting on the new peer list below, so a device that dropped
+        // out of this exact update is torn down in the same pass it's
+        // noticed missing, rather than only on some later update.
         let current_netmap: NetmapSnapshot = update
             .peers
             .iter()
@@ -656,7 +651,7 @@ async fn run_netmap_attempt(
                 session_index.fetch_add(1, Ordering::Relaxed),
                 diff_state.clone(),
             );
-            // task 2.2: stored immediately (synchronously, right after
+            // stored immediately (synchronously, right after
             // `spawn_peer_session` returns its `JoinHandle` — before the
             // task's own `PeerChannel::connect().await` has necessarily
             // finished) so a revocation racing a still-connecting session
@@ -848,24 +843,20 @@ fn end_session(state: &DaemonState, peer_device_id: &str) {
         .remove(peer_device_id);
 }
 
-/// enforce-live-device-revocation task 2.2/2.3, wired end-to-end by task
-/// 5.1: acts on one netmap update's diff (task 2.1's `diff_netmap`
-/// output). Whole-device removals get torn down entirely; group-edge
-/// removals leave the transport layer alone (D3's "tunnel stays up" is
-/// simply the *absence* of a teardown call here) but now — closing the
-/// gap section 2 explicitly left open — call
+/// Acts on one netmap update's diff (`diff_netmap`'s output). Whole-device
+/// removals get torn down entirely; group-edge removals leave the
+/// transport layer alone (the tunnel stays up — that's simply the
+/// *absence* of a teardown call here) but now call
 /// [`PeerSyncSession::revoke_group`] on that peer's still-live session
 /// (found via `state.sessions`, the same map `teardown_peer` reads for
 /// the whole-device case) so `yadorilink-sync-core`'s per-request
-/// re-validation (tasks.md section 4) actually learns about the
-/// narrower revocation instead of continuing to check the
-/// construction-time `shared_group_ids` snapshot forever. This is the
-/// only piece of this event flow section 4 couldn't wire up itself
-/// (`PeerSyncSession` has no reference to any daemon-level "current
-/// netmap" — see its task 4.4 coordination note) and section 2 didn't
-/// either (a `PeerChannel` has no concept of a session or a group at
-/// all) — `state.sessions` is the one place both a `device_id` and its
-/// live `Arc<PeerSyncSession>` are available together.
+/// re-validation actually learns about the narrower revocation instead
+/// of continuing to check the construction-time `shared_group_ids`
+/// snapshot forever. `PeerSyncSession` has no reference to any
+/// daemon-level "current netmap" of its own, and a `PeerChannel` has no
+/// concept of a session or a group at all — `state.sessions` is the one
+/// place both a `device_id` and its live `Arc<PeerSyncSession>` are
+/// available together.
 fn apply_netmap_diff(diff: &NetmapDiff, state: &Arc<DaemonState>, diff_state: &NetmapDiffState) {
     for device_id in &diff.removed_devices {
         tracing::warn!(
@@ -883,7 +874,7 @@ fn apply_netmap_diff(diff: &NetmapDiff, state: &Arc<DaemonState>, diff_state: &N
         if let Some(session) =
             state.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(device_id)
         {
-            // task 5.1: this is the actual enforcement step for the
+            // this is the actual enforcement step for the
             // group-edge case — from this call onward, `session`'s
             // `shares_group(group_id)` (consulted fresh by every
             // in-flight/queued block request and index update, per task
@@ -905,7 +896,7 @@ fn apply_netmap_diff(diff: &NetmapDiff, state: &Arc<DaemonState>, diff_state: &N
     }
 }
 
-/// task 2.2: tears `device_id` down entirely — revokes its `PeerChannel`
+/// tears `device_id` down entirely — revokes its `PeerChannel`
 /// (see `PeerChannel::revoke`'s doc comment: this is what actually stops
 /// the WireGuard tunnel/actor and refuses any further handshake attempt
 /// from this key, task 2.4), aborts its `PeerSyncSession` task (so any
@@ -989,11 +980,11 @@ fn spawn_peer_session(
 
         let channel = match connect_result {
             Ok(c) => {
-                // add-advanced-sync-operations task 4.1: `TransportMode::Auto`
-                // always starts on relay (design D6/D10), so a successful
-                // `connect` here is a relay-path connection — the
-                // subsequent direct upgrade (if any) is recorded
-                // separately by `poll_path_status` below.
+                // `TransportMode::Auto` always starts on relay (design
+                // D6/D10), so a successful `connect` here is a
+                // relay-path connection — the subsequent direct upgrade
+                // (if any) is recorded separately by `poll_path_status`
+                // below.
                 state.connection_traces.record(
                     peer_device_id.clone(),
                     CandidateSource::Relay,
@@ -1025,7 +1016,7 @@ fn spawn_peer_session(
             }
         };
 
-        // task 2.2: registered so a later netmap-diff teardown
+        // registered so a later netmap-diff teardown
         // (`teardown_peer`) can find and `revoke()` this exact channel —
         // dropping every `Arc<PeerChannel>` clone this task will go on to
         // hand out (below, and via `PeerSyncSession`) is not by itself
@@ -1053,22 +1044,21 @@ fn spawn_peer_session(
             Some(state.forward_tx.clone()),
             Some(state.presence_tx.clone()),
         );
-        // add-resource-governance task 2.2/2.3/3.2: every session shares
-        // this daemon's one global upload/download token-bucket pair
-        // (task 2.3 — never an independent per-session copy), and its own
-        // disk-headroom preflight is turned on only once `main.rs` has
-        // opted the whole daemon into enforcement (see
+        // Every session shares this daemon's one global upload/download
+        // token-bucket pair (never an independent per-session copy), and
+        // its own disk-headroom preflight is turned on only once
+        // `main.rs` has opted the whole daemon into enforcement (see
         // `DaemonState::disk_headroom_enforcement_enabled`'s doc comment
         // for why that's not just always-on here).
         session.set_rate_limiters(state.rate_limiters.clone());
         if state.disk_headroom_enforcement_enabled() {
             session.set_headroom_enforced(true);
         }
-        // fix-local-edit-swallowed-by-self-echo-race: lets this session's
-        // `reconcile_one_file` force a racing local change out of this
-        // device's per-link debounce accumulators before comparing/
-        // applying a peer update — see `PendingLocalChangeFlush for
-        // DaemonState`'s doc comment (`link_manager.rs`).
+        // Lets this session's `reconcile_one_file` force a racing local
+        // change out of this device's per-link debounce accumulators
+        // before comparing/applying a peer update — see
+        // `PendingLocalChangeFlush for DaemonState`'s doc comment
+        // (`link_manager.rs`).
         session.set_pending_local_change_flush(state.clone());
         state
             .sessions
@@ -1121,10 +1111,9 @@ async fn poll_path_status(
             yadorilink_transport::PathKind::Direct => "direct".into(),
             yadorilink_transport::PathKind::Relay => "relay".into(),
         };
-        // add-advanced-sync-operations task 4.1: a path-kind transition is
-        // itself a meaningful connection event (a direct/NAT-traversed
-        // upgrade, or a fallback back to relay) — recorded once per
-        // transition, not once per poll tick.
+        // A path-kind transition is itself a meaningful connection event
+        // (a direct/NAT-traversed upgrade, or a fallback back to relay)
+        // — recorded once per transition, not once per poll tick.
         if previous_path.is_some_and(|p| p != current) {
             let (source, class) = match current {
                 yadorilink_transport::PathKind::Direct => {
@@ -1198,9 +1187,9 @@ mod tests {
         assert!(!is_loopback_host(Some("coordination.example")));
     }
 
-    /// migrate-coordination-plane-to-cloudflare task 7.2: the WebSocket
-    /// path's equivalent loopback/scheme validation, mirroring the gRPC
-    /// path's `loopback_host_detection_accepts_only_local_hosts` above.
+    /// The WebSocket path's equivalent loopback/scheme validation,
+    /// mirroring the gRPC path's
+    /// `loopback_host_detection_accepts_only_local_hosts` above.
     #[cfg(feature = "http-coordination")]
     #[test]
     fn ws_netmap_url_rejects_remote_http_and_accepts_loopback_and_https() {
@@ -1419,8 +1408,7 @@ mod tests {
         assert_eq!(Arc::strong_count(&channel), 1);
     }
 
-    // --- enforce-live-device-revocation task 2.6: netmap-diff-driven
-    // teardown integration tests ------------------------------------------
+    // --- Netmap-diff-driven teardown integration tests -------------------
 
     fn fake_session_for(
         state: &Arc<DaemonState>,
@@ -1561,7 +1549,7 @@ mod tests {
             .contains_key("device-b"));
     }
 
-    /// task 5.1: the gap section 2 explicitly left open — a group-edge-only
+    /// the gap section 2 explicitly left open — a group-edge-only
     /// removal must call `session.revoke_group(group_id)` on the
     /// still-live session so `yadorilink-sync-core`'s per-request
     /// re-validation (section 4) actually reflects the narrower
@@ -1607,7 +1595,7 @@ mod tests {
         assert!(session.shares_group("group-1"), "the remaining shared group must stay authorized");
     }
 
-    /// task 2.2: `teardown_peer` aborts the in-flight `PeerSyncSession`
+    /// `teardown_peer` aborts the in-flight `PeerSyncSession`
     /// task, not just the transport channel — a session stuck awaiting
     /// something that isn't unblocked by the channel closing (e.g. a
     /// spawned per-message handler task, per `PeerSyncSession::run`'s doc
@@ -1654,7 +1642,7 @@ mod tests {
         );
     }
 
-    /// task 2.6: `run_netmap_attempt`'s dedup check (`peer_already_connected`,
+    /// `run_netmap_attempt`'s dedup check (`peer_already_connected`,
     /// unchanged by this task) only ever suppresses opening a *second*
     /// session for an already-connected peer; it never re-adds one that
     /// `apply_netmap_diff` just tore down within the same update, since

@@ -189,13 +189,13 @@ async fn handle_request(
     state: &Arc<DaemonState>,
     req: DaemonControlRequest,
 ) -> DaemonControlResponse {
-    // add-update-migration-safety task 1.1/2.3: read before `req.payload`
-    // is matched (and partially moved) below — a `u32` copy, not a borrow,
-    // so this doesn't fight the match on `req.payload` for ownership.
-    // Absent on a request from a CLI build that predates this field,
-    // decodes as 0, which is `< CONTROL_PROTOCOL_VERSION` and thus handled
-    // by the same "older/unversioned client" branch below as a real old
-    // version would be.
+    // Read before `req.payload` is matched (and partially moved) below —
+    // a `u32` copy, not a borrow, so this doesn't fight the match on
+    // `req.payload` for ownership. Absent on a request from a CLI build
+    // that predates this field, decodes as 0, which is
+    // `< CONTROL_PROTOCOL_VERSION` and thus handled by the same
+    // "older/unversioned client" branch below as a real old version would
+    // be.
     let client_protocol_version = req.protocol_version;
     let payload = match req.payload {
         Some(ReqPayload::Link(r)) => match link(state, r) {
@@ -226,7 +226,6 @@ async fn handle_request(
             Err(e) => RespPayload::Error(e.to_string()),
         },
 
-        // add-folder-direction-modes task 4.2.
         Some(ReqPayload::SetMode(r)) => {
             match set_link_mode_and_reconcile(state, &r.local_path, LinkMode::from_db_str(&r.mode))
                 .await
@@ -246,9 +245,9 @@ async fn handle_request(
             Err(e) => RespPayload::Error(e.to_string()),
         },
 
-        // add-file-version-history task 5.2: `yadorilink versions <path>`.
-        // Resolves the absolute path to `(group_id, relative path)` via the
-        // same `resolve_group_and_rel_path` helper `Hydrate`/`Pin`/`Unpin`/
+        // `yadorilink versions <path>`. Resolves the absolute path to
+        // `(group_id, relative path)` via the same
+        // `resolve_group_and_rel_path` helper `Hydrate`/`Pin`/`Unpin`/
         // `Evict` above already use.
         Some(ReqPayload::ListVersions(r)) => {
             match resolve_group_and_rel_path(state, &r.absolute_path) {
@@ -326,7 +325,7 @@ async fn handle_request(
         // `yadorilink link retention <path> --keep-versions <n> --keep-days
         // <t>` (task 6.4) — adjusts an already-linked folder's retention
         // policy in place; takes effect on the next retention-expiry sweep
-        // (design D2), no restart needed since `link_manager::run_
+        // (), no restart needed since `link_manager::run_
         // retention_expiry_sweep` re-reads the policy from `SyncState` on
         // every sweep rather than caching it.
         Some(ReqPayload::SetRetentionPolicy(r)) => {
@@ -350,33 +349,31 @@ async fn handle_request(
                         device_id: device_id.clone(),
                         connected: info.connected,
                         path_kind: info.path_kind.clone(),
-                        // add-untrusted-storage-peer task 4.3: not yet
-                        // populated here -- wiring this from the
+                        // Not yet populated here -- wiring this from the
                         // coordination-plane's storage-only ACL flag
                         // (`PeerInfo.storage_only_group_ids`) is a
-                        // documented daemon-level follow-up (see
-                        // tasks.md's notes); `yadorilink-daemon` is not one
-                        // of this change's listed affected crates. Always
-                        // `false` for now, which is exactly today's
-                        // pre-existing behavior (no peer ever showed a
-                        // storage-only badge before this field existed).
+                        // documented daemon-level follow-up;
+                        // `yadorilink-daemon` doesn't currently consume
+                        // that flag. Always `false` for now, which is
+                        // exactly today's pre-existing behavior (no peer
+                        // ever showed a storage-only badge before this
+                        // field existed).
                         storage_only: false,
                     })
                     .collect();
-                // add-resource-governance task 5.4: configured limits +
-                // current measured rates (from the shared `rate_limiters`
-                // every session/hydration fetch draws down, task 2.3) and
-                // per-volume free-space state, alongside the existing
-                // per-folder/per-peer status above.
+                // Configured limits + current measured rates (from the
+                // shared `rate_limiters` every session/hydration fetch
+                // draws down) and per-volume free-space state, alongside
+                // the existing per-folder/per-peer status above.
                 let governance = state.governance_config.load_or_default();
                 let volumes = volumes_free_space(state, &links);
-                // add-automatic-updates task 3.2: concise update state
-                // embedded directly in `StatusResponse` — reuses
-                // `update_ipc::status_response`'s exact field values
-                // rather than re-deriving them a second way.
+                // Concise update state embedded directly in
+                // `StatusResponse` — reuses `update_ipc::status_response`'s
+                // exact field values rather than re-deriving them a
+                // second way.
                 let update_status = crate::update_ipc::status_response(state);
-                // add-block-store-gc task 4.1: O(1) usage counters
-                // (design D5) — never a directory walk on a `status` call.
+                // O(1) usage counters — never a directory walk on a
+                // `status` call.
                 let block_store_usage = state.block_store.usage().unwrap_or_default();
                 let mut response = StatusResponse {
                     links,
@@ -400,16 +397,15 @@ async fn handle_request(
                         .download
                         .current_rate_bytes_per_sec(),
                     volumes,
-                    // add-block-store-gc task 4.1: block-store usage
-                    // (O(1) counters, design D5) and GC health, alongside
-                    // every other status surface above.
+                    // Block-store usage (O(1) counters) and GC health,
+                    // alongside every other status surface above.
                     block_store_total_bytes: block_store_usage.total_bytes,
                     block_store_block_count: block_store_usage.block_count,
                     last_gc_unix: state.gc.last_run_unix(),
                     gc_reclaimable_estimate_bytes: state.gc.reclaimable_estimate_bytes(),
-                    // add-observability-and-metrics task 1.3/2.2: every
-                    // currently-active transfer and the bounded recent-error
-                    // feed, alongside every other status surface above.
+                    // Every currently-active transfer and the bounded
+                    // recent-error feed, alongside every other status
+                    // surface above.
                     active_transfers: state
                         .transfer_progress
                         .snapshot()
@@ -435,10 +431,10 @@ async fn handle_request(
                             coarse_context: e.coarse_context,
                         })
                         .collect(),
-                    // add-desktop-status-app task 1.1/1.2: filled in below,
-                    // from `response`'s own already-populated fields, so
-                    // this rollup can never disagree with the rest of the
-                    // message it's summarizing.
+                    // Filled in below, from `response`'s own
+                    // already-populated fields, so this rollup can never
+                    // disagree with the rest of the message it's
+                    // summarizing.
                     overall_state: String::new(),
                     attention_reasons: Vec::new(),
                 };
@@ -456,7 +452,7 @@ async fn handle_request(
                 .set_limits(r.upload_bytes_per_sec, r.download_bytes_per_sec)
             {
                 Ok(config) => {
-                    // task 2.5: apply immediately to the running daemon's
+                    // apply immediately to the running daemon's
                     // shared buckets, not just persist to disk — a
                     // `limits set` takes effect without a restart.
                     state.apply_governance_config();
@@ -526,9 +522,9 @@ async fn handle_request(
 
         Some(ReqPayload::Health(_)) => RespPayload::Health(health_snapshot(state)),
 
-        // add-oss-usage-error-reporting task 3.2: dispatch into
-        // `reporting_ipc`, which owns the actual translation to/from
-        // `yadorilink_reporting`/`crate::reporting` types.
+        // Dispatch into `reporting_ipc`, which owns the actual
+        // translation to/from `yadorilink_reporting`/`crate::reporting`
+        // types.
         Some(ReqPayload::ReportingStatus(_)) => {
             RespPayload::ReportingStatus(reporting_ipc::reporting_status(state))
         }
@@ -572,9 +568,8 @@ async fn handle_request(
             Err(e) => RespPayload::Error(e),
         },
 
-        // add-automatic-updates task 3.3: dispatch into `update_ipc`,
-        // which owns the actual translation to/from
-        // `crate::update::{manager, policy}` types — mirrors
+        // Dispatch into `update_ipc`, which owns the actual translation
+        // to/from `crate::update::{manager, policy}` types — mirrors
         // `reporting_ipc`'s own dispatch pattern immediately above.
         Some(ReqPayload::UpdateStatus(_)) => {
             RespPayload::UpdateStatus(crate::update_ipc::status_response(state))
@@ -591,11 +586,10 @@ async fn handle_request(
             Err(e) => RespPayload::Error(e),
         },
 
-        // add-advanced-sync-operations section 2: dispatch into
-        // `folder_ops`, which owns the actual divergence-summary/preview/
-        // confirm/audit logic this just translates to/from the wire
-        // types — mirrors `reporting_ipc`/`update_ipc`'s own dispatch
-        // pattern above.
+        // Dispatch into `folder_ops`, which owns the actual
+        // divergence-summary/preview/confirm/audit logic this just
+        // translates to/from the wire types — mirrors
+        // `reporting_ipc`/`update_ipc`'s own dispatch pattern above.
         Some(ReqPayload::FolderDivergenceSummary(r)) => {
             match crate::folder_ops::divergence_summary(state, &r.local_path) {
                 Ok(summary) => {
@@ -671,8 +665,7 @@ async fn handle_request(
             RespPayload::ListFolderOperationAudit(ListFolderOperationAuditResponse { entries })
         }
 
-        // add-advanced-sync-operations section 4: dispatch into
-        // `connection_trace`.
+        // Dispatch into `connection_trace`.
         Some(ReqPayload::ListConnectionTraces(r)) => {
             let peer_device_id =
                 (!r.peer_device_id.is_empty()).then_some(r.peer_device_id.as_str());
@@ -708,10 +701,9 @@ async fn handle_request(
             RespPayload::ConnectivityDoctor(ConnectivityDoctorResponse { categories })
         }
 
-        // add-diagnostics-support-bundle task 2.1/2.2: dispatch into
-        // `diagnostics_ipc`, which owns the actual bundle assembly (from
-        // existing status/config/update/recent-error sources) and the
-        // bounded-time-budget handling (task 2.3) -- mirrors
+        // Dispatch into `diagnostics_ipc`, which owns the actual bundle
+        // assembly (from existing status/config/update/recent-error
+        // sources) and the bounded-time-budget handling -- mirrors
         // `reporting_ipc`/`update_ipc`'s own dispatch pattern above.
         // Preview and Export both request the exact same daemon-side
         // bundle; only the CLI-side disposition of the result differs.
@@ -722,10 +714,10 @@ async fn handle_request(
             RespPayload::DiagnosticsExport(crate::diagnostics_ipc::build_bundle(state).await)
         }
 
-        // add-block-store-gc task 4.2: dispatch into `gc::run_sweep`,
-        // which owns the actual mark-and-sweep, daemon-wide
-        // mutual-exclusion, and never-mid-burst logic (tasks 3.2/3.5) --
-        // this arm only translates to/from the wire types, mirroring
+        // Dispatch into `gc::run_sweep`, which owns the actual
+        // mark-and-sweep, daemon-wide mutual-exclusion, and
+        // never-mid-burst logic -- this arm only translates to/from the
+        // wire types, mirroring
         // `reporting_ipc`/`update_ipc`/`diagnostics_ipc`'s own dispatch
         // pattern above. `GcTriggerError`'s `Display` (already a clear,
         // actionable message for `AlreadyRunning`/`SyncBurstInProgress`)
@@ -739,8 +731,8 @@ async fn handle_request(
             Err(e) => RespPayload::Error(e.to_string()),
         },
 
-        // add-update-migration-safety task 2.3, spec "New CLI talks to
-        // older supported daemon": an unset `oneof payload` is what a
+        // Per spec "New CLI talks to older supported daemon": an unset
+        // `oneof payload` is what a
         // *this* daemon build's proto decodes an unrecognized request
         // variant number as — the shape a newer CLI's request takes once
         // it reaches an older daemon that predates that variant entirely
@@ -773,8 +765,8 @@ async fn handle_request(
 /// doesn't depend on the ordering (it never queries the links table for
 /// the path it's given directly).
 ///
-/// add-first-run-safety-onboarding task 2.3: defense-in-depth re-check,
-/// independent of whatever the CLI already showed/gated. Scoped to
+/// Defense-in-depth re-check, independent of whatever the CLI already
+/// showed/gated. Scoped to
 /// nested-link conflicts specifically (an already-linked folder that is an
 /// ancestor, descendant, or exact match of `r.local_path`) rather than the
 /// full preflight (non-empty folder, low disk space, risky location) --
@@ -815,8 +807,8 @@ fn link(state: &Arc<DaemonState>, r: LinkRequest) -> Result<(), crate::error::Da
         )));
     }
     state.sync_state.add_link(&r.local_path, &r.group_id)?;
-    // add-folder-direction-modes task 4.2/4.3: `--mode <mode>` at link
-    // time. An empty `r.mode` (the CLI's unset default) decodes to
+    // `--mode <mode>` at link time. An empty `r.mode` (the CLI's unset
+    // default) decodes to
     // `LinkMode::SendReceive` via `from_db_str`'s own fallback — exactly
     // `add_link`'s own freshly-created-row default, so this is always
     // safe to call unconditionally rather than needing an `if let Some`
@@ -833,13 +825,13 @@ fn link(state: &Arc<DaemonState>, r: LinkRequest) -> Result<(), crate::error::Da
     if r.content_defined_chunking {
         state.sync_state.set_chunking_policy(&r.local_path, ChunkingPolicy::ContentDefined)?;
     }
-    // add-file-version-history task 5.2/6.4: `--keep-versions`/`--keep-days`
-    // at link time. Only touch the retention-policy row if the caller
-    // actually asked for a non-default value — matching `on_demand`'s/
-    // `content_defined_chunking`'s "only touch it if the caller asked"
-    // pattern above; the columns already default to 10/30 (design D2) via
-    // the `links` table's own `DEFAULT`s, so calling `set_retention_policy`
-    // unconditionally on every link would be harmless but sloppy.
+    // `--keep-versions`/`--keep-days` at link time. Only touch the
+    // retention-policy row if the caller actually asked for a non-default
+    // value — matching `on_demand`'s/`content_defined_chunking`'s "only
+    // touch it if the caller asked" pattern above; the columns already
+    // default to 10/30 via the `links` table's own `DEFAULT`s, so calling
+    // `set_retention_policy` unconditionally on every link would be
+    // harmless but sloppy.
     if r.keep_versions.is_some() || r.keep_days.is_some() {
         state.sync_state.set_retention_policy(
             &r.local_path,
@@ -853,12 +845,12 @@ fn link(state: &Arc<DaemonState>, r: LinkRequest) -> Result<(), crate::error::Da
     Ok(())
 }
 
-/// add-file-version-history task 5.2: `VersionRecord` (sync-core) ->
-/// `FileVersionInfo` (proto) — mirrors `LinkStatus`'s own by-field mapping
-/// pattern from `yadorilink_sync_core` types elsewhere in this file.
-/// Translates `FolderResolutionPreviewRequest`'s wire strings
-/// ("override" | "revert" | "mode_change" + a `target_mode` only
-/// meaningful for the last one) into `folder_ops::ResolutionAction`, or a
+/// `VersionRecord` (sync-core) -> `FileVersionInfo` (proto) — mirrors
+/// `LinkStatus`'s own by-field mapping pattern from `yadorilink_sync_core`
+/// types elsewhere in this file. Translates
+/// `FolderResolutionPreviewRequest`'s wire strings ("override" | "revert"
+/// | "mode_change" + a `target_mode` only meaningful for the last one)
+/// into `folder_ops::ResolutionAction`, or a
 /// human-readable error for the CLI to surface directly (this validation
 /// failure is a request-shape problem, not a `SyncError`, so it's built
 /// as a `String` for `RespPayload::Error` here rather than routed through
@@ -958,9 +950,8 @@ pub(crate) fn list_link_statuses(
             files.iter().filter(|f| f.path.contains("(conflicted copy")).count() as u64;
         let materialization = state.sync_state.materialization_counts(&link.group_id)?;
         let open_elsewhere_count = state.open_elsewhere_count(&link.group_id);
-        // add-sync-fidelity task 5.3: held-file and skipped-symlink status
-        // (design.md D1/D3), populated from section 1's per-file
-        // `SyncState` getters. Deliberately `get_held_state`/
+        // Held-file and skipped-symlink status, populated from section
+        // 1's per-file `SyncState` getters. Deliberately `get_held_state`/
         // `get_record_kind` per non-deleted file rather than a new
         // aggregate SQL query on `index.rs` — this section's scope is the
         // daemon/IPC surface only, and `index.rs` already exposes exactly
@@ -993,21 +984,20 @@ pub(crate) fn list_link_statuses(
             }
         }
         let held_file_count = held_files.len() as u64;
-        // add-resource-governance task 3.4/5.4: independent of `paused`
-        // (a link can be paused and/or degraded at once — see
-        // `DegradedLinkInfo`'s doc comment).
+        // Independent of `paused` (a link can be paused and/or degraded
+        // at once — see `DegradedLinkInfo`'s doc comment).
         let degraded_info = state.degraded_link_info(&link.local_path);
-        // add-folder-direction-modes task 4.2/4.3: divergence counts are
-        // meaningless (always 0) for a link not in the corresponding mode
-        // — `count_out_of_sync`/`count_receive_only_changed` themselves
-        // stay accurate regardless (nothing produces a stray entry for the
-        // "wrong" mode), so this is just the by-group_id lookup, not a
+        // Divergence counts are meaningless (always 0) for a link not in
+        // the corresponding mode — `count_out_of_sync`/
+        // `count_receive_only_changed` themselves stay accurate
+        // regardless (nothing produces a stray entry for the "wrong"
+        // mode), so this is just the by-group_id lookup, not a
         // mode-conditional query.
         let out_of_sync_count = state.sync_state.count_out_of_sync(&link.group_id)?;
         let receive_only_changed_count =
             state.sync_state.count_receive_only_changed(&link.group_id)?;
-        // add-observability-and-metrics task 1.2: this link's active-
-        // transfer rollup, if any is currently in flight.
+        // This link's active-transfer rollup, if any is currently in
+        // flight.
         let rollup = state.transfer_progress.link_rollup(&link.group_id);
         out.push(LinkStatus {
             local_path: link.local_path.clone(),
@@ -1032,8 +1022,7 @@ pub(crate) fn list_link_statuses(
             mode: link.mode.as_db_str().to_string(),
             out_of_sync_count,
             receive_only_changed_count,
-            // add-observability-and-metrics task 1.2/1.3: this link's
-            // active-transfer rollup — absent (all zero,
+            // This link's active-transfer rollup — absent (all zero,
             // `has_active_transfer = false`) when nothing is currently
             // in flight for this link.
             has_active_transfer: rollup.is_some(),
@@ -1047,15 +1036,14 @@ pub(crate) fn list_link_statuses(
     Ok(out)
 }
 
-/// add-resource-governance task 1.3/5.4: free-space state for every volume
-/// hosting the block store or a linked folder — the block-store root (via
-/// `BlockStore::free_space`, `None` for a backend with no real volume
-/// concept) plus one entry per distinct link `local_path` (paths can
-/// collide if a device somehow links the same directory twice, so this
-/// dedups by path rather than by link count). Best-effort: a link whose
-/// volume can't currently be queried (e.g. the folder was removed from
-/// disk without being unlinked) is silently skipped rather than failing
-/// the whole `status` response.
+/// Free-space state for every volume hosting the block store or a linked
+/// folder — the block-store root (via `BlockStore::free_space`, `None`
+/// for a backend with no real volume concept) plus one entry per distinct
+/// link `local_path` (paths can collide if a device somehow links the
+/// same directory twice, so this dedups by path rather than by link
+/// count). Best-effort: a link whose volume can't currently be queried
+/// (e.g. the folder was removed from disk without being unlinked) is
+/// silently skipped rather than failing the whole `status` response.
 pub(crate) fn volumes_free_space(
     state: &DaemonState,
     links: &[LinkStatus],
@@ -1096,10 +1084,9 @@ pub(crate) fn volumes_free_space(
     volumes
 }
 
-/// add-sync-fidelity task 5.3: whether `path` is a symlink record this
-/// device's index tracks (and still syncs normally, per design.md D1/
-/// task 4.4) but never materialized to disk under the Windows
-/// default-skip-with-visible-status policy (task 3.2) — i.e. the local
+/// Whether `path` is a symlink record this device's index tracks (and
+/// still syncs normally) but never materialized to disk under the
+/// Windows default-skip-with-visible-status policy — i.e. the local
 /// daemon is running on Windows, the record is `RecordKind::Symlink`, and
 /// this link never opted in to real Windows symlink materialization. On a
 /// non-Windows daemon this is always `false`: only the Windows
@@ -1129,12 +1116,12 @@ fn is_skipped_windows_symlink(
     Ok(false)
 }
 
-/// add-desktop-status-app task 1.1/1.2: `StatusResponse.overall_state`'s
-/// three values, kept as a small internal enum (rather than juggling raw
-/// strings below) purely so the precedence rules below read clearly; the
-/// wire format is still the plain lowercase string this converts to via
-/// `as_str()`, matching every other string-typed status enum in this
-/// message (`LinkStatus.mode`, `VolumeFreeSpace.state`, ...).
+/// `StatusResponse.overall_state`'s three values, kept as a small internal
+/// enum (rather than juggling raw strings below) purely so the precedence
+/// rules below read clearly; the wire format is still the plain lowercase
+/// string this converts to via `as_str()`, matching every other
+/// string-typed status enum in this message (`LinkStatus.mode`,
+/// `VolumeFreeSpace.state`, ...).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OverallState {
     Healthy,
@@ -1152,11 +1139,10 @@ impl OverallState {
     }
 }
 
-/// add-desktop-status-app task 1.1/1.2 (design.md decision 3, spec's
-/// "Aggregate Sync Status"/"Sync needs attention" scenarios): rolls up
-/// every already-populated field on `response` into one glanceable
-/// `(state, reasons)` pair, computed daemon-side so a UI client (or the
-/// CLI, task 1.3) never has to re-derive "is anything wrong?" itself and
+/// Rolls up every already-populated field on `response` into one
+/// glanceable `(state, reasons)` pair (spec's "Aggregate Sync Status"/
+/// "Sync needs attention" scenarios), computed daemon-side so a UI client
+/// (or the CLI) never has to re-derive "is anything wrong?" itself and
 /// risk drifting from this definition. Deliberately takes the
 /// already-built `StatusResponse` rather than the raw `DaemonState` — this
 /// keeps it a pure function over data the caller already has, directly
@@ -1342,12 +1328,12 @@ mod overall_status_tests {
     }
 }
 
-// --- add-update-migration-safety task 2.3: old-CLI/new-daemon and
-// new-CLI/old-daemon compatibility, exercised directly against
-// `handle_request` (the actual dispatch a real control-socket connection
-// runs through) rather than only at the wire-decode level (see
-// `yadorilink_ipc_proto`'s own `old_daemon_control_request_bytes_decode_
-// with_zero_protocol_version`/`..._response_...` tests for that layer).
+// --- Old-CLI/new-daemon and new-CLI/old-daemon compatibility, exercised
+// directly against `handle_request` (the actual dispatch a real
+// control-socket connection runs through) rather than only at the
+// wire-decode level (see `yadorilink_ipc_proto`'s own
+// `old_daemon_control_request_bytes_decode_with_zero_protocol_version`/
+// `..._response_...` tests for that layer).
 
 #[cfg(test)]
 mod migration_safety_tests {

@@ -1,9 +1,8 @@
-//! Local filesystem change detection (task 5.2), watching a linked folder
+//! Local filesystem change detection, watching a linked folder
 //! for create/modify/delete/rename events without requiring a manual scan
 //! trigger (`sync-engine` spec's "Local Change Detection" requirement).
 //!
-//! fix-watcher-directory-registration-race-and-deadlock: `notify`'s
-//! `RecommendedWatcher::watch()`/`unwatch()` must never be called
+//! `notify`'s `RecommendedWatcher::watch()`/`unwatch()` must never be called
 //! synchronously from within the watcher's own event-callback closure.
 //! Every one of `notify` 8.2's backends (verified directly against its
 //! vendored source, not assumed) funnels callback delivery and
@@ -19,8 +18,7 @@
 //! FSEvents-specific quirk. See `spawn_new_directory_registrar` below,
 //! which hands new-directory registration off to a tokio task instead.
 //!
-//! fix-local-change-lost-under-registration-mutex-contention: moving
-//! `watch()` off the callback thread closed that deadlock, but not a
+//! Moving `watch()` off the callback thread closed that deadlock, but not a
 //! residual gap — confirmed directly against `notify` 8.2.0's vendored
 //! FSEvents source (`fsevent.rs`): `watch_inner`/`unwatch_inner` always
 //! call `stop()` (tear down the *entire* `FSEventStream` and block until
@@ -73,11 +71,11 @@ use crate::error::SyncError;
 use crate::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
 
 /// Default channel capacity between the OS watcher callback and whatever
-/// consumes `FolderWatcher::events` — batch-sync-optimizations design D6:
-/// a tuning knob for how early the overflow fallback (see `overflowed`)
-/// engages, not the only thing standing between "keep events" and
-/// "block the OS callback thread" (non-blocking `try_send`, below,
-/// already guarantees the latter regardless of capacity).
+/// consumes `FolderWatcher::events` — a tuning knob for how early the
+/// overflow fallback (see `overflowed`) engages, not the only thing
+/// standing between "keep events" and "block the OS callback thread"
+/// (non-blocking `try_send`, below, already guarantees the latter
+/// regardless of capacity).
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,8 +102,8 @@ pub struct FolderWatcher {
 /// events alive for as long as this is held; dropping it stops that
 /// source. Opaque (not the concrete `notify` watcher type) so that
 /// `FolderWatchSource` implementations other than `RealFolderWatchSource`
-/// (add-deterministic-sync-testing: a simulated source feeding synthetic
-/// `FsChangeEvent`s under a DST harness) can return a `FolderWatcher` too,
+/// (a simulated source feeding synthetic `FsChangeEvent`s under a
+/// deterministic-simulation test harness) can return a `FolderWatcher` too,
 /// without this crate's consumers (`run_debouncer` and everyone above it)
 /// ever needing to know which kind they're holding.
 pub struct WatcherGuard {
@@ -113,10 +111,10 @@ pub struct WatcherGuard {
 }
 
 impl FolderWatcher {
-    /// Splits into the event receiver, the overflow flag (design D6 —
-    /// see `watch_folder`'s doc comment), and an opaque guard that keeps
-    /// the underlying OS watch alive for as long as it's held (design
-    /// D1/D7): the debounce accumulator needs to own `events` and the
+    /// Splits into the event receiver, the overflow flag (see
+    /// `watch_folder`'s doc comment), and an opaque guard that keeps
+    /// the underlying OS watch alive for as long as it's held: the
+    /// debounce accumulator needs to own `events` and the
     /// overflow flag directly, in a different task than whatever holds
     /// the OS-watcher guard, since the accumulator and the executor
     /// consuming its output are two independently-scheduled tasks.
@@ -140,12 +138,12 @@ pub fn watch_folder_with_ignore(
 }
 
 /// Watches `root` for filesystem events, delivered on `FolderWatcher::events`
-/// with the given channel `capacity` (batch-sync-optimizations task 4.5).
+/// with the given channel `capacity`.
 ///
 /// The OS callback (running on notify's own thread, not tokio) uses a
-/// non-blocking `try_send` rather than `blocking_send` (task 4.1): it
-/// never blocks waiting for a consumer, regardless of how full the
-/// channel gets or how slow the consumer is. When the channel is full,
+/// non-blocking `try_send` rather than `blocking_send`: it never blocks
+/// waiting for a consumer, regardless of how full the channel gets or
+/// how slow the consumer is. When the channel is full,
 /// that specific event's data is unavoidably dropped — there is no way
 /// to block without risking the *upstream* OS-level notification queue
 /// (inotify/FSEvents/`ReadDirectoryChangesW`) overflowing instead, which
@@ -153,9 +151,9 @@ pub fn watch_folder_with_ignore(
 /// `overflowed` (an `AtomicBool`, checked and cleared by the consumer —
 /// see `FolderWatcher::split`), which the debounce accumulator treats as
 /// a trigger for the same full-reconciliation recovery as an oversized
-/// debounce burst (design D2/D6): an overflow means precise per-path
-/// tracking is no longer trustworthy, so only a full rescan restores a
-/// correct index — but nothing is ever silently, permanently lost.
+/// debounce burst: an overflow means precise per-path tracking is no
+/// longer trustworthy, so only a full rescan restores a correct index —
+/// but nothing is ever silently, permanently lost.
 pub fn watch_folder_with_capacity(
     root: &Path,
     capacity: usize,
@@ -178,8 +176,7 @@ pub fn watch_folder_with_capacity_and_ignore(
     let callback_root = root.clone();
     let callback_ignore_set = ignore_set.clone();
 
-    // fix-watcher-directory-registration-race-and-deadlock task 2.1/2.2:
-    // the callback below must never call `RecommendedWatcher::watch()`
+    // The callback below must never call `RecommendedWatcher::watch()`
     // itself (see the module doc comment) — it only ever sends the
     // newly-observed directory's path over this unbounded channel.
     // Unbounded (not the bounded, drop-on-full `tx`/`overflowed` pair
@@ -195,9 +192,9 @@ pub fn watch_folder_with_capacity_and_ignore(
     let callback_new_dir_tx = new_dir_tx.clone();
     // The registrar task (spawned below, after `watcher_holder` is
     // populated) needs its own handle to synthesize reconciliation events
-    // (task 3.1) through the same `FsChangeEvent` channel/overflow flag the
-    // callback uses — cloned here, before `tx`/`overflowed` are moved into
-    // the callback closure below.
+    // through the same `FsChangeEvent` channel/overflow flag the callback
+    // uses — cloned here, before `tx`/`overflowed` are moved into the
+    // callback closure below.
     let registrar_tx = tx.clone();
     let registrar_overflowed = overflowed.clone();
 
@@ -207,16 +204,14 @@ pub fn watch_folder_with_capacity_and_ignore(
             if !should_queue_path(&callback_root, &callback_ignore_set, &path, kind) {
                 return;
             }
-            // add-sync-fidelity task 2.3: `path.is_dir()` follows a
-            // symlink to decide, which would let a freshly-created
-            // symlink-to-directory register recursive watches into
-            // whatever it points to (including outside `root`) — use an
-            // lstat-equivalent check instead so a symlink is never
-            // treated as something to descend into, matching the
-            // scanner's lstat-first classification.
+            // `path.is_dir()` follows a symlink to decide, which would let
+            // a freshly-created symlink-to-directory register recursive
+            // watches into whatever it points to (including outside
+            // `root`) — use an lstat-equivalent check instead so a
+            // symlink is never treated as something to descend into,
+            // matching the scanner's lstat-first classification.
             if matches!(kind, FsChangeKind::CreatedOrModified) && is_real_directory(&path) {
-                // fix-watcher-directory-registration-race-and-deadlock:
-                // send-only, off this callback thread — see the module
+                // Send-only, off this callback thread — see the module
                 // doc comment and `spawn_new_directory_registrar` below.
                 // `send` on an unbounded channel only fails if the
                 // receiving task is gone (shutdown race), never because
@@ -228,7 +223,7 @@ pub fn watch_folder_with_capacity_and_ignore(
             }
         };
 
-        // COR-2: a plain `EventKind::Modify(_) => CreatedOrModified` blanket
+        // A plain `EventKind::Modify(_) => CreatedOrModified` blanket
         // match (the previous behavior) misclassifies a rename's *source*
         // path as a live edit — `process_event` then sees the path no
         // longer exists on disk and just drops the event (`None`), so the
@@ -294,9 +289,8 @@ pub fn watch_folder_with_capacity_and_ignore(
     }
     *watcher_holder.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(watcher);
 
-    // fix-watcher-directory-registration-race-and-deadlock task 2.2: the
-    // registrar task owns only a `Weak` handle to `watcher_holder` — the
-    // `WatcherGuard` returned below (via `FolderWatcher`/`FolderWatcher::
+    // The registrar task owns only a `Weak` handle to `watcher_holder` —
+    // the `WatcherGuard` returned below (via `FolderWatcher`/`FolderWatcher::
     // split`) holds the only strong `Arc`. When that guard is dropped, the
     // `RecommendedWatcher` (and, with it, this closure and its own
     // `new_dir_tx` clone) is dropped, so `new_dir_rx.recv()` below
@@ -321,10 +315,10 @@ pub fn watch_folder_with_capacity_and_ignore(
     })
 }
 
-/// add-deterministic-sync-testing: constructs a `FolderWatcher` for a
-/// linked folder root. `link_manager::start_link_watch` depends on this
-/// trait (rather than calling `watch_folder_with_ignore` directly) so a
-/// DST scenario can substitute a source that feeds synthetic
+/// Constructs a `FolderWatcher` for a linked folder root.
+/// `link_manager::start_link_watch` depends on this trait (rather than
+/// calling `watch_folder_with_ignore` directly) so a deterministic-
+/// simulation test scenario can substitute a source that feeds synthetic
 /// `FsChangeEvent`s under simulated timing instead of a real OS
 /// filesystem watcher, while every consumer downstream of the returned
 /// `FolderWatcher` (the debounce accumulator, indexing, peer
@@ -352,7 +346,7 @@ impl FolderWatchSource for RealFolderWatchSource {
     }
 }
 
-/// add-deterministic-sync-testing: a `FolderWatchSource` a DST scenario
+/// A `FolderWatchSource` a deterministic-simulation test scenario
 /// constructs itself, feeding synthetic `FsChangeEvent`s through the same
 /// `mpsc` channel/overflow-flag boundary a real OS watcher would, so
 /// `run_debouncer` and everything above it (indexing, peer reconciliation,
@@ -411,22 +405,19 @@ impl FolderWatchSource for SimulatedFolderWatchSource {
     }
 }
 
-/// fix-watcher-directory-registration-race-and-deadlock tasks 2.2/3.1: runs
-/// off the FSEvents/inotify/`ReadDirectoryChangesW` callback thread — see
-/// the module doc comment for why that call site can never do this work
-/// itself. Receives newly-observed directory paths from the callback
-/// closure (`new_dir_rx`) purely as a trigger signal — see
-/// fix-local-change-lost-under-registration-mutex-contention below for why
+/// Runs off the FSEvents/inotify/`ReadDirectoryChangesW` callback thread —
+/// see the module doc comment for why that call site can never do this
+/// work itself. Receives newly-observed directory paths from the callback
+/// closure (`new_dir_rx`) purely as a trigger signal — see below for why
 /// the actual registration scan below always starts at `root`, not at the
 /// specific path a given trigger names.
 ///
-/// fix-local-change-lost-under-registration-mutex-contention: a `watch()`
-/// call opens an OS-level blind window (module doc comment) that can lose
-/// a live event for *any* currently-watched path, not only the specific
-/// directory that triggered this iteration — so scanning only that one
-/// directory's subtree (the original, narrower fix-watcher-directory-
-/// registration-race-and-deadlock behavior) cannot discover a directory
-/// that appeared elsewhere in the tree as a result of a lost event (e.g. a
+/// A `watch()` call opens an OS-level blind window (module doc comment)
+/// that can lose a live event for *any* currently-watched path, not only
+/// the specific directory that triggered this iteration — so scanning
+/// only that one directory's subtree (the original, narrower approach)
+/// cannot discover a directory that appeared elsewhere in the tree as a
+/// result of a lost event (e.g. a
 /// lost rename's *destination* name, which the callback never got a
 /// chance to report at all). Scanning from `root` instead — via
 /// `register_new_directory_tree`, unchanged except for this call's `start`
@@ -452,9 +443,9 @@ impl FolderWatchSource for SimulatedFolderWatchSource {
 ///
 /// For every directory this scan newly registers (including, but not
 /// limited to, the one that triggered this iteration), closes the
-/// registration-race window (design.md's related bug: a write landing in
-/// the gap between "directory observed" and "watch registered" would
-/// otherwise be silently missed forever) by synthesizing a
+/// registration-race window (a write landing in the gap between
+/// "directory observed" and "watch registered" would otherwise be
+/// silently missed forever) by synthesizing a
 /// `CreatedOrModified` event for every real file already present in it,
 /// exactly as if the watcher had observed each one live — this is what
 /// recovers a lost rename's destination content: it was never reported as
@@ -484,8 +475,8 @@ fn spawn_new_directory_registrar(
                 &ignore_set,
             ) {
                 Ok(newly_registered) if !newly_registered.is_empty() => {
-                    // task 3.2: strictly after `watch()` has succeeded for
-                    // each of these subtrees, never concurrent with it.
+                    // Strictly after `watch()` has succeeded for each of
+                    // these subtrees, never concurrent with it.
                     for dir in &newly_registered {
                         reconcile_new_directory_subtree(&tx, &overflowed, &root, dir, &ignore_set);
                     }
@@ -511,11 +502,11 @@ fn spawn_new_directory_registrar(
     });
 }
 
-/// fix-watcher-directory-registration-race-and-deadlock task 3.1: emits a
-/// synthesized `CreatedOrModified` event (through the same channel/overflow
-/// discipline as a live callback event — task 3's non-blocking `try_send`,
-/// never a blocking send that could stall this task on a slow consumer)
-/// for every real (non-symlink) file already present under `start`, so a
+/// Emits a synthesized `CreatedOrModified` event (through the same
+/// channel/overflow discipline as a live callback event — using
+/// non-blocking `try_send`, never a blocking send that could stall this
+/// a slow consumer) for every real (non-symlink) file already
+/// present under `start`, so a
 /// write that landed there before this subtree's watch registration
 /// completed is still picked up by `local_change.rs`'s ordinary dispatch,
 /// exactly as if the watcher had seen it live. Only ever called after
@@ -572,7 +563,7 @@ fn should_queue_path(
     if is_ignore_file_relative_path(relative_path) {
         return true;
     }
-    // task 2.3: lstat-equivalent, not `path.is_dir()` — a symlink to a
+    // Lstat-equivalent, not `path.is_dir()` — a symlink to a
     // directory must be treated as a (symlink) leaf for ignore-pattern
     // purposes, not as a directory, matching the scanner's classification
     // and keeping this consistent with `is_real_directory` above.
@@ -581,18 +572,18 @@ fn should_queue_path(
 }
 
 /// True only for a genuine directory — never for a symlink, even one
-/// whose target is a directory (task 2.2/2.3: the watcher must never
-/// treat a symlink as something to register recursive/new-subtree
-/// watches into, mirroring the scanner's lstat-first classification in
+/// whose target is a directory (the watcher must never treat a symlink
+/// as something to register recursive/new-subtree watches into,
+/// mirroring the scanner's lstat-first classification in
 /// `local_change.rs`). `symlink_metadata` never follows the final path
 /// component, unlike `Path::is_dir`.
 fn is_real_directory(path: &Path) -> bool {
     path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false)
 }
 
-/// fix-watcher-directory-registration-race-and-deadlock: now called only
-/// from `spawn_new_directory_registrar`'s tokio task, never from the
-/// watcher callback thread directly (see the module doc comment for why).
+/// Now called only from `spawn_new_directory_registrar`'s tokio task,
+/// never from the watcher callback thread directly (see the module doc
+/// comment for why).
 /// Returns an empty `Vec` both when registration genuinely finds nothing
 /// new to watch and when there is nothing to do (the watcher has already
 /// been dropped, e.g. a shutdown race between this call and
@@ -600,8 +591,7 @@ fn is_real_directory(path: &Path) -> bool {
 /// reconciling scan is harmless to run on an empty list in either case,
 /// and treating "already gone" as an error would just be extra noise on
 /// an ordinary shutdown path. A non-empty `Vec` lists every directory this
-/// call newly registered a watch on (fix-local-change-lost-under-
-/// registration-mutex-contention: each is a genuine `stop()`/recreate
+/// call newly registered a watch on (each is a genuine `stop()`/recreate
 /// cycle on the underlying OS watch — see the module doc comment — so the
 /// caller reconciles each one's contents).
 fn register_new_directory_tree(
@@ -619,9 +609,8 @@ fn register_new_directory_tree(
 }
 
 /// Returns every directory under `start`'s subtree this call newly
-/// registered a watch on (fix-local-change-lost-under-registration-
-/// mutex-contention) — empty when every directory in `start`'s subtree
-/// was already registered (`watched.insert` returning `false`
+/// registered a watch on — empty when every directory in `start`'s
+/// subtree was already registered (`watched.insert` returning `false`
 /// throughout), so no OS-level `stop()`/recreate cycle occurred and there
 /// is nothing for a caller to reconcile.
 fn register_non_ignored_directories(
@@ -631,7 +620,7 @@ fn register_non_ignored_directories(
     start: &Path,
     ignore_set: &EffectiveIgnoreSet,
 ) -> Result<Vec<PathBuf>, SyncError> {
-    // task 2.2/2.3 defense-in-depth: refuse to walk from a symlink root.
+    // Defense-in-depth: refuse to walk from a symlink root.
     // walkdir's `follow_links(false)` (explicit below) does NOT protect an
     // explicitly-given walk root — verified empirically that
     // `WalkDir::new(symlink_to_dir)` still descends into the target at
@@ -715,8 +704,7 @@ mod tests {
         .unwrap_or_else(|_| panic!("{msg}"))
     }
 
-    /// fix-watcher-directory-registration-race-and-deadlock task 4.4: a
-    /// minimal, fast regression for the deadlock this change fixes — a
+    /// A minimal, fast regression for the deadlock this change fixes — a
     /// brand-new one-level subdirectory, created after the watcher has
     /// already started, followed by one write inside it. Before this
     /// change, the callback's own synchronous, reentrant
@@ -728,7 +716,7 @@ mod tests {
     /// this fails loudly rather than hanging the suite. Deliberately does
     /// not need `windows_path_hazard_conflict.rs`'s deep nesting or long
     /// path — those were incidental to the actual bug, not required to
-    /// reproduce it (see proposal.md/design.md).
+    /// reproduce it.
     #[tokio::test]
     async fn new_subdirectory_then_write_inside_it_does_not_deadlock_the_watcher() {
         let dir = tempfile::tempdir().unwrap();
@@ -769,14 +757,14 @@ mod tests {
         .await;
     }
 
-    /// fix-watcher-directory-registration-race-and-deadlock task 3: the
-    /// registration-race half of this change -- a write landing inside a
-    /// brand-new directory must not be silently missed regardless of its
-    /// exact timing relative to that directory's own watch registration.
-    /// Deliberately does *not* drain the directory-creation event before
-    /// writing the file (unlike the deadlock test above), matching
-    /// `create_dir_all(parent)` immediately followed by a write into
-    /// `parent` -- the exact shape design.md's related bug describes. The
+    /// The registration-race half of this change -- a write landing
+    /// inside a brand-new directory must not be silently missed
+    /// regardless of its exact timing relative to that directory's own
+    /// watch registration. Deliberately does *not* drain the
+    /// directory-creation event before writing the file (unlike the
+    /// deadlock test above), matching `create_dir_all(parent)`
+    /// immediately followed by a write into `parent` -- exactly the shape
+    /// that risks losing the write to the registration race. The
     /// deferred registrar's reconciling scan (`reconcile_new_directory_
     /// subtree`) is what guarantees this: it walks the newly-registered
     /// subtree for already-on-disk files unconditionally once `watch()`
@@ -808,12 +796,12 @@ mod tests {
         assert_eq!(found.kind, FsChangeKind::CreatedOrModified);
     }
 
-    /// batch-sync-optimizations task 4.6: the OS callback thread must
-    /// never block, even when the channel is deliberately kept full (no
-    /// one draining it) — proven here by directly exercising the
-    /// callback's own non-blocking `try_send` path via a tiny channel
-    /// filled to capacity, without needing a real filesystem event (which
-    /// would be much slower and less deterministic to arrange).
+    /// The OS callback thread must never block, even when the channel is
+    /// deliberately kept full (no one draining it) — proven here by
+    /// directly exercising the callback's own non-blocking `try_send` path
+    /// via a tiny channel filled to capacity, without needing a real
+    /// filesystem event (which would be much slower and less deterministic
+    /// to arrange).
     #[test]
     fn try_send_never_blocks_when_the_channel_is_full() {
         let (tx, _rx) = mpsc::channel(1);
@@ -855,7 +843,7 @@ mod tests {
         assert!(!overflowed.load(Ordering::Relaxed));
     }
 
-    /// batch-sync-optimizations task 4.5: capacity is configurable.
+    /// Capacity is configurable.
     #[tokio::test]
     async fn watch_folder_with_capacity_accepts_a_custom_capacity() {
         let dir = tempfile::tempdir().unwrap();
@@ -910,11 +898,11 @@ mod tests {
         );
     }
 
-    // --- add-sync-fidelity task 2.3/2.5 ---
+    // --- Symlink-safe directory classification and registration ---
 
-    /// `is_real_directory` is lstat-based (task 2.3): true only for a
-    /// genuine directory, false for a symlink even when its target is a
-    /// directory, and false for a plain file.
+    /// `is_real_directory` is lstat-based: true only for a genuine
+    /// directory, false for a symlink even when its target is a directory,
+    /// and false for a plain file.
     #[cfg(unix)]
     #[test]
     fn is_real_directory_is_lstat_based_not_follow() {
@@ -933,12 +921,11 @@ mod tests {
         assert!(!is_real_directory(&dir.path().join("does_not_exist")));
     }
 
-    /// task 2.2/2.3 defense-in-depth: `register_non_ignored_directories`
-    /// refuses to walk from a symlink `start` outright, rather than
-    /// relying solely on the caller (`register_new_directory_tree`) never
-    /// passing one — proven directly against the function, not just
-    /// through the higher-level watcher behavior covered in
-    /// `local_change.rs`'s tests.
+    /// Defense-in-depth: `register_non_ignored_directories` refuses to
+    /// walk from a symlink `start` outright, rather than relying solely on
+    /// the caller (`register_new_directory_tree`) never passing one —
+    /// proven directly against the function, not just through the
+    /// higher-level watcher behavior covered in `local_change.rs`'s tests.
     #[cfg(unix)]
     #[test]
     fn register_non_ignored_directories_refuses_a_symlink_start() {
@@ -963,10 +950,10 @@ mod tests {
         *watcher_holder.lock().unwrap() = Some(watcher);
     }
 
-    /// task 2.5: a self-referential symlinked-directory cycle must not
-    /// hang `register_non_ignored_directories` — real symlink cycle on
-    /// disk, wrapped in a wall-clock timeout so a genuine infinite loop
-    /// fails the test loudly instead of hanging the suite.
+    /// A self-referential symlinked-directory cycle must not hang
+    /// `register_non_ignored_directories` — real symlink cycle on disk,
+    /// wrapped in a wall-clock timeout so a genuine infinite loop fails
+    /// the test loudly instead of hanging the suite.
     #[cfg(unix)]
     #[test]
     fn register_non_ignored_directories_does_not_hang_on_a_symlink_cycle() {

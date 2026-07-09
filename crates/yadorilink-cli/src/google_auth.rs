@@ -1,6 +1,6 @@
-//! switch-coordination-auth-to-google-oidc: Google OIDC login for the
-//! HTTP-coordination transport, replacing email+password auth entirely.
-//! Only compiled under the `http-coordination` feature.
+//! Google OIDC login for the HTTP-coordination transport, replacing
+//! email+password auth entirely. Only compiled under the
+//! `http-coordination` feature.
 //!
 //! Built on the `oauth2` crate rather than hand-rolled request/response
 //! parsing: OAuth request-building, PKCE generation, and device-flow
@@ -36,13 +36,13 @@ use crate::error::CliError;
 use crate::http_client::post_json;
 use crate::token_store;
 
-/// **Confirmed** (tasks.md 2.4): Google requires a distinct OAuth client
-/// *type* for the Device Authorization Grant ("TVs and Limited Input
-/// devices") than for the loopback-redirect flow ("Desktop app") -- no
-/// single client covers both, so this crate hardcodes two separate
-/// id/secret pairs (design.md: the coordination plane is not open source
-/// and not self-hosted, so one hardcoded value per flow covers every
-/// install of this CLI). Google issues a client secret even for
+/// Google requires a distinct OAuth client *type* for the Device
+/// Authorization Grant ("TVs and Limited Input devices") than for the
+/// loopback-redirect flow ("Desktop app") -- no single client covers both,
+/// so this crate hardcodes two separate id/secret pairs (the coordination
+/// plane is not open source and not self-hosted, so one hardcoded value
+/// per flow covers every install of this CLI). Google issues a client
+/// secret even for
 /// installed-app OAuth clients (it is not treated as confidential the way
 /// a server-side web app's would be -- PKCE is the actual security
 /// mechanism for the loopback flow, per RFC 8252). Both client ids must
@@ -311,8 +311,7 @@ mod tests {
     /// its first call, `slow_down` on its second, and a successful token
     /// response (carrying a distinguishable `id_token`) from the third call
     /// onward -- exercises `oauth2`'s RFC 8628 polling/backoff handling
-    /// (switch-coordination-auth-to-google-oidc task 5.3) deterministically,
-    /// by call count rather than by real elapsed time.
+    /// deterministically, by call count rather than by real elapsed time.
     struct SequencedTokenResponder {
         call_count: AtomicUsize,
     }

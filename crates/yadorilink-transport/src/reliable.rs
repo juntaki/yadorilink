@@ -1,6 +1,6 @@
-//! add-reliable-message-delivery: a minimal ARQ (automatic-repeat-request)
-//! shim over the lossy UDP/WireGuard datagram pipe (`peer_channel.rs`'s
-//! actor). Every application-level message (already an opaque, encrypted-
+//! A minimal ARQ (automatic-repeat-request) shim over the lossy
+//! UDP/WireGuard datagram pipe (`peer_channel.rs`'s actor). Every
+//! application-level message (already an opaque, encrypted-
 //! at-a-lower-layer `Bytes` blob from this module's point of view) is
 //! wrapped with a small header carrying a per-peer send sequence number
 //! plus piggybacked ack info, retransmitted on an RTT-adaptive timeout
@@ -8,12 +8,12 @@
 //! datagram into a sub-second-to-few-seconds recovery instead of the 30s/
 //! 90s per-message-type backstops (`DEFAULT_HYDRATION_TIMEOUT`, the full-
 //! index resync interval) this replaces as the *primary* recovery path
-//! (those backstops stay, demoted to last-resort — see design.md).
+//! (those backstops stay, demoted to last-resort).
 //!
-//! Reliable, NOT in-order (design.md decision 1): the sync protocol's
-//! version-vector-based apply already tolerates reordering and re-
-//! delivery, so this only needs "every message eventually arrives at
-//! least once" — no head-of-line blocking, no reorder buffer.
+//! Reliable, NOT in-order: the sync protocol's version-vector-based apply
+//! already tolerates reordering and re-delivery, so this only needs
+//! "every message eventually arrives at least once" — no head-of-line
+//! blocking, no reorder buffer.
 //!
 //! Self-describing wire framing (not a proto change): a legacy (pre-this-
 //! change) `SyncMessage` encoding's first byte is always one of the
@@ -202,8 +202,8 @@ impl ReliableSend {
         Self { next_seq: 1, unacked: BTreeMap::new(), rtt: RttEstimator::new() }
     }
 
-    /// Bounded per-peer buffer (design.md's "bounded buffers + backpressure,
-    /// never unbounded memory"): once this many messages are awaiting ack,
+    /// Bounded per-peer buffer ("bounded buffers + backpressure, never
+    /// unbounded memory"): once this many messages are awaiting ack,
     /// further sends block until one clears. Mirrors the existing
     /// `MAX_IN_FLIGHT_MESSAGES_PER_PEER` semaphore's role one layer down —
     /// this is about unacked *reliable-delivery* frames specifically, not

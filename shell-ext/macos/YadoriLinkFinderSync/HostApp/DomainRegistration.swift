@@ -1,8 +1,8 @@
 //
-//  DomainRegistration.swift — on-demand-sync task 7.2.
+//  DomainRegistration.swift
 //
 //  Registers one NSFileProviderDomain per OnDemand-linked folder group
-//  (design.md D1's managed location, `~/Library/CloudStorage/yadorilink/
+//  (the managed location, `~/Library/CloudStorage/yadorilink/
 //  <group-name>`) so the YadoriLinkFileProvider extension gets a domain to
 //  serve. Runs from the host app (not the extension itself — an
 //  extension process can't register its own domain; only a containing
@@ -10,13 +10,13 @@
 //  every launch, since this app has no persistent background presence
 //  of its own (matching its existing "exists only to carry the
 //  extension bundle, quit it once enabled" design from main.swift) and
-//  is the natural place the task brief's own "how does the extension
-//  learn which OnDemand folder groups exist" question resolves to: ask
+//  is the natural place to answer "how does the extension learn which
+//  OnDemand folder groups exist": ask
 //  the daemon directly via `yadorilink_fp_list_on_demand_folders`, same as
 //  the extension itself does when re-deriving its own `localPath` (see
 //  YadoriLinkFileProvider/Extension/FileProviderExtension.swift).
 //
-//  ARCHITECTURE DECISION (task 7.2, not fully pinned down by the spec):
+//  ARCHITECTURE DECISION (not fully pinned down by the spec):
 //  domain *identifier* = the folder group's group_id (stable, daemon-
 //  assigned, matches what shellipc.proto's `OnDemandFolder.group_id`
 //  already reports); domain *displayName* = the local folder's own last
@@ -26,18 +26,18 @@
 //  `~/Library/CloudStorage/<vendor>/<displayName>` — no
 //  `pathRelativeToDocumentStorage` needed, that overload is for the
 //  older non-replicated extension type) is used rather than any
-//  path-based constructor, matching D1's "macOS mounts at a fixed
+//  path-based constructor, matching the "macOS mounts at a fixed
 //  managed location" constraint exactly.
 //
-//  UNVERIFIED (flagged honestly, task 7.8): which exact vendor-level
-//  folder name macOS uses under `~/Library/CloudStorage/` (i.e. whether
-//  it is literally "yadorilink" as design.md D1 specifies, or derived from
-//  some other piece of this bundle's metadata) was not independently
-//  confirmed against Apple's non-header documentation in this session —
-//  the SDK headers read directly (NSFileProviderDomain.h) don't name the
-//  exact source of that path component. This needs a real VM screenshot
-//  of `~/Library/CloudStorage/` after domain registration to confirm
-//  (see tasks.md 7.8's honest verification notes).
+//  UNVERIFIED (flagged honestly): which exact vendor-level folder name
+//  macOS uses under `~/Library/CloudStorage/` (i.e. whether it is
+//  literally "yadorilink" as the managed-location convention specifies,
+//  or derived from some other piece of this bundle's metadata) was not
+//  independently confirmed against Apple's non-header documentation in
+//  this session — the SDK headers read directly (NSFileProviderDomain.h)
+//  don't name the exact source of that path component. This needs a real
+//  VM screenshot of `~/Library/CloudStorage/` after domain registration
+//  to confirm.
 
 import FileProvider
 

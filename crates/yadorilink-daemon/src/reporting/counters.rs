@@ -1,17 +1,17 @@
-//! Task 2.3: daemon-owned aggregate usage counters, persisted to
+//! Daemon-owned aggregate usage counters, persisted to
 //! `<config_dir>/reporting/counters.json`. This module owns the
 //! storage/aggregation layer only — actually incrementing these from real
-//! call sites in `link_manager.rs`/`peer_orchestrator.rs`/etc. is section
-//! 3's job ("Wire reporting IPC dispatch into yadorilink-daemon"). Every
-//! mutation method here is deliberately infallible (`-> ()`), not
-//! `-> ReportingResult<()>`: this is the API a future call site deep in
-//! an unrelated sync/command path will call directly, so a reporting
-//! storage failure structurally *cannot* be `?`-propagated into it — the
-//! signature doesn't offer an `Err` to propagate. Persistence failures
-//! are logged (`tracing::warn!`) and otherwise swallowed; the in-memory
-//! counters keep accumulating either way, so a transient disk failure
-//! only risks losing counts on an unclean shutdown, never a lost or
-//! failed sync/command.
+//! call sites in `link_manager.rs`/`peer_orchestrator.rs`/etc. happens
+//! elsewhere, as part of wiring reporting IPC dispatch into
+//! yadorilink-daemon. Every mutation method here is deliberately
+//! infallible (`-> ()`), not `-> ReportingResult<()>`: this is the API a
+//! future call site deep in an unrelated sync/command path will call
+//! directly, so a reporting storage failure structurally *cannot* be
+//! `?`-propagated into it — the signature doesn't offer an `Err` to
+//! propagate. Persistence failures are logged (`tracing::warn!`) and
+//! otherwise swallowed; the in-memory counters keep accumulating either
+//! way, so a transient disk failure only risks losing counts on an
+//! unclean shutdown, never a lost or failed sync/command.
 //!
 //! Flush policy: every mutation flushes the full counters state to disk
 //! immediately, rather than batching/periodic flush. This is deliberate,
@@ -49,11 +49,10 @@ struct CountersState {
     peer_count_bucket_counts: BTreeMap<String, u32>,
 }
 
-/// Coarse buckets, per design.md D3 ("coarse performance buckets") — see
-/// `schema.rs`'s doc comments for the two bucket shapes it gives as
-/// examples (uptime, peer count); the transfer-size/latency bucket edges
-/// below are this module's own reasoned choices, not specified anywhere
-/// in design.md.
+/// Coarse performance buckets — see `schema.rs`'s doc comments for the
+/// two bucket shapes it gives as examples (uptime, peer count); the
+/// transfer-size/latency bucket edges below are this module's own
+/// reasoned choices, not specified elsewhere.
 fn bucket_transfer_size(bytes: u64) -> &'static str {
     const MB: u64 = 1024 * 1024;
     match bytes {
@@ -107,8 +106,8 @@ pub struct ReportingCounters {
 
 impl ReportingCounters {
     /// Loads persisted counters (best-effort — a missing or unreadable
-    /// file just starts from zero rather than failing daemon startup;
-    /// see task 2.6) and starts the in-process uptime clock.
+    /// file just starts from zero rather than failing daemon startup)
+    /// and starts the in-process uptime clock.
     pub fn open(reporting_dir: impl Into<PathBuf>) -> Self {
         let path = reporting_dir.into().join("counters.json");
         let state = match Self::load(&path) {
@@ -189,10 +188,10 @@ impl ReportingCounters {
         self.mutate(|s| *s.peer_count_bucket_counts.entry(bucket.to_string()).or_insert(0) += 1);
     }
 
-    /// Clears every counter (design.md D3: "reset after successful
-    /// export/submission unless the user chooses otherwise" — the actual
-    /// reset-on-export policy decision lives with section 3/4's IPC/CLI
-    /// wiring; this is the primitive they'll call).
+    /// Clears every counter. Counters reset after successful
+    /// export/submission unless the user chooses otherwise; the actual
+    /// reset-on-export policy decision lives with the daemon's IPC/CLI
+    /// wiring — this is the primitive it calls.
     pub fn reset(&self) {
         self.mutate(|s| *s = CountersState::default());
     }

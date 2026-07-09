@@ -8,11 +8,11 @@
 //! `os_version_bucket` is deliberately `"unknown"`: there is no existing
 //! dependency-free way in this workspace to read a coarse OS version
 //! string (e.g. "14.x", "24.04") across macOS/Windows/Linux, and adding a
-//! new dependency (e.g. `os_info`) for one field is out of scope for this
-//! change — design.md's payload doc comment already treats this field as
-//! "coarse, e.g. ...", not a guaranteed-present one, and `"unknown"` is a
-//! valid, honest coarse bucket rather than a fabricated one. Flagged here
-//! for a future follow-up rather than silently guessed at.
+//! new dependency (e.g. `os_info`) for one field is out of scope. This
+//! field is documented as "coarse, e.g. ...", not guaranteed-present, so
+//! `"unknown"` is a valid, honest coarse bucket rather than a fabricated
+//! one. Flagged here for a future follow-up rather than silently guessed
+//! at.
 
 use yadorilink_reporting::builder::ReportEnvironment;
 use yadorilink_reporting::consent::ConsentState;
@@ -29,8 +29,7 @@ fn os_family() -> OsFamily {
 
 /// The current process's environment facts, for use in a freshly-built
 /// report envelope. `consent.anonymous_reporter_id` is threaded straight
-/// through — absent until the user opts in (design.md D2), never
-/// generated here.
+/// through — absent until the user opts in, never generated here.
 pub fn current(consent: &ConsentState) -> ReportEnvironment {
     ReportEnvironment {
         generated_at: super::time::now_rfc3339(),

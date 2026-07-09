@@ -1,4 +1,4 @@
-//! build-filebox-mvp task 9.5: COM registration for the four overlay
+//! COM registration for the four overlay
 //! identifier CLSIDs, driven by `regsvr32.exe` calling `DllRegisterServer`
 //! / `DllUnregisterServer` (the standard COM DLL registration contract —
 //! no separate installer script is needed beyond `regsvr32`, though a
@@ -34,8 +34,8 @@ const SLOTS: &[OverlaySlot] = &[
     OverlaySlot { clsid: crate::overlay::CLSID_SYNCING, name: "YadoriLinkSyncing" },
     OverlaySlot { clsid: crate::overlay::CLSID_ERROR, name: "YadoriLinkError" },
     OverlaySlot { clsid: crate::overlay::CLSID_ONLINE_ONLY, name: "YadoriLinkOnlineOnly" },
-    // on-demand-sync task 6.4 — a 5th overlay slot for the "open
-    // elsewhere" edit-presence badge (design D7). Windows exposes a
+    // A 5th overlay slot for the "open
+    // elsewhere" edit-presence badge (). Windows exposes a
     // limited number of overlay slots system-wide (commonly ~15, several
     // OS-reserved) shared across every installed cloud-sync client, so
     // this is one more real deployments should expect to compete for.
@@ -46,9 +46,9 @@ fn guid_to_registry_string(guid: GUID) -> String {
     format!("{{{guid:?}}}")
 }
 
-/// add-desktop-status-app task 4.3: made crate-visible so
-/// `context_menu::status_app_path` can locate the status app binary
-/// installed alongside this DLL, reusing the exact same "ask Windows for
+/// Made crate-visible so `context_menu::status_app_path` can locate the
+/// status app binary installed alongside this DLL, reusing the exact
+/// same "ask Windows for
 /// this DLL's own module path" logic this file already needed for COM
 /// registration (see this function's own doc comment above for the real
 /// bug that made getting this right non-trivial) rather than re-deriving
@@ -153,7 +153,7 @@ fn create_key(parent: HKEY, subkey: &str) -> Result<HKEY> {
     Ok(hkey)
 }
 
-/// build-filebox-mvp task 9.4: registered as a per-file-type context menu
+/// Registered as a per-file-type context menu
 /// handler (`*\shellex\ContextMenuHandlers`, i.e. applies to every file
 /// regardless of extension) rather than a folder-specific one, since a
 /// linked folder can contain any file type and every entry needs the

@@ -1,4 +1,4 @@
-//! Allowlist-based construction helpers (task 1.3). `UsagePayload`/
+//! Allowlist-based construction helpers. `UsagePayload`/
 //! `ErrorPayload` already structurally forbid serializing arbitrary
 //! internal state (they have no field that could hold a raw struct) —
 //! these builders are the ergonomic layer on top: a fluent surface with
@@ -104,7 +104,7 @@ impl ErrorPayloadBuilder {
         self
     }
 
-    /// Runs the D5 denylist safety pass over every free-text field
+    /// Runs the denylist safety pass over every free-text field
     /// before producing the final payload — the one place in this
     /// builder where raw caller-supplied text (log lines, a backtrace)
     /// is unavoidable, and therefore the one place redaction is

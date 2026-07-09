@@ -33,15 +33,15 @@
 //! - **`Violation` is structured for P4's triage/dedup**, not a bare
 //!   string: `kind` + machine-readable `path`/`content_ids`/`devices`, with
 //!   `detail` only for the human-readable remainder.
-//! - **History legality (design.md oracle #4) is intentionally not a
+//! - **History legality (the oracle's 4th invariant) is intentionally not a
 //!   separate general linearizability checker in P0.** Its two components
 //!   that actually matter for what P0's scenarios produce — "no write is
 //!   lost without a causally-later write/delete explaining its absence"
 //!   and "every genuine concurrent-edit pair keeps both copies" — are
 //!   covered by `check_no_loss` and `check_conflict_copy_accounting`
-//!   respectively. A dedicated, more general legality oracle is deferred
-//!   (design.md's risk section: grow it from real triaged cases, don't let
-//!   a from-scratch perfect checker block P0).
+//!   respectively. A dedicated, more general legality oracle is deferred:
+//!   grow it from real triaged cases, don't let a from-scratch perfect
+//!   checker block P0.
 
 #![cfg(madsim)]
 #![allow(dead_code)] // not every check has a caller in P0's single retrofitted scenario yet
@@ -69,9 +69,9 @@ pub enum ViolationKind {
     /// per-round failure -- production has no "N seconds or fail" gate,
     /// only eventual consistency -- but a genuine, measured cost (the
     /// self-echo re-index churn's ~30s hydration-timeout cycle, confirmed
-    /// production-real via `fix-duplicate-conflict-copy-on-reresolution`'s
-    /// investigation) that must stay *visible* rather than being hidden
-    /// by simply loosening the round-progression gate that tolerates it.
+    /// production-real by investigation) that must stay *visible* rather
+    /// than being hidden by simply loosening the round-progression gate
+    /// that tolerates it.
     SlowConvergence,
 }
 
@@ -150,8 +150,7 @@ impl GlobalOracle {
     /// progression (that's `converge_path`'s own, deliberately generous,
     /// bound in the harness). Keeps a real, measured cost (self-echo
     /// re-index churn's ~30s hydration-timeout cycle -- confirmed
-    /// production-real, not a harness/madsim artifact, in
-    /// `fix-duplicate-conflict-copy-on-reresolution`'s investigation)
+    /// production-real, not a harness/madsim artifact, by investigation)
     /// visible in the oracle's own findings rather than silently
     /// tolerated just because the round-progression gate is loose enough
     /// to not fail on it.
@@ -469,8 +468,8 @@ impl GlobalOracle {
         violations
     }
 
-    /// **Convergence (recursive).** `add-dst-directory-chaos` (task: nested
-    /// paths from directory ops): identical in every respect to
+    /// **Convergence (recursive).** For nested paths from directory ops:
+    /// identical in every respect to
     /// `check_convergence` except it walks subdirectories too, via
     /// `recursive_hash_snapshot` instead of `flat_hash_snapshot` — a new
     /// sibling method, not a rewrite, so `dst_two_device_chaos.rs`'s flat
@@ -739,7 +738,7 @@ fn count_matching_occurrences(root: &Path, path: &str, expected: &[u8]) -> usize
     count
 }
 
-/// `add-dst-directory-chaos`: recursively walks `dir` (relative to
+/// Recursively walks `dir` (relative to
 /// `root`, for building forward-slash-separated relative paths), invoking
 /// `visit(relative_path, bytes)` for every regular file found. The
 /// genuinely-recursive counterpart `flat_hash_snapshot`'s own doc comment

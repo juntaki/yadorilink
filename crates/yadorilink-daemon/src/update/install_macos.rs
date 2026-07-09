@@ -1,4 +1,4 @@
-//! add-automatic-updates task 4.1: macOS install handoff for a verified
+//! macOS install handoff for a verified
 //! notarized `.pkg` artifact.
 //!
 //! Scope note (per this change's own review guidance): this repo's macOS
@@ -10,7 +10,7 @@
 //! (that requires root). Rather than inventing a privileged-helper
 //! architecture that can't be verified without real Developer ID
 //! Installer signing and notarization credentials, this implements the
-//! honest, currently-buildable half of design.md's "Daemon-Orchestrated
+//! honest, currently-buildable half of the "Daemon-Orchestrated
 //! Checks, Installer-Owned Replacement" decision: the daemon hands the
 //! verified `.pkg` off to macOS's own Installer.app (`open <pkg>`),
 //! which prompts the user for admin credentials itself and performs the

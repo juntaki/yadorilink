@@ -1,12 +1,12 @@
-//! add-untrusted-storage-peer task 1: the group content-encryption key
+//! The group content-encryption key
 //! (`K_g`), block/path AEAD, and wrapped-key distribution to trusted
 //! devices.
 //!
 //! This module is the *only* place `K_g` is generated, wrapped, unwrapped,
 //! or used to encrypt/decrypt bytes. `peer_session.rs` calls into it at the
-//! two chokepoints design.md specifies (block send/receive,
+//! two chokepoints (block send/receive,
 //! index-entry send/receive) but never manipulates key material itself.
-//! Per design.md's threat model and the encrypted-peer spec's "Group
+//! Per the encrypted-peer spec's "Group
 //! Content Key Stays On Trusted Devices" requirement: `K_g` and its wrapped
 //! forms are produced/consumed only by trusted devices, are never sent to
 //! the coordination plane (this module has zero knowledge of the
@@ -16,7 +16,7 @@
 //! live_storage_only_flags` and `send_wrapped_group_key_if_due`).
 //!
 //! ## Algorithm choices
-//! - AEAD: XChaCha20-Poly1305 (design.md's first-listed option) — chosen
+//! - AEAD: XChaCha20-Poly1305 — chosen
 //!   over AES-256-GCM-SIV specifically because its 24-byte extended nonce
 //!   gives comfortable collision margin for the *deterministic*
 //!   convergent-mode nonce (task 1.1/2.1: `nonce = KDF(K_g, h)`), which by
@@ -32,8 +32,8 @@
 //!   of curve) buys nothing extra here; one HMAC call as a keyed PRF is
 //!   the standard simplification in that case and avoids an additional
 //!   `hkdf` crate dependency for a single call site.
-//! - Key wrapping: an authenticated ECIES-style construction (design.md's
-//!   phrase) — X25519 ephemeral-static *and* static-static Diffie-Hellman
+//! - Key wrapping: an authenticated ECIES-style construction — X25519
+//!   ephemeral-static *and* static-static Diffie-Hellman
 //!   (mirroring the ephemeral+static combination of an X3DH-style
 //!   handshake, minus prekeys) so the recipient can verify the wrap was
 //!   produced by someone holding the claimed sender's real identity secret
@@ -79,7 +79,7 @@ pub enum ContentCryptoError {
     BadKeyLen(usize),
 }
 
-/// A folder group's symmetric content-encryption key (design.md "Group
+/// A folder group's symmetric content-encryption key ("Group
 /// content key", `K_g`). Lives only on trusted devices — see this module's
 /// doc comment. Zeroized on drop; deliberately has no `Debug`/`Display`
 /// impl that would print the raw bytes (the derived `Debug` below only
@@ -95,7 +95,7 @@ impl std::fmt::Debug for GroupKey {
 }
 
 impl GroupKey {
-    /// task 1.1: generates a fresh, uniformly-random `K_g`. Also the
+    /// generates a fresh, uniformly-random `K_g`. Also the
     /// function task 1.3's key rotation calls to mint `K_g'` — rotation is
     /// "generate a new key the same way as the first one, then re-wrap and
     /// re-encrypt with it," not a distinct code path.
@@ -118,12 +118,12 @@ impl GroupKey {
     }
 }
 
-/// task 1.1: `nonce = KDF(K_g, h)` — deterministic, so two trusted devices
+/// `nonce = KDF(K_g, h)` — deterministic, so two trusted devices
 /// (or the same device on two occasions) encrypting the same plaintext
 /// block under the same group key produce byte-identical ciphertext,
 /// letting an untrusted storage peer dedup on ciphertext hash alone
-/// (design.md's convergent-encryption trade-off; see `encrypt_block`'s
-/// `convergent` parameter for the per-group opt-out, task 1.4).
+/// (the convergent-encryption trade-off; see `encrypt_block`'s
+/// `convergent` parameter for the per-group opt-out).
 pub fn derive_block_nonce(key: &GroupKey, plaintext_hash: &[u8]) -> [u8; NONCE_LEN] {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(&key.0).expect("HMAC accepts any key length");
     mac.update(b"yadorilink-block-nonce-v1");
@@ -134,7 +134,7 @@ pub fn derive_block_nonce(key: &GroupKey, plaintext_hash: &[u8]) -> [u8; NONCE_L
     nonce
 }
 
-/// task 1.4: a fresh random nonce, used instead of `derive_block_nonce` when
+/// a fresh random nonce, used instead of `derive_block_nonce` when
 /// a group has convergent encryption disabled (so identical plaintext
 /// blocks get *distinct* ciphertext and don't cross-dedup on the untrusted
 /// peer — see `encrypt_block`), and also used for encrypting index path/
@@ -178,7 +178,7 @@ pub struct EncryptedBlock {
 }
 
 impl EncryptedBlock {
-    /// task 2.1: the untrusted peer addresses/dedups this block by
+    /// the untrusted peer addresses/dedups this block by
     /// `H(ciphertext)` (SHA-256, matching the plaintext content-hash
     /// algorithm this codebase already uses everywhere else — see
     /// `peer_session::block_data_matches`), never by the plaintext hash.
@@ -189,7 +189,7 @@ impl EncryptedBlock {
     }
 }
 
-/// task 2.1: encrypts one plaintext block for storage on an untrusted peer.
+/// encrypts one plaintext block for storage on an untrusted peer.
 /// `plaintext_hash` is `h` — this block's plaintext content-hash identity,
 /// exactly as already computed by `peer_session::block_data_matches`'s
 /// caller.
@@ -197,7 +197,7 @@ impl EncryptedBlock {
 /// `convergent = true` (the default, task 1.1) derives the nonce
 /// deterministically from `(K_g, h)`, so identical plaintext anywhere in
 /// the group produces identical ciphertext and dedups on the untrusted
-/// peer — design.md's disclosed equal-block-correlation trade-off.
+/// peer — a disclosed equal-block-correlation trade-off.
 /// `convergent = false` (task 1.4, a per-group opt-out for higher-
 /// sensitivity groups) uses a fresh random nonce every call instead, so the
 /// same plaintext block encrypted twice produces two unrelated ciphertexts
@@ -213,7 +213,7 @@ pub fn encrypt_block(
     Ok(EncryptedBlock { nonce, ciphertext })
 }
 
-/// task 2.3: decrypts a block fetched (by ciphertext hash) from an
+/// decrypts a block fetched (by ciphertext hash) from an
 /// untrusted peer. Returns `Err` on any AEAD authentication failure —
 /// tampered ciphertext, wrong nonce, or a peer that returned some other
 /// block's ciphertext wholesale. `peer_session.rs` treats this identically
@@ -235,13 +235,13 @@ pub fn decrypt_block(
     aead_decrypt(key, nonce, ciphertext)
 }
 
-/// task 3.1: encrypts index metadata (a file's path and its ordered list of
+/// encrypts index metadata (a file's path and its ordered list of
 /// plaintext block hashes — see `peer_session::EncryptedFileMeta`) for
 /// inclusion in an encrypted index entry. Always uses a random nonce
 /// (returned alongside the ciphertext) — this data has no dedup
 /// requirement, and a deterministic nonce here would additionally leak
 /// "these two entries have the exact same encrypted metadata," an
-/// unnecessary correlation design.md does not ask for.
+/// unnecessary correlation with no benefit here.
 pub fn encrypt_metadata(
     key: &GroupKey,
     plaintext: &[u8],
@@ -255,8 +255,8 @@ pub fn encrypt_metadata(
 /// that holds `K_g` to recover a file's real path and block-hash list from
 /// an `EncryptedFileEntry` it received (whether directly from the
 /// encrypting device, or relayed unchanged through an untrusted storage
-/// peer that cannot itself decrypt it — design.md's "storage peer as a
-/// relay" role).
+/// peer that cannot itself decrypt it — acting purely as a
+/// relay).
 pub fn decrypt_metadata(
     key: &GroupKey,
     nonce: &[u8],
@@ -265,10 +265,10 @@ pub fn decrypt_metadata(
     aead_decrypt(key, nonce, ciphertext)
 }
 
-/// task 1.2: a wrapped copy of `K_g`, addressed to one recipient trusted
+/// a wrapped copy of `K_g`, addressed to one recipient trusted
 /// device by their X25519 identity public key. Everything in this struct
-/// is safe to transit via peers (never the coordination plane, per
-/// design.md) — it reveals nothing about `K_g` without the recipient's
+/// is safe to transit via peers (never the coordination plane)
+/// — it reveals nothing about `K_g` without the recipient's
 /// identity secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrappedGroupKey {
@@ -294,7 +294,7 @@ fn derive_wrap_key(dh_ephemeral: &[u8; 32], dh_static: &[u8; 32]) -> GroupKey {
     GroupKey(bytes)
 }
 
-/// task 1.2: wraps `K_g` to one trusted device's identity key. Uses both an
+/// wraps `K_g` to one trusted device's identity key. Uses both an
 /// ephemeral-static and a static-static X25519 Diffie-Hellman (see this
 /// module's doc comment) so `unwrap_group_key` implicitly authenticates
 /// that whoever produced this wrap held `sender_identity_secret` — a bare
@@ -344,7 +344,7 @@ pub fn unwrap_group_key(
     Ok(GroupKey(bytes))
 }
 
-/// task 1.3: mints a fresh `K_g'` and wraps it to every remaining trusted
+/// mints a fresh `K_g'` and wraps it to every remaining trusted
 /// device in one call — the composition a revocation handler runs
 /// (generate once, re-wrap per remaining recipient). Deliberately returns
 /// the new key *and* the per-recipient wraps together rather than making
@@ -354,7 +354,7 @@ pub fn unwrap_group_key(
 /// some remaining device would silently strand that device without
 /// access — this signature makes that split harder to accidentally do).
 ///
-/// **Documented, accepted cost (design.md, task 1.3):** this only mints and
+/// **Documented, accepted cost:** this only mints and
 /// distributes the new key. It does not re-encrypt any block already
 /// stored under the old key — those ciphertexts remain decryptable by
 /// anyone who held `K_g` (including a now-revoked device, if it retained a
@@ -393,7 +393,7 @@ mod tests {
         assert_eq!(a.ciphertext_hash(), b.ciphertext_hash());
     }
 
-    /// task 5.3: convergent mode dedups identical plaintext across
+    /// convergent mode dedups identical plaintext across
     /// independent encryption calls (different "devices"/occasions using
     /// the same group key) — the untrusted peer sees the same ciphertext
     /// hash both times and can store one copy.
@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(first.ciphertext_hash(), second.ciphertext_hash());
     }
 
-    /// task 5.3 (the disable-convergence half): with convergence disabled,
+    /// (the disable-convergence half): with convergence disabled,
     /// two encryptions of identical plaintext under the identical key
     /// produce *distinct* ciphertext, so an untrusted peer under this mode
     /// cannot correlate them.
@@ -479,7 +479,7 @@ mod tests {
         assert_eq!(k, unwrapped);
     }
 
-    /// task 5.2 groundwork: the wrapped form reveals nothing recoverable
+    /// groundwork: the wrapped form reveals nothing recoverable
     /// without the recipient's identity secret — a third party (or a
     /// storage-only peer that merely relays the bytes) holding only the
     /// wrapped struct cannot unwrap it.

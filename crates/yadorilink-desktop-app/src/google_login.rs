@@ -1,13 +1,13 @@
-//! switch-coordination-auth-to-google-oidc: the desktop app's own "Login"
-//! action -- an OAuth 2.0 Authorization Code + PKCE flow with a loopback
-//! (`127.0.0.1`) redirect (RFC 8252's native-app pattern). Opens the
-//! system browser to Google's consent screen and receives the callback on
-//! a temporary local HTTP listener this module starts for that purpose,
-//! entirely self-contained with no external relay service. PKCE
-//! generation, the authorization URL, and the final token exchanges all
-//! live in `yadorilink_cli::google_auth` (shared with the CLI's own Device
-//! Authorization Grant flow) -- this module only owns what's specific to
-//! the loopback-redirect variant: the local listener and opening the browser.
+//! The desktop app's own "Login" action -- an OAuth 2.0 Authorization
+//! Code + PKCE flow with a loopback (`127.0.0.1`) redirect (RFC 8252's
+//! native-app pattern). Opens the system browser to Google's consent
+//! screen and receives the callback on a temporary local HTTP listener
+//! this module starts for that purpose, entirely self-contained with no
+//! external relay service. PKCE generation, the authorization URL, and
+//! the final token exchanges all live in `yadorilink_cli::google_auth`
+//! (shared with the CLI's own Device Authorization Grant flow) -- this
+//! module only owns what's specific to the loopback-redirect variant:
+//! the local listener and opening the browser.
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -121,7 +121,7 @@ mod tests {
     use super::*;
     use tokio::net::TcpStream;
 
-    /// task 5.4: a real local `TcpListener` + a real TCP connection sending
+    /// a real local `TcpListener` + a real TCP connection sending
     /// a hand-written HTTP GET request line, simulating exactly what the
     /// browser's redirect produces -- not a mocked stream.
     #[tokio::test]

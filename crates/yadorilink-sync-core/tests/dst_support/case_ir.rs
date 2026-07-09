@@ -1,20 +1,20 @@
-//! dst-full-stack-heat-run-framework P0 task 0.1: the unified, serializable
-//! Case IR every DST scenario (today: `dst_two_device_chaos`; later:
-//! `monkey_chaos` and the full-stack daemon under P1+) is retrofitted onto,
-//! replacing bespoke per-scenario event bookkeeping with one shared shape
-//! that survives generator evolution (a serialized `Case` persists to the
-//! corpus verbatim -- a bare seed only replays as long as the generator
-//! that produced it from that seed hasn't changed).
+//! The unified, serializable Case IR every DST scenario (today:
+//! `dst_two_device_chaos`; later: `monkey_chaos` and the full-stack daemon
+//! under P1+) is retrofitted onto, replacing bespoke per-scenario event
+//! bookkeeping with one shared shape that survives generator evolution (a
+//! serialized `Case` persists to the corpus verbatim -- a bare seed only
+//! replays as long as the generator that produced it from that seed
+//! hasn't changed).
 //!
 //! `#![cfg(madsim)]`-gated like every DST scenario file.
 //!
-//! P0 scope note: `Fault` and most of `Op` are defined completely per
-//! design.md's full IR shape (so P1-P3 don't need a breaking schema
-//! change), but P0's only producer (`dst_two_device_chaos`'s retrofit,
-//! task 0.3) populates `fault_schedule` with an empty `Vec` (no fault
+//! P0 scope note: `Fault` and most of `Op` are defined completely to
+//! match the full IR shape (so P1-P3 don't need a breaking schema
+//! change), but P0's only producer (`dst_two_device_chaos`'s retrofit)
+//! populates `fault_schedule` with an empty `Vec` (no fault
 //! injectors exist before P2) and only ever emits `Op::Write`/`Op::Delete`
 //! (that scenario's only two op kinds -- everything from `Rename` onward
-//! is P3's op-vocabulary-extension task's receiving end, defined now so
+//! is the op-vocabulary-extension's receiving end, defined now so
 //! the type doesn't need to change shape later).
 
 #![cfg(madsim)]
@@ -99,14 +99,14 @@ pub enum Op {
     },
     /// Multiple devices' ops at the same logical round targeting paths
     /// that are expected to race -- a generator-level grouping hint for
-    /// the oracle's history-legality check (task 0.2 item 4), not a new
+    /// the oracle's history-legality check, not a new
     /// primitive op in its own right.
     ConflictingConcurrent {
         paths: Vec<String>,
     },
 }
 
-/// All four fault classes design.md specifies, defined completely now so
+/// All four fault classes the design specifies, defined completely now so
 /// P1-P3 slot their injectors in without a breaking IR change. No P0
 /// scenario schedules any of these yet (`fault_schedule` is always empty
 /// before P2).
@@ -121,9 +121,9 @@ pub enum Fault {
 }
 
 /// Stub shape for P2's intercepting-transport injector; fields are the
-/// minimum design.md's fault model names (`drop`/`delay`/`reorder`/
-/// `duplicate`/`partition`/`heal`) so `Fault::Net` doesn't need to change
-/// shape once P2 wires an actual interceptor behind it.
+/// minimum fault model names (`drop`/`delay`/`reorder`/`duplicate`/
+/// `partition`/`heal`) so `Fault::Net` doesn't need to change shape once
+/// P2 wires an actual interceptor behind it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetFault {
     Drop,

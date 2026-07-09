@@ -1,8 +1,5 @@
 //! Permanent, generalized regression test superseding the temporary
-//! `three_way_conflict_diag.rs` diagnostic (task 4.1 of the
-//! `fix-multiway-conflict-name-content-mismatch` OpenSpec change --
-//! see `openspec/changes/fix-multiway-conflict-name-content-mismatch/`
-//! for the full mechanism writeup).
+//! `three_way_conflict_diag.rs` diagnostic.
 //!
 //! Background: `peer_session.rs`'s `resolve_and_apply_conflict` hardcodes
 //! `self.local_device_id`/`self.peer_device_id` when naming a conflict
@@ -29,8 +26,8 @@
 //! stack -- that is expected and is the point: this file is meant to be
 //! run repeatedly (e.g. via a heat-run script) across the device-count /
 //! timing grid to characterize the bug's actual repro-rate envelope,
-//! which feeds directly into verifying the fix for the OpenSpec change
-//! above. Do not weaken the core assertion to a file-count check to make
+//! which feeds directly into verifying the fix described above. Do not
+//! weaken the core assertion to a file-count check to make
 //! these pass -- that would silently hide the bug this file exists to
 //! catch.
 

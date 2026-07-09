@@ -21,7 +21,7 @@ pub struct IncomingResult {
     pub to_send: Vec<Vec<u8>>,
     /// Fully-reassembled application messages decoded from this datagram.
     pub messages: Vec<Vec<u8>>,
-    /// SEC-TRANS-1: true iff this datagram was cryptographically
+    /// True iff this datagram was cryptographically
     /// meaningful — it decrypted successfully as WireGuard data (even an
     /// empty keepalive/probe that never completes a full reassembled
     /// message) or advanced an authenticated handshake transition that
@@ -108,7 +108,7 @@ impl WgTunnel {
                     // parsed as a valid WireGuard control message (handshake
                     // init/response/cookie) and advanced the handshake state
                     // machine — junk bytes hit `Err` above instead, so this
-                    // is a genuine authenticated transition (SEC-TRANS-1).
+                    // is a genuine authenticated transition.
                     authenticated = true;
                     to_send.push(bytes.to_vec());
                     next_input = Some(Vec::new());
@@ -149,7 +149,7 @@ impl WgTunnel {
     /// Unconditionally produces a datagram right now: a handshake
     /// initiation if no session exists yet, or an empty (keepalive-style)
     /// data packet if one does. Used to actively probe a candidate path
-    /// (e.g. task 4.5/4.6's direct-path upgrade attempts) without waiting
+    /// (e.g., during direct-path upgrade attempts) without waiting
     /// on `tick`'s internal timer gating.
     pub fn probe(&mut self) -> Option<Vec<u8>> {
         let mut buf = vec![0u8; WG_SCRATCH_BUF_SIZE];
@@ -178,7 +178,7 @@ mod tests {
         assert!(!result.authenticated);
     }
 
-    /// SEC-TRANS-1's foundation: a datagram that is not a valid WireGuard
+    /// Security foundation: a datagram that is not a valid WireGuard
     /// packet at all (no keys, no MAC, no handshake) must decapsulate to
     /// `TunnResult::Err` and therefore never set `authenticated`, however
     /// many bytes it contains — this is what an off-path attacker who only

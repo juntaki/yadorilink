@@ -6,10 +6,9 @@
 #   - crates/yadorilink-cli          -> /usr/local/bin/yadorilink
 #   - crates/yadorilink-daemon       -> /usr/local/bin/yadorilink-daemon
 #   - crates/yadorilink-desktop-app  -> /usr/local/bin/yadorilink-status-app
-#     (add-desktop-status-app: the menu-bar status app. Shipped as a plain
-#     signed executable, not an .app bundle — see this script's task-4.1
-#     staging comment below for why, and tasks.md for the follow-up this
-#     defers.)
+#     (the menu-bar status app. Shipped as a plain
+#     signed executable, not an .app bundle — see this script's
+#     staging comment below for why.)
 #   - shell-ext/macos/YadoriLinkFinderSync (host app + both extensions)
 #                                -> /Applications/YadoriLinkFinderSyncHost.app
 #
@@ -113,14 +112,13 @@ mkdir -p "$STAGE_DIR/usr/local/bin" "$STAGE_DIR/Applications"
 
 cp "$YADORILINK_BIN" "$STAGE_DIR/usr/local/bin/yadorilink"
 cp "$YADORILINK_DAEMON_BIN" "$STAGE_DIR/usr/local/bin/yadorilink-daemon"
-# add-desktop-status-app task 4.1: staged as a plain binary next to
+# Staged as a plain binary next to
 # `yadorilink`/`yadorilink-daemon`, not wrapped in an `.app` bundle —
 # `tray-icon`'s `NSStatusItem` works fine from a bare executable given a
 # running `NSApplication`/event loop (this app's `main.rs`), and a real
 # multi-resolution `.icns` + `Info.plist`-bundled `.app` (needed for it to
-# show in Launchpad/the Applications list, the spec's "discoverable from
-# the OS application list" scenario) is packaging work intentionally
-# deferred — see tasks.md's honest notes on this change's scope.
+# show in Launchpad/the Applications list) is packaging work intentionally
+# deferred for now.
 cp "$YADORILINK_STATUS_APP_BIN" "$STAGE_DIR/usr/local/bin/yadorilink-status-app"
 chmod 755 \
     "$STAGE_DIR/usr/local/bin/yadorilink" \

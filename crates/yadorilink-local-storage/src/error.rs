@@ -12,13 +12,12 @@ pub enum StorageError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// add-resource-governance task 1.4/3.1: a block write was rejected
-    /// before any bytes were written because completing it would breach the
-    /// configured free-space headroom on the volume hosting the block-store
-    /// root — deliberately a distinct variant (not `Io`, and never
-    /// constructed via `#[from]`) so callers can tell "disk is full, back
-    /// off differently" from a transient I/O error and retry accordingly
-    /// (task 1.5).
+    /// A block write was rejected before any bytes were written because
+    /// completing it would breach the configured free-space headroom on the
+    /// volume hosting the block-store root — deliberately a distinct
+    /// variant (not `Io`, and never constructed via `#[from]`) so callers
+    /// can tell "disk is full, back off differently" from a transient I/O
+    /// error and retry accordingly.
     #[error(
         "insufficient free space to write block at {path:?}: {available_bytes} bytes available \
          on {volume:?}, headroom requires at least {headroom_bytes} bytes free"

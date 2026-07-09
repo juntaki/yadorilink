@@ -73,8 +73,8 @@ pub fn resolve_status(state: &DaemonState, absolute_path: &str) -> ShellSyncStat
     }
 }
 
-/// Resolves `absolute_path`'s materialization state (`on-demand-sync`
-/// design D2) for the shell extension's placeholder/hydrated/hydrating
+/// Resolves `absolute_path`'s materialization state for the
+/// shell extension's placeholder/hydrated/hydrating
 /// badge — `None` if the path isn't under any linked folder or isn't
 /// indexed at all (e.g. an `Eager` folder's files are always `Hydrated`
 /// in practice, but report `None` rather than a state if never indexed).
@@ -86,7 +86,7 @@ pub fn resolve_materialization_state(
     state.sync_state.get_materialization_state(&group_id, &rel_path).ok().flatten()
 }
 
-/// Resolves `absolute_path`'s edit-presence state (task 9.4): the device
+/// Resolves `absolute_path`'s edit-presence state: the device
 /// id currently reported editing it, if any and not stale.
 pub fn resolve_open_elsewhere(state: &DaemonState, absolute_path: &str) -> Option<String> {
     let (group_id, rel_path) = resolve_group_and_rel_path(state, absolute_path)?;

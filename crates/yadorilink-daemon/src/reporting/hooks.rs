@@ -1,11 +1,11 @@
-//! Task 3.3: severe-error hooks. A "severe error" here means a daemon
+//! severe-error hooks. A "severe error" here means a daemon
 //! failure serious enough that a maintainer would want to know about it
 //! even without a user filing a GitHub issue — startup failures and an
-//! essential supervised task dying (REL-8) are the two real call sites
+//! essential supervised task dying are the two real call sites
 //! wired up in `main.rs`; this module only owns the capture logic
 //! itself, kept separate from `main.rs` so it's independently testable.
 //!
-//! These hooks only ever *create a local candidate* (design.md D4) — they
+//! These hooks only ever *create a local candidate* — they
 //! never submit, queue for submission, or make a network call, regardless
 //! of consent state. That's what makes them safe to call from a startup
 //! path that runs before consent has even been loaded into `DaemonState`:
@@ -20,14 +20,14 @@ use super::ReportingStorage;
 
 /// Persists a severe-error candidate for later user review (`yadorilink
 /// report error --last`). Infallible from the caller's perspective — logs
-/// and swallows any storage failure (task 2.6) rather than returning a
+/// and swallows any storage failure rather than returning a
 /// `Result` a severe-error call site would have to handle on top of the
 /// error it's already handling.
 ///
 /// `category`/`subsystem` are coarse labels (e.g. `"daemon_startup"` /
 /// `"sync-state"`, `"essential_task_died"` / `"control-socket"`) — never
 /// raw error text, which is what `log_lines` is for (already passed
-/// through the D5 redaction pass inside `ErrorPayloadBuilder::build()`).
+/// through the redaction pass inside `ErrorPayloadBuilder::build()`).
 pub fn record_severe_error(
     storage: &ReportingStorage,
     category: &str,

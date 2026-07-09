@@ -1,5 +1,5 @@
-//! Task 3.2/3.4: daemon-side handlers for the reporting IPC surface added
-//! to `daemon_control.proto` (task 3.1). Kept in its own module (like
+//! Daemon-side handlers for the reporting IPC surface added
+//! to `daemon_control.proto`. Kept in its own module (like
 //! `hydration.rs`) rather than inlined into `control_socket.rs`'s match
 //! arms, since each handler needs several lines of translation between
 //! the wire messages and `yadorilink_reporting`/`crate::reporting` types.
@@ -8,11 +8,11 @@
 //! wraps `Err` into `RespPayload::Error`, the same convention every other
 //! fallible control-socket operation already uses.
 //!
-//! Task 3.4 ("report preview generation returns the exact payload"): the
+//! ("report preview generation returns the exact payload"): the
 //! `generate_*` handlers below return `envelope.to_json()` verbatim — no
 //! re-derivation, no summarized/approximated view — so a CLI `--preview`
 //! is guaranteed byte-identical to what `--export`/`--submit` would
-//! transmit (design.md D5).
+//! transmit.
 
 use yadorilink_ipc_proto::daemonctl::{
     ConsentAction, DeleteQueueItemResponse, FlushQueueResponse, GenerateLastErrorReportResponse,
@@ -50,9 +50,9 @@ pub fn reporting_status(state: &DaemonState) -> ReportingStatusResponse {
     }
 }
 
-/// Task 3.4: builds and returns a usage report envelope from the
+/// builds and returns a usage report envelope from the
 /// daemon's current counters — never persisted/queued by this call alone
-/// (that's `SubmitReportRequest`'s job, task 3.2), so generating a
+/// (that's `SubmitReportRequest`'s job), so generating a
 /// preview has no side effect on stored state.
 pub fn generate_usage_report(state: &DaemonState) -> GenerateUsageReportResponse {
     let consent = state.reporting.consent_or_default();
@@ -62,9 +62,9 @@ pub fn generate_usage_report(state: &DaemonState) -> GenerateUsageReportResponse
     GenerateUsageReportResponse { report_json: envelope.to_json() }
 }
 
-/// Task 3.4: returns the most recent error candidate (`report_id: None`)
+/// returns the most recent error candidate (`report_id: None`)
 /// or a specific one (`report_id: Some(id)`), plus the redaction summary
-/// captured when it was created (task 3.3's hook).
+/// captured when it was created.
 pub fn generate_last_error_report(
     state: &DaemonState,
     report_id: Option<String>,
@@ -140,7 +140,7 @@ pub fn flush_queue(state: &DaemonState) -> Result<FlushQueueResponse, String> {
     Ok(FlushQueueResponse { removed_count: removed as u32 })
 }
 
-/// Task 3.2: submits a caller-provided envelope (typically fed straight
+/// submits a caller-provided envelope (typically fed straight
 /// back from `GenerateUsageReport`/`GenerateLastErrorReport`). Consent is
 /// re-checked here regardless of what the caller already believes (point
 /// 4 of this change's implementation notes) — this is the *only* place in

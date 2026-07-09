@@ -1,8 +1,8 @@
-//! add-resource-governance section 2 (design.md D2): a token-bucket rate
-//! limiter gating block payload bytes at the sync-session/transfer layer —
-//! deliberately *not* inside `yadorilink-transport` (D2's rationale: a
-//! transport-level limiter can't distinguish block payload bytes from
-//! keepalives/handshakes/relay control frames without protocol-aware
+//! A token-bucket rate limiter gating block payload bytes at the
+//! sync-session/transfer layer — deliberately *not* inside
+//! `yadorilink-transport` (a transport-level limiter can't distinguish
+//! block payload bytes from keepalives/handshakes/relay control frames
+//! without protocol-aware
 //! inspection, and throttling those risks destabilizing the tunnel for a
 //! problem that's really about payload volume).
 //!
@@ -105,7 +105,7 @@ impl TokenBucket {
         m.bytes_in_window += bytes;
     }
 
-    /// task 2.5: live-reload, applied to every `acquire` call — including
+    /// live-reload, applied to every `acquire` call — including
     /// transfers already awaiting a refill — from this point on, no
     /// reconstruction or per-session replumbing needed.
     pub fn set_rate_bytes_per_sec(&self, rate: u64) {
@@ -211,7 +211,7 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    /// task 2.6: unlimited (`0`, the default) imposes no measurable delay —
+    /// unlimited (`0`, the default) imposes no measurable delay —
     /// a huge transfer completes in well under a millisecond of bucket
     /// overhead, not gated by any sleep.
     #[tokio::test]
@@ -267,7 +267,7 @@ mod tests {
         );
     }
 
-    /// task 2.6: a configured rate caps throughput — acquiring more bytes
+    /// a configured rate caps throughput — acquiring more bytes
     /// than the bucket's capacity in one go forces a wait proportional to
     /// the deficit at the configured rate.
     #[tokio::test]
@@ -284,7 +284,7 @@ mod tests {
         assert!(elapsed < Duration::from_secs(2), "wait was unexpectedly long: {elapsed:?}");
     }
 
-    /// task 2.5: a rate change is picked up by a call already blocked
+    /// a rate change is picked up by a call already blocked
     /// awaiting refill, not just newly-started calls — simulated by
     /// draining the bucket, raising the rate significantly, and confirming
     /// the next acquire finishes much sooner than the *original* rate would

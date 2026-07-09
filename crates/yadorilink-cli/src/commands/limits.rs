@@ -1,10 +1,9 @@
-//! add-resource-governance task 5.3: `yadorilink limits set --up <RATE>
-//! --down <RATE>` / `yadorilink limits show` — global transfer rate limit
-//! management over the daemon control socket. Rate arguments are typed as
-//! `u64` in `main.rs`'s `clap` definition, so a negative or unparseable
-//! value is already rejected by clap itself, with a clear error and a
-//! non-zero exit, before this module's code ever runs (task 5.5's "invalid
-//! rate arguments are rejected with a clear CLI error").
+//! `yadorilink limits set --up <RATE> --down <RATE>` / `yadorilink limits
+//! show` — global transfer rate limit management over the daemon control
+//! socket. Rate arguments are typed as `u64` in `main.rs`'s `clap`
+//! definition, so a negative or unparseable value is already rejected by
+//! clap itself, with a clear error and a non-zero exit, before this
+//! module's code ever runs.
 
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;

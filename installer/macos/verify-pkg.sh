@@ -2,9 +2,8 @@
 #
 # installer/macos/verify-pkg.sh
 #
-# Standalone verification for a built (or downloaded) yadorilink .pkg —
-# part of add-release-artifact-verification, tasks.md 2.1. Unlike the
-# signing/verification steps already inline in build-pkg.sh (which only
+# Standalone verification for a built (or downloaded) yadorilink .pkg.
+# Unlike the signing/verification steps already inline in build-pkg.sh (which only
 # run right after that same script produces the artifact), this can be
 # pointed at any .pkg — e.g. one downloaded from a release page, or
 # handed off from a build machine — to independently confirm its checksum
@@ -118,7 +117,7 @@ else
     echo "NOTE: xcrun not found; skipping stapler check"
 fi
 
-# --- 5. Payload contents (add-desktop-status-app task 4.4) ---------------
+# --- 5. Payload contents --------------------------------------------------
 # Confirms the status app binary is actually present in the built payload
 # — a real, if narrow, smoke test that doesn't require installing the pkg
 # or a running window manager: `pkgutil --expand-full` recursively expands

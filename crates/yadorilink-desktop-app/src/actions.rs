@@ -1,11 +1,10 @@
-//! add-desktop-status-app task 3.3: the tray menu's mutating/action-taking
-//! commands. Every action here is a thin wrapper around an existing daemon
-//! control-socket request (design.md decision 1: "It never reads the sync
-//! index or block store directly... sends explicit commands to the
-//! daemon") — this module invents no new sync behavior, it only calls the
-//! same requests `yadorilink-cli`'s `commands/` already send, so mutating
-//! settings are validated and persisted by the daemon, not only by this
-//! UI (task 3.4).
+//! The tray menu's mutating/action-taking commands. Every action here is
+//! a thin wrapper around an existing daemon control-socket request — it
+//! never reads the sync index or block store directly, it sends
+//! explicit commands to the daemon — this module invents no new sync
+//! behavior, it only calls the same requests `yadorilink-cli`'s
+//! `commands/` already send, so mutating settings are validated and
+//! persisted by the daemon, not only by this UI (task 3.4).
 
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
@@ -16,7 +15,7 @@ use yadorilink_ipc_proto::daemonctl::{
 
 use crate::ipc_client::{self, IpcError};
 
-/// task 3.3 "pause/resume ... for linked folders": pauses every currently
+/// pauses every currently
 /// linked folder — mirrors `yadorilink-cli`'s `commands/daemon::pause`
 /// exactly (list links, then `Pause` each), rather than adding a new
 /// "pause everything" daemon request, since the existing per-link
@@ -52,8 +51,7 @@ async fn list_link_paths() -> Result<Vec<String>, IpcError> {
     }
 }
 
-/// task 3.2 "folder selection and link management that reuse daemon link
-/// preflight and acknowledgement checks": sends the identical `LinkRequest`
+/// sends the identical `LinkRequest`
 /// shape `yadorilink-cli`'s `commands/link::link` sends after its own
 /// preflight/acknowledgement gate, with `acknowledge_risks: true` — this
 /// crate has no interactive terminal to prompt "proceed anyway? [y/N]" in,
@@ -112,13 +110,13 @@ pub async fn add_synced_folder(
     Ok(())
 }
 
-/// task 3.3 "open folder": reveals a linked folder in the native file
+/// reveals a linked folder in the native file
 /// manager (Finder/Explorer) — a pure OS action, no daemon IPC involved.
 pub fn open_folder(local_path: &str) -> Result<(), opener::OpenError> {
     opener::open(local_path)
 }
 
-/// task 3.3 "restart daemon": a clean `Shutdown` request. The daemon is
+/// a clean `Shutdown` request. The daemon is
 /// registered to restart itself (macOS `LaunchAgent` `KeepAlive`/Windows
 /// Scheduled Task `-AtLogOn`, see `installer/`) for anything other than a
 /// clean exit; a graceful `Shutdown` is exactly what `yadorilink daemon
@@ -131,7 +129,7 @@ pub async fn restart_daemon() -> Result<(), IpcError> {
     Ok(())
 }
 
-/// task 2.3 "degraded-state actions": the daemon-unavailable/degraded tray
+/// the daemon-unavailable/degraded tray
 /// menu's "Start Daemon" action — unlike `restart_daemon` above, this
 /// covers the case where nothing is listening on the control socket at
 /// all (so a `Shutdown` request would just fail with "daemon not
@@ -184,24 +182,24 @@ fn daemon_binary_path() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from(name))
 }
 
-/// task 3.3 "updates": check for an available update — identical request
+/// check for an available update — identical request
 /// `yadorilink update check` sends.
 pub async fn check_for_updates() -> Result<(), IpcError> {
     ipc_client::send(ReqPayload::UpdateCheck(UpdateCheckRequest {})).await?;
     Ok(())
 }
 
-/// task 3.3 "updates": install a previously-checked update — identical
+/// install a previously-checked update — identical
 /// request `yadorilink update install` sends. The daemon's own update
-/// pipeline (mandatory/holdback/safe-point gating, `add-automatic-updates`)
-/// is the sole authority for whether/when this actually applies, matching
-/// design.md decision 4 ("round-trip through daemon validation").
+/// pipeline (mandatory/holdback/safe-point gating) is the sole
+/// authority for whether/when this actually applies — this always
+/// round-trips through daemon validation rather than deciding locally.
 pub async fn install_update() -> Result<(), IpcError> {
     ipc_client::send(ReqPayload::UpdateInstall(UpdateInstallRequest {})).await?;
     Ok(())
 }
 
-/// task 3.3 "resource limit" actions: a small, fixed set of bandwidth
+/// actions: a small, fixed set of bandwidth
 /// presets for the tray menu (a native numeric-entry dialog is out of
 /// scope for this pass — see this crate's top-level honesty notes) —
 /// `yadorilink limits set` itself accepts an arbitrary rate, this is just
@@ -262,8 +260,8 @@ impl BandwidthPreset {
 /// Applies the same preset to both upload and download — matches
 /// `yadorilink limits set`'s own per-direction request shape, but the
 /// tray's presets are deliberately symmetric for simplicity (a user who
-/// wants asymmetric limits already has the CLI for that -- design.md's
-/// "keep the first beta scope small").
+/// wants asymmetric limits already has the CLI for that — keeping the
+/// first beta scope small).
 pub async fn set_bandwidth_limit(preset: BandwidthPreset) -> Result<(), IpcError> {
     ipc_client::send(ReqPayload::LimitsSet(LimitsSetRequest {
         upload_bytes_per_sec: preset.bytes_per_sec(),
@@ -329,7 +327,7 @@ fn applescript_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// task 3.3 "diagnostics export": requests the same daemon-assembled,
+/// requests the same daemon-assembled,
 /// already-redacted bundle `yadorilink diagnose export` writes, saves it
 /// under this device's config directory, and reveals it in the native
 /// file manager — "without requiring a terminal" (spec scenario).

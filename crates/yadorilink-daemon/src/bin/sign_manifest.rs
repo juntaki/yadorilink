@@ -1,4 +1,4 @@
-//! add-automatic-updates task 6.1: offline release-manifest signing tool.
+//! Offline release-manifest signing tool.
 //!
 //! Maintainer-only — never shipped as part of an end-user install (see
 //! `installer/macos/build-pkg.sh`/`installer/windows/yadorilink.iss`,

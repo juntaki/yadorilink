@@ -1,9 +1,9 @@
-//! HTTP+WebSocket client for the Cloudflare-hosted coordination plane
-//! (migrate-coordination-plane-to-cloudflare). Mirrors `grpc.rs`'s role for
-//! the gRPC transport, but talks to the HTTP coordination service's plain JSON
-//! routes instead of the tonic-generated service clients. Only compiled
-//! under the `http-coordination` feature (see Cargo.toml) so the existing
-//! gRPC path is unaffected when this feature is off.
+//! HTTP+WebSocket client for the Cloudflare-hosted coordination plane.
+//! Mirrors `grpc.rs`'s role for the gRPC transport, but talks to the HTTP
+//! coordination service's plain JSON routes instead of the tonic-generated
+//! service clients. Only compiled under the `http-coordination` feature
+//! (see Cargo.toml) so the existing gRPC path is unaffected when this
+//! feature is off.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -15,9 +15,9 @@ pub fn coordination_http_addr() -> String {
         .unwrap_or_else(|_| "http://127.0.0.1:8787".into())
 }
 
-/// Same http(s)/loopback validation as `grpc::coordination_channel`
-/// (SEC-COORD-8 equivalent): a remote address must use `https://`; only a
-/// loopback host may use plain `http://` (local `wrangler dev`). Uses the
+/// Same http(s)/loopback validation as `grpc::coordination_channel`: a
+/// remote address must use `https://`; only a loopback host may use plain
+/// `http://` (local `wrangler dev`). Uses the
 /// `url` crate to parse the address rather than hand-rolled string
 /// splitting -- an earlier hand-rolled version of this function split on
 /// `:` to find the host, which silently mangled IPv6 literal addresses

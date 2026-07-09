@@ -1,4 +1,4 @@
-//! Task 2.6: reporting storage gets its own error type, deliberately kept
+//! reporting storage gets its own error type, deliberately kept
 //! separate from `crate::error::DaemonError`. Nothing in this crate ever
 //! converts a `ReportingStorageError` into a `DaemonError` (there is no
 //! `From` impl and there must never be one) — that's what structurally

@@ -1,5 +1,5 @@
 //! Shared, in-process state for the running daemon: the durable sync
-//! index/block store (survives restarts, task 7.1), plus purely in-memory
+//! index/block store (survives restarts), plus purely in-memory
 //! bookkeeping the control socket (section 7.6/7.7) reports on — live peer
 //! connectivity and per-link watcher tasks, neither of which makes sense
 //! to persist.
@@ -25,7 +25,7 @@ use crate::link_manager::{run_disk_reconcile_backstop_sweep, run_retention_expir
 use crate::reporting::ReportingStorage;
 use crate::supervise;
 
-/// add-file-version-history task 2.4: how often the retention-expiry sweep
+/// How often the retention-expiry sweep
 /// runs — see its spawn site in `DaemonState::new` for why this is a much
 /// longer interval than the other periodic sweeps in this file.
 const RETENTION_EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
@@ -37,7 +37,7 @@ pub struct PeerStatusInfo {
     pub path_kind: String,
 }
 
-/// A presence signal received from a peer (task 9.4), plus enough to
+/// A presence signal received from a peer, plus enough to
 /// decide when it's stale — `received_at_unix + ttl_seconds` in the past
 /// means the sender hasn't refreshed it in a while (crashed, disconnected,
 /// or genuinely stopped editing without a clean "editing stopped" signal)
@@ -49,7 +49,7 @@ pub struct ReceivedPresence {
     pub ttl_seconds: u32,
 }
 
-/// add-resource-governance task 3.4: a linked folder's Degraded
+/// A linked folder's Degraded
 /// (disk-pressure) state — in-memory only, deliberately not persisted
 /// (mirrors `paused_paths`'s "transient" rationale): it's re-derived from
 /// live disk state on the very next preflight/re-check either way, so
@@ -60,7 +60,7 @@ pub struct DegradedLinkInfo {
     /// `Display`), shown by `yadorilink status`.
     pub reason: String,
     pub since_unix: i64,
-    /// task 3.5: how many consecutive re-checks have found the link still
+    /// how many consecutive re-checks have found the link still
     /// under pressure — drives `BackoffConfig::DEGRADED_LINK_RECHECK`'s
     /// increasing interval. `0` for a link that just became degraded.
     pub backoff_attempt: u32,
@@ -99,12 +99,12 @@ pub struct DaemonState {
     pub sessions: Mutex<HashMap<String, Arc<PeerSyncSession>>>,
     /// local_path -> the folder-watcher's tasks (the debounce accumulator
     /// and the executor that consumes its flushes — batch-sync-optimizations
-    /// design D7 splits these into two independently-scheduled tasks),
+    /// splits these into two independently-scheduled tasks),
     /// kept alive for as long as the link exists; all aborted together on
     /// unlink.
     pub link_tasks: Mutex<HashMap<String, Vec<JoinHandle<()>>>>,
-    /// fix-local-edit-swallowed-by-self-echo-race: local_path -> that
-    /// link's targeted-flush handle (task 1.1's chosen plumbing) — same
+    /// local_path -> that
+    /// link's targeted-flush handle — same
     /// key and lifetime as `link_tasks` (registered by `link_manager::
     /// start_link_watch`, removed by `stop_link_watch`). Consulted by
     /// `PendingLocalChangeFlush for DaemonState`
@@ -114,11 +114,11 @@ pub struct DaemonState {
     /// `peer_orchestrator::sync_roots_for_groups` already uses).
     pub link_flush_handles: Mutex<HashMap<String, Arc<crate::link_manager::LinkFlushHandle>>>,
     /// Absolute paths a shell-extension client has asked to pause
-    /// individually (task 8's `ContextAction::PauseItem` — finer-grained
+    /// individually (`ContextAction::PauseItem` — finer-grained
     /// than the whole-link pause in `SyncState`, and deliberately
     /// in-memory only: it's a transient UI action, not durable state).
     pub paused_paths: Mutex<HashSet<String>>,
-    /// Fan-out for the shell-integration IPC (task 8.5): every connected
+    /// Fan-out for the shell-integration IPC: every connected
     /// shell-extension client subscribes and receives status pushes as
     /// local changes are indexed, instead of only ever answering queries.
     pub status_push_tx: broadcast::Sender<StatusPush>,
@@ -130,13 +130,13 @@ pub struct DaemonState {
     pub forward_tx: mpsc::UnboundedSender<(String, FileRecord)>,
     /// (group_id, path) this device is currently editing — set/cleared by
     /// `link_manager` on `LocalChangeOutcome::PresenceChanged`, consulted
-    /// by the periodic TTL-refresh sweep (task 9.3) to know what's still
+    /// by the periodic TTL-refresh sweep to know what's still
     /// worth re-announcing.
     pub active_local_edits: Mutex<HashSet<(String, String)>>,
     /// (group_id, path) -> the most recent presence signal *received*
-    /// from a peer (task 9.4), independent of `active_local_edits` (this
+    /// from a peer, independent of `active_local_edits` (this
     /// device's own edits never appear here, only what peers report).
-    /// REL-6: entries whose TTL has elapsed are swept out of this map
+    /// Entries whose TTL has elapsed are swept out of this map
     /// entirely by the periodic loop below, not just filtered out of
     /// `open_elsewhere`'s reads — otherwise a peer that signals
     /// `editing = true` and then crashes (never sending the matching
@@ -147,7 +147,7 @@ pub struct DaemonState {
     /// incoming presence signal is sent here, and a background task
     /// (spawned in `new`) records it into `received_presence`.
     pub presence_tx: mpsc::UnboundedSender<PresenceEvent>,
-    /// REL-10: group_id -> peer_device_id -> the batch of changed files
+    /// group_id -> peer_device_id -> the batch of changed files
     /// most recently queued for that peer because `broadcast_change`'s
     /// `send_index_update` call failed (a transient channel/transport
     /// error, not necessarily permanent — the peer may just be
@@ -157,19 +157,19 @@ pub struct DaemonState {
     /// `yadorilink status`'s previously-hardcoded-to-0 `pending_changes`
     /// field.
     pending_changes: Mutex<HashMap<String, HashMap<String, Vec<FileRecord>>>>,
-    /// REL-4 graceful-shutdown support: incremented for the duration of
+    /// Graceful-shutdown support: incremented for the duration of
     /// every `broadcast_change`/`broadcast_presence` fan-out so
     /// `main.rs`'s shutdown path can wait for in-flight broadcasts to
     /// drain (bounded by a timeout) before tearing the process down,
     /// instead of possibly cutting one off mid-send.
     in_flight_broadcasts: AtomicI64,
-    /// REL-13: name -> still running, for every essential task `main.rs`
-    /// supervises together (REL-8). Populated from the outside (`main.rs`
+    /// name -> still running, for every essential supervised task.
+    /// Populated from the outside (`main.rs`
     /// sets this as it spawns/observes the exit of each task) since
     /// `DaemonState` doesn't own those tasks itself; read by the control
     /// socket's health handler.
     pub task_liveness: Mutex<HashMap<String, bool>>,
-    /// REL-4: the control socket's `Shutdown` handler used to call
+    /// The control socket's `Shutdown` handler used to call
     /// `std::process::exit(0)` directly, a second shutdown path entirely
     /// separate from SIGTERM/SIGINT handling — neither aborted watcher
     /// tasks, checkpointed anything, or drained broadcasts. Sending `true`
@@ -177,28 +177,28 @@ pub struct DaemonState {
     /// code in `main.rs` that the signal handlers use; `main.rs` holds the
     /// matching `Receiver` (via `subscribe()`) in its top-level `select!`.
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
-    /// add-oss-usage-error-reporting: local consent/counters/error-candidate/
-    /// queue storage (sections 1-2), the type section 3's IPC dispatch and
+    /// Local consent/counters/error-candidate/
+    /// queue storage, the type that IPC dispatch and
     /// severe-error hooks operate on. Opening this never writes anything
     /// to disk by itself (see `reporting::mod`'s doc comment), so adding
     /// this field is safe for every existing `DaemonState::new` call site,
     /// test or production.
     pub reporting: ReportingStorage,
-    /// add-resource-governance section 5: on-disk persistence for the
+    /// On-disk persistence for the
     /// global rate limits / headroom override (`governance_config`'s doc
     /// comment). Opening this never writes anything to disk by itself,
     /// mirroring `reporting`'s "safe for every existing call site" property.
     pub governance_config: GovernanceConfigStore,
-    /// add-resource-governance task 2.2/2.3: the single, shared upload/
+    /// The single, shared upload/
     /// download token-bucket pair every `PeerSyncSession` this daemon
     /// constructs is wired to (`peer_orchestrator::spawn_peer_session`,
     /// via `PeerSyncSession::set_rate_limiters`) — this is what makes
-    /// "concurrent per-peer fetches share one global ceiling" (task 2.3)
+    /// "concurrent per-peer fetches share one global ceiling"
     /// true: they all draw from these exact two `Arc<TokenBucket>`
     /// instances, not independent per-session copies. Initialized from
     /// `governance_config` at construction; `apply_governance_config`
     /// re-reads config and updates these same buckets' rates in place
-    /// (task 2.5's live reload) rather than replacing the `Arc`, so every
+    /// (live reload) rather than replacing the `Arc`, so every
     /// already-connected session picks up a change on its very next token
     /// consumption.
     pub rate_limiters: Arc<RateLimiters>,
@@ -211,14 +211,14 @@ pub struct DaemonState {
     /// exact same `spawn_peer_session`, so this needs the same "off unless
     /// `main.rs` opts in" default the block store gets).
     disk_headroom_enforcement_enabled: std::sync::atomic::AtomicBool,
-    /// add-resource-governance task 3.4: local_path -> Degraded
+    /// local_path -> Degraded
     /// (disk-pressure) state for that link, entered by `mark_link_degraded`
     /// (called from wherever a `DiskPressure` error surfaces for a
     /// specific link — currently `hydration::hydrate_inner`) and cleared by
     /// the periodic re-check task spawned in `new` once a subsequent
-    /// headroom check for that link's volume succeeds (task 3.5).
+    /// headroom check for that link's volume succeeds.
     pub degraded_links: Mutex<HashMap<String, DegradedLinkInfo>>,
-    /// add-advanced-sync-operations section 2: bounded, in-memory
+    /// Bounded, in-memory
     /// dry-run-preview and audit state for folder-mode resolution actions
     /// (`crate::folder_ops`). Never persisted — a preview is only ever
     /// meaningful for the lifetime of the daemon process that computed it,
@@ -226,29 +226,29 @@ pub struct DaemonState {
     /// (mirrors `degraded_links`'/`paused_paths`'s own "transient,
     /// in-memory" precedent).
     pub folder_ops: crate::folder_ops::FolderOpsState,
-    /// add-advanced-sync-operations section 4: bounded history of recent
+    /// Bounded history of recent
     /// connection attempts (`crate::connection_trace`), feeding both the
     /// raw trace listing and the connectivity-doctor summary. Same
     /// "transient, in-memory, never persisted" treatment as `folder_ops`.
     pub connection_traces: crate::connection_trace::ConnectionTraceLog,
-    /// add-observability-and-metrics section 1: bounded, in-memory
+    /// Bounded, in-memory
     /// per-active-transfer progress state (`crate::transfer_progress`),
     /// updated as blocks land during hydration and torn down automatically
     /// once a transfer completes, fails, or times out (its RAII guard's
     /// `Drop`). Same "transient, in-memory, never persisted" treatment as
     /// `connection_traces`.
     pub transfer_progress: crate::transfer_progress::TransferProgressTracker,
-    /// add-observability-and-metrics section 2: bounded, in-memory recent
+    /// Bounded, in-memory recent
     /// sync-error ring buffer (`crate::recent_errors`), surfaced in
     /// `yadorilink status` so a stuck or failing sync is diagnosable
     /// without reading logs. Same "transient, in-memory, never persisted"
     /// treatment as `connection_traces`.
     pub recent_errors: crate::recent_errors::RecentErrorLog,
-    /// add-automatic-updates task 2.1/2.2: check/download/verify/install
+    /// Check/download/verify/install
     /// orchestration, persisted update policy, and the pinned trust root
     /// for manifest signature verification.
     pub update_manager: Arc<crate::update::manager::UpdateManager>,
-    /// add-automatic-updates task 2.4: incremented for the duration of
+    /// Incremented for the duration of
     /// every sync-critical write this daemon performs — the initial
     /// folder scan and every debounced flush's chunk/index/broadcast pass
     /// (`link_manager::start_link_watch`), and on-demand-sync's
@@ -257,16 +257,16 @@ pub struct DaemonState {
     /// counter-plus-RAII-guard shape, so a write path that returns early
     /// or panics still gets counted back out. `is_write_safe_point`
     /// (below) is exactly "this counter is zero" — install is deferred
-    /// whenever it isn't, per design.md's "Safe Update Windows" decision.
+    /// whenever it isn't, per the "Safe Update Windows" decision.
     active_write_ops: AtomicI64,
-    /// add-diagnostics-support-bundle task 2.2: when this `DaemonState`
+    /// When this `DaemonState`
     /// (i.e. this daemon process) was constructed — feeds the diagnostics
     /// bundle's coarse `daemon.uptime_bucket` field via `uptime()` below.
     /// In-memory only, like `task_liveness`/`degraded_links` above:
     /// naturally resets on every restart, which is exactly "time since
     /// this daemon started."
     started_at: std::time::Instant,
-    /// add-block-store-gc task 3.1: unix seconds of the most recent
+    /// Unix seconds of the most recent
     /// local-change/peer-reconciliation/hydration activity — the idle
     /// scheduler (`gc::maybe_run_idle_sweep`) waits for this to be at
     /// least `gc::GC_IDLE_THRESHOLD` in the past before attempting a
@@ -279,7 +279,7 @@ pub struct DaemonState {
     /// period before its very first sweep rather than immediately racing
     /// startup's own link-resume/repair work.
     last_activity_unix: AtomicI64,
-    /// add-block-store-gc tasks 3.2/3.4: GC scheduling coordination and
+    /// GC scheduling coordination and
     /// last-run bookkeeping — see `gc::GcState`'s doc comment.
     pub gc: crate::gc::GcState,
 }
@@ -297,7 +297,7 @@ impl Drop for BroadcastGuard<'_> {
     }
 }
 
-/// add-automatic-updates task 2.4: RAII guard for
+/// RAII guard for
 /// `DaemonState::active_write_ops`, mirroring `BroadcastGuard` exactly.
 pub struct WriteActivityGuard<'a> {
     counter: &'a AtomicI64,
@@ -320,7 +320,7 @@ impl DaemonState {
         let (presence_tx, mut presence_rx) = mpsc::unbounded_channel::<PresenceEvent>();
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let governance_config = GovernanceConfigStore::new(crate::device_config::config_dir());
-        // add-resource-governance task 1.1/2.1: apply whatever's on disk
+        // Apply whatever's on disk
         // (or the safe unlimited/no-override default if nothing's ever
         // been written) right away, so a freshly-started daemon's very
         // first session/block write already reflects a previous `limits
@@ -332,7 +332,7 @@ impl DaemonState {
             initial_governance.download_limit_bytes_per_sec,
         ));
         // Rate limiting is always safe to wire in unconditionally (`0` =
-        // unlimited = zero overhead, task 2.1), so every `DaemonState`,
+        // unlimited = zero overhead), so every `DaemonState`,
         // test or production, gets the real configured/default rates.
         // Disk-headroom *enforcement* is deliberately NOT turned on here —
         // see `enable_disk_headroom_enforcement`'s doc comment for why
@@ -376,13 +376,13 @@ impl DaemonState {
             last_activity_unix: AtomicI64::new(now_unix()),
             gc: crate::gc::GcState::new(),
         });
-        // add-automatic-updates task 2.5: recover from any update artifact
+        // Recover from any update artifact
         // left unverified, or an install left mid-handoff, by a previous
         // run that crashed/was killed/lost power — before the periodic
         // scheduler (spawned below) or any control-socket update request
         // can observe (and potentially act on) stale state.
         state.update_manager.recover_on_startup();
-        // add-automatic-updates task 2.2: periodic background update
+        // Periodic background update
         // checks with jitter, honoring `automatic_checks_enabled` (a
         // disabled policy just means this loop's iteration is a no-op,
         // not that the loop stops running — `yadorilink update check`
@@ -394,8 +394,8 @@ impl DaemonState {
         supervise::spawn_logged("daemon-state-update-check-scheduler", async move {
             let mut consecutive_failures: u32 = 0;
             loop {
-                // design.md 2.2: "periodic update checks at daemon startup
-                // and on an interval" — the startup check runs first
+                // Periodic update checks at daemon startup
+                // and on an interval — the startup check runs first
                 // (immediately, no delay), and every subsequent iteration
                 // waits out the jittered steady-state interval, or a
                 // shorter jittered backoff after a failure.
@@ -418,7 +418,7 @@ impl DaemonState {
                 tokio::time::sleep(delay).await;
             }
         });
-        // add-oss-usage-error-reporting task 3.5: the background queue-retry
+        // The background queue-retry
         // sweep, spawned unconditionally like the other periodic tasks
         // below — it is a no-op (no network call at all) until the user
         // opts into `queue_retry_enabled` and configures an endpoint, so
@@ -426,7 +426,7 @@ impl DaemonState {
         // is inert, matching how the presence-TTL-refresh task below is
         // already spawned unconditionally.
         crate::reporting::retry::spawn_periodic(state.clone());
-        // REL-7/2.1: every one of `DaemonState`'s own background tasks
+        // Every one of `DaemonState`'s own background tasks
         // used to be a bare `tokio::spawn` with its `JoinHandle` dropped —
         // a panic partway through a single forwarded record or presence
         // event would silently stop mesh propagation/presence tracking
@@ -440,7 +440,7 @@ impl DaemonState {
         let task_state = state.clone();
         supervise::spawn_logged("daemon-state-forward-rebroadcast", async move {
             while let Some((group_id, record)) = forward_rx.recv().await {
-                // add-block-store-gc task 3.1: a record forwarded here is
+                // A record forwarded here is
                 // exactly a peer session having just adopted/resolved an
                 // incoming file — this is this crate's "peer-reconciliation
                 // activity" signal for the GC idle scheduler.
@@ -456,13 +456,13 @@ impl DaemonState {
             }
             Ok(())
         });
-        // Periodic TTL refresh (task 9.3): while a file is still in
+        // Periodic TTL refresh: while a file is still in
         // `active_local_edits`, keep re-announcing it well within
         // `PRESENCE_TTL_SECS` so transient network hiccups never expire a
         // still-genuinely-open file on a peer's side. Also doubles as the
         // home for two other periodic sweeps that share the same natural
-        // cadence: REL-6's expired-`received_presence` eviction and
-        // REL-10's pending-broadcast retry.
+        // cadence: expired-`received_presence` eviction and
+        // pending-broadcast retry.
         let refresh_state = state.clone();
         supervise::spawn_logged("daemon-state-presence-ttl-refresh", async move {
             loop {
@@ -484,7 +484,7 @@ impl DaemonState {
                 refresh_state.retry_pending_changes().await;
             }
         });
-        // add-resource-governance task 3.5: a dedicated, short-interval
+        // A dedicated, short-interval
         // poll (not folded into the 30s presence-refresh loop above — the
         // whole point of `BackoffConfig::DEGRADED_LINK_RECHECK`'s 5s
         // *initial* interval is a link that degrades and recovers quickly
@@ -498,7 +498,7 @@ impl DaemonState {
                 degraded_state.recheck_degraded_links();
             }
         });
-        // add-file-version-history task 2.4: the retention-expiry sweep —
+        // The retention-expiry sweep —
         // "scheduled periodically ... and on daemon startup". Once
         // immediately (a daemon that was down for a while, or one whose
         // retention policy just changed, shouldn't wait a full interval
@@ -508,8 +508,8 @@ impl DaemonState {
         // appropriate here: retention expiry is a slow-moving housekeeping
         // concern — a version that's `RETENTION_EXPIRY_SWEEP_INTERVAL`
         // late to be swept is not a correctness problem, only a delayed
-        // storage reclamation, and design.md's actual space reclamation is
-        // deferred to `add-block-store-gc` regardless (this sweep only
+        // storage reclamation, and the actual space reclamation is
+        // deferred to the block-store GC regardless (this sweep only
         // ever drops the *index* row, per D5).
         run_retention_expiry_sweep(&state);
         let retention_state = state.clone();
@@ -519,11 +519,10 @@ impl DaemonState {
                 run_retention_expiry_sweep(&retention_state);
             }
         });
-        // add-disk-reconcile-backstop: piggy-backs on the same cadence as
+        // Piggy-backs on the same cadence as
         // `PeerSyncSession`'s own periodic full-index resync
         // (`DEFAULT_FULL_INDEX_RESYNC_INTERVAL`) rather than a new,
-        // independent timer — see that change's design.md for the cadence
-        // trade-off. Not run once immediately at startup the way the
+        // independent timer. Not run once immediately at startup the way the
         // retention sweep above is: `start_link_watch`'s own initial
         // `scan_existing_files` already indexes everything present on disk
         // at daemon start, so an immediate add-only pass here would find
@@ -539,10 +538,10 @@ impl DaemonState {
                 run_disk_reconcile_backstop_sweep(&disk_reconcile_state).await;
             }
         });
-        // add-block-store-gc task 3.1/3.3: the idle-triggered GC scheduler,
+        // The idle-triggered GC scheduler,
         // modeled on this same `spawn_logged` periodic-task shape as every
         // other sweep in this file. Shares its poll tick with the
-        // previously-uncalled `run_eviction_sweep` (task 3.3) — see
+        // previously-uncalled `run_eviction_sweep` — see
         // `gc::run_periodic_capacity_eviction_sweep`'s doc comment for why
         // that one doesn't need the same idle/write-safe-point gating GC
         // itself does.
@@ -580,11 +579,11 @@ impl DaemonState {
         state
     }
 
-    /// add-resource-governance task 3.4/3.5: marks `local_path` Degraded
+    /// Marks `local_path` Degraded
     /// (disk-pressure), scheduling its next re-check via
     /// `BackoffConfig::DEGRADED_LINK_RECHECK` — a link already degraded has
-    /// its backoff attempt count bumped (spacing repeated pressure further
-    /// apart, task 3.5's "not a tight retry loop") rather than reset, and
+    /// has its backoff attempt count bumped (spacing repeated pressure further
+    /// apart, not a tight retry loop) rather than reset, and
     /// keeps its original `since_unix` onset time.
     pub fn mark_link_degraded(&self, local_path: &str, reason: String) {
         let mut degraded = self.degraded_links.lock().unwrap_or_else(|p| p.into_inner());
@@ -616,8 +615,8 @@ impl DaemonState {
         self.degraded_links.lock().unwrap_or_else(|p| p.into_inner()).get(local_path).cloned()
     }
 
-    /// task 3.5: re-checks free space for every Degraded link whose backoff
-    /// window has elapsed, clearing it (task 3.4's "cleared once a
+    /// re-checks free space for every Degraded link whose backoff
+    /// window has elapsed, clearing it (cleared once a
     /// subsequent headroom check for that link's volume succeeds") once
     /// the volume is no longer `Critical`, or rescheduling it (bumped
     /// backoff) if it's still under pressure. A link whose local folder no
@@ -661,7 +660,7 @@ impl DaemonState {
         }
     }
 
-    /// add-resource-governance task 2.5/5.2/5.3: re-reads the persisted
+    /// Re-reads the persisted
     /// governance config and applies it to the *same* shared
     /// `rate_limiters`/`block_store` instances (never replacing them) —
     /// this is what makes a `limits set`/headroom-override change take
@@ -677,7 +676,7 @@ impl DaemonState {
         self.block_store.set_headroom_override_bytes(config.headroom_override_bytes);
     }
 
-    /// add-resource-governance task 3.1/5.2: turns on the block store's
+    /// Turns on the block store's
     /// disk-headroom preflight (`FsBlockStore::headroom_enforced`'s "off by
     /// default" flag) for this daemon's actual production block store.
     /// Deliberately **not** called from `DaemonState::new` itself — `new`
@@ -702,7 +701,7 @@ impl DaemonState {
         self.disk_headroom_enforcement_enabled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// REL-6: drops every `received_presence` entry whose TTL has already
+    /// Drops every `received_presence` entry whose TTL has already
     /// elapsed, not just excluding it from `open_elsewhere`'s reads —
     /// otherwise a peer that signals `editing = true` and then crashes
     /// (or is killed) before ever sending the matching `editing = false`
@@ -720,7 +719,7 @@ impl DaemonState {
         }
     }
 
-    /// REL-10: re-attempts delivery of every batch `broadcast_change`
+    /// Re-attempts delivery of every batch `broadcast_change`
     /// queued after a failed `send_index_update`, for any peer whose
     /// session is present again in `sessions` (a peer that's still
     /// disconnected is simply left queued for the next sweep — retrying
@@ -794,7 +793,7 @@ impl DaemonState {
         }
     }
 
-    /// `yadorilink status`'s per-folder `pending_changes` count (REL-10):
+    /// `yadorilink status`'s per-folder `pending_changes` count:
     /// total records still queued for retry across every peer for
     /// `group_id` — a path queued for two peers counts twice, matching
     /// "not yet acknowledged by every peer" from the doc comment this
@@ -808,14 +807,14 @@ impl DaemonState {
     }
 
     /// Same total as `pending_changes_count`, summed across every group —
-    /// REL-13's health surface reports one process-wide number rather
+    /// The health surface reports one process-wide number rather
     /// than per-folder detail.
     pub fn total_pending_changes(&self) -> u64 {
         let pending = self.pending_changes.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         pending.values().flat_map(|per_peer| per_peer.values()).map(|v| v.len() as u64).sum()
     }
 
-    /// REL-4 graceful shutdown: blocks until no `broadcast_change`/
+    /// Graceful shutdown: blocks until no `broadcast_change`/
     /// `broadcast_presence` call is in flight, or `timeout` elapses,
     /// whichever comes first — best-effort draining rather than a hard
     /// guarantee (a peer session's send can itself hang on a dead
@@ -841,7 +840,7 @@ impl DaemonState {
         BroadcastGuard { counter: &self.in_flight_broadcasts }
     }
 
-    /// add-automatic-updates task 2.4: call around any sync-critical
+    /// Call around any sync-critical
     /// write (folder scan/flush processing in `link_manager.rs`,
     /// materialization writes in `hydration.rs`) so
     /// `is_write_safe_point` reports `false` for its duration. Public (not
@@ -850,7 +849,7 @@ impl DaemonState {
     /// `broadcast_change`'s own private `begin_broadcast` uses internally.
     pub fn begin_write_activity(&self) -> WriteActivityGuard<'_> {
         self.active_write_ops.fetch_add(1, Ordering::SeqCst);
-        // add-block-store-gc task 3.1: every existing call site of this
+        // Every existing call site of this
         // guard (the local-change flush executor in `link_manager.rs`,
         // hydration's hydrate/evict/restore paths in `hydration.rs`) is
         // exactly the "local-change/hydration activity" the GC idle
@@ -859,14 +858,14 @@ impl DaemonState {
         WriteActivityGuard { counter: &self.active_write_ops }
     }
 
-    /// add-block-store-gc task 3.1: marks "now" as the most recent
+    /// Marks "now" as the most recent
     /// local-change/peer-reconciliation/hydration activity — see
     /// `last_activity_unix`'s doc comment for its two call sites.
     pub fn record_activity(&self) {
         self.last_activity_unix.store(now_unix(), Ordering::SeqCst);
     }
 
-    /// add-block-store-gc task 3.1: how long it's been since the most
+    /// How long it's been since the most
     /// recent recorded activity — the GC idle scheduler's own condition is
     /// exactly `idle_duration() >= gc::GC_IDLE_THRESHOLD`.
     pub fn idle_duration(&self) -> Duration {
@@ -883,15 +882,15 @@ impl DaemonState {
         self.last_activity_unix.store(unix, Ordering::SeqCst);
     }
 
-    /// design.md "Safe Update Timing": `true` exactly when no
+    /// Per the "Safe Update Timing" decision: `true` exactly when no
     /// sync-critical write is currently in progress — the sole condition
     /// `update_ipc::install`/the periodic install-safe-point check
-    /// (task 2.4) uses to decide whether to proceed or defer.
+    /// uses to decide whether to proceed or defer.
     pub fn is_write_safe_point(&self) -> bool {
         self.active_write_ops.load(Ordering::SeqCst) <= 0
     }
 
-    /// add-diagnostics-support-bundle task 2.2: wall-clock time elapsed
+    /// Wall-clock time elapsed
     /// since this `DaemonState` was constructed — i.e. since this daemon
     /// process started. Used only to bucket `daemon.uptime_bucket` in the
     /// diagnostics bundle (`diagnostics_ipc::uptime_bucket`); never
@@ -903,9 +902,9 @@ impl DaemonState {
         self.started_at.elapsed()
     }
 
-    /// REL-13 health surface: records whether essential task `name` is
+    /// Health surface: records whether essential task `name` is
     /// currently running, from the outside (`main.rs` owns the essential
-    /// `JoinSet`/REL-8 supervision itself; this is just where the result
+    /// supervision itself; this is just where the result
     /// is published for `control_socket`'s health handler to read).
     pub fn set_task_alive(&self, name: &str, alive: bool) {
         self.task_liveness
@@ -919,9 +918,9 @@ impl DaemonState {
     /// 5.5's propagation half — see `peer_session::PeerSyncSession::shares_group`
     /// for why this filter matters, not just efficiency), as a single
     /// `IndexUpdate` wire message per peer rather than one message per
-    /// file (batch-sync-optimizations design D5). A no-op for an empty batch.
+    /// file (batch-sync-optimizations ). A no-op for an empty batch.
     ///
-    /// REL-10: a peer whose `send_index_update` call fails has its batch
+    /// A peer whose `send_index_update` call fails has its batch
     /// queued in `pending_changes` for the periodic retry sweep
     /// (`retry_pending_changes`) instead of being silently dropped.
     pub async fn broadcast_change(
@@ -932,7 +931,7 @@ impl DaemonState {
         if records.is_empty() {
             return;
         }
-        let _in_flight = self.begin_broadcast(); // REL-4: let shutdown wait for this to finish
+        let _in_flight = self.begin_broadcast(); // let shutdown wait for this to finish
         let sessions: Vec<(String, Arc<PeerSyncSession>)> = self
             .sessions
             .lock()
@@ -953,13 +952,13 @@ impl DaemonState {
         }
     }
 
-    /// Sends an edit-presence signal (task 9.3) to every currently-connected
+    /// Sends an edit-presence signal to every currently-connected
     /// peer session authorized for `group_id` — the same fan-out shape as
     /// `broadcast_change`, for the presence-signal wire message instead.
     /// Presence signals are inherently ephemeral (superseded by the next
     /// refresh or an explicit "editing stopped") so, unlike file changes,
     /// a failed send here isn't queued for retry — only counted for
-    /// REL-4's in-flight drain.
+    /// In-flight drain.
     pub async fn broadcast_presence(&self, group_id: &str, path: &str, editing: bool) {
         let _in_flight = self.begin_broadcast();
         let sessions: Vec<_> = self
@@ -1005,7 +1004,7 @@ impl DaemonState {
     }
 
     /// Whether `(group_id, path)` is currently reported open by another
-    /// device, and not stale (task 9.4) — `None` if never reported, was
+    /// device, and not stale — `None` if never reported, was
     /// explicitly reported closed, or the last signal's TTL has elapsed
     /// with no refresh.
     pub fn open_elsewhere(&self, group_id: &str, path: &str) -> Option<String> {
@@ -1020,7 +1019,7 @@ impl DaemonState {
     }
 
     /// How many files in `group_id` are currently reported open elsewhere
-    /// and not stale (task 9.4) — `yadorilink status`'s per-folder summary,
+    /// and not stale — `yadorilink status`'s per-folder summary,
     /// the same "count, don't enumerate" shape as `conflict_count`.
     pub fn open_elsewhere_count(&self, group_id: &str) -> u64 {
         let received =
@@ -1058,7 +1057,7 @@ mod tests {
         DaemonState::new("device-a".into(), sync_state, store)
     }
 
-    /// task 9.4 / edit-presence-awareness spec "Stale presence signals
+    /// / edit-presence-awareness spec "Stale presence signals
     /// expire": a signal whose TTL has elapsed since it was received (no
     /// refresh arrived in time) must no longer be reported as open.
     #[tokio::test]
@@ -1094,7 +1093,7 @@ mod tests {
         assert_eq!(state.open_elsewhere_count("group-1"), 1);
     }
 
-    /// task 9.4: an explicit "editing stopped" event clears the entry
+    /// an explicit "editing stopped" event clears the entry
     /// immediately, not just letting it expire naturally.
     #[tokio::test]
     async fn editing_stopped_event_clears_presence_immediately() {
@@ -1118,9 +1117,9 @@ mod tests {
         assert_eq!(state.open_elsewhere("group-1", "report.docx"), None);
     }
 
-    // --- add-resource-governance task 3.6: Degraded-link state tests ----
+    // --- Degraded-link state tests ----
 
-    /// task 3.6: a link enters Degraded on disk pressure — `is_link_degraded`
+    /// a link enters Degraded on disk pressure — `is_link_degraded`
     /// flips true and the reason is recorded.
     #[tokio::test]
     async fn mark_link_degraded_makes_the_link_report_degraded_with_a_reason() {
@@ -1135,7 +1134,7 @@ mod tests {
         assert_eq!(info.backoff_attempt, 0);
     }
 
-    /// task 3.6: a link leaves Degraded once cleared — the mirror case,
+    /// a link leaves Degraded once cleared — the mirror case,
     /// and the trigger `hydration::hydrate_inner`'s success path uses
     /// directly (a snappier recovery signal beyond the periodic re-check).
     #[tokio::test]
@@ -1151,7 +1150,7 @@ mod tests {
         assert!(!state.is_link_degraded("/links/photos"));
     }
 
-    /// task 3.5/3.6: repeated disk pressure on the same link produces
+    /// Repeated disk pressure on the same link produces
     /// backoff re-checks, not a tight retry loop — each re-mark bumps the
     /// backoff attempt count and pushes `next_recheck_unix` further out
     /// (via `BackoffConfig::DEGRADED_LINK_RECHECK`'s doubling schedule),
@@ -1181,7 +1180,7 @@ mod tests {
         assert!(third.next_recheck_unix >= second.next_recheck_unix);
     }
 
-    /// task 3.4: a Degraded link recovers once its volume's free-space
+    /// a Degraded link recovers once its volume's free-space
     /// check succeeds again — exercised through the real periodic
     /// `recheck_degraded_links` sweep (not just the mark/clear API
     /// directly), using an isolated `YADORILINK_CONFIG_DIR` so this test's
@@ -1229,7 +1228,7 @@ mod tests {
         std::env::remove_var("YADORILINK_CONFIG_DIR");
     }
 
-    /// task 3.4: the mirror case — a link stays Degraded (rescheduled with
+    /// the mirror case — a link stays Degraded (rescheduled with
     /// bumped backoff, not cleared) when its volume is still under
     /// pressure at re-check time.
     #[tokio::test]
@@ -1267,17 +1266,16 @@ mod tests {
         std::env::remove_var("YADORILINK_CONFIG_DIR");
     }
 
-    // --- add-crash-power-loss-recovery task 2.4/3.4: interrupted-update
+    // --- Interrupted-update
     // recovery is wired into the exact same daemon-startup entry point
     // (`DaemonState::new`, the one `main.rs` calls before any watcher
-    // resumes or any control-socket request can arrive) as this change's
-    // own `cleanup_stale_temp_files`/`repair_interrupted_materializations`
-    // calls. `add-automatic-updates` task 2.5 already built
-    // `UpdateManager::recover_on_startup` and its own unit tests
-    // (`update::manager::tests::recover_on_startup_*`) call it directly;
-    // these two tests instead go through the real `DaemonState::new` used
+    // resumes or any control-socket request can arrive) as the
+    // `cleanup_stale_temp_files`/`repair_interrupted_materializations`
+    // calls. `UpdateManager::recover_on_startup` already has its own unit
+    // tests (`update::manager::tests::recover_on_startup_*`); these two
+    // tests instead go through the real `DaemonState::new` used
     // by `main.rs`, with the on-disk `update_policy.json`/artifact state
-    // written exactly as a crash would leave it (matching this change's
+    // written exactly as a crash would leave it (matching the
     // established "simulate the exact on-disk state a crash would leave"
     // standard from `materialization.rs`'s own crash tests), proving the
     // wiring itself rather than re-proving `recover_on_startup`'s own logic.

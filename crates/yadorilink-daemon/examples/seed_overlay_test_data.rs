@@ -1,8 +1,8 @@
-//! build-yadorilink-mvp task 9.1/9.6 spike verification helper: seeds a
+//! Verification helper: seeds a
 //! folder link + one "Synced" file directly into the daemon's SQLite
 //! state, bypassing the CLI's coordination-plane-dependent `link`
 //! command (which needs a logged-in, registered device) — this is only
-//! for locally verifying the Windows shell-icon-overlay spike actually
+//! for locally verifying the Windows shell-icon-overlay actually
 //! renders an overlay in Explorer, not part of the shipped product.
 //!
 //! Usage: `cargo run --example seed_overlay_test_data -- <folder> <group_id> <relative_file>`

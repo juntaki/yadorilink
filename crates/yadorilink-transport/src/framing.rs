@@ -291,7 +291,7 @@ mod tests {
         assert_eq!(reassembler.buffered_bytes, 0);
     }
 
-    /// sync-correctness-fixes task 3.3: a message with a genuine gap
+    /// A message with a genuine gap
     /// (fragment 1 of 3 never arrives) must never be reported complete —
     /// `insert` should keep returning `None` for every fragment that
     /// does arrive, and the message should stay pending (not silently

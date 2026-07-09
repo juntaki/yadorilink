@@ -1,14 +1,14 @@
-//! add-desktop-status-app task 2.3: exercises this crate's own
-//! `ipc_client`/`actions` (the modules the tray binary actually calls)
-//! against a real daemon over the real control socket — same harness
-//! pattern `yadorilink-cli`'s `tests/update.rs`/`tests/desktop_status_
-//! parity.rs` use. The tray/menu/event-loop wiring in `main.rs` itself
-//! cannot be exercised this way (no display/window manager in this
-//! environment — see `main.rs`'s top doc comment); this file instead
-//! proves the non-UI half of this crate — the part that actually talks to
-//! the daemon — behaves correctly, independent of `yadorilink-cli`'s own
-//! (separately duplicated, per this crate's `ipc_client.rs` doc comment)
-//! client code.
+//! Exercises this crate's own `ipc_client`/`actions` (the modules the
+//! tray binary actually calls) against a real daemon over the real
+//! control socket — same harness pattern `yadorilink-cli`'s
+//! `tests/update.rs`/`tests/desktop_status_parity.rs` use. The
+//! tray/menu/event-loop wiring in `main.rs` itself cannot be exercised
+//! this way (no display/window manager in this environment — see
+//! `main.rs`'s top doc comment); this file instead proves the non-UI
+//! half of this crate — the part that actually talks to the daemon —
+//! behaves correctly, independent of `yadorilink-cli`'s own (separately
+//! duplicated, per this crate's `ipc_client.rs` doc comment) client
+//! code.
 #![cfg(unix)]
 
 use std::sync::Arc;
@@ -102,7 +102,7 @@ async fn ipc_client_reports_a_clear_error_with_no_daemon_running() {
     assert!(matches!(err, ipc_client::IpcError::DaemonNotRunning));
 }
 
-/// task 3.3 "pause/resume ... for linked folders": `actions::pause_all`/
+/// `actions::pause_all`/
 /// `resume_all` actually flip every link's `paused` flag through the real
 /// daemon, not just locally in this app's own state.
 #[tokio::test]
@@ -135,7 +135,7 @@ async fn pause_all_and_resume_all_affect_every_linked_folder() {
     assert!(!status.links[0].paused, "resume_all should have resumed the link");
 }
 
-/// task 3.3 "diagnostics export": `actions::export_diagnostics` writes a
+/// `actions::export_diagnostics` writes a
 /// real file with the daemon-assembled bundle contents under the config
 /// directory.
 #[tokio::test]

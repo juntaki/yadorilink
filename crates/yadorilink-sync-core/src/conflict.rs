@@ -1,9 +1,8 @@
-//! Conflict-copy naming (design.md D7, `sync-engine` spec's "Conflict
-//! Handling" requirement): when a true concurrent edit is detected, the
+//! Conflict-copy naming: when a true concurrent edit is detected, the
 //! older-mtime copy is renamed to a conflict-marked filename rather than
 //! silently discarded, matching Dropbox/Syncthing user expectations.
 //!
-//! ## Content-hash disambiguator (`fix-conflict-copy-filename-collision`)
+//! ## Content-hash disambiguator
 //!
 //! `(truncated-second timestamp, device_id)` alone is not unique per
 //! losing *content* — only per losing *device-and-second*. When the same
@@ -20,7 +19,7 @@
 //! while making a same-filename collision between two different pieces
 //! of content impossible rather than merely unlikely.
 //!
-//! ## Trust boundary (SEC-SYNC-3(b), `harden-untrusted-peer-data`)
+//! ## Trust boundary (SEC-SYNC-3(b))
 //!
 //! `mtime_unix_nanos` on an incoming `FileRecord` is peer-supplied and
 //! otherwise unvalidated. Before this fix, the winner of a genuine
@@ -148,7 +147,7 @@ pub fn resolve_conflict_names(
 /// appended, so this cannot introduce a character illegal in Windows
 /// filenames (see `hazard.rs`).
 ///
-/// Idempotent against an already-conflict-suffixed `path` (task 2.1): an
+/// Idempotent against an already-conflict-suffixed `path`: an
 /// existing `(conflicted copy, ...)` suffix is stripped before rebuilding,
 /// so re-resolving an already-conflict-marked path produces one suffix,
 /// not a compounding, doubly-wrapped name.
@@ -204,12 +203,12 @@ pub fn is_conflict_copy_of(candidate: &str, original_path: &str) -> bool {
         && strip_conflict_suffix(candidate_stem) == original_stem
 }
 
-/// Task 2.1 idempotency guard: strips an already-present `(conflicted
+/// idempotency guard: strips an already-present `(conflicted
 /// copy, ...)` suffix from a filename stem, so `conflict_copy_path`
 /// rebuilds a single suffix instead of wrapping an already-conflict-marked
-/// path a second time (design.md's "strip-and-rebuild rather than
-/// compound" decision — defense in depth even if some future edge case
-/// still produced a colliding disambiguator). Strips from the leftmost
+/// path a second time (strip-and-rebuild rather than compound — defense
+/// in depth even if some future edge case still produced a colliding
+/// disambiguator). Strips from the leftmost
 /// occurrence, so a path that had already (incorrectly) compounded past
 /// one suffix is fully unwrapped back to its true base name rather than
 /// only peeling off the outermost layer.
@@ -327,8 +326,8 @@ mod tests {
         assert!(name.starts_with("a/b/c (conflicted copy"));
     }
 
-    /// Task 4.3(a) / spec scenario "Two different losing contents resolved
-    /// within the same second never collide onto one filename": the same
+    /// Verifies that two different losing contents resolved
+    /// within the same second never collide onto one filename: the same
     /// device losing two structurally distinct conflicts for genuinely
     /// different content, with mtimes that truncate to the identical
     /// second, must never produce the same conflict-copy filename — this
@@ -366,7 +365,7 @@ mod tests {
         );
     }
 
-    /// Task 2.2: an already-conflict-suffixed path fed back through
+    /// an already-conflict-suffixed path fed back through
     /// conflict resolution (e.g. the conflict copy itself hits a second,
     /// genuine conflict) must not compound into a doubly-suffixed name.
     #[test]
@@ -382,7 +381,7 @@ mod tests {
         assert!(re_resolved.ends_with(".bin"), "{re_resolved}");
     }
 
-    /// Task 2.2, extensionless variant: same idempotency guarantee without
+    /// extensionless variant: same idempotency guarantee without
     /// an extension in play (exercises the `ext == None` formatting path).
     #[test]
     fn conflict_copy_naming_does_not_compound_without_an_extension() {
@@ -392,7 +391,7 @@ mod tests {
         assert!(re_resolved.starts_with("README (conflicted copy"), "{re_resolved}");
     }
 
-    /// SEC-SYNC-3(b) / task 4.3(b) — adversarial case: a peer advertising
+    /// Adversarial case (SEC-SYNC-3(b)): a peer advertising
     /// an absurd future `mtime_unix_nanos` (`i64::MAX`) must not
     /// unconditionally win the real filename against a local file with an
     /// ordinary, plausible (near-"now") mtime — the claim gets clamped to
@@ -429,7 +428,7 @@ mod tests {
         assert!(!loser.contains("292471208677"), "must not embed i64::MAX's absurd year: {loser}");
     }
 
-    /// SEC-SYNC-3(b) / task 4.3(b): once local's own mtime is *also*
+    /// Plausibility bound check (SEC-SYNC-3(b)): once local's own mtime is *also*
     /// implausibly far in the future relative to "now" (or once the
     /// attacker's clamped value ties with it), the extreme value no
     /// longer wins outright — it degrades to the deterministic device-id
@@ -449,7 +448,7 @@ mod tests {
         assert_eq!(is_a_loser, "device-local" < "device-attacker");
     }
 
-    /// SEC-SYNC-3(b) / task 4.3(b) — legitimate case: an ordinary,
+    /// Legitimate case (SEC-SYNC-3(b)): an ordinary,
     /// non-adversarial mtime comparison (both well in the past relative
     /// to "now") is completely unaffected by the skew bound — the older,
     /// real mtime loses exactly as it always did.
@@ -465,8 +464,7 @@ mod tests {
         assert!(loser.contains("device-a")); // the genuinely older edit loses, as before
     }
 
-    // fix-duplicate-conflict-copy-on-reresolution: `is_conflict_copy_of`
-    // coverage.
+    // `is_conflict_copy_of` coverage.
 
     #[test]
     fn is_conflict_copy_of_matches_a_genuine_sibling() {

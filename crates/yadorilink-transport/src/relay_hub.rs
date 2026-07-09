@@ -9,7 +9,7 @@
 //! demultiplexes incoming `Forwarded` frames to the right `PeerChannel` by
 //! sender public key.
 //!
-//! daemon-reliability REL-2: the relay TCP connection is not one-shot.
+//! The relay TCP connection is not one-shot.
 //! `connect` performs (and requires to succeed, so callers get a fast
 //! failure on totally-unreachable config) exactly one handshake, then
 //! hands the connection to a supervised loop (`crate::supervise::
@@ -48,8 +48,7 @@ pub struct RelayHub {
     // the writer task — a small bounded queue would silently drop
     // fragments mid-message). This means a prolonged relay outage queues
     // sends unboundedly rather than erroring immediately; bounding that
-    // with real backpressure/retry is REL-10's per-peer pending/unacked
-    // tracking, not this task's scope.
+    // with real backpressure/retry is a separate concern (per-peer pending/unacked tracking).
     outbound_tx: mpsc::UnboundedSender<RelayMessage>,
     observed_address: Mutex<String>,
     routes: Mutex<HashMap<PublicKeyBytes, mpsc::Sender<Vec<u8>>>>,
@@ -125,7 +124,7 @@ impl RelayHub {
     /// either side ends (write failure, read error/EOF, or the relay
     /// closing the connection). The caller (the reconnect supervisor
     /// spawned in `connect`) is responsible for looping this with
-    /// backoff and a fresh Hello each time (REL-2).
+    /// backoff and a fresh Hello each time.
     async fn run_connection_until_disconnected(
         self: &Arc<Self>,
         conn: RelayConnection,
@@ -168,7 +167,7 @@ impl RelayHub {
                         // for a fan-out dispatcher, same as the relay
                         // server's own absent-destination handling.
                     }
-                    // Registration-renewal handshake (task 3.1): the relay
+                    // Registration-renewal handshake: the relay
                     // answers our periodic renewal `Hello` (sent by the
                     // ticker task below) with a fresh challenge. Compute
                     // and send the proof the exact same way the initial
@@ -193,7 +192,7 @@ impl RelayHub {
                                 payload: Some(Payload::HelloProof(HelloProof { mac: proof })),
                             });
                         }
-                        // A non-contributory challenge key (SEC-TRANS-3) or
+                        // A non-contributory challenge key or
                         // a send failure (outbound channel closing during
                         // shutdown) isn't fatal here: worst case this
                         // renewal attempt is skipped and the next tick
@@ -210,7 +209,7 @@ impl RelayHub {
             }
         });
 
-        // Registration renewal ticker (task 3.1): proactively re-proves
+        // Registration renewal ticker: proactively re-proves
         // key ownership well before the relay's registration TTL
         // (`relay_server::REGISTRATION_TTL`) would otherwise lapse, so a
         // healthy, long-lived connection never actually hits server-side
@@ -248,7 +247,7 @@ impl RelayHub {
     }
 
     /// This device's public endpoint as observed by the relay on the most
-    /// recent (re)connection (task 4.4).
+    /// recent (re)connection.
     pub fn observed_address(&self) -> String {
         self.observed_address.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
@@ -302,7 +301,7 @@ mod tests {
         addr
     }
 
-    /// task 6.2: registering interest in a peer's traffic and sending a
+    /// registering interest in a peer's traffic and sending a
     /// `Forward` to that peer's key must deliver the payload on the
     /// registered route.
     #[tokio::test]
@@ -324,7 +323,7 @@ mod tests {
         assert_eq!(received, b"hello");
     }
 
-    /// task 6.2's "absent-dest behavior" at the hub's local dispatch
+    /// Testing "absent-dest behavior" at the hub's local dispatch
     /// layer: a `Forwarded` frame from a sender nobody `register`ed
     /// interest in must be silently dropped — not panic, not disrupt
     /// dispatch to other, already-registered routes on the same

@@ -1,7 +1,7 @@
-//! `yadorilink report ...` (tasks 4.1-4.6): usage/error report preview,
+//! `yadorilink report ...`: usage/error report preview,
 //! export, and submission; consent controls; and local queue management.
 //!
-//! ## Daemon-backed vs. CLI-only (task 4.6)
+//! ## Daemon-backed vs. CLI-only
 //!
 //! Every command here first checks whether the daemon control socket is
 //! reachable (`daemon_available()`) and prefers routing through it — the
@@ -21,7 +21,7 @@
 //!   — this is deliberately **not** treated as daemon-only. See the
 //!   module doc comment on `handle_reportable_error` below for why: a
 //!   candidate is a finished, self-contained document (unlike the
-//!   continuously-mutating counters), and this crate's own 4.5 hook
+//!   continuously-mutating counters), and this crate's own error hook
 //!   writes into the exact same store, so "read the shared store
 //!   directly" is what makes daemon-created and CLI-created candidates
 //!   both show up under `--last` regardless of whether the daemon
@@ -29,12 +29,12 @@
 //! - `consent *`: same reasoning as error candidates — consent state is
 //!   plain local config, not daemon-owned runtime state, so every consent
 //!   command works directly against `ConsentStore` when the daemon isn't
-//!   reachable (design.md D7's "easy for forks/offline users to disable
-//!   or inspect").
+//!   reachable, keeping it easy for forks/offline users to disable or
+//!   inspect.
 //! - `queue *` and `--submit`: **do** require the daemon and fail with a
 //!   clear, reporting-specific error (`CliError::ReportingDaemonRequired`)
 //!   when it's unavailable — the queue is genuinely daemon-managed
-//!   runtime state (task 4.6's explicit example), and submission is the
+//!   runtime state, and submission is the
 //!   one network path this crate keeps exclusively behind the daemon.
 
 use std::io::{BufRead, Write};
@@ -124,8 +124,7 @@ fn print_redaction_summary(redaction_summary: &[(String, u32)]) {
     }
 }
 
-/// Interactive submit confirmation (task 4.7 "submit asks for
-/// confirmation"), factored so the prompt-reading itself is unit
+/// Interactive submit confirmation, factored so the prompt-reading itself is unit
 /// testable without a real terminal — `confirm` (used by real commands)
 /// always reads real stdin; tests call `confirm_with_reader` directly
 /// with an in-memory reader.
@@ -158,7 +157,7 @@ fn generate_limited_usage_report_json() -> String {
     build_usage_envelope(env, payload).to_json()
 }
 
-// -- `yadorilink report usage` (task 4.1) --------------------------------
+// -- `yadorilink report usage` -----------------------------------------------
 
 pub async fn usage(
     preview: bool,
@@ -193,7 +192,7 @@ pub async fn usage(
     Ok(())
 }
 
-// -- `yadorilink report error` (task 4.2) --------------------------------
+// -- `yadorilink report error` -----------------------------------------------
 
 pub async fn error(
     id: Option<String>,
@@ -289,7 +288,7 @@ async fn submit_report_json(report_json: String, kind: &str, yes: bool) -> Resul
     Ok(())
 }
 
-// -- `yadorilink report consent ...` (task 4.3) --------------------------
+// -- `yadorilink report consent ...` -----------------------------------------
 
 pub async fn consent_status() -> Result<(), CliError> {
     if daemon_available().await {
@@ -392,7 +391,7 @@ pub async fn consent_endpoint(url: Option<String>) -> Result<(), CliError> {
     update_consent(ConsentAction::SetEndpoint, None, url).await
 }
 
-// -- `yadorilink report queue ...` (task 4.4) — daemon-required ---------
+// -- `yadorilink report queue ...` — daemon-required --------------------------
 
 fn require_daemon_for_queue() -> CliError {
     CliError::ReportingDaemonRequired(
@@ -466,17 +465,17 @@ pub async fn queue_flush() -> Result<(), CliError> {
     Ok(())
 }
 
-// -- reportable-error hook (task 4.5) ------------------------------------
+// -- reportable-error hook -----------------------------------------------
 
 /// Called from `main.rs`'s top-level error path for any command failure
 /// worth surfacing to reporting (`CliError::is_reportable`). Two jobs,
 /// both best-effort and both entirely local (no network call is
-/// reachable from this function — the point of task 4.5's "sending no
-/// data"):
+/// reachable from this function (sending no
+/// data):
 /// 1. Persists a local error candidate directly into the *shared*
 ///    `error-candidates` store (see module doc comment) — this is this
 ///    change's answer to "where does a CLI-command failure get captured,
-///    vs. a daemon-side severe error (task 3.3)?": both write into the
+///    vs. a daemon-side severe error?": both write into the
 ///    exact same on-disk store via the exact same `ErrorCandidateStore`
 ///    API, just from two different processes/call sites. No IPC message
 ///    was added for this because a local file write needs no daemon
@@ -486,8 +485,8 @@ pub async fn queue_flush() -> Result<(), CliError> {
 /// 2. Prints a one-line hint suggesting `yadorilink report error --last
 ///    --preview`.
 ///
-/// Both are skipped entirely if `prompt_to_report_enabled` is off (task
-/// 4.7 "prompts can be disabled") — `report consent prompts false`.
+/// Both are skipped entirely if `prompt_to_report_enabled` is off
+/// (via `report consent prompts false`).
 /// Never panics, never changes the process's exit code (the caller reads
 /// that from the original `CliError` untouched), never blocks on
 /// anything beyond a local file write.
@@ -531,7 +530,7 @@ mod tests {
         assert!(!confirm_with_reader("ok?", false, &mut Cursor::new(b"".to_vec())));
     }
 
-    /// Task 4.7 "submit asks for confirmation": `assume_yes` (the CLI's
+    /// `assume_yes` (the CLI's
     /// `--yes` flag) skips reading the reader entirely, so it works even
     /// with a reader that would otherwise reject (proving the flag, not
     /// the input, decided the outcome).

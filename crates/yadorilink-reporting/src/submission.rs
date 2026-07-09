@@ -1,4 +1,4 @@
-//! Optional HTTPS submission client (design.md D6, task 5).
+//! Optional HTTPS submission client.
 //!
 //! This module is deliberately narrow and self-contained: it takes a
 //! `&ReportEnvelope` and a plain `Option<&str>` endpoint URL and returns
@@ -8,8 +8,7 @@
 //! it any of that; it is structurally impossible for it to attach an
 //! `Authorization` header or similar credential.
 //!
-//! Design constraints enforced here (see design.md D6 for the full
-//! reasoning and rejected alternatives):
+//! Design constraints enforced here:
 //! - HTTPS-only, with the same loopback exception used by
 //!   `yadorilink-cli`'s coordination-address validation
 //!   (`crates/yadorilink-cli/src/grpc.rs::is_loopback_host`), so a
@@ -28,12 +27,11 @@
 //!   from permanent ones (no endpoint configured, invalid endpoint,
 //!   invalid payload, 4xx) that won't succeed on retry. This module
 //!   never retries internally — retry/backoff policy belongs to the
-//!   caller (see design.md D6 and task 5.2), so a single `submit` call
-//!   can never loop indefinitely.
+//!   caller, so a single `submit` call can never loop indefinitely.
 //! - "No endpoint configured" is representable at the type level
 //!   (`endpoint: Option<&str>` -> `SubmissionError::NoEndpointConfigured`)
 //!   rather than requiring a placeholder URL, so preview/export-only
-//!   builds and configs remain first-class (task 5.4).
+//!   builds and configs remain first-class.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -75,9 +73,9 @@ impl Default for SubmissionConfig {
 /// for retry/backoff policy.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SubmissionError {
-    /// `endpoint` was `None` — a first-class, non-error-ish state (task
-    /// 5.4): callers should treat this as "reporting export/preview
-    /// still works, submission just isn't configured," not as a network
+    /// `endpoint` was `None` — a first-class, non-error-ish state:
+    /// callers should treat this as "reporting export/preview still
+    /// works, submission just isn't configured," not as a network
     /// failure.
     #[error("no reporting endpoint is configured")]
     NoEndpointConfigured,
@@ -107,9 +105,9 @@ pub enum SubmissionError {
     #[error("reporting endpoint returned HTTP {status}")]
     HttpStatus { status: u16, body_snippet: String },
     /// The endpoint returned 2xx but a body this client could not parse
-    /// into a receipt. Per design.md D6 the endpoint contract is narrow
-    /// (validate + return an opaque receipt id), so a malformed 2xx body
-    /// indicates a protocol mismatch, not a transient condition.
+    /// into a receipt. The endpoint contract is narrow (validate +
+    /// return an opaque receipt id), so a malformed 2xx body indicates a
+    /// protocol mismatch, not a transient condition.
     #[error("reporting endpoint returned an unparseable response: {0}")]
     InvalidResponse(String),
 }
@@ -117,8 +115,7 @@ pub enum SubmissionError {
 impl SubmissionError {
     /// Whether a caller might reasonably retry this exact submission
     /// later (subject to its own backoff policy — this module never
-    /// retries on its own). See task 5.2: "the CALLER decides whether to
-    /// retry."
+    /// retries on its own). The caller decides whether to retry.
     pub fn is_retryable(&self) -> bool {
         match self {
             SubmissionError::NoEndpointConfigured => false,
@@ -133,8 +130,8 @@ impl SubmissionError {
     }
 }
 
-/// The narrow response contract from design.md D6: "return an opaque
-/// receipt ID." `submitted_at` is endpoint-stamped (not generated here)
+/// The narrow response contract here: "return an opaque receipt ID."
+/// `submitted_at` is endpoint-stamped (not generated here)
 /// so this module — like the rest of this crate — never needs its own
 /// clock source; see `lib.rs`/`schema.rs` module docs for why that
 /// property matters for testability.

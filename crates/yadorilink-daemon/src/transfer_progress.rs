@@ -1,5 +1,4 @@
-//! add-observability-and-metrics section 1 (design.md "Progress
-//! accounting"): lightweight, additive per-active-transfer progress state
+//! Lightweight, additive per-active-transfer progress state
 //! keyed by `(group_id, path)` — bytes/blocks done vs total, source peer,
 //! and a started-at timestamp — plus the cumulative counters/histogram the
 //! `/metrics` endpoint (section 3) renders from the exact same observation
@@ -27,12 +26,12 @@ fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// One in-flight file transfer's progress (design.md: "bytes_done /
-/// bytes_total, blocks_done / blocks_total, source_peer, started_at").
+/// One in-flight file transfer's progress: bytes_done / bytes_total,
+/// blocks_done / blocks_total, source_peer, started_at.
 /// Every field here is a count, a project-internal device id, or a
 /// sync-relative file path already known to both peers over an
 /// authenticated session — never raw content, so this is safe to surface
-/// verbatim over the control socket (task 1.3) the way `LinkStatus`
+/// verbatim over the control socket the way `LinkStatus`
 /// already surfaces `local_path`/`group_id`.
 #[derive(Debug, Clone)]
 pub struct ActiveTransferProgress {
@@ -43,20 +42,20 @@ pub struct ActiveTransferProgress {
     pub blocks_done: u64,
     pub blocks_total: u64,
     /// The most recent peer a block was actually fetched from — a
-    /// multi-peer dispatch (parallel-multi-peer-fetch design D1) can pull
-    /// blocks for the same file from several candidates, so this is
-    /// "most recently active source," not "the only source."
+    /// multi-peer dispatch () can pull blocks for the same file
+    /// from several candidates, so this is "most recently active source,"
+    /// not "the only source."
     pub source_peer: String,
     pub started_at_unix: i64,
 }
 
-/// design.md "An overall per-link rollup (sum across active transfers) for
-/// a headline percent," plus a best-effort ETA (task 1.2) derived from the
+/// An overall per-link rollup (sum across active transfers) for a
+/// headline percent, plus a best-effort ETA derived from the
 /// average throughput observed since the earliest active transfer in this
 /// link started — deliberately simple (a cumulative average, not a
-/// windowed/decaying rate estimator): design.md itself calls this "a simple
-/// derived estimate ... best-effort," and every value here is explicitly
-/// labelled as such by the CLI (task 4.1), not asserted as precise.
+/// windowed/decaying rate estimator): a simple derived estimate,
+/// best-effort, and every value here is explicitly labelled as such by
+/// the CLI, not asserted as precise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkProgressRollup {
     pub bytes_done: u64,
@@ -79,8 +78,8 @@ struct Entry {
 }
 
 /// Prometheus-style cumulative histogram buckets for block-fetch latency
-/// (design.md `yadorilink_block_fetch_seconds`) — the standard default
-/// bucket boundaries (seconds), fine enough to distinguish a healthy LAN
+/// (`yadorilink_block_fetch_seconds`) — the standard default bucket
+/// boundaries (seconds), fine enough to distinguish a healthy LAN
 /// round trip from a slow/lossy one without being a per-request trace of
 /// anything content-identifying (it's purely a duration).
 const HISTOGRAM_BUCKETS_SECONDS: &[f64] =
@@ -141,8 +140,8 @@ impl Histogram {
 struct Inner {
     active: Mutex<HashMap<(String, String), Entry>>,
     /// Monotonic, never-decreasing total of every byte actually written to
-    /// the block store from a fetched block (design.md
-    /// `yadorilink_transfer_bytes_total` — a counter, unlike `bytes_done`
+    /// the block store from a fetched block
+    /// (`yadorilink_transfer_bytes_total` — a counter, unlike `bytes_done`
     /// above which resets to nothing once a transfer's entry is torn down).
     transfer_bytes_total: AtomicU64,
     block_fetch_seconds: Histogram,
@@ -211,10 +210,10 @@ impl TransferProgressTracker {
         self.0.transfer_bytes_total.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    /// design.md `yadorilink_block_fetch_seconds`: records one block-fetch
-    /// round trip's duration, whatever its outcome (found, not-found, or
-    /// timed out) — `hydration.rs`'s dispatcher is the single choke point
-    /// every block fetch already passes through.
+    /// Records one block-fetch round trip's duration
+    /// (`yadorilink_block_fetch_seconds`), whatever its outcome (found,
+    /// not-found, or timed out) — `hydration.rs`'s dispatcher is the
+    /// single choke point every block fetch already passes through.
     pub fn observe_block_fetch_seconds(&self, seconds: f64) {
         self.0.block_fetch_seconds.observe(seconds);
     }
@@ -223,7 +222,7 @@ impl TransferProgressTracker {
         self.0.active.lock().unwrap_or_else(|p| p.into_inner()).remove(key);
     }
 
-    /// Every currently-active transfer, for `yadorilink status` (task 1.3)
+    /// Every currently-active transfer, for `yadorilink status`
     /// and the `/metrics` active-transfers gauge.
     pub fn snapshot(&self) -> Vec<ActiveTransferProgress> {
         self.0
@@ -244,7 +243,7 @@ impl TransferProgressTracker {
             .collect()
     }
 
-    /// task 1.2: the per-link rollup — `None` when `group_id` has no
+    /// the per-link rollup — `None` when `group_id` has no
     /// currently-active transfer at all (distinct from "0% done," which is
     /// a real, just-started transfer).
     pub fn link_rollup(&self, group_id: &str) -> Option<LinkProgressRollup> {
@@ -336,7 +335,7 @@ mod tests {
         assert_eq!(snapshot[0].blocks_total, 10);
     }
 
-    /// task 5.1: progress advances as blocks land.
+    /// progress advances as blocks land.
     #[test]
     fn record_block_done_advances_bytes_and_blocks_done() {
         let tracker = TransferProgressTracker::new();
@@ -352,7 +351,7 @@ mod tests {
         assert_eq!(tracker.transfer_bytes_total(), 200);
     }
 
-    /// task 5.1: "completes at 100%" — once every block has landed and the
+    /// "completes at 100%" — once every block has landed and the
     /// guard is dropped (as `hydrate_inner` does at the end of a
     /// successful hydration), the transfer disappears from the active set
     /// rather than lingering at 100%.
@@ -367,7 +366,7 @@ mod tests {
         assert!(tracker.snapshot().is_empty());
     }
 
-    /// task 1.2: the per-link rollup sums across every active transfer for
+    /// the per-link rollup sums across every active transfer for
     /// that link, and is absent (not zeroed) when the link has none.
     #[test]
     fn link_rollup_sums_across_active_transfers_for_the_same_link() {

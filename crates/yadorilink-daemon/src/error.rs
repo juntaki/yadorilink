@@ -6,7 +6,7 @@ pub enum DaemonError {
     #[error("sync-core error: {0}")]
     Sync(#[from] yadorilink_sync_core::SyncError),
 
-    /// daemon-reliability TD (5.2): `peer_orchestrator`'s transport-level
+    /// `peer_orchestrator`'s transport-level
     /// failures (relay connect, `PeerChannel` connect attempted eagerly
     /// while establishing the shared per-device relay hub).
     #[error("transport error: {0}")]
@@ -40,9 +40,9 @@ pub enum DaemonError {
     #[error("{0}")]
     Config(String),
 
-    /// migrate-coordination-plane-to-cloudflare task 7.2: the
-    /// WebSocket-based netmap subscription's connection/protocol errors —
-    /// the `http-coordination` feature's counterpart to `GrpcTransport`/`Grpc` above.
+    /// The WebSocket-based netmap subscription's connection/protocol
+    /// errors — the `http-coordination` feature's counterpart to
+    /// `GrpcTransport`/`Grpc` above.
     #[cfg(feature = "http-coordination")]
     #[error("websocket error: {0}")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),

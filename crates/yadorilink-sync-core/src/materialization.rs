@@ -13,12 +13,12 @@ use crate::error::SyncError;
 use crate::index::SyncState;
 use crate::types::{MaterializationState, RecordKind};
 
-/// add-resource-governance task 3.2: preflight check before a hydration
+/// Preflight check before a hydration
 /// fetch or a materialize-to-temp-and-rename write begins, scoped to the
 /// volume hosting `root` (the target link's local folder) — shares the
 /// exact classification (`yadorilink_local_storage::free_space`) the
 /// block-store preflight and `yadorilink status`'s per-volume reporting
-/// both use (task 1.3), so a single computed state backs the decision here
+/// both use, so a single computed state backs the decision here
 /// and what's reported elsewhere. Returns `Ok(())` when the write may
 /// proceed, or `SyncError::DiskPressure` — never partially writing anything,
 /// since this is checked *before* any temp file is created — when
@@ -89,7 +89,7 @@ pub fn evict_file(
     Ok(())
 }
 
-/// Runs one pass of the automatic eviction sweep (design D6) for a single
+/// Runs one pass of the automatic eviction sweep () for a single
 /// `OnDemand` folder group with a configured disk-usage cap: evicts
 /// least-recently-accessed unpinned hydrated files until usage is back at
 /// or under `max_local_size_bytes`. Returns the paths evicted, in the
@@ -103,15 +103,15 @@ pub fn evict_file(
 ///
 /// Before ranking candidates, best-effort fills in `last_accessed_unix`
 /// from each file's on-disk `atime` for files that have *never* recorded
-/// one at all (design D6's fallback — chiefly, a file that was already
-/// fully materialized before this device ever ran on-demand-sync-aware
-/// code, per the "existing materialized content is preserved on upgrade"
+/// one at all ('s fallback — chiefly, a file that was already
+/// fully materialized before this device ever supported on-demand sync at
+/// all, per the "existing materialized content is preserved on upgrade"
 /// requirement, so hydration's own `touch_last_accessed` call never ran
 /// for it). Deliberately does **not** overwrite an *existing* recorded
 /// value: atime also advances on writes (not just reads), so once a real
 /// access timestamp is on record, trusting it over a possibly
-/// write-inflated atime is the safer default — see design.md's Risks for
-/// the accepted trade-off this implies for files hydrated once, then only
+/// write-inflated atime is the safer default, accepting the trade-off
+/// this implies for files hydrated once, then only
 /// ever read (never re-hydrated) afterward.
 ///
 /// Errors reading a given file's metadata (e.g. it vanished) are ignored
@@ -173,7 +173,7 @@ fn refresh_missing_last_accessed(
     }
 }
 
-/// add-resource-governance task 4.1/4.2: runs the automatic eviction sweep
+/// Runs the automatic eviction sweep
 /// in response to disk-space pressure on the volume hosting `root`,
 /// independent of whether `group_id`'s link has any `max_local_size_bytes`
 /// cap configured at all — the disk-pressure trigger `run_eviction_sweep`
@@ -231,7 +231,7 @@ pub fn run_disk_pressure_eviction_sweep(
     Ok(evicted)
 }
 
-// --- add-crash-power-loss-recovery: startup recovery ----------------------
+// --- Startup recovery ------------------------------------------------------
 
 /// Result of one `repair_interrupted_materializations` pass — which paths
 /// were found inconsistent, and how each was resolved.
@@ -257,7 +257,7 @@ impl MaterializationRepairReport {
     }
 }
 
-/// task 2.3: startup self-heal for a file whose local index already
+/// startup self-heal for a file whose local index already
 /// recorded a `Hydrated` materialization state (and the new version/block
 /// list) *before* the crash, but whose on-disk content was never fully
 /// (re)written — the exact window `PeerSyncSession::materialize`'s
@@ -272,7 +272,7 @@ impl MaterializationRepairReport {
 /// leaves the index correctly describing the new version while the
 /// on-disk file is either stale (still the previous version's bytes) or
 /// missing outright — indistinguishable from a genuinely synced file to
-/// every other code path, which is exactly what design.md's "avoid
+/// every other code path, which is exactly what the "avoid
 /// partial materialization being mistaken for a valid synced file"
 /// invariant forbids.
 ///
@@ -283,7 +283,7 @@ impl MaterializationRepairReport {
 /// handled here) that a crash can leave in a state inconsistent with
 /// reality.
 ///
-/// fix-materialization-disk-index-divergence: this same check (a
+/// This same check (a
 /// `Hydrated` record whose on-disk state doesn't match) can also arise
 /// during live operation, not just from a crash — see this function's
 /// caller in `yadorilink-daemon`'s `link_manager.rs`, which now also
@@ -298,8 +298,8 @@ impl MaterializationRepairReport {
 /// `root.join(path)` is missing, or its size doesn't match the record's
 /// expected `size`, this is diagnosed as an interrupted materialization.
 /// The size check is a deliberately cheap proxy, not a full content-hash
-/// verification pass over every synced byte — design.md's non-goals
-/// explicitly exclude "surviving arbitrary disk corruption"; this exists
+/// verification pass over every synced byte — surviving arbitrary disk
+/// corruption is explicitly out of scope; this exists
 /// only to catch the specific interrupted-write window this crate's own
 /// materialization code can leave, not to be a general integrity scanner
 /// (a torn/corrupt block itself is still separately caught by
@@ -355,7 +355,7 @@ pub fn repair_interrupted_materializations(
     Ok(report)
 }
 
-/// task 2.1: recursively removes stale temp-write artifacts left behind by
+/// recursively removes stale temp-write artifacts left behind by
 /// an interrupted `chunker::reconstruct_file`/`write_placeholder`/
 /// `materialize_symlink_at` call (or `FsBlockStore::put`, when `root` is a
 /// block-store root instead of a link's synced folder — both crates'
@@ -367,8 +367,8 @@ pub fn repair_interrupted_materializations(
 /// Only ever removes a filename matching the *exact*
 /// `<original-name>.yadorilink-tmp.<pid>.<counter>` suffix shape those
 /// functions generate (both `<pid>` and `<counter>` non-empty and
-/// ASCII-digit-only) — see `is_own_stale_temp_file_name`. design.md's
-/// explicit "aggressive cleanup could delete user files" risk means a
+/// ASCII-digit-only) — see `is_own_stale_temp_file_name`. Aggressive
+/// cleanup could delete user files, so a
 /// user file that merely *contains* the substring `.yadorilink-tmp.`
 /// somewhere in a name it chose itself (e.g. `notes.yadorilink-tmp.txt`,
 /// or `report.yadorilink-tmp.12345.7.bak`) is deliberately left untouched
@@ -512,7 +512,7 @@ mod tests {
         );
     }
 
-    /// design D6's atime fallback: a file read many times without ever
+    /// 's atime fallback: a file read many times without ever
     /// going through the daemon (so `last_accessed_unix` was never
     /// recorded) must still be recognized as recently used via its
     /// on-disk `atime`, rather than looking like it was never accessed
@@ -605,9 +605,9 @@ mod tests {
         );
     }
 
-    // --- add-resource-governance task 3.6: disk-space preflight ----------
+    // --- Disk-space preflight ---------------------------------------------
 
-    /// task 3.6: a materialize/hydrate write that would breach headroom
+    /// a materialize/hydrate write that would breach headroom
     /// fails with `DiskPressure` before anything is written — forced
     /// deterministically via a headroom override far larger than any real
     /// disk's free space (this crate's tests must not depend on the host
@@ -634,10 +634,10 @@ mod tests {
         check_disk_headroom(dir.path(), &target, 1024, Some(0)).unwrap();
     }
 
-    // --- add-resource-governance task 4.4: disk-pressure-triggered
+    // --- Disk-pressure-triggered
     // eviction ---------------------------------------------------------
 
-    /// task 4.4: disk pressure on a volume triggers eviction on an
+    /// disk pressure on a volume triggers eviction on an
     /// OnDemand-style link with **no** configured cap at all
     /// (`run_eviction_sweep` itself would no-op here — see
     /// `sweep_no_ops_when_no_cap_configured` above — this is exactly the gap
@@ -667,7 +667,7 @@ mod tests {
         assert_eq!(evicted[0], "old.bin", "least-recently-accessed must be evicted first");
     }
 
-    /// task 4.4: pinned files are never evicted by the disk-pressure
+    /// pinned files are never evicted by the disk-pressure
     /// trigger, exactly as they're already excluded from the cap trigger
     /// (reused, not reimplemented — task 4.3).
     #[test]
@@ -688,7 +688,7 @@ mod tests {
         );
     }
 
-    /// task 4.4: a volume that isn't under pressure (`Ok` classification —
+    /// a volume that isn't under pressure (`Ok` classification —
     /// a zero headroom override, "no headroom required," is always `Ok`) is
     /// never swept, leaving an unrelated healthy link's files untouched.
     #[test]
@@ -707,7 +707,7 @@ mod tests {
         );
     }
 
-    // --- add-crash-power-loss-recovery: startup recovery ------------------
+    // --- Startup recovery ---------------------------------------------------
 
     use yadorilink_local_storage::FsBlockStore;
 
@@ -724,7 +724,7 @@ mod tests {
         }
     }
 
-    /// task 3.1 (crash-before-rename): the index already has the new
+    /// (crash-before-rename): the index already has the new
     /// version/blocks committed (as `PeerSyncSession::materialize`'s
     /// eager-fetch branch does *before* its `reconstruct_file` call), but
     /// the process was killed before that write's rename ever landed —
@@ -780,7 +780,7 @@ mod tests {
         assert!(!stale_tmp.exists());
     }
 
-    /// task 3.1 (crash-after-rename, the converse): the rename already
+    /// (crash-after-rename, the converse): the rename already
     /// completed before the crash (or there was no crash at all) — on-disk
     /// content matches the index exactly, so repair must be a pure no-op,
     /// not just "doesn't error" but genuinely untouched (verified via an
@@ -806,7 +806,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&out_path).unwrap().modified().unwrap(), mtime_before);
     }
 
-    /// task 3.1: a crash-before-rename where the block(s) are *not* fully
+    /// a crash-before-rename where the block(s) are *not* fully
     /// present locally either (e.g. the block store itself never finished
     /// receiving them) cannot be self-healed without a peer — repair must
     /// demote the record to `Placeholder` rather than leaving it claiming
@@ -846,7 +846,7 @@ mod tests {
         );
     }
 
-    /// task 2.3: `Placeholder`/`Hydrating` records (the file was never
+    /// `Placeholder`/`Hydrating` records (the file was never
     /// claimed to be hydrated in the first place) are never touched by
     /// this pass — it only ever repairs/demotes rows currently claiming
     /// `Hydrated`.
@@ -874,7 +874,7 @@ mod tests {
         );
     }
 
-    /// task 3.3: `cleanup_stale_temp_files` must remove only genuine
+    /// `cleanup_stale_temp_files` must remove only genuine
     /// orphaned temp artifacts matching this crate's own exact
     /// `.yadorilink-tmp.<pid>.<counter>` naming scheme — a user's own file
     /// that merely resembles that name (no numeric suffix at all, or one

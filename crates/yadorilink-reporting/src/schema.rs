@@ -63,8 +63,8 @@ pub enum ReportPayload {
     Error(ErrorPayload),
 }
 
-/// Aggregate, coarse-grained counts only — see design.md D3. No file
-/// paths, folder names, group IDs, peer IDs, or command arguments.
+/// Aggregate, coarse-grained counts only. No file paths, folder names,
+/// group IDs, peer IDs, or command arguments.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsagePayload {
     pub enabled_feature_flags: Vec<String>,
@@ -87,12 +87,11 @@ pub struct UsagePayload {
     pub peer_count_bucket: String,
 }
 
-/// A candidate error report — see design.md D4. Sanitized/redacted
-/// before it ever reaches this struct; the redactor in `redact.rs` is
-/// also re-applied to every string field here as the D5 "denylist
-/// safety pass," since a caller-provided log line or backtrace is
-/// exactly the kind of free-text field most likely to accidentally
-/// carry a path or token through.
+/// A candidate error report. Sanitized/redacted before it ever reaches
+/// this struct; the redactor in `redact.rs` is also re-applied to every
+/// string field here as a denylist safety pass, since a caller-provided
+/// log line or backtrace is exactly the kind of free-text field most
+/// likely to accidentally carry a path or token through.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorPayload {
     pub error_category: String,

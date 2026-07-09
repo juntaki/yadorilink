@@ -1,8 +1,8 @@
 # Builds the Windows installer and enforces the SEC-LOCAL-3 release policy:
 # release builds must be Authenticode-signed through an Inno Setup SignTool
-# profile. Every build, signed or unsigned, gets a SHA-256 sidecar — per
-# add-release-artifact-verification, every downloadable release artifact
-# must have a published checksum regardless of signing status (a signed
+# profile. Every build, signed or unsigned, gets a SHA-256 sidecar — every
+# downloadable release artifact must have a published checksum regardless
+# of signing status (a signed
 # installer can still be checksummed to detect corruption/tampering in
 # transit independent of the Authenticode signature).
 param(
@@ -57,8 +57,8 @@ if (-not [string]::IsNullOrWhiteSpace($SignToolName)) {
     Write-Output "Verified Authenticode signature on $outputPath"
 }
 
-# Always write a checksum sidecar, signed or not (add-release-artifact-verification:
-# "every downloadable release artifact SHALL have a published checksum").
+# Always write a checksum sidecar, signed or not (every downloadable
+# release artifact SHALL have a published checksum).
 $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $outputPath
 $sidecar = "$outputPath.sha256"
 "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $outputPath)" | Set-Content -LiteralPath $sidecar -NoNewline

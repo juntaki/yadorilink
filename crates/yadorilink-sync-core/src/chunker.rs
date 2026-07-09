@@ -1,14 +1,13 @@
-//! Fixed-size block splitting (design.md D7 — Syncthing-proven fixed-size
-//! blocks, content-defined chunking deferred by default; see design.md's
-//! Context for why) is the default, plus an opt-in, size-gated
-//! content-defined chunking (CDC) path (`content-defined-chunking` change)
-//! for large files edited internally rather than appended to or replaced
-//! wholesale (VM images, databases, large project files), where fixed-size
-//! blocks re-transfer everything after an edit point due to boundary
-//! shift. Blocks are content-addressed and stored via
-//! `yadorilink-local-storage`, giving free local dedup: an identical block
-//! from any other file/version is only ever stored once, regardless of
-//! which chunking method produced it.
+//! Fixed-size block splitting (Syncthing-proven fixed-size blocks,
+//! content-defined chunking deferred by default) is the default, plus an
+//! opt-in, size-gated content-defined chunking (CDC) path for large files
+//! edited internally rather than appended to or replaced wholesale (VM
+//! images, databases, large project files), where fixed-size blocks
+//! re-transfer everything after an edit point due to boundary shift.
+//! Blocks are content-addressed and stored via `yadorilink-local-storage`,
+//! giving free local dedup: an identical block from any other file/version
+//! is only ever stored once, regardless of which chunking method produced
+//! it.
 
 use std::ffi::OsString;
 use std::fs;
@@ -26,31 +25,30 @@ pub const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
 /// Upper bound blocks scale to for very large files, matching Syncthing's
 /// max (16 MiB), so a huge file doesn't produce an unwieldy block count.
 ///
-/// `pub(crate)`, not private: add-transfer-compression's decompression-bomb
+/// `pub(crate)`, not private: the decompression-bomb
 /// guard (`peer_session::decompress_block`) reuses this exact constant as
 /// its maximum-decompressed-size bound, rather than duplicating the number
-/// — see design.md's Context ("no legitimate block payload should ever
-/// decompress past it") for why this is the natural ceiling to reuse.
+/// — no legitimate block payload should ever decompress past it, which
+/// makes this the natural ceiling to reuse.
 pub(crate) const MAX_BLOCK_SIZE: usize = 16 * 1024 * 1024;
 /// Target upper bound on block count per file before scaling the block
 /// size up (doubling), keeping index/request overhead bounded.
 const TARGET_MAX_BLOCKS: u64 = 2000;
 
-/// content-defined-chunking design D2: chunk-size parameters targeting
-/// Borg/restic's large-binary-backup range (512 KiB-8 MiB, ~2 MiB target)
-/// rather than Xet's ML-model-weights range (~64 KiB target) — yadorilink's
-/// CDC use case (VM images, databases, large project files) doesn't need
-/// Xet's finer granularity, and a coarser target keeps block counts (and
-/// therefore index/request overhead) reasonable for multi-gigabyte files.
+/// Chunk-size parameters targeting Borg/restic's large-binary-backup range
+/// (512 KiB-8 MiB, ~2 MiB target) rather than Xet's ML-model-weights range
+/// (~64 KiB target) — yadorilink's CDC use case (VM images, databases,
+/// large project files) doesn't need Xet's finer granularity, and a
+/// coarser target keeps block counts (and therefore index/request
+/// overhead) reasonable for multi-gigabyte files.
 pub const CDC_MIN_SIZE: usize = 512 * 1024;
 pub const CDC_AVG_SIZE: usize = 2 * 1024 * 1024;
 pub const CDC_MAX_SIZE: usize = 8 * 1024 * 1024;
 
-/// content-defined-chunking design D3/Open Questions: files smaller than
-/// this always use fixed-size chunking regardless of a link's chunking
-/// policy — CDC's rolling-hash cost isn't justified until there's enough
-/// content for boundary-shift resilience to actually matter. Comfortably
-/// above the fixed chunker's own default block size.
+/// Files smaller than this always use fixed-size chunking regardless of a
+/// link's chunking policy — CDC's rolling-hash cost isn't justified until
+/// there's enough content for boundary-shift resilience to actually
+/// matter. Comfortably above the fixed chunker's own default block size.
 pub const CDC_SIZE_THRESHOLD: u64 = 32 * 1024 * 1024;
 
 /// Picks a block size for a file of `file_size` bytes: the default, unless
@@ -94,12 +92,12 @@ pub fn chunk_file(store: &dyn BlockStore, path: &Path) -> Result<Vec<BlockInfo>,
 }
 
 /// Reads `path`, splits it into content-defined (variable-size) blocks
-/// using `fastcdc`'s Gear-hash CDC algorithm (content-defined-chunking
-/// design D1), stores each via `store`, and returns the block list in the
-/// same shape `chunk_file` produces — `reconstruct_file` needs no changes
-/// since it already handles arbitrary, variable block sizes. Intended for
-/// files at or above `CDC_SIZE_THRESHOLD`; the caller decides when to use
-/// this versus `chunk_file` (design D3 — policy plus size gate).
+/// using `fastcdc`'s Gear-hash CDC algorithm, stores each via `store`, and
+/// returns the block list in the same shape `chunk_file` produces —
+/// `reconstruct_file` needs no changes since it already handles arbitrary,
+/// variable block sizes. Intended for files at or above
+/// `CDC_SIZE_THRESHOLD`; the caller decides when to use this versus
+/// `chunk_file` (policy plus size gate).
 pub fn chunk_file_content_defined(
     store: &dyn BlockStore,
     path: &Path,
@@ -130,7 +128,7 @@ pub fn chunk_file_content_defined(
 /// write of the same path) never share a temp path either — each
 /// inbound peer message is handled in its own spawned task
 /// (`peer_session.rs`), so this collision was reachable in practice, not
-/// just in theory (COR-1).
+/// just in theory.
 fn unique_tmp_path(path: &Path) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -139,7 +137,7 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// SEC-SYNC-5 defense-in-depth: creates `out_path`'s parent directory (if
+/// Defense-in-depth: creates `out_path`'s parent directory (if
 /// needed) then canonicalizes it and confirms it still `starts_with`
 /// `sync_root`'s own canonical form, before any caller writes through
 /// `out_path`. `is_safe_relative_path` (`peer_session.rs`) already rejects
@@ -151,8 +149,8 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
 /// would otherwise follow right out of the sync root. This closes that
 /// specific gap for the common case (a symlinked *directory* component);
 /// it does not fully eliminate every TOCTOU window (e.g. a symlink swapped
-/// in between this check and the write) — see design.md SEC-SYNC-5's
-/// explicit "Low / TOCTOU" severity: exploiting even this residual window
+/// in between this check and the write) — this is a known "Low / TOCTOU"
+/// severity residual gap: exploiting even this residual window
 /// requires a locally pre-planted symlink or a racing local actor, not
 /// something a remote peer can create on its own.
 ///
@@ -209,10 +207,10 @@ pub fn reconstruct_file(
     Ok(())
 }
 
-/// Writes a placeholder (`on-demand-sync` design D2/task 1.4) at `out_path`:
-/// a sparse file of `size` bytes with no real content, so `stat`/`ls`
-/// report the file's correct size and modification time without its bytes
-/// occupying disk space or requiring a block fetch. This is the
+/// Writes a placeholder at `out_path`: a sparse file of `size` bytes with
+/// no real content, so `stat`/`ls` report the file's correct size and
+/// modification time without its bytes occupying disk space or requiring
+/// a block fetch. This is the
 /// platform-neutral core representation; sections 6/7's platform shell
 /// extensions layer the OS-specific placeholder markers on top (a reparse
 /// point via the Cloud Filter API on Windows, a File Provider item on
@@ -247,10 +245,10 @@ pub fn write_placeholder(
 }
 
 /// Materializes a symlink record at `out_path`, pointing at `target` (the
-/// record's raw, unresolved target text — design.md D1: a symlink target
+/// record's raw, unresolved target text — a symlink target
 /// is never dereferenced by this crate) using the same atomic
 /// temp-path-then-rename pattern `reconstruct_file`/`write_placeholder`
-/// already use (`add-sync-fidelity` task 3.1): `unique_tmp_path`'s
+/// already use: `unique_tmp_path`'s
 /// existing collision-free naming scheme picks a temp path,
 /// `std::os::unix::fs::symlink` creates the link there, and `fs::rename`
 /// atomically swaps it into place — a torn/partial symlink is never
@@ -268,7 +266,7 @@ pub fn materialize_symlink(out_path: &Path, target: &str) -> Result<(), SyncErro
     Ok(())
 }
 
-/// Windows per-link opt-in symlink materialization (task 3.2): the default
+/// Windows per-link opt-in symlink materialization: the default
 /// Windows policy is skip-with-visible-status (the record is tracked and
 /// synced, but nothing is written to disk — see
 /// `peer_session::materialize_symlink_at`'s Windows branch), and this
@@ -323,13 +321,12 @@ pub fn materialize_symlink_windows(out_path: &Path, target: &str) -> Result<(), 
     Ok(())
 }
 
-/// Applies the POSIX owner-executable bit to `path`'s on-disk permissions
-/// (design D2, task 3.3), after materialization/hydration has already
-/// written its content. Idempotent (only calls `set_permissions` when the
-/// mode would actually change). A no-op — `Ok(())`, no attempted mode
-/// change, no error — on any non-Unix platform (Windows has no equivalent
-/// owner-exec permission bit; task 3.3 requires this be silent there, not
-/// an error).
+/// Applies the POSIX owner-executable bit to `path`'s on-disk permissions,
+/// after materialization/hydration has already written its content.
+/// Idempotent (only calls `set_permissions` when the mode would actually
+/// change). A no-op — `Ok(())`, no attempted mode change, no error — on
+/// any non-Unix platform (Windows has no equivalent owner-exec permission
+/// bit, so this must be silent there, not an error).
 #[cfg(unix)]
 pub fn apply_exec_bit(path: &Path, exec_bit: bool) -> Result<(), SyncError> {
     use std::os::unix::fs::PermissionsExt;
@@ -346,7 +343,7 @@ pub fn apply_exec_bit(path: &Path, exec_bit: bool) -> Result<(), SyncError> {
 }
 
 /// See the `#[cfg(unix)]` `apply_exec_bit` above — the no-op
-/// Windows/other-platform counterpart task 3.3 explicitly requires.
+/// Windows/other-platform counterpart needed for cross-platform parity.
 #[cfg(not(unix))]
 pub fn apply_exec_bit(_path: &Path, _exec_bit: bool) -> Result<(), SyncError> {
     Ok(())
@@ -413,7 +410,7 @@ mod tests {
         assert!(block_size_for(huge) > DEFAULT_BLOCK_SIZE);
     }
 
-    /// task 1.4: a placeholder reports the file's correct size via `stat`
+    /// A placeholder reports the file's correct size via `stat`
     /// without its content actually occupying disk space or being fetched.
     #[test]
     fn write_placeholder_reports_correct_size_with_no_content() {
@@ -440,8 +437,8 @@ mod tests {
         (0..size).map(|_| rng.r#gen()).collect()
     }
 
-    /// content-defined-chunking task 1.4: a large file chunked with CDC
-    /// round-trips correctly through `reconstruct_file`.
+    /// A large file chunked with CDC round-trips correctly through
+    /// `reconstruct_file`.
     #[test]
     fn cdc_chunk_and_reconstruct_roundtrip() {
         let store_dir = tempfile::tempdir().unwrap();
@@ -460,11 +457,10 @@ mod tests {
         assert_eq!(fs::read(&out_path).unwrap(), content);
     }
 
-    /// content-defined-chunking task 1.4 (the core property this whole
-    /// change exists for): inserting bytes partway through a large file
-    /// and re-chunking with CDC leaves most block hashes unchanged for
-    /// the untouched regions, while the same edit under fixed-size
-    /// chunking changes every block hash from the edit point onward.
+    /// Inserting bytes partway through a large file and re-chunking with
+    /// CDC leaves most block hashes unchanged for the untouched regions,
+    /// while the same edit under fixed-size chunking changes every block
+    /// hash from the edit point onward.
     #[test]
     fn cdc_resists_boundary_shift_unlike_fixed_size_chunking() {
         let store_dir = tempfile::tempdir().unwrap();
@@ -521,10 +517,9 @@ mod tests {
     }
 
     /// Content below `CDC_SIZE_THRESHOLD` is a caller-side decision (this
-    /// function itself doesn't enforce the threshold — see design D3) —
-    /// confirm it still functions correctly for a small file, since
-    /// nothing here should assume a minimum input size beyond `fastcdc`'s
-    /// own `CDC_MIN_SIZE`.
+    /// function itself doesn't enforce the threshold) — confirm it still
+    /// functions correctly for a small file, since nothing here should
+    /// assume a minimum input size beyond `fastcdc`'s own `CDC_MIN_SIZE`.
     #[test]
     fn cdc_chunking_handles_small_input_correctly() {
         let store_dir = tempfile::tempdir().unwrap();
@@ -541,9 +536,9 @@ mod tests {
         assert_eq!(fs::read(&out_path).unwrap(), content);
     }
 
-    /// task 3.1: `materialize_symlink` creates a real, correctly-targeted
-    /// symlink at `out_path`, atomically (via `unique_tmp_path` + rename —
-    /// no partial/temp artifact left behind at the final path).
+    /// `materialize_symlink` creates a real, correctly-targeted symlink at
+    /// `out_path`, atomically (via `unique_tmp_path` + rename — no
+    /// partial/temp artifact left behind at the final path).
     #[cfg(unix)]
     #[test]
     fn materialize_symlink_creates_a_real_symlink_atomically() {
@@ -557,7 +552,7 @@ mod tests {
         assert_eq!(fs::read_link(&out_path).unwrap(), Path::new("../outside/target.txt"));
     }
 
-    /// task 3.1: re-materializing the same path (e.g. a re-sent index
+    /// Re-materializing the same path (e.g. a re-sent index
     /// update for an unchanged symlink record) must cleanly replace the
     /// old link via the same atomic rename, not error on "already exists".
     #[cfg(unix)]
@@ -572,7 +567,7 @@ mod tests {
         assert_eq!(fs::read_link(&out_path).unwrap(), Path::new("new-target.txt"));
     }
 
-    /// task 3.3: flipping the exec bit on and off actually changes the
+    /// Flipping the exec bit on and off actually changes the
     /// owner-executable permission bit on disk, and is idempotent (calling
     /// it again with the same value doesn't error or otherwise misbehave).
     #[cfg(unix)]
@@ -598,11 +593,11 @@ mod tests {
         assert_eq!(mode_after_clear & 0o777, 0o644, "owner-exec bit must be cleared");
 
         // Other permission bits (group/other read, in this case) are left
-        // alone — this only ever touches the owner-exec bit (design D2).
+        // alone — this only ever touches the owner-exec bit.
         assert_eq!(mode_after_clear & 0o077, 0o044);
     }
 
-    /// task 3.3: `apply_exec_bit` must never error on a plain file — this
+    /// `apply_exec_bit` must never error on a plain file — this
     /// runs unconditionally (not `#[cfg(unix)]`-gated) so the non-Unix
     /// no-op arm is at least compiled and exercised on every platform this
     /// crate builds for; on this dev machine it's the `#[cfg(unix)]`-arm's

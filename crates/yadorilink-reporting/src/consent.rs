@@ -1,8 +1,7 @@
-//! Consent state shape (design.md D1, D7). This module defines the type
-//! only — persistence (reading/writing it under the daemon's config
-//! directory) is section 2's job, in `yadorilink-daemon`, which is the
-//! only place that should ever construct or mutate one of these outside
-//! tests.
+//! Consent state shape. This module defines the type only —
+//! persistence (reading/writing it under the daemon's config directory)
+//! is `yadorilink-daemon`'s job, which is the only place that should
+//! ever construct or mutate one of these outside tests.
 
 use serde::{Deserialize, Serialize};
 
@@ -42,7 +41,7 @@ impl ConsentState {
     /// Enables usage-summary submission, creating an anonymous reporter
     /// ID if one doesn't already exist. Does not touch
     /// `error_submission_enabled` — usage and automatic-error submission
-    /// are separate toggles per design.md D4.
+    /// are separate toggles.
     pub fn opt_in_usage(&mut self, new_reporter_id: impl FnOnce() -> String) {
         self.usage_submission_enabled = true;
         if self.anonymous_reporter_id.is_none() {

@@ -1,4 +1,4 @@
-//! on-demand-sync task 5.5: `yadorilink pin/unpin/evict` end-to-end against a
+//! On-demand sync: `yadorilink pin/unpin/evict` end-to-end against a
 //! real daemon over the actual control socket — unlike `link`/`status`,
 //! these commands need no coordination-plane/auth setup at all, so they're
 //! testable directly at the CLI-command layer (not just the daemon's

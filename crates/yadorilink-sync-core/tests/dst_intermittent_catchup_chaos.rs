@@ -32,8 +32,7 @@ use yadorilink_transport::{PeerChannel, TransportMode};
 const GROUP_ID: &str = "dst-intermittent-catchup";
 const CANARY_PATH: &str = "startup-canary.txt";
 const HOT_PATH: &str = "hot-counter.txt";
-/// fix-recv-loop-head-of-line-deadlock-on-catchup task 2.1: dialed from an
-/// original 80ms (~1000x more aggressive than production's
+/// Dialed from an original 80ms (~1000x more aggressive than production's
 /// `DEFAULT_FULL_INDEX_RESYNC_INTERVAL`, 90s) to a still-fast-for-a-test
 /// but realistic-order-of-magnitude 2s, so this scenario reflects a real
 /// catch-up cadence rather than manufacturing a guaranteed deadlock via an

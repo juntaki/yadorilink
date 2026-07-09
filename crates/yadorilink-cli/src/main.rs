@@ -1,4 +1,4 @@
-//! `yadorilink` CLI (see openspec `cli` spec).
+//! `yadorilink` CLI.
 
 use clap::{Parser, Subcommand};
 use yadorilink_cli::commands;
@@ -54,7 +54,7 @@ enum Command {
         #[arg(long)]
         on_demand: bool,
         /// Automatic-eviction disk-usage cap in bytes for an `--on-demand`
-        /// folder (design D6); only meaningful together with `--on-demand`.
+        /// folder (); only meaningful together with `--on-demand`.
         #[arg(long)]
         max_local_size: Option<i64>,
         /// content-defined-chunking: opt this folder into content-defined
@@ -62,31 +62,27 @@ enum Command {
         /// the default fixed-size chunking. Independent of `--on-demand`.
         #[arg(long)]
         content_defined_chunking: bool,
-        /// add-folder-direction-modes: this link's directional propagation
-        /// mode — `send-receive` (default), `send-only`, or
-        /// `receive-only`.
+        /// This link's directional propagation mode — `send-receive`
+        /// (default), `send-only`, or `receive-only`.
         #[arg(long)]
         mode: Option<String>,
-        /// add-file-version-history: maximum number of superseded/trashed
-        /// versions to retain per file (design D2 default: 10, `0` =
-        /// unlimited). Only applies to superseded/trashed versions — the
-        /// current live version is never subject to this policy.
+        /// Maximum number of superseded/trashed versions to retain per file
+        /// (default: 10, `0` = unlimited). Only applies to
+        /// superseded/trashed versions — the current live version is never
+        /// subject to this policy.
         #[arg(long)]
         keep_versions: Option<i64>,
-        /// add-file-version-history: maximum age in days of a
-        /// superseded/trashed version (design D2 default: 30, `0` =
-        /// unlimited).
+        /// Maximum age in days of a superseded/trashed version (default: 30, `0` = unlimited).
         #[arg(long)]
         keep_days: Option<i64>,
-        /// add-first-run-safety-onboarding: run the link preflight and
-        /// print its findings without registering the link (no daemon
-        /// writes at all).
+        /// Run the link preflight and print its findings without
+        /// registering the link (no daemon writes at all).
         #[arg(long)]
         dry_run: bool,
-        /// add-first-run-safety-onboarding: acknowledge a risky preflight
-        /// result (non-empty folder, low disk space, a nested-link
-        /// conflict, or a risky location) non-interactively, matching
-        /// `backup import`'s existing `--yes` precedent.
+        /// Acknowledge a risky preflight result (non-empty folder, low disk
+        /// space, a nested-link conflict, or a risky location)
+        /// non-interactively, matching `backup import`'s existing `--yes`
+        /// precedent.
         #[arg(long)]
         yes: bool,
     },
@@ -94,11 +90,11 @@ enum Command {
     Unlink { local_path: String },
     /// List currently linked folders.
     Links,
-    /// add-file-version-history task 6.4: `yadorilink link retention
-    /// <local-path> --keep-versions <n> --keep-days <t>` per the `cli`
-    /// spec. Named `link-retention` (rather than truly nested under
-    /// `link`) for the same reason `LinkSetMode` above is `link-set-mode`
-    /// instead of nesting under `link`: `Link` takes flat positional args
+    /// `yadorilink link retention <local-path> --keep-versions <n>
+    /// --keep-days <t>`. Named `link-retention` (rather
+    /// than truly nested under `link`) for the same reason `LinkSetMode`
+    /// above is `link-set-mode` instead of nesting under `link`: `Link`
+    /// takes flat positional args
     /// (`<local_path> <group_name>`), not a subcommand-only group, and
     /// clap's derive macro has no way to disambiguate "is this positional
     /// token `local_path`, or the subcommand name `retention`?" without an
@@ -106,8 +102,7 @@ enum Command {
     /// parsing for every other `link` invocation. This keeps `main.rs`'s
     /// existing enum shape unchanged (judgment call — the smallest,
     /// most-consistent-with-precedent option) rather than reworking `Link`
-    /// into a subcommand group to match the spec's literal `link
-    /// retention` wording.
+    /// into a subcommand group.
     LinkRetention {
         local_path: String,
         #[arg(long)]
@@ -115,23 +110,21 @@ enum Command {
         #[arg(long)]
         keep_days: Option<i64>,
     },
-    /// add-file-version-history task 6.1: list every retained version of a
-    /// file (current, superseded, and trashed alike), newest first.
+    /// List every retained version of a file (current, superseded, and
+    /// trashed alike), newest first.
     Versions { local_path: String },
-    /// add-file-version-history task 6.2: restore a file to a chosen (or,
-    /// by default, the most recently superseded) version, as a new current
-    /// version.
+    /// Restore a file to a chosen (or, by default, the most recently
+    /// superseded) version, as a new current version.
     Restore {
         local_path: String,
         /// The specific version to restore to; omitted defaults to the
-        /// most recently superseded version (spec "Restore without a
-        /// version defaults to the most recent superseded version").
+        /// most recently superseded version.
         #[arg(long)]
         version: Option<i64>,
     },
-    /// add-file-version-history task 6.3: list and recover deleted files
-    /// still within their link's retention window. A genuine `list`/
-    /// `restore` verb pair under one noun (unlike `Link`, which takes
+    /// List and recover deleted files still within their link's retention
+    /// window. A genuine `list`/`restore` verb pair under one noun (unlike
+    /// `Link`, which takes
     /// positional args at its own top level) — nested under `trash` the
     /// same way `Daemon`/`DaemonAction` and `Report`/`ReportQueue` already
     /// nest below.
@@ -139,9 +132,9 @@ enum Command {
         #[command(subcommand)]
         action: TrashAction,
     },
-    /// add-folder-direction-modes: change an existing link's directional
-    /// mode, triggering a rescan/reconcile of the new gating and
-    /// divergence sets. Named `link-set-mode` (rather than nested under
+    /// Change an existing link's directional mode, triggering a
+    /// rescan/reconcile of the new gating and divergence sets. Named
+    /// `link-set-mode` (rather than nested under
     /// `link`, since `Link`/`Unlink`/`Links` are already flat top-level
     /// commands in this CLI, not a `link <verb>` subcommand group).
     LinkSetMode {
@@ -149,14 +142,14 @@ enum Command {
         /// `send-receive` | `send-only` | `receive-only`.
         mode: String,
     },
-    /// add-folder-direction-modes: re-assert this device's local state as
-    /// authoritative for every out-of-sync path on a send-only link,
-    /// clearing the out-of-sync set. Only valid on a send-only link.
+    /// Re-assert this device's local state as authoritative for every
+    /// out-of-sync path on a send-only link, clearing the out-of-sync set.
+    /// Only valid on a send-only link.
     Override { local_path: String },
-    /// add-folder-direction-modes: discard this device's un-sent local
-    /// changes for every receive-only-changed path on a receive-only
-    /// link and re-adopt peer-authoritative state, clearing the
-    /// receive-only-changed set. Only valid on a receive-only link.
+    /// Discard this device's un-sent local changes for every
+    /// receive-only-changed path on a receive-only link and re-adopt
+    /// peer-authoritative state, clearing the receive-only-changed set.
+    /// Only valid on a receive-only link.
     Revert { local_path: String },
     /// Force-hydrate a placeholder file and keep it hydrated (on-demand-sync).
     Pin { local_path: String },
@@ -172,20 +165,20 @@ enum Command {
     },
     /// Show sync status.
     Status {
-        /// add-observability-and-metrics task 4.1: re-poll and re-render
-        /// status on an interval instead of exiting after one snapshot —
-        /// useful for watching a big sync's per-transfer progress live.
+        /// Re-poll and re-render status on an interval instead of exiting
+        /// after one snapshot — useful for watching a big sync's
+        /// per-transfer progress live.
         #[arg(long)]
         watch: bool,
     },
-    /// Manually trigger block-store garbage collection (add-block-store-gc).
+    /// Manually trigger block-store garbage collection.
     Gc {
         /// Compute and report what would be deleted without actually
         /// deleting anything.
         #[arg(long)]
         dry_run: bool,
     },
-    /// Manage global transfer rate limits (add-resource-governance).
+    /// Manage global transfer rate limits.
     Limits {
         #[command(subcommand)]
         action: LimitsAction,
@@ -195,9 +188,8 @@ enum Command {
         #[command(subcommand)]
         action: IgnoreAction,
     },
-    /// OSS usage/error reporting (add-oss-usage-error-reporting): preview,
-    /// export, or submit usage/error reports, manage consent, and manage
-    /// the local unsent-report queue.
+    /// OSS usage/error reporting: preview, export, or submit usage/error
+    /// reports, manage consent, and manage the local unsent-report queue.
     Report {
         #[command(subcommand)]
         action: ReportAction,
@@ -207,11 +199,11 @@ enum Command {
         #[command(subcommand)]
         action: DiagnoseAction,
     },
-    /// add-account-recovery: account-level recovery -- one-time recovery
-    /// codes, a recovery-code-based password reset, and a
-    /// passphrase-encrypted device key-bundle backup for when every device
-    /// is lost. See each subcommand's help for the login-vs-data-access
-    /// distinction (a password reset alone never grants E2E data access).
+    /// Account-level recovery -- one-time recovery codes, a
+    /// recovery-code-based password reset, and a passphrase-encrypted
+    /// device key-bundle backup for when every device is lost. See each
+    /// subcommand's help for the login-vs-data-access distinction (a
+    /// password reset alone never grants E2E data access).
     Account {
         #[command(subcommand)]
         action: AccountAction,
@@ -221,37 +213,38 @@ enum Command {
         #[command(subcommand)]
         action: BackupAction,
     },
-    /// add-automatic-updates task 5: check update status, trigger a
-    /// manual check/install, and configure automatic checks/install.
+    /// Check update status, trigger a manual check/install, and configure
+    /// automatic checks/install.
     Update {
         #[command(subcommand)]
         action: UpdateAction,
     },
-    /// add-advanced-sync-operations section 2: divergence summaries and
-    /// guarded dry-run/confirm resolution for directional folder modes.
+    /// Divergence summaries and guarded dry-run/confirm resolution for
+    /// directional folder modes.
     FolderOps {
         #[command(subcommand)]
         action: FolderOpsAction,
     },
-    /// add-advanced-sync-operations section 4: connectivity-doctor summary
+    /// Connectivity-doctor summary
     /// (daemon/listener/discovery/coordination-plane/relay/authorization/
     /// clock/policy categories).
     Doctor,
-    /// add-advanced-sync-operations section 4: recent connection-attempt
-    /// history, optionally filtered to one peer device id.
+    /// Recent connection-attempt history, optionally filtered to one peer
+    /// device id.
     Connections {
         #[arg(long)]
         peer: Option<String>,
     },
-    /// add-advanced-sync-operations section 3: introducer trust flags,
-    /// scoped auto-accept policies, and introduction proposal/accept/reject.
+    /// Introducer trust flags, scoped auto-accept policies, and
+    /// introduction proposal/accept/reject.
     Introduce {
         #[command(subcommand)]
         action: IntroduceAction,
     },
 }
 
-/// add-advanced-sync-operations section 2.
+/// Divergence summaries and guarded dry-run/confirm resolution actions for
+/// directional folder modes.
 #[derive(Subcommand)]
 enum FolderOpsAction {
     /// Send-only/receive-only divergence counts and a bounded sample of
@@ -278,7 +271,8 @@ enum FolderOpsAction {
     Audit { local_path: Option<String> },
 }
 
-/// add-advanced-sync-operations section 3.
+/// Introducer trust flags, scoped auto-accept policies, and introduction
+/// proposal/accept/reject.
 #[derive(Subcommand)]
 enum IntroduceAction {
     /// Mark (or, with `--unset`, unmark) a device as a trusted introducer.
@@ -335,7 +329,8 @@ enum AutoAcceptPolicyAction {
     },
 }
 
-/// add-automatic-updates task 5.1-5.4.
+/// Check update status, trigger a manual check/install, and configure
+/// automatic checks/install.
 #[derive(Subcommand)]
 enum UpdateAction {
     /// Print current version, channel, install source, last check,
@@ -476,10 +471,9 @@ enum IgnoreAction {
     List { link_path: std::path::PathBuf },
     /// Test whether a path is ignored by the inferred link root's rules.
     Test { path: std::path::PathBuf },
-    /// add-advanced-sync-operations task 5.2: explain why a path is (or
-    /// isn't) ignored — the winning rule's text, source file, `#include`
-    /// chain, line number, and case-sensitivity mode, using the exact
-    /// same evaluator `test` uses.
+    /// Explain why a path is (or isn't) ignored — the winning rule's text,
+    /// source file, `#include` chain, line number, and case-sensitivity
+    /// mode, using the exact same evaluator `test` uses.
     Explain { path: std::path::PathBuf },
 }
 
@@ -571,9 +565,9 @@ enum ShareAction {
     },
     /// Revoke a device's access to one folder group, or (given a single
     /// argument) revoke one edge listed by `share list` by its edge id —
-    /// add-cross-account-sharing's `yadorilink share revoke <edge>` form,
-    /// which also works for a cross-account edge and can be issued by
-    /// either the group owner or the invitee (see `share revoke-edge`'s
+    /// the `yadorilink share revoke <edge>` form, which also works for a
+    /// cross-account edge and can be issued by either the group owner or
+    /// the invitee (see `share revoke-edge`'s
     /// underlying `RevokeShareEdge` RPC). Takes effect promptly for a
     /// currently-connected peer (bounded, sub-second propagation target)
     /// rather than only on its next poll: if the two devices still share
@@ -587,13 +581,12 @@ enum ShareAction {
         group_name_or_edge: String,
         device_id: Option<String>,
     },
-    /// add-cross-account-sharing: mint a one-time, expiring invite so
-    /// another account can gain access to this folder group. Prints the
-    /// plaintext code exactly once — transmit it out-of-band to the
-    /// invitee, who redeems it with `share accept <code>`. Accepting
-    /// widens the trust boundary: the invitee's device becomes a fully
-    /// authorized peer with a direct WireGuard tunnel to this group's
-    /// other devices (see design.md's "Trust boundary widens" risk note).
+    /// Mint a one-time, expiring invite so another account can gain access
+    /// to this folder group. Prints the plaintext code exactly once —
+    /// transmit it out-of-band to the invitee, who redeems it with `share
+    /// accept <code>`. Accepting widens the trust boundary: the invitee's
+    /// device becomes a fully authorized peer with a direct WireGuard
+    /// tunnel to this group's other devices.
     Invite {
         group_name: String,
         /// `read` or `write`; defaults to `write` (matches the ACL
@@ -604,18 +597,18 @@ enum ShareAction {
         #[arg(long)]
         expires: Option<String>,
     },
-    /// add-cross-account-sharing: redeem a share-invite code under this
-    /// device's own account. Requires a device already registered on this
-    /// machine (`yadorilink device register`).
+    /// Redeem a share-invite code under this device's own account.
+    /// Requires a device already registered on this machine (`yadorilink
+    /// device register`).
     Accept {
         code: String,
     },
-    /// add-cross-account-sharing: list every ACL edge visible to this
-    /// account — folder groups it owns, and its own devices' shares
-    /// (including cross-account edges accepted from another account).
+    /// List every ACL edge visible to this account — folder groups it
+    /// owns, and its own devices' shares (including cross-account edges
+    /// accepted from another account).
     List,
-    /// add-untrusted-storage-peer task 4.3: designate (or un-designate,
-    /// with `--unset`) `device_id` as storage-only/untrusted for
+    /// Designate (or un-designate, with `--unset`) `device_id` as
+    /// storage-only/untrusted for
     /// `group_name`. The device must already have an ACL edge for this
     /// group (e.g. via `share grant`) — this only flips the storage-only
     /// flag on an existing grant. A storage-only device never receives the
@@ -638,8 +631,8 @@ enum DaemonAction {
     Stop,
     Pause,
     Resume,
-    /// add-observability-and-metrics task 4.2: view/toggle the daemon's
-    /// opt-in `/metrics` endpoint. Persists to the same config directory
+    /// View/toggle the daemon's opt-in `/metrics` endpoint. Persists to
+    /// the same config directory
     /// the daemon itself reads at startup (`metrics_config.json`) — a
     /// change here takes effect on the daemon's *next* start, not the
     /// currently-running process (binding a new listener isn't something
@@ -661,7 +654,8 @@ enum DaemonAction {
     },
 }
 
-/// add-file-version-history task 6.3.
+/// List and recover deleted files still within their link's retention
+/// window.
 #[derive(Subcommand)]
 enum TrashAction {
     /// List deleted files still within their link's retention window.
@@ -677,10 +671,10 @@ async fn main() {
     let result = run(cli.command).await;
     if let Err(e) = result {
         eprintln!("error: {e}");
-        // add-oss-usage-error-reporting task 4.5: a reportable failure
-        // gets a local-only candidate plus a hint, entirely after the
-        // fact — this never changes `e`/the exit code below, and makes
-        // no network call (see `commands::report::handle_reportable_error`).
+        // A reportable failure gets a local-only candidate plus a hint,
+        // entirely after the fact — this never changes `e`/the exit code
+        // below, and makes no network call (see
+        // `commands::report::handle_reportable_error`).
         if e.is_reportable() {
             commands::report::handle_reportable_error(&e).await;
         }
@@ -951,7 +945,7 @@ fn prompt_password(prompt: &str) -> Result<String, CliError> {
 
 /// Prompts for `label` twice (masked) and requires both entries to match --
 /// shared by the new-password flow (`Register`) and the new-passphrase flow
-/// (`export-key-bundle`, add-account-recovery task 3.1).
+/// (`export-key-bundle`).
 fn prompt_confirmed(label: &str) -> Result<String, CliError> {
     let value = prompt_password(&format!("{label}: "))?;
     let confirm = prompt_password(&format!("Confirm {}: ", label.to_lowercase()))?;

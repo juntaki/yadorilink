@@ -350,10 +350,9 @@ fn get_unchecked_is_not_slower_than_verified_get_on_a_large_block() {
     );
 }
 
-// --- add-resource-governance task 3.6: disk-pressure preflight regression
-// tests -----------------------------------------------------------------
+// --- Disk-pressure preflight regression tests -----------------------------
 
-/// task 3.6: a block write that would breach headroom is rejected with
+/// A block write that would breach headroom is rejected with
 /// `DiskPressure` and writes nothing — forced deterministically by
 /// configuring a headroom override far larger than any real disk's free
 /// space, rather than depending on this test environment's actual free
@@ -391,7 +390,7 @@ fn put_never_rejects_when_headroom_enforcement_is_not_enabled() {
     store.put(b"still succeeds").unwrap();
 }
 
-/// task 3.6: identical content already on disk is still a dedup no-op even
+/// identical content already on disk is still a dedup no-op even
 /// under disk pressure — no *new* bytes need to be written, so the
 /// preflight check must not block it.
 #[test]
@@ -405,7 +404,7 @@ fn put_dedup_no_op_succeeds_even_under_disk_pressure() {
     assert_eq!(second, hash);
 }
 
-/// task 1.5: `DiskPressure` must be distinguishable from a transient I/O
+/// `DiskPressure` must be distinguishable from a transient I/O
 /// error by callers (e.g. to back off differently) rather than being folded
 /// into the generic `Io` variant.
 #[test]
@@ -418,7 +417,7 @@ fn disk_pressure_is_not_confused_with_a_transient_io_error() {
     assert!(matches!(err, yadorilink_local_storage::StorageError::DiskPressure { .. }));
 }
 
-/// task 3.6 / 1.3: `free_space` reflects the same override-driven
+/// / 1.3: `free_space` reflects the same override-driven
 /// classification `put`'s preflight uses, live-updating as the configured
 /// override changes — always computed from real disk state (not dependent
 /// on `headroom_enforced`, since status reporting should show real health

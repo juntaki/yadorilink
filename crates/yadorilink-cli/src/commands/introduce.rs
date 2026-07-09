@@ -1,6 +1,5 @@
-//! `add-advanced-sync-operations` section 3 (Device Introduction): CLI
-//! surface for introducer trust flags, scoped auto-accept policies, and
-//! introduction proposal/accept/reject flows — talks directly to the
+//! CLI surface for introducer trust flags, scoped auto-accept policies,
+//! and introduction proposal/accept/reject flows — talks directly to the
 //! coordination plane's `IntroductionService` (mirrors `share.rs`'s own
 //! direct-to-coordination pattern, since this is account/ACL-scoped state
 //! the daemon doesn't own).

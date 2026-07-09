@@ -1,8 +1,7 @@
-//! add-file-version-history tasks 6.1-6.4: `versions`/`restore`/`trash
-//! list`/`trash restore`/`link retention` — the CLI surface for
-//! `yadorilink-daemon/src/control_socket.rs`'s new `ListVersions`/
-//! `RestoreVersion`/`ListTrash`/`RestoreTrash`/`SetRetentionPolicy`
-//! handlers (task 5.2). Mirrors `commands/materialization.rs`'s
+//! `versions`/`restore`/`trash list`/`trash restore`/`link retention` —
+//! the CLI surface for `yadorilink-daemon/src/control_socket.rs`'s
+//! `ListVersions`/`RestoreVersion`/`ListTrash`/`RestoreTrash`/
+//! `SetRetentionPolicy` handlers. Mirrors `commands/materialization.rs`'s
 //! by-absolute-path resolution pattern (pin/unpin/evict), since these
 //! commands resolve the same way over the same control socket.
 
@@ -26,7 +25,7 @@ fn absolute_path(local_path: &str) -> Result<String, CliError> {
         .or_else(|_| Ok(local_path.to_string()))
 }
 
-/// task 6.1: `yadorilink versions <path>` — every retained version,
+/// `yadorilink versions <path>` — every retained version,
 /// newest first, including the current one (spec "List versions of a
 /// file").
 pub async fn versions(local_path: String) -> Result<(), CliError> {
@@ -58,7 +57,7 @@ fn version_line(v: &FileVersionInfo) -> String {
     )
 }
 
-/// task 6.2: `yadorilink restore <path> [--version <id>]` — an omitted
+/// `yadorilink restore <path> [--version <id>]` — an omitted
 /// `--version` resolves daemon-side to the most recent superseded version
 /// (spec "Restore without a version defaults to the most recent superseded
 /// version"). A missing-blocks failure (`SyncError::VersionContentUnavailable`)
@@ -84,7 +83,7 @@ pub async fn restore(local_path: String, version: Option<i64>) -> Result<(), Cli
     Ok(())
 }
 
-/// task 6.3: `yadorilink trash list` — every deleted file still within its
+/// `yadorilink trash list` — every deleted file still within its
 /// link's retention window.
 pub async fn trash_list() -> Result<(), CliError> {
     let resp = control_client::send(ReqPayload::ListTrash(ListTrashRequest {})).await?;
@@ -112,7 +111,7 @@ fn trashed_file_line(f: &TrashedFileInfo) -> String {
     )
 }
 
-/// task 6.3: `yadorilink trash restore <path>` — recovers a deleted file's
+/// `yadorilink trash restore <path>` — recovers a deleted file's
 /// last version before deletion as a new current version; the file becomes
 /// live again.
 pub async fn trash_restore(local_path: String) -> Result<(), CliError> {
@@ -122,7 +121,7 @@ pub async fn trash_restore(local_path: String) -> Result<(), CliError> {
     Ok(())
 }
 
-/// task 6.4: `yadorilink link retention <path> --keep-versions <n>
+/// `yadorilink link retention <path> --keep-versions <n>
 /// --keep-days <t>` — adjusts an already-linked folder's retention policy
 /// in place, effective on the next retention-expiry sweep without
 /// unlinking (spec "Adjust retention policy on an existing link"). See
@@ -150,7 +149,7 @@ pub async fn link_retention(
 mod tests {
     use super::*;
 
-    /// task 6.5: `versions` output shape — one line per version, newest
+    /// `versions` output shape — one line per version, newest
     /// first is the daemon's own ordering contract (`SyncState::list_versions`'s
     /// doc comment), this just checks the per-line rendering.
     #[test]

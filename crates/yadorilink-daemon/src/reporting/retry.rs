@@ -1,10 +1,9 @@
-//! Task 3.5: daemon-side queue retry. Periodically attempts to submit
-//! every report still sitting in the local queue (`QueueStore`), guarded
-//! by consent state, endpoint availability, and `SubmissionClient`'s own
-//! rate limit — this module never makes a network decision on its own
-//! that bypasses those checks (see design.md D1/D6 and point 4 of this
-//! change's implementation notes: reuse `ConsentStore`/`SubmissionClient`
-//! rather than a second consent-check path).
+//! Daemon-side queue retry. Periodically attempts to submit every report
+//! still sitting in the local queue (`QueueStore`), guarded by consent
+//! state, endpoint availability, and `SubmissionClient`'s own rate limit —
+//! this module never makes a network decision on its own that bypasses
+//! those checks; it reuses `ConsentStore`/`SubmissionClient` rather than
+//! adding a second consent-check path.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,11 +13,11 @@ use yadorilink_reporting::submission::SubmissionClient;
 
 use crate::daemon_state::DaemonState;
 
-/// How often the background sweep runs. Reports aren't time-sensitive
-/// (design.md D6: submission is explicit/asynchronous and must never
-/// block sync), so a coarse interval is fine — this is a background
-/// safety net for "the user opted into retry and the endpoint was
-/// temporarily down," not a hot path.
+/// How often the background sweep runs. Reports aren't time-sensitive —
+/// submission is explicit/asynchronous and must never block sync — so a
+/// coarse interval is fine. This is a background safety net for "the
+/// user opted into retry and the endpoint was temporarily down," not a
+/// hot path.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// A queued entry stops being retried automatically after this many
@@ -43,13 +42,13 @@ pub struct RetrySweepOutcome {
 /// `spawn_periodic`); exposed standalone so tests can call it directly
 /// without waiting on `SWEEP_INTERVAL`.
 ///
-/// Consent is re-checked here, not cached from anywhere else (task 3.5's
-/// "guarded by consent state"): `queue_retry_enabled` must be on and an
-/// endpoint (`consent.endpoint_override`) must be configured, or this
-/// returns immediately having made zero calls into `client` — no
-/// `client.submit` call is reachable from this function unless both are
-/// true, which is what task 3.6's "no network submission when consent is
-/// disabled" test exercises.
+/// Consent is re-checked here, not cached from anywhere else: guarded by
+/// consent state, `queue_retry_enabled` must be on and an endpoint
+/// (`consent.endpoint_override`) must be configured, or this returns
+/// immediately having made zero calls into `client` — no `client.submit`
+/// call is reachable from this function unless both are true, which is
+/// what the "no network submission when consent is disabled" test below
+/// exercises.
 pub async fn run_retry_sweep_once(
     state: &DaemonState,
     client: &SubmissionClient,
@@ -75,8 +74,8 @@ pub async fn run_retry_sweep_once(
         // A per-report-type consent check on top of `queue_retry_enabled`
         // above: opting into retrying already-queued *usage* reports
         // doesn't imply consent to auto-submit *error* reports, and vice
-        // versa (design.md D4: "automatic error submission requires
-        // explicit opt-in separate from usage-summary opt-in").
+        // versa — automatic error submission requires explicit opt-in
+        // separate from usage-summary opt-in.
         let allowed = match entry.report_type {
             ReportType::Usage => consent.usage_submission_enabled,
             ReportType::Error => consent.error_submission_enabled,
@@ -112,9 +111,9 @@ pub async fn run_retry_sweep_once(
     outcome
 }
 
-/// Spawns the recurring background sweep (task 3.5) as a supervised task
-/// (REL-8 pattern — logged, not restarted: a panic here would indicate a
-/// real bug, not a transient condition worth restarting into).
+/// Spawns the recurring background sweep as a supervised task — logged,
+/// not restarted, since a panic here would indicate a real bug, not a
+/// transient condition worth restarting into.
 pub fn spawn_periodic(state: Arc<DaemonState>) {
     crate::supervise::spawn_logged("reporting-queue-retry", async move {
         let Ok(client) = SubmissionClient::with_default_config() else {
@@ -186,12 +185,11 @@ mod tests {
         .unwrap()
     }
 
-    /// Task 3.6: the core "no network submission when consent is
-    /// disabled" proof for the retry path — a real local HTTP listener
-    /// (`wiremock`) with no mock registered, so a request would 404 if it
-    /// arrived, and `queue_retry_enabled: false` (the default). Asserts
-    /// zero requests reached the endpoint, not just an assertion on
-    /// internal state.
+    /// The core "no network submission when consent is disabled" proof
+    /// for the retry path — a real local HTTP listener (`wiremock`) with
+    /// no mock registered, so a request would 404 if it arrived, and
+    /// `queue_retry_enabled: false` (the default). Asserts zero requests
+    /// reached the endpoint, not just an assertion on internal state.
     #[tokio::test]
     async fn retry_sweep_makes_no_network_call_when_queue_retry_consent_is_disabled() {
         let _guard = TEST_MUTEX.lock().await;
@@ -221,7 +219,8 @@ mod tests {
 
     /// Same as above, but with `queue_retry_enabled` on and no endpoint
     /// configured — still zero requests, since "no endpoint" must be free
-    /// (mirrors `yadorilink-reporting::submission`'s own task 5.4 test).
+    /// (mirrors `yadorilink-reporting::submission`'s own test for the
+    /// same behavior).
     #[tokio::test]
     async fn retry_sweep_makes_no_network_call_when_no_endpoint_is_configured() {
         let _guard = TEST_MUTEX.lock().await;

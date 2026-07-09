@@ -93,8 +93,8 @@ const RESOURCE_EXHAUSTION_MARKER: &str = "RESOURCE_EXHAUSTION: ";
 /// has strictly more in-flight forwarding work per round (each adopted
 /// record re-enters `send_index_update` on both of the adopting device's
 /// sessions), so the same self-echo re-index churn this project has
-/// already root-caused (`fix-duplicate-conflict-copy-on-reresolution`) has
-/// more opportunities to fire per round here, not fewer.
+/// already root-caused has more opportunities to fire per round here, not
+/// fewer.
 const ROUND_PROGRESSION_GATE: Duration = Duration::from_secs(75);
 const FINAL_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -1202,8 +1202,7 @@ fn run_in_madsim(seed: u64, ops_per_run: usize) -> Result<(), String> {
     // Generous margin above `FINAL_CONVERGENCE_TIMEOUT` (90s) plus rounds'
     // own settle time: a 3-node mesh has more forwarding hops per round
     // than the two-device harness, so its own known ~30s hydration-
-    // timeout churn (`fix-duplicate-conflict-copy-on-reresolution`) has
-    // more chances to fire per run, not fewer.
+    // timeout churn has more chances to fire per run, not fewer.
     rt.set_time_limit(Duration::from_secs(180));
     rt.set_allow_system_thread(true);
     rt.block_on(run_scenario(seed, ops_per_run)).map_err(|e| {

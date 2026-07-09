@@ -1,4 +1,4 @@
-//! build-filebox-mvp task 9.4: a classic `IContextMenu` handler (shows
+//! A classic `IContextMenu` handler (shows
 //! under Explorer's "Show more options" on Windows 11's default menu,
 //! or as a primary entry pre-11/with the classic-menu policy) exposing
 //! View Status / Pause / Resume / Pin / Evict, calling
@@ -33,9 +33,9 @@ enum Command {
     Resume = 2,
     Pin = 3,
     Evict = 4,
-    /// add-desktop-status-app task 4.3 (shell-integration spec's "Shell
-    /// Actions Can Open Desktop Status App"): kept out of `COMMANDS` below
-    /// since it's a pure UI action (spawns a companion process) rather
+    /// Per the shell-integration spec's "Shell Actions Can Open Desktop
+    /// Status App": kept out of `COMMANDS` below since it's a pure UI
+    /// action (spawns a companion process) rather
     /// than a daemon `ContextAction` — see `QueryContextMenu`/
     /// `InvokeCommand`'s special-cased handling of this id.
     OpenStatusApp = 5,
@@ -49,7 +49,7 @@ const COMMANDS: [(Command, &str, ContextAction); 5] = [
     (Command::Evict, "Evict (free disk space)", ContextAction::EvictItem),
 ];
 
-/// task 4.3: the status app binary's install location, mirroring how
+/// the status app binary's install location, mirroring how
 /// `installer/windows/yadorilink.iss` installs `yadorilink.exe`/
 /// `yadorilink-daemon.exe` flat into `{app}` (`%ProgramFiles%\yadorilink`).
 const STATUS_APP_EXE_NAME: &str = "yadorilink-status-app.exe";
@@ -158,8 +158,8 @@ impl IContextMenu_Impl for ContextMenuHandler_Impl {
                 );
                 let _ = position; // position tracking only matters for InsertMenuW above
             }
-            // add-desktop-status-app task 4.3: appended after the daemon
-            // actions above, same "yadorilink: " label prefix convention.
+            // Appended after the daemon actions above, same
+            // "yadorilink: " label prefix convention.
             // Not part of `COMMANDS` — see `Command::OpenStatusApp`'s doc
             // comment.
             let wide: Vec<u16> =
@@ -187,8 +187,8 @@ impl IContextMenu_Impl for ContextMenuHandler_Impl {
             }
             let cmd_offset = info.lpVerb.0 as usize as u32;
             if cmd_offset == Command::OpenStatusApp as u32 {
-                // add-desktop-status-app task 4.3: a pure UI action (spawn
-                // a companion process), not a daemon `ContextAction` — see
+                // A pure UI action (spawn a companion process), not a
+                // daemon `ContextAction` — see
                 // `Command::OpenStatusApp`'s doc comment. Fails soft: a
                 // missing/unlaunchable status app never surfaces an error
                 // to Explorer (shell-integration spec's "App is

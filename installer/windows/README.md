@@ -55,8 +55,8 @@ powershell -ExecutionPolicy Bypass -File installer\windows\build-installer.ps1
 
 The resulting installer is written to `installer\windows\Output\yadorilink-setup.exe`,
 with `installer\windows\Output\yadorilink-setup.exe.sha256` always written next
-to it (release or interim, signed or unsigned — see
-add-release-artifact-verification).
+to it (release or interim, signed or unsigned — every downloadable release
+artifact gets a published checksum).
 
 `yadorilink.iss` locates the four binaries via `BinDir`/`ShellExtDir`
 preprocessor constants that default to the standard build layout above

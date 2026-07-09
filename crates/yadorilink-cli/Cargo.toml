@@ -41,12 +41,7 @@ serde_json = "1"
 rpassword = "7"
 # Passphrase-encrypted key-bundle export/import is entirely client-side
 # per the zero-knowledge design -- these four are only ever used from
-# `commands/account.rs`, never sent to the
-# coordination plane. Versions match the same crates already used
-# elsewhere in the workspace (argon2/rand/hex match
-# yadorilink-coordination's Cargo.toml; zeroize matches
-# yadorilink-transport's) except `chacha20poly1305`, which is new to the
-# workspace -- no existing crate does AEAD encryption yet.
+# `commands/account.rs`, never sent to the coordination plane.
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 rand = "0.8"
@@ -61,14 +56,9 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
     "rustls-tls",
     "json",
 ] }
-# Battle-tested OAuth 2.0 client (RFC 6749 Authorization Code + PKCE per
-# RFC 7636, RFC 8628 Device Authorization Grant) for `google_auth.rs` --
-# deliberately NOT hand-rolled: JWT/OAuth request-building and response
-# parsing is exactly the kind of auth-adjacent code better left to a
-# maintained library than reimplemented, unlike the earlier Argon2id/WASM
-# situation where an established dependency (`hash-wasm`) turned out to be
-# actively incompatible with the target runtime and hand-rolling was the
-# only option. Same rustls-tls choice as this crate's own `reqwest` dep.
+# OAuth 2.0 client (RFC 6749 Authorization Code + PKCE per RFC 7636,
+# RFC 8628 Device Authorization Grant) for `google_auth.rs`. Same
+# rustls-tls choice as this crate's own `reqwest` dep.
 oauth2 = { version = "5", optional = true, default-features = false, features = ["reqwest", "rustls-tls"] }
 # Matches yadorilink-daemon's existing version pin -- only needed to encode
 # WireGuard public keys as base64 for HTTP coordination service JSON routes

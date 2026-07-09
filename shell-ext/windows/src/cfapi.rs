@@ -1,10 +1,10 @@
-//! Windows Cloud Filter API (cfapi) integration — on-demand-sync tasks
-//! 6.1-6.3. Runs inside the `yadorilink-cfapi-host` binary (see Cargo.toml's
+//! Windows Cloud Filter API (cfapi) integration for on-demand sync.
+//! Runs inside the `yadorilink-cfapi-host` binary (see Cargo.toml's
 //! `[[bin]]` doc comment for why this is a separate process from the
 //! `yadorilink_shell_ext` COM DLL), not the shell extension DLL itself.
 //!
 //! Scope/known limitations, stated up front rather than discovered late:
-//! - MVP hydrates whole files only (design.md Non-Goals: no byte-range
+//! - MVP hydrates whole files only (no byte-range
 //!   hydration), so the sync root's `Hydration` policy is `FULL` and the
 //!   fetch-data callback always serves the entire file regardless of the
 //!   OS-requested range.
@@ -27,15 +27,14 @@
 //!   real content by reconstructing to a temp file and rename-replacing
 //!   the target (`yadorilink_sync_core::chunker::reconstruct_file`) — this
 //!   was written and tested against the platform-neutral placeholder
-//!   representation (design D2) on a non-Windows dev machine, not against
+//!   representation on a non-Windows dev machine, not against
 //!   a real cfapi reparse-point placeholder. A rename-replace over a file
 //!   with an in-flight `CF_CALLBACK_TYPE_FETCH_DATA` callback is expected
 //!   to work (the placeholder's reparse point and sparse ranges are
 //!   simply replaced by an ordinary, fully-present file, which is a
 //!   documented-valid way for a provider to "finish" a placeholder), but
 //!   this specific interaction has NOT been exercised against a live
-//!   Explorer file-open on real hardware — see this change's tasks.md
-//!   section 6.7 notes.
+//!   Explorer file-open on real hardware.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -60,7 +59,7 @@ use windows::Win32::Storage::CloudFilters::{
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO};
 use yadorilink_ipc_proto::shellipc::MaterializationState;
 
-/// Fixed provider identity (task 6.1). Namespace-derived, like the
+/// Fixed provider identity. Namespace-derived, like the
 /// overlay CLSIDs in `overlay.rs` — a real release would hand-pick and
 /// never regenerate this, since `CfRegisterSyncRoot` ties a sync root's
 /// registration to this GUID.
@@ -116,16 +115,16 @@ fn unix_nanos_to_filetime_ticks(unix_nanos: i64) -> i64 {
     unix_nanos / 100 + UNIX_EPOCH_IN_FILETIME_TICKS
 }
 
-/// Registers `local_path` as a Cloud Filter API sync root (task 6.1) and
-/// connects it, wiring up the `CF_CALLBACK_TYPE_FETCH_DATA` handler (task
-/// 6.3). Idempotent-ish: `CfRegisterSyncRoot` itself tolerates
+/// Registers `local_path` as a Cloud Filter API sync root and
+/// connects it, wiring up the `CF_CALLBACK_TYPE_FETCH_DATA` handler.
+/// Idempotent-ish: `CfRegisterSyncRoot` itself tolerates
 /// re-registering the same root (it's meant to be called on every
 /// provider startup, not just the first time — this is the documented
 /// pattern, not a workaround).
 ///
-/// Hydration policy is `FULL` (whole-file only, matching design.md's
-/// Non-Goals — no partial/byte-range hydration in this MVP) and
-/// population policy is `PARTIAL` (the provider, not the OS, controls
+/// Hydration policy is `FULL` (whole-file only — no partial/byte-range
+/// hydration in this MVP) and population policy is `PARTIAL` (the
+/// provider, not the OS, controls
 /// which files are placeholders vs. fully present, which is exactly the
 /// OnDemand model).
 pub fn register_and_connect(local_path: &Path) -> WinResult<()> {
@@ -200,7 +199,7 @@ pub fn disconnect(local_path: &Path) -> WinResult<()> {
     unsafe { CfDisconnectSyncRoot(windows::Win32::Storage::CloudFilters::CF_CONNECTION_KEY(key)) }
 }
 
-/// Unregisters a sync root (task 6.6's uninstall path).
+/// Unregisters a sync root, typically used during uninstallation.
 ///
 /// `CfUnregisterSyncRoot` is documented to fail with
 /// `ERROR_CLOUD_FILE_INVALID_REQUEST` if a sync provider is still
@@ -208,9 +207,9 @@ pub fn disconnect(local_path: &Path) -> WinResult<()> {
 /// VM) — this disconnects first if *this process* holds a connection for
 /// `local_path`. It does NOT reach into another process's connection:
 /// the real long-lived `yadorilink-cfapi-host` process holds the actual
-/// production connection, so callers driving the uninstall flow (task
-/// 6.6's `install.ps1`) must stop that process/its Scheduled Task before
-/// calling this, not after — a connection is tied to process lifetime,
+/// production connection, so callers driving the uninstall flow must
+/// stop that process or its Scheduled Task before calling this,
+/// not after — a connection is tied to process lifetime,
 /// so stopping the process itself also tears down its connection.
 pub fn unregister(local_path: &Path) -> WinResult<()> {
     let _ = disconnect(local_path);
@@ -218,7 +217,7 @@ pub fn unregister(local_path: &Path) -> WinResult<()> {
     unsafe { CfUnregisterSyncRoot(PCWSTR::from_raw(path_wide.as_ptr())) }
 }
 
-/// Creates a cfapi placeholder for one file (task 6.2). `relative_path`
+/// Creates a cfapi placeholder for one file. `relative_path`
 /// is forward-slash-separated (matching the shell-IPC wire format);
 /// converted to backslashes here. The immediate parent directory is
 /// created as an ordinary directory if missing (see module doc's
@@ -285,13 +284,13 @@ pub fn create_placeholder(
     entries[0].Result.ok()
 }
 
-/// The `CF_CALLBACK_TYPE_FETCH_DATA` handler (task 6.3): invoked by the
+/// The `CF_CALLBACK_TYPE_FETCH_DATA` handler, invoked by the
 /// Cloud Filter driver, on an OS threadpool thread, whenever an
 /// application's read reaches a dehydrated range of a placeholder under
 /// one of this process's connected sync roots. Must always end by calling
 /// `CfExecute(..., CF_OPERATION_TYPE_TRANSFER_DATA, ...)` — that call is
 /// what unblocks the application's blocked `ReadFile`, whether hydration
-/// succeeded or not (design D5: a bounded failure, never a hang).
+/// succeeded or not (: a bounded failure, never a hang).
 unsafe extern "system" fn fetch_data_callback(
     callback_info: *const CF_CALLBACK_INFO,
     callback_parameters: *const CF_CALLBACK_PARAMETERS,
@@ -398,7 +397,7 @@ mod tests {
     /// `CfUnregisterSyncRoot` calls against a real directory on whatever
     /// machine runs it, independent of the daemon or CLI (no
     /// coordination-plane login needed) — the narrowest possible
-    /// real-cfapi-runtime check for tasks 6.1/6.2. `#[ignore]`d since it
+    /// real-cfapi-runtime check. `#[ignore]`d since it
     /// touches real OS state; run explicitly with `cargo test --release
     /// -- --ignored cfapi_smoke_test` on a disposable Windows machine.
     #[test]

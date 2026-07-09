@@ -23,17 +23,16 @@ pub mod local_discovery {
 pub mod daemonctl {
     tonic::include_proto!("yadorilink.daemonctl.v1");
 
-    /// add-update-migration-safety task 1.1: this crate's own control-
-    /// protocol version marker — bump it whenever a change to this wire
-    /// format needs the daemon/CLI to actively distinguish "I'm talking to
-    /// an old peer" rather than relying on protobuf's ordinary
-    /// unknown-field/zero-default forward compatibility alone (e.g. a
-    /// request variant that isn't safe to silently ignore). Every
-    /// `DaemonControlRequest`/`DaemonControlResponse` carries this via its
-    /// own `protocol_version`/`daemon_protocol_version` field (see those
-    /// fields' doc comments in `daemon_control.proto`) so either side can
-    /// tell a genuinely pre-versioning peer (field absent, decodes as 0)
-    /// apart from a peer that's simply one version behind.
+    /// This crate's own control-protocol version marker — bump it whenever
+    /// a change to this wire format needs the daemon/CLI to actively
+    /// distinguish "I'm talking to an old peer" rather than relying on
+    /// protobuf's ordinary unknown-field/zero-default forward compatibility
+    /// alone (e.g. a request variant that isn't safe to silently ignore).
+    /// Every `DaemonControlRequest`/`DaemonControlResponse` carries this via
+    /// its own `protocol_version`/`daemon_protocol_version` field (see
+    /// those fields' doc comments in `daemon_control.proto`) so either side
+    /// can tell a genuinely pre-versioning peer (field absent, decodes as
+    /// 0) apart from a peer that's simply one version behind.
     pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
 }
 
@@ -64,10 +63,9 @@ mod tests {
         assert_eq!(decoded.compression, Compression::None as i32);
     }
 
-    /// add-untrusted-storage-peer task 5's wire-compat discipline (mirrors
-    /// `old_block_response_bytes_decode_as_uncompressed` above): a
-    /// `BlockResponse` encoded by a pre-encryption build never sets
-    /// `is_ciphertext`/`ciphertext_nonce`, so it decodes as ordinary
+    /// This mirrors `old_block_response_bytes_decode_as_uncompressed`
+    /// above: a `BlockResponse` encoded by a pre-encryption build never
+    /// sets `is_ciphertext`/`ciphertext_nonce`, so it decodes as ordinary
     /// plaintext — a peer that adds this code never needs to worry about
     /// misinterpreting old traffic as ciphertext.
     #[test]
@@ -127,7 +125,7 @@ mod tests {
         assert!(decoded.storage_only_group_ids.is_empty());
     }
 
-    /// task 3.1: an `EncryptedFileEntry`'s `encrypted_file_meta` round-trips
+    /// an `EncryptedFileEntry`'s `encrypted_file_meta` round-trips
     /// as opaque bytes — this crate doesn't know or care about AEAD, only
     /// that the wire type carries arbitrary ciphertext bytes faithfully.
     #[test]
@@ -176,13 +174,12 @@ mod tests {
         assert_eq!(decoded.compression, Compression::None as i32);
     }
 
-    /// add-update-migration-safety task 1.1/2.3, spec "Old CLI talks to
-    /// newer daemon": a `DaemonControlRequest` built the way every CLI
-    /// build before this change built one — only `payload` set, no
-    /// `protocol_version` field at all — decodes with `protocol_version ==
-    /// 0`, not an error and not some other sentinel. A current daemon must
-    /// treat that 0 as "pre-versioning client," never as a literal invalid
-    /// version number.
+    /// Covers the "old CLI talks to newer daemon" scenario: a
+    /// `DaemonControlRequest` built the way every CLI build before this
+    /// change built one — only `payload` set, no `protocol_version` field
+    /// at all — decodes with `protocol_version == 0`, not an error and not
+    /// some other sentinel. A current daemon must treat that 0 as
+    /// "pre-versioning client," never as a literal invalid version number.
     #[test]
     fn old_daemon_control_request_bytes_decode_with_zero_protocol_version() {
         let old_format = DaemonControlRequest {

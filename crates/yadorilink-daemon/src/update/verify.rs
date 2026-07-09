@@ -1,15 +1,14 @@
-//! add-automatic-updates task 1.4: downloaded-artifact verification —
-//! SHA-256 checksum (against the signed manifest entry's
-//! `artifact_sha256`) and platform publisher-signature verification
-//! hooks for macOS and Windows.
+//! Downloaded-artifact verification — SHA-256 checksum (against the
+//! signed manifest entry's `artifact_sha256`) and platform
+//! publisher-signature verification hooks for macOS and Windows.
 //!
 //! This is deliberately independent of, and in addition to, the manifest
-//! signature check in `manifest::verify_and_parse` — design.md's "Signed
-//! Manifest Plus Platform Signature" decision: the manifest signature
-//! protects metadata (which artifact URL/checksum is claimed for this
-//! version); this module protects the artifact bytes themselves, using
-//! exactly the same checks this repo's release tooling already performs
-//! by hand (`scripts/ci/generate-release-checksums.py`'s SHA-256 sidecar
+//! signature check in `manifest::verify_and_parse`: the manifest
+//! signature protects metadata (which artifact URL/checksum is claimed
+//! for this version); this module protects the artifact bytes
+//! themselves, using exactly the same checks this repo's release
+//! tooling already performs by hand
+//! (`scripts/ci/generate-release-checksums.py`'s SHA-256 sidecar
 //! convention, `installer/macos/verify-pkg.sh`'s `pkgutil`/`spctl`
 //! checks, `installer/windows/verify-installer.ps1`'s
 //! `Get-AuthenticodeSignature` check) — reused here as the fail-closed,
@@ -77,7 +76,7 @@ impl CommandRunner for SystemCommandRunner {
     }
 }
 
-/// macOS platform-signature verification (task 1.4): reuses exactly the
+/// macOS platform-signature verification: reuses exactly the
 /// checks `installer/macos/verify-pkg.sh` already performs by hand —
 /// `pkgutil --check-signature` (any signed status) plus `spctl -a -vvv -t
 /// install` (Gatekeeper's own install-time verdict) — and additionally
@@ -130,7 +129,7 @@ pub fn verify_macos_signature(
     Ok(())
 }
 
-/// Windows platform-signature verification (task 1.4): shells out to
+/// Windows platform-signature verification: shells out to
 /// PowerShell's `Get-AuthenticodeSignature`, mirroring
 /// `installer/windows/verify-installer.ps1` exactly, and requires
 /// `Status` to be `Valid` plus (when pinned) the signer certificate
@@ -234,8 +233,8 @@ mod tests {
         }
     }
 
-    /// task 1.5 "fail-closed" proof #1: a downloaded artifact whose bytes
-    /// don't match the manifest-declared checksum is genuinely rejected.
+    /// "Fail-closed" proof #1: a downloaded artifact whose bytes don't
+    /// match the manifest-declared checksum is genuinely rejected.
     #[test]
     fn tampered_artifact_fails_checksum_verification() {
         let dir = tempfile::tempdir().unwrap();
@@ -272,8 +271,8 @@ mod tests {
         assert!(matches!(result, Err(VerifyError::Io(_))));
     }
 
-    /// task 1.5 "fail-closed" proof #2: an unsigned artifact (pkgutil
-    /// reports "no signature") is rejected outright.
+    /// "Fail-closed" proof #2: an unsigned artifact (pkgutil reports
+    /// "no signature") is rejected outright.
     #[test]
     fn macos_unsigned_artifact_is_rejected() {
         let mut responses = std::collections::HashMap::new();
@@ -299,7 +298,7 @@ mod tests {
     /// A pinned expected identity that doesn't appear in the signing
     /// authority is rejected even though the package is otherwise validly
     /// signed and Gatekeeper-accepted — this is the "wrong-publisher
-    /// artifact is refused" case from tasks.md 4.4.
+    /// artifact is refused" case.
     #[test]
     fn macos_wrong_publisher_identity_is_rejected() {
         let mut responses = std::collections::HashMap::new();
@@ -338,7 +337,7 @@ mod tests {
     }
 
     /// The Windows mirror of `macos_wrong_publisher_identity_is_rejected`
-    /// (tasks.md 4.4's "Windows wrong-publisher artifact is refused").
+    /// (the "Windows wrong-publisher artifact is refused" case).
     #[test]
     fn windows_wrong_publisher_identity_is_rejected() {
         let mut responses = std::collections::HashMap::new();

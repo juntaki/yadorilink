@@ -30,7 +30,7 @@ use yadorilink_sync_core::watcher::{
 use crate::daemon_state::DaemonState;
 use crate::error::DaemonError;
 
-/// fix-materialization-disk-index-divergence: how often each link's
+/// How often each link's
 /// background task re-runs `materialization::repair_interrupted_
 /// materializations` during live operation, not just at daemon startup —
 /// defense-in-depth against whatever bug might leave a `Hydrated` index
@@ -44,7 +44,7 @@ use crate::error::DaemonError;
 /// overhead against normal sync traffic.
 const MATERIALIZATION_REPAIR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// add-folder-direction-modes: small shared helper, same shape as
+/// Small shared helper, same shape as
 /// `yadorilink_sync_core::peer_session`'s private `now_unix_nanos` (that
 /// one isn't `pub`, and this module has no other reason to depend on
 /// `peer_session` directly) — used to timestamp `receive_only_changed`
@@ -56,8 +56,7 @@ fn now_unix_nanos() -> i64 {
         .unwrap_or(0)
 }
 
-/// fix-local-edit-swallowed-by-self-echo-race task 1.1's chosen plumbing:
-/// lets `yadorilink_sync_core::peer_session::PeerSyncSession::
+/// Lets `yadorilink_sync_core::peer_session::PeerSyncSession::
 /// reconcile_one_file` force this specific link's debounce accumulator to
 /// flush and index any pending, undispatched local change for one path
 /// *before* a peer's write or tombstone for that same path is
@@ -90,15 +89,15 @@ pub struct LinkFlushHandle {
 }
 
 /// Bounded wait for `LinkFlushHandle::flush_pending_local_change`'s round
-/// trip to this link's debounce accumulator — design.md's Risk section:
-/// this must never block a peer message handler indefinitely if the
-/// accumulator task is somehow stalled or backlogged. A single bounded
-/// wait, not a jittered multi-attempt retry like `peer_session`'s
-/// `RECONCILE_RETRY_*`: there's nothing transient to retry against here
-/// (either the accumulator answers almost instantly, since it's just a
-/// `HashMap` lookup/removal, or something is genuinely wrong with it), and
-/// retrying an already-timed-out request would only compound the delay on
-/// this critical path.
+/// trip to this link's debounce accumulator: this must never block a peer
+/// message handler indefinitely if the accumulator task is somehow
+/// stalled or backlogged. A single bounded wait, not a jittered
+/// multi-attempt retry like `peer_session`'s `RECONCILE_RETRY_*`: there's
+/// nothing transient to retry against here (either the accumulator
+/// answers almost instantly, since it's just a `HashMap` lookup/removal,
+/// or something is genuinely wrong with it), and retrying an
+/// already-timed-out request would only compound the delay on this
+/// critical path.
 const FORCE_FLUSH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl LinkFlushHandle {
@@ -130,11 +129,10 @@ impl LinkFlushHandle {
                 None
             }
         };
-        // fix-local-change-lost-under-registration-mutex-contention (scope
-        // widened during scenario 5's investigation — see design.md's
-        // Decisions section): a `None` reply here means the debounce
-        // accumulator has nothing queued for this path, but that no longer
-        // means there is nothing local to protect — a brand-new file
+        // Scope widened during scenario 5's investigation: a `None` reply
+        // here means the debounce accumulator has nothing queued for this
+        // path, but that no longer means there is nothing local to
+        // protect — a brand-new file
         // inside a brand-new, not-yet-watched directory can still be
         // genuinely *undiscovered* at this point (no `FsChangeEvent` for
         // it has ever been produced, so it was never a candidate to be
@@ -175,8 +173,7 @@ impl LinkFlushHandle {
         }
     }
 
-    /// fix-case-fold-sibling-local-change-not-flushed-before-reconcile:
-    /// like `flush_pending_local_change` above, but looks for a *different*
+    /// Like `flush_pending_local_change` above, but looks for a *different*
     /// pending path in this link's debounce accumulator that case-fold-
     /// collides with `rel_path` (same parent directory, case-equal final
     /// component, different exact bytes) rather than `rel_path` itself.
@@ -192,8 +189,8 @@ impl LinkFlushHandle {
     /// entirely: the incoming record for the other case-variant
     /// materializes for real (no hazard detected, because the sibling
     /// wasn't indexed yet) instead of being held, exactly the kind of
-    /// artifact-free silent overwrite `fix-local-edit-swallowed-by-
-    /// self-echo-race` already closed for the exact-same-path case.
+    /// artifact-free silent overwrite already closed for the
+    /// exact-same-path case.
     ///
     /// Deliberately no `capture_undiscovered_local_change` fallback here
     /// (unlike `flush_pending_local_change`): that fallback exists for a
@@ -264,7 +261,7 @@ impl LinkFlushHandle {
         }
     }
 
-    /// fix-resume-does-not-flush-pending-local-changes: drains and indexes
+    /// Drains and indexes
     /// *every* currently-pending, undispatched local change in this link's
     /// debounce accumulator — called by `resume_link` immediately before
     /// it snapshots this link's current state to broadcast on resume.
@@ -330,8 +327,7 @@ impl LinkFlushHandle {
         }
     }
 
-    /// fix-local-change-lost-under-registration-mutex-contention: the
-    /// debounce-accumulator flush above (`FlushPathRequest`) only ever
+    /// The debounce-accumulator flush above (`FlushPathRequest`) only ever
     /// recovers a local change that some path has already been turned
     /// into an `FsChangeEvent` and queued for — i.e. one the watcher (or
     /// `watcher::reconcile_new_directory_subtree`'s own discovery
@@ -352,7 +348,7 @@ impl LinkFlushHandle {
     /// permanently destroying a genuine local edit with no conflict ever
     /// detected (see `directory_conflict_matrix.rs`'s
     /// `concurrently_creating_same_named_directory_with_a_conflicting_
-    /// file_inside`, and this change's design.md).
+    /// file_inside`).
     ///
     /// `LocalChangeProcessor::process_event` re-derives everything
     /// (`FsChangeKind`, content/blocks/mtime) directly from disk
@@ -494,7 +490,7 @@ pub fn start_link_watch(
     start_link_watch_with_source(state, local_path, group_id, Arc::new(RealFolderWatchSource))
 }
 
-/// add-deterministic-sync-testing: same as `start_link_watch`, but takes
+/// Same as `start_link_watch`, but takes
 /// an explicit `FolderWatchSource` so a DST scenario can substitute a
 /// synthetic event source in place of the real OS filesystem watcher,
 /// while every other production code path below (debounce, indexing,
@@ -525,11 +521,11 @@ pub fn start_link_watch_with_source(
 
     let (flush_tx, mut flush_rx) =
         tokio::sync::mpsc::channel(debounce::DEFAULT_EXECUTOR_CHANNEL_CAPACITY);
-    // fix-local-edit-swallowed-by-self-echo-race task 1.1: a small
+    // A small
     // channel is enough — a targeted flush request is a single in-flight
     // round trip per racing path, not a backlog like `flush_tx` above.
     let (flush_request_tx, flush_request_rx) = tokio::sync::mpsc::channel(4);
-    // fix-resume-does-not-flush-pending-local-changes: same sizing
+    // Same sizing
     // rationale as `flush_request_tx` above — a single in-flight round
     // trip per resume, not a backlog.
     let (flush_all_request_tx, flush_all_request_rx) = tokio::sync::mpsc::channel(4);
@@ -560,7 +556,7 @@ pub fn start_link_watch_with_source(
             let group_id = executor_group_id.clone();
             let root = executor_root.clone();
             let ignore_set = executor_ignore_set.clone();
-            // add-automatic-updates task 2.4: the initial scan chunks and
+            // The initial scan chunks and
             // indexes every not-already-current file — a genuine
             // sync-critical write, held for the guard's whole duration
             // (including the `spawn_blocking` await) so an update install
@@ -574,7 +570,7 @@ pub fn start_link_watch_with_source(
         match scan_result {
             Ok(Ok(records)) => {
                 // One batched broadcast for the whole initial scan
-                // (batch-sync-optimizations design D5) instead of one
+                // (batch-sync-optimizations ) instead of one
                 // peer message per pre-existing file.
                 announce_local_change(
                     &executor_state,
@@ -616,7 +612,7 @@ pub fn start_link_watch_with_source(
                 flush
             };
             if burst_fallback {
-                // design D8: every fallback trigger is logged, not silent.
+                // : every fallback trigger is logged, not silent.
                 tracing::warn!(
                     local_path = %executor_local_path,
                     group_id = %executor_group_id,
@@ -636,7 +632,7 @@ pub fn start_link_watch_with_source(
             // without requiring the future/closure to be `'static` (unlike
             // `spawn_blocking`, it can run in place, so no extra `Arc`
             // clones are needed here).
-            // add-automatic-updates task 2.4: every flush chunks/indexes
+            // Every flush chunks/indexes
             // touched files (or runs a full reconciliation scan) — held
             // across the whole `block_in_place`/`block_on` call so an
             // update install never starts mid-flush.
@@ -693,7 +689,7 @@ pub fn start_link_watch_with_source(
         .await;
     });
 
-    // fix-local-edit-swallowed-by-self-echo-race task 1.1: registered
+    // Registered
     // before the tasks below are handed to `link_tasks` so a peer session
     // can never observe a `link_tasks` entry for this link without a
     // matching flush handle also being reachable.
@@ -710,7 +706,7 @@ pub fn start_link_watch_with_source(
         }),
     );
 
-    // fix-materialization-disk-index-divergence: periodic live repair
+    // Periodic live repair
     // pass — see MATERIALIZATION_REPAIR_INTERVAL's doc comment. First
     // tick is after one full interval (tokio::time::interval's default),
     // not immediately, since the startup repair pass in main.rs already
@@ -817,7 +813,7 @@ pub async fn resume_link(
     else {
         return Ok(());
     };
-    // fix-resume-does-not-flush-pending-local-changes: closes the gap this
+    // Closes the gap this
     // fn's own doc comment doesn't cover -- a change still sitting
     // undispatched in the debounce accumulator (not yet even in
     // `SyncState`) at the moment of resume isn't part of the backlog
@@ -839,9 +835,9 @@ pub async fn resume_link(
     Ok(())
 }
 
-/// add-file-version-history task 2.4: runs `SyncState::expire_superseded_
+/// Runs `SyncState::expire_superseded_
 /// and_trashed_versions` for every currently-registered link, using each
-/// link's own retention policy — the periodic sweep design D2 requires
+/// link's own retention policy — the periodic sweep requires
 /// ("a version exceeding both retention_max_versions and
 /// retention_max_age_days is swept"). Bounded and synchronous (SQLite
 /// calls only, no network I/O), matching this module's other maintenance
@@ -892,13 +888,13 @@ pub fn run_retention_expiry_sweep(state: &DaemonState) {
     }
 }
 
-/// add-disk-reconcile-backstop: a periodic, filesystem-watcher-event-
+/// A periodic, filesystem-watcher-event-
 /// *independent* disk-authoritative reconcile — the eventual-consistency
 /// backstop for a local write whose OS watcher event never arrives at all
 /// (e.g. an FSEvents blind window opened by `watch()` tearing down and
-/// recreating its entire event stream — see `watcher.rs`'s module doc, and
-/// `openspec/changes/investigate-rename-to-identical-name-non-convergence/
-/// design.md`'s confirmed root cause for `taguchi_v3` row 8). No
+/// recreating its entire event stream — see `watcher.rs`'s module doc;
+/// this was the confirmed root cause of a `taguchi_v3` row 8
+/// non-convergence). No
 /// watcher-triggered recovery (the registrar's own `reconcile_new_
 /// directory_subtree` safety net) can reach a loss like this one, since
 /// that safety net only ever walks a *newly-registered* directory — it
@@ -911,9 +907,9 @@ pub fn run_retention_expiry_sweep(state: &DaemonState) {
 /// changed, never tombstones an indexed file missing from disk. Those two
 /// operations mutate an already-known path and are the ones `watcher.rs`'s
 /// module doc documents as unsafe to run this often (they can re-derive or
-/// false-delete a file mid-conflict-resolution between two devices,
-/// reproduced deterministically against `fix-local-change-lost-under-
-/// registration-mutex-contention`). A file with no index row has never
+/// false-delete a file mid-conflict-resolution between two devices —
+/// reproduced deterministically against the registration-mutex-contention
+/// race that made this fallback necessary). A file with no index row has never
 /// been broadcast or adopted by a peer, so indexing it carries none of
 /// that hazard — it's byte-for-byte what a live create event would have
 /// done.
@@ -971,8 +967,8 @@ pub async fn run_disk_reconcile_backstop_sweep(state: &Arc<DaemonState>) {
     }
 }
 
-/// add-folder-direction-modes task 4.1: changes `local_path`'s directional
-/// mode and triggers the rescan/reconcile design.md requires — "the new
+/// Changes `local_path`'s directional
+/// mode and triggers the rescan/reconcile this needs — "the new
 /// gating and divergence sets are recomputed against current on-disk and
 /// peer state, rather than waiting for the next incidental FS or index
 /// event." Two things happen, deliberately distinct from `override_link`/
@@ -1030,15 +1026,15 @@ pub async fn set_link_mode_and_reconcile(
     Ok(())
 }
 
-/// add-folder-direction-modes task 3.1: `override` (send-only only) — the
-/// explicit action design.md describes as "broadcast the local records for
-/// the out-of-sync paths through the normal local-change path, clearing
-/// the out-of-sync set. Local wins." Unlike `set_link_mode_and_reconcile`
-/// above, this *does* resolve content divergence — deliberately, since the
-/// user explicitly asked for it. Returns the number of paths reconciled.
+/// `override` (send-only only) — the explicit action of "broadcast the
+/// local records for the out-of-sync paths through the normal
+/// local-change path, clearing the out-of-sync set. Local wins." Unlike
+/// `set_link_mode_and_reconcile` above, this *does* resolve content
+/// divergence — deliberately, since the user explicitly asked for it.
+/// Returns the number of paths reconciled.
 ///
 /// Rejected (not silently no-op) when the link isn't `send-only`, or is
-/// paused — pause "trumps everything regardless of mode" (design.md), so
+/// paused — pause trumps everything regardless of mode, so
 /// broadcasting here would be a silent no-op while still clearing the
 /// out-of-sync set, falsely reporting the divergence as resolved when the
 /// peer never actually received anything.
@@ -1078,18 +1074,18 @@ pub async fn override_link(
     Ok(paths.len() as u64)
 }
 
-/// add-folder-direction-modes task 3.2: `revert` (receive-only only) — the
-/// explicit action design.md describes as "discard the un-sent local
-/// changes for the locally-changed paths and re-pull the peer-authoritative
-/// state, clearing the receive-only-changed set. Peer wins."
+/// `revert` (receive-only only) — the explicit action of "discard the
+/// un-sent local changes for the locally-changed paths and re-pull the
+/// peer-authoritative state, clearing the receive-only-changed set. Peer
+/// wins."
 ///
 /// **Judgment call, documented rather than papered over**: this crate's
 /// peer-sync wire protocol (`yadorilink-ipc-proto`'s `sync.proto`) is
 /// push-only — a peer sends a full index once per connection
 /// (`PeerSyncSession::run`) and an `IndexUpdate` whenever its own state
 /// changes; there is no "give me your current record for this path"
-/// request message, and per proposal.md's explicit non-goals this change
-/// must not touch "how bytes move" or add new wire mechanics. So "re-pull
+/// request message, and this action must not touch "how bytes move"
+/// or add new wire mechanics. So "re-pull
 /// the peer-authoritative state" cannot mean a synchronous fetch here.
 /// Instead, this **discards this device's local causal claim** for each
 /// locally-changed path by resetting its version vector to empty
@@ -1141,15 +1137,15 @@ pub async fn revert_link(
 
 /// Broadcasts a batch of locally-indexed changes to connected peers as one
 /// wire message per peer (unless the link is paused — task 6.8; batch
-/// broadcast is batch-sync-optimizations design D5), and pushes one
+/// broadcast is batch-sync-optimizations ), and pushes one
 /// shell-extension status update per file regardless (task 8.5 — `StatusPush`
-/// stays per-file even when the peer-facing broadcast batches, design D5's
+/// stays per-file even when the peer-facing broadcast batches, 's
 /// explicit call-out: UI feedback and peer wire efficiency are different
 /// concerns). Shared by both the initial scan and the live watch loop.
 /// A no-op for an empty batch.
 ///
-/// add-folder-direction-modes task 2.2/2.3: a `receive-only` link never
-/// propagates a local modification (design.md's propagation-gating table)
+/// A `receive-only` link never
+/// propagates a local modification (per the propagation-gating rules)
 /// — gated here, alongside the pre-existing `paused` gate, since this is
 /// the one place every local change (watcher-driven and initial-scan
 /// alike) funnels through on its way to `DaemonState::broadcast_change`.
@@ -1181,8 +1177,8 @@ async fn announce_local_change(
     let mode = link.as_ref().map(|l| l.mode).unwrap_or(LinkMode::SendReceive);
 
     // Local changes are always indexed (task 6.8's "queued backlog");
-    // only *propagation* is gated — on pause (unchanged) and, per
-    // add-folder-direction-modes, on receive-only mode.
+    // only *propagation* is gated — on pause (unchanged) and on
+    // receive-only mode.
     if !paused {
         if mode == LinkMode::ReceiveOnly {
             let recorded_at = now_unix_nanos();
@@ -1291,7 +1287,7 @@ mod tests {
         }
     }
 
-    /// batch-sync-optimizations task 2.3 / design D5: `StatusPush` stays
+    /// batch-sync-optimizations task 2.3 / : `StatusPush` stays
     /// one-per-file for the shell extension even when the peer-facing
     /// broadcast batches many files into a single wire message — these
     /// are different concerns (local UI feedback vs. peer wire
@@ -1330,7 +1326,7 @@ mod tests {
             .is_err());
     }
 
-    /// add-folder-direction-modes task 2.2/5.1: a `receive-only` link never
+    /// A `receive-only` link never
     /// broadcasts a local change — `announce_local_change` must record it
     /// as receive-only-changed instead of calling `broadcast_change` (no
     /// connected peer sessions exist in this unit test, so any attempted
@@ -1365,7 +1361,7 @@ mod tests {
     }
 
     /// A `send-only` link's local changes are unaffected by
-    /// add-folder-direction-modes — only the *incoming* direction is gated
+    /// direction-mode gating — only the *incoming* direction is gated
     /// (in `yadorilink-sync-core::peer_session`, not here), so a send-only
     /// link's local edits keep broadcasting exactly like `send-receive`,
     /// and nothing is ever recorded as receive-only-changed for one.
@@ -1380,7 +1376,7 @@ mod tests {
         assert_eq!(state.sync_state.count_receive_only_changed("group-1").unwrap(), 0);
     }
 
-    /// add-folder-direction-modes task 3.1: `override` on a valid,
+    /// `override` on a valid,
     /// unpaused send-only link clears every out-of-sync path and reports
     /// how many it reconciled. No peer session is connected in this unit
     /// test (`broadcast_change` fans out over `state.sessions`, empty
@@ -1424,7 +1420,7 @@ mod tests {
         assert!(matches!(err, yadorilink_sync_core::SyncError::InvalidLinkMode(_)));
     }
 
-    /// add-folder-direction-modes task 3.2: `revert` on a valid, unpaused
+    /// `revert` on a valid, unpaused
     /// receive-only link voids the local causal claim (empty version
     /// vector) for every locally-changed path and clears the
     /// receive-only-changed set.
@@ -1467,7 +1463,7 @@ mod tests {
         assert!(matches!(err, yadorilink_sync_core::SyncError::InvalidLinkMode(_)));
     }
 
-    /// add-folder-direction-modes task 4.1: leaving `send-only` clears any
+    /// Leaving `send-only` clears any
     /// out-of-sync bookkeeping (no longer producible under the new mode);
     /// leaving `receive-only` clears receive-only-changed the same way.
     /// Switching mode while staying within the same divergence-producing
@@ -1519,7 +1515,7 @@ mod tests {
             .is_err());
     }
 
-    /// add-file-version-history task 2.4/2.5: the retention-expiry sweep
+    /// The retention-expiry sweep
     /// actually removes an aged-out superseded version, respecting each
     /// link's own configured retention policy — a real, if minimal,
     /// end-to-end proof that `DaemonState::new`'s periodic call reaches

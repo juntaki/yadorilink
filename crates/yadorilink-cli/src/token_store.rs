@@ -1,4 +1,4 @@
-//! OS-native credential store access (design.md D9) for coordination-plane
+//! OS-native credential store access for coordination-plane
 //! session tokens. `yadorilink-daemon` has its own read-only copy of the
 //! loader half, since it needs to authenticate its netmap stream using
 //! whatever the CLI most recently logged in with.

@@ -34,7 +34,7 @@ async fn connect() -> std::io::Result<tokio::net::UnixStream> {
     tokio::net::UnixStream::connect(crate::device_config::control_socket_path()).await
 }
 
-/// windows-local-ipc-support design D3: the daemon's `windows_transport`
+/// windows-local-ipc-support : the daemon's `windows_transport`
 /// pre-creates the next pipe instance before handing off each connection,
 /// so a fresh instance should almost always be waiting — but a burst of
 /// concurrent CLI invocations can still race it, so a busy pipe

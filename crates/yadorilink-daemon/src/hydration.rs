@@ -1,12 +1,12 @@
 //! Daemon-level orchestration for on-demand-sync's hydrate/pin/unpin/evict
-//! operations (design D4/D6): the sync-core primitives
+//! operations (D6): the sync-core primitives
 //! (`PeerSyncSession::fetch_block`, `materialization::evict_file`) are
 //! each scoped to one peer or pure local state — this module is what picks
 //! *which* connected peer(s) to hydrate from, and resolves a folder group
 //! to its local root path for the operations that need one.
 //!
-//! parallel-multi-peer-fetch design D1-D5: hydration no longer tries one
-//! whole-file transfer per peer sequentially. A file's missing blocks are
+//! D5: hydration no longer tries one whole-file transfer per
+//! peer sequentially. A file's missing blocks are
 //! partitioned across every currently-reachable, authorized peer session
 //! and fetched concurrently, with a block a peer reports not-found
 //! reassigned to a different peer rather than failing the whole attempt,
@@ -25,7 +25,7 @@ use yadorilink_sync_core::SyncError;
 
 use crate::daemon_state::DaemonState;
 
-/// A single deadline for the *entire* multi-session dispatch (design D4) —
+/// A single deadline for the *entire* multi-session dispatch () —
 /// supersedes what used to be `PeerSyncSession::hydrate_file`'s per-session
 /// timeout for the daemon-orchestrated hydration path. Same value as
 /// `PeerSyncSession::DEFAULT_HYDRATION_TIMEOUT` (unchanged budget, moved
@@ -89,10 +89,10 @@ const WORKER_IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from
 // per worker, so multiple lanes sharing one `peer_id` need no changes
 // there: each lane only ever resolves the specific block it itself popped.
 //
-// improve-transfer-performance task 1: PERF-5 originally fixed this lane
-// count at a flat constant (4) for every candidate, with no adaptation to
-// observed conditions — proposal.md's "Why": "fast links are throttled
-// below their capacity; slow/lossy links are pushed past theirs." The lane
+// PERF-5 originally fixed this lane count at a flat constant (4) for every
+// candidate, with no adaptation to observed conditions: "fast links are
+// throttled below their capacity; slow/lossy links are pushed past
+// theirs." The lane
 // count is now read per-candidate from `PeerSyncSession::fetch_window()`
 // (see that method's doc comment and `yadorilink_sync_core::
 // adaptive_window`) instead of this constant — each session's own AIMD
@@ -106,7 +106,7 @@ const WORKER_IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from
 // the actual call site.
 
 /// Shared, mutex-guarded work queue for multi-session block dispatch
-/// (design D2): tracks which blocks remain to fetch and, per block, which
+/// (): tracks which blocks remain to fetch and, per block, which
 /// candidate peer device ids have already tried and failed to provide it —
 /// so a not-found response reassigns the block to a different candidate
 /// instead of giving up, and a block every candidate has tried is
@@ -247,14 +247,13 @@ impl BlockWorkQueue {
 /// written to `block_store` as it arrives. Returns whatever couldn't be
 /// fetched from *any* candidate — empty if everything was retrieved.
 ///
-/// add-observability-and-metrics section 1/3: `progress` and
-/// `recent_errors` are the same lightweight, additive observation hooks
-/// described in `crate::transfer_progress`/`crate::recent_errors`'s own doc
-/// comments — this is the single choke point every block fetch for a file
-/// already passes through, so it's also where per-transfer progress,
-/// block-fetch latency, and a block-integrity mismatch are recorded,
-/// without otherwise changing this dispatcher's existing rate-limit/
-/// adaptive-window/reassignment behavior.
+/// `progress` and `recent_errors` are the same lightweight, additive
+/// observation hooks described in `crate::transfer_progress`/
+/// `crate::recent_errors`'s own doc comments — this is the single choke
+/// point every block fetch for a file already passes through, so it's
+/// also where per-transfer progress, block-fetch latency, and a
+/// block-integrity mismatch are recorded, without otherwise changing this
+/// dispatcher's existing rate-limit/adaptive-window/reassignment behavior.
 async fn fetch_blocks_from_sessions(
     group_id: &str,
     file_path: &str,
@@ -272,9 +271,9 @@ async fn fetch_blocks_from_sessions(
     let work = Arc::new(StdMutex::new(BlockWorkQueue::new(missing)));
 
     let mut workers = tokio::task::JoinSet::new();
-    // PERF-5 / improve-transfer-performance task 1: several lanes per
-    // candidate, not one — see the comment block above `BlockWorkQueue`
-    // for the original PERF-5 rationale. The lane count
+    // PERF-5: several lanes per candidate, not one — see the comment
+    // block above `BlockWorkQueue` for the original PERF-5 rationale. The
+    // lane count
     // itself is no longer a fixed constant: each session's own adaptive
     // window (`fetch_window`) decides how many lanes *that* candidate gets
     // this round, based on RTT/timeout signals observed on that session
@@ -322,10 +321,10 @@ async fn fetch_blocks_from_sessions(
                     }
                     (None, false) => break, // queue empty, nothing outstanding anywhere: truly done
                 };
-                // add-observability-and-metrics task 3.2: measured across
-                // the whole bounded attempt (success, not-found, request
-                // error, or timeout alike) — `yadorilink_block_fetch_seconds`
-                // is "how long a block-fetch round trip took," not just the
+                // Measured across the whole bounded attempt (success,
+                // not-found, request error, or timeout alike) —
+                // `yadorilink_block_fetch_seconds` is "how long a
+                // block-fetch round trip took," not just the
                 // successful-outcome subset.
                 let fetch_started = std::time::Instant::now();
                 let outcome = tokio::time::timeout(
@@ -359,10 +358,9 @@ async fn fetch_blocks_from_sessions(
                         };
                         match put_result {
                             Ok(Ok(_)) => {
-                                // task 1.1: counted as "done" only once the
-                                // block is actually durably stored, matching
-                                // design.md's "written to the block store as
-                                // it arrives."
+                                // counted as "done" only once the
+                                // block is actually durably stored — written
+                                // to the block store as it arrives.
                                 progress.record_block_done(&group_id, &file_path, data_len, &peer_id);
                                 work.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).resolve_fetched()
                             }
@@ -395,9 +393,8 @@ async fn fetch_blocks_from_sessions(
                         // block unrecoverable when it happens to be the
                         // only reachable holder.
                         //
-                        // improve-transfer-performance task 1.1: also feeds
-                        // this as a loss/timeout signal to the session's
-                        // own adaptive window (`fetch_window`'s doc
+                        // Also feeds this as a loss/timeout signal to the
+                        // session's own adaptive window (`fetch_window`'s doc
                         // comment) — `fetch_block`'s future was dropped by
                         // this very `tokio::time::timeout` the instant it
                         // fired, so the session itself never got a chance
@@ -427,7 +424,7 @@ async fn fetch_blocks_from_sessions(
 
 /// Hydrates `path` in `group_id` by partitioning its missing blocks across
 /// every currently-connected, authorized peer session and fetching
-/// concurrently (design D1-D5), bounded by one file-level
+/// concurrently (D5), bounded by one file-level
 /// `HYDRATION_TIMEOUT`. Reverts to `Placeholder` and returns
 /// `HydrationFailed` if the deadline elapses or any block remains
 /// unavailable from every candidate.
@@ -459,12 +456,12 @@ pub async fn hydrate_with_timeout(
             );
             Err(SyncError::HydrationFailed(path.to_string()))
         });
-    // add-observability-and-metrics section 2: every hydration failure
-    // (disk pressure, no reachable candidate, timed-out/incomplete fetch,
-    // or anything else `hydrate_inner` can return) lands in the recent-error
-    // ring buffer here, centrally — `SyncError::category`'s doc comment for
-    // why this is safe to record unconditionally (never derived from
-    // `Display`, so never a path/volume/hash).
+    // Every hydration failure (disk pressure, no reachable candidate,
+    // timed-out/incomplete fetch, or anything else `hydrate_inner` can
+    // return) lands in the recent-error ring buffer here, centrally —
+    // `SyncError::category`'s doc comment for why this is safe to record
+    // unconditionally (never derived from `Display`, so never a
+    // path/volume/hash).
     if let Err(e) = &result {
         state.recent_errors.record(e.category(), "hydration");
     }
@@ -476,10 +473,9 @@ async fn hydrate_inner(
     group_id: &str,
     path: &str,
 ) -> Result<(), SyncError> {
-    // add-automatic-updates task 2.4: hydration is a materialization
-    // write (block-store reads plus a `reconstruct_file` disk write) —
-    // held for this whole function's duration so an update install never
-    // starts mid-hydration.
+    // Hydration is a materialization write (block-store reads plus a
+    // `reconstruct_file` disk write) — held for this whole function's
+    // duration so an update install never starts mid-hydration.
     let _write_activity = state.begin_write_activity();
     let Some(record) = state.sync_state.get_file(group_id, path)? else {
         return Err(SyncError::NotFound(format!("file {group_id}/{path}")));
@@ -490,13 +486,13 @@ async fn hydrate_inner(
 
     let root = local_root_for_group(state, group_id)?;
 
-    // add-resource-governance task 3.2/4.2: disk-space preflight before
-    // hydration starts fetching anything at all, scoped to the volume
-    // hosting this link's local folder — checked before setting
-    // `Hydrating` (a link that's about to fail preflight shouldn't
-    // announce "hydrating" to a concurrent status query first) and before
-    // any peer is contacted, so disk pressure never wastes a network round
-    // trip. A no-op fast path when the daemon hasn't opted into headroom
+    // Disk-space preflight before hydration starts fetching anything at
+    // all, scoped to the volume hosting this link's local folder —
+    // checked before setting `Hydrating` (a link that's about to fail
+    // preflight shouldn't announce "hydrating" to a concurrent status
+    // query first) and before any peer is contacted, so disk pressure
+    // never wastes a network round trip. A no-op fast path when the
+    // daemon hasn't opted into headroom
     // enforcement at all — see
     // `DaemonState::disk_headroom_enforcement_enabled`'s doc comment for
     // why that's not just always-on (this same function is exercised
@@ -529,12 +525,12 @@ async fn hydrate_inner(
         .map(|(block, _)| block.clone())
         .collect();
 
-    // add-observability-and-metrics task 1.1: registers this file as an
-    // active transfer for the *missing* blocks only (already-present blocks
-    // never touch the network, so they're not part of "progress" toward
-    // completing this fetch) — torn down automatically (whatever the
-    // outcome) once `_progress_guard` drops at the end of this function or
-    // via the outer `hydrate_with_timeout` timeout cancelling this future.
+    // Registers this file as an active transfer for the *missing* blocks
+    // only (already-present blocks never touch the network, so they're
+    // not part of "progress" toward completing this fetch) — torn down
+    // automatically (whatever the outcome) once `_progress_guard` drops at
+    // the end of this function or via the outer `hydrate_with_timeout`
+    // timeout cancelling this future.
     let bytes_total: u64 = missing.iter().map(|b| b.size as u64).sum();
     let blocks_total = missing.len() as u64;
     let _progress_guard = state.transfer_progress.begin(group_id, path, bytes_total, blocks_total);
@@ -562,11 +558,11 @@ async fn hydrate_inner(
     let out_path = root.join(path);
     reconstruct_file(state.block_store.as_ref(), &out_path, &record.blocks)?;
     state.sync_state.set_materialization_state(group_id, path, MaterializationState::Hydrated)?;
-    // add-resource-governance: a snappier recovery signal beyond the
-    // periodic backoff re-check (task 3.5) — any successful hydration on
-    // this link proves its volume currently has headroom, so a stale
-    // Degraded entry (if any) can clear immediately rather than waiting
-    // out the next scheduled re-check. A no-op if the link wasn't degraded.
+    // A snappier recovery signal beyond the periodic backoff re-check
+    // (task 3.5) — any successful hydration on this link proves its
+    // volume currently has headroom, so a stale Degraded entry (if any)
+    // can clear immediately rather than waiting out the next scheduled
+    // re-check. A no-op if the link wasn't degraded.
     state.clear_link_degraded(&root.to_string_lossy());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -576,15 +572,14 @@ async fn hydrate_inner(
     Ok(())
 }
 
-/// add-resource-governance task 3.2/4.1/4.2: fails cleanly with
-/// `SyncError::DiskPressure` (and marks `group_id`'s link Degraded, task
-/// 3.4) if hydrating `path` (a write of `required_bytes`, the file's full
-/// size) would breach the configured headroom on the volume hosting
-/// `root`. Before failing, if `group_id`'s link is `OnDemand`, runs the
-/// disk-pressure-triggered eviction sweep (task 4.1) and re-checks once —
-/// giving it a chance to free enough space for the operation to still
-/// succeed (task 4.2's "sweep runs and completes before a pending
-/// hydration/materialization is failed").
+/// Fails cleanly with `SyncError::DiskPressure` (and marks `group_id`'s
+/// link Degraded, task 3.4) if hydrating `path` (a write of
+/// `required_bytes`, the file's full size) would breach the configured
+/// headroom on the volume hosting `root`. Before failing, if `group_id`'s
+/// link is `OnDemand`, runs the disk-pressure-triggered eviction sweep
+/// (task 4.1) and re-checks once — giving it a chance to free enough
+/// space for the operation to still succeed: the sweep runs and completes
+/// before a pending hydration/materialization is failed (task 4.2).
 fn preflight_disk_pressure(
     state: &DaemonState,
     group_id: &str,
@@ -598,7 +593,7 @@ fn preflight_disk_pressure(
         return Ok(());
     }
 
-    // task 4.1: the sweep only applies to (and only makes sense for) an
+    // the sweep only applies to (and only makes sense for) an
     // OnDemand link — an Eager link has no placeholder/hydrated-content
     // distinction to evict from.
     let is_on_demand = state
@@ -629,7 +624,7 @@ fn preflight_disk_pressure(
 }
 
 /// Pins `path`, hydrating it first (via the same multi-session dispatch as
-/// `hydrate`, design D5) if it isn't already `Hydrated`. If the file is
+/// `hydrate`, ) if it isn't already `Hydrated`. If the file is
 /// already `Hydrated`, this only sets the pin flag and never needs a peer
 /// at all.
 pub async fn pin(state: &Arc<DaemonState>, group_id: &str, path: &str) -> Result<(), SyncError> {
@@ -655,16 +650,16 @@ pub fn unpin(state: &DaemonState, group_id: &str, path: &str) -> Result<(), Sync
 /// Manually evicts `path` back to a placeholder (spec "Manual Eviction").
 /// Resolves `group_id` to its local root path via the registered link.
 pub fn evict(state: &DaemonState, group_id: &str, path: &str) -> Result<(), SyncError> {
-    // add-automatic-updates task 2.4: a block-store/materialization
-    // mutation, same as `hydrate_inner`'s guard above.
+    // A block-store/materialization mutation, same as `hydrate_inner`'s
+    // guard above.
     let _write_activity = state.begin_write_activity();
     let root = local_root_for_group(state, group_id)?;
     evict_file(&state.sync_state, &root, group_id, path)
 }
 
-// --- add-file-version-history section 3: restore engine ---
+// --- restore engine ---
 
-/// task 3.1-3.3: resolves `version_seq`'s content — verifying local
+/// 3.3: resolves `version_seq`'s content — verifying local
 /// presence of every block it references and, for any missing block,
 /// attempting a peer fetch scoped to those hashes via the same
 /// multi-session dispatch `hydrate` uses — and, on success, writes it to
@@ -716,10 +711,9 @@ async fn restore_to_version_inner(
     path: &str,
     version_seq: i64,
 ) -> Result<(), SyncError> {
-    // add-automatic-updates task 2.4: a materialization write
-    // (`reconstruct_file`) plus an index write, same treatment as
-    // `hydrate_inner`'s guard above; also covers `restore_trashed`, which
-    // calls through to this same function.
+    // A materialization write (`reconstruct_file`) plus an index write,
+    // same treatment as `hydrate_inner`'s guard above; also covers
+    // `restore_trashed`, which calls through to this same function.
     let _write_activity = state.begin_write_activity();
     // COR-5: restore both reads the current record (to compute the new
     // version vector correctly) and writes new content — the exact same
@@ -756,9 +750,9 @@ async fn restore_to_version_inner(
 
     if !missing.is_empty() {
         let candidates = candidate_sessions(state, group_id);
-        // add-observability-and-metrics task 1.1: a version restore is the
-        // same kind of block-fetch transfer as an ordinary hydration — see
-        // `hydrate_inner`'s identical `begin`/guard usage just above.
+        // A version restore is the same kind of block-fetch transfer as
+        // an ordinary hydration — see `hydrate_inner`'s identical
+        // `begin`/guard usage just above.
         let bytes_total: u64 = missing.iter().map(|b| b.size as u64).sum();
         let blocks_total = missing.len() as u64;
         let _progress_guard =
@@ -812,12 +806,12 @@ async fn restore_to_version_inner(
     Ok(())
 }
 
-/// task 3.4: restores a trashed file — the last version before its
+/// restores a trashed file — the last version before its
 /// deletion (`SyncState::list_trashed`'s own `version_seq`, always the
 /// *most recent* trashed row for `path` — see that method's doc comment)
 /// — as a new current version via `restore_to_version` above. The file
 /// becomes live again; the trashed row itself is left exactly as it was
-/// (design D3: restore never mutates existing version rows) — it simply
+/// (: restore never mutates existing version rows) — it simply
 /// stops being "the last version before the current tombstone" once a
 /// newer current version supersedes the tombstone.
 pub async fn restore_trashed(
@@ -909,9 +903,9 @@ mod tests {
         assert!(!block_data_matches(&wrong_size, data));
     }
 
-    /// parallel-multi-peer-fetch task 2.5: blocks split across two peers
-    /// each holding a disjoint subset resolve correctly — each peer only
-    /// ever pops blocks it hasn't tried yet, and different peers can pop
+    /// Blocks split across two peers each holding a disjoint subset
+    /// resolve correctly — each peer only ever pops blocks it hasn't
+    /// tried yet, and different peers can pop
     /// different blocks from the same queue without stepping on each other.
     #[test]
     fn disjoint_subsets_resolve_independently() {
@@ -1048,7 +1042,7 @@ mod tests {
         assert_eq!(result, missing, "with no candidate sessions, nothing can be fetched");
     }
 
-    // --- add-resource-governance task 3.6: disk-space preflight tests ---
+    // --- disk-space preflight tests (task 3.6) ---
 
     const GROUP: &str = "group-1";
     const PATH: &str = "big.bin";
@@ -1100,7 +1094,7 @@ mod tests {
         record
     }
 
-    /// task 3.6: a preflight that would breach headroom fails with
+    /// a preflight that would breach headroom fails with
     /// `DiskPressure` and marks the link Degraded — forced deterministically
     /// via a headroom override far larger than any real disk's free space
     /// (this crate's tests must not depend on the host machine's actual
@@ -1167,7 +1161,7 @@ mod tests {
         );
     }
 
-    /// task 4.3: a pinned file is never evicted by the disk-pressure sweep,
+    /// a pinned file is never evicted by the disk-pressure sweep,
     /// even when it's the only OnDemand content on a pressured volume.
     #[tokio::test]
     async fn preflight_disk_pressure_never_evicts_a_pinned_file() {
@@ -1215,7 +1209,7 @@ mod tests {
         );
     }
 
-    /// task 3.6: disk pressure on one file's preflight doesn't affect a
+    /// disk pressure on one file's preflight doesn't affect a
     /// second, independent file on an unrelated (unpressured) volume —
     /// modeled here as two calls with different headroom overrides against
     /// two different roots, since `preflight_disk_pressure` is inherently
@@ -1253,7 +1247,7 @@ mod tests {
         assert!(!state.is_link_degraded(&root_b.path().to_string_lossy()));
     }
 
-    // --- add-file-version-history section 3: restore engine ---
+    // --- restore engine ---
 
     /// Writes `data`'s block into `state`'s block store and returns the
     /// `BlockInfo` describing it — the restore tests' equivalent of
@@ -1287,9 +1281,9 @@ mod tests {
         }
     }
 
-    /// task 3.6: restoring a version whose blocks are all still present
+    /// restoring a version whose blocks are all still present
     /// locally succeeds without needing any peer, writes the restored
-    /// content to disk, and — the load-bearing assertion (design D3) —
+    /// content to disk, and — the load-bearing assertion () —
     /// creates a **new** version rather than mutating the one being
     /// restored: the original version-1 row is unchanged and still
     /// queryable, and the restored content becomes version 3 (not a
@@ -1395,7 +1389,7 @@ mod tests {
         assert!(!current.deleted, "the file must be live again after a trash restore");
     }
 
-    /// task 6.2: `yadorilink restore <path>` without `--version` resolves
+    /// `yadorilink restore <path>` without `--version` resolves
     /// to the most recent *superseded* version, not the current one (there
     /// would be nothing to restore *to* if it picked the current version)
     /// and not an older superseded version if a newer one exists.

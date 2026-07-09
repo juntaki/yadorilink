@@ -1,5 +1,5 @@
 # installer/windows: registers/unregisters yadorilink-status-app.exe (the
-# menu-bar/notification-area status app, add-desktop-status-app) as a
+# menu-bar/notification-area status app) as a
 # per-user Scheduled Task that starts at logon — mirrors daemon-task.ps1's
 # own approach for yadorilink-daemon.exe almost exactly (see that script's
 # comments for the full rationale on why a Scheduled Task rather than a
@@ -14,7 +14,7 @@
 #
 # UNVERIFIED IN THIS ENVIRONMENT: this script was written and syntax
 # checked (`Test-ScriptFileInfo`/parser-level) but never run against a
-# real Windows machine — add-desktop-status-app was implemented in a
+# real Windows machine — the status app was implemented in a
 # macOS-only sandbox with no Windows VM available this pass, unlike
 # daemon-task.ps1 and shell-ext/windows/install.ps1, which this project's
 # history says were verified against a real Windows 11 VM earlier. Treat

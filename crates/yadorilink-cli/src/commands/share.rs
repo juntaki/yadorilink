@@ -1,6 +1,6 @@
-/// add-cross-account-sharing D1: default invite lifetime when `--expires`
-/// is omitted — short enough to bound a leaked-but-unredeemed code's
-/// exposure window (see design.md's "Bearer invite codes" risk note).
+/// Default invite lifetime when `--expires` is omitted — short enough to
+/// bound a leaked-but-unredeemed code's exposure window (see the "Bearer
+/// invite codes" risk note).
 const DEFAULT_INVITE_TTL_SECS: i64 = 24 * 60 * 60;
 
 /// Parses a plain-integer-seconds or single-unit-suffixed duration ("30m",
@@ -404,10 +404,10 @@ mod grpc_impl {
         Ok(())
     }
 
-    /// add-cross-account-sharing: removes one ACL edge by the `edge_id` shown
-    /// by `share list`. Unlike [`revoke`] above (owner-only, same-account),
-    /// the underlying `RevokeShareEdge` RPC also allows the invitee side of a
-    /// cross-account share to remove their own access (design.md D2).
+    /// Removes one ACL edge by the `edge_id` shown by `share list`. Unlike
+    /// [`revoke`] above (owner-only, same-account), the underlying
+    /// `RevokeShareEdge` RPC also allows the invitee side of a
+    /// cross-account share to remove their own access.
     pub async fn revoke_edge(edge_id: String) -> Result<(), CliError> {
         let access_token = require_access_token()?;
         let mut client = ShareInviteServiceClient::new(coordination_channel().await?);
@@ -421,10 +421,9 @@ mod grpc_impl {
         Ok(())
     }
 
-    /// add-cross-account-sharing D1: mints a one-time, expiring invite for
-    /// `group_name`, scoped to `role`, and prints the plaintext code — the
-    /// only time it is ever shown, since the coordination plane persists only
-    /// a hash of it.
+    /// Mints a one-time, expiring invite for `group_name`, scoped to
+    /// `role`, and prints the plaintext code — the only time it is ever
+    /// shown, since the coordination plane persists only a hash of it.
     pub async fn invite(
         group_name: String,
         role: String,
@@ -460,9 +459,9 @@ mod grpc_impl {
         Ok(())
     }
 
-    /// add-cross-account-sharing D2: redeems `code` under this device's own
-    /// account (loaded from the local device config — see
-    /// `device_config::load`), creating a cross-account ACL edge.
+    /// Redeems `code` under this device's own account (loaded from the
+    /// local device config — see `device_config::load`), creating a
+    /// cross-account ACL edge.
     pub async fn accept(code: String) -> Result<(), CliError> {
         let access_token = require_access_token()?;
         let device_id = crate::device_config::load()
@@ -489,9 +488,9 @@ mod grpc_impl {
         Ok(())
     }
 
-    /// add-cross-account-sharing: lists every ACL edge visible to this
-    /// account (`ListShares`) — groups it owns, and its own devices' shares,
-    /// marking which edges are cross-account.
+    /// Lists every ACL edge visible to this account (`ListShares`) —
+    /// groups it owns, and its own devices' shares, marking which edges
+    /// are cross-account.
     pub async fn list_shares() -> Result<(), CliError> {
         let access_token = require_access_token()?;
         let mut client = ShareInviteServiceClient::new(coordination_channel().await?);
@@ -505,10 +504,10 @@ mod grpc_impl {
         Ok(())
     }
 
-    /// add-untrusted-storage-peer task 4.3: one `share list` line per ACL
-    /// edge, including a `[storage-only]` badge for any edge flagged
-    /// ciphertext-only (`ShareEdgeInfo.storage_only`, wired by the
-    /// coordination plane's `SetStorageOnly` RPC).
+    /// One `share list` line per ACL edge, including a `[storage-only]`
+    /// badge for any edge flagged ciphertext-only
+    /// (`ShareEdgeInfo.storage_only`, wired by the coordination plane's
+    /// `SetStorageOnly` RPC).
     fn share_edge_line(edge: &ShareEdgeInfo) -> String {
         let role = if edge.role == ShareRole::Read as i32 { "read" } else { "write" };
         let scope = if edge.cross_account { "cross-account" } else { "same-account" };
@@ -519,9 +518,8 @@ mod grpc_impl {
         )
     }
 
-    /// add-untrusted-storage-peer task 4.3: flags (or unflags, when `unset`)
-    /// `device_id` as storage-only/untrusted for `group_name`, via the
-    /// coordination plane's `SetStorageOnly` RPC.
+    /// Flags (or unflags, when `unset`) `device_id` as storage-only/untrusted
+    /// for `group_name`, via the coordination plane's `SetStorageOnly` RPC.
     pub async fn mark_storage_only(
         group_name: String,
         device_id: String,
@@ -574,8 +572,8 @@ mod grpc_impl {
             }
         }
 
-        /// add-untrusted-storage-peer task 4.3: `share list` shows a
-        /// `[storage-only]` badge for an edge flagged ciphertext-only.
+        /// `share list` shows a `[storage-only]` badge for an edge flagged
+        /// ciphertext-only.
         #[test]
         fn share_edge_line_shows_storage_only_badge_when_flagged() {
             let mut edge = base_edge();

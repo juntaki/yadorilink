@@ -1,7 +1,7 @@
-//! add-account-recovery: account-level recovery.
+//! Account-level recovery.
 //!
-//! Two entirely separate mechanisms live in this file, matching design.md's
-//! "two separable problems":
+//! Two entirely separate mechanisms live in this file, addressing two
+//! separable problems:
 //!
 //! - `generate_recovery_codes`/`reset_password` talk to the coordination
 //!   plane's `AuthService` (new `GenerateRecoveryCodes`/`ResetPassword`
@@ -35,10 +35,9 @@ const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
 
-// switch-coordination-auth-to-google-oidc: recovery codes and password
-// reset have no equivalent under Google OIDC login (there is no password
-// to reset) -- these commands exist only for the legacy gRPC transport,
-// already slated for decommission per migrate-coordination-plane-to-cloudflare.
+// Recovery codes and password reset have no equivalent under Google OIDC
+// login (there is no password to reset) -- these commands exist only for
+// the legacy gRPC transport, already slated for decommission.
 #[cfg(not(feature = "http-coordination"))]
 mod grpc_impl {
     use yadorilink_ipc_proto::coordination::auth_service_client::AuthServiceClient;
@@ -119,8 +118,8 @@ struct KeyBundleFile {
 
 /// What's actually encrypted inside the bundle: enough to re-establish this
 /// device's identity on a fresh machine and point it at the same
-/// coordination/relay endpoints. Per design.md this is deliberately just
-/// the device's WireGuard private key (its "content key" in this codebase
+/// coordination/relay endpoints. This is deliberately just the device's
+/// WireGuard private key (its "content key" in this codebase
 /// -- there is no separate per-file content-encryption key today; devices
 /// authenticate to each other and sync over a WireGuard tunnel keyed by
 /// this identity) plus the addressing the device needs to reconnect.
@@ -234,8 +233,7 @@ pub async fn import_key_bundle(input_path: PathBuf, passphrase: String) -> Resul
         device_id: plaintext.device_id.clone(),
         coordination_addr: plaintext.coordination_addr,
         relay_addr: plaintext.relay_addr,
-        // `save` always overwrites this with the current `CONFIG_VERSION`
-        // (add-update-migration-safety task 1.1).
+        // `save` always overwrites this with the current `CONFIG_VERSION`.
         config_version: 0,
     })?;
 
@@ -333,8 +331,7 @@ fn write_bundle_file(path: &Path, contents: &str) -> Result<(), CliError> {
 mod tests {
     use super::*;
 
-    /// task 5.1 "key-bundle export/import round-trips and is passphrase-
-    /// protected": exercises the encrypt/decrypt + (de)serialize path
+    /// exercises the encrypt/decrypt + (de)serialize path
     /// directly (without touching `device_config`/`keypair_path`, which are
     /// process-global paths export/import read from disk), which is the
     /// part of `export_key_bundle`/`import_key_bundle` worth a focused unit
@@ -390,10 +387,10 @@ mod tests {
 
     #[test]
     fn export_then_import_round_trips_through_real_files() {
-        // add-update-migration-safety: `YADORILINK_CONFIG_DIR` is
-        // process-global; serialize on `device_config`'s shared test lock
-        // so this doesn't race its own version-safety tests, which touch
-        // the same env var — see that lock's doc comment.
+        // `YADORILINK_CONFIG_DIR` is process-global; serialize on
+        // `device_config`'s shared test lock so this doesn't race its own
+        // version-safety tests, which touch the same env var — see that
+        // lock's doc comment.
         let _env_guard =
             crate::device_config::CONFIG_DIR_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();

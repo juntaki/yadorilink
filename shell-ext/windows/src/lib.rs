@@ -1,7 +1,7 @@
 //! build-filebox-mvp task 9.1 spike: a pure-Rust `windows-rs` COM
 //! implementation of `IShellIconOverlayIdentifier` for Windows Explorer's
-//! icon-overlay system (design.md D4's first-choice approach, before
-//! falling back to a C++/COM shim per task 9.2 if this proves unstable).
+//! icon-overlay system (the first-choice approach, before
+//! falling back to a C++/COM shim if this proves unstable).
 //!
 //! This crate is a shell extension DLL, loaded into every Explorer.exe
 //! process — it must never touch the network or storage directly (spec

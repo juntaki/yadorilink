@@ -28,10 +28,8 @@ reqwest = { version = "0.12", default-features = false, features = [
 tokio = { version = "1", default-features = false, features = ["time"] }
 
 [dev-dependencies]
-# Real local HTTP listener for mock-endpoint tests (mirrors
-# the "spin up a real listener on 127.0.0.1:0" pattern used elsewhere
-# in this workspace, e.g. yadorilink-coordination's test setup) —
-# dev-only, so it never affects this crate's own build footprint.
+# Real local HTTP listener for mock-endpoint tests -- dev-only, so it
+# never affects this crate's own build footprint.
 wiremock = "0.6"
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",

@@ -85,9 +85,9 @@ async fn send_batch_fallback(
 ) -> io::Result<usize> {
     let mut sent = 0;
     for datagram in datagrams {
-        // add-deterministic-sync-testing: see local_discovery.rs's
-        // equivalent comment — `madsim`'s simulated `UdpSocket::send_to`
-        // takes `(dst, buf)`, the reverse of real tokio's `(buf, dst)`.
+        // See local_discovery.rs's equivalent comment — `madsim`'s
+        // simulated `UdpSocket::send_to` takes `(dst, buf)`, the reverse
+        // of real tokio's `(buf, dst)`.
         #[cfg(not(madsim))]
         socket.send_to(datagram, addr).await?;
         #[cfg(madsim)]
@@ -97,10 +97,10 @@ async fn send_batch_fallback(
     Ok(sent)
 }
 
-/// add-deterministic-sync-testing: `async` (not a plain non-blocking
-/// call) so the same signature works whether or not the platform truly
-/// has a non-blocking `try_recv_from` — real tokio's `UdpSocket` does
-/// (used as-is below), `madsim`'s simulated `UdpSocket` doesn't, so that
+/// `async` (not a plain non-blocking call) so the same signature works
+/// whether or not the platform truly has a non-blocking `try_recv_from`
+/// — real tokio's `UdpSocket` does (used as-is below), `madsim`'s
+/// simulated `UdpSocket` doesn't, so that
 /// branch approximates "return immediately if nothing is ready yet" with
 /// a zero-duration `timeout` around the async `recv_from` instead. This
 /// method's sole caller (`peer_channel.rs::drain_ready_direct_datagrams`)

@@ -1,7 +1,6 @@
-//! Shared DST support (add-deterministic-sync-testing task group 4):
-//! the no-silent-data-loss invariant checker (design.md D3), expressed
-//! once here so every `tests/dst_*.rs` scenario asserts the same
-//! invariant rather than each hand-rolling its own ad hoc check.
+//! Shared DST support: the no-silent-data-loss invariant checker,
+//! expressed once here so every `tests/dst_*.rs` scenario asserts the
+//! same invariant rather than each hand-rolling its own ad hoc check.
 //!
 //! The invariant (`sync-deterministic-testing` spec's "No-Silent-Data-
 //! Loss Invariant Checker" requirement): a local write durably observed
@@ -46,7 +45,7 @@ struct ObservedWrite {
     /// gone, not silently lost. `None` until a scenario actually tracks
     /// per-device version vectors itself (single-device scenarios today
     /// have only one device's own monotonic ordering, which `seq`
-    /// already captures; multi-device scenarios, task group 5, should
+    /// already captures; multi-device scenarios should
     /// populate this from the real record's `FileRecord::version`).
     causal_evidence: Option<VersionVector>,
     /// Monotonic order within this run, used when `causal_evidence` is
@@ -56,7 +55,7 @@ struct ObservedWrite {
     seq: u64,
 }
 
-/// The "shadow oracle" (design.md D3): every local write/delete a
+/// The "shadow oracle": every local write/delete a
 /// scenario has durably delivered to the watcher/debounce boundary,
 /// keyed by path, retaining only the causally-latest entry per path.
 pub struct WriteOracle {
@@ -124,7 +123,7 @@ impl std::fmt::Display for InvariantViolation {
 /// no-silent-data-loss invariant. An empty result means the invariant
 /// held for everything this run observed.
 ///
-/// Today's check (single-device scenarios, task group 3/4): a durably
+/// Today's check (single-device scenarios): a durably
 /// observed write must be indexed, not deleted, with content matching
 /// what was written — the oracle already collapses to only the
 /// causally-latest write per path (`record_write`/`record_delete`
@@ -132,7 +131,7 @@ impl std::fmt::Display for InvariantViolation {
 /// write" branch is needed here. A durably observed delete must be
 /// indexed as deleted.
 ///
-/// Not yet checked (task group 5, once peer reconciliation is wired into
+/// Not yet checked (once peer reconciliation is wired into
 /// a DST scenario): the "superseded by a causally-later *remote* write
 /// per the version vector" and "present as a conflict-copy, not the
 /// live path" branches the full invariant allows — `ObservedWrite`'s
@@ -218,7 +217,7 @@ pub fn check_no_silent_data_loss(
 
 /// Formats a seed and its violations the way every scenario's panic
 /// message should, so a DST failure is always reproducible the same way
-/// (task spec's "Invariant violation fails the scenario" scenario:
+/// (the "Invariant violation fails the scenario" requirement:
 /// report the seed, the offending path, and the loss point).
 pub fn format_violations(seed: u64, violations: &[InvariantViolation]) -> String {
     let lines: Vec<String> = violations.iter().map(|v| format!("  - {v}")).collect();
@@ -229,11 +228,11 @@ pub fn format_violations(seed: u64, violations: &[InvariantViolation]) -> String
     )
 }
 
-/// task 4.4: validates the checker itself catches each way a write can
+/// validates the checker itself catches each way a write can
 /// be silently lost -- fabricating the index state directly (bypassing
 /// the debounce pipeline entirely) so each case is isolated and
 /// deterministic to set up, rather than relying on a real historical bug
-/// reproducing under this specific harness (task group 5's job, once
+/// reproducing under this specific harness (once
 /// peer reconciliation is wired into a DST scenario).
 #[cfg(test)]
 mod tests {

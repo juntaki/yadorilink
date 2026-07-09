@@ -1,12 +1,12 @@
-//! Block-store garbage collection (add-block-store-gc): idle-triggered and
-//! on-demand mark-and-sweep scheduling, daemon-wide "only one sweep at a
+//! Block-store garbage collection: idle-triggered and on-demand
+//! mark-and-sweep scheduling, daemon-wide "only one sweep at a
 //! time" coordination, and last-run bookkeeping for `yadorilink status`/
 //! `gc [--dry-run]`. Mirrors this crate's existing dispatch-module
 //! convention (`folder_ops`, `update_ipc`, `reporting_ipc`): this module
 //! owns the actual GC logic, `control_socket.rs` only translates to/from
 //! the wire types.
 //!
-//! design.md D1: liveness is computed fresh from the index
+//! Liveness is computed fresh from the index
 //! (`SyncState::live_block_hashes`) on every sweep rather than
 //! transactionally refcounted, so this module needs no persisted state of
 //! its own beyond simple bookkeeping counters (below) — a crash mid-sweep
@@ -22,17 +22,16 @@ use yadorilink_local_storage::GcReport;
 
 use crate::daemon_state::DaemonState;
 
-/// design.md D3: "comfortably larger than normal sync-burst duration" —
-/// the daemon must have seen no local-change/peer-reconciliation/
-/// hydration activity for at least this long before an idle-triggered
-/// sweep may run at all. A documented starting point (design.md's Open
-/// Questions explicitly leaves the exact constant to implementation), not
-/// a value tuned against production telemetry.
+/// "Comfortably larger than normal sync-burst duration" — the daemon must
+/// have seen no local-change/peer-reconciliation/hydration activity for
+/// at least this long before an idle-triggered sweep may run at all. A
+/// documented starting point (the exact constant is left to
+/// implementation), not a value tuned against production telemetry.
 pub const GC_IDLE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 
-/// design.md D2: "comfortably larger than the normal local-change/
-/// hydration processing latency between a block write and its index
-/// commit" — a stored block whose on-disk mtime is newer than this is
+/// "Comfortably larger than the normal local-change/hydration processing
+/// latency between a block write and its index commit" — a stored block
+/// whose on-disk mtime is newer than this is
 /// never swept even if it currently looks unreferenced, since the index
 /// row that will reference it may simply not have committed yet (every
 /// block-write path writes the block before the referencing index row
@@ -45,20 +44,20 @@ pub const GC_GRACE_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// daemon does go idle.
 pub const GC_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Daemon-wide GC coordination and last-run bookkeeping (tasks 3.2/3.4) —
+/// Daemon-wide GC coordination and last-run bookkeeping —
 /// one instance lives on `DaemonState`, shared by the idle scheduler and
 /// every on-demand `gc`/`gc --dry-run` request, so both go through the
 /// exact same mutual-exclusion and reporting state.
 pub struct GcState {
-    /// task 3.2: "only one sweep runs at a time daemon-wide" — claimed via
+    /// "only one sweep runs at a time daemon-wide" — claimed via
     /// `compare_exchange` in `run_sweep` regardless of which trigger (idle
     /// scheduler vs. on-demand IPC request) is attempting it, so an
     /// on-demand trigger firing mid-idle-sweep never starts a second,
-    /// concurrent sweep (task 3.5).
+    /// concurrent sweep.
     running: AtomicBool,
     /// Unix seconds of the last *real* (non-dry-run) sweep's completion;
     /// `0` if none has ever completed since this daemon's block store was
-    /// created (task 3.4).
+    /// created.
     last_run_unix: AtomicI64,
     last_blocks_deleted: AtomicU64,
     last_bytes_reclaimed: AtomicU64,
@@ -66,9 +65,9 @@ pub struct GcState {
     /// immediately after a real sweep (everything reclaimable as of that
     /// snapshot was just reclaimed), or left at the reported delete-set
     /// size after a `gc --dry-run` — going stale as new writes/deletes
-    /// happen until the next sweep/dry-run computes it again (design D4's
-    /// disclosed dry-run semantics: "modulo the ordinary passage of time
-    /// ... disclosed behavior, not a bug"). Backs
+    /// happen until the next sweep/dry-run computes it again (this is
+    /// disclosed dry-run behavior — modulo the ordinary passage of time —
+    /// not a bug). Backs
     /// `StatusResponse.gc_reclaimable_estimate_bytes`.
     reclaimable_estimate_bytes: AtomicU64,
 }
@@ -125,11 +124,11 @@ impl Drop for GcRunGuard<'_> {
 /// Why a requested sweep did not run (or did not complete).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GcTriggerError {
-    /// task 3.2/3.5: another sweep (idle-triggered or on-demand) is
+    /// Another sweep (idle-triggered or on-demand) is
     /// already in progress.
     AlreadyRunning,
-    /// proposal.md: GC "runs after sync activity quiesces or on an
-    /// explicit command, never mid-burst" — a sync-critical write
+    /// GC "runs after sync activity quiesces or on an explicit command,
+    /// never mid-burst" — a sync-critical write
     /// (`DaemonState::is_write_safe_point`) was in flight at the moment
     /// this sweep was attempted.
     SyncBurstInProgress,
@@ -159,14 +158,14 @@ fn now_unix() -> i64 {
     SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// task 3.2/4.2: runs one sweep (real or `--dry-run`) against this
+/// Runs one sweep (real or `--dry-run`) against this
 /// daemon's block store, enforcing both daemon-wide invariants this
-/// change requires — never two sweeps at once (task 3.2), never
-/// concurrently with a sync-critical write (proposal.md's "never
-/// mid-burst") — regardless of whether the caller is the idle scheduler
-/// or an on-demand `gc`/`gc --dry-run` IPC request (task 3.5's "an
+/// change requires — never two sweeps at once, never
+/// concurrently with a sync-critical write ("never mid-burst") —
+/// regardless of whether the caller is the idle scheduler
+/// or an on-demand `gc`/`gc --dry-run` IPC request (an
 /// on-demand trigger firing during an idle-triggered attempt does not
-/// double-run").
+/// double-run).
 ///
 /// PERF-8-style runtime hygiene, mirroring `FsBlockStore::present_blocks`:
 /// the actual sweep is synchronous, batch-throttled blocking I/O
@@ -209,24 +208,24 @@ fn run_sweep_sync(
     }
     let _guard = GcRunGuard { running: &state.gc.running };
 
-    // proposal.md: "never mid-burst" — checked *after* claiming `running`
-    // (so a genuinely concurrent attempt observes the more specific
+    // "Never mid-burst" — checked *after* claiming `running` (so a
+    // genuinely concurrent attempt observes the more specific
     // `AlreadyRunning` rather than this) but before any real work starts.
-    // A manual `gc` bypasses the *idle wait*, not this check — design.md
-    // D3 draws that exact line ("bypassing the idle wait but not ... the
-    // 'never concurrently with another sweep' invariant"); never running
-    // during active sync IO is a stronger, always-on invariant, not just
-    // a property of the idle trigger.
+    // A manual `gc` bypasses the *idle wait*, not this check: bypassing
+    // the idle wait does not bypass the "never concurrently with another
+    // sweep" invariant; never running during active sync IO is a
+    // stronger, always-on invariant, not just a property of the idle
+    // trigger.
     if !state.is_write_safe_point() {
         return Err(GcTriggerError::SyncBurstInProgress);
     }
 
-    // design.md D5/task 1.2: `live_block_hashes` already includes every
-    // retained version/trash record's blocks (any `deleted = 0` row,
+    // `live_block_hashes` already includes every retained
+    // version/trash record's blocks (any `deleted = 0` row,
     // current or superseded/trashed alike — see its own doc comment), so
     // no separate version-history extra-roots call is needed here yet;
     // `live_block_hashes_with_extra_roots` remains available as the
-    // documented seam (task 1.2/6.2) for a future root category that
+    // the documented seam for a future root category that
     // isn't already representable as a `files` row.
     let live =
         state.sync_state.live_block_hashes().map_err(|e| GcTriggerError::Failed(e.to_string()))?;
@@ -247,7 +246,7 @@ fn run_sweep_sync(
     Ok(report)
 }
 
-/// task 3.1: the idle scheduler's single tick — called on
+/// the idle scheduler's single tick — called on
 /// `GC_IDLE_POLL_INTERVAL` by the periodic task `DaemonState::new` spawns,
 /// and called directly (with an injected `idle_threshold`) by this
 /// module's own tests so they never have to wait out the real
@@ -268,10 +267,9 @@ pub async fn maybe_run_idle_sweep(
     Some(run_sweep(state.clone(), false).await)
 }
 
-/// task 3.3: resolves `materialization::run_eviction_sweep`'s previously
-/// entirely-absent periodic caller (design.md's Context: "`run_eviction_
-/// sweep` exists but currently has no periodic caller in the daemon at
-/// all — worth resolving alongside this change"). Runs on the same
+/// resolves `materialization::run_eviction_sweep`'s previously
+/// entirely-absent periodic caller — `run_eviction_sweep` existed but
+/// had no periodic caller in the daemon at all. Runs on the same
 /// idle-scheduler cadence as the GC sweep above: every `OnDemand` link
 /// with a configured `max_local_size_bytes` cap gets that cap enforced
 /// here too, not only reactively on measured disk-space pressure
@@ -350,8 +348,8 @@ mod tests {
         (DaemonState::new("device-a".into(), sync_state, store), store_dir)
     }
 
-    /// proposal.md/task 3.5: GC must not start while a sync burst is
-    /// active — simulated here exactly the way `link_manager`'s flush
+    /// GC must not start while a sync burst is active —
+    /// simulated here exactly the way `link_manager`'s flush
     /// executor and `hydration.rs`'s hydrate/evict/restore paths mark
     /// activity in production (`begin_write_activity`'s RAII guard), not
     /// by directly poking the write-safe-point flag.
@@ -365,7 +363,7 @@ mod tests {
         assert_eq!(result, Err(GcTriggerError::SyncBurstInProgress));
     }
 
-    /// task 3.2: a sweep already in flight (flag pre-claimed here,
+    /// a sweep already in flight (flag pre-claimed here,
     /// standing in for a concurrently-running real sweep) makes a second
     /// attempt observe `AlreadyRunning` rather than running a second,
     /// concurrent sweep.
@@ -379,7 +377,7 @@ mod tests {
         assert_eq!(result, Err(GcTriggerError::AlreadyRunning));
     }
 
-    /// task 3.2/3.5, exercised with real concurrent tasks (not just the
+    /// Exercised with real concurrent tasks (not just the
     /// flag pre-claimed by hand, as above) across multiple linked
     /// folders: however the two attempts interleave, at most one may
     /// actually run a sweep — the other must observe `AlreadyRunning`,
@@ -424,7 +422,7 @@ mod tests {
         );
     }
 
-    /// task 3.1: a freshly-constructed daemon (activity recorded as "now")
+    /// a freshly-constructed daemon (activity recorded as "now")
     /// must not fire an idle sweep even against a threshold far shorter
     /// than the real `GC_IDLE_THRESHOLD`.
     #[tokio::test]
@@ -439,7 +437,7 @@ mod tests {
         );
     }
 
-    /// task 3.1: once idle past the threshold, the scheduler tick actually
+    /// once idle past the threshold, the scheduler tick actually
     /// runs a (real, non-dry-run) sweep.
     #[tokio::test]
     async fn idle_sweep_fires_once_idle_past_the_threshold() {
@@ -452,11 +450,11 @@ mod tests {
         assert!(state.gc.last_run_unix() > 0, "a real sweep must record its completion time");
     }
 
-    /// task 3.5: a daemon idle past the threshold, but with sync activity
+    /// a daemon idle past the threshold, but with sync activity
     /// actively in progress right now, still must not sweep — idle-ness
-    /// alone is not sufficient; the two conditions are independent
-    /// (design.md D3: "waits for both the idle period and no in-flight
-    /// hydration/materialization"). Starts the write guard *first* (as
+    /// alone is not sufficient; the two conditions are independent —
+    /// this waits for both the idle period and no in-flight
+    /// hydration/materialization. Starts the write guard *first* (as
     /// production does — `begin_write_activity` itself records "now" as
     /// the last-activity time) and only afterward backdates
     /// `last_activity_unix`, simulating a long-running write/hydration
@@ -475,7 +473,7 @@ mod tests {
         assert_eq!(outcome, Some(Err(GcTriggerError::SyncBurstInProgress)));
     }
 
-    /// task 3.5's exact scenario: an on-demand `gc` trigger firing while
+    /// An on-demand `gc` trigger firing while
     /// an idle-triggered sweep is already underway (simulated here by
     /// pre-claiming the flag, as the idle scheduler's own `run_sweep` call
     /// would have done) must not start a second, concurrent sweep.
@@ -490,8 +488,8 @@ mod tests {
         assert_eq!(manual, Err(GcTriggerError::AlreadyRunning));
     }
 
-    /// design D4: `--dry-run` computes the exact same delete set a real
-    /// sweep would, without deleting anything or updating
+    /// `--dry-run` computes the exact same delete set a real sweep would,
+    /// without deleting anything or updating
     /// `last_run_unix`, but does update the reclaimable estimate. Uses
     /// `run_sweep_with_grace_cutoff` directly (a future cutoff, mirroring
     /// `fs_backend.rs`'s own sweep tests) so this doesn't depend on

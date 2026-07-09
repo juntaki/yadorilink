@@ -1,5 +1,5 @@
-//! add-automatic-updates task 5: `yadorilink update status|check|install|config`
-//! — mirrors `commands::limits`'s exact shape (a thin `control_client::send`
+//! `yadorilink update status|check|install|config` — mirrors
+//! `commands::limits`'s exact shape (a thin `control_client::send`
 //! wrapper per subcommand, printing the daemon's response).
 
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;

@@ -1,7 +1,7 @@
-//! fix-materialization-disk-index-divergence task 8.1: a genuine "device
-//! goes offline (paused), both sides independently diverge, device comes
-//! back online" matrix — a scenario shape no existing chaos/matrix test
-//! actually exercises. `monkey_chaos.rs`, `taguchi_collision_matrix.rs`, and
+//! A genuine "device goes offline (paused), both sides independently
+//! diverge, device comes back online" matrix — a scenario shape no
+//! existing chaos/matrix test actually exercises.
+//! `monkey_chaos.rs`, `taguchi_collision_matrix.rs`, and
 //! `collision_matrix.rs` all race real-time concurrent operations between
 //! two devices that stay connected the whole time; none of them ever calls
 //! `set_paused` to make one device genuinely stop sending *and receiving*
@@ -334,7 +334,6 @@ async fn partition_edit_edit_reconnect_keeps_both_copies_as_original_plus_confli
 /// Device B edits a file while offline; device A (still online) deletes the
 /// same file concurrently, strictly *after* B's edit has already been
 /// indexed (enforced by `wait_for_local_edit_indexed` below, not a race).
-/// Since `fix-local-edit-swallowed-by-self-echo-race`'s task 3 fix,
 /// `index.rs`'s `mark_deleted`/`mark_deleted_at` stamps a tombstone with
 /// the deletion's own real observed time rather than carrying forward
 /// stale content mtime — so A's delete, genuinely later than B's edit here,

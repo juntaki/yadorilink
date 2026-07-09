@@ -9,14 +9,14 @@
 //! (`partition_reconnect_matrix.rs`'s domain) with device churn, rename/
 //! directory topology (`directory_conflict_matrix.rs`'s domain), or
 //! op-type combinations in a single matrix -- every historical silent
-//! data-loss bug found by this test suite so far
-//! (`fix-local-edit-swallowed-by-self-echo-race`,
-//! `fix-multiway-conflict-name-content-mismatch`,
-//! `fix-local-change-lost-under-registration-mutex-contention`) came from
-//! exactly this kind of previously-uncrossed timing interaction. This file
-//! exists to close that gap: five *new* factors, four levels each, covered
-//! pairwise-exhaustively by the same standard L16(4^5) orthogonal array
-//! v1/v2 use (16 runs instead of 4^5 = 1024 for a full factorial).
+//! data-loss bug found by this test suite so far (a local edit silently
+//! swallowed by its own self-echo, a multiway conflict-copy's name not
+//! matching its content, and a local change lost to registration-mutex
+//! contention) came from exactly this kind of previously-uncrossed timing
+//! interaction. This file exists to close that gap: five *new* factors,
+//! four levels each, covered pairwise-exhaustively by the same standard
+//! L16(4^5) orthogonal array v1/v2 use (16 runs instead of 4^5 = 1024 for
+//! a full factorial).
 //!
 //! Factors (see each `FACTOR_*` doc comment below for level definitions):
 //! - A: partition/reconnect timing (none / full-offline-then-sync /
@@ -385,9 +385,9 @@ fn stagger_ms(level: u8) -> u64 {
 /// final converged tree -- as the winning copy, a conflict copy, or any
 /// other surviving name. Plain convergence alone does not guarantee this:
 /// all devices could "converge" by silently ending up without content that
-/// should exist, which is exactly the shape
-/// `fix-local-edit-swallowed-by-self-echo-race` fixed (a real edit
-/// `fs::remove_file`'d with no conflict-copy artifact at all).
+/// should exist, which is exactly the shape of the self-echo-race bug
+/// this suite caught (a real edit `fs::remove_file`'d with no
+/// conflict-copy artifact at all).
 ///
 /// Skipped entirely for path_level 4 (case-fold): a case-insensitive
 /// filesystem can only ever hold one of two differently-cased names, so

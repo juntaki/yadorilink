@@ -134,10 +134,10 @@ pub unsafe extern "C" fn yadorilink_fp_query_status(path: *const c_char) -> *mut
     }
 }
 
-/// Requests hydration of `path` from the daemon (task 7.3's
+/// Requests hydration of `path` from the daemon (backs
 /// `fetchContents(for:version:request:completionHandler:)`), blocking
 /// the calling thread up to `ipc_client`'s `HYDRATION_TIMEOUT` (35s,
-/// design.md D5's bounded-timeout decision). Returns `true` only on a
+/// a bounded-timeout decision). Returns `true` only on a
 /// confirmed `HydrateResponse{ok: true}`; `false` for a null path,
 /// timeout, unreachable daemon, or a daemon-reported hydration failure —
 /// the Swift caller is expected to complete the OS callback with an

@@ -1,21 +1,20 @@
-//! add-desktop-status-app tasks 2.1-2.4, 3.1-3.3: a single cross-platform
-//! menu-bar/notification-area tray binary (see this crate's `Cargo.toml`
-//! doc comment for why one binary covers both target platforms instead of
-//! two native shells). Thin client over the daemon control socket only
-//! (design.md decision 1) — every mutating action in `actions.rs` is a
-//! direct pass-through to an existing daemon request, and every displayed
-//! field comes straight from `StatusResponse` (`status_model.rs`).
+//! A single cross-platform menu-bar/notification-area tray binary (see
+//! this crate's `Cargo.toml` doc comment for why one binary covers both
+//! target platforms instead of two native shells). Thin client over the
+//! daemon control socket only — every mutating action in `actions.rs` is
+//! a direct pass-through to an existing daemon request, and every
+//! displayed field comes straight from `StatusResponse`
+//! (`status_model.rs`).
 //!
 //! IMPORTANT / honesty note for reviewers: the pure logic in
 //! `status_model.rs`/`actions.rs`/`ipc_client.rs` is unit-tested and the
-//! IPC calls are exercised by this crate's `tests/` against a real daemon
-//! (same harness `yadorilink-cli`'s integration tests use). The actual
-//! tray icon / menu / event-loop wiring below can only be verified by
-//! `cargo build`/`cargo check` in this sandboxed environment — there is no
-//! display server or window manager here to click a real menu item
-//! against, so the event-loop plumbing itself (this file) is UI-verified
-//! only by inspection, not by a real run. See tasks.md's notes on this
-//! change for the precise scope of what was/wasn't verified.
+//! IPC calls are exercised by this crate's `tests/` against a real
+//! daemon (same harness `yadorilink-cli`'s integration tests use). The
+//! actual tray icon / menu / event-loop wiring below can only be
+//! verified by `cargo build`/`cargo check` in this sandboxed
+//! environment — there is no display server or window manager here to
+//! click a real menu item against, so the event-loop plumbing itself
+//! (this file) is UI-verified only by inspection, not by a real run.
 
 use std::time::Duration;
 
@@ -122,8 +121,8 @@ fn apply_status(tray_icon: &TrayIcon, status: Option<StatusResponse>) {
 
 /// Rebuilds the whole menu from the latest status snapshot — simpler and
 /// less error-prone than mutating individual native menu items in place,
-/// and cheap enough at a 2s poll interval (design.md non-goal: this is not
-/// a high-frequency UI).
+/// and cheap enough at a 2s poll interval (this is not a high-frequency
+/// UI).
 fn build_menu(status: Option<&StatusResponse>) -> Menu {
     let menu = Menu::new();
 
@@ -134,18 +133,18 @@ fn build_menu(status: Option<&StatusResponse>) -> Menu {
     let _ = menu.append(&MenuItem::new(headline_text, false, None));
     let _ = menu.append(&PredefinedMenuItem::separator());
 
-    // switch-coordination-auth-to-google-oidc: no valid session yet --
-    // offer the loopback-redirect + PKCE login flow directly (see
-    // `handle_menu_event`'s "login_with_google" case and
-    // `google_login::login`). Shown ahead of "Set Up YadoriLink…" below
-    // since device registration itself needs a valid access token.
+    // No valid session yet -- offer the loopback-redirect + PKCE login
+    // flow directly (see `handle_menu_event`'s "login_with_google" case
+    // and `google_login::login`). Shown ahead of "Set Up YadoriLink…"
+    // below since device registration itself needs a valid access
+    // token.
     if yadorilink_cli::grpc::require_access_token().is_err() {
         let _ =
             menu.append(&MenuItem::with_id("login_with_google", "Login with Google…", true, None));
         let _ = menu.append(&PredefinedMenuItem::separator());
     }
 
-    // task 3.1 "first-run setup": no local device identity yet means this
+    // no local device identity yet means this
     // machine has never completed `yadorilink device register`/`login` —
     // offer a discoverable entry point into that existing, already-tested
     // CLI onboarding flow rather than reimplementing sign-in/device-setup
@@ -184,7 +183,7 @@ fn build_menu(status: Option<&StatusResponse>) -> Menu {
         let _ = menu.append(&MenuItem::with_id("resume_all", "Resume All", true, None));
         let _ = menu.append(&PredefinedMenuItem::separator());
 
-        // task 3.3 "resource limit" actions.
+        // actions.
         let limits = Submenu::new("Bandwidth Limits", true);
         for preset in actions::BandwidthPreset::ALL {
             let _ = limits.append(&MenuItem::with_id(preset.menu_id(), preset.label(), true, None));
@@ -208,7 +207,7 @@ fn build_menu(status: Option<&StatusResponse>) -> Menu {
         ));
         let _ = menu.append(&MenuItem::with_id("restart_daemon", "Restart Daemon", true, None));
     } else {
-        // task 2.3 "degraded-state actions": distinct from `restart_daemon`
+        // distinct from `restart_daemon`
         // above (which sends a `Shutdown` IPC request — a no-op, not a
         // "start", when nothing is listening) — see
         // `actions::start_daemon`'s doc comment.
@@ -283,15 +282,15 @@ fn handle_menu_event(id: &str) {
                 tracing::warn!(error = %e, "launch-at-login toggle failed");
             }
         }
-        // task 3.1 "first-run setup": this app has no native sign-in/
-        // device-registration UI of its own (design.md's "keep the first
-        // beta scope small" — that flow already exists, fully working, as
-        // `yadorilink device register`/`yadorilink login`, task 4.3-style
-        // scope discipline for this pass). Reveals a Terminal with the
-        // right first command pre-typed rather than silently doing
-        // nothing, so the tray icon is still a genuine, working
-        // discoverable entry point into setup, per the spec's "First run
-        // starts setup" scenario — just not a bespoke native form.
+        // this app has no native sign-in/
+        // device-registration UI of its own — that flow already exists,
+        // fully working, as `yadorilink device register`/`yadorilink
+        // login` (task 4.3-style scope discipline: keep the first beta
+        // scope small). Reveals a Terminal with the right first command
+        // pre-typed rather than silently doing nothing, so the tray icon
+        // is still a genuine, working discoverable entry point into
+        // setup, per the spec's "First run starts setup" scenario — just
+        // not a bespoke native form.
         "setup_device" => {
             std::thread::spawn(open_setup_terminal);
         }
@@ -315,7 +314,7 @@ fn handle_menu_event(id: &str) {
     }
 }
 
-/// task 3.1: opens a Terminal window with `yadorilink device register`
+/// opens a Terminal window with `yadorilink device register`
 /// ready to run — macOS-only for now (mirrors `actions::pick_folder`'s/
 /// `prompt_text`'s scope). Fails soft (matching this app's overall
 /// discipline of never crashing on an unavailable OS integration) if
@@ -348,8 +347,8 @@ where
 }
 
 /// A minimal 16x16 solid-color placeholder icon — this change ships no
-/// real icon asset (a proper multi-resolution `.icns`/`.ico` is packaging
-/// work, tracked as follow-up per tasks.md's notes), just enough for
+/// real icon asset (a proper multi-resolution `.icns`/`.ico` is
+/// packaging work, tracked as a follow-up), just enough for
 /// `TrayIconBuilder::build` to succeed and for the tray to be visibly
 /// present.
 fn placeholder_icon() -> Icon {

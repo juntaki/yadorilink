@@ -1,5 +1,5 @@
-//! add-automatic-updates task 3.2/3.3: daemon-side handlers for the
-//! update IPC surface added to `daemon_control.proto` (task 3.1). Kept in
+//! Daemon-side handlers for the update IPC surface added to
+//! `daemon_control.proto`. Kept in
 //! its own module (mirroring `reporting_ipc.rs`'s precedent) rather than
 //! inlined into `control_socket.rs`'s match arms, since each handler
 //! needs a little translation between wire messages and
@@ -40,7 +40,7 @@ pub fn status_response(state: &DaemonState) -> UpdateStatusResponse {
     }
 }
 
-/// `yadorilink update check` (task 5.2): runs an immediate manifest
+/// `yadorilink update check`: runs an immediate manifest
 /// check regardless of `automatic_checks_enabled` (spec "Automatic
 /// checks disabled ... still allows a user-initiated manual check") and
 /// returns the resulting status. A check failure is still reported via
@@ -52,9 +52,9 @@ pub async fn check(state: &DaemonState) -> UpdateCheckResponse {
     UpdateCheckResponse { status: Some(status_response(state)) }
 }
 
-/// `yadorilink update install` (task 5.3): requests installation of a
-/// verified update. Consults `DaemonState::is_write_safe_point` (task
-/// 2.4) so a caller never has to know about safe-point mechanics
+/// `yadorilink update install`: requests installation of a
+/// verified update. Consults `DaemonState::is_write_safe_point` so a
+/// caller never has to know about safe-point mechanics
 /// directly — this is the one and only place that check happens before
 /// installation is attempted.
 pub async fn install(state: &DaemonState) -> Result<UpdateInstallResponse, String> {
@@ -76,7 +76,7 @@ pub async fn install(state: &DaemonState) -> Result<UpdateInstallResponse, Strin
     }
 }
 
-/// `yadorilink update config` (task 5.4): each optional field left unset
+/// `yadorilink update config`: each optional field left unset
 /// leaves that setting unchanged.
 pub fn config(
     state: &DaemonState,

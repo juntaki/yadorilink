@@ -1,6 +1,6 @@
-//! Denylist safety pass (design.md D5): applied to every free-text field
-//! that ends up in a report (sanitized log lines, backtraces) as a
-//! second line of defense on top of allowlist construction. Redaction is
+//! Denylist safety pass: applied to every free-text field that ends up
+//! in a report (sanitized log lines, backtraces) as a second line of
+//! defense on top of allowlist construction. Redaction is
 //! pattern-based and intentionally conservative — a false positive
 //! (over-redacting something harmless) is an acceptable cost; a false
 //! negative (letting something sensitive through) is not.
@@ -279,8 +279,8 @@ mod tests {
 
     #[test]
     fn known_sensitive_example_fixture_produces_no_leaked_substrings() {
-        // Task 1.6's "sensitive-pattern redaction" snapshot check, and
-        // task 6.4's privacy-focused regression fixture, in one place:
+        // A sensitive-pattern redaction snapshot check and
+        // privacy-focused regression fixture in one place:
         // a synthetic log line carrying one of every sensitive category
         // this module claims to catch, asserted to be fully gone after
         // redaction.

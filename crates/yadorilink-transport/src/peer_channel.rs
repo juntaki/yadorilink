@@ -1,9 +1,9 @@
 //! Transport-path-agnostic per-peer channel (task 4.7): `yadorilink-sync-core`
 //! sends/receives plain application messages here and never knows whether
-//! the underlying WireGuard session is currently relayed or direct — or,
-//! per design.md D10, which of possibly several direct candidates (LAN,
-//! NAT-traversed public, or one learned later via local broadcast
-//! discovery) ended up being used.
+//! the underlying WireGuard session is currently relayed or direct — or
+//! which of possibly several direct candidates (LAN, NAT-traversed
+//! public, or one learned later via local broadcast discovery) ended up
+//! being used.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -38,8 +38,8 @@ const DIRECT_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 const DIRECT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_OUTBOUND_BATCH: usize = 16;
 const MAX_DIRECT_RECV_BATCH: usize = 16;
-/// add-reliable-message-delivery: how often the actor checks for a due
-/// standalone ack and/or a due retransmit (`ReliableSend::due_retransmits`,
+/// How often the actor checks for a due standalone ack and/or a due
+/// retransmit (`ReliableSend::due_retransmits`,
 /// `ReliableRecv::take_ack_dirty`). Well under the RTT-adaptive retransmit
 /// timeout itself (`reliable.rs`'s `RttEstimator`, 100ms-5s) so this
 /// interval never meaningfully delays a retransmit past its computed
@@ -56,7 +56,7 @@ const RELIABLE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 /// relay-observed public address) while still being small.
 const MAX_DIRECT_CANDIDATES: usize = 8;
 
-// --- enforce-live-device-revocation task 2.1: netmap-diff logic ---------
+// --- Netmap-diff logic ----------------------------------------------
 //
 // The coordination plane's `stream_netmap` (see `yadorilink-coordination`'s
 // `grpc.rs`) always pushes a *full* netmap snapshot, never a delta —
@@ -83,7 +83,8 @@ const MAX_DIRECT_CANDIDATES: usize = 8;
 pub type NetmapSnapshot = HashMap<String, HashSet<String>>;
 
 /// The result of [`diff_netmap`]: what disappeared between two netmap
-/// snapshots, split by design.md D3's blast-radius distinction.
+/// snapshots, split by blast-radius: a whole device losing all shared
+/// groups versus one shared group among several being revoked.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetmapDiff {
     /// Device ids present in `previous` but entirely absent from
@@ -109,12 +110,12 @@ pub struct NetmapDiff {
 /// Diffs `current` against `previous` (task 2.1), classifying every
 /// device that lost at least one shared group as either a whole-device
 /// removal ([`NetmapDiff::removed_devices`]) or a narrower group-edge
-/// removal ([`NetmapDiff::removed_group_edges`]) per design.md D3. Devices
-/// present in `current` but not `previous` (newly authorized) and groups
-/// unchanged between the two snapshots produce no diff entries — this
-/// function only ever reports *removals*, matching what tasks 2.2-2.3
-/// react to. Output order is sorted for deterministic logging/testing
-/// (`HashMap`/`HashSet` iteration order is not stable).
+/// removal ([`NetmapDiff::removed_group_edges`]). Devices present in
+/// `current` but not `previous` (newly authorized) and groups unchanged
+/// between the two snapshots produce no diff entries — this function
+/// only ever reports *removals*. Output order is sorted for
+/// deterministic logging/testing (`HashMap`/`HashSet` iteration order is
+/// not stable).
 pub fn diff_netmap(previous: &NetmapSnapshot, current: &NetmapSnapshot) -> NetmapDiff {
     let mut removed_devices = Vec::new();
     let mut removed_group_edges = Vec::new();
@@ -181,11 +182,11 @@ pub struct PeerChannel {
     /// This device's public IP:port as observed by the relay at connect
     /// time (task 4.4's netcheck). `None` for `DirectOnly` channels, which
     /// never talk to a relay. Reported to the coordination plane's
-    /// `report_endpoint` by the daemon (wired up in tasks.md section 7).
+    /// `report_endpoint` by the daemon.
     observed_address: Option<String>,
-    /// enforce-live-device-revocation task 2.2/2.4: set by [`revoke`] and
-    /// checked by `handle_datagram` before processing *any* further
-    /// datagram — including a subsequent, otherwise-valid WireGuard
+    /// Set by [`revoke`] and checked by `handle_datagram` before
+    /// processing *any* further datagram — including a subsequent,
+    /// otherwise-valid WireGuard
     /// handshake attempt from this same peer. Separate from `shutdown`
     /// (which wakes the actor loop to exit) so the refusal is effective
     /// immediately and synchronously, not only once the actor notices the
@@ -193,9 +194,9 @@ pub struct PeerChannel {
     ///
     /// [`revoke`]: PeerChannel::revoke
     revoked: Arc<AtomicBool>,
-    /// enforce-live-device-revocation task 2.2: wakes the actor loop
-    /// (`run_actor`'s `biased` `select!`) to break out and run its normal
-    /// exit cleanup (relay deregistration) immediately on [`revoke`],
+    /// Wakes the actor loop (`run_actor`'s `biased` `select!`) to break
+    /// out and run its normal exit cleanup (relay deregistration)
+    /// immediately on [`revoke`],
     /// rather than only on the next `TICK_INTERVAL` tick or once every
     /// `Arc<PeerChannel>` clone happens to be dropped (dropping the
     /// clones alone does not stop the actor — its `tick`/`direct_probe`
@@ -204,8 +205,8 @@ pub struct PeerChannel {
     ///
     /// [`revoke`]: PeerChannel::revoke
     shutdown: Arc<Notify>,
-    /// add-reliable-message-delivery: shared with `ActorState` (same
-    /// pattern as `revoked`/`current_path`). Starts `false`; flipped by
+    /// Shared with `ActorState` (same pattern as
+    /// `revoked`/`current_path`). Starts `false`; flipped by
     /// [`enable_reliable_delivery`] once `peer_session.rs`'s `ClusterConfig`
     /// handshake confirms *both* sides advertised `supports_reliable_
     /// delivery`. Only gates whether THIS device wraps its own outbound
@@ -225,8 +226,8 @@ impl PeerChannel {
     /// `RelayOnly`/`Auto` modes; `direct_candidates` are the peer's known
     /// endpoints (from the coordination plane's netmap, highest priority
     /// — typically LAN addresses — first) for `DirectOnly`/`Auto` modes.
-    /// All candidates are raced concurrently (design.md D10) rather than
-    /// tried one at a time.
+    /// All candidates are raced concurrently rather than tried one at a
+    /// time.
     ///
     /// `direct_socket` lets a caller supply a pre-bound local UDP socket
     /// (its bound port is what must be exchanged with the peer as this
@@ -332,9 +333,9 @@ impl PeerChannel {
         })
     }
 
-    /// add-reliable-message-delivery: called once `peer_session.rs`'s
-    /// `ClusterConfig` handshake confirms *both* sides advertised
-    /// `supports_reliable_delivery` — from this point on, this device's
+    /// Called once `peer_session.rs`'s `ClusterConfig` handshake confirms
+    /// *both* sides advertised `supports_reliable_delivery` — from this
+    /// point on, this device's
     /// own outbound sends via [`send`](Self::send) are wrapped with the
     /// seq/ack framing (`reliable.rs`) and retransmitted until acked
     /// rather than relying solely on the 30s/90s per-message-type
@@ -452,27 +453,24 @@ struct ActorState {
     current_path: Arc<AtomicU8>,
     allow_direct: bool,
     allow_relay: bool,
-    /// enforce-live-device-revocation task 2.2/2.4: mirrors
-    /// [`PeerChannel::revoke`]'s doc comment — checked at the top of
-    /// `handle_datagram` so a revoked channel refuses to process anything
-    /// further, and mirrored from the same `Arc` the `PeerChannel` handle
-    /// exposes so a caller's `revoke()` takes effect without a round trip
-    /// through the actor's message channels.
+    /// Mirrors [`PeerChannel::revoke`]'s doc comment — checked at the top
+    /// of `handle_datagram` so a revoked channel refuses to process
+    /// anything further, and mirrored from the same `Arc` the
+    /// `PeerChannel` handle exposes so a caller's `revoke()` takes effect
+    /// without a round trip through the actor's message channels.
     revoked: Arc<AtomicBool>,
-    /// enforce-live-device-revocation task 2.2: see
-    /// [`PeerChannel::revoke`]'s doc comment on `shutdown`.
+    /// See [`PeerChannel::revoke`]'s doc comment on `shutdown`.
     shutdown: Arc<Notify>,
     udp_batching: UdpBatchingSupport,
-    /// add-reliable-message-delivery: shared with [`PeerChannel::
-    /// enable_reliable_delivery`] — gates whether `handle_outbound_batch`
-    /// wraps this device's own outbound sends. See that method's doc
-    /// comment.
+    /// Shared with [`PeerChannel::enable_reliable_delivery`] — gates
+    /// whether `handle_outbound_batch` wraps this device's own outbound
+    /// sends. See that method's doc comment.
     reliable_enabled: Arc<AtomicBool>,
-    /// add-reliable-message-delivery: send-side sequence/unacked-buffer/
-    /// RTT state, owned solely by this actor task (see `reliable.rs`).
+    /// Send-side sequence/unacked-buffer/RTT state, owned solely by this
+    /// actor task (see `reliable.rs`).
     reliable_send: ReliableSend,
-    /// add-reliable-message-delivery: receive-side dedup/ack state, owned
-    /// solely by this actor task (see `reliable.rs`).
+    /// Receive-side dedup/ack state, owned solely by this actor task
+    /// (see `reliable.rs`).
     reliable_recv: ReliableRecv,
 }
 
@@ -491,12 +489,11 @@ async fn run_actor(mut state: ActorState) {
         tokio::select! {
             biased;
 
-            // enforce-live-device-revocation task 2.2: checked first
-            // (this `select!` is `biased`) so a revocation wins over any
-            // datagram/tick that happens to be ready in the same poll,
-            // and the actor exits (running the same relay-unregister
-            // cleanup as any other loop exit below) without waiting out
-            // `TICK_INTERVAL`.
+            // Checked first (this `select!` is `biased`) so a revocation
+            // wins over any datagram/tick that happens to be ready in
+            // the same poll, and the actor exits (running the same
+            // relay-unregister cleanup as any other loop exit below)
+            // without waiting out `TICK_INTERVAL`.
             _ = state.shutdown.notified() => {
                 tracing::info!(
                     peer = %hex::encode(state.peer_public_bytes),
@@ -542,10 +539,10 @@ async fn run_actor(mut state: ActorState) {
                 evaluate_direct_liveness(&mut state);
             }
 
-            // add-reliable-message-delivery: gated so a connection that
-            // never negotiates reliable delivery (an un-upgraded peer, or
-            // — as found investigating seed 3298840590 — a lost/never-
-            // completed `ClusterConfig` handshake) pays zero recurring
+            // Gated so a connection that never negotiates reliable
+            // delivery (an un-upgraded peer, or — as found investigating
+            // seed 3298840590 — a lost/never-completed `ClusterConfig`
+            // handshake) pays zero recurring
             // scheduling cost from this timer, keeping its behavior
             // identical to before this layer existed. `has_pending_ack`
             // (not `reliable_enabled` alone) covers the asymmetric window
@@ -596,9 +593,9 @@ async fn handle_outbound_batch(state: &mut ActorState, first_payload: Bytes) {
 
     let mut datagrams = Vec::new();
     for payload in payloads {
-        // add-reliable-message-delivery: wrap with the seq/ack framing
-        // once this device has confirmed the peer supports it (`reliable_
-        // enabled`, flipped by `PeerChannel::enable_reliable_delivery`).
+        // Wrap with the seq/ack framing once this device has confirmed
+        // the peer supports it (`reliable_enabled`, flipped by
+        // `PeerChannel::enable_reliable_delivery`).
         // If the unacked buffer is already at `ReliableSend::MAX_UNACKED`
         // (a sustained-loss/overload edge case, not the common path),
         // this one message is sent unwrapped rather than blocking the
@@ -625,9 +622,9 @@ async fn handle_outbound_batch(state: &mut ActorState, first_payload: Bytes) {
     send_batch_via_current_path(state, datagrams).await;
 }
 
-/// add-reliable-message-delivery: checked every `RELIABLE_CHECK_INTERVAL`
-/// (`run_actor`'s `reliable_tick` branch). Sends a standalone ack frame
-/// when one is due — deliberately independent of `state.reliable_enabled`
+/// Checked every `RELIABLE_CHECK_INTERVAL` (`run_actor`'s `reliable_tick`
+/// branch). Sends a standalone ack frame when one is due — deliberately
+/// independent of `state.reliable_enabled`
 /// (see `PeerChannel::enable_reliable_delivery`'s doc comment and `reliable
 /// .rs`'s `ReliableRecv::ack_dirty` doc comment): this device may have
 /// received reliable-framed DATA frames from a peer that has confirmed
@@ -710,9 +707,9 @@ async fn handle_datagram(
     via: PathKind,
     from_addr: Option<SocketAddr>,
 ) {
-    // enforce-live-device-revocation task 2.4: a revoked channel refuses
-    // to process anything further, including a datagram that would
-    // otherwise be a perfectly valid WireGuard handshake initiation from
+    // A revoked channel refuses to process anything further, including
+    // a datagram that would otherwise be a perfectly valid WireGuard
+    // handshake initiation from
     // this same (now-unauthorized) peer key — refusal doesn't depend on
     // whether the loop has already noticed `shutdown` and broken out yet.
     if state.revoked.load(Ordering::Relaxed) {
@@ -734,9 +731,9 @@ async fn handle_datagram(
     }
 
     for message in result.messages {
-        // add-reliable-message-delivery: every decrypted plaintext message
-        // is checked against the marker-byte framing regardless of this
-        // device's own `reliable_enabled` state — receiving is always
+        // Every decrypted plaintext message is checked against the
+        // marker-byte framing regardless of this device's own
+        // `reliable_enabled` state — receiving is always
         // format-agnostic (see `reliable.rs`'s module doc comment), so a
         // peer that has started sending wrapped frames is understood
         // immediately, even before this device's own `ClusterConfig`
@@ -768,7 +765,7 @@ async fn handle_datagram(
     // tick) is unchanged and still detects the inverse case: a confirmed
     // Direct path that's gone quiet, failing back to Relay.
     if via == PathKind::Direct && state.allow_direct && authenticated {
-        // Task 1.2 hardening: only ever confirm an address that is
+        // hardening: only ever confirm an address that is
         // already a known candidate (coordination- or discovery-supplied)
         // — authenticated traffic alone, from an address we never
         // solicited or learned of, isn't enough to adopt as the direct
@@ -1229,7 +1226,7 @@ mod tests {
         }
     }
 
-    // --- enforce-live-device-revocation task 2.6: diff logic tests ------
+    // --- Diff logic tests -------------------------------------------
 
     fn snapshot(entries: &[(&str, &[&str])]) -> NetmapSnapshot {
         entries
@@ -1330,9 +1327,9 @@ mod tests {
         assert_eq!(diff.removed_group_edges, vec![("device-b".to_string(), "group-2".to_string())]);
     }
 
-    // --- enforce-live-device-revocation task 2.2/2.4/2.6: revocation ----
+    // --- Revocation tests ---------------------------------------------
 
-    /// task 2.2: `revoke()` wakes the actor loop to exit (rather than the
+    /// `revoke()` wakes the actor loop to exit (rather than the
     /// loop only ever exiting via the fallthrough `else` arm, which never
     /// fires on its own here — see `run_actor`'s `shutdown` branch).
     #[tokio::test]

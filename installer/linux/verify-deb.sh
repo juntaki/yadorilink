@@ -20,8 +20,8 @@
 #      present at their expected paths, with the unit file NOT executable
 #      (0644) and the binaries executable (0755).
 #   4. `lintian` (if installed) as a best-effort extra lint pass -- this is
-#      the same tool CI's installer-linux job is expected to run (tasks.md
-#      4.2); not required locally.
+#      the same tool CI's installer-linux job is expected to run; not
+#      required locally.
 #
 # Usage:
 #   installer/linux/verify-deb.sh path/to/yadorilink_<version>_<arch>.deb
@@ -117,7 +117,7 @@ if command -v lintian >/dev/null 2>&1; then
         ok "lintian reported no error-level tags"
     fi
 else
-    echo "NOTE: lintian not installed locally; skipping (CI's installer-linux job runs this, see tasks.md 4.2)"
+    echo "NOTE: lintian not installed locally; skipping (CI's installer-linux job runs this)"
 fi
 
 echo

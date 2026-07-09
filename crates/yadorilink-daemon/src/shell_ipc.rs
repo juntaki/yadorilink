@@ -1,6 +1,6 @@
 //! Local IPC between the daemon and OS shell extensions (Windows Explorer
-//! icon overlay/context-menu handler, macOS Finder Sync extension) —
-//! design.md D3, tasks 8.2-8.5. Framed as length-prefixed protobuf
+//! icon overlay/context-menu handler, macOS Finder Sync extension).
+//! Framed as length-prefixed protobuf
 //! (`yadorilink_ipc_proto::framing`), not gRPC, since Explorer/Finder call
 //! synchronously and frequently — full HTTP/2 setup overhead risks
 //! visible UI lag.
@@ -16,9 +16,8 @@
 //! here is the daemon-side socket those XPC-relayed bytes would ultimately
 //! reach). Windows named pipe (task 8.3) is implemented behind
 //! `#[cfg(windows)]` and has not been compiled or run on this
-//! (non-Windows) development machine — see design.md's Windows shell
-//! integration risk note; verify on real Windows hardware before relying
-//! on it.
+//! (non-Windows) development machine; verify on real Windows hardware
+//! before relying on it.
 
 use std::sync::Arc;
 
@@ -245,7 +244,7 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
 }
 
 /// Reference client implementation (task 8.6): the shell extension's
-/// native shim (Rust via `windows-rs` on Windows per design D4, or an FFI
+/// native shim (Rust via `windows-rs` on Windows per or an FFI
 /// core called from the Swift `FinderSync` extension on macOS) follows
 /// this exact pattern — bounded timeout, `Unspecified` (no overlay) on
 /// any failure, never blocking the file manager UI waiting on a daemon

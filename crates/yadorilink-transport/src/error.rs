@@ -20,8 +20,8 @@ pub enum TransportError {
 }
 
 impl TransportError {
-    /// add-advanced-sync-operations task 4.1/4.3: a short, stable category
-    /// label for connection-attempt diagnostics — mirrors
+    /// A short, stable category label for connection-attempt diagnostics —
+    /// mirrors
     /// `CliError::report_category`'s "coarse, stable category, never the
     /// raw error text" convention, so a bounded connection-trace history
     /// can record *why* an attempt failed without ever holding onto (or

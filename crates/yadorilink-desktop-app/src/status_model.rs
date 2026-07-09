@@ -1,8 +1,8 @@
-//! add-desktop-status-app task 2.4: pure, GUI-free transforms from a
-//! `StatusResponse` (the same message `yadorilink status` renders — see
-//! `yadorilink-cli`'s `commands/status.rs`) into the strings the tray icon
-//! shows. Kept entirely free of `tray_icon`/`tao` so every rendering
-//! decision here is unit-testable without a display or event loop, mirroring
+//! Pure, GUI-free transforms from a `StatusResponse` (the same message
+//! `yadorilink status` renders — see `yadorilink-cli`'s
+//! `commands/status.rs`) into the strings the tray icon shows. Kept
+//! entirely free of `tray_icon`/`tao` so every rendering decision here
+//! is unit-testable without a display or event loop, mirroring
 //! `yadorilink-cli`'s own established "one pure formatter fn per field
 //! group, tested against a default fixture" discipline (`status.rs`'s
 //! `held_summary_suffix`/`degraded_suffix`/etc.).
@@ -23,9 +23,9 @@ pub fn headline(status: &StatusResponse) -> String {
     }
 }
 
-/// design.md "degraded state when IPC is unavailable" (Risks/Trade-offs):
-/// the headline shown when the daemon can't be reached at all, never
-/// confused with a real `StatusResponse`'s own states above.
+/// The headline shown when the daemon can't be reached at all — a
+/// degraded state where IPC itself is unavailable, never confused with
+/// a real `StatusResponse`'s own states above.
 pub const DAEMON_UNREACHABLE_HEADLINE: &str = "YadoriLink: daemon not running";
 
 /// One line per attention/degraded reason, in the same coarse
@@ -107,7 +107,7 @@ mod tests {
 
     /// An empty/unrecognized `overall_state` (an old daemon predating this
     /// field) renders as "unknown", never silently as healthy — a stale
-    /// or misleading status is exactly the risk design.md calls out.
+    /// or misleading status is exactly the risk to avoid here.
     #[test]
     fn empty_state_renders_unknown_not_healthy() {
         assert_eq!(headline(&base_status()), "YadoriLink: unknown");

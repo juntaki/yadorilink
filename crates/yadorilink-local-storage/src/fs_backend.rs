@@ -24,8 +24,8 @@ const GC_SWEEP_BATCH_DELAY: Duration = Duration::from_millis(1);
 pub struct FsBlockStore {
     root: PathBuf,
     usage: Mutex<StorageUsage>,
-    /// add-resource-governance task 1.2/3.1: an explicit headroom override
-    /// (bytes), live-reloadable via `set_headroom_override_bytes` without
+    /// An explicit headroom override (bytes), live-reloadable via
+    /// `set_headroom_override_bytes` without
     /// reconstructing the store — mirrors the "mutable-after-construction
     /// field + setter" pattern `PeerSyncSession::set_authorized_groups`
     /// already established for a daemon-config-driven value that must take
@@ -50,9 +50,9 @@ pub struct FsBlockStore {
     /// production call site with real governance config) explicitly calls
     /// `set_headroom_enforced(true)` once at startup (section 5 wiring),
     /// after applying whatever headroom override its config resolves to —
-    /// so production behavior still matches design.md D3's "checks the
-    /// volume before every block write" once actually running as a daemon;
-    /// only a bare, ungoverned `FsBlockStore` stays inert.
+    /// so production behavior still "checks the volume before every block
+    /// write" once actually running as a daemon; only a bare, ungoverned
+    /// `FsBlockStore` stays inert.
     headroom_enforced: AtomicBool,
 }
 
@@ -80,7 +80,7 @@ impl FsBlockStore {
         *self.headroom_override_bytes.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// task 3.1: before persisting a block write, query free space on the
+    /// before persisting a block write, query free space on the
     /// volume hosting the block-store root and reject with `DiskPressure`
     /// if completing it would breach the configured headroom — checked
     /// before any temp file is created, so a rejection writes nothing. A
@@ -278,11 +278,10 @@ impl BlockStore for FsBlockStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        // add-resource-governance task 3.1: preflight before any bytes
-        // touch disk — must run after the dedup short-circuit above (a
-        // dedup no-op needs no new space) but before the temp file below is
-        // ever created, so a rejection here leaves nothing partially
-        // written to clean up.
+        // Preflight before any bytes touch disk — must run after the dedup
+        // short-circuit above (a dedup no-op needs no new space) but before
+        // the temp file below is ever created, so a rejection here leaves
+        // nothing partially written to clean up.
         self.check_headroom(&path, data.len() as u64)?;
         // Write to a unique-per-writer temp file then rename, so a crash
         // never leaves a partially-written block visible under its final
@@ -300,19 +299,19 @@ impl BlockStore for FsBlockStore {
     /// doc comment. `yadorilink-daemon` calls this with `true` once at
     /// startup (through `Arc<dyn BlockStore>`, hence this living on the
     /// trait rather than only as an inherent method); direct/test users of
-    /// this crate that never call it get the pre-existing (pre-
-    /// `add-resource-governance`) unthrottled behavior.
+    /// this crate that never call it get the pre-existing unthrottled
+    /// behavior.
     fn set_headroom_enforced(&self, enforced: bool) {
         self.headroom_enforced.store(enforced, Ordering::Relaxed);
     }
 
-    /// task 2.5-style live reload for the headroom check (task 1.2): applied
+    /// Live reload for the headroom check: applied
     /// to every subsequent `put()` call, no reconstruction needed.
     fn set_headroom_override_bytes(&self, headroom_bytes: Option<u64>) {
         *self.headroom_override_bytes.lock().unwrap_or_else(|p| p.into_inner()) = headroom_bytes;
     }
 
-    /// task 1.3/5.4: the block-store root's volume free-space snapshot,
+    /// The block-store root's volume free-space snapshot,
     /// for `yadorilink status`'s per-volume reporting — the exact same
     /// `classify_volume` call `put`'s preflight check uses, so the two can
     /// never disagree. Always computed from real disk state (using the
@@ -406,10 +405,10 @@ impl BlockStore for FsBlockStore {
         Ok(*self.usage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
     }
 
-    /// add-block-store-gc task 3.2: delegates to the inherent
-    /// `FsBlockStore::sweep` (already exercised directly by this module's
-    /// own unit tests below) so `yadorilink-daemon`'s `Arc<dyn BlockStore>`
-    /// can invoke it too — see the trait method's doc comment.
+    /// Delegates to the inherent `FsBlockStore::sweep` (already exercised
+    /// directly by this module's own unit tests below) so
+    /// `yadorilink-daemon`'s `Arc<dyn BlockStore>` can invoke it too — see
+    /// the trait method's doc comment.
     fn sweep(
         &self,
         live: &HashSet<ContentHash>,
@@ -436,14 +435,13 @@ impl BlockStore for FsBlockStore {
     /// (the plain `#[tokio::test]`s used throughout
     /// `yadorilink-sync-core`), it just runs the work inline, exactly as
     /// the previous default did — behavior is unchanged in both cases.
-    // add-deterministic-sync-testing: `madsim`'s tokio shim has no
-    // `block_in_place`/`runtime_flavor` (its cooperative scheduler has no
-    // real OS thread to block in place on) — under `--cfg madsim` this
-    // always takes the same inline fallback the multi-thread fast path
-    // above would take on any non-multi-thread runtime anyway (see this
-    // method's doc comment), so correctness is unaffected; only the
-    // off-executor-thread performance optimization is skipped under
-    // simulation.
+    // `madsim`'s tokio shim has no `block_in_place`/`runtime_flavor` (its
+    // cooperative scheduler has no real OS thread to block in place on) —
+    // under `--cfg madsim` this always takes the same inline fallback the
+    // multi-thread fast path above would take on any non-multi-thread
+    // runtime anyway (see this method's doc comment), so correctness is
+    // unaffected; only the off-executor-thread performance optimization is
+    // skipped under simulation.
     #[cfg(not(madsim))]
     fn present_blocks(&self, hashes: &[ContentHash]) -> Result<Vec<bool>, StorageError> {
         match tokio::runtime::Handle::try_current() {

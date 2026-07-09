@@ -1,4 +1,4 @@
-//! parallel-multi-peer-fetch tasks 4.1-4.6: real, connected-session
+//! Real, connected-session
 //! integration tests for `yadorilink_daemon::hydration`'s multi-session
 //! block dispatch. Deliberately lightweight — a raw relay + hand-built
 //! `PeerSyncSession`s, like `yadorilink-sync-core/tests/peer_session.rs`,
@@ -173,7 +173,7 @@ fn big_content() -> Vec<u8> {
     (0..(DEFAULT_BLOCK_SIZE * 6)).map(|i| (i % 251) as u8).collect()
 }
 
-/// task 4.1: blocks split across two peer sessions, each holding only
+/// blocks split across two peer sessions, each holding only
 /// some of the blocks — hydration succeeds and reconstructs identical
 /// content.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -206,7 +206,7 @@ async fn blocks_split_across_two_peers_each_holding_a_disjoint_subset() {
     assert_eq!(reconstructed, content);
 }
 
-/// task 4.2: one peer reports a block not found; a second connected peer
+/// one peer reports a block not found; a second connected peer
 /// does hold it — hydration still succeeds via the second peer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_block_not_found_on_one_peer_is_fetched_from_another() {
@@ -233,7 +233,7 @@ async fn a_block_not_found_on_one_peer_is_fetched_from_another() {
     assert_eq!(reconstructed, content);
 }
 
-/// task 4.3: no connected peer holds one particular block — hydration
+/// no connected peer holds one particular block — hydration
 /// fails cleanly, the file remains a placeholder, and nothing corrupt is
 /// written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -267,7 +267,7 @@ async fn a_block_missing_from_every_peer_fails_hydration_cleanly() {
     );
 }
 
-/// task 4.5: hydrating with three connected peers, all holding the full
+/// hydrating with three connected peers, all holding the full
 /// file, completes correctly — not just the two-peer minimum case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hydration_succeeds_with_three_full_peers() {
@@ -294,7 +294,7 @@ async fn hydration_succeeds_with_three_full_peers() {
     assert_eq!(std::fs::read(device_d.root.path().join(PATH)).unwrap(), content);
 }
 
-/// task 4.6: `hydration::pin`'s multi-session dispatch path — the pin
+/// `hydration::pin`'s multi-session dispatch path — the pin
 /// flag is set correctly alongside successful multi-peer hydration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pin_hydrates_via_multiple_peers_and_sets_the_pin_flag() {
@@ -325,17 +325,17 @@ async fn pin_hydrates_via_multiple_peers_and_sets_the_pin_flag() {
     assert_eq!(std::fs::read(device_d.root.path().join(PATH)).unwrap(), content);
 }
 
-/// task 4.4: the file-level deadline bounds the *whole* multi-session
+/// the file-level deadline bounds the *whole* multi-session
 /// dispatch — hydration against an unresponsive peer (connected, but
 /// never answering any request) fails within roughly the configured
 /// deadline rather than hanging indefinitely.
 ///
 /// Note: this test covers the deterministic, always-guaranteed half of
-/// design D4's goal (the deadline is a hard upper bound on the whole
+/// 's goal (the deadline is a hard upper bound on the whole
 /// operation). The more optimistic "a fast, fully-responsive peer's
 /// share completes without waiting for a co-present unresponsive peer"
-/// is *not* separately asserted here — design.md's own Non-Goals
-/// explicitly excludes sophisticated piece-selection/peer-prioritization
+/// is *not* separately asserted here — sophisticated
+/// piece-selection/peer-prioritization is explicitly out of scope
 /// (round-robin/first-available assignment is deliberately simple), so
 /// whether a slow peer's checked-out-but-never-returned block delays the
 /// fast peer's otherwise-complete result is inherent to that simplicity,
@@ -383,10 +383,10 @@ async fn hydration_deadline_bounds_an_unresponsive_peer() {
     );
 }
 
-/// add-resource-governance task 2.3/2.6: a configured download rate caps
-/// *aggregate* throughput across concurrent multi-peer hydration — the
-/// hydrating device's sessions to two different peers share the daemon's
-/// one `state.rate_limiters` instance (exactly as `peer_orchestrator`
+/// A configured download rate caps *aggregate* throughput across
+/// concurrent multi-peer hydration — the hydrating device's sessions to
+/// two different peers share the daemon's one `state.rate_limiters`
+/// instance (exactly as `peer_orchestrator`
 /// wires real sessions), so fetching one block from each peer concurrently
 /// draws down the *same* bucket rather than each peer's fetch getting an
 /// independent full-rate allowance. Distinguishes the two by wall-clock
@@ -443,8 +443,8 @@ async fn configured_rate_caps_aggregate_throughput_across_concurrent_multi_peer_
 }
 
 /// Like `connect_as_peer`, but wires both of the hydrating device's
-/// sessions-to-peer onto `hydrating.state.rate_limiters` (task 2.3's "same
-/// bucket" — mirrors what `peer_orchestrator::spawn_peer_session` does for
+/// sessions-to-peer onto `hydrating.state.rate_limiters` (sharing the same
+/// bucket, which mirrors what `peer_orchestrator::spawn_peer_session` does for
 /// every real production session) instead of each session defaulting to
 /// its own independent unlimited pair.
 async fn connect_as_peer_sharing_hydrating_rate_limiters(

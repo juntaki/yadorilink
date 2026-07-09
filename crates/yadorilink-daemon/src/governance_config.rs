@@ -1,37 +1,35 @@
-//! add-resource-governance section 1: on-disk persistence for the daemon's
-//! resource-governance configuration (global upload/download rate limits,
-//! disk-space headroom override) — mirrors
-//! `reporting::consent_store::ConsentStore`'s pattern exactly (a small,
-//! independent JSON file under the config directory, `#[serde(default)]` +
-//! a hand-written `Default` impl so an old/missing file always resolves to
-//! the documented default rather than a deserialization error, tempfile-
-//! then-rename writes).
+//! On-disk persistence for the daemon's resource-governance configuration
+//! (global upload/download rate limits, disk-space headroom override) —
+//! mirrors `reporting::consent_store::ConsentStore`'s pattern exactly (a
+//! small, independent JSON file under the config directory,
+//! `#[serde(default)]` + a hand-written `Default` impl so an old/missing
+//! file always resolves to the documented default rather than a
+//! deserialization error, tempfile-then-rename writes).
 //!
 //! Living in its own file (rather than being bolted onto
 //! `device_config::DeviceConfig`, which has no `#[serde(default)]` today
 //! and would hard-fail deserialization on any new required field) means an
 //! existing install with no `resource_governance.json` at all — the normal
-//! case for every device that existed before this change shipped — loads
-//! the safe, spec-mandated default (`0`/unlimited rates, no headroom
-//! override) without any migration step (task 1.1's "version-safe
-//! defaulting for existing installs").
+//! case for every device that predates this feature — loads the safe,
+//! spec-mandated default (`0`/unlimited rates, no headroom override)
+//! without any migration step, providing version-safe defaulting for
+//! existing installs.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Global transfer rate limits and disk-space headroom override
-/// (design.md's "What Changes"). `0` for either rate means unlimited (the
-/// default, task 2.1) — a bucket at rate `0` is bypassed entirely, so an
-/// unconfigured install imposes no throttling. `headroom_override_bytes`
-/// `None` means "use the default `max(1 GiB, 5%)` formula" (design.md D3);
-/// `Some(_)` is an explicit override.
+/// Global transfer rate limits and disk-space headroom override. `0` for
+/// either rate means unlimited (the default) — a bucket at rate `0` is
+/// bypassed entirely, so an unconfigured install imposes no throttling.
+/// `headroom_override_bytes` `None` means "use the default `max(1 GiB,
+/// 5%)` formula"; `Some(_)` is an explicit override.
 // Unlike `reporting::ConsentState` (which needs a hand-written `Default`
 // impl because one of its fields defaults to `true`), every field here
-// genuinely defaults to Rust's own zero-value default (`0`/`None`) — task
-// 1.1's spec-mandated default ("`0` = unlimited... default `0`", "no
-// headroom override") happens to coincide exactly with `#[derive(Default)]`,
-// so a hand-written impl would just be redundant (and clippy agrees).
+// genuinely defaults to Rust's own zero-value default (`0`/`None`) — the
+// spec-mandated default ("`0` = unlimited... default `0`", "no headroom
+// override") happens to coincide exactly with `#[derive(Default)]`, so a
+// hand-written impl would just be redundant (and clippy agrees).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ResourceGovernanceConfig {
@@ -49,10 +47,10 @@ impl GovernanceConfigStore {
         GovernanceConfigStore { path: config_dir.as_ref().join("resource_governance.json") }
     }
 
-    /// task 1.1: reads the persisted config, or the documented default if
-    /// no file has ever been written — deliberately does **not** write
-    /// anything to disk, so simply loading can never turn a fresh install
-    /// into one with a governance config file on disk.
+    /// Reads the persisted config, or the documented default if no file
+    /// has ever been written — deliberately does **not** write anything
+    /// to disk, so simply loading can never turn a fresh install into
+    /// one with a governance config file on disk.
     pub fn load(&self) -> std::io::Result<ResourceGovernanceConfig> {
         match std::fs::read_to_string(&self.path) {
             Ok(contents) => serde_json::from_str(&contents)
@@ -95,8 +93,8 @@ impl GovernanceConfigStore {
         Ok(())
     }
 
-    /// task 5.3: `yadorilink limits set --up <RATE> --down <RATE>` persists
-    /// both rates in one write (rather than two separate round trips that
+    /// `yadorilink limits set --up <RATE> --down <RATE>` persists both
+    /// rates in one write (rather than two separate round trips that
     /// could interleave with a concurrent read).
     pub fn set_limits(
         &self,
@@ -131,9 +129,9 @@ mod tests {
         (dir, store)
     }
 
-    /// task 1.5: config defaults when unset — no file written just by
-    /// reading, and the documented default (unlimited, no headroom
-    /// override) is returned.
+    /// Config defaults when unset — no file written just by reading, and
+    /// the documented default (unlimited, no headroom override) is
+    /// returned.
     #[test]
     fn fresh_store_reports_defaults_without_writing_a_file() {
         let (dir, store) = store();
@@ -145,7 +143,7 @@ mod tests {
         assert!(!dir.path().join("resource_governance.json").exists());
     }
 
-    /// task 1.5: config round-trip after an explicit `limits set`.
+    /// Config round-trip after an explicit `limits set`.
     #[test]
     fn set_limits_persists_across_a_new_store_instance() {
         let (dir, store) = store();
@@ -168,11 +166,11 @@ mod tests {
         assert_eq!(cleared.headroom_override_bytes, None);
     }
 
-    /// task 1.5: an old/hand-edited config file that's missing fields (or
-    /// entirely empty) must still deserialize to the safe default for
-    /// whichever fields are absent, never a hard error — `#[serde(default)]`
-    /// plus a real `Default` impl, the same discipline
-    /// `reporting::ConsentState` already established.
+    /// An old/hand-edited config file that's missing fields (or entirely
+    /// empty) must still deserialize to the safe default for whichever
+    /// fields are absent, never a hard error — `#[serde(default)]` plus a
+    /// real `Default` impl, the same discipline `reporting::ConsentState`
+    /// already established.
     #[test]
     fn deserializing_a_partial_or_empty_json_object_fills_in_safe_defaults() {
         let (dir, store) = store();

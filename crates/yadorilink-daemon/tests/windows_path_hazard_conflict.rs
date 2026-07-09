@@ -29,7 +29,7 @@
 //!   receives that record over the wire and tries to materialize it
 //!   locally.
 //! - `hold_record` (`peer_session.rs`) never renames and never writes
-//!   under any alternate name (design D3) — a held record only gets a
+//!   under any alternate name () — a held record only gets a
 //!   `SyncState::upsert_file`/`set_held` pair; `SyncState::get_held_state`
 //!   is the direct, non-flaky way to observe that from a test, rather
 //!   than inferring "held" from a timing-sensitive absence-of-file check.

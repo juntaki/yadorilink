@@ -156,7 +156,7 @@ impl EntryStore {
         Ok(removed)
     }
 
-    /// Task 3.5: records one more failed submission attempt against `id`
+    /// records one more failed submission attempt against `id`
     /// (used by the queue-retry sweep's backoff — see `retry.rs`),
     /// returning the new attempt count, or `None` if the entry no longer
     /// exists (e.g. deleted concurrently). Rewrites the entry file in
@@ -247,7 +247,7 @@ mod tests {
         assert_eq!(store.show("does-not-exist").unwrap(), None);
     }
 
-    /// Task 2.7: queue deletion.
+    /// queue deletion.
     #[test]
     fn delete_removes_the_entry_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
@@ -273,7 +273,7 @@ mod tests {
         assert!(store.list().unwrap().is_empty());
     }
 
-    /// Task 2.7: retention cap deletion — count cap, exercised through
+    /// retention cap deletion — count cap, exercised through
     /// the real `EntryStore`/filesystem rather than only the pure
     /// `RetentionPolicy` unit tests in `yadorilink-reporting`.
     #[test]

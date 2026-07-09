@@ -1,9 +1,9 @@
-//! Task 2.5: bounded local storage for reports the user has already
+//! bounded local storage for reports the user has already
 //! confirmed (a usage summary or an error report) but that haven't been
 //! submitted yet — either because network submission is disabled, the
 //! submission attempt failed, or the user asked to export/inspect later
 //! instead. Lives at `<config_dir>/reporting/queue/`, outside any linked
-//! folder (design.md D3/D7: this data must never sync to peers — nothing
+//! folder (this data must never sync to peers — nothing
 //! in this module ever touches `yadorilink-sync-core` or a linked-folder
 //! path).
 //!
@@ -50,7 +50,7 @@ impl QueueStore {
         self.inner.delete(report_id)
     }
 
-    /// Task 3.5: bumps `report_id`'s `submit_attempts` after a failed,
+    /// bumps `report_id`'s `submit_attempts` after a failed,
     /// retryable submission attempt — used by the queue-retry sweep's
     /// backoff (`retry.rs`) to eventually give up on an entry that keeps
     /// failing rather than retrying it forever.
@@ -91,7 +91,7 @@ mod tests {
         }
     }
 
-    /// Task 2.7: queue deletion (via the public `QueueStore` facade, not
+    /// queue deletion (via the public `QueueStore` facade, not
     /// just `EntryStore` directly).
     #[test]
     fn enqueue_list_delete_round_trip() {

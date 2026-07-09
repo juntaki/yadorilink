@@ -11,10 +11,9 @@
 #
 # yadorilink-desktop-app (the GTK tray app) and yadorilink-sign-manifest
 # (a maintainer-only offline signing tool, see yadorilink-daemon's
-# Cargo.toml) are deliberately NOT built or packaged here -- this change
-# scopes Linux support to the CLI + daemon only (see
-# openspec/changes/add-linux-support/proposal.md's Explicitly out of
-# scope section). No GTK/appindicator system packages are required to
+# Cargo.toml) are deliberately NOT built or packaged here -- Linux support
+# is intentionally scoped to the CLI + daemon only. No GTK/appindicator
+# system packages are required to
 # build or run this package as a result.
 #
 # HAND-AUTHORED CONTROL FILE + dpkg-deb, NOT cargo-deb -- see

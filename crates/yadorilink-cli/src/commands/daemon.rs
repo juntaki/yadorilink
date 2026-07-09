@@ -70,9 +70,9 @@ async fn set_all_paused(paused: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-/// add-observability-and-metrics task 4.2: view/toggle the daemon's opt-in
-/// `/metrics` endpoint by writing directly to the same
-/// `metrics_config.json` `yadorilink-daemon`'s `main.rs` reads at startup
+/// View/toggle the daemon's opt-in `/metrics` endpoint by writing
+/// directly to the same `metrics_config.json` `yadorilink-daemon`'s
+/// `main.rs` reads at startup
 /// (`yadorilink_daemon::metrics_config::MetricsConfigStore`) — both
 /// processes already share the same config directory convention
 /// (`crate::device_config::config_dir`), the same way `token_store`/

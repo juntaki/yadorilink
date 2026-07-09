@@ -1,16 +1,16 @@
-//! Task 2.4: bounded local persistence for error-report *candidates*
-//! (design.md D4) — severe-error snapshots the daemon captures on its own
+//! bounded local persistence for error-report *candidates*
+//! — severe-error snapshots the daemon captures on its own
 //! (section 3.3's job to actually create these from real error hooks;
 //! this module only owns the storage) before the user has decided
 //! whether to preview, export, submit, or discard them. Lives at
 //! `<config_dir>/reporting/error-candidates/`, a separate directory from
-//! `queue/` (task 2.5) because a candidate hasn't been confirmed by the
+//! `queue/` because a candidate hasn't been confirmed by the
 //! user yet — it's not "queued for submission," it's "waiting for the
 //! user to look at it."
 //!
-//! Default retention (design.md's Open Questions leaves the exact cap
-//! unspecified, so these are this module's own reasoned defaults, not a
-//! number pulled from the design doc):
+//! Default retention (the exact cap is intentionally left unspecified
+//! upstream, so these are this module's own reasoned defaults, not a
+//! number pulled from a spec):
 //! - `max_entries = 20`: candidates are created automatically by daemon
 //!   error hooks with no user action, so the cap needs to be tighter than
 //!   the user-confirmed queue's 50 — a crash loop must not fill the disk,
@@ -24,9 +24,9 @@
 //!   — candidates are full `ReportEnvelope`s subject to the same overall
 //!   size contract as every other report.
 //!
-//! Task 3.4 extension: `create_candidate_with_summary`/`show_with_summary`
+//! extension: `create_candidate_with_summary`/`show_with_summary`
 //! store/retrieve the `RedactionSummary` produced at candidate-creation
-//! time (by `ErrorPayloadBuilder::build()`, task 3.3's hook) alongside the
+//! time (by the `ErrorPayloadBuilder::build()` hook) alongside the
 //! entry, as a small sidecar `<id>.redaction.json` file next to the
 //! `EntryStore`-managed `<id>.json`. This is deliberately *not* modeled as
 //! a change to the shared `EntryStore`/`QueuedReportMetadata` shape (used
@@ -80,7 +80,7 @@ impl ErrorCandidateStore {
         self.inner.insert(envelope)
     }
 
-    /// Task 3.3/3.4: same as `create_candidate`, but also persists the
+    /// Same as `create_candidate`, but also persists the
     /// redaction summary produced while building `envelope`'s payload, so
     /// a later preview (`show_with_summary`) can show the user exactly
     /// what categories of sensitive data were stripped — see module doc
@@ -231,7 +231,7 @@ mod tests {
         assert_eq!(store.most_recent().unwrap().unwrap().report_id, meta.report_id);
     }
 
-    /// Task 2.7: retention cap deletion for error candidates specifically
+    /// retention cap deletion for error candidates specifically
     /// (distinct defaults from the queue).
     #[test]
     fn default_policy_caps_at_twenty_entries() {
@@ -258,7 +258,7 @@ mod tests {
         assert!(!dir.path().join("queue").exists());
     }
 
-    /// Task 3.4: the redaction summary captured at creation time survives
+    /// the redaction summary captured at creation time survives
     /// a round trip through the sidecar file.
     #[test]
     fn create_candidate_with_summary_round_trips_the_summary() {

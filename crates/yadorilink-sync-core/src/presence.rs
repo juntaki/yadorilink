@@ -15,7 +15,7 @@ pub fn office_lock_file_target(filename: &str) -> Option<&str> {
 }
 
 /// Default TTL (seconds) a presence signal is valid for on the receiving
-/// side absent a refresh (design D7's open question, resolved with a
+/// side absent a refresh ('s open question, resolved with a
 /// concrete default here: refresh well within the TTL so a couple of
 /// missed sends don't flap the "open elsewhere" badge).
 pub const PRESENCE_TTL_SECS: u32 = 90;

@@ -1,28 +1,25 @@
-//! `add-advanced-sync-operations` section 2 (Folder Operations): divergence
-//! summaries, dry-run resolution previews, and confirmation-gated
-//! override/revert/mode-change actions for directional (`send-only`/
-//! `receive-only`) links.
+//! Folder Operations: divergence summaries, dry-run resolution previews,
+//! and confirmation-gated override/revert/mode-change actions for
+//! directional (`send-only`/`receive-only`) links.
 //!
-//! This is layered entirely on top of `add-folder-direction-modes`'
-//! existing divergence-tracking primitives
-//! (`SyncState::list_out_of_sync`/`list_receive_only_changed`) and
-//! resolution actions (`link_manager::override_link`/`revert_link`/
+//! This is layered entirely on top of the existing divergence-tracking
+//! primitives (`SyncState::list_out_of_sync`/`list_receive_only_changed`)
+//! and resolution actions (`link_manager::override_link`/`revert_link`/
 //! `set_link_mode_and_reconcile`) — nothing here changes how divergence is
 //! recorded or how a resolution action actually mutates state; it only
 //! adds a preview/confirm workflow and audit trail in front of those
-//! existing entry points (design.md decision 1: "operations
-//! daemon-authoritative").
+//! existing entry points (these operations stay daemon-authoritative).
 //!
-//! **Preview/confirm/staleness (tasks 2.2-2.4)**: `preview_resolution`
-//! snapshots exactly the paths the requested action would affect right
-//! now and hands back an opaque `preview_id`. `confirm_resolution` looks
-//! that snapshot back up, recomputes the *same* affected-path set fresh,
-//! and only proceeds if the two sets still match — if anything else
-//! resolved/reconciled/re-linked in between (another client, a peer
-//! reconnect, a concurrent CLI invocation), the confirm is rejected as
-//! stale rather than silently acting on out-of-date information, and the
-//! preview is discarded either way (single-use, so a stale confirm can't
-//! be retried without a fresh preview).
+//! **Preview/confirm/staleness**: `preview_resolution` snapshots exactly
+//! the paths the requested action would affect right now and hands back
+//! an opaque `preview_id`. `confirm_resolution` looks that snapshot back
+//! up, recomputes the *same* affected-path set fresh, and only proceeds
+//! if the two sets still match — if anything else resolved/reconciled/
+//! re-linked in between (another client, a peer reconnect, a concurrent
+//! CLI invocation), the confirm is rejected as stale rather than silently
+//! acting on out-of-date information, and the preview is discarded either
+//! way (single-use, so a stale confirm can't be retried without a fresh
+//! preview).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,8 +32,8 @@ use yadorilink_sync_core::SyncError;
 use crate::daemon_state::DaemonState;
 use crate::link_manager;
 
-/// task 1.2 "bounded audit/trace state": this is a diagnostic trail, not a
-/// durable record store — old entries are dropped once this many have
+/// Bounded audit/trace state: this is a diagnostic trail, not a durable
+/// record store — old entries are dropped once this many have
 /// accumulated, oldest first.
 pub const MAX_AUDIT_ENTRIES: usize = 200;
 
@@ -84,7 +81,7 @@ impl ResolutionAction {
     }
 }
 
-/// task 2.1: a link's current divergence state, computed straight from
+/// A link's current divergence state, computed straight from
 /// index/reconcile state (`SyncState::count_out_of_sync`/
 /// `list_out_of_sync` and the receive-only-changed counterparts) — never
 /// a separately-persisted summary that could drift from what reconcile
@@ -123,7 +120,7 @@ pub fn divergence_summary(
     })
 }
 
-/// task 2.2: a dry-run preview for a resolution action — computed, never
+/// A dry-run preview for a resolution action — computed, never
 /// mutating anything. `revision` is an opaque token derived from the
 /// snapshot content itself (not just a counter), so `confirm_resolution`
 /// can detect staleness even across a daemon restart that happens to
@@ -228,7 +225,7 @@ impl FolderOpsState {
         }
     }
 
-    /// task 2.4 / diagnostics integration: the most recent audit entries,
+    /// Diagnostics integration: the most recent audit entries,
     /// newest first, optionally filtered to one link.
     pub fn audit_entries(&self, local_path: Option<&str>) -> Vec<FolderOperationAuditEntry> {
         let audit = self.audit.lock().unwrap_or_else(|p| p.into_inner());
@@ -262,9 +259,10 @@ fn find_link(
         .ok_or_else(|| SyncError::NotFound(format!("link {local_path}")))
 }
 
-/// task 2.1's divergence lists, but scoped to exactly what `action` would
-/// affect right now — shared by both `preview_resolution` (to snapshot)
-/// and `confirm_resolution` (to re-derive fresh, for the staleness check).
+/// The same divergence lists as `divergence_summary`, but scoped to
+/// exactly what `action` would affect right now — shared by both
+/// `preview_resolution` (to snapshot) and `confirm_resolution` (to
+/// re-derive fresh, for the staleness check).
 fn affected_paths_for(
     state: &DaemonState,
     link: &yadorilink_sync_core::index::FolderLink,
@@ -293,8 +291,8 @@ fn affected_paths_for(
         }
         ResolutionAction::ModeChange(target_mode) => {
             // Mirrors `set_link_mode_and_reconcile`'s own clearing rule
-            // exactly (task 2.2's preview must never predict something
-            // different from what task 2.3's confirm will actually do):
+            // exactly (`preview_resolution` must never predict something
+            // different from what `confirm_resolution` will actually do):
             // moving to a mode still clears whichever divergence set that
             // mode can no longer produce.
             let mut affected = Vec::new();
@@ -309,7 +307,7 @@ fn affected_paths_for(
     }
 }
 
-/// task 2.2: computes and stores a dry-run preview. Rejects exactly the
+/// Computes and stores a dry-run preview. Rejects exactly the
 /// same preconditions the real action would (wrong mode, paused link),
 /// so a preview is never misleadingly "successful" for a request
 /// `confirm_resolution` could never actually satisfy.
@@ -340,14 +338,13 @@ pub fn preview_resolution(
     })
 }
 
-/// task 2.3: performs the resolution action named by `preview_id`, but
-/// only if the affected-path set computed fresh right now still matches
-/// what was snapshotted at preview time (order-independent — a
-/// concurrent reconcile that only reorders `list_out_of_sync`'s result
-/// isn't a real change). Any mismatch — including the preview having
-/// already expired/been consumed — is `SyncError::InvalidLinkMode`
-/// (task 2.4 "stale preview rejection"), and the preview is discarded
-/// either way.
+/// Performs the resolution action named by `preview_id`, but only if the
+/// affected-path set computed fresh right now still matches what was
+/// snapshotted at preview time (order-independent — a concurrent
+/// reconcile that only reorders `list_out_of_sync`'s result isn't a real
+/// change). Any mismatch — including the preview having already
+/// expired/been consumed — is `SyncError::InvalidLinkMode` (stale
+/// preview rejection), and the preview is discarded either way.
 pub async fn confirm_resolution(state: &DaemonState, preview_id: &str) -> Result<u64, SyncError> {
     let Some(stored) = state.folder_ops.take_preview(preview_id) else {
         return Err(SyncError::InvalidLinkMode(format!(

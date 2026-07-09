@@ -1,17 +1,15 @@
-//! `add-advanced-sync-operations` section 4 (Connection Operations):
-//! a bounded, in-memory history of recent connection attempts, plus a
-//! connectivity-doctor summary derived from it and other already-tracked
-//! daemon state.
+//! Connection Operations: a bounded, in-memory history of recent
+//! connection attempts, plus a connectivity-doctor summary derived from
+//! it and other already-tracked daemon state.
 //!
-//! design.md decision 3 ("store bounded diagnostic traces, not verbose
-//! raw logs"): every field here is a structured category or a
-//! project-internal identifier (device id, relay id) — never a raw
-//! socket address, hostname, or any file content/path, matching this
-//! project's content-blindness discipline and mirroring
-//! `add-oss-usage-error-reporting`'s bounded error-candidate ring buffer
-//! (`crate::reporting::error_candidates`) and `folder_ops`'s bounded
-//! audit trail: oldest entries are dropped once the cap is reached, this
-//! is never durably persisted, and a restart starts the history empty.
+//! Bounded diagnostic traces, not verbose raw logs: every field here is
+//! a structured category or a project-internal identifier (device id,
+//! relay id) — never a raw socket address, hostname, or any file
+//! content/path, matching this project's content-blindness discipline
+//! and mirroring `crate::reporting::error_candidates`'s bounded
+//! error-candidate ring buffer and `folder_ops`'s bounded audit trail:
+//! oldest entries are dropped once the cap is reached, this is never
+//! durably persisted, and a restart starts the history empty.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -56,8 +54,8 @@ impl CandidateSource {
     }
 }
 
-/// Coarse address class — never a raw IP/hostname/port (task 4.3's
-/// redaction requirement).
+/// Coarse address class — never a raw IP/hostname/port, per this
+/// module's redaction requirement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressClass {
     Lan,
@@ -94,8 +92,8 @@ impl AttemptOutcome {
     }
 }
 
-/// One structured connection-attempt record (task 4.1) — candidate
-/// source, coarse address class, outcome, latency, failure category,
+/// One structured connection-attempt record — candidate source, coarse
+/// address class, outcome, latency, failure category,
 /// whether this attempt became the selected path, relay identity (if
 /// any), and the authorization decision. `peer_device_id` is empty for
 /// an attempt that isn't peer-specific (e.g. the coordination-plane
@@ -179,7 +177,7 @@ impl ConnectionTraceLog {
     }
 }
 
-/// task 4.2: connectivity-doctor categories. Each category's status is
+/// Connectivity-doctor categories. Each category's status is
 /// derived from state this daemon already tracks cheaply (task liveness,
 /// live peer statuses, this trace log, and folder-link pause state) —
 /// deliberately not a full active network probe. Where the underlying
@@ -378,10 +376,10 @@ mod tests {
     #[test]
     fn never_carries_a_raw_address_field() {
         // Structural guarantee, not a runtime one: `ConnectionAttemptTrace`
-        // has no field that could hold a raw socket address at all (task
-        // 4.3's redaction requirement) — this test exists to force a
-        // compile error (via an exhaustive match with named bindings)
-        // if a future edit ever adds one without updating this note.
+        // has no field that could hold a raw socket address at all — this
+        // test exists to force a compile error (via an exhaustive match
+        // with named bindings) if a future edit ever adds one without
+        // updating this note.
         let trace = ConnectionAttemptTrace {
             peer_device_id: "device-a".into(),
             candidate_source: "relay",

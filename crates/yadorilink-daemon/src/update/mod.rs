@@ -1,7 +1,6 @@
-//! add-automatic-updates: signed update discovery, verification, download,
-//! install orchestration, and rollback/recovery for desktop builds
-//! (design.md). See each submodule's doc comment for its slice of the
-//! design:
+//! Signed update discovery, verification, download, install
+//! orchestration, and rollback/recovery for desktop builds. See each
+//! submodule's doc comment for its slice of the design:
 //!   - `manifest`: the signed update manifest (task 1).
 //!   - `verify`: downloaded-artifact checksum/publisher-signature checks (task 1.4).
 //!   - `policy`: persisted daemon update policy/state (task 2.1).

@@ -1,8 +1,7 @@
 # installer/windows/verify-installer.ps1
 #
-# Standalone verification for a built (or downloaded) yadorilink-setup.exe —
-# part of add-release-artifact-verification, tasks.md 2.2. Unlike the
-# signature check already inline in build-installer.ps1 (which only runs
+# Standalone verification for a built (or downloaded) yadorilink-setup.exe.
+# Unlike the signature check already inline in build-installer.ps1 (which only runs
 # right after that same script produces the artifact, and only for
 # -SignToolName builds), this can be pointed at any yadorilink-setup.exe —
 # e.g. one downloaded from a release page — to independently confirm its
@@ -79,7 +78,7 @@ if ($signature.Status -eq "Valid") {
 Write-Output "== Microsoft Store metadata =="
 Write-Note "no MSIX/Store package produced by this repo yet; Store metadata verification is not applicable"
 
-# add-desktop-status-app task 4.4: best-effort, non-blocking check for the
+# Best-effort, non-blocking check for the
 # status app's Scheduled Task registration (status-app-task.ps1). This is
 # NOT a check of $Path itself (an Inno Setup .exe is a self-extracting
 # archive this script has no unpacker for, unlike installer/macos/

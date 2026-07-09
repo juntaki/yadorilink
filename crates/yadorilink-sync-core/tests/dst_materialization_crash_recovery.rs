@@ -1,8 +1,8 @@
-//! Fault-injection DST scenario (add-deterministic-sync-testing task
-//! group 6): simulates a process crash during materialization and
-//! verifies the real recovery path (`materialization::repair_
-//! interrupted_materializations` + `cleanup_stale_temp_files`) self-heals
-//! without data loss or leftover garbage.
+//! Fault-injection DST scenario: simulates a process crash during
+//! materialization and verifies the real recovery path
+//! (`materialization::repair_interrupted_materializations` +
+//! `cleanup_stale_temp_files`) self-heals without data loss or leftover
+//! garbage.
 //!
 //! Scope note: unlike the watcher (`SimulatedFolderWatchSource`) and
 //! peer-network (madsim tokio shim) boundaries, this scenario is

@@ -1,16 +1,16 @@
-//! add-first-run-safety-onboarding task 1.1: link preflight — the checks
-//! that run before a folder is actually linked, so a first-time user gets a
-//! clear picture of what's about to happen instead of finding out the hard
-//! way. Shared by `yadorilink-cli` (the client-side preflight/dry-run/
-//! interactive-confirmation gate, `yadorilink link` and `--dry-run`) and
-//! `yadorilink-daemon` (a defense-in-depth re-check at the actual
-//! registration point, `control_socket::link`) — a single computed report
-//! always backs both, the same "never two independently-computed answers
-//! that could disagree" discipline `yadorilink_local_storage::free_space`'s
-//! own module doc comment already documents for disk-pressure checks (this
+//! Link preflight — the checks that run before a folder is actually
+//! linked, so a first-time user gets a clear picture of what's about to
+//! happen instead of finding out the hard way. Shared by `yadorilink-cli`
+//! (the client-side preflight/dry-run/interactive-confirmation gate,
+//! `yadorilink link` and `--dry-run`) and `yadorilink-daemon` (a
+//! defense-in-depth re-check at the actual registration point,
+//! `control_socket::link`) — a single computed report always backs both,
+//! the same "never two independently-computed answers that could
+//! disagree" discipline `yadorilink_local_storage::free_space`'s own
+//! module doc comment already documents for disk-pressure checks (this
 //! module reuses that exact classification rather than re-deriving it).
 //!
-//! Deliberately local-only and fast (design.md's "keep checks local and
+//! Deliberately local-only and fast ("keep checks local and
 //! fast; deep scans can be optional for huge folders"): the directory scan
 //! below is capped at [`SCAN_ENTRY_CAP`] entries, so a preflight on a huge
 //! folder still returns promptly with `scan_truncated: true` rather than
@@ -22,15 +22,15 @@ use yadorilink_local_storage::free_space::{self, FreeSpaceState, VolumeFreeSpace
 
 use crate::ignore_patterns::EffectiveIgnoreSet;
 
-/// Directory-scan cap (task 1.1's "huge folder" handling / design.md's
-/// "deep scans can be optional for huge folders"): once this many entries
+/// Directory-scan cap (task 1.1's "huge folder" handling — deep scans can
+/// be optional for huge folders): once this many entries
 /// (ignored or not) have been visited, the scan stops early and
 /// `scan_truncated` is set, rather than walking an arbitrarily large tree
 /// before a first-run user even sees a preflight result.
 pub const SCAN_ENTRY_CAP: u64 = 50_000;
 
-/// Well-known cloud-provider-managed folder names (task 1.1 / spec.md's
-/// "Risky folder location" scenario). Matched case-insensitively against
+/// Well-known cloud-provider-managed folder names (task 1.1's "Risky
+/// folder location" scenario). Matched case-insensitively against
 /// any path component, not just the last one, since the marker folder is
 /// often an ancestor of the folder actually being linked (e.g. linking
 /// `~/Dropbox/Photos` rather than `~/Dropbox` itself).
@@ -48,8 +48,8 @@ const CLOUD_PROVIDER_MARKERS: &[&str] = &[
 ];
 
 /// How an about-to-be-linked path relates to an already-linked path — task
-/// 1.1's "risky location detection" / spec.md's nested-link scenario
-/// (implied by "obvious conflict risks" in the `first-run-safety` spec).
+/// 1.1's "risky location detection" / nested-link scenario (implied by
+/// "obvious conflict risks" in the `first-run-safety` spec).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NestedLinkRelation {
     /// The already-linked path is an ancestor of the folder being linked
@@ -94,7 +94,7 @@ pub struct LinkPreflightReport {
     pub is_directory: bool,
     /// Count of entries (files and directories, recursive) that are *not*
     /// matched by the link's effective ignore rules — this is what "would
-    /// participate in initial reconciliation" per spec.md's non-empty-folder
+    /// participate in initial reconciliation" per the non-empty-folder
     /// scenario.
     pub entry_count: u64,
     /// Count of entries matched by the effective ignore rules (built-in
@@ -123,7 +123,7 @@ impl LinkPreflightReport {
         self.free_space.map(|s| s.classify())
     }
 
-    /// task 1.3 / spec.md: whether this preflight found anything that
+    /// whether this preflight found anything that
     /// should require explicit confirmation or an acknowledgement flag
     /// before linking proceeds.
     pub fn is_risky(&self) -> bool {
@@ -348,8 +348,8 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
-    /// spec.md "Non-empty folder warning": a folder with real content is
-    /// flagged risky and produces a specific warning.
+    /// The "Non-empty folder warning" scenario: a folder with real content
+    /// is flagged risky and produces a specific warning.
     #[test]
     fn non_empty_folder_is_risky_with_a_warning() {
         let dir = tempdir();
@@ -384,7 +384,7 @@ mod tests {
         assert!(!report.is_risky());
     }
 
-    /// spec.md "Low disk space warning": constructed via a headroom
+    /// The "Low disk space warning" scenario: constructed via a headroom
     /// override large enough that any real test volume is "critical"
     /// relative to it, deterministically (not dependent on actual free
     /// space on the machine running the test).
@@ -451,8 +451,8 @@ mod tests {
         assert!(!report.is_risky());
     }
 
-    /// spec.md "Risky folder location": a well-known cloud-provider-managed
-    /// folder name anywhere in the path is flagged.
+    /// The "Risky folder location" scenario: a well-known
+    /// cloud-provider-managed folder name anywhere in the path is flagged.
     #[test]
     fn cloud_provider_folder_is_flagged_risky() {
         let dir = tempdir();

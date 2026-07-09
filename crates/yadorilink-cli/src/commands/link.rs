@@ -12,13 +12,13 @@ use crate::control_client;
 use crate::error::CliError;
 use crate::grpc::{require_access_token, resolve_group_id};
 
-/// add-folder-direction-modes task 4.3: the `  mode=<mode>` suffix
-/// appended to a link's summary line — same "empty unless applicable"
-/// discipline as `skipped_symlink_suffix`/`status.rs`'s `held_summary_
-/// suffix`, except `send-receive` (the default, unchanged-behavior mode)
-/// is itself treated as "nothing to call out", so an existing link's
-/// output stays exactly as it was before this feature existed unless the
-/// user actually opted into a directional mode.
+/// The `  mode=<mode>` suffix appended to a link's summary line — same
+/// "empty unless applicable" discipline as `skipped_symlink_suffix`/
+/// `status.rs`'s `held_summary_suffix`, except `send-receive` (the
+/// default, unchanged-behavior mode) is itself treated as "nothing to
+/// call out", so an existing link's output stays exactly as it was
+/// before this feature existed unless the user actually opted into a
+/// directional mode.
 fn mode_suffix(link: &LinkStatus) -> String {
     if link.mode.is_empty() || link.mode == "send_receive" {
         String::new()
@@ -27,9 +27,9 @@ fn mode_suffix(link: &LinkStatus) -> String {
     }
 }
 
-/// add-folder-direction-modes task 4.3: the out-of-sync (send-only) /
-/// locally-changed (receive-only) divergence-count suffix. Empty when
-/// both counts are zero, matching the same discipline.
+/// The out-of-sync (send-only) / locally-changed (receive-only)
+/// divergence-count suffix. Empty when both counts are zero, matching
+/// the same discipline.
 fn divergence_suffix(link: &LinkStatus) -> String {
     let mut parts = Vec::new();
     if link.out_of_sync_count > 0 {
@@ -45,16 +45,16 @@ fn divergence_suffix(link: &LinkStatus) -> String {
     }
 }
 
-/// add-sync-fidelity task 6.2: the `  skipped_symlinks=N` suffix appended
-/// to a link's summary line in `link list` — empty (no suffix) when the
-/// link has none, matching the same "no new fields rendered when a link
-/// has none" contract task 6.3 requires (see `status.rs`'s
-/// `held_summary_suffix` for the identical pattern used there). Always 0
-/// on a non-Windows daemon (`LinkStatus::skipped_symlink_count`'s own doc
-/// comment), so this suffix never appears on this dev/CI environment's
-/// own real runs — reviewed by inspection and covered by the unit test
-/// below, the same honest limitation already documented for the
-/// Windows-only mechanism itself (section 3.2/5.4's `tasks.md` notes).
+/// The `  skipped_symlinks=N` suffix appended to a link's summary line
+/// in `link list` — empty (no suffix) when the link has none, matching
+/// the same "no new fields rendered when a link has none" contract task
+/// 6.3 requires (see `status.rs`'s `held_summary_suffix` for the
+/// identical pattern used there). Always 0 on a non-Windows daemon
+/// (`LinkStatus::skipped_symlink_count`'s own doc comment), so this
+/// suffix never appears on this dev/CI environment's own real runs —
+/// reviewed by inspection and covered by the unit test below, the same
+/// honest limitation already documented for the Windows-only mechanism
+/// itself.
 fn skipped_symlink_suffix(link: &LinkStatus) -> String {
     if link.skipped_symlink_count == 0 {
         String::new()
@@ -63,34 +63,35 @@ fn skipped_symlink_suffix(link: &LinkStatus) -> String {
     }
 }
 
-/// `on_demand_sync` task 5.1: `yadorilink link --on-demand [--max-local-size <SIZE>]`.
+/// `yadorilink link --on-demand [--max-local-size <SIZE>]`.
 /// `max_local_size_bytes` is only meaningful when `on_demand` is set (the
-/// daemon ignores it otherwise, matching design D6's "no cap configured =
-/// no automatic eviction" default). content-defined-chunking task 4.3:
+/// daemon ignores it otherwise, matching 's "no cap configured =
+/// no automatic eviction" default).
 /// `--content-defined-chunking` opts this link into content-defined
-/// chunking for files at or above the size threshold (design D3);
+/// chunking for files at or above the size threshold ();
 /// unrelated to `on_demand` and may be combined freely with it.
-/// add-folder-direction-modes task 4.3: `--mode <mode>` at link time.
-/// `None` (the flag omitted) sends an empty `mode` string, which the
-/// daemon's `LinkMode::from_db_str` decodes as `SendReceive` — the same
-/// "absent means unchanged default behavior" contract every other
-/// optional link-time setting here already follows.
+/// `--mode <mode>` at link time. `None` (the flag omitted) sends an
+/// empty `mode` string, which the daemon's `LinkMode::from_db_str`
+/// decodes as `SendReceive` — the same "absent means unchanged default
+/// behavior" contract every other optional link-time setting here
+/// already follows.
 ///
-/// add-file-version-history task 6.4: `--keep-versions <n>`/`--keep-days
-/// <t>` at link time (design D2's defaults, 10/30, apply when both are
-/// omitted — see `control_socket.rs`'s `link()` for the "absent = use the
-/// column's own `DEFAULT`" contract this mirrors).
+/// `--keep-versions <n>`/`--keep-days <t>` at link time ('s
+/// defaults, 10/30, apply when both are omitted — see
+/// `control_socket.rs`'s `link()` for the "absent = use the column's own
+/// `DEFAULT`" contract this mirrors).
 ///
-/// add-first-run-safety-onboarding tasks 1.2/1.3/2.1/2.2: `--dry-run` runs
-/// the local preflight (`yadorilink_sync_core::link_preflight`) and prints
-/// its findings without ever contacting the daemon to register a link (so
-/// nothing is persisted — task 1.2's "no persisted writes"). Otherwise, the
-/// same preflight always runs first and its summary is always printed
-/// (task 2.2); if it found a risky condition (non-empty folder, low disk
+/// `--dry-run` runs the local preflight
+/// (`yadorilink_sync_core::link_preflight`) and prints its findings
+/// without ever contacting the daemon to register a link (so nothing is
+/// persisted). Otherwise, the same
+/// preflight always runs first and its summary is always printed;
+/// if it found a risky condition (non-empty folder, low disk
 /// space, a nested-link conflict, or a risky location), the link is only
-/// sent on if `--yes` was passed or (in an interactive terminal) the user
-/// confirms — a risky link attempted non-interactively without `--yes`
-/// exits non-zero instead (spec.md's "Risk acknowledgement" scenario).
+/// sent on if `--yes` was passed or (in an interactive terminal) the
+/// user confirms — a risky link attempted non-interactively without
+/// `--yes` exits non-zero instead (spec.md's "Risk acknowledgement"
+/// scenario).
 #[allow(clippy::too_many_arguments)]
 pub async fn link(
     local_path: String,
@@ -147,11 +148,11 @@ pub async fn link(
 
 /// Best-effort: an unreachable daemon (or any other `ListLinks` failure)
 /// is treated as "no known existing links" rather than aborting the whole
-/// preflight — nested-link detection then just can't find anything, which
-/// is acceptable per design.md's "Non-Goals: perfect prediction of every
-/// conflict". A real (non-dry-run) link attempt still fails clearly right
-/// after, when `control_client::send`'s own `Link` call hits the same
-/// unreachable daemon.
+/// preflight — nested-link detection then just can't find anything,
+/// which is acceptable since perfect prediction of every conflict isn't
+/// a goal here. A real (non-dry-run) link attempt still fails clearly
+/// right after, when `control_client::send`'s own `Link` call hits the
+/// same unreachable daemon.
 async fn fetch_existing_link_paths() -> Vec<String> {
     match control_client::send(ReqPayload::ListLinks(ListLinksRequest {})).await {
         Ok(resp) => match resp.payload {
@@ -164,9 +165,9 @@ async fn fetch_existing_link_paths() -> Vec<String> {
     }
 }
 
-/// task 2.2: always prints a short factual summary of what preflight found
+/// always prints a short factual summary of what preflight found
 /// (empty/non-empty, ignored-entry count, free-space state), then one
-/// `warning:` line per risky condition (task 1.1's scenarios) — printed
+/// `warning:` line per risky condition — printed
 /// separately from the factual summary so a risky link's output is
 /// unambiguous even when scrolled past quickly.
 fn print_preflight_report(report: &LinkPreflightReport) {
@@ -201,7 +202,7 @@ fn print_preflight_report(report: &LinkPreflightReport) {
     }
 }
 
-/// task 1.3/2.1: the acknowledgement gate. Returns whether the caller has
+/// The acknowledgement gate. Returns whether the caller has
 /// (or needed to) acknowledge a risky preflight result; only ever
 /// `Err`ors when the preflight is risky and there is no way to
 /// acknowledge it (non-interactive without `--yes`, or an interactive "no"
@@ -243,10 +244,9 @@ fn confirm_risky(warnings: &[String]) -> bool {
     confirm_risky_with_reader(warnings, &mut lock)
 }
 
-/// add-file-version-history task 6.4: only mentioned in the link summary
-/// when the caller actually passed `--keep-versions`/`--keep-days` —
-/// matches `mode`'s own "say nothing when the default applies" discipline
-/// above.
+/// Only mentioned in the link summary when the caller actually passed
+/// `--keep-versions`/`--keep-days` — matches `mode`'s own "say nothing
+/// when the default applies" discipline above.
 fn retention_suffix(keep_versions: Option<i64>, keep_days: Option<i64>) -> String {
     if keep_versions.is_none() && keep_days.is_none() {
         return String::new();
@@ -290,9 +290,8 @@ pub async fn unlink(local_path: String) -> Result<(), CliError> {
     Ok(())
 }
 
-/// add-folder-direction-modes task 4.3: `yadorilink link-set-mode <path>
-/// <mode>` — changes an existing link's mode and triggers the daemon's
-/// rescan/reconcile.
+/// `yadorilink link-set-mode <path> <mode>` — changes an existing link's
+/// mode and triggers the daemon's rescan/reconcile.
 pub async fn set_mode(local_path: String, mode: String) -> Result<(), CliError> {
     control_client::send(ReqPayload::SetMode(SetModeRequest {
         local_path: local_path.clone(),
@@ -303,7 +302,7 @@ pub async fn set_mode(local_path: String, mode: String) -> Result<(), CliError> 
     Ok(())
 }
 
-/// add-folder-direction-modes task 4.3: `yadorilink override <path>`.
+/// `yadorilink override <path>`.
 pub async fn override_link(local_path: String) -> Result<(), CliError> {
     let resp = control_client::send(ReqPayload::Override(OverrideRequest {
         local_path: local_path.clone(),
@@ -316,7 +315,7 @@ pub async fn override_link(local_path: String) -> Result<(), CliError> {
     Ok(())
 }
 
-/// add-folder-direction-modes task 4.3: `yadorilink revert <path>`.
+/// `yadorilink revert <path>`.
 pub async fn revert(local_path: String) -> Result<(), CliError> {
     let resp =
         control_client::send(ReqPayload::Revert(RevertRequest { local_path: local_path.clone() }))
@@ -347,7 +346,7 @@ pub async fn list() -> Result<(), CliError> {
             } else {
                 String::new()
             },
-            // on-demand-sync task 5.4: only show the materialization
+            // Only show the materialization
             // breakdown for `ondemand` folders — an `eager` folder's files
             // are always hydrated, so the summary would be pure noise.
             if link.materialization_policy == "ondemand" {
@@ -358,7 +357,7 @@ pub async fn list() -> Result<(), CliError> {
             } else {
                 String::new()
             },
-            // content-defined-chunking task 4.4: only show the chunking
+            // Only show the chunking
             // policy when it differs from the default — a `fixed` link is
             // unremarkable and matches every link before this feature
             // existed, so calling it out would be noise.
@@ -367,9 +366,7 @@ pub async fn list() -> Result<(), CliError> {
             } else {
                 String::new()
             },
-            // add-sync-fidelity task 6.2.
             skipped_symlink_suffix(link),
-            // add-folder-direction-modes task 4.3.
             mode_suffix(link),
             divergence_suffix(link),
         );
@@ -411,13 +408,13 @@ mod tests {
         }
     }
 
-    /// task 6.3: a link with no skipped symlinks renders no new output.
+    /// a link with no skipped symlinks renders no new output.
     #[test]
     fn no_skipped_symlinks_renders_no_new_output() {
         assert_eq!(skipped_symlink_suffix(&base_link()), "");
     }
 
-    /// task 6.2: a link with skipped symlinks (the Windows default-skip
+    /// a link with skipped symlinks (the Windows default-skip
     /// policy) shows the count alongside the existing sync-state summary.
     #[test]
     fn skipped_symlinks_render_the_count() {
@@ -426,9 +423,9 @@ mod tests {
         assert_eq!(skipped_symlink_suffix(&link), "  skipped_symlinks=3");
     }
 
-    /// add-folder-direction-modes task 4.3: a `send-receive` (default)
-    /// link renders no mode suffix at all — an unaffected existing link's
-    /// output is unchanged from before this feature existed.
+    /// A `send-receive` (default) link renders no mode suffix at all —
+    /// an unaffected existing link's output is unchanged from before
+    /// this feature existed.
     #[test]
     fn send_receive_mode_renders_no_new_output() {
         assert_eq!(mode_suffix(&base_link()), "");
@@ -469,7 +466,7 @@ mod tests {
         assert_eq!(normalize_mode_arg("receive-only").unwrap(), "receive_only");
     }
 
-    /// task 6.4: omitting both retention flags renders no new output —
+    /// omitting both retention flags renders no new output —
     /// the schema defaults (10/30) apply silently, matching `mode`'s own
     /// "unaffected existing behavior" discipline.
     #[test]
@@ -498,7 +495,7 @@ mod tests {
         assert_eq!(divergence_suffix(&link), "  out_of_sync=2 receive_only_changed=5");
     }
 
-    // -- add-first-run-safety-onboarding: acknowledgement gate --------------
+    // -- acknowledgement gate -------------------------------------------
 
     fn risky_report() -> LinkPreflightReport {
         let dir = tempfile::tempdir().unwrap();

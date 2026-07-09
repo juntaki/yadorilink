@@ -131,7 +131,7 @@ fn spawn_session_with_groups(
 }
 
 /// Like `spawn_session`, but wired to forward presence signals received
-/// from this peer into `presence_tx` (task 9.6).
+/// from this peer into `presence_tx`.
 fn spawn_session_with_presence(
     channel: Arc<PeerChannel>,
     device: &Device,
@@ -319,12 +319,12 @@ async fn same_version_resync_does_not_hydrate_an_ondemand_placeholder() {
     assert_ne!(std::fs::read(&replicated_path).unwrap(), contents);
 }
 
-/// add-folder-direction-modes task 2.1/5.1: a `send-only` link never
-/// applies an incoming peer change — the receiving device's `link_mode_for_
-/// group` reads `SendOnly` (set via `set_link_mode` below), so `reconcile_
-/// one_file`'s never-seen-path branch must record an out-of-sync item
-/// instead of writing the file to disk. Local content stays authoritative
-/// (here: no file at all) until an explicit `override`.
+/// A `send-only` link never applies an incoming peer change — the
+/// receiving device's `link_mode_for_group` reads `SendOnly` (set via
+/// `set_link_mode` below), so `reconcile_one_file`'s never-seen-path
+/// branch must record an out-of-sync item instead of writing the file to
+/// disk. Local content stays authoritative (here: no file at all) until
+/// an explicit `override`.
 #[tokio::test]
 async fn send_only_link_does_not_apply_incoming_change_and_records_out_of_sync() {
     let relay_addr = start_relay().await;
@@ -364,13 +364,12 @@ async fn send_only_link_does_not_apply_incoming_change_and_records_out_of_sync()
     assert_eq!(device_b.state.list_out_of_sync(GROUP).unwrap(), vec!["vacation.jpg".to_string()]);
 }
 
-/// add-folder-direction-modes task 2.1/5.1, design.md's "Pause still
-/// trumps everything": a paused link never applies an incoming change,
-/// regardless of mode — including the ordinary `send-receive` default,
-/// which this module never gated on `paused` at all before this change
-/// (only the daemon's local→peer broadcast did). No out-of-sync item is
-/// recorded either — pause suspends the link entirely rather than
-/// activating a mode gate.
+/// Pause always trumps everything: a paused link never applies an
+/// incoming change, regardless of mode — including the ordinary
+/// `send-receive` default, which this module previously never gated on
+/// `paused` at all (only the daemon's local→peer broadcast did). No
+/// out-of-sync item is recorded either — pause suspends the link entirely
+/// rather than activating a mode gate.
 #[tokio::test]
 async fn paused_link_does_not_apply_an_incoming_change_regardless_of_mode() {
     let relay_addr = start_relay().await;
@@ -408,11 +407,10 @@ async fn paused_link_does_not_apply_an_incoming_change_regardless_of_mode() {
     );
 }
 
-/// add-folder-direction-modes task 2.1/2.3: a send-only link gates an
-/// incoming tombstone identically to ordinary content (design.md's
-/// "Tombstones" section) — recorded as out-of-sync, never applied, so a
-/// file this device already has locally must survive an incoming deletion
-/// from a send-only-gated peer.
+/// A send-only link gates an incoming tombstone identically to ordinary
+/// content — recorded as out-of-sync, never applied, so a file this
+/// device already has locally must survive an incoming deletion from a
+/// send-only-gated peer.
 #[tokio::test]
 async fn send_only_link_does_not_apply_incoming_tombstone_and_records_out_of_sync() {
     let relay_addr = start_relay().await;
@@ -461,9 +459,9 @@ async fn send_only_link_does_not_apply_incoming_tombstone_and_records_out_of_syn
     assert!(!local.deleted, "the local index row must stay untouched by the gated deletion");
 }
 
-/// sync-engine spec: "Local file edit detected" + incremental propagation
-/// (task 5.5) — a change made *after* the initial sync must also reach
-/// the peer, sent as an index update rather than a full re-sync.
+/// "Local file edit detected" + incremental propagation — a change made
+/// *after* the initial sync must also reach the peer, sent as an index
+/// update rather than a full re-sync.
 #[tokio::test]
 async fn incremental_change_after_initial_sync_propagates() {
     let relay_addr = start_relay().await;
@@ -497,10 +495,10 @@ async fn incremental_change_after_initial_sync_propagates() {
     assert_eq!(std::fs::read(&replicated_path).unwrap(), b"first draft");
 }
 
-/// sync-engine spec: "Concurrent edit produces conflicted copy" — both
-/// devices edit the same file before either has seen the other's change;
-/// version vectors must detect this as a true conflict (not a simple
-/// ordering), and both copies must survive on both devices (task 6.6, 6.7).
+/// "Concurrent edit produces conflicted copy" — both devices edit the
+/// same file before either has seen the other's change; version vectors
+/// must detect this as a true conflict (not a simple ordering), and both
+/// copies must survive on both devices.
 #[tokio::test]
 async fn concurrent_edit_produces_conflict_copy_on_both_sides() {
     let relay_addr = start_relay().await;
@@ -605,8 +603,7 @@ async fn concurrent_edit_produces_conflict_copy_on_both_sides() {
     }
 }
 
-/// add-folder-direction-modes task 2.1/5.1: design.md is explicit that
-/// "send-only never conflict-copies an incoming change" — a genuine
+/// Send-only never conflict-copies an incoming change — a genuine
 /// concurrent edit against a send-only link must be recorded as
 /// out-of-sync, not resolved via the normal rename-the-loser conflict
 /// machinery, so no conflict-copy file is ever written and B's own content
@@ -704,11 +701,10 @@ async fn send_only_link_records_out_of_sync_instead_of_conflict_copy_on_concurre
     );
 }
 
-/// sync-correctness-fixes task 3.2 (guards COR-3): a delete-vs-edit
-/// conflict where the tombstone is the *loser* must never leave an empty
-/// ghost file behind, and disk state must match the index exactly — only
-/// the winner's real content, at the original path, no conflict-copy
-/// file for the tombstone (COR-3's fix: `resolve_and_apply_conflict`
+/// A delete-vs-edit conflict where the tombstone is the *loser* must
+/// never leave an empty ghost file behind, and disk state must match the
+/// index exactly — only the winner's real content, at the original path,
+/// no conflict-copy file for the tombstone (`resolve_and_apply_conflict`
 /// skips creating a conflict copy for a tombstone loser entirely, since
 /// "conflict copy of a deletion" has no content to preserve).
 #[tokio::test]
@@ -795,8 +791,8 @@ async fn delete_vs_edit_conflict_tombstone_as_loser_leaves_no_ghost_file() {
     }
 }
 
-/// sync-correctness-fixes task 3.2 (guards COR-3): the reverse case — the
-/// tombstone *wins* the conflict. The file must be removed from disk with
+/// The reverse case — the tombstone *wins* the conflict. The file must
+/// be removed from disk with
 /// no leftover empty/ghost file at the original path, while the loser's
 /// real (non-tombstone) content is preserved as a conflict-marked copy
 /// rather than silently discarded, matching this codebase's existing
@@ -957,10 +953,10 @@ async fn unauthorized_group_id_in_incoming_message_is_ignored() {
     assert!(device_b.state.get_file(GROUP, "private.txt").unwrap().is_none());
 }
 
-/// on-demand-sync task 1.7 / spec "OnDemand folder creates placeholders
-/// instead of full content": adopting a file into an `OnDemand`-policy
-/// folder must index it and write a correctly-sized placeholder — without
-/// ever fetching its blocks from the peer.
+/// "OnDemand folder creates placeholders instead of full content":
+/// adopting a file into an `OnDemand`-policy folder must index it and
+/// write a correctly-sized placeholder — without ever fetching its
+/// blocks from the peer.
 #[tokio::test]
 async fn ondemand_folder_adopts_placeholder_without_fetching_blocks() {
     let relay_addr = start_relay().await;
@@ -969,7 +965,7 @@ async fn ondemand_folder_adopts_placeholder_without_fetching_blocks() {
 
     // Device B links the folder group as `OnDemand` — this is what
     // `PeerSyncSession::materialize` consults to decide placeholder vs.
-    // full hydration (design D3).
+    // full hydration.
     let root_b = device_b.root_path().to_string_lossy().to_string();
     device_b.state.add_link(&root_b, GROUP).unwrap();
     device_b
@@ -1027,11 +1023,10 @@ async fn ondemand_folder_adopts_placeholder_without_fetching_blocks() {
     }
 }
 
-/// on-demand-sync task 2.1/2.8 / spec "Opening a placeholder triggers
-/// hydration": `PeerSyncSession::hydrate_file` must fetch a placeholder's
-/// blocks on demand and materialize its real content, transitioning to
-/// `Hydrated` — the on-access path, independent of ordinary index
-/// reconciliation.
+/// "Opening a placeholder triggers hydration":
+/// `PeerSyncSession::hydrate_file` must fetch a placeholder's blocks on
+/// demand and materialize its real content, transitioning to `Hydrated`
+/// — the on-access path, independent of ordinary index reconciliation.
 #[tokio::test]
 async fn hydrate_file_fetches_and_materializes_placeholder_content() {
     let relay_addr = start_relay().await;
@@ -1088,9 +1083,9 @@ async fn hydrate_file_fetches_and_materializes_placeholder_content() {
     }
 }
 
-/// on-demand-sync task 2.2/2.8: hydrating a file with no peer connected at
-/// all must fail with a clear, bounded error rather than hanging forever —
-/// the plain (no-network) case of "no reachable peer holds the blocks."
+/// Hydrating a file with no peer connected at all must fail with a
+/// clear, bounded error rather than hanging forever — the plain
+/// (no-network) case of "no reachable peer holds the blocks."
 #[tokio::test]
 async fn hydrate_file_without_any_connected_peer_fails_immediately() {
     let device_b = Device::new("device-b");
@@ -1168,10 +1163,10 @@ async fn hydrate_file_without_any_connected_peer_fails_immediately() {
     );
 }
 
-/// on-demand-sync task 2.8: hydrate → evict → re-hydrate must round-trip
-/// to byte-identical content — eviction doesn't touch sync state (version,
-/// block list), so a second hydration from the same (or any other) peer
-/// reconstructs exactly the same bytes.
+/// Hydrate → evict → re-hydrate must round-trip to byte-identical
+/// content — eviction doesn't touch sync state (version, block list), so
+/// a second hydration from the same (or any other) peer reconstructs
+/// exactly the same bytes.
 #[tokio::test]
 async fn evict_then_rehydrate_round_trips_to_identical_content() {
     let relay_addr = start_relay().await;
@@ -1240,10 +1235,9 @@ async fn evict_then_rehydrate_round_trips_to_identical_content() {
     );
 }
 
-/// on-demand-sync task 9.6 / edit-presence-awareness spec "Peers learn a
-/// file is being edited" and "Presence signal does not affect sync
-/// state": a presence signal reaches the peer's session and nothing else —
-/// no version bump, no index entry, no materialized file.
+/// "Peers learn a file is being edited" and "Presence signal does not
+/// affect sync state": a presence signal reaches the peer's session and
+/// nothing else — no version bump, no index entry, no materialized file.
 #[tokio::test]
 async fn presence_signal_reaches_peer_without_affecting_index_state() {
     let relay_addr = start_relay().await;
@@ -1273,9 +1267,9 @@ async fn presence_signal_reaches_peer_without_affecting_index_state() {
     assert!(!device_b.root_path().join("report.docx").exists());
 }
 
-/// on-demand-sync task 9.6 / spec "Lock file is never treated as a synced
-/// file itself": a `~$*` lock file created in a linked, actively-syncing
-/// folder must never propagate to a connected peer as a file at all.
+/// "Lock file is never treated as a synced file itself": a `~$*` lock
+/// file created in a linked, actively-syncing folder must never
+/// propagate to a connected peer as a file at all.
 #[tokio::test]
 async fn lock_file_never_appears_in_peer_index_or_on_disk() {
     let relay_addr = start_relay().await;
@@ -1328,10 +1322,10 @@ async fn lock_file_never_appears_in_peer_index_or_on_disk() {
     assert!(!device_b.root_path().join("~$shared.txt").exists());
 }
 
-/// on-demand-sync task 10.1: three devices, one `OnDemand` folder group —
-/// a file created on A appears as a placeholder on both B and C with no
-/// content transfer; hydrating on B fetches content only there, C stays a
-/// placeholder throughout.
+/// Three devices, one `OnDemand` folder group — a file created on A
+/// appears as a placeholder on both B and C with no content transfer;
+/// hydrating on B fetches content only there, C stays a placeholder
+/// throughout.
 #[tokio::test]
 async fn three_devices_on_demand_hydration_is_per_device_not_group_wide() {
     let relay_addr = start_relay().await;
@@ -1378,7 +1372,7 @@ async fn three_devices_on_demand_hydration_is_per_device_not_group_wide() {
     wait_until(|| path_on_b.exists() && path_on_c.exists(), Duration::from_secs(10)).await;
 
     // Both adopted a placeholder — correct size, no real content, and no
-    // block bytes fetched over the wire at all (design D3's whole point).
+    // block bytes fetched over the wire at all.
     for (device, path) in [(&device_b, &path_on_b), (&device_c, &path_on_c)] {
         assert_eq!(std::fs::metadata(path).unwrap().len(), 300_000);
         assert_ne!(std::fs::read(path).unwrap(), content);
@@ -1422,10 +1416,10 @@ async fn three_devices_on_demand_hydration_is_per_device_not_group_wide() {
     }
 }
 
-/// on-demand-sync task 10.3: hydration with no reachable peer holding the
-/// blocks must time out with a clear, catchable error, never hang the
-/// caller indefinitely — exercised here with a short timeout to keep the
-/// test itself fast (production uses `DEFAULT_HYDRATION_TIMEOUT`, task D5).
+/// Hydration with no reachable peer holding the blocks must time out
+/// with a clear, catchable error, never hang the caller indefinitely —
+/// exercised here with a short timeout to keep the test itself fast
+/// (production uses `DEFAULT_HYDRATION_TIMEOUT`).
 /// Simulated with a real, connected channel whose peer side simply never
 /// runs (so a `BlockRequest` is sent but never answered) — a stalled peer
 /// is a more realistic "unreachable" case than a channel that fails to
@@ -1673,14 +1667,14 @@ async fn block_request_for_unreferenced_hash_is_refused() {
     assert!(response.data.is_empty(), "refused block response must not leak content bytes");
 }
 
-/// on-demand-sync task 10.5 (security review): a hydration request's
-/// underlying `BlockRequest` goes through the exact same
-/// `handle_block_request` authorization check as any other block fetch —
-/// there is no separate, unchecked path for on-access hydration. Verified
-/// here by having the *responding* peer's session independently lack
-/// authorization for the group (simulating a coordination-plane ACL that
-/// doesn't actually cover this pairing), even though the requester
-/// believes it does — content must never be leaked either way.
+/// A hydration request's underlying `BlockRequest` goes through the
+/// exact same `handle_block_request` authorization check as any other
+/// block fetch — there is no separate, unchecked path for on-access
+/// hydration. Verified here by having the *responding* peer's session
+/// independently lack authorization for the group (simulating a
+/// coordination-plane ACL that doesn't actually cover this pairing),
+/// even though the requester believes it does — content must never be
+/// leaked either way.
 #[tokio::test]
 async fn hydration_block_request_is_refused_for_a_group_the_peer_does_not_authorize() {
     let relay_addr = start_relay().await;
@@ -1764,16 +1758,15 @@ async fn recv_matching_block_response(channel: &PeerChannel, hash: &[u8]) -> pro
     }
 }
 
-/// enforce-live-device-revocation task 4.1/4.4 (sync-engine spec scenario
-/// "A mid-session revocation stops further block requests without waiting
-/// for teardown"): a block request that was valid when the session started
-/// must be refused once a netmap update revokes that group edge
-/// mid-session — even though nothing here tears down the transport-level
-/// `PeerChannel`/tunnel (that reaction is section 2/5's job, deliberately
-/// exercised nowhere in this test). `PeerSyncSession::revoke_group` is the
-/// hook a daemon-level netmap-diff reaction (tasks.md section 2/5) is
-/// expected to call; this test calls it directly to simulate that
-/// reaction landing mid-session, proving the sync-engine layer's own
+/// "A mid-session revocation stops further block requests without
+/// waiting for teardown": a block request that was valid when the
+/// session started must be refused once a netmap update
+/// revokes that group edge mid-session — even though nothing here tears
+/// down the transport-level `PeerChannel`/tunnel (that reaction is a
+/// separate concern, deliberately exercised nowhere in this test).
+/// `PeerSyncSession::revoke_group` is the hook a daemon-level netmap-diff
+/// reaction is expected to call; this test calls it directly to simulate
+/// that reaction landing mid-session, proving the sync-engine layer's own
 /// defense works independently of whether transport teardown has happened
 /// yet.
 #[tokio::test]
@@ -1857,12 +1850,11 @@ async fn block_request_is_refused_after_mid_session_group_revocation() {
     assert!(second_response.data.is_empty(), "refused block response must not leak content bytes");
 }
 
-/// enforce-live-device-revocation task 4.2/4.4 (sync-engine spec scenario
-/// "An index update from a just-revoked peer is rejected"): an index
-/// update from a peer whose authorization for the named group was revoked
-/// *before* the update is processed must be rejected, not applied — even
-/// though the update arrives over an already-established session whose
-/// transport-level tunnel is untouched by this test.
+/// "An index update from a just-revoked peer is rejected": an index
+/// update from a peer whose authorization for the named group was
+/// revoked *before* the update is processed must be rejected, not
+/// applied — even though the update arrives over an already-established
+/// session whose transport-level tunnel is untouched by this test.
 #[tokio::test]
 async fn index_update_from_just_revoked_peer_is_rejected() {
     let relay_addr = start_relay().await;
@@ -1912,11 +1904,10 @@ async fn index_update_from_just_revoked_peer_is_rejected() {
     );
 }
 
-/// add-cross-account-sharing D4 (task 5.2): a peer this device has shared
-/// a group to at role `read` may not push its own changes into that
-/// group — an inbound `IndexUpdate` from a read-role peer must be
-/// rejected, not applied, exactly like an index update from an
-/// unauthorized/revoked peer
+/// A peer this device has shared a group to at role `read` may not push
+/// its own changes into that group — an inbound `IndexUpdate` from a
+/// read-role peer must be rejected, not applied, exactly like an index
+/// update from an unauthorized/revoked peer
 /// (`index_update_from_just_revoked_peer_is_rejected` above), but for a
 /// *different* reason: the peer remains fully authorized (`shares_group`
 /// stays true throughout) — it's specifically the write role that the
@@ -2005,13 +1996,12 @@ async fn index_update_from_a_read_role_peer_is_rejected() {
     );
 }
 
-/// add-cross-account-sharing D4 (task 5.2): role enforcement is
-/// asymmetric — read-only is only about *inbound* index updates/writes
-/// (`index_update_from_a_read_role_peer_is_rejected` above); a read-role
-/// peer must still be able to *read*: existing content it requests via
-/// `BlockRequest` is still served normally ("it will serve index and
-/// block reads to that peer, but will refuse to accept inbound index
-/// updates or block writes originating from it" — design.md D4). Mirrors
+/// Role enforcement is asymmetric — read-only is only about *inbound*
+/// index updates/writes (`index_update_from_a_read_role_peer_is_rejected`
+/// above); a read-role peer must still be able to *read*: existing content
+/// it requests via `BlockRequest` is still served normally — it will serve
+/// index and block reads to that peer, but will refuse to accept inbound
+/// index updates or block writes originating from it. Mirrors
 /// `block_request_is_refused_after_mid_session_group_revocation`'s
 /// structure, but — unlike that test — setting a read role (as opposed to
 /// revoking authorization outright) must NOT cause the block request to
@@ -2087,10 +2077,9 @@ async fn block_requests_are_still_served_to_a_read_role_peer() {
     assert_eq!(response.data, data);
 }
 
-/// on-demand-sync task 10.5 (security review): presence signals are
-/// scoped to `shares_group` exactly like every other sync message type —
-/// a signal for a group the receiver doesn't authorize is dropped, not
-/// forwarded to `presence_tx`.
+/// Presence signals are scoped to `shares_group` exactly like every
+/// other sync message type — a signal for a group the receiver doesn't
+/// authorize is dropped, not forwarded to `presence_tx`.
 #[tokio::test]
 async fn presence_signal_for_an_unauthorized_group_is_ignored() {
     let relay_addr = start_relay().await;
@@ -2128,12 +2117,12 @@ async fn presence_signal_for_an_unauthorized_group_is_ignored() {
     );
 }
 
-/// on-demand-sync task 10.4: two devices both "open" the same file
-/// (Office lock-file convention) at the same time — each must learn the
-/// other is editing it (mutual presence awareness), and if they proceed
-/// to edit anyway (advisory, not enforced — the whole point of choosing
-/// an advisory lock over real co-authoring), the outcome is exactly the
-/// pre-existing conflicted-copy behavior, unaffected by this capability.
+/// Two devices both "open" the same file (Office lock-file convention)
+/// at the same time — each must learn the other is editing it (mutual
+/// presence awareness), and if they proceed to edit anyway (advisory,
+/// not enforced — the whole point of choosing an advisory lock over real
+/// co-authoring), the outcome is exactly the pre-existing
+/// conflicted-copy behavior, unaffected by this capability.
 #[tokio::test]
 async fn concurrent_editing_with_presence_warning_still_produces_conflict_copy_unchanged() {
     let relay_addr = start_relay().await;
@@ -2296,12 +2285,11 @@ async fn concurrent_editing_with_presence_warning_still_produces_conflict_copy_u
             names_a.iter().any(|n| is_final_conflict_copy(n))
                 && names_b.iter().any(|n| is_final_conflict_copy(n))
         },
-        // add-transfer-compression: bumped from 10s, then add-linux-support:
-        // bumped again from 20s — still occasionally timing out under
-        // contention (observed on both macos-latest and windows-latest CI
-        // runners) even though the underlying conflict-resolution logic
-        // itself is unaffected and unchanged; same fix as last time, a
-        // more generous timeout, not a logic fix.
+        // Bumped from 10s, then again from 20s — still occasionally timing
+        // out under contention (observed on both macos-latest and
+        // windows-latest CI runners) even though the underlying
+        // conflict-resolution logic itself is unaffected and unchanged;
+        // same fix as last time, a more generous timeout, not a logic fix.
         Duration::from_secs(45),
     )
     .await;
@@ -2323,11 +2311,10 @@ async fn concurrent_editing_with_presence_warning_still_produces_conflict_copy_u
     assert!(device_b.state.get_file(GROUP, "~$shared.txt").unwrap().is_none());
 }
 
-/// batch-sync-optimizations task 2.4 / design D5: broadcasting a batch of
-/// several changed files results in exactly one wire `IndexUpdate` message
-/// carrying all of them, not one message per file. Verified at the raw
-/// `PeerChannel` level (bypassing a receiving `PeerSyncSession`) so the
-/// message count is directly observable.
+/// Broadcasting a batch of several changed files results in exactly one
+/// wire `IndexUpdate` message carrying all of them, not one message per
+/// file. Verified at the raw `PeerChannel` level (bypassing a receiving
+/// `PeerSyncSession`) so the message count is directly observable.
 #[tokio::test]
 async fn send_index_update_delivers_a_batch_as_a_single_wire_message() {
     let relay_addr = start_relay().await;
@@ -2374,9 +2361,9 @@ async fn send_index_update_delivers_a_batch_as_a_single_wire_message() {
     assert!(extra.is_err(), "batch must arrive as exactly one message, not several");
 }
 
-/// batch-sync-optimizations task 2.5: a peer that receives one batched
-/// `IndexUpdate` reconciles every file in it correctly, end to end
-/// (materializes each file with the right content on disk and in the index).
+/// A peer that receives one batched `IndexUpdate` reconciles every file
+/// in it correctly, end to end (materializes each file with the right
+/// content on disk and in the index).
 #[tokio::test]
 async fn peer_reconciles_every_file_in_a_batched_index_update() {
     let relay_addr = start_relay().await;
@@ -2420,7 +2407,7 @@ async fn peer_reconciles_every_file_in_a_batched_index_update() {
     }
 }
 
-/// SEC-SYNC-4 / task 4.4: `handle_presence_signal` must bind the emitted
+/// `handle_presence_signal` must bind the emitted
 /// event's `device_id` to this connection's own authenticated identity
 /// (`peer_device_id`), not trust the message's own `device_id` field —
 /// otherwise an authorized peer could impersonate a *different* device,
@@ -2479,7 +2466,7 @@ async fn presence_signal_with_spoofed_device_id_is_dropped() {
     assert_eq!(event.device_id, "device-a");
 }
 
-/// SEC-SYNC-4 / task 4.4: the counterpart to the spoofed-`device_id` test
+/// The counterpart to the spoofed-`device_id` test
 /// above — `handle_presence_signal` must also drop a signal whose `path`
 /// fails `is_safe_relative_path` (e.g. `..` traversal or an absolute
 /// path), rather than forwarding it verbatim as a `PresenceEvent` for the
@@ -2529,15 +2516,15 @@ async fn presence_signal_with_unsafe_path_is_dropped() {
     assert_eq!(event.path, "shared.txt");
 }
 
-/// SEC-SYNC-5 / task 4.4: a pre-existing symlink at an intermediate path
-/// component inside the sync root must not let a peer-advertised file's
-/// content land outside the sync root. `is_safe_relative_path` only
-/// rejects `..`/absolute path *strings* — it cannot see a symlink already
-/// planted on disk, which is exactly design.md's stated precondition for
-/// this TOCTOU to be exploitable at all (a locally pre-planted symlink or
-/// a racing local actor, not something a remote peer alone can create).
-/// `verify_write_target`'s canonicalize-and-`starts_with` check is the
-/// defense-in-depth this test confirms actually closes the gap.
+/// A pre-existing symlink at an intermediate path component inside the
+/// sync root must not let a peer-advertised file's content land outside
+/// the sync root. `is_safe_relative_path` only rejects `..`/absolute path
+/// *strings* — it cannot see a symlink already planted on disk, which is
+/// exactly the precondition for this TOCTOU to be exploitable at all (a
+/// locally pre-planted symlink or a racing local actor, not something a
+/// remote peer alone can create). `verify_write_target`'s
+/// canonicalize-and-`starts_with` check is the defense-in-depth this test
+/// confirms actually closes the gap.
 #[cfg(unix)]
 #[tokio::test]
 async fn symlinked_intermediate_component_does_not_let_a_write_escape_the_sync_root() {
@@ -2546,7 +2533,7 @@ async fn symlinked_intermediate_component_does_not_let_a_write_escape_the_sync_r
     let device_b = Device::new("device-b");
 
     // A directory *outside* device_a's sync root that a symlink inside the
-    // root points to — the locally pre-planted symlink design.md requires.
+    // root points to — the locally pre-planted symlink this scenario requires.
     let outside = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink(outside.path(), device_a.root_path().join("evil_link")).unwrap();
 
@@ -2610,13 +2597,13 @@ async fn symlinked_intermediate_component_does_not_let_a_write_escape_the_sync_r
     assert_eq!(std::fs::read(device_a.root_path().join("ordinary.txt")).unwrap(), b"fine");
 }
 
-/// add-ignore-patterns task 3.4: a file device A already synced to device B
-/// becomes newly ignored on device A (design.md D2: not the same as a
-/// deletion). The rescan must drop it from A's own local index without
-/// producing a tombstone, leave A's on-disk file untouched, and — the part
-/// this test actually exercises over a real peer connection — device B's
-/// already-synced copy must be completely unaffected: no tombstone ever
-/// reaches it, because the rescan never produced one to begin with.
+/// A file device A already synced to device B becomes newly ignored on
+/// device A (not the same as a deletion). The rescan must drop it from
+/// A's own local index without producing a tombstone, leave A's on-disk
+/// file untouched, and — the part this test actually exercises over a
+/// real peer connection — device B's already-synced copy must be
+/// completely unaffected: no tombstone ever reaches it, because the
+/// rescan never produced one to begin with.
 #[tokio::test]
 async fn newly_ignored_file_drops_from_local_index_without_tombstoning_the_peers_copy() {
     let relay_addr = start_relay().await;
@@ -2643,8 +2630,8 @@ async fn newly_ignored_file_drops_from_local_index_without_tombstoning_the_peers
     wait_until(|| replicated_path.exists(), Duration::from_secs(10)).await;
     assert!(device_a.state.get_file(GROUP, "cache.tmp").unwrap().is_some());
 
-    // Device A alone decides to ignore "*.tmp" — device-local and unsynced
-    // (design.md D1); device B's own config is untouched.
+    // Device A alone decides to ignore "*.tmp" — device-local and unsynced;
+    // device B's own config is untouched.
     std::fs::write(device_a.root_path().join(".yadorilinkignore"), "*.tmp\n").unwrap();
     let ignore_set = yadorilink_sync_core::ignore_patterns::EffectiveIgnoreSet::load_for_link_root(
         device_a.root_path(),
@@ -2658,7 +2645,7 @@ async fn newly_ignored_file_drops_from_local_index_without_tombstoning_the_peers
     // A's own index no longer carries the now-ignored file...
     assert!(device_a.state.get_file(GROUP, "cache.tmp").unwrap().is_none());
     // ...but the on-disk file itself is left completely untouched — newly
-    // ignored is not deleted (design.md D2).
+    // ignored is not deleted.
     assert!(device_a.root_path().join("cache.tmp").exists());
     // ...and the rescan produced no record for it at all (no tombstone to
     // even broadcast), the crux of D2's "drop, don't delete" behavior.
@@ -2683,13 +2670,13 @@ async fn newly_ignored_file_drops_from_local_index_without_tombstoning_the_peers
     );
 }
 
-/// add-ignore-patterns task 3.3/3.4: an incoming record for a path matching
-/// this device's own ignore patterns must be dropped before any
-/// materialization, indexing, or forwarding — see `peer_session.rs`'s
+/// An incoming record for a path matching this device's own ignore
+/// patterns must be dropped before any materialization, indexing, or
+/// forwarding — see `peer_session.rs`'s
 /// `is_locally_ignored`/`reconcile_files`. Device A (the sender) does not
 /// ignore the path itself — only device B does, via its own
-/// `.yadorilinkignore` (device-local, unsynced — design.md D1) — so this
-/// exercises the filter purely from the receiving side.
+/// `.yadorilinkignore` (device-local, unsynced) — so this exercises the
+/// filter purely from the receiving side.
 #[tokio::test]
 async fn incoming_record_for_a_locally_ignored_path_is_dropped_before_materializing_or_forwarding()
 {
@@ -2773,25 +2760,25 @@ async fn incoming_record_for_a_locally_ignored_path_is_dropped_before_materializ
     );
 }
 
-/// add-sync-fidelity task 3.5/3.6: tombstoning a symlink record must
-/// remove the on-disk symlink itself, and must never touch — let alone
-/// delete — whatever real file the link happens to point at. Verified
-/// against an actual target file living entirely outside device_b's sync
-/// root (a separate tempdir, never itself part of what's being
-/// tombstoned), so a regression here (e.g. accidentally resolving/
-/// following the link before removing it) would show up as real data
-/// loss in the assertions below, not just a passing-by-accident check.
+/// Tombstoning a symlink record must remove the on-disk symlink itself,
+/// and must never touch — let alone delete — whatever real file the link
+/// happens to point at. Verified against an actual target file living
+/// entirely outside device_b's sync root (a separate tempdir, never
+/// itself part of what's being tombstoned), so a regression here (e.g.
+/// accidentally resolving/following the link before removing it) would
+/// show up as real data loss in the assertions below, not just a
+/// passing-by-accident check.
 ///
 /// `device_b`'s pre-tombstone state (an already-materialized symlink,
 /// `record_kind = Symlink`, a recorded target) is set up directly against
 /// `SyncState` rather than produced by a live scan/watch or a genuine
 /// wire-transmitted symlink record — see `peer_session.rs`'s
-/// `materialize_symlink_at` doc comment for why: today's wire schema
-/// (`proto::FileInfo`, section 5 of this change, not yet implemented)
-/// carries no `record_kind`/`symlink_target` field, so a peer cannot yet
-/// actually advertise "this is a symlink" over the wire. The tombstone
-/// itself, by contrast, is entirely real and wire-driven: `deleted` is an
-/// ordinary, already-supported `FileRecord` field, sent via a real
+/// `materialize_symlink_at` doc comment for why: at this point the wire
+/// schema (`proto::FileInfo`) still carries no `record_kind`/
+/// `symlink_target` field, so a peer cannot yet actually advertise "this
+/// is a symlink" over the wire. The tombstone itself, by contrast, is
+/// entirely real and wire-driven: `deleted` is an ordinary,
+/// already-supported `FileRecord` field, sent via a real
 /// `PeerSyncSession` full-index exchange like any other record.
 #[cfg(unix)]
 #[tokio::test]
@@ -2862,15 +2849,15 @@ async fn symlink_tombstone_removes_link_but_never_its_target() {
     assert!(record.deleted, "the index must agree the record is now a tombstone");
 }
 
-/// add-sync-fidelity task 3.5/3.6: a held file's held state must clear
-/// once its record is tombstoned, rather than leaving an orphaned
-/// `held_reason`/`held_since_unix_nanos` entry with no corresponding live
-/// index record. Driven by a real, wire-transmitted tombstone (`deleted`
-/// is an ordinary already-supported `FileRecord` field) through an actual
-/// two-peer `PeerSyncSession` exchange — the held-file setup itself is
-/// device-local index state (`SyncState::set_held`), the same as it would
-/// be from a real case-fold-collision/invalid-name detection (section 4,
-/// not yet implemented).
+/// A held file's held state must clear once its record is tombstoned,
+/// rather than leaving an orphaned `held_reason`/`held_since_unix_nanos`
+/// entry with no corresponding live index record. Driven by a real,
+/// wire-transmitted tombstone (`deleted` is an ordinary already-supported
+/// `FileRecord` field) through an actual two-peer `PeerSyncSession`
+/// exchange — the held-file setup itself is device-local index state
+/// (`SyncState::set_held`), the same as it would be from a real
+/// case-fold-collision/invalid-name detection (not yet implemented at
+/// this point).
 #[tokio::test]
 async fn held_file_tombstone_clears_held_state() {
     let relay_addr = start_relay().await;
@@ -2923,15 +2910,14 @@ async fn held_file_tombstone_clears_held_state() {
     );
 }
 
-/// add-sync-fidelity task 4.1/4.5/4.6: a real, wire-driven two-peer
-/// scenario — device A's "Photo.jpg" fully materializes on device B
-/// first; only afterward does A send a second, real-content record,
-/// "photo.jpg", differing only in case. Device B's sync root (an ordinary
-/// tempdir, case-insensitive on this suite's actual dev/CI platforms) has
-/// a genuine case-fold collision (task 4.1): the *second*-arriving record
-/// must be held (task 4.3's short-circuit ahead of the atomic write) —
-/// never written to disk under its own name or any other (design D3, task
-/// 4.5) — while the first, already-materialized file is left completely
+/// A real, wire-driven two-peer scenario — device A's "Photo.jpg" fully
+/// materializes on device B first; only afterward does A send a second,
+/// real-content record, "photo.jpg", differing only in case. Device B's
+/// sync root (an ordinary tempdir, case-insensitive on this suite's
+/// actual dev/CI platforms) has a genuine case-fold collision: the
+/// *second*-arriving record must be held (a short-circuit ahead of the
+/// atomic write) — never written to disk under its own name or any other
+/// — while the first, already-materialized file is left completely
 /// untouched.
 #[tokio::test]
 async fn case_fold_collision_holds_the_second_arriving_file_without_touching_the_first() {
@@ -3005,12 +2991,12 @@ async fn case_fold_collision_holds_the_second_arriving_file_without_touching_the
     let held = device_b.state.get_held_state(GROUP, "photo.jpg").unwrap().unwrap();
     assert!(held.reason.starts_with("case_collision"), "unexpected reason: {}", held.reason);
 
-    // task 4.4: a held record still keeps its own index row.
+    // a held record still keeps its own index row.
     let stored = device_b.state.get_file(GROUP, "photo.jpg").unwrap().unwrap();
     assert!(!stored.deleted);
     assert_eq!(stored.size, second_bytes.len() as u64);
 
-    // task 4.5 (design D3): the actual regression assertion — device B's
+    // (): the actual regression assertion — device B's
     // sync root must contain *exactly* the one, original, non-hazardous
     // file. No `photo.jpg`, no numbered/suffixed variant of either name
     // (`Photo (1).jpg`, `photo_2.jpg`, ...) — nothing beyond what a
@@ -3024,7 +3010,7 @@ async fn case_fold_collision_holds_the_second_arriving_file_without_touching_the
         entries,
         vec!["Photo.jpg".to_string()],
         "a name hazard must never produce a written file under any name other than the \
-         original — this crate implements no automatic rename/escape path (design D3)"
+         original — this crate implements no automatic rename/escape path ()"
     );
     assert_eq!(
         std::fs::read(&first_replicated).unwrap(),
@@ -3034,19 +3020,18 @@ async fn case_fold_collision_holds_the_second_arriving_file_without_touching_the
     );
 }
 
-/// add-sync-fidelity task 4.4/4.6: a held file's record and content
-/// blocks must keep flowing to peers exactly like any other record — held
-/// state is a *local* materialization gate (this device won't write the
-/// bytes to disk under this hazardous name), not an exclusion from index
-/// exchange or block serving (design D3: "the index continues tracking
-/// it... so it still syncs correctly to any peer/platform where the name
-/// is valid"). Held state is set up directly against device B's own
-/// `SyncState`/`BlockStore` here (the same device-local setup
-/// `held_file_tombstone_clears_held_state` above uses) rather than driven
-/// through an actual case-fold collision, so this test isolates exactly
-/// the property task 4.6 calls for — B, despite holding this record,
-/// still answers device C's real block requests for it over an actual
-/// two-peer wire connection.
+/// A held file's record and content blocks must keep flowing to peers
+/// exactly like any other record — held state is a *local* materialization
+/// gate (this device won't write the bytes to disk under this hazardous
+/// name), not an exclusion from index exchange or block serving: the
+/// index continues tracking it, so it still syncs correctly to any
+/// peer/platform where the name is valid. Held state is set up directly
+/// against device B's own `SyncState`/`BlockStore` here (the same
+/// device-local setup `held_file_tombstone_clears_held_state` above uses)
+/// rather than driven through an actual case-fold collision, so this test
+/// isolates exactly the property that matters — B, despite holding this
+/// record, still answers device C's real block requests for it over an
+/// actual two-peer wire connection.
 #[tokio::test]
 async fn held_files_blocks_are_still_served_to_a_requesting_peer() {
     let relay_addr = start_relay().await;
@@ -3098,16 +3083,15 @@ async fn held_files_blocks_are_still_served_to_a_requesting_peer() {
     assert!(!device_b.root_path().join("photo.jpg").exists());
 }
 
-/// add-sync-fidelity: closes the task 5.1 wire-serialization gap section
-/// 3's and section 5's `tasks.md` notes both flagged — `FileRecord` (and
-/// therefore `proto::FileInfo`'s pre-fix `From` conversions) never carried
-/// `record_kind`/`symlink_target`, so sections 2-4's real symlink
+/// Closes a wire-serialization gap: `FileRecord` (and therefore
+/// `proto::FileInfo`'s pre-fix `From` conversions) never carried
+/// `record_kind`/`symlink_target`, so the real symlink
 /// scan/materialization logic only ever worked within *one* device's own
 /// local state; a symlink genuinely could not cross the wire from a peer.
 ///
 /// This is the real, end-to-end case that gap blocked: device A creates a
-/// genuine symlink on disk, `LocalChangeProcessor::process_event` (section
-/// 2's actual scan/watch classification — not a hand-built `FileRecord`)
+/// genuine symlink on disk, `LocalChangeProcessor::process_event` (the
+/// actual scan/watch classification — not a hand-built `FileRecord`)
 /// records it as `RecordKind::Symlink` with its target text, and only
 /// *then* do the two devices connect over an actual relay `PeerChannel`
 /// and run real `PeerSyncSession`s. If `send_full_index`
@@ -3129,7 +3113,7 @@ async fn symlink_created_on_one_device_materializes_as_a_real_symlink_on_its_pee
 
     // An ordinary sibling file the link points at, entirely within device
     // A's linked folder — an intra-folder-root symlink is the common,
-    // legitimate case design.md D1 says must actually sync as a link.
+    // legitimate case that must actually sync as a link.
     std::fs::write(device_a.root_path().join("original.txt"), b"vacation photos live here")
         .unwrap();
     let link_path = device_a.root_path().join("shortcut");
@@ -3199,13 +3183,13 @@ async fn symlink_created_on_one_device_materializes_as_a_real_symlink_on_its_pee
     );
 }
 
-/// add-sync-fidelity: closes the same task 5.1 wire gap as the symlink
-/// test above, for the other field the gap silently dropped in both
-/// directions — the owner-executable bit. Device A's index records a file
-/// as executable (`SyncState::set_exec_bit`, standing in for section 2/3's
-/// still-separately-open local-capture wiring — see `types.rs`'s
-/// `owner_exec_bit_from_metadata` doc comment for that distinct, still-
-/// undone gap; this test is scoped to whether an *already-recorded* bit
+/// Closes the same wire-serialization gap as the symlink test above, for
+/// the other field it silently dropped in both directions — the
+/// owner-executable bit. Device A's index records a file as executable
+/// (`SyncState::set_exec_bit`, standing in for the still-separately-open
+/// local-capture wiring — see `types.rs`'s `owner_exec_bit_from_metadata`
+/// doc comment for that distinct, still-undone gap; this test is scoped
+/// to whether an *already-recorded* bit
 /// crosses the wire and gets applied for real, not to how it got recorded
 /// in the first place), and a real two-peer sync must leave device B's
 /// **actual on-disk file** — not just its index row — with the owner-exec
@@ -3249,11 +3233,11 @@ async fn exec_bit_set_on_one_device_is_applied_to_the_real_file_on_its_peer() {
     );
 }
 
-/// add-sync-fidelity: closes the specific, honestly-documented limitation
-/// in section 3.6's own `tasks.md` notes — "exec-bit-only-change-skips-
-/// block-fetch [is] NOT exercised as [a] genuine over-the-wire two-peer
-/// test" — because before this fix `proto::FileInfo` had nowhere to carry
-/// an exec-bit change at all. Device A first syncs a file normally (full
+/// Closes a specific, honestly-documented limitation: an exec-bit-only
+/// change that skips the block fetch was previously not exercised as a
+/// genuine over-the-wire two-peer test, because before this fix
+/// `proto::FileInfo` had nowhere to carry an exec-bit change at all.
+/// Device A first syncs a file normally (full
 /// content, not executable), then changes *only* the exec bit (content
 /// byte-identical) and pushes an incremental `IndexUpdate`. Device B must
 /// end up with the owner-exec bit applied to its already-materialized
@@ -3327,9 +3311,9 @@ async fn exec_bit_only_change_propagates_over_the_wire_without_disturbing_conten
     );
 }
 
-// --- add-resource-governance task 2.6: rate-limiting integration tests --
+// --- Rate-limiting integration tests ---
 
-/// task 2.6: the default (unlimited, `RateLimiters::unlimited()`) session
+/// the default (unlimited, `RateLimiters::unlimited()`) session
 /// configuration imposes no measurable delay on a real block transfer —
 /// end-to-end confirmation alongside `rate_limiter::tests`'s unit-level one.
 #[tokio::test]
@@ -3368,7 +3352,7 @@ async fn unlimited_rate_limiters_impose_no_measurable_delay_on_a_real_transfer()
     );
 }
 
-/// task 2.6: a configured non-zero download rate measurably caps real
+/// a configured non-zero download rate measurably caps real
 /// block-transfer throughput — the file is small enough to be a single
 /// `DEFAULT_BLOCK_SIZE` block, so the configured rate directly bounds the
 /// one `fetch_block` call's `acquire` wait.
@@ -3416,7 +3400,7 @@ async fn configured_download_rate_caps_real_block_transfer_throughput() {
     );
 }
 
-/// task 2.6: control messages are not delayed even while the download
+/// control messages are not delayed even while the download
 /// bucket is saturated by an in-progress, heavily-throttled block transfer
 /// — a presence signal (small protocol message, never gated on either
 /// bucket) sent concurrently must still complete promptly.
@@ -3467,9 +3451,9 @@ async fn saturated_download_bucket_never_delays_a_concurrent_presence_signal() {
 }
 
 // ---------------------------------------------------------------------
-// add-transfer-compression (tasks 3.3-3.5, 4.3-4.4): real, wire-driven
-// proof that compression is actually negotiated and used end-to-end — not
-// just that `compress_block`/`decompress_block` work in isolation
+// Transfer compression: real, wire-driven proof that compression is
+// actually negotiated and used end-to-end — not just that
+// `compress_block`/`decompress_block` work in isolation
 // (`peer_session::compression_codec_tests` already covers that). These
 // tests either drive a real two-`PeerSyncSession` pair (proving
 // negotiation + content correctness through the real send/receive path)
@@ -3480,7 +3464,7 @@ async fn saturated_download_bucket_never_delays_a_concurrent_presence_signal() {
 // wire can be inspected directly.
 // ---------------------------------------------------------------------
 
-/// task 3.3: two real sessions, both advertising compression support (this
+/// two real sessions, both advertising compression support (this
 /// build always does — task 2.4), must negotiate it and still deliver
 /// byte-for-byte correct content through the real compress-on-send /
 /// decompress-on-receive path — not merely "sync still works," but sync
@@ -3492,9 +3476,9 @@ async fn compression_is_negotiated_between_two_real_sessions_and_content_round_t
     let device_a = Device::new("device-a");
     let device_b = Device::new("device-b");
 
-    // Highly repetitive text content (the shape proposal.md targets:
-    // source trees, documents, logs) spanning multiple blocks, so both a
-    // full-index exchange and multiple block fetches are exercised.
+    // Highly repetitive text content (the kind of shape source trees,
+    // documents, and logs typically have) spanning multiple blocks, so both
+    // a full-index exchange and multiple block fetches are exercised.
     let content = "line of repeated log-like content\n".repeat(20_000).into_bytes();
     let file_path = device_a.root_path().join("app.log");
     std::fs::write(&file_path, &content).unwrap();
@@ -3623,7 +3607,7 @@ async fn block_response_is_actually_compressed_on_the_wire_when_negotiated() {
     );
 }
 
-/// task 3.4: a peer that never advertises compression support (an old,
+/// a peer that never advertises compression support (an old,
 /// pre-this-change peer, simulated here by simply never sending a
 /// `ClusterConfig` with `supported_compression` set) must never receive a
 /// `Compression::Zstd`-tagged response — block fetch behaves identically
@@ -3681,15 +3665,14 @@ async fn block_response_is_uncompressed_when_peer_did_not_advertise_support() {
     );
 }
 
-/// task 3.5 (first half) / proposal.md's decompression-bomb bound: a
-/// `BlockResponse` declaring `Compression::Zstd` whose true decompressed
-/// size vastly exceeds the sync engine's `MAX_BLOCK_SIZE` (16 MiB) must be
-/// rejected without ever materializing that size in memory, hydration
-/// must fail cleanly (not hang or crash), and nothing must be persisted to
-/// the block store — mirroring `hydration_rejects_block_response_with_
-/// wrong_hash_or_size`'s structure exactly, since both are the same
-/// reject-and-reassign path (see `PeerSyncSession::handle_block_response`'s
-/// doc comment).
+/// A decompression-bomb bound: a `BlockResponse` declaring
+/// `Compression::Zstd` whose true decompressed size vastly exceeds the
+/// sync engine's `MAX_BLOCK_SIZE` (16 MiB) must be rejected without ever
+/// materializing that size in memory, hydration must fail cleanly (not
+/// hang or crash), and nothing must be persisted to the block store —
+/// mirroring `hydration_rejects_block_response_with_wrong_hash_or_size`'s
+/// structure exactly, since both are the same reject-and-reassign path
+/// (see `PeerSyncSession::handle_block_response`'s doc comment).
 #[tokio::test]
 async fn hydration_rejects_a_decompression_bomb_block_response() {
     let relay_addr = start_relay().await;
@@ -3802,7 +3785,7 @@ async fn hydration_rejects_a_decompression_bomb_block_response() {
     );
 }
 
-/// task 3.5 (second half): a `BlockResponse` declaring `Compression::Zstd`
+/// (second half): a `BlockResponse` declaring `Compression::Zstd`
 /// whose bytes aren't a valid zstd stream at all (corrupted or tampered in
 /// transit) must be rejected the same way — cleanly, no panic, no
 /// persisted block, hydration reported as failed.
@@ -3897,10 +3880,10 @@ async fn hydration_rejects_a_corrupt_compressed_block_response() {
     );
 }
 
-/// task 4.1/4.3: a synthetic large folder (many files, deeply repetitive
-/// paths — proposal.md's target shape) produces a smaller on-wire index
-/// message when compression is negotiated than when it isn't, with the
-/// same file set recoverable either way.
+/// A synthetic large folder (many files, deeply repetitive paths)
+/// produces a smaller on-wire index message when compression is
+/// negotiated than when it isn't, with the same file set recoverable
+/// either way.
 ///
 /// Deliberately exercises `send_index_update` (not the very first
 /// `FullIndex` `run()` sends at connect time) via an explicit call made
@@ -3908,19 +3891,18 @@ async fn hydration_rejects_a_corrupt_compressed_block_response() {
 /// initial handshake send happens before this session has ever had a
 /// chance to receive the peer's `ClusterConfig` (there is no round trip
 /// before it), so it is *always* sent uncompressed regardless of what the
-/// peer advertises — that's expected, not a bug (design.md D2's
-/// negotiation only applies once a peer's advertisement has actually been
-/// observed). This test targets the negotiated-and-therefore-compressible
-/// steady state `send_full_index`/`send_index_update` share via
-/// `compress_index_files`, which is what task 4.1 actually integrates.
+/// peer advertises — that's expected, not a bug (negotiation only applies
+/// once a peer's advertisement has actually been observed). This test
+/// targets the negotiated-and-therefore-compressible steady state
+/// `send_full_index`/`send_index_update` share via `compress_index_files`.
 #[tokio::test]
 async fn compressed_index_update_is_smaller_on_the_wire_than_uncompressed() {
     let relay_addr = start_relay().await;
     let device_a = Device::new("device-a");
 
-    // Deeply repetitive paths (the shape proposal.md calls out: "thousands
-    // of highly repetitive FileRecord paths") — enough files that the
-    // index message is meaningfully large either way.
+    // Deeply repetitive paths (thousands of highly repetitive FileRecord
+    // paths) — enough files that the index message is meaningfully large
+    // either way.
     for i in 0..80 {
         let dir = device_a.root_path().join(format!("src/pkg/module_{:04}", i / 20));
         std::fs::create_dir_all(&dir).unwrap();
@@ -4014,7 +3996,7 @@ async fn compressed_index_update_is_smaller_on_the_wire_than_uncompressed() {
     assert_eq!(compressed_paths, uncompressed_paths);
 }
 
-/// task 4.4: the same large, repetitive-path folder as above, but this
+/// the same large, repetitive-path folder as above, but this
 /// time synced through two *real* sessions end to end via an explicit
 /// `send_index_update` (see `compressed_index_update_is_smaller_on_the_
 /// wire_than_uncompressed`'s doc comment for why: the very first `FullIndex`
@@ -4092,15 +4074,15 @@ async fn large_compressed_index_survives_fragmentation_and_reassembly() {
     }
 }
 
-/// improve-transfer-performance task 1.3 / design.md "Adaptive in-flight
-/// window": a real, end-to-end proof (not just the standalone
-/// `AdaptiveWindow` unit tests) that `PeerSyncSession::fetch_window` moves
-/// in response to real `fetch_block` traffic over a real (relay) transport,
-/// through the actual public API `yadorilink-daemon`'s multi-peer
-/// dispatcher consults (`fetch_window`/`record_fetch_timeout`) — grows
-/// under many real, fast, successful round trips, then shrinks once
-/// timeouts are reported the way a real caller-imposed bound would report
-/// them, then grows back once good conditions resume.
+/// The adaptive in-flight window: a real, end-to-end proof (not just the
+/// standalone `AdaptiveWindow` unit tests) that
+/// `PeerSyncSession::fetch_window` moves in response to real `fetch_block`
+/// traffic over a real (relay) transport, through the actual public API
+/// `yadorilink-daemon`'s multi-peer dispatcher consults
+/// (`fetch_window`/`record_fetch_timeout`) — grows under many real, fast,
+/// successful round trips, then shrinks once timeouts are reported the
+/// way a real caller-imposed bound would report them, then grows back
+/// once good conditions resume.
 #[tokio::test]
 async fn fetch_window_grows_under_real_traffic_and_shrinks_after_timeouts_then_recovers() {
     let relay_addr = start_relay().await;
@@ -4327,16 +4309,16 @@ async fn large_mostly_unchanged_index_resync_still_correctly_reconciles_the_few_
     );
 }
 
-/// add-file-version-history task 2.2/3.6: a tombstone *adopted from a
-/// peer* (not just a local delete — `mark_deleted`'s own case is covered
-/// directly in `index.rs`'s unit tests) enters the same recoverable
-/// trashed state as a local deletion would (spec "A tombstone adopted from
-/// a peer also enters trash"). Device A holds real content for
-/// "shared.txt"; device B's tombstone strictly dominates A's version
-/// vector (an ordinary "peer is ahead" adoption, not a conflict), so A
-/// adopts it outright via `reconcile_one_file`'s `VvOrdering::Before`
-/// branch — exercising `materialize`'s tombstone-apply path over the real
-/// wire, not a direct `SyncState` call.
+/// A tombstone *adopted from a peer* (not just a local delete —
+/// `mark_deleted`'s own case is covered directly in `index.rs`'s unit
+/// tests) enters the same recoverable trashed state as a local deletion
+/// would (spec "A tombstone adopted from a peer also enters trash").
+/// Device A holds real content for "shared.txt"; device B's tombstone
+/// strictly dominates A's version vector (an ordinary "peer is ahead"
+/// adoption, not a conflict), so A adopts it outright via
+/// `reconcile_one_file`'s `VvOrdering::Before` branch — exercising
+/// `materialize`'s tombstone-apply path over the real wire, not a direct
+/// `SyncState` call.
 #[tokio::test]
 async fn tombstone_adopted_from_a_peer_enters_recoverable_trash() {
     let relay_addr = start_relay().await;
@@ -4421,7 +4403,7 @@ async fn tombstone_adopted_from_a_peer_enters_recoverable_trash() {
     );
 }
 
-// --- add-untrusted-storage-peer (tasks 5.1, 5.2, 5.3) ---
+// --- Untrusted storage peer ---
 //
 // These tests exercise the real wire protocol (real `PeerChannel`s over a
 // real relay, real `PeerSyncSession`s) exactly like every other test in
@@ -4492,14 +4474,14 @@ async fn fetch_from_storage_peer_rejects_aead_tampered_ciphertext() {
 }
 
 /// encrypted-peer spec: "A malicious storage peer returning wrong bytes is
-/// detected" — case 2, the subtler one design.md/content_crypto's doc
+/// detected" — case 2, the subtler one `content_crypto`'s own doc
 /// comments call out explicitly: a peer returns a *different*, validly
 /// AEAD-encrypted block (correctly authenticated under its own correct
 /// nonce and the same group key) instead of the one requested. AEAD
 /// authentication alone cannot catch this — only the post-decrypt
-/// plaintext-content-hash re-check (task 2.3) can, which is exactly what
-/// this test proves is wired in at the real `fetch_block_from_storage_peer`
-/// call, not just unit-tested in isolation inside `content_crypto`.
+/// plaintext-content-hash re-check can, which is exactly what this test
+/// proves is wired in at the real `fetch_block_from_storage_peer` call,
+/// not just unit-tested in isolation inside `content_crypto`.
 #[tokio::test]
 async fn fetch_from_storage_peer_rejects_a_different_validly_encrypted_block() {
     let relay_addr = start_relay().await;
@@ -4697,13 +4679,13 @@ async fn no_wire_message_to_a_flagged_storage_only_peer_carries_the_group_key_or
     assert!(resp.is_ciphertext, "must be marked as ciphertext");
 }
 
-/// The change's central claim (proposal.md's "Why"/design.md): content
-/// that passes entirely through an untrusted storage peer — which never
-/// holds the group key and never sees plaintext — is still fully
-/// recoverable, integrity-verified, and materializable by a trusted device
-/// that never talked to the original uploader directly. Three real
-/// devices, three real `PeerSyncSession`s, two independent real relay
-/// hops (A-to-C and C-to-B) — no mocked crypto standing in for the wire.
+/// The central claim: content that passes entirely through an untrusted
+/// storage peer — which never holds the group key and never sees
+/// plaintext — is still fully recoverable, integrity-verified, and
+/// materializable by a trusted device that never talked to the original
+/// uploader directly. Three real devices, three real `PeerSyncSession`s,
+/// two independent real relay hops (A-to-C and C-to-B) — no mocked crypto
+/// standing in for the wire.
 ///
 /// This also doubles as the "genuinely never contains plaintext on disk"
 /// proof: after A pushes the block to C over the real wire, this test
@@ -4932,28 +4914,28 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|window| window == needle)
 }
 
-/// fix-recv-loop-head-of-line-deadlock-on-catchup task 3.2: a catch-up
-/// batch larger than `MAX_IN_FLIGHT_MESSAGES_PER_PEER` (64) distinct
-/// eager-fetch-triggering messages must not permanently deadlock the
-/// recv loop. Sends `N` (> 64) separate single-file `IndexUpdate`s (one
-/// per wire message, so each spawns its own `handle_message` task/permit
-/// rather than sharing one permit across a single batched message),
-/// followed by an interleaved control message (`PresenceSignal`), all
-/// *before* answering a single `BlockRequest` — reproducing exactly the
-/// ordering that used to deadlock: every permit held by a task stuck
-/// awaiting a `BlockResponse` this test hasn't sent yet, with other
-/// messages (including the presence signal) queued behind them.
+/// A catch-up batch larger than `MAX_IN_FLIGHT_MESSAGES_PER_PEER` (64)
+/// distinct eager-fetch-triggering messages must not permanently deadlock
+/// the recv loop. Sends `N` (> 64) separate single-file `IndexUpdate`s
+/// (one per wire message, so each spawns its own `handle_message`
+/// task/permit rather than sharing one permit across a single batched
+/// message), followed by an interleaved control message
+/// (`PresenceSignal`), all *before* answering a single `BlockRequest` —
+/// reproducing exactly the ordering that used to deadlock: every permit
+/// held by a task stuck awaiting a `BlockResponse` this test hasn't sent
+/// yet, with other messages (including the presence signal) queued
+/// behind them.
 ///
-/// Before this change's fix, the recv loop would block on
-/// `acquire_owned()` trying to admit the 65th message and never call
-/// `self.channel.recv()` again — so it could never even read, let alone
-/// process, the incoming `BlockResponse`s this test's responder task
-/// sends once it observes the resulting `BlockRequest`s, nor the
-/// presence signal. Forward progress would then depend entirely on each
-/// stuck fetch's own `DEFAULT_HYDRATION_TIMEOUT` (30s, times
-/// `RECONCILE_RETRY_ATTEMPTS`) elapsing — far outside this test's
-/// generous-but-bounded timeouts, so the old structure fails this test
-/// with a timeout rather than a clean assertion failure.
+/// Before the fix, the recv loop would block on `acquire_owned()` trying
+/// to admit the 65th message and never call `self.channel.recv()` again
+/// — so it could never even read, let alone process, the incoming
+/// `BlockResponse`s this test's responder task sends once it observes
+/// the resulting `BlockRequest`s, nor the presence signal. Forward
+/// progress would then depend entirely on each stuck fetch's own
+/// `DEFAULT_HYDRATION_TIMEOUT` (30s, times `RECONCILE_RETRY_ATTEMPTS`)
+/// elapsing — far outside this test's generous-but-bounded timeouts, so
+/// the old structure fails this test with a timeout rather than a clean
+/// assertion failure.
 #[tokio::test]
 async fn recv_loop_survives_a_catchup_batch_larger_than_the_permit_budget() {
     let relay_addr = start_relay().await;

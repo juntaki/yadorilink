@@ -135,12 +135,11 @@ async fn connect() -> std::io::Result<UnixStream> {
 pub struct StatusInfo {
     pub sync_state: SyncState,
     pub materialization_state: MaterializationState,
-    /// design.md D7's advisory "open elsewhere" signal: the device id
-    /// currently reported editing this file (Office `~$*` lock-file
-    /// convention), empty if not open elsewhere or the signal has
-    /// expired. Threaded through here (on-demand-sync task 7.4) so
-    /// `combine_status` in lib.rs can render the sixth badge state
-    /// without a second round trip.
+    /// The advisory "open elsewhere" signal: the device id currently
+    /// reported editing this file (Office `~$*` lock-file convention),
+    /// empty if not open elsewhere or the signal has expired. Threaded
+    /// through here so `combine_status` in lib.rs can render the sixth
+    /// badge state without a second round trip.
     pub open_elsewhere_device_id: String,
 }
 

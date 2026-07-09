@@ -1,9 +1,9 @@
 #[cfg(feature = "http-coordination")]
 mod http {
-    //! switch-coordination-auth-to-google-oidc: Google OIDC login, replacing
-    //! email+password register/login entirely for this transport. There is
-    //! no separate `register` -- the HTTP coordination service's `/auth/google` finds
-    //! or creates the account on first login.
+    //! Google OIDC login, replacing email+password register/login entirely
+    //! for this transport. There is no separate `register` -- the HTTP
+    //! coordination service's `/auth/google` finds or creates the account
+    //! on first login.
 
     use serde::Serialize;
 

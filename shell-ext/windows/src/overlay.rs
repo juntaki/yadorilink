@@ -6,8 +6,8 @@
 //! `CLSID`s (one per visual state) is the standard pattern every
 //! shell-icon-overlay client (OneDrive, Dropbox, Nextcloud) uses.
 //!
-//! Icon files are placeholders (`shell32.dll`'s built-in icons) for this
-//! spike (task 9.1) — real custom overlay artwork is follow-up polish,
+//! Icon files are currently placeholders (`shell32.dll`'s built-in icons);
+//! real custom overlay artwork is follow-up polish,
 //! not part of proving the COM plumbing itself works.
 
 use windows::core::{implement, w, Result, GUID, PCWSTR, PWSTR};
@@ -17,16 +17,16 @@ use windows::Win32::UI::Shell::{IShellIconOverlayIdentifier, IShellIconOverlayId
 use crate::ipc_client;
 use yadorilink_ipc_proto::shellipc::SyncState;
 
-// Placeholder namespace-derived GUIDs (task 9.1 spike) — a real release
+// Placeholder namespace-derived GUIDs — a real release
 // would use dedicated, hand-picked GUIDs and never regenerate them (the
 // registry association is by GUID, so changing these breaks upgrades).
 pub const CLSID_SYNCED: GUID = GUID::from_u128(0x8f3a1c00_1e6b_4b7a_9d2e_1a2b3c4d5e01);
 pub const CLSID_SYNCING: GUID = GUID::from_u128(0x8f3a1c00_1e6b_4b7a_9d2e_1a2b3c4d5e02);
 pub const CLSID_ERROR: GUID = GUID::from_u128(0x8f3a1c00_1e6b_4b7a_9d2e_1a2b3c4d5e03);
 pub const CLSID_ONLINE_ONLY: GUID = GUID::from_u128(0x8f3a1c00_1e6b_4b7a_9d2e_1a2b3c4d5e04);
-// on-demand-sync task 6.4 — edit-presence awareness (design D7)'s "open
-// elsewhere" badge: a 5th overlay identifier, same pattern as the four
-// above, querying `StatusResponse.open_elsewhere_device_id` instead of
+// Edit-presence awareness's "open elsewhere" badge: a 5th overlay
+// identifier, same pattern as the four above, querying
+// `StatusResponse.open_elsewhere_device_id` instead of
 // `SyncState`/`MaterializationState`.
 pub const CLSID_OPEN_ELSEWHERE: GUID = GUID::from_u128(0x8f3a1c00_1e6b_4b7a_9d2e_1a2b3c4d5e05);
 
@@ -229,12 +229,11 @@ impl IShellIconOverlayIdentifier_Impl for OnlineOnlyOverlay_Impl {
     }
 }
 
-/// on-demand-sync task 6.4 / design D7: renders `open_elsewhere_device_id`
-/// (set daemon-side by the edit-presence-awareness capability, task
-/// 9.1-9.4) as its own overlay badge, same pattern as `OnlineOnlyOverlay`
-/// above — an independent signal from both `SyncState` and
-/// `MaterializationState`, so this is its own CLSID rather than folded
-/// into one of the other four.
+/// Renders `open_elsewhere_device_id` (set daemon-side by the
+/// edit-presence-awareness capability) as its own overlay badge, same
+/// pattern as `OnlineOnlyOverlay` above — an independent signal from both
+/// `SyncState` and `MaterializationState`, so this is its own CLSID
+/// rather than folded into one of the other four.
 #[implement(IShellIconOverlayIdentifier)]
 pub struct OpenElsewhereOverlay;
 

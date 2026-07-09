@@ -37,7 +37,7 @@ pub type ContentHash = String;
 /// trips it.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// add-deterministic-sync-testing (DST long-sweep hardening): one
+/// The deterministic-simulation test setup's long-sweep hardening: one
 /// process-lifetime `ScheduledThreadPool`, shared by *every* r2d2 pool
 /// this crate opens under `cfg(madsim)`, instead of letting each
 /// `Pool::builder()` default to its own fresh 3-thread pool.
@@ -101,7 +101,7 @@ fn madsim_or_default_pool(
     Ok(Pool::new(manager)?)
 }
 
-/// add-update-migration-safety task 1.1: an explicit, monotonically
+/// An explicit, monotonically
 /// increasing marker for this crate's on-disk schema, stored via SQLite's
 /// built-in `PRAGMA user_version` (a plain integer SQLite reserves in the
 /// database header specifically for application use — no extra table
@@ -113,7 +113,7 @@ fn madsim_or_default_pool(
 /// layered on top: bump this constant whenever a migration changes the
 /// on-disk shape in a way an older binary must not silently reopen.
 /// Version 1 is the schema as of the first public beta baseline (every
-/// migration present in this file as of `add-update-migration-safety`).
+/// migration present in this file up to this point).
 pub const SCHEMA_VERSION: i32 = 1;
 
 pub struct SyncState {
@@ -147,7 +147,7 @@ pub struct SyncState {
     path_locks: Mutex<PathLockMap>,
 }
 
-/// add-file-version-history task 1.1: rebuilds `files` from its pre-this-
+/// Rebuilds `files` from its pre-this-
 /// change shape (primary key `(group_id, path)`) into the version-history
 /// shape (primary key `(group_id, path, version_seq)`, plus `state`/
 /// `origin_device_id`) — see `SyncState::init`'s call site for why this
@@ -169,7 +169,7 @@ pub struct SyncState {
 /// history to backfill, which is honest — this change's retention only
 /// starts accruing from the first edit/delete after upgrade), then drops
 /// the old table and renames the new one into place.
-/// fix-local-edit-swallowed-by-self-echo-race: same shape as
+/// Same shape as
 /// `peer_session`'s and `link_manager`'s private `now_unix_nanos` helpers —
 /// used by `mark_deleted` to stamp a tombstone with the deletion's own
 /// observed time rather than carrying forward stale content mtime.
@@ -261,7 +261,7 @@ fn migrate_files_table_widen_primary_key(conn: &Connection) -> Result<(), SyncEr
     Ok(())
 }
 
-/// add-update-migration-safety task 1.3: reads `PRAGMA user_version` and
+/// Reads `PRAGMA user_version` and
 /// errors if it's newer than this binary's [`SCHEMA_VERSION`] — an older
 /// binary opening state a newer one already migrated. Deliberately checked
 /// *before* any migration statement runs (see `init`'s call site), so an
@@ -299,7 +299,7 @@ fn files_table_has_column(conn: &Connection, column: &str) -> Result<bool, SyncE
     Ok(false)
 }
 
-/// add-file-version-history task 1.3: the shared version-retaining write
+/// The shared version-retaining write
 /// path behind `SyncState::upsert_file_with_origin` and
 /// `SyncState::upsert_files_batch` — see `upsert_file_with_origin`'s doc
 /// comment for the full semantics. Takes an open `Transaction` rather than
@@ -323,7 +323,7 @@ fn files_table_has_column(conn: &Connection, column: &str) -> Result<bool, SyncE
 ///
 /// The first round trip below is an `UPDATE ... RETURNING`: it flips
 /// whatever row is currently `state = 'current'` (if any) to
-/// `superseded`/`trashed` per design D4's rule *and* returns everything
+/// `superseded`/`trashed` per 's rule *and* returns everything
 /// needed to build the new current row, so no separate up-front `SELECT`
 /// is needed before it.
 fn upsert_file_in_tx(
@@ -630,7 +630,7 @@ impl SyncState {
     }
 
     fn init(conn: &Connection) -> Result<(), SyncError> {
-        // add-update-migration-safety task 1.3: refuse to touch a database
+        // Refuse to touch a database
         // an older binary migrated *this* binary doesn't understand,
         // before any migration below runs a single statement against it —
         // an unsupported downgrade must error cleanly, not silently drop
@@ -640,7 +640,7 @@ impl SyncState {
         // `<= SCHEMA_VERSION`, so this never blocks first-run.
         check_schema_not_newer_than_supported(conn)?;
 
-        // add-file-version-history task 1.1: widening `files`' primary key
+        // Widening `files`' primary key
         // from `(group_id, path)` to `(group_id, path, version_seq)` is not
         // expressible as an `ALTER TABLE ... ADD COLUMN` — SQLite has no
         // syntax to change a declared primary key in place. Must run
@@ -661,7 +661,7 @@ impl SyncState {
                 version_json      TEXT NOT NULL,
                 blocks_json       TEXT NOT NULL,
                 deleted           INTEGER NOT NULL DEFAULT 0,
-                -- add-file-version-history task 1.1: a per-`(group_id,
+                -- A per-`(group_id,
                 -- path)` monotonically increasing counter. Exactly one row
                 -- per `(group_id, path)` has `state = 'current'` at a time;
                 -- `state` and `origin_device_id` below are additionally
@@ -681,7 +681,7 @@ impl SyncState {
                 paused     INTEGER NOT NULL DEFAULT 0
             );
 
-            -- add-folder-direction-modes task 1.2: divergence tracking for
+            -- Divergence tracking for
             -- a gated direction — new tables (not `ALTER TABLE`s), so
             -- `CREATE TABLE IF NOT EXISTS` alone is the whole migration for
             -- these, the same way `files`/`links` themselves were
@@ -709,7 +709,7 @@ impl SyncState {
         // "duplicate column" error on a database that already has them.
         // Existing rows default to `hydrated`/`eager` — every file and
         // link already on disk before this change keeps behaving exactly
-        // as it did (design.md's "no rollback concerns" migration note).
+        // as it did — no rollback concerns for this migration.
         for stmt in [
             "ALTER TABLE files ADD COLUMN materialization_state TEXT NOT NULL DEFAULT 'hydrated'",
             "ALTER TABLE files ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
@@ -721,7 +721,7 @@ impl SyncState {
             // opt-in, matching the migration guarantee already
             // established for materialization_policy above.
             "ALTER TABLE links ADD COLUMN chunking_policy TEXT NOT NULL DEFAULT 'fixed'",
-            // add-sync-fidelity task 1.1-1.3: every pre-existing row
+            // Every pre-existing row
             // defaults to `record_kind = 'file'` (the only kind scan/watch
             // ever produced before this change) with no symlink target,
             // `exec_bit = 0` (no workflow depended on the bit being set,
@@ -735,14 +735,14 @@ impl SyncState {
             "ALTER TABLE files ADD COLUMN exec_bit INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE files ADD COLUMN held_reason TEXT",
             "ALTER TABLE files ADD COLUMN held_since_unix_nanos INTEGER",
-            // add-sync-fidelity task 2.4: whether a symlink's raw target is
+            // Whether a symlink's raw target is
             // an absolute path, or resolves (syntactically, never via
             // dereferencing) outside the linked folder's root. Deliberately
             // a *separate* column from `held_reason`/`held_since_unix_nanos`
             // above rather than reusing them: `held_*` (section 4) gates
             // materialization — a held file is never written to disk. An
             // out-of-root/absolute symlink is not held by this flag alone —
-            // design D1 says it's "synced as a record like any other
+            // says it's "synced as a record like any other
             // symlink but flagged", so it must keep materializing normally
             // (as a real symlink on POSIX) while carrying a distinct
             // out-of-scope-risk signal a later policy change can consult.
@@ -750,9 +750,9 @@ impl SyncState {
             // "no behavior change without opt-in" guarantee as every other
             // column in this list.
             "ALTER TABLE files ADD COLUMN symlink_out_of_root INTEGER NOT NULL DEFAULT 0",
-            // add-sync-fidelity task 3.2: per-link opt-in for attempting
+            // Per-link opt-in for attempting
             // real Win32 symlink creation on Windows (default 0 — the safe
-            // skip-with-visible-status policy design D1 describes, since a
+            // skip-with-visible-status policy describes, since a
             // default assuming `SeCreateSymbolicLinkPrivilege`/Developer
             // Mode would fail unpredictably per-machine). Mirrors
             // `materialization_policy`/`chunking_policy` above: a per-link
@@ -760,14 +760,14 @@ impl SyncState {
             // device-local link-wide policy decision, not something that
             // varies symlink-by-symlink.
             "ALTER TABLE links ADD COLUMN windows_symlink_opt_in INTEGER NOT NULL DEFAULT 0",
-            // add-folder-direction-modes task 1.1: every pre-existing link
+            // Every pre-existing link
             // defaults to `send_receive` (`LinkMode::default()`'s db
             // string) — the unchanged, original behavior every link had
             // before this column existed, matching the "no behavior change
             // without opt-in" guarantee already established for every
             // other column in this list.
             "ALTER TABLE links ADD COLUMN mode TEXT NOT NULL DEFAULT 'send_receive'",
-            // add-file-version-history task 1.1, defensive: `files.version_seq`/
+            // Defensive: `files.version_seq`/
             // `state`/`origin_device_id` are normally already present by the
             // time this loop runs, via either a fresh `CREATE TABLE IF NOT
             // EXISTS` above or `migrate_files_table_widen_primary_key`'s own
@@ -778,8 +778,8 @@ impl SyncState {
             "ALTER TABLE files ADD COLUMN version_seq INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE files ADD COLUMN state TEXT NOT NULL DEFAULT 'current'",
             "ALTER TABLE files ADD COLUMN origin_device_id TEXT",
-            // add-file-version-history task 1.2: a link's retention policy
-            // (design D2) — two independent, optional bounds. Every
+            // A link's retention policy
+            // () — two independent, optional bounds. Every
             // pre-existing and freshly-created link defaults to the sane
             // defaults (10 versions / 30 days), matching every other
             // per-link policy column's "no behavior change without opt-in"
@@ -801,7 +801,7 @@ impl SyncState {
             }
         }
 
-        // add-update-migration-safety task 1.1: stamp the now-current
+        // Stamp the now-current
         // schema version *after* every migration above has run —
         // unconditionally, not just when it changed, so this is exactly as
         // idempotent as the migrations themselves (setting `user_version`
@@ -824,8 +824,8 @@ impl SyncState {
         self.upsert_file_with_origin(group_id, record, "")
     }
 
-    /// add-file-version-history task 1.3: the version-retaining write path
-    /// (design D4) — see the free function `upsert_file_in_tx` (this
+    /// The version-retaining write path
+    /// () — see the free function `upsert_file_in_tx` (this
     /// method's entire implementation) for the exact supersede/trash/
     /// promote-scaffold logic. `origin_device_id` is the local device id
     /// for a local edit, or the sending peer's device id when adopting a
@@ -848,7 +848,7 @@ impl SyncState {
     }
 
     /// Upserts many records for one group inside a single SQLite
-    /// transaction (batch-sync-optimizations design D4) — used by
+    /// transaction (batch-sync-optimizations ) — used by
     /// `LocalChangeProcessor::scan_existing_files` so a large initial scan
     /// commits once instead of once per file. Semantically identical to
     /// calling `upsert_file_with_origin` for each record in order (same
@@ -875,7 +875,7 @@ impl SyncState {
         })
     }
 
-    /// add-file-version-history: creates a `version_seq = 0` scaffold row
+    /// Creates a `version_seq = 0` scaffold row
     /// for `path` if (and only if) no `current` row exists for it yet — the
     /// `apply_incoming_wire_metadata` bootstrap need (`peer_session.rs`):
     /// its four metadata setters (`set_record_kind`/`set_symlink_target`/
@@ -894,7 +894,7 @@ impl SyncState {
         group_id: &str,
         path: &str,
     ) -> Result<(), SyncError> {
-        // fix-burst-sync-permanent-stall: this write, like every sibling
+        // This write, like every sibling
         // per-path metadata setter below it (`set_record_kind`,
         // `set_symlink_target`, `set_symlink_out_of_root`, `set_exec_bit`,
         // `set_held`/`clear_held`) sits directly on `reconcile_one_file`'s
@@ -949,7 +949,7 @@ impl SyncState {
     }
 
     /// Bulk-loads every non-deleted file's materialization state for
-    /// `group_id` (batch-sync-optimizations design D4) — used by
+    /// `group_id` (batch-sync-optimizations ) — used by
     /// `LocalChangeProcessor::scan_existing_files` so deciding whether an
     /// on-disk entry is a placeholder (which must never be chunked) costs
     /// one query for the whole scan instead of one per file.
@@ -996,15 +996,15 @@ impl SyncState {
         Ok(out)
     }
 
-    /// improve-transfer-performance task 2.1: bulk-loads every local
+    /// Bulk-loads every local
     /// `FileRecord` (including tombstones — deleted rows are not filtered
     /// here, matching `get_file`'s own behavior) whose `path` is in
     /// `paths`, for `group_id`, keyed by path — the batched counterpart to
     /// calling `get_file` once per path. Mirrors the existing bulk-load
     /// pattern `LocalChangeProcessor::scan_existing_files` already uses via
-    /// `list_files` (design.md: "Collect the batch of incoming paths/
-    /// hashes and issue set-based queries ... then diff in memory"), but
-    /// scoped to exactly the requested paths via `WHERE path IN (...)`
+    /// `list_files` — collecting the batch of incoming paths/hashes and
+    /// issuing set-based queries, then diffing in memory — but scoped to
+    /// exactly the requested paths via `WHERE path IN (...)`
     /// rather than loading the whole group — the right shape for
     /// `reconcile_files`, where an incoming `IndexUpdate` is often a
     /// handful of changed files out of a much larger indexed group, not
@@ -1066,7 +1066,7 @@ impl SyncState {
     /// so a future version-history/trash table can contribute retained
     /// blocks without changing `live_block_hashes` again.
     ///
-    /// add-file-version-history design D5/task 4.1-4.2: this query is
+    /// This query is
     /// deliberately **not** filtered by `state` — every row with
     /// `deleted = 0` contributes its blocks regardless of whether it is
     /// `current`, `superseded`, or `trashed`, which is exactly the live-root
@@ -1079,8 +1079,8 @@ impl SyncState {
     /// scanned here. No code changes to `BlockStore` itself are required by
     /// this change (`delete` is still never called); this comment and
     /// `live_block_hashes_include_superseded_and_trashed_blocks` below are
-    /// the load-bearing documentation of that contract for whoever
-    /// implements `add-block-store-gc`.
+    /// the load-bearing documentation of that contract for a future
+    /// block-store GC implementation.
     pub fn live_block_hashes_with_extra_roots(
         &self,
         extra_roots: impl IntoIterator<Item = ContentHash>,
@@ -1120,7 +1120,7 @@ impl SyncState {
     /// Like `mark_deleted`, but stamps the tombstone with a caller-supplied
     /// observed time instead of "now".
     ///
-    /// fix-local-edit-swallowed-by-self-echo-race: `local_change.rs`'s
+    /// `local_change.rs`'s
     /// debounced dispatch of a `Removed` event is the one caller that
     /// needs this — a local deletion can sit in the debounce accumulator
     /// for up to `DebounceConfig::quiet_period` (default 300ms) before
@@ -1153,7 +1153,7 @@ impl SyncState {
             deleted: false,
         });
         record.deleted = true;
-        // fix-local-edit-swallowed-by-self-echo-race: stamp the tombstone
+        // Stamp the tombstone
         // with the deletion's own observed time, not the mtime carried
         // forward from the file's last live content (the field above is
         // only overwritten here, nowhere else in this function) — a stale
@@ -1164,7 +1164,7 @@ impl SyncState {
         // `peer_session::PeerSyncSession::reconcile_one_file`).
         record.mtime_unix_nanos = observed_at_unix_nanos;
         record.version.increment(device_id);
-        // add-file-version-history task 2.2: `device_id` is a known origin
+        // `device_id` is a known origin
         // (this device, for a local delete) — routes through
         // `upsert_file_with_origin` so the tombstone row itself records it,
         // and so the row it supersedes (the file's last live content, if
@@ -1173,7 +1173,7 @@ impl SyncState {
         self.upsert_file_with_origin(group_id, &record, device_id)
     }
 
-    // --- Materialization (on-demand-sync design D2, D3, D6) ---
+    // --- Materialization (on-demand-sync D3, D6) ---
 
     pub fn get_materialization_state(
         &self,
@@ -1259,7 +1259,7 @@ impl SyncState {
         Ok(())
     }
 
-    /// Records `unix_ts` as this file's last-accessed time (design D6):
+    /// Records `unix_ts` as this file's last-accessed time ():
     /// called on hydration completion, and best-effort from the eviction
     /// sweep's `fs::metadata().accessed()` fallback for already-hydrated
     /// files.
@@ -1280,7 +1280,7 @@ impl SyncState {
         Ok(())
     }
 
-    // --- Sync fidelity (add-sync-fidelity design D1-D3, task 1.1-1.3) ---
+    // --- Sync fidelity ---
     //
     // Like `materialization_state`/`pinned` above, these are index-local
     // per-file columns surfaced through dedicated getters/setters rather
@@ -1291,7 +1291,7 @@ impl SyncState {
     // the column's `DEFAULT` and re-upserting an existing row never resets
     // whatever one of these setters previously recorded for it.
 
-    /// The kind of on-disk entry this record represents (design D1). `None`
+    /// The kind of on-disk entry this record represents (). `None`
     /// if no row exists for `group_id`/`path` at all — distinct from `Some
     /// (RecordKind::File)`, which is a real row that just hasn't been
     /// classified as anything else.
@@ -1311,7 +1311,7 @@ impl SyncState {
         Ok(kind.as_deref().map(RecordKind::from_db_str))
     }
 
-    // fix-burst-sync-permanent-stall: `retry_on_database_locked`-wrapped
+    // `retry_on_database_locked`-wrapped
     // for the same reason as `ensure_bootstrap_row_for_metadata` just
     // above -- see its doc comment for the full diagnostic story.
     pub fn set_record_kind(
@@ -1332,7 +1332,7 @@ impl SyncState {
         })
     }
 
-    /// The raw, unresolved symlink target text (design D1) — only
+    /// The raw, unresolved symlink target text () — only
     /// meaningful when `get_record_kind` returns `Symlink`; `None`
     /// otherwise (either no row, or a row that isn't a symlink).
     pub fn get_symlink_target(
@@ -1351,7 +1351,7 @@ impl SyncState {
         Ok(target.flatten())
     }
 
-    // fix-burst-sync-permanent-stall: retry-wrapped, same reason as
+    // Retry-wrapped, same reason as
     // `ensure_bootstrap_row_for_metadata`.
     pub fn set_symlink_target(
         &self,
@@ -1371,7 +1371,7 @@ impl SyncState {
         })
     }
 
-    /// Task 2.4: `true` when this symlink's raw target is an absolute
+    /// `true` when this symlink's raw target is an absolute
     /// path, or resolves (syntactically — see
     /// `local_change::symlink_target_is_out_of_root`, never by
     /// dereferencing) outside the linked folder's root. Only meaningful
@@ -1393,7 +1393,7 @@ impl SyncState {
         Ok(flag.unwrap_or(0) != 0)
     }
 
-    // fix-burst-sync-permanent-stall: retry-wrapped, same reason as
+    // Retry-wrapped, same reason as
     // `ensure_bootstrap_row_for_metadata`.
     pub fn set_symlink_out_of_root(
         &self,
@@ -1413,7 +1413,7 @@ impl SyncState {
         })
     }
 
-    /// The owner-executable bit (design D2). Defaults to `false` for any
+    /// The owner-executable bit (). Defaults to `false` for any
     /// row — including every pre-existing one from before this column
     /// existed — matching `is_pinned`'s existing default-to-`false` shape
     /// for an unknown/never-set row.
@@ -1429,11 +1429,11 @@ impl SyncState {
         Ok(exec_bit.unwrap_or(0) != 0)
     }
 
-    /// fix-multiway-conflict-name-content-mismatch: the device id that
+    /// The device id that
     /// actually produced this path's *current* content, as already
     /// recorded by every `upsert_file_with_origin` call (the
-    /// `origin_device_id` column has existed since add-file-version-
-    /// history task 1.3, previously write-only from this query's point of
+    /// `origin_device_id` column has existed since file-version-history
+    /// support was added, previously write-only from this query's point of
     /// view — used for version-history attribution, never read back
     /// during conflict resolution). `None` for a row with no recorded
     /// origin (an empty string is stored as SQL `NULL`, per
@@ -1458,7 +1458,7 @@ impl SyncState {
         Ok(origin)
     }
 
-    // fix-burst-sync-permanent-stall: retry-wrapped, same reason as
+    // Retry-wrapped, same reason as
     // `ensure_bootstrap_row_for_metadata`.
     pub fn set_exec_bit(
         &self,
@@ -1478,7 +1478,7 @@ impl SyncState {
         })
     }
 
-    /// A held file's reason and hold timestamp (design D3), so both
+    /// A held file's reason and hold timestamp (), so both
     /// survive a daemon restart. `None` if the row isn't currently held
     /// (either no row, or a row with no `held_reason` recorded) — the two
     /// columns are only ever written/cleared together (`set_held`/
@@ -1508,9 +1508,9 @@ impl SyncState {
     /// the hazard-detection logic that actually decides these reasons
     /// isn't constrained by this schema-only task) as of `since_unix_nanos`.
     /// Held state is purely local — a held file's index row keeps
-    /// participating in normal index exchange with peers (design D3); this
+    /// participating in normal index exchange with peers (); this
     /// column is never sent over the wire.
-    // fix-burst-sync-permanent-stall: retry-wrapped, same reason as
+    // Retry-wrapped, same reason as
     // `ensure_bootstrap_row_for_metadata`.
     pub fn set_held(
         &self,
@@ -1532,12 +1532,12 @@ impl SyncState {
         })
     }
 
-    /// Clears a file's held state (design D3: "a held file that is later
+    /// Clears a file's held state (: "a held file that is later
     /// tombstoned clears its held state rather than leaving an orphaned
     /// held entry"). A no-op, not an error, if the file wasn't held (or
     /// the row doesn't exist) — callers tombstoning a record don't first
     /// need to check whether it was ever held.
-    // fix-burst-sync-permanent-stall: retry-wrapped, same reason as
+    // Retry-wrapped, same reason as
     // `ensure_bootstrap_row_for_metadata`.
     pub fn clear_held(&self, group_id: &str, path: &str) -> Result<(), SyncError> {
         retry_on_database_locked(|| {
@@ -1619,7 +1619,7 @@ impl SyncState {
         Ok(counts)
     }
 
-    /// A folder group's materialization policy (design D3), by `group_id`
+    /// A folder group's materialization policy (), by `group_id`
     /// rather than `local_path` — the lookup `PeerSyncSession::materialize`
     /// needs, since it only knows the folder group, not the local path a
     /// caller linked it under. `None` if no link is registered for this
@@ -1697,9 +1697,9 @@ impl SyncState {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    // --- Version history & trash (add-file-version-history) ---
+    // --- Version history & trash ---
 
-    /// design D2: a link's retention policy, by `group_id` — mirrors
+    /// : a link's retention policy, by `group_id` — mirrors
     /// `link_mode_for_group`/`chunking_policy_for_group`'s by-`group_id`
     /// lookup shape, since the retention-expiry sweep and the restore/
     /// listing IPC handlers only know the folder group, not the local path
@@ -1723,11 +1723,11 @@ impl SyncState {
         Ok(row.map(|(max_versions, max_age_days)| RetentionPolicy { max_versions, max_age_days }))
     }
 
-    /// design D2: sets a folder link's retention policy — `yadorilink link
+    /// : sets a folder link's retention policy — `yadorilink link
     /// --keep-versions <n> --keep-days <t>` at link time, or `yadorilink
     /// link retention <path> --keep-versions <n> --keep-days <t>`
     /// afterward. Either bound may be `0` (unlimited on that axis, per
-    /// design D2 — "documented as a storage-growth footgun, not blocked
+    /// — "documented as a storage-growth footgun, not blocked
     /// outright"). Mirrors `set_materialization_policy`/`set_link_mode`'s
     /// by-`local_path` shape.
     pub fn set_retention_policy(
@@ -1858,7 +1858,7 @@ impl SyncState {
     }
 
     /// Sets a folder group's default materialization policy for
-    /// newly-adopted files (design D3) — `yadorilink link --on-demand` or
+    /// newly-adopted files () — `yadorilink link --on-demand` or
     /// its Eager-default counterpart.
     pub fn set_materialization_policy(
         &self,
@@ -1876,8 +1876,8 @@ impl SyncState {
     }
 
     /// Sets a folder link's chunking policy (content-defined-chunking
-    /// design D3) — `yadorilink link --content-defined-chunking` or its
-    /// Fixed-default counterpart. Device-local; see design D4 for why
+    /// ) — `yadorilink link --content-defined-chunking` or its
+    /// Fixed-default counterpart. Device-local; see for why
     /// this doesn't need cross-device agreement.
     pub fn set_chunking_policy(
         &self,
@@ -1894,9 +1894,9 @@ impl SyncState {
         Ok(())
     }
 
-    /// add-sync-fidelity task 3.2: whether `group_id`'s link has opted in
+    /// Whether `group_id`'s link has opted in
     /// to attempting real Win32 symlink creation on Windows, rather than
-    /// the default skip-with-visible-status policy (design D1). Mirrors
+    /// the default skip-with-visible-status policy (). Mirrors
     /// `materialization_policy_for_group`'s by-`group_id` lookup shape —
     /// `PeerSyncSession::materialize` only knows the folder group, not the
     /// local path a caller linked it under. `false` (not an error) if no
@@ -1936,7 +1936,7 @@ impl SyncState {
     }
 
     /// Sets (or clears, with `None`) an `OnDemand` folder's automatic
-    /// eviction disk-usage cap (design D6) — unset means no automatic
+    /// eviction disk-usage cap () — unset means no automatic
     /// eviction, matching the existing manual-only default.
     pub fn set_max_local_size_bytes(
         &self,
@@ -1964,10 +1964,10 @@ impl SyncState {
         Ok(())
     }
 
-    // --- Folder direction modes (add-folder-direction-modes task 1.1) ---
+    // --- Folder direction modes ---
 
-    /// Sets a folder link's directional propagation mode (design.md's
-    /// "Propagation gating" table) — `yadorilink link --mode <mode>` or
+    /// Sets a folder link's directional propagation mode (per this
+    /// crate's propagation-gating rules) — `yadorilink link --mode <mode>` or
     /// `yadorilink link set-mode <path> <mode>`. Mirrors
     /// `set_materialization_policy`/`set_chunking_policy`'s by-`local_path`
     /// shape: every other per-link policy setter here is addressed by
@@ -1983,11 +1983,11 @@ impl SyncState {
         Ok(())
     }
 
-    /// add-folder-direction-modes: whether `group_id`'s link is currently
+    /// Whether `group_id`'s link is currently
     /// paused, by `group_id` — the lookup `PeerSyncSession::reconcile_
-    /// files_if_authorized` needs (task 2.1's "pause still stops both
-    /// directions regardless of mode" — design.md's "Pause still trumps
-    /// everything" — a gate this crate never previously enforced on the
+    /// files_if_authorized` needs (pause still stops both directions
+    /// regardless of mode, trumping everything — a gate this crate never
+    /// previously enforced on the
     /// *incoming*-apply path; only the daemon's local→peer broadcast
     /// checked `paused` before this change). Mirrors `link_mode_for_
     /// group`'s by-`group_id` shape. `false` (not an error) if no link is
@@ -2018,9 +2018,9 @@ impl SyncState {
         Ok(mode.as_deref().map(LinkMode::from_db_str))
     }
 
-    // --- Divergence tracking (add-folder-direction-modes task 1.2) ---
+    // --- Divergence tracking ---
     //
-    // The invariant (design.md "Divergence tracking (no data loss)") is
+    // The invariant (no data loss during divergence tracking) is
     // that gating a direction never silently discards state: a send-only
     // link records an out-of-sync item instead of applying a differing
     // incoming change; a receive-only link records a receive-only-changed
@@ -2126,18 +2126,18 @@ impl SyncState {
         Ok(count as u64)
     }
 
-    // --- Version history retention expiry (add-file-version-history task 2.3) ---
+    // --- Version history retention expiry ---
 
     /// The retention-expiry sweep — deletes the index row (never the
-    /// blocks; design D5 leaves actual block reclamation to
-    /// `add-block-store-gc`) for any `superseded`/`trashed` version of
+    /// blocks; leaves actual block reclamation to a future
+    /// block-store GC) for any `superseded`/`trashed` version of
     /// `group_id` that exceeds *both* `policy.max_versions` (by recency
     /// rank among that path's own superseded/trashed rows) and
     /// `policy.max_age_days` (by wall-clock age from `now_unix_nanos`) —
     /// see `RetentionPolicy`'s doc comment for the union-retain/
     /// intersection-expire rule this implements. The `current` row for any
     /// path is never a candidate — the `WHERE state IN ('superseded',
-    /// 'trashed')` below structurally excludes it, matching design D2's
+    /// 'trashed')` below structurally excludes it, matching 's
     /// "the current (live) version ... is never subject to this policy".
     /// Returns the number of rows deleted.
     pub fn expire_superseded_and_trashed_versions(
@@ -2157,7 +2157,7 @@ impl SyncState {
             // given path; `policy.max_versions` rows survive on the count
             // axis alone. A `0` bound on either axis structurally can never
             // satisfy its own `!= 0` guard, so that axis never contributes
-            // to expiry — exactly "unlimited on that axis" (design D2).
+            // to expiry — exactly "unlimited on that axis" ().
             let mut stmt = tx.prepare(
                 "SELECT path, version_seq FROM (
                     SELECT path, version_seq, mtime_unix_nanos,
@@ -2194,24 +2194,24 @@ pub struct FolderLink {
     pub group_id: String,
     pub paused: bool,
     pub materialization_policy: MaterializationPolicy,
-    /// Automatic-eviction disk-usage cap in bytes, if configured (design D6).
+    /// Automatic-eviction disk-usage cap in bytes, if configured ().
     pub max_local_size_bytes: Option<i64>,
-    /// content-defined-chunking design D3.
+    /// content-defined-chunking .
     pub chunking_policy: ChunkingPolicy,
-    /// add-folder-direction-modes task 1.1: this link's directional
+    /// This link's directional
     /// propagation mode.
     pub mode: LinkMode,
-    /// add-file-version-history design D2: this link's version-retention
+    /// This link's version-retention
     /// policy.
     pub retention_policy: RetentionPolicy,
 }
 
-/// add-file-version-history design D2: a link's retention policy — two
+/// A link's retention policy — two
 /// independent, optional bounds on how long a *superseded* or *trashed*
 /// version is kept (the current/live version is never subject to this
 /// policy). A version is retained as long as it is within *either* bound,
 /// and only becomes eligible for expiry once it exceeds *both* (union-
-/// retain, intersection-expire — see design D2 for the rationale). `0`
+/// retain, intersection-expire — see for the rationale). `0`
 /// means unlimited on that axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
@@ -2224,13 +2224,13 @@ pub struct RetentionPolicy {
 }
 
 impl Default for RetentionPolicy {
-    /// design D2's defaults: 10 versions / 30 days.
+    /// 's defaults: 10 versions / 30 days.
     fn default() -> Self {
         RetentionPolicy { max_versions: 10, max_age_days: 30 }
     }
 }
 
-/// design D4: which of the three states a `files` row is in.
+/// : which of the three states a `files` row is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionState {
     /// The live version of the file at this path right now (or, if the
@@ -2276,7 +2276,7 @@ pub struct VersionRecord {
     pub state: VersionState,
     /// The device that produced this version: this device's own id for a
     /// local edit, or the sending peer's device id when adopted from a
-    /// remote change (design D4). `None` for versions written before this
+    /// remote change (). `None` for versions written before this
     /// change existed, or by a caller using the origin-agnostic
     /// `upsert_file` (design's honest "unknown origin" case).
     pub origin_device_id: Option<String>,
@@ -2321,7 +2321,7 @@ fn version_record(
     }
 }
 
-/// One candidate for the automatic eviction sweep (design D6), in the
+/// One candidate for the automatic eviction sweep (), in the
 /// order `list_evictable_files` returns them: least-recently-accessed first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvictableFile {
@@ -2337,7 +2337,7 @@ pub struct MaterializationCounts {
     pub hydrating: u64,
 }
 
-/// A held file's reason and hold timestamp (add-sync-fidelity design D3),
+/// A held file's reason and hold timestamp,
 /// as returned by `SyncState::get_held_state`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldState {
@@ -2392,7 +2392,7 @@ mod tests {
         hex::encode(vec![hash_byte; 32])
     }
 
-    /// improve-transfer-performance task 2.1: correctness — every requested
+    /// Correctness — every requested
     /// path with a row comes back, keyed by its own path, and a requested
     /// path with no row is simply absent (not an error, not a spurious
     /// entry), mirroring `get_file` returning `None` for the same case.
@@ -2433,7 +2433,7 @@ mod tests {
         assert!(state.get_files_by_paths("group-1", &[]).unwrap().is_empty());
     }
 
-    /// improve-transfer-performance task 2.1/2.2: a real regression guard
+    /// A real regression guard
     /// for "batched set-based query instead of one point query per
     /// record" — mirrors the established style of
     /// `local_change::tests::scan_existing_files_completes_quickly_for_
@@ -2481,7 +2481,7 @@ mod tests {
         );
     }
 
-    /// task 5.1: link registration and persistence round-trip.
+    /// link registration and persistence round-trip.
     #[test]
     fn link_lifecycle_add_list_remove() {
         let state = SyncState::open_in_memory().unwrap();
@@ -2581,7 +2581,7 @@ mod tests {
         assert!(live_after_commit.contains(&hash_hex(0x99)));
     }
 
-    /// task 6.8: pausing a link doesn't lose already-recorded changes —
+    /// pausing a link doesn't lose already-recorded changes —
     /// the index is the queued-change backlog, and it's untouched by the
     /// pause flag itself (only propagation to peers is gated on it,
     /// handled by the caller per `local_change`'s module docs).
@@ -2613,7 +2613,7 @@ mod tests {
         assert!(matches!(err, SyncError::NotFound(_)));
     }
 
-    /// add-folder-direction-modes task 1.1: every pre-existing and
+    /// Every pre-existing and
     /// freshly-added link defaults to `SendReceive` — the "no behavior
     /// change without opt-in" migration guarantee, same shape as
     /// `new_links_default_to_eager_policy_with_no_cap` above.
@@ -2652,7 +2652,7 @@ mod tests {
         assert_eq!(state.link_mode_for_group("no-such-group").unwrap(), None);
     }
 
-    /// add-folder-direction-modes: `is_paused_for_group` reflects
+    /// `is_paused_for_group` reflects
     /// `set_paused`, addressed by `group_id` instead of `local_path` —
     /// the lookup shape `reconcile_files_if_authorized` needs.
     #[test]
@@ -2674,7 +2674,7 @@ mod tests {
         assert!(!state.is_paused_for_group("no-such-group").unwrap());
     }
 
-    /// add-folder-direction-modes task 1.2: an out-of-sync item survives an
+    /// An out-of-sync item survives an
     /// `INSERT OR REPLACE` re-record (a fresher gated event for the same
     /// path doesn't create a second entry) and is removed by `override`'s
     /// `clear_out_of_sync`.
@@ -2722,7 +2722,7 @@ mod tests {
         state.clear_receive_only_changed("group-1", "never-recorded.txt").unwrap();
     }
 
-    /// design D3: existing links (and freshly-added ones with no explicit
+    /// : existing links (and freshly-added ones with no explicit
     /// policy) default to `Eager` with no configured cap — the "no
     /// behavior change without opt-in" migration guarantee.
     #[test]
@@ -2778,7 +2778,7 @@ mod tests {
         assert!(matches!(err, SyncError::NotFound(_)));
     }
 
-    /// design D2: a freshly-indexed file defaults to `Hydrated` and
+    /// : a freshly-indexed file defaults to `Hydrated` and
     /// unpinned, matching `upsert_file`'s existing (pre-on-demand-sync)
     /// callers, all of which represent genuine local content.
     #[test]
@@ -2860,7 +2860,7 @@ mod tests {
         assert_eq!(state.reset_stale_hydrating_to_placeholder().unwrap(), 0);
     }
 
-    /// design D6: eviction candidates are hydrated, unpinned, non-deleted
+    /// : eviction candidates are hydrated, unpinned, non-deleted
     /// files, ordered least-recently-accessed first (never-accessed
     /// files sort before any that have been accessed at all).
     #[test]
@@ -2894,7 +2894,7 @@ mod tests {
         assert_eq!(paths, vec!["never-accessed.jpg", "old.jpg", "recent.jpg"]);
     }
 
-    /// task 5.4: `yadorilink status`'s per-folder materialization summary.
+    /// `yadorilink status`'s per-folder materialization summary.
     #[test]
     fn materialization_counts_summarizes_by_state_excluding_deleted() {
         let state = SyncState::open_in_memory().unwrap();
@@ -3064,9 +3064,9 @@ mod tests {
         assert!(links[0].paused, "the write is visible once the writer actually commits");
     }
 
-    // --- add-sync-fidelity task 1.1-1.5: record model & index schema ---
+    // --- Record model & index schema ---
 
-    /// The exact pre-add-sync-fidelity `files`/`links` schema (identical to
+    /// The exact pre-sync-fidelity `files`/`links` schema (identical to
     /// the base `CREATE TABLE` block in `SyncState::init`, which itself
     /// already reflects on-demand-sync and content-defined-chunking's
     /// lightweight migrations having long since landed) — used to simulate
@@ -3119,7 +3119,7 @@ mod tests {
         .unwrap()
     }
 
-    /// task 1.4: a fresh database (created purely through `init`'s normal
+    /// a fresh database (created purely through `init`'s normal
     /// `CREATE TABLE IF NOT EXISTS` + lightweight-migration path, exactly
     /// what `SyncState::open_in_memory` does) and a database upgraded from
     /// the real pre-existing (`OLD_SCHEMA_SQL`) schema end up with
@@ -3153,7 +3153,7 @@ mod tests {
         }
     }
 
-    /// task 1.4: running the migration twice (e.g. two `SyncState::open`
+    /// running the migration twice (e.g. two `SyncState::open`
     /// calls against the same on-disk file within one process, or a crash
     /// and restart mid-migration) must not error on SQLite's "duplicate
     /// column name" and must not duplicate any column.
@@ -3218,19 +3218,19 @@ mod tests {
         assert_eq!(row.5, 0, "symlink_out_of_root (task 2.4) must also default to unflagged");
     }
 
-    // --- add-update-migration-safety task 2.1/2.2: schema-version
+    // --- Schema-version
     // stamping, interrupted-migration recovery, and unsupported-downgrade
     // rejection. `OLD_SCHEMA_SQL` above stands in for the first public
-    // beta baseline: it's the exact pre-add-sync-fidelity `files`/`links`
+    // beta baseline: it's the exact pre-sync-fidelity `files`/`links`
     // shape a real early-beta on-disk database would have had before any
-    // of add-sync-fidelity/add-folder-direction-modes/add-file-version-
-    // history's migrations existed, which is exactly the "fixture state
-    // from the first public beta baseline" task 2.1 asks for — reused
+    // of sync-fidelity/folder-direction-modes/file-version-
+    // history's migrations existed, which is exactly the fixture state
+    // from the first public beta baseline this test group needs — reused
     // here rather than duplicated, since it already faithfully represents
     // that shape and every test below builds on the same `init` call
     // those tests already exercise.
 
-    /// task 1.1: a fresh database ends up with `PRAGMA user_version`
+    /// a fresh database ends up with `PRAGMA user_version`
     /// stamped to the current `SCHEMA_VERSION`, not left at SQLite's
     /// default of 0 — the explicit version marker this task adds on top
     /// of the pre-existing shape-detection migrations.
@@ -3242,7 +3242,7 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
     }
 
-    /// task 2.2 (rerun): stamping the schema version is exactly as
+    /// (rerun): stamping the schema version is exactly as
     /// idempotent as the column migrations it accompanies — re-running
     /// `init` on an already-current database leaves `user_version`
     /// unchanged and still makes no destructive changes, matching the
@@ -3256,7 +3256,7 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
     }
 
-    /// task 2.2 (interrupted migration recovery): simulates a crash that
+    /// (interrupted migration recovery): simulates a crash that
     /// hit partway through the `ALTER TABLE` loop — some but not all of
     /// the lightweight-migration columns present, mirroring exactly what
     /// a real interrupted upgrade would leave on disk (each `ALTER TABLE`
@@ -3302,7 +3302,7 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION, "recovery must also complete the version stamp");
     }
 
-    /// task 1.3 / spec "Downgrade blocked": a database whose `user_version`
+    /// / spec "Downgrade blocked": a database whose `user_version`
     /// is newer than this binary's `SCHEMA_VERSION` (i.e. it was migrated
     /// by a newer build) must make `init` fail with
     /// `UnsupportedSchemaDowngrade` instead of running any migration
@@ -3330,7 +3330,7 @@ mod tests {
         );
     }
 
-    /// task 1.5: a freshly-upserted file (the common case: scan/watch
+    /// a freshly-upserted file (the common case: scan/watch
     /// producing a brand-new row via `upsert_file`, which doesn't mention
     /// any of these columns) defaults the same way an upgraded pre-existing
     /// row does — `RecordKind::File`, no symlink target, no exec bit, not
@@ -3348,7 +3348,7 @@ mod tests {
         assert!(!state.get_symlink_out_of_root("group-1", "a.jpg").unwrap());
     }
 
-    /// task 1.5: `record_kind` getter/setter round-trip, matching the
+    /// `record_kind` getter/setter round-trip, matching the
     /// existing `chunking_policy_round_trips`/`materialization_state_and_
     /// pin_round_trip` accessor shape.
     #[test]
@@ -3387,7 +3387,7 @@ mod tests {
         assert!(matches!(err, SyncError::NotFound(_)));
     }
 
-    /// task 1.5: `symlink_target` getter/setter round-trip, including
+    /// `symlink_target` getter/setter round-trip, including
     /// clearing it back to `None`.
     #[test]
     fn symlink_target_round_trips() {
@@ -3407,7 +3407,7 @@ mod tests {
         assert_eq!(state.get_symlink_target("group-1", "link").unwrap(), None);
     }
 
-    /// task 2.4: `symlink_out_of_root` getter/setter round-trip, matching
+    /// `symlink_out_of_root` getter/setter round-trip, matching
     /// `exec_bit`'s existing bool-column accessor shape.
     #[test]
     fn symlink_out_of_root_round_trips() {
@@ -3428,7 +3428,7 @@ mod tests {
         assert!(matches!(err, SyncError::NotFound(_)));
     }
 
-    /// task 1.5: `exec_bit` getter/setter round-trip, matching `is_pinned`/
+    /// `exec_bit` getter/setter round-trip, matching `is_pinned`/
     /// `set_pinned`'s existing bool-column accessor shape.
     #[test]
     fn exec_bit_round_trips() {
@@ -3449,7 +3449,7 @@ mod tests {
         assert!(matches!(err, SyncError::NotFound(_)));
     }
 
-    /// task 1.5: held state round-trips through `set_held`/`get_held_state`
+    /// held state round-trips through `set_held`/`get_held_state`
     /// and clears via `clear_held`, surviving in the index the way design
     /// D3 requires (a held file's state and reason must survive a daemon
     /// restart — modeled here by simply reopening state via `get_held_state`
@@ -3472,7 +3472,7 @@ mod tests {
     }
 
     /// `clear_held` on a file that was never held (or doesn't exist) is a
-    /// deliberate no-op, not an error — design D3's tombstone-clears-held
+    /// deliberate no-op, not an error — 's tombstone-clears-held
     /// -state requirement (task 3.5, a later section) needs to clear held
     /// state unconditionally when applying a tombstone, without first
     /// checking whether the record was ever held.
@@ -3494,7 +3494,7 @@ mod tests {
         assert!(matches!(err, SyncError::NotFound(_)));
     }
 
-    // --- add-file-version-history task 1.6/2.5/4.3 ---
+    // --- File version history ---
 
     fn record_with_size(path: &str, size: u64) -> FileRecord {
         let mut version = VersionVector::new();
@@ -3628,7 +3628,7 @@ mod tests {
         assert_eq!(versions[1].blocks.len(), 1, "the trashed row must retain its block references");
     }
 
-    /// fix-local-edit-swallowed-by-self-echo-race: a tombstone's
+    /// A tombstone's
     /// `mtime_unix_nanos` must reflect the deletion's own observed time,
     /// not the stale mtime carried forward from the file's last live
     /// content (`record_with_size`'s fixed `1000`) — otherwise
@@ -3709,7 +3709,7 @@ mod tests {
         assert!(state.get_version("group-1", "a.txt", 99).unwrap().is_none());
     }
 
-    /// design D2: every new and pre-existing link defaults to 10
+    /// : every new and pre-existing link defaults to 10
     /// versions / 30 days, and the policy round-trips through
     /// `set_retention_policy`.
     #[test]
@@ -3746,7 +3746,7 @@ mod tests {
 
     const ONE_DAY_NANOS: i64 = 86_400 * 1_000_000_000;
 
-    /// design D2's union-retain/intersection-expire rule (task 2.5): a
+    /// 's union-retain/intersection-expire rule (task 2.5): a
     /// version within either bound survives; one exceeding both is swept;
     /// the current row is never a candidate regardless of policy.
     #[test]
@@ -3782,7 +3782,7 @@ mod tests {
     }
 
     /// Either bound set to `0` disables that axis — a version stays
-    /// retained via the other axis's union, matching design D2's
+    /// retained via the other axis's union, matching 's
     /// documented "footgun, not blocked outright" semantics.
     #[test]
     fn expire_treats_a_zero_bound_as_unlimited_on_that_axis() {
@@ -3813,7 +3813,7 @@ mod tests {
         assert_eq!(state.list_versions("group-1", "a.txt").unwrap().len(), 3);
     }
 
-    /// design D5/task 4.1-4.3: the live-block-hash root set includes
+    /// task 4.1-4.3: the live-block-hash root set includes
     /// blocks referenced only by a superseded or trashed version, not just
     /// the current one — the contract a future block-store GC must honor.
     #[test]

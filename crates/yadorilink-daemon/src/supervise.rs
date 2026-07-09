@@ -6,7 +6,7 @@
 //! This module gives every long-lived task two things: (1) a name for
 //! logging, and (2) an explicit policy for what happens when it exits —
 //! restart with backoff, or propagate the exit to whoever's supervising
-//! essential tasks together (`main.rs`'s `JoinSet`, task 2.2/REL-8).
+//! essential tasks together (`main.rs`'s `JoinSet`, REL-8).
 
 use std::future::Future;
 use std::time::Duration;
@@ -30,38 +30,38 @@ impl BackoffConfig {
     pub const RECONNECT: BackoffConfig =
         BackoffConfig { initial: Duration::from_secs(1), max: Duration::from_secs(45) };
 
-    /// add-resource-governance task 3.5: a Degraded (disk-pressure) link's
-    /// periodic free-space re-check schedule — starts at 5s (disk pressure
-    /// can resolve quickly, e.g. a user manually deleting a large file) and
-    /// caps at 5 minutes (a persistently full disk shouldn't be re-checked
-    /// so often it's effectively a hot loop, but still recovers within a
-    /// bounded, documented window once space frees up).
+    /// A Degraded (disk-pressure) link's periodic free-space re-check
+    /// schedule — starts at 5s (disk pressure can resolve quickly, e.g. a
+    /// user manually deleting a large file) and caps at 5 minutes (a
+    /// persistently full disk shouldn't be re-checked so often it's
+    /// effectively a hot loop, but still recovers within a bounded,
+    /// documented window once space frees up).
     pub const DEGRADED_LINK_RECHECK: BackoffConfig =
         BackoffConfig { initial: Duration::from_secs(5), max: Duration::from_secs(300) };
 
-    /// add-automatic-updates task 2.2: steady-state periodic update-check
-    /// interval. `initial == max` reuses `next`'s existing ±25% jitter
-    /// around a fixed point rather than modeling true escalating
-    /// backoff — there's no "failure" being backed off here, just
-    /// spreading many installs' checks so they don't all hit the
-    /// manifest endpoint at the same wall-clock moment.
+    /// Steady-state periodic update-check interval. `initial == max`
+    /// reuses `next`'s existing ±25% jitter around a fixed point rather
+    /// than modeling true escalating backoff — there's no "failure"
+    /// being backed off here, just spreading many installs' checks so
+    /// they don't all hit the manifest endpoint at the same wall-clock
+    /// moment.
     pub const UPDATE_CHECK_INTERVAL: BackoffConfig = BackoffConfig {
         initial: Duration::from_secs(6 * 3600),
         max: Duration::from_secs(6 * 3600),
     };
 
-    /// add-automatic-updates task 2.2: backoff after a *failed* update
-    /// check (manifest fetch/parse/signature error) — retried sooner
-    /// than the steady-state interval above, doubling up to a cap, so a
-    /// transient network blip recovers quickly but a persistently broken
-    /// endpoint doesn't hot-loop against it.
+    /// Backoff after a *failed* update check (manifest fetch/parse/
+    /// signature error) — retried sooner than the steady-state interval
+    /// above, doubling up to a cap, so a transient network blip recovers
+    /// quickly but a persistently broken endpoint doesn't hot-loop
+    /// against it.
     pub const UPDATE_CHECK_RETRY: BackoffConfig =
         BackoffConfig { initial: Duration::from_secs(60), max: Duration::from_secs(3600) };
 
-    /// add-resource-governance task 3.5: made `pub` (was private, used only
-    /// by `spawn_restarting` below) so `daemon_state`'s Degraded-link
-    /// re-check scheduling can reuse this exact doubling+jitter+cap
-    /// schedule instead of a second, independent backoff implementation.
+    /// Made `pub` (was private, used only by `spawn_restarting` below) so
+    /// `daemon_state`'s Degraded-link re-check scheduling can reuse this
+    /// exact doubling+jitter+cap schedule instead of a second, independent
+    /// backoff implementation.
     pub fn next(&self, attempt: u32) -> Duration {
         let scale = 1u64 << attempt.min(20); // avoid overflow on a long-lived task
         let backed_off = self.initial.saturating_mul(scale as u32).min(self.max);
@@ -176,9 +176,9 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
-    /// stabilize-beta-test-suite task 1.1: polls for `attempts` to reach
-    /// `target` instead of sleeping a fixed duration and then asserting a
-    /// threshold. A fixed sleep + count assertion assumes the host
+    /// Polls for `attempts` to reach `target` instead of sleeping a fixed
+    /// duration and then asserting a threshold. A fixed sleep + count
+    /// assertion assumes the host
     /// scheduler gives this task's ~1-5ms backoff loop enough real
     /// wall-clock progress within that fixed window; under heavy
     /// concurrent CPU load (many parallel builds/tests contending for

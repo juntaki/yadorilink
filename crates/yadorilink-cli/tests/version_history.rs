@@ -1,8 +1,7 @@
-//! add-file-version-history task 6.5: `versions`/`restore`/`trash list`/
-//! `trash restore`/`link retention` end-to-end against a real daemon over
-//! the actual control socket — same fixture/`TEST_MUTEX` pattern as
-//! `materialization.rs` (on-demand-sync task 5.5), since these commands
-//! also need no coordination-plane/auth setup.
+//! Tests `versions`/`restore`/`trash list`/`trash restore`/`link
+//! retention` end-to-end against a real daemon over the actual control
+//! socket — same fixture/`TEST_MUTEX` pattern as `materialization.rs`,
+//! since these commands also need no coordination-plane/auth setup.
 //!
 //! `commands::link::link` itself is auth-gated (it resolves a group name
 //! against the coordination plane via `require_access_token`/
@@ -72,7 +71,7 @@ fn record(
     }
 }
 
-/// task 6.1/6.5: `yadorilink versions <path>` succeeds and the underlying
+/// `yadorilink versions <path>` succeeds and the underlying
 /// `ListVersions` response (the exact data the CLI's `version_line`
 /// renders — unit-tested for exact text shape in
 /// `commands::version_history::tests`) is ordered newest first, including
@@ -121,7 +120,7 @@ async fn versions_command_lists_all_retained_versions_newest_first_including_cur
     assert_eq!(list.versions[1].state, "superseded");
 }
 
-/// task 6.2/6.5: `yadorilink restore <path> --version <id>` succeeds and
+/// `yadorilink restore <path> --version <id>` succeeds and
 /// writes the chosen version's content back to disk as a brand-new
 /// current version.
 #[tokio::test]
@@ -170,7 +169,7 @@ async fn restore_command_restores_a_specific_version_as_a_new_current_version() 
     assert_eq!(versions.len(), 3, "restore must add a new version, not rewrite history");
 }
 
-/// task 6.2/6.5: `yadorilink restore <path>` without `--version` defaults
+/// `yadorilink restore <path>` without `--version` defaults
 /// to the most recent superseded version.
 #[tokio::test]
 async fn restore_command_without_version_defaults_to_most_recent_superseded() {
@@ -205,7 +204,7 @@ async fn restore_command_without_version_defaults_to_most_recent_superseded() {
     assert_eq!(std::fs::read(folder.join("todo.txt")).unwrap(), b"first");
 }
 
-/// task 6.2/6.5: the missing-blocks restore failure exits non-zero (via
+/// The missing-blocks restore failure exits non-zero (via
 /// `CliError::Other`'s existing `exit_code()`, the same path every other
 /// daemon-reported failure takes) with a message specifically identifying
 /// unavailable version content, not a generic failure.
@@ -247,7 +246,7 @@ async fn restore_command_fails_clearly_and_exits_non_zero_on_missing_blocks() {
     assert!(!folder.join("phantom.bin").exists(), "a failed restore must not create a file");
 }
 
-/// task 6.3/6.5: `yadorilink trash list` shows a deleted file still within
+/// `yadorilink trash list` shows a deleted file still within
 /// retention, and `yadorilink trash restore <path>` recovers it.
 #[tokio::test]
 async fn trash_list_then_trash_restore_recovers_a_deleted_file() {
@@ -286,7 +285,7 @@ async fn trash_list_then_trash_restore_recovers_a_deleted_file() {
     assert!(!current.deleted, "the file must be live again after trash restore");
 }
 
-/// task 6.4/6.5: `--keep-versions`/`--keep-days` at link time persist —
+/// `--keep-versions`/`--keep-days` at link time persist —
 /// seeded directly over `control_client::send(ReqPayload::Link)`, the same
 /// wire message `commands::link::link` itself sends (see module doc
 /// comment for why `commands::link::link` isn't called directly here).
@@ -316,7 +315,7 @@ async fn link_time_retention_flags_persist() {
     assert_eq!(policy, Some(RetentionPolicy { max_versions: 3, max_age_days: 7 }));
 }
 
-/// task 6.4/6.5: `yadorilink link retention <path> --keep-versions <n>
+/// `yadorilink link retention <path> --keep-versions <n>
 /// --keep-days <t>` adjusts an already-linked folder's policy in place,
 /// reflected immediately via `SyncState` (the same source the retention-
 /// expiry sweep reads on its next pass — no daemon restart needed).
@@ -329,7 +328,7 @@ async fn link_retention_command_persists_an_updated_policy() {
     let local_path = folder.to_string_lossy().to_string();
     state.sync_state.add_link(&local_path, "group-1").unwrap();
 
-    // Defaults (10/30, design D2) before any adjustment.
+    // Defaults (10/30, ) before any adjustment.
     let policy = state.sync_state.retention_policy_for_group("group-1").unwrap();
     assert_eq!(policy, Some(RetentionPolicy::default()));
 
