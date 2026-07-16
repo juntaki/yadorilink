@@ -74,7 +74,7 @@ rand = "0.10.2"
 # `http-coordination` feature above). rustls-tls-webpki-roots to match
 # this workspace's existing rustls-only choice (reqwest above, and
 # yadorilink-reporting's own client) rather than pulling in native-tls.
-tokio-tungstenite = { version = "0.24", optional = true, default-features = false, features = [
+tokio-tungstenite = { version = "0.30", optional = true, default-features = false, features = [
     "connect",
     "rustls-tls-webpki-roots",
 ] }
