@@ -150,6 +150,10 @@ async fn demoting_setup(
 
     let content = b"the file device-a confirms holding";
     let hash = a.state.block_store.put(content).unwrap();
+    a.state
+        .sync_state
+        .record_group_block_provenance(GROUP, &[hex::decode(hash.as_str()).unwrap()])
+        .unwrap();
     b.state.block_store.put(content).unwrap();
     let bytes = hex::decode(hash.as_str()).unwrap();
     let record = record_referencing("only.bin", bytes, content.len() as u64);
@@ -412,6 +416,10 @@ async fn demotion_refused_when_a_target_is_confirmed_but_this_device_has_no_conf
     let b = new_daemon("device-b");
     let content = b"the file device-a confirms holding";
     let hash = a.state.block_store.put(content).unwrap();
+    a.state
+        .sync_state
+        .record_group_block_provenance(GROUP, &[hex::decode(hash.as_str()).unwrap()])
+        .unwrap();
     let bytes = hex::decode(hash.as_str()).unwrap();
     let record = record_referencing("only.bin", bytes, content.len() as u64);
     a.state.sync_state.upsert_file(GROUP, &record).unwrap();

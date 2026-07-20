@@ -106,10 +106,7 @@ fn store_with_checkpoint() -> FakeStore {
     store
 }
 
-fn trust_for<'a>(
-    device_id: &'a str,
-    key: &'a SigningKey,
-) -> impl RebootstrapTrust + 'a {
+fn trust_for<'a>(device_id: &'a str, key: &'a SigningKey) -> impl RebootstrapTrust + 'a {
     let key_bytes = key.verifying_key().to_bytes();
     move |candidate: &str| (candidate == device_id).then_some(key_bytes)
 }
@@ -268,11 +265,8 @@ fn unrelated_current_head_cannot_be_signed_under_checkpoint_history_base() {
 #[test]
 fn checkpoint_for_another_group_cannot_be_signed_for_requested_group() {
     let store = store_with_checkpoint();
-    *store.checkpoint.borrow_mut() = Some(Checkpoint::new(
-        FolderGroupId("other-group".into()),
-        vec![h(2)],
-        [9u8; 32],
-    ));
+    *store.checkpoint.borrow_mut() =
+        Some(Checkpoint::new(FolderGroupId("other-group".into()), vec![h(2)], [9u8; 32]));
     let key = SigningKey::from_bytes(&[4u8; 32]);
 
     let error = prepare_rebootstrap_required(

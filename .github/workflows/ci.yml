@@ -166,7 +166,6 @@ jobs:
           mkdir -p release/linux/bin
           cp target/release/yadorilink \
              target/release/yadorilink-daemon \
-             target/release/yadorilink-relay \
              release/linux/bin/
           tar -C release/linux/bin -czf "release/linux/yadorilink-${version}-linux-${arch}-binaries.tar.gz" .
           python3 scripts/ci/generate-release-checksums.py \
@@ -240,7 +239,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path release/windows/bin | Out-Null
           Copy-Item target/release/yadorilink.exe,
                     target/release/yadorilink-daemon.exe,
-                    target/release/yadorilink-relay.exe,
                     target/release/yadorilink-status-app.exe -Destination release/windows/bin
           Copy-Item shell-ext/windows/target/release/yadorilink_shell_ext.dll,
                     shell-ext/windows/target/release/yadorilink-cfapi-host.exe -Destination release/windows/bin
@@ -396,7 +394,6 @@ jobs:
           mkdir -p release/macos/bin
           cp target/release/yadorilink \
              target/release/yadorilink-daemon \
-             target/release/yadorilink-relay \
              target/release/yadorilink-status-app \
              release/macos/bin/
           cat > release/macos/README.txt <<'EOF'

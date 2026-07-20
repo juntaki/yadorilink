@@ -149,6 +149,16 @@ fn seed_placeholder(
         .unwrap();
     for block in owned_blocks {
         device.state.block_store.put(&data_by_hash[&block.hash]).unwrap();
+        // Mirrors what `LocalChangeProcessor` does for a real local edit
+        // (`record_group_block_provenance`'s doc comment): without this,
+        // hydration's `resolve_blocks_local_first` refuses this block as
+        // never having been obtained through the group, even though the
+        // bytes are physically present.
+        device
+            .state
+            .sync_state
+            .record_group_block_provenance(GROUP, &[block.hash.clone()])
+            .unwrap();
     }
 }
 

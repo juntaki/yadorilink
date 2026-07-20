@@ -195,12 +195,23 @@ struct Device {
     session: OnceLock<Arc<PeerSyncSession>>,
 }
 
-fn setup_device(device_id: &str, root: PathBuf, state: Arc<SyncState>, store: Arc<FsBlockStore>) -> Arc<Device> {
+fn setup_device(
+    device_id: &str,
+    root: PathBuf,
+    state: Arc<SyncState>,
+    store: Arc<FsBlockStore>,
+) -> Arc<Device> {
     let processor = Arc::new(
         LocalChangeProcessor::new(state.clone(), store, device_id.to_string())
             .with_change_emitter(dst_dag_migrate_b2::emitter_for(device_id)),
     );
-    Arc::new(Device { device_id: device_id.to_string(), root, state, processor, session: OnceLock::new() })
+    Arc::new(Device {
+        device_id: device_id.to_string(),
+        root,
+        state,
+        processor,
+        session: OnceLock::new(),
+    })
 }
 
 fn gen_keypair(rng: &mut StdRng) -> (StaticSecret, PublicKey) {
@@ -502,8 +513,7 @@ fn stem_of(path: &str) -> &str {
 }
 
 fn run_in_madsim(seed: u64) -> Result<(), String> {
-    let mut rt =
-        madsim::runtime::Runtime::with_seed_and_config(seed, madsim::Config::default());
+    let mut rt = madsim::runtime::Runtime::with_seed_and_config(seed, madsim::Config::default());
     // Comfortable margin over the cycles' own windows plus
     // FINAL_CONVERGENCE_BUDGET.
     rt.set_time_limit(Duration::from_secs(240));

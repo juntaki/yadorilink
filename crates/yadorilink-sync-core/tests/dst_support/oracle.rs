@@ -416,10 +416,7 @@ impl GlobalOracle {
                     continue; // device-local identity marker, not a synced write
                 }
                 if matches!(
-                    state.get_materialization_state(
-                        group_id,
-                        &file_name.to_string_lossy()
-                    ),
+                    state.get_materialization_state(group_id, &file_name.to_string_lossy()),
                     Ok(Some(MaterializationState::Placeholder))
                 ) {
                     continue;
@@ -1287,7 +1284,8 @@ mod tests {
         table.insert(1, b"hello".to_vec());
 
         let oracle = GlobalOracle::new();
-        let violations = oracle.check_no_corruption(&table, &[(root_a.path(), &state_a)], group_id());
+        let violations =
+            oracle.check_no_corruption(&table, &[(root_a.path(), &state_a)], group_id());
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].kind, ViolationKind::Corruption);
     }
@@ -1301,7 +1299,8 @@ mod tests {
         table.insert(1, b"hello".to_vec());
 
         let oracle = GlobalOracle::new();
-        let violations = oracle.check_no_corruption(&table, &[(root_a.path(), &state_a)], group_id());
+        let violations =
+            oracle.check_no_corruption(&table, &[(root_a.path(), &state_a)], group_id());
         assert!(violations.is_empty(), "{violations:?}");
     }
 

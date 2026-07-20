@@ -723,22 +723,19 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
     let store_dir_a = tempfile::tempdir().map_err(|e| e.to_string())?;
     let store_a = Arc::new(FsBlockStore::new(store_dir_a.path()).map_err(|e| e.to_string())?);
     let state_a = Arc::new(SyncState::open_in_memory().map_err(|e| e.to_string())?);
-    dst_support::link::link_and_start(&state_a, &root_a, GROUP_ID)
-        .map_err(|e| e.to_string())?;
+    dst_support::link::link_and_start(&state_a, &root_a, GROUP_ID).map_err(|e| e.to_string())?;
     let root_dir_b = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_b = root_dir_b.path().canonicalize().map_err(|e| e.to_string())?;
     let store_dir_b = tempfile::tempdir().map_err(|e| e.to_string())?;
     let store_b = Arc::new(FsBlockStore::new(store_dir_b.path()).map_err(|e| e.to_string())?);
     let state_b = Arc::new(SyncState::open_in_memory().map_err(|e| e.to_string())?);
-    dst_support::link::link_and_start(&state_b, &root_b, GROUP_ID)
-        .map_err(|e| e.to_string())?;
+    dst_support::link::link_and_start(&state_b, &root_b, GROUP_ID).map_err(|e| e.to_string())?;
     let root_dir_c = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_c = root_dir_c.path().canonicalize().map_err(|e| e.to_string())?;
     let store_dir_c = tempfile::tempdir().map_err(|e| e.to_string())?;
     let store_c = Arc::new(FsBlockStore::new(store_dir_c.path()).map_err(|e| e.to_string())?);
     let state_c = Arc::new(SyncState::open_in_memory().map_err(|e| e.to_string())?);
-    dst_support::link::link_and_start(&state_c, &root_c, GROUP_ID)
-        .map_err(|e| e.to_string())?;
+    dst_support::link::link_and_start(&state_c, &root_c, GROUP_ID).map_err(|e| e.to_string())?;
     // Per-device change-signing keys; every session pins all three verifying
     // keys so any device's signed change authenticates on arrival.
     let key_a = device_signing_key(0x11);
@@ -752,16 +749,28 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
         ]),
     });
 
-    let device_a = setup_device("device-a", root_a.clone(), state_a.clone(), store_a.clone(), key_a);
-    let device_b = setup_device("device-b", root_b.clone(), state_b.clone(), store_b.clone(), key_b);
-    let device_c = setup_device("device-c", root_c.clone(), state_c.clone(), store_c.clone(), key_c);
+    let device_a =
+        setup_device("device-a", root_a.clone(), state_a.clone(), store_a.clone(), key_a);
+    let device_b =
+        setup_device("device-b", root_b.clone(), state_b.clone(), store_b.clone(), key_b);
+    let device_c =
+        setup_device("device-c", root_c.clone(), state_c.clone(), store_c.clone(), key_c);
     let recovery_store_a = store_a.clone();
     let recovery_store_b = store_b.clone();
     let recovery_store_c = store_c.clone();
 
     connect_mesh(
-        &mut rng, &device_a, state_a, store_a, &device_b, state_b, store_b, &device_c, state_c,
-        store_c, authenticator,
+        &mut rng,
+        &device_a,
+        state_a,
+        store_a,
+        &device_b,
+        state_b,
+        store_b,
+        &device_c,
+        state_c,
+        store_c,
+        authenticator,
     )
     .await;
 

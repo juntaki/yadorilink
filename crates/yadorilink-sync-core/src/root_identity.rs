@@ -393,29 +393,29 @@ pub fn indexed_path_is_corroborated(
     };
     let kind = state.get_record_kind(group_id, &record.path)?.unwrap_or_default();
     Ok(match kind {
-            RecordKind::Directory => metadata.file_type().is_dir(),
-            RecordKind::Symlink => {
-                metadata.file_type().is_symlink()
-                    && std::fs::read_link(&disk_path)
-                        .ok()
-                        .map(|target| target.to_string_lossy().to_string())
-                        == state.get_symlink_target(group_id, &record.path)?
-            }
-            RecordKind::File => {
-                if !metadata.file_type().is_file() {
-                    false
-                } else {
-                    match state.get_materialization_state(group_id, &record.path)? {
-                        Some(MaterializationState::Placeholder) => metadata.len() == record.size,
-                        Some(MaterializationState::Hydrating)
-                        | Some(MaterializationState::Evicting) => false,
-                        _ => {
-                            metadata.len() == record.size
-                                && disk_bytes_match_indexed_blocks(&disk_path, &record.blocks)?
-                        }
+        RecordKind::Directory => metadata.file_type().is_dir(),
+        RecordKind::Symlink => {
+            metadata.file_type().is_symlink()
+                && std::fs::read_link(&disk_path)
+                    .ok()
+                    .map(|target| target.to_string_lossy().to_string())
+                    == state.get_symlink_target(group_id, &record.path)?
+        }
+        RecordKind::File => {
+            if !metadata.file_type().is_file() {
+                false
+            } else {
+                match state.get_materialization_state(group_id, &record.path)? {
+                    Some(MaterializationState::Placeholder) => metadata.len() == record.size,
+                    Some(MaterializationState::Hydrating)
+                    | Some(MaterializationState::Evicting) => false,
+                    _ => {
+                        metadata.len() == record.size
+                            && disk_bytes_match_indexed_blocks(&disk_path, &record.blocks)?
                     }
                 }
             }
+        }
     })
 }
 

@@ -72,10 +72,8 @@ impl ChangeAuthenticator for PinnedKeysAuthenticator {
 /// `(device_id, signing_key)` pair's verifying key. Wire this onto both sides of
 /// a DAG session so each admits the other's signed changes.
 pub fn pinned_authenticator(pairs: &[(&str, &SigningKey)]) -> Arc<dyn ChangeAuthenticator> {
-    let keys = pairs
-        .iter()
-        .map(|(id, key)| (id.to_string(), key.verifying_key().to_bytes()))
-        .collect();
+    let keys =
+        pairs.iter().map(|(id, key)| (id.to_string(), key.verifying_key().to_bytes())).collect();
     Arc::new(PinnedKeysAuthenticator { keys })
 }
 

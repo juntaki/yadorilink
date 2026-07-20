@@ -1087,8 +1087,7 @@ fn prepare_ambiguity_recovery(
         return Ok(None);
     }
 
-    let survivors: Vec<String> =
-        live_paths.into_iter().filter(|path| path != local_path).collect();
+    let survivors: Vec<String> = live_paths.into_iter().filter(|path| path != local_path).collect();
 
     state.sync_state.arm_duplicate_recovery_paths(&group_id)?;
     for survivor in &survivors {
@@ -1539,7 +1538,9 @@ async fn ensure_unlink_keeps_a_full_replica(
     let Some(link) = state
         .sync_state
         .list_links()
-        .map_err(|e| format!("refusing to unlink because the local link table could not be read: {e}"))?
+        .map_err(|e| {
+            format!("refusing to unlink because the local link table could not be read: {e}")
+        })?
         .into_iter()
         .find(|l| l.local_path == local_path)
     else {
@@ -1869,12 +1870,7 @@ async fn full_replica_handoff_not_ready_excluding(
     excluded_device_id: &str,
 ) -> Result<Vec<String>, yadorilink_sync_core::SyncError> {
     let candidate_groups: Vec<String> = if group_id.is_empty() {
-        state
-            .sync_state
-            .list_links()?
-            .into_iter()
-            .map(|l| l.group_id)
-            .collect()
+        state.sync_state.list_links()?.into_iter().map(|l| l.group_id).collect()
     } else {
         vec![group_id.to_string()]
     };

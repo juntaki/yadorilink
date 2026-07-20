@@ -7826,9 +7826,9 @@ mod tests {
         let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert!(table_exists(&conn, "group_block_provenance").unwrap());
-        let provenance_rows: i64 =
-            conn.query_row("SELECT COUNT(*) FROM group_block_provenance", [], |row| row.get(0))
-                .unwrap();
+        let provenance_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM group_block_provenance", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(
             provenance_rows, 0,
             "v4 metadata must not be treated as proof that block bytes came through a group"

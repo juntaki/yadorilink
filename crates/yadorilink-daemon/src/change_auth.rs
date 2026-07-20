@@ -360,7 +360,8 @@ mod tests {
         let cache: Mutex<HashMap<String, bool>> = Mutex::new(HashMap::new());
         cache.lock().unwrap().insert("group-x".to_string(), false);
 
-        let result = NetmapChangeAuthenticator::effective_servable_groups(state, &raw_groups, &cache);
+        let result =
+            NetmapChangeAuthenticator::effective_servable_groups(state, &raw_groups, &cache);
         assert!(result.is_empty());
     }
 

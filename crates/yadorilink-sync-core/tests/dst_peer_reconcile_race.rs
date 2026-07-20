@@ -253,8 +253,9 @@ fn setup_device_a(root: PathBuf, sync_state: Arc<SyncState>, store: Arc<FsBlockS
     // The wired emitter makes every local edit (baseline + the racing edit,
     // once force-flushed) a signed DAG change on this device.
     let processor = Arc::new(
-        LocalChangeProcessor::new(sync_state, store, "device-a".to_string())
-            .with_change_emitter(Arc::new(ChangeEmitter::new("device-a", device_signing_key("device-a")))),
+        LocalChangeProcessor::new(sync_state, store, "device-a".to_string()).with_change_emitter(
+            Arc::new(ChangeEmitter::new("device-a", device_signing_key("device-a"))),
+        ),
     );
     let (flush_request_tx, flush_request_rx) = tokio::sync::mpsc::channel(4);
     let sim = Arc::new(SimDevice {
@@ -424,15 +425,13 @@ async fn run_scenario(seed: u64, guard_enabled: bool, b_edit: BEdit) -> Result<(
     let store_dir_a = tempfile::tempdir().map_err(|e| e.to_string())?;
     let store_a = Arc::new(FsBlockStore::new(store_dir_a.path()).map_err(|e| e.to_string())?);
     let state_a = Arc::new(SyncState::open_in_memory().map_err(|e| e.to_string())?);
-    dst_support::link::link_and_start(&state_a, &root_a, GROUP_ID)
-        .map_err(|e| e.to_string())?;
+    dst_support::link::link_and_start(&state_a, &root_a, GROUP_ID).map_err(|e| e.to_string())?;
     let root_dir_b = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_b = root_dir_b.path().canonicalize().map_err(|e| e.to_string())?;
     let store_dir_b = tempfile::tempdir().map_err(|e| e.to_string())?;
     let store_b = Arc::new(FsBlockStore::new(store_dir_b.path()).map_err(|e| e.to_string())?);
     let state_b = Arc::new(SyncState::open_in_memory().map_err(|e| e.to_string())?);
-    dst_support::link::link_and_start(&state_b, &root_b, GROUP_ID)
-        .map_err(|e| e.to_string())?;
+    dst_support::link::link_and_start(&state_b, &root_b, GROUP_ID).map_err(|e| e.to_string())?;
     // Baseline: A creates the file locally (real chunking/indexing via
     // process_event, not fabricated), establishing version {device-a: 1}.
     let device_a = setup_device_a(root_a.clone(), state_a.clone(), store_a.clone());
@@ -608,8 +607,12 @@ async fn device_b_process_event(
     root_b: &Path,
     kind: FsChangeKind,
 ) -> Result<LocalChangeOutcome, String> {
-    let processor = LocalChangeProcessor::new(state_b.clone(), store_b.clone(), "device-b".to_string())
-        .with_change_emitter(Arc::new(ChangeEmitter::new("device-b", device_signing_key("device-b"))));
+    let processor =
+        LocalChangeProcessor::new(state_b.clone(), store_b.clone(), "device-b".to_string())
+            .with_change_emitter(Arc::new(ChangeEmitter::new(
+                "device-b",
+                device_signing_key("device-b"),
+            )));
     processor
         .process_event(GROUP_ID, root_b, &FsChangeEvent { path: root_b.join(RACE_PATH), kind })
         .await

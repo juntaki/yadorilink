@@ -212,8 +212,7 @@ impl Device {
         let store_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
         let store = Arc::new(FsBlockStore::new(store_dir.path()).map_err(|e| e.to_string())?);
         let state = Arc::new(SyncState::open_in_memory().map_err(|e| e.to_string())?);
-        dst_support::link::link_and_start(&state, &root, GROUP_ID)
-            .map_err(|e| e.to_string())?;
+        dst_support::link::link_and_start(&state, &root, GROUP_ID).map_err(|e| e.to_string())?;
         Ok((
             Self { id: id.to_string(), root, state, store, session: std::sync::OnceLock::new() },
             root_dir,

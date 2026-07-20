@@ -886,9 +886,7 @@ fn start_link_watch_inner(
                         }
                     }
                     let recovery_complete = matches!(
-                        executor_state
-                            .sync_state
-                            .duplicate_recovery_pending(&executor_group_id),
+                        executor_state.sync_state.duplicate_recovery_pending(&executor_group_id),
                         Ok(false)
                     );
                     if recovery_complete {
@@ -927,9 +925,8 @@ fn start_link_watch_inner(
                                 error = %error,
                                 "post-scan change-history bootstrap failed; group startup remains closed"
                             );
-                            history_failure = Some(format!(
-                                "post-scan change-history bootstrap failed: {error}"
-                            ));
+                            history_failure =
+                                Some(format!("post-scan change-history bootstrap failed: {error}"));
                         }
                     }
                     // One batched broadcast for the whole initial scan
@@ -1466,7 +1463,10 @@ pub async fn run_disk_reconcile_backstop_sweep(state: &Arc<DaemonState>) {
 fn link_should_propagate(state: &DaemonState, local_path: &str, group_id: &str) -> bool {
     match state.sync_state.link_gate_for_group(group_id) {
         Ok(yadorilink_sync_core::index::LinkGate::Live { local_path: live_path, .. })
-            if live_path == local_path => true,
+            if live_path == local_path =>
+        {
+            true
+        }
         Ok(_) => false,
         Err(e) => {
             tracing::warn!(
@@ -1929,18 +1929,19 @@ mod tests {
         // this branch just restored). This test is about tombstone-
         // suppression/duplicate-recovery scan behavior, not policy
         // resolution, so bypass it the same way `index.rs`'s own tests do.
-        state
-            .sync_state
-            .set_local_change_auth_provider(std::sync::Arc::new(|_group_id| {
-                Ok(yadorilink_sync_core::change::ChangeAuth::PLACEHOLDER)
-            }));
+        state.sync_state.set_local_change_auth_provider(std::sync::Arc::new(|_group_id| {
+            Ok(yadorilink_sync_core::change::ChangeAuth::PLACEHOLDER)
+        }));
         // The survivor's own file, indexed and present: that is what corroborates
         // the root, so the root-identity check adopts rather than refusing it as
         // a possible bare mountpoint. Without it this test would never reach the
         // tombstone decision it is about. Must actually match the bytes just
         // written above — `sample_record`'s placeholder size/blocks would not
         // corroborate and `VerifiedRoot::open` below would refuse.
-        state.sync_state.upsert_file(group, &record_matching_disk_content("in-a.txt", b"aaa")).unwrap();
+        state
+            .sync_state
+            .upsert_file(group, &record_matching_disk_content("in-a.txt", b"aaa"))
+            .unwrap();
         yadorilink_sync_core::root_identity::VerifiedRoot::open(
             root.path(),
             group,

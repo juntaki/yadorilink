@@ -28,29 +28,29 @@ use std::path::PathBuf;
 /// half-migrated tree is never falsely failed.
 const MIGRATED_FILES: &[&str] = &[
     // Added by as each migration lands.
-    "dst_two_device_chaos.rs",           //
-    "dst_network_fault_chaos.rs",        //
-    "dst_directory_chaos.rs",            //
-    "dst_three_device_mesh_chaos.rs",    // (full clock/settle/sweep migration)
-    "dst_disk_crash_chaos.rs",           // (settle-only migration; see note)
-                                         // `dst_intermittent_catchup_chaos.rs` was listed here for its
-                                         // partition->FaultPlan swap and self-healing sweep hook, with an approved
-                                         // exception for its fine-grained per-op mtime `stamp` fork. It was deleted
-                                         // along with the legacy mtime index-convergence engine: every mutation it
-                                         // published crossed the wire via `PeerSyncSession::send_index_update`, which
-                                         // went with that engine, so the file could not compile, let alone run. Its
-                                         // properties were re-homed rather than dropped -- see the accounting in
-                                         // `dst_dag_catchup_chaos.rs`'s module doc. Nothing to guard, so no entry
-                                         // here; the `stamp` exception died with the file.
-                                         //
-                                         // `dst_disk_crash_chaos.rs` is a deliberate settle-only
-                                         // migration: its `repair_interrupted_materializations` calls are the
-                                         // subject under test and it deliberately does not tie-break on mtime, so it
-                                         // does not adopt `fs_ops`/`HarnessClock`/`run_self_healing`. It is listed
-                                         // here because it carries none of the banned forks and the ratchet should
-                                         // still hold it to that; `dst_materialization_crash_recovery.rs` (7.2's
-                                         // other file) is a genuine no-op with no seams and is intentionally not
-                                         // listed (nothing to guard).
+    "dst_two_device_chaos.rs",        //
+    "dst_network_fault_chaos.rs",     //
+    "dst_directory_chaos.rs",         //
+    "dst_three_device_mesh_chaos.rs", // (full clock/settle/sweep migration)
+    "dst_disk_crash_chaos.rs",        // (settle-only migration; see note)
+                                      // `dst_intermittent_catchup_chaos.rs` was listed here for its
+                                      // partition->FaultPlan swap and self-healing sweep hook, with an approved
+                                      // exception for its fine-grained per-op mtime `stamp` fork. It was deleted
+                                      // along with the legacy mtime index-convergence engine: every mutation it
+                                      // published crossed the wire via `PeerSyncSession::send_index_update`, which
+                                      // went with that engine, so the file could not compile, let alone run. Its
+                                      // properties were re-homed rather than dropped -- see the accounting in
+                                      // `dst_dag_catchup_chaos.rs`'s module doc. Nothing to guard, so no entry
+                                      // here; the `stamp` exception died with the file.
+                                      //
+                                      // `dst_disk_crash_chaos.rs` is a deliberate settle-only
+                                      // migration: its `repair_interrupted_materializations` calls are the
+                                      // subject under test and it deliberately does not tie-break on mtime, so it
+                                      // does not adopt `fs_ops`/`HarnessClock`/`run_self_healing`. It is listed
+                                      // here because it carries none of the banned forks and the ratchet should
+                                      // still hold it to that; `dst_materialization_crash_recovery.rs` (7.2's
+                                      // other file) is a genuine no-op with no seams and is intentionally not
+                                      // listed (nothing to guard).
 ];
 
 /// A banned pattern plus the shared replacement a reviewer should reach for

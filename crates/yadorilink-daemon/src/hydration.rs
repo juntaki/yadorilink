@@ -763,8 +763,7 @@ fn preflight_disk_pressure(
         {
             match tokio::runtime::Handle::try_current() {
                 Ok(handle)
-                    if handle.runtime_flavor()
-                        == tokio::runtime::RuntimeFlavor::MultiThread =>
+                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
                 {
                     tokio::task::block_in_place(run_sweep);
                 }

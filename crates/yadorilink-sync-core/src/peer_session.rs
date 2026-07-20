@@ -1393,7 +1393,8 @@ pub struct PeerSyncSession {
     /// Correlates outstanding `RebootstrapSnapshotRequest`s to the oneshot
     /// `request_rebootstrap_snapshot_from_peer` awaits: request_id ->
     /// reply sender. Mirrors `pending_handoff_lease` exactly.
-    pending_rebootstrap_snapshot: StdMutex<HashMap<u64, oneshot::Sender<Option<PreparedRebootstrap>>>>,
+    pending_rebootstrap_snapshot:
+        StdMutex<HashMap<u64, oneshot::Sender<Option<PreparedRebootstrap>>>>,
     /// Monotonic id used to correlate a `RebootstrapSnapshotRequest` with
     /// its reply.
     next_rebootstrap_snapshot_request_id: std::sync::atomic::AtomicU64,
@@ -7886,9 +7887,7 @@ mod promoted_orphan_projection_tests {
         assert!(state.dag_has_change(&parent.compute_hash()).unwrap());
         assert!(!state.dag_has_change(&rejected.compute_hash()).unwrap());
         assert!(!state.dag_has_file_version(GROUP, &poisoned_version.version_hash).unwrap());
-        assert!(!state
-            .dag_group_file_version_references_block(GROUP, &block_hash)
-            .unwrap());
+        assert!(!state.dag_group_file_version_references_block(GROUP, &block_hash).unwrap());
     }
 
     #[tokio::test]
@@ -9521,7 +9520,10 @@ mod rebootstrap_wire_tests {
             Ok(self.0.clone())
         }
 
-        fn verify_rebootstrap(&self, _required: &RebootstrapRequired) -> Result<(), crate::SyncError> {
+        fn verify_rebootstrap(
+            &self,
+            _required: &RebootstrapRequired,
+        ) -> Result<(), crate::SyncError> {
             Ok(())
         }
 

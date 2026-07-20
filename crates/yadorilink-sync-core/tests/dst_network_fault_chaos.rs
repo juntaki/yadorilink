@@ -629,15 +629,13 @@ async fn run_scenario(
     let store_dir_a = tempfile::tempdir().map_err(|e| e.to_string())?;
     let store_a = Arc::new(FsBlockStore::new(store_dir_a.path()).map_err(|e| e.to_string())?);
     let state_a = Arc::new(SyncState::open_in_memory().map_err(|e| e.to_string())?);
-    dst_support::link::link_and_start(&state_a, &root_a, GROUP_ID)
-        .map_err(|e| e.to_string())?;
+    dst_support::link::link_and_start(&state_a, &root_a, GROUP_ID).map_err(|e| e.to_string())?;
     let root_dir_b = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_b = root_dir_b.path().canonicalize().map_err(|e| e.to_string())?;
     let store_dir_b = tempfile::tempdir().map_err(|e| e.to_string())?;
     let store_b = Arc::new(FsBlockStore::new(store_dir_b.path()).map_err(|e| e.to_string())?);
     let state_b = Arc::new(SyncState::open_in_memory().map_err(|e| e.to_string())?);
-    dst_support::link::link_and_start(&state_b, &root_b, GROUP_ID)
-        .map_err(|e| e.to_string())?;
+    dst_support::link::link_and_start(&state_b, &root_b, GROUP_ID).map_err(|e| e.to_string())?;
     let device_a = setup_device("device-a", root_a.clone(), state_a.clone(), store_a.clone());
     let device_b = setup_device("device-b", root_b.clone(), state_b.clone(), store_b.clone());
     // PF (fidelity/artifact-reduction) F.2, agmsg investigation 2026-07-09:

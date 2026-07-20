@@ -2469,10 +2469,7 @@ async fn eager_materialize_leaves_placeholder_when_peer_cannot_supply_a_block() 
     device_a.store.put(content.as_slice()).unwrap();
     // See the identical comment in
     // `block_request_is_refused_after_mid_session_group_revocation` above.
-    device_a
-        .state
-        .record_group_block_provenance(GROUP, std::slice::from_ref(&block_hash))
-        .unwrap();
+    device_a.state.record_group_block_provenance(GROUP, std::slice::from_ref(&block_hash)).unwrap();
     session_b.hydrate_file(GROUP, "loser.bin").await.unwrap();
     let out = device_b.root_path().join("loser.bin");
     assert_eq!(

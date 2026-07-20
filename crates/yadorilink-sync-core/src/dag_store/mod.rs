@@ -46,12 +46,12 @@ pub use retained_history_integrity::{
     get_encoded, group_history_paths, has_all_parents, has_change, is_ancestor, lamport_of,
     list_unapplied, mark_applied, parents_of,
 };
+pub(crate) use serving_authorization_index::sweep_unreferenced_file_versions;
 pub use serving_authorization_index::{
     get_file_version, group_file_version_references_block, group_has_block_provenance,
     has_file_version, put_file_version, record_compacted_file_version_authorization,
     record_group_block_provenance,
 };
-pub(crate) use serving_authorization_index::sweep_unreferenced_file_versions;
 
 use rusqlite::Connection;
 

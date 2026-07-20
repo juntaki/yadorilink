@@ -178,6 +178,11 @@ async fn exclude_target_readiness_false_when_only_ready_replica_is_the_excluded_
     let content = b"file only device-a holds";
     let hash = a.state.block_store.put(content).unwrap();
     let bytes = hex::decode(hash.as_str()).unwrap();
+    // Mirrors what `LocalChangeProcessor` does for a real local edit
+    // (`record_group_block_provenance`'s doc comment): without this, the
+    // real peer-to-peer readiness confirmation this file exercises refuses
+    // the block as never having been obtained through the group.
+    a.state.sync_state.record_group_block_provenance(GROUP, &[bytes.clone()]).unwrap();
     let record = record_referencing("held.bin", bytes, content.len() as u64);
     a.state.sync_state.upsert_file(GROUP, &record).unwrap();
     b.state.sync_state.upsert_file(GROUP, &record).unwrap();
@@ -215,8 +220,11 @@ async fn exclude_target_readiness_true_when_a_different_replica_is_ready() {
     }
     // Give device-a and device-c the actual block too, since each must
     // independently confirm holding it when queried.
+    let block_hash = record.blocks[0].hash.clone();
     a.state.block_store.put(content).unwrap();
+    a.state.sync_state.record_group_block_provenance(GROUP, &[block_hash.clone()]).unwrap();
     c.state.block_store.put(content).unwrap();
+    c.state.sync_state.record_group_block_provenance(GROUP, &[block_hash]).unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
     connect_two_daemons(&c.state, "device-c", &b.state, "device-b", &[GROUP.to_string()]).await;
@@ -260,6 +268,11 @@ async fn unlink_setup(
     let hash = a.state.block_store.put(content).unwrap();
     b.state.block_store.put(content).unwrap();
     let bytes = hex::decode(hash.as_str()).unwrap();
+    // Mirrors what `LocalChangeProcessor` does for a real local edit
+    // (`record_group_block_provenance`'s doc comment): without this, the
+    // real peer-to-peer readiness confirmation this file exercises refuses
+    // the block as never having been obtained through the group.
+    a.state.sync_state.record_group_block_provenance(GROUP, &[bytes.clone()]).unwrap();
     let record = record_referencing("only.bin", bytes, content.len() as u64);
     a.state.sync_state.upsert_file(GROUP, &record).unwrap();
     b.state.sync_state.upsert_file(GROUP, &record).unwrap();

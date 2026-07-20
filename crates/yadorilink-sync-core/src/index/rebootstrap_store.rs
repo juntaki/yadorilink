@@ -11,8 +11,8 @@ use rusqlite::{params, OptionalExtension};
 
 use super::*;
 use crate::change::{Change, ChangeHash, FileVersion, Op, SyncPath, VersionHash};
-use crate::dag_store::ChangeEmitter;
 use crate::compaction::{Checkpoint, CheckpointHash, PrunePlan};
+use crate::dag_store::ChangeEmitter;
 use crate::rebootstrap::{HistoryBase, SnapshotManifest};
 use crate::rebootstrap_snapshot::{
     BoundaryParentAuth, RebootstrapSnapshot, SnapshotFile, SnapshotVersionState,
@@ -258,13 +258,14 @@ impl SyncState {
             }
             for op in &change.ops {
                 if let Some(version_hash) = op_version_hash(op) {
-                    let version = crate::dag_store::get_file_version(&conn, group_id, &version_hash)?
-                        .ok_or_else(|| {
-                            SyncError::CorruptState(format!(
-                                "checkpoint frontier references missing file version {}",
-                                hex::encode(version_hash.0)
-                            ))
-                        })?;
+                    let version =
+                        crate::dag_store::get_file_version(&conn, group_id, &version_hash)?
+                            .ok_or_else(|| {
+                                SyncError::CorruptState(format!(
+                                    "checkpoint frontier references missing file version {}",
+                                    hex::encode(version_hash.0)
+                                ))
+                            })?;
                     versions.entry(version_hash).or_insert_with(|| version.canonical_encoding());
                 }
             }
@@ -397,14 +398,16 @@ impl SyncState {
             ));
         }
         let group_id_owned = manifest.group_id.as_str().to_string();
-        let local_auth = local_emitter.map(|_| self.local_emission_auth(&group_id_owned)).transpose()?;
+        let local_auth =
+            local_emitter.map(|_| self.local_emission_auth(&group_id_owned)).transpose()?;
 
         retry_on_database_locked(|| {
             let mut conn = self.pool.get()?;
             init_rebootstrap_schema(&conn)?;
             let tx = new_immediate_write_transaction(&mut conn)?;
             let group_id = manifest.group_id.as_str();
-            let frontier: HashSet<ChangeHash> = manifest.checkpoint.frontier.iter().copied().collect();
+            let frontier: HashSet<ChangeHash> =
+                manifest.checkpoint.frontier.iter().copied().collect();
 
             // Rollback/fork protection: an independently-valid manifest for
             // this group (a replayed response, an out-of-order delivery, a
@@ -438,8 +441,8 @@ impl SyncState {
                 .optional()?;
             if let Some(current_checkpoint_hash) = &current_checkpoint_hash {
                 let incoming_checkpoint_hash = manifest.checkpoint.checkpoint_hash();
-                let is_idempotent_reinstall = current_checkpoint_hash.as_slice()
-                    == &incoming_checkpoint_hash.0[..];
+                let is_idempotent_reinstall =
+                    current_checkpoint_hash.as_slice() == &incoming_checkpoint_hash.0[..];
                 let is_direct_advance = manifest
                     .previous_checkpoint_hash
                     .is_some_and(|hash| hash[..] == current_checkpoint_hash[..]);
@@ -499,14 +502,8 @@ impl SyncState {
                     tx.execute("DELETE FROM changes WHERE change_hash = ?1", [&hash.0[..]])?;
                 }
             }
-            tx.execute(
-                "DELETE FROM orphan_changes WHERE group_id = ?1",
-                [group_id],
-            )?;
-            tx.execute(
-                "DELETE FROM device_frontier WHERE group_id = ?1",
-                [group_id],
-            )?;
+            tx.execute("DELETE FROM orphan_changes WHERE group_id = ?1", [group_id])?;
+            tx.execute("DELETE FROM device_frontier WHERE group_id = ?1", [group_id])?;
 
             // The checkpoint insert trigger normally opens a prune context. An
             // install is a base replacement, not evidence that every discarded
@@ -547,9 +544,8 @@ impl SyncState {
                 let emitter = local_emitter.expect(
                     "checked above: offline_branches is non-empty only when local_emitter is Some",
                 );
-                let auth = local_auth.expect(
-                    "checked above: local_auth is Some whenever local_emitter is Some",
-                );
+                let auth = local_auth
+                    .expect("checked above: local_auth is Some whenever local_emitter is Some");
                 let ops = squash_offline_ops(&branch.chain);
                 if ops.is_empty() {
                     continue;
@@ -664,13 +660,14 @@ fn read_snapshot_files(conn: &Connection, group_id: &str) -> Result<Vec<Snapshot
     let rows = stmt.query_map([group_id], |row| {
         let version_json: String = row.get(3)?;
         let blocks_json: String = row.get(4)?;
-        let counters: BTreeMap<String, u64> = serde_json::from_str(&version_json).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                3,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?;
+        let counters: BTreeMap<String, u64> =
+            serde_json::from_str(&version_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
         let blocks: Vec<BlockInfo> = serde_json::from_str(&blocks_json).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
                 4,
@@ -761,13 +758,12 @@ fn replace_group_files_from_snapshot(
     for file in files {
         let version_json = serde_json::to_string(file.record.version.counters())?;
         let blocks_json = serde_json::to_string(&file.record.blocks)?;
-        let materialization_state = if file.state == SnapshotVersionState::Current
-            && !file.record.deleted
-        {
-            "placeholder"
-        } else {
-            "hydrated"
-        };
+        let materialization_state =
+            if file.state == SnapshotVersionState::Current && !file.record.deleted {
+                "placeholder"
+            } else {
+                "hydrated"
+            };
         conn.execute(
             "INSERT INTO files \
              (group_id, path, size, mtime_unix_nanos, version_json, blocks_json, deleted, \
@@ -823,7 +819,8 @@ fn retained_descendants_reaching_frontier(
     boundary_parents: &HashSet<ChangeHash>,
 ) -> Result<FrontierReachability, SyncError> {
     let rows: Vec<(Vec<u8>, Vec<u8>)> = {
-        let mut stmt = conn.prepare("SELECT change_hash, encoded FROM changes WHERE group_id = ?1")?;
+        let mut stmt =
+            conn.prepare("SELECT change_hash, encoded FROM changes WHERE group_id = ?1")?;
         let rows = stmt.query_map([group_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<_, _>>()?
     };
@@ -866,9 +863,7 @@ fn retained_descendants_reaching_frontier(
             return false;
         }
         let result = changes.get(&hash).is_some_and(|change| {
-            change.parents.iter().any(|parent| {
-                reaches(*parent, frontier, changes, memo, visiting)
-            })
+            change.parents.iter().any(|parent| reaches(*parent, frontier, changes, memo, visiting))
         });
         visiting.remove(&hash);
         memo.insert(hash, result);
@@ -898,9 +893,7 @@ fn retained_descendants_reaching_frontier(
         }
         if let Some(change) = changes.get(&hash) {
             for parent in &change.parents {
-                if frontier.contains(parent)
-                    || memo.get(parent).copied().unwrap_or(false)
-                {
+                if frontier.contains(parent) || memo.get(parent).copied().unwrap_or(false) {
                     stack.push(*parent);
                 }
             }
@@ -962,30 +955,30 @@ fn squash_offline_ops(chain: &[Change]) -> Vec<Op> {
         for op in &change.ops {
             match op {
                 Op::Create { path, version } => {
-                    state.insert(path.as_str().to_string(), PathState::Present {
-                        version: *version,
-                        is_new: true,
-                    });
+                    state.insert(
+                        path.as_str().to_string(),
+                        PathState::Present { version: *version, is_new: true },
+                    );
                 }
                 Op::Update { path, version } => {
                     let is_new = matches!(
                         state.get(path.as_str()),
                         None | Some(PathState::Present { is_new: true, .. })
                     );
-                    state.insert(path.as_str().to_string(), PathState::Present {
-                        version: *version,
-                        is_new,
-                    });
+                    state.insert(
+                        path.as_str().to_string(),
+                        PathState::Present { version: *version, is_new },
+                    );
                 }
                 Op::Delete { path } => {
                     state.insert(path.as_str().to_string(), PathState::Deleted);
                 }
                 Op::Move { from, to, version } => {
                     state.insert(from.as_str().to_string(), PathState::Deleted);
-                    state.insert(to.as_str().to_string(), PathState::Present {
-                        version: *version,
-                        is_new: false,
-                    });
+                    state.insert(
+                        to.as_str().to_string(),
+                        PathState::Present { version: *version, is_new: false },
+                    );
                 }
             }
         }
@@ -1086,16 +1079,16 @@ fn rebuild_change_file_version_relations(
 ) -> Result<(), SyncError> {
     conn.execute("DELETE FROM change_file_versions WHERE group_id = ?1", [group_id])?;
     let changes: Vec<(Vec<u8>, Vec<u8>)> = {
-        let mut stmt = conn.prepare(
-            "SELECT change_hash, encoded FROM changes WHERE group_id = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT change_hash, encoded FROM changes WHERE group_id = ?1")?;
         let rows = stmt.query_map([group_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<_, _>>()?
     };
     for (hash_bytes, encoded) in changes {
-        let hash: [u8; 32] = hash_bytes.as_slice().try_into().map_err(|_| {
-            SyncError::CorruptState("stored change hash is not 32 bytes".into())
-        })?;
+        let hash: [u8; 32] = hash_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| SyncError::CorruptState("stored change hash is not 32 bytes".into()))?;
         let change = decode_stored_change(&encoded)?;
         for op in &change.ops {
             if let Some(version_hash) = op_version_hash(op) {
@@ -1192,14 +1185,19 @@ mod tests {
             blocking_devices: vec![],
         };
         let snapshot = sender.build_compaction_snapshot(&plan).unwrap();
-        let checkpoint = Checkpoint::new(group(), plan.checkpoint_frontier.clone(), snapshot.snapshot_hash());
+        let checkpoint =
+            Checkpoint::new(group(), plan.checkpoint_frontier.clone(), snapshot.snapshot_hash());
         sender.commit_compaction_snapshot(&checkpoint, &snapshot, &plan.pruned).unwrap();
 
         // The pruned prefix is really gone, and the new HistoryBase is recorded.
         assert_eq!(sender.dag_group_heads("g").unwrap(), vec![b.compute_hash()]);
         assert_eq!(sender.dag_parents_of(&b.compute_hash()).unwrap(), Vec::<ChangeHash>::new());
-        assert_eq!(sender.history_base("g").unwrap(), Some(HistoryBase::from_checkpoint(&checkpoint)));
-        let snapshot_bytes = sender.checkpoint_snapshot(&checkpoint.checkpoint_hash()).unwrap().unwrap();
+        assert_eq!(
+            sender.history_base("g").unwrap(),
+            Some(HistoryBase::from_checkpoint(&checkpoint))
+        );
+        let snapshot_bytes =
+            sender.checkpoint_snapshot(&checkpoint.checkpoint_hash()).unwrap().unwrap();
         assert_eq!(snapshot_bytes, snapshot.canonical_encoding());
 
         // A receiving device already has the full pre-compaction history (it
@@ -1226,10 +1224,18 @@ mod tests {
         assert_eq!(receiver.dag_group_heads("g").unwrap(), vec![d.compute_hash()]);
         assert!(receiver.dag_parents_of(&d.compute_hash()).unwrap().contains(&b.compute_hash()));
         // ...frontier is applied (its effects are already in the baseline)...
-        assert!(receiver.dag_list_unapplied_changes("g").unwrap().iter().all(|c| c.compute_hash() != b.compute_hash()));
+        assert!(receiver
+            .dag_list_unapplied_changes("g")
+            .unwrap()
+            .iter()
+            .all(|c| c.compute_hash() != b.compute_hash()));
         // ...but the retained descendant is left unapplied for the ordinary
         // reprojection backstop to replay onto the fresh baseline.
-        assert!(receiver.dag_list_unapplied_changes("g").unwrap().iter().any(|c| c.compute_hash() == d.compute_hash()));
+        assert!(receiver
+            .dag_list_unapplied_changes("g")
+            .unwrap()
+            .iter()
+            .any(|c| c.compute_hash() == d.compute_hash()));
         assert_eq!(
             receiver.history_base("g").unwrap(),
             Some(HistoryBase::from_checkpoint(&checkpoint))
@@ -1261,7 +1267,8 @@ mod tests {
             blocking_devices: vec![],
         };
         let snapshot = sender.build_compaction_snapshot(&plan).unwrap();
-        let checkpoint = Checkpoint::new(group(), plan.checkpoint_frontier.clone(), snapshot.snapshot_hash());
+        let checkpoint =
+            Checkpoint::new(group(), plan.checkpoint_frontier.clone(), snapshot.snapshot_hash());
         sender.commit_compaction_snapshot(&checkpoint, &snapshot, &plan.pruned).unwrap();
 
         // The real boundary edge b -> a is found under the current checkpoint.
@@ -1326,9 +1333,11 @@ mod tests {
             blocking_devices: vec![],
         };
         let snapshot = sender.build_compaction_snapshot(&plan).unwrap();
-        let checkpoint = Checkpoint::new(group(), plan.checkpoint_frontier.clone(), snapshot.snapshot_hash());
+        let checkpoint =
+            Checkpoint::new(group(), plan.checkpoint_frontier.clone(), snapshot.snapshot_hash());
         sender.commit_compaction_snapshot(&checkpoint, &snapshot, &plan.pruned).unwrap();
-        let snapshot_bytes = sender.checkpoint_snapshot(&checkpoint.checkpoint_hash()).unwrap().unwrap();
+        let snapshot_bytes =
+            sender.checkpoint_snapshot(&checkpoint.checkpoint_hash()).unwrap().unwrap();
 
         let receiver = SyncState::open_in_memory().unwrap();
         let manifest = SnapshotManifest::new_signed(
@@ -1373,9 +1382,11 @@ mod tests {
             blocking_devices: vec![],
         };
         let snapshot = sender.build_compaction_snapshot(&plan).unwrap();
-        let checkpoint = Checkpoint::new(group(), plan.checkpoint_frontier.clone(), snapshot.snapshot_hash());
+        let checkpoint =
+            Checkpoint::new(group(), plan.checkpoint_frontier.clone(), snapshot.snapshot_hash());
         sender.commit_compaction_snapshot(&checkpoint, &snapshot, &plan.pruned).unwrap();
-        let snapshot_bytes = sender.checkpoint_snapshot(&checkpoint.checkpoint_hash()).unwrap().unwrap();
+        let snapshot_bytes =
+            sender.checkpoint_snapshot(&checkpoint.checkpoint_hash()).unwrap().unwrap();
 
         // The receiver's own head is a totally unrelated root, sharing no
         // ancestry with the incoming checkpoint frontier at all.
@@ -1428,9 +1439,11 @@ mod tests {
             blocking_devices: vec![],
         };
         let snapshot = sender.build_compaction_snapshot(&plan).unwrap();
-        let checkpoint = Checkpoint::new(group(), plan.checkpoint_frontier.clone(), snapshot.snapshot_hash());
+        let checkpoint =
+            Checkpoint::new(group(), plan.checkpoint_frontier.clone(), snapshot.snapshot_hash());
         sender.commit_compaction_snapshot(&checkpoint, &snapshot, &plan.pruned).unwrap();
-        let snapshot_bytes = sender.checkpoint_snapshot(&checkpoint.checkpoint_hash()).unwrap().unwrap();
+        let snapshot_bytes =
+            sender.checkpoint_snapshot(&checkpoint.checkpoint_hash()).unwrap().unwrap();
 
         // Device 1 (receiver): went offline right after admitting a, then
         // made its own local edit b (a -> b) that device 2 never saw.
@@ -1466,9 +1479,7 @@ mod tests {
         .unwrap();
 
         let emitter = ChangeEmitter::new("device-1", receiver_signing.clone());
-        receiver
-            .install_rebootstrap_snapshot(&manifest, &snapshot_bytes, Some(&emitter))
-            .unwrap();
+        receiver.install_rebootstrap_snapshot(&manifest, &snapshot_bytes, Some(&emitter)).unwrap();
 
         // b's original signed hash cannot survive (parents are part of its
         // signed bytes; splicing a new parent onto it is not possible), but
@@ -1590,28 +1601,39 @@ mod tests {
         // previous_checkpoint_hash claims -- there is nothing installed yet
         // to extend or fork away from.
         receiver.install_rebootstrap_snapshot(&manifest1, &snapshot_bytes1, None).unwrap();
-        assert_eq!(receiver.history_base("g").unwrap(), Some(HistoryBase::from_checkpoint(&checkpoint1)));
+        assert_eq!(
+            receiver.history_base("g").unwrap(),
+            Some(HistoryBase::from_checkpoint(&checkpoint1))
+        );
 
         // A genuine one-hop forward advance succeeds.
         receiver.dag_admit_change(&c, true).unwrap();
         receiver.install_rebootstrap_snapshot(&manifest2, &snapshot_bytes2, None).unwrap();
-        assert_eq!(receiver.history_base("g").unwrap(), Some(HistoryBase::from_checkpoint(&checkpoint2)));
+        assert_eq!(
+            receiver.history_base("g").unwrap(),
+            Some(HistoryBase::from_checkpoint(&checkpoint2))
+        );
 
         // Re-installing the now-superseded checkpoint1 is a rollback --
         // refused, state unchanged.
-        let error = receiver
-            .install_rebootstrap_snapshot(&manifest1, &snapshot_bytes1, None)
-            .unwrap_err();
+        let error =
+            receiver.install_rebootstrap_snapshot(&manifest1, &snapshot_bytes1, None).unwrap_err();
         assert!(
             matches!(error, SyncError::CorruptState(ref m) if m.contains("does not directly extend")),
             "unexpected error: {error:?}"
         );
-        assert_eq!(receiver.history_base("g").unwrap(), Some(HistoryBase::from_checkpoint(&checkpoint2)));
+        assert_eq!(
+            receiver.history_base("g").unwrap(),
+            Some(HistoryBase::from_checkpoint(&checkpoint2))
+        );
 
         // Re-installing the identical, already-current checkpoint2 is a
         // harmless idempotent re-install.
         receiver.install_rebootstrap_snapshot(&manifest2, &snapshot_bytes2, None).unwrap();
-        assert_eq!(receiver.history_base("g").unwrap(), Some(HistoryBase::from_checkpoint(&checkpoint2)));
+        assert_eq!(
+            receiver.history_base("g").unwrap(),
+            Some(HistoryBase::from_checkpoint(&checkpoint2))
+        );
     }
 
     /// A manifest whose `previous_checkpoint_hash` does not name the
@@ -1635,9 +1657,11 @@ mod tests {
             blocking_devices: vec![],
         };
         let snapshot = sender.build_compaction_snapshot(&plan).unwrap();
-        let checkpoint = Checkpoint::new(group(), plan.checkpoint_frontier.clone(), snapshot.snapshot_hash());
+        let checkpoint =
+            Checkpoint::new(group(), plan.checkpoint_frontier.clone(), snapshot.snapshot_hash());
         sender.commit_compaction_snapshot(&checkpoint, &snapshot, &plan.pruned).unwrap();
-        let snapshot_bytes = sender.checkpoint_snapshot(&checkpoint.checkpoint_hash()).unwrap().unwrap();
+        let snapshot_bytes =
+            sender.checkpoint_snapshot(&checkpoint.checkpoint_hash()).unwrap().unwrap();
 
         // A second, unrelated sender independently produces a DIFFERENT
         // checkpoint for the same group and frontier hash space -- a fork,
@@ -1722,7 +1746,11 @@ mod tests {
             blocks: version
                 .blocks
                 .iter()
-                .map(|b| crate::types::BlockInfo { hash: b.hash.0.clone(), offset: 0, size: b.size })
+                .map(|b| crate::types::BlockInfo {
+                    hash: b.hash.0.clone(),
+                    offset: 0,
+                    size: b.size,
+                })
                 .collect(),
             deleted: false,
         }
@@ -1776,7 +1804,8 @@ mod tests {
             blocking_devices: vec![],
         };
         let snapshot = sender.build_compaction_snapshot(&plan).unwrap();
-        let checkpoint = Checkpoint::new(group(), plan.checkpoint_frontier.clone(), snapshot.snapshot_hash());
+        let checkpoint =
+            Checkpoint::new(group(), plan.checkpoint_frontier.clone(), snapshot.snapshot_hash());
         sender.commit_compaction_snapshot(&checkpoint, &snapshot, &plan.pruned).unwrap();
 
         // change1 (the only change that ever admitted v1) is gone...
@@ -1815,9 +1844,11 @@ mod tests {
             blocking_devices: vec![],
         };
         let snapshot = sender.build_compaction_snapshot(&plan).unwrap();
-        let checkpoint = Checkpoint::new(group(), plan.checkpoint_frontier.clone(), snapshot.snapshot_hash());
+        let checkpoint =
+            Checkpoint::new(group(), plan.checkpoint_frontier.clone(), snapshot.snapshot_hash());
         sender.commit_compaction_snapshot(&checkpoint, &snapshot, &plan.pruned).unwrap();
-        let snapshot_bytes = sender.checkpoint_snapshot(&checkpoint.checkpoint_hash()).unwrap().unwrap();
+        let snapshot_bytes =
+            sender.checkpoint_snapshot(&checkpoint.checkpoint_hash()).unwrap().unwrap();
 
         // The receiver has already caught up to exactly the incoming
         // frontier (no local descendant needed for this test), plus a

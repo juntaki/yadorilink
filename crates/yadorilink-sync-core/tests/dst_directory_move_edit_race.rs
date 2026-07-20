@@ -141,11 +141,7 @@ impl SimDevice {
     /// records the dispatch produced (a tombstone, or nothing). Used both
     /// by the trait method below and directly by the test to sequence the
     /// `dir1` dispatch deterministically.
-    async fn drain_and_dispatch(
-        &self,
-        group_id: &str,
-        abs_path: &Path,
-    ) -> Vec<FileRecord> {
+    async fn drain_and_dispatch(&self, group_id: &str, abs_path: &Path) -> Vec<FileRecord> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if self
             .flush_request_tx
@@ -584,8 +580,7 @@ async fn run_scenario(seed: u64, ordering: Ordering) -> Result<(), String> {
             // branch tombstones the orphaned child dir1/b.bin with A's own
             // component bumped, and broadcasts it.
             let recs = device_a.sim.drain_and_dispatch(GROUP_ID, &root_a.join(DIR1)).await;
-            let child_tombstoned =
-                recs.iter().any(|r| r.path.as_str() == CHILD_REL && r.deleted);
+            let child_tombstoned = recs.iter().any(|r| r.path.as_str() == CHILD_REL && r.deleted);
             if !child_tombstoned {
                 return Err(format!(
                     "dir1 dispatch did not tombstone the orphaned child dir1/b.bin as expected \
@@ -623,10 +618,7 @@ async fn run_scenario(seed: u64, ordering: Ordering) -> Result<(), String> {
             "SILENT DATA LOSS ({ordering:?}, seed {seed}): device B's edited bytes are present \
              NOWHERE on A. live dir1/b.bin={live_child}; dir1/b.bin index row={child_row:?}; \
              dir dispatch records={:?}; files on disk={files:?}",
-            dir_dispatch_records
-                .iter()
-                .map(|r| (r.path.clone(), r.deleted))
-                .collect::<Vec<_>>(),
+            dir_dispatch_records.iter().map(|r| (r.path.clone(), r.deleted)).collect::<Vec<_>>(),
         ));
     }
 

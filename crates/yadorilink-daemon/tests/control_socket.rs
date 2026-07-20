@@ -40,7 +40,8 @@ mod unix_socket_tests {
         // key is fail-closed (`link_manager::ensure_initial_change_history`):
         // linking a folder refuses index-only sync rather than leave
         // emission silently off. Wire one before any test here links.
-        state.set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
+        state
+            .set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
         let socket_path = dir.path().join("daemon.sock");
 
         let serve_path = socket_path.clone();
@@ -931,7 +932,10 @@ mod unix_socket_tests {
         // (`record_group_block_provenance`'s doc comment): without this, a
         // restore treats a block this test poked directly into the store as
         // never having been obtained through the group, and refuses it.
-        state.sync_state.record_group_block_provenance("group-versions", &[v1_block.hash.clone()]).unwrap();
+        state
+            .sync_state
+            .record_group_block_provenance("group-versions", &[v1_block.hash.clone()])
+            .unwrap();
         let mut v1_version = yadorilink_sync_core::version_vector::VersionVector::new();
         v1_version.increment("device-a");
         state
@@ -956,7 +960,10 @@ mod unix_socket_tests {
             offset: 0,
             size: 12,
         };
-        state.sync_state.record_group_block_provenance("group-versions", &[v2_block.hash.clone()]).unwrap();
+        state
+            .sync_state
+            .record_group_block_provenance("group-versions", &[v2_block.hash.clone()])
+            .unwrap();
         let mut v2_version = yadorilink_sync_core::version_vector::VersionVector::new();
         v2_version.increment("device-a");
         v2_version.increment("device-a");
@@ -1064,7 +1071,10 @@ mod unix_socket_tests {
             .unwrap();
 
         let v2_hash = hex::decode(state.block_store.put(b"second content").unwrap()).unwrap();
-        state.sync_state.record_group_block_provenance("group-default-restore", &[v2_hash.clone()]).unwrap();
+        state
+            .sync_state
+            .record_group_block_provenance("group-default-restore", &[v2_hash.clone()])
+            .unwrap();
         let mut v2_version = yadorilink_sync_core::version_vector::VersionVector::new();
         v2_version.increment("device-a");
         v2_version.increment("device-a");
@@ -1250,7 +1260,10 @@ mod unix_socket_tests {
         };
         // See the identical comment in `list_versions_then_restore_version_
         // round_trips_through_control_socket` above.
-        state.sync_state.record_group_block_provenance("group-trash", &[block.hash.clone()]).unwrap();
+        state
+            .sync_state
+            .record_group_block_provenance("group-trash", &[block.hash.clone()])
+            .unwrap();
         let mut version = yadorilink_sync_core::version_vector::VersionVector::new();
         version.increment("device-a");
         state
@@ -1331,7 +1344,8 @@ mod windows_pipe_tests {
         let state_db = Arc::new(SyncState::open(dir.path().join("sync.sqlite3")).unwrap());
         let state = DaemonState::new("device-under-test".into(), state_db, store);
         // See the identical comment in the Unix `start_daemon_with_state` above.
-        state.set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
+        state
+            .set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
         let pipe_name = unique_pipe_name();
 
         let serve_name = pipe_name.clone();

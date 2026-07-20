@@ -450,8 +450,7 @@ mod tests {
         // Owner A holds distinct block store A + DB S.
         let a = tempfile::tempdir().unwrap();
         let shared_db = a.path().join("sync-state.sqlite3");
-        let _owner_a =
-            DataResourceLocks::acquire(&a.path().join("blocks"), &shared_db).unwrap();
+        let _owner_a = DataResourceLocks::acquire(&a.path().join("blocks"), &shared_db).unwrap();
 
         // Daemon B has a *distinct* block store but shares A's DB. Acquisition
         // order is block store (succeeds) then DB (conflicts) — B must fail and

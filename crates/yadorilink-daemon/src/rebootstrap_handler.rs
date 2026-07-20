@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-use yadorilink_sync_core::change::{
-    self, Change, ChangeAuth, ChangeHash, DeviceId, FolderGroupId,
-};
+use yadorilink_sync_core::change::{self, Change, ChangeAuth, ChangeHash, DeviceId, FolderGroupId};
 use yadorilink_sync_core::dag_store::ChangeEmitter;
 use yadorilink_sync_core::index::SyncState;
-use yadorilink_sync_core::peer_session::{ChangeAuthenticator, PreparedRebootstrap, RebootstrapHandler};
+use yadorilink_sync_core::peer_session::{
+    ChangeAuthenticator, PreparedRebootstrap, RebootstrapHandler,
+};
 use yadorilink_sync_core::rebootstrap::{
     prepare_rebootstrap_required, verify_and_install_rebootstrap, AtomicRebootstrapInstaller,
     RebootstrapRequired, RebootstrapTrust,
@@ -68,7 +68,10 @@ impl DaemonRebootstrapHandler {
     /// has no group context to check them itself, so this runs as a second,
     /// explicit gate after signature verification, before either
     /// `verify_rebootstrap` or `install_rebootstrap` accepts the message.
-    fn check_signer_authorized_for_group(&self, required: &RebootstrapRequired) -> Result<(), SyncError> {
+    fn check_signer_authorized_for_group(
+        &self,
+        required: &RebootstrapRequired,
+    ) -> Result<(), SyncError> {
         let group_id = required.manifest.group_id.as_str();
         let signer = required.manifest.signer_device_id.as_str();
         if signer == self.state.device_id {
@@ -137,14 +140,19 @@ impl DaemonRebootstrapHandler {
                 auth_epoch: frontier_change.auth_epoch,
                 policy_head_hash: frontier_change.policy_head_hash,
             };
-            change::verify_change(&frontier_change, &hash, &verifying_key, |device_id, group_id| {
-                authenticator.accepts_change_auth(
-                    device_id.as_str(),
-                    group_id.as_str(),
-                    signing_key_fingerprint,
-                    auth,
-                )
-            })
+            change::verify_change(
+                &frontier_change,
+                &hash,
+                &verifying_key,
+                |device_id, group_id| {
+                    authenticator.accepts_change_auth(
+                        device_id.as_str(),
+                        group_id.as_str(),
+                        signing_key_fingerprint,
+                        auth,
+                    )
+                },
+            )
             .map_err(|error| {
                 SyncError::CorruptState(format!(
                     "re-bootstrap frontier change {} by {} failed signature/authorization \
@@ -175,7 +183,11 @@ impl AtomicRebootstrapInstaller for SyncStateRebootstrapInstaller {
         manifest: &yadorilink_sync_core::rebootstrap::SnapshotManifest,
         snapshot_bytes: &[u8],
     ) -> Result<(), SyncError> {
-        self.state.install_rebootstrap_snapshot(manifest, snapshot_bytes, self.local_emitter.as_ref())
+        self.state.install_rebootstrap_snapshot(
+            manifest,
+            snapshot_bytes,
+            self.local_emitter.as_ref(),
+        )
     }
 }
 
@@ -277,15 +289,14 @@ mod tests {
     fn required_signed_by(group_id: &str, signer: &str, key: &SigningKey) -> RebootstrapRequired {
         let frontier = ChangeHash([9u8; 32]);
         let checkpoint = Checkpoint::new(FolderGroupId(group_id.into()), vec![frontier], [1u8; 32]);
-        let manifest =
-            SnapshotManifest::new_signed(
-                checkpoint,
-                vec![frontier],
-                None,
-                DeviceId(signer.into()),
-                key,
-            )
-            .unwrap();
+        let manifest = SnapshotManifest::new_signed(
+            checkpoint,
+            vec![frontier],
+            None,
+            DeviceId(signer.into()),
+            key,
+        )
+        .unwrap();
         RebootstrapRequired::new_signed(ChangeHash([2u8; 32]), manifest, key)
     }
 

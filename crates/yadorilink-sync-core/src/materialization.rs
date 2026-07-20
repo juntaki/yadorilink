@@ -16,8 +16,8 @@ use crate::chunker::{
     apply_exec_bit, reconstruct_file, verify_write_target_within_root, write_placeholder,
 };
 use crate::custody::CustodyVerifier;
-use crate::dag_store::ChangeEmitter;
 pub use crate::custody::FullReplicaCustody;
+use crate::dag_store::ChangeEmitter;
 use crate::error::SyncError;
 use crate::index::SyncState;
 use crate::root_identity::VerifiedRoot;
@@ -355,8 +355,16 @@ pub fn run_eviction_sweep(
         // call that actually dehydrated the working-tree copy reduces the
         // hydrated-usage figure this sweep tracks, so gate the accounting on
         // it rather than assuming every candidate was reclaimed.
-        let outcome =
-            evict_file(state, liveness_gate, store, root, group_id, &candidate.path, false, custody)?;
+        let outcome = evict_file(
+            state,
+            liveness_gate,
+            store,
+            root,
+            group_id,
+            &candidate.path,
+            false,
+            custody,
+        )?;
         if !outcome.dehydrated {
             continue;
         }
@@ -457,8 +465,16 @@ pub fn run_disk_pressure_eviction_sweep(
         // only count the working-tree copy against `freed` when it actually
         // dehydrated — otherwise the sweep over-estimates reclaimed space and
         // can stop while the volume is still under pressure.
-        let outcome =
-            evict_file(state, liveness_gate, store, root, group_id, &candidate.path, false, custody)?;
+        let outcome = evict_file(
+            state,
+            liveness_gate,
+            store,
+            root,
+            group_id,
+            &candidate.path,
+            false,
+            custody,
+        )?;
         if !outcome.dehydrated {
             continue;
         }
@@ -690,8 +706,7 @@ fn repair_interrupted_materializations_inner(
         // for a divergent user edit — quarantining it as a bogus conflict copy
         // and reversing the just-completed eviction. Only a row still currently
         // `Hydrated` here is a genuine interrupted-materialization candidate.
-        if state.get_materialization_state(group_id, &path)?
-            != Some(MaterializationState::Hydrated)
+        if state.get_materialization_state(group_id, &path)? != Some(MaterializationState::Hydrated)
         {
             continue;
         }
@@ -3130,7 +3145,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(report.reconstructed.is_empty(), "no intent => must not reconstruct from the index");
+        assert!(
+            report.reconstructed.is_empty(),
+            "no intent => must not reconstruct from the index"
+        );
         assert!(!out_path.exists());
         assert_eq!(report.offline_deleted, vec!["f.txt".to_string()]);
         assert_eq!(emitted_delete_paths(&state, "group-1"), vec!["f.txt".to_string()]);

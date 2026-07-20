@@ -89,9 +89,8 @@ mod tests {
         for field_number in [2u8, 3u8] {
             let old_peer_bytes = legacy_index_shaped_field(field_number);
 
-            let decoded = SyncMessage::decode(old_peer_bytes.as_slice()).unwrap_or_else(|e| {
-                panic!("field {field_number} must decode, not error: {e}")
-            });
+            let decoded = SyncMessage::decode(old_peer_bytes.as_slice())
+                .unwrap_or_else(|e| panic!("field {field_number} must decode, not error: {e}"));
 
             assert!(
                 decoded.payload.is_none(),

@@ -165,6 +165,10 @@ async fn demoting_setup(server: &MockServer) -> (Daemon, Daemon, std::path::Path
 
     let content = b"the file device-a confirms holding";
     let hash = a.state.block_store.put(content).unwrap();
+    a.state
+        .sync_state
+        .record_group_block_provenance(GROUP, &[hex::decode(hash.as_str()).unwrap()])
+        .unwrap();
     b.state.block_store.put(content).unwrap();
     let bytes = hex::decode(hash.as_str()).unwrap();
     let record = record_referencing("only.bin", "device-b", bytes, content.len() as u64);
