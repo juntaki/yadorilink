@@ -157,7 +157,7 @@ fn seed_placeholder(
         device
             .state
             .sync_state
-            .record_group_block_provenance(GROUP, &[block.hash.clone()])
+            .record_group_block_provenance(GROUP, std::slice::from_ref(&block.hash))
             .unwrap();
     }
 }

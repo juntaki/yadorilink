@@ -470,6 +470,7 @@ pub fn emit_local_change_onto(
 mod tests {
     use super::*;
     use crate::change::{BlockHash, FileMeta, SyncPath, VersionBlock};
+    use crate::index::ChangeContent;
     use crate::types::RecordKind;
     use ed25519_dalek::SigningKey;
 
@@ -798,7 +799,9 @@ mod tests {
         change.lamport = 99;
         change.sign(&signing);
 
-        assert!(state.dag_admit_change_with_versions(&change, &[version.clone()], false).is_err());
+        assert!(state
+            .dag_admit_change_with_versions(&change, std::slice::from_ref(&version), false)
+            .is_err());
         assert!(!state.dag_has_file_version("group-a", &version.version_hash).unwrap());
         assert!(!state.dag_group_file_version_references_block("group-a", &block_hash).unwrap());
     }
@@ -1190,8 +1193,7 @@ mod tests {
                 "g",
                 &record,
                 "device-A",
-                vec![create_op("a.txt")],
-                &[],
+                ChangeContent { ops: vec![create_op("a.txt")], versions: &[] },
                 None,
                 &em,
             )

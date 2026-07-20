@@ -17,22 +17,14 @@ use std::panic::catch_unwind;
 use yadorilink_ipc_proto::shellipc::{ContextAction, MaterializationState, SyncState};
 
 /// Mirrors the four spec'd overlay states plus on-demand-sync's
-/// "online-only" placeholder overlay and an advisory "open elsewhere"
-/// signal, as a flat C enum Swift can switch
-/// on directly. `open_elsewhere_device_id` non-empty takes priority over
-/// everything else in `yadorilink_query_status` below — it's a warning
-/// about a *different device* actively editing the file right now, which
-/// is more actionable to surface than the file's own convergence state
-/// (a file can be simultaneously "synced" and "open elsewhere": synced
-/// reflects the last-converged content, open-elsewhere warns about an
-/// edit in flight that hasn't produced a new version yet). Next,
-/// `MaterializationState::Placeholder` takes priority over the raw
-/// `SyncState`, since "online-only" is the visually distinct badge the
+/// "online-only" placeholder overlay, as a flat C enum Swift can switch
+/// on directly. `MaterializationState::Placeholder` takes priority over the
+/// raw `SyncState`, since "online-only" is the visually distinct badge the
 /// spec calls for on an unhydrated file regardless of its underlying
 /// convergence state; `Hydrating` is folded into `Syncing` (content
 /// actively moving), matching the spirit of the existing
-/// `SyncState::Syncing` badge rather than adding a seventh visual state
-/// not called for by the spec.
+/// `SyncState::Syncing` badge rather than adding a sixth visual state not
+/// called for by the spec.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum YadoriLinkBadgeStatus {
@@ -42,7 +34,6 @@ pub enum YadoriLinkBadgeStatus {
     Pending = 3,
     Error = 4,
     OnlineOnly = 5,
-    OpenElsewhere = 6,
 }
 
 /// Mirrors `shellipc.proto`'s `ContextAction` enum, as the small stable
@@ -100,9 +91,6 @@ unsafe fn path_from_c_str(path: *const c_char) -> Option<String> {
 }
 
 fn combine_status(info: ipc_client::StatusInfo) -> YadoriLinkBadgeStatus {
-    if !info.open_elsewhere_device_id.is_empty() {
-        return YadoriLinkBadgeStatus::OpenElsewhere;
-    }
     if info.materialization_state == MaterializationState::Placeholder {
         return YadoriLinkBadgeStatus::OnlineOnly;
     }

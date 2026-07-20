@@ -125,8 +125,7 @@ impl CheckpointStore for MockStore {
             .checkpoints
             .borrow()
             .iter()
-            .filter(|checkpoint| checkpoint.group_id == *group)
-            .next_back()
+            .rfind(|checkpoint| checkpoint.group_id == *group)
             .cloned())
     }
 
@@ -193,7 +192,7 @@ fn prunes_interior_keeps_cut_and_head() {
 #[test]
 fn public_execute_prune_fails_closed_until_rebootstrap_pipeline_is_ready() {
     let (store, plan) = prunable_store();
-    assert!(!crate::rebootstrap::COMPACTION_SCHEDULING_READY);
+    const { assert!(!crate::rebootstrap::COMPACTION_SCHEDULING_READY) };
 
     let error = execute_prune(&store, &plan, [9; 32]).unwrap_err();
     assert!(matches!(error, SyncError::CorruptState(_)));

@@ -44,7 +44,9 @@ use yadorilink_ipc_proto::daemonctl::{
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_sync_core::index::{RoleLossAction, RoleLossOperationState};
+use yadorilink_sync_core::index::{
+    RoleLossAction, RoleLossOperationParams, RoleLossOperationState,
+};
 use yadorilink_sync_core::types::{BlockInfo, FileRecord, MaterializationPolicy};
 use yadorilink_sync_core::version_vector::VersionVector;
 
@@ -519,12 +521,14 @@ async fn prepared_reconcile_restores_worker_eager_after_response_loss() {
         .insert_role_loss_operation(
             "op-ambiguous-prepared",
             GROUP,
-            "device-b",
-            "device-a",
-            Some("lease-prepared"),
-            RoleLossAction::Demote,
-            Some(&b.root.path().to_string_lossy()),
-            now,
+            RoleLossOperationParams {
+                source_device_id: "device-b",
+                target_device_id: "device-a",
+                lease_id: Some("lease-prepared"),
+                action: RoleLossAction::Demote,
+                local_path: Some(&b.root.path().to_string_lossy()),
+                now_unix: now,
+            },
         )
         .unwrap();
 
@@ -565,12 +569,14 @@ async fn worker_committed_row_found_at_startup_is_compensated_by_the_sweep() {
         .insert_role_loss_operation(
             "op-crash-1",
             GROUP,
-            "device-b",
-            "device-a",
-            Some("lease-crash-1"),
-            RoleLossAction::Demote,
-            Some(&b.root.path().to_string_lossy()),
-            now,
+            RoleLossOperationParams {
+                source_device_id: "device-b",
+                target_device_id: "device-a",
+                lease_id: Some("lease-crash-1"),
+                action: RoleLossAction::Demote,
+                local_path: Some(&b.root.path().to_string_lossy()),
+                now_unix: now,
+            },
         )
         .unwrap();
     b.state
@@ -620,12 +626,14 @@ async fn compensation_unreachable_leaves_the_row_compensating_and_retries() {
         .insert_role_loss_operation(
             "op-crash-2",
             GROUP,
-            "device-b",
-            "device-a",
-            Some("lease-crash-2"),
-            RoleLossAction::Demote,
-            Some(&b.root.path().to_string_lossy()),
-            now,
+            RoleLossOperationParams {
+                source_device_id: "device-b",
+                target_device_id: "device-a",
+                lease_id: Some("lease-crash-2"),
+                action: RoleLossAction::Demote,
+                local_path: Some(&b.root.path().to_string_lossy()),
+                now_unix: now,
+            },
         )
         .unwrap();
     b.state

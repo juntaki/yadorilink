@@ -96,11 +96,15 @@ struct ChannelEntry {
     candidate_ips: HashSet<IpAddr>,
 }
 
+/// A raw inbound datagram handed to whoever is currently registered to
+/// receive STUN replies (`(payload, sender address)`).
+type StunDatagram = (Vec<u8>, SocketAddr);
+
 /// The demux routing table, shared between [`TransportHub`] and its receive
 /// loop.
 struct DemuxRegistry {
     channels: Mutex<HashMap<u32, ChannelEntry>>,
-    stun_tx: Mutex<Option<mpsc::Sender<(Vec<u8>, SocketAddr)>>>,
+    stun_tx: Mutex<Option<mpsc::Sender<StunDatagram>>>,
     /// Transaction ids of binding requests sent but not yet answered (bounded
     /// ring; a response with an unknown id is dropped).
     stun_pending: Mutex<VecDeque<[u8; 12]>>,
@@ -643,11 +647,8 @@ mod tests {
         assert!(hub.endpoint.v4.is_some());
         // The v6 half is present whenever the host could bind it on the same
         // port; when it is, it shares the v4 half's port.
-        if hub.endpoint.v6.is_some() {
-            assert_eq!(
-                hub.endpoint.v6.as_ref().unwrap().local_addr().unwrap().port(),
-                hub.local_port()
-            );
+        if let Some(v6) = hub.endpoint.v6.as_ref() {
+            assert_eq!(v6.local_addr().unwrap().port(), hub.local_port());
         }
     }
 

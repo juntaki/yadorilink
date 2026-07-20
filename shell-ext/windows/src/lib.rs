@@ -24,9 +24,7 @@ use windows::Win32::Foundation::{BOOL, CLASS_E_CLASSNOTAVAILABLE, E_NOINTERFACE,
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 
 pub use context_menu::ContextMenuHandler;
-pub use overlay::{
-    ErrorOverlay, OnlineOnlyOverlay, OpenElsewhereOverlay, SyncedOverlay, SyncingOverlay,
-};
+pub use overlay::{ErrorOverlay, OnlineOnlyOverlay, SyncedOverlay, SyncingOverlay};
 
 /// Shared class factory: `pwszpath`-free construction is enough for every
 /// overlay identifier here, since each is a stateless singleton that just
@@ -47,13 +45,12 @@ impl IClassFactory_Impl for ClassFactory_Impl {
             return Err(windows::Win32::Foundation::CLASS_E_NOAGGREGATION.into());
         }
         unsafe {
-            *object = std::ptr::null_mut;
+            *object = std::ptr::null_mut();
             let unknown: IUnknown = match self.clsid {
                 overlay::CLSID_SYNCED => SyncedOverlay::new().into(),
                 overlay::CLSID_SYNCING => SyncingOverlay::new().into(),
                 overlay::CLSID_ERROR => ErrorOverlay::new().into(),
                 overlay::CLSID_ONLINE_ONLY => OnlineOnlyOverlay::new().into(),
-                overlay::CLSID_OPEN_ELSEWHERE => OpenElsewhereOverlay::new().into(),
                 context_menu::CLSID_CONTEXT_MENU => ContextMenuHandler::new().into(),
                 _ => return Err(CLASS_E_CLASSNOTAVAILABLE.into()),
             };

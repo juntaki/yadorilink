@@ -41,8 +41,12 @@ fn decode_verified_row(
 /// authorized their deletion, so an older checkpoint is still part of the
 /// integrity boundary after a newer one is committed and cannot be left as an
 /// unchecked blob that tombstone validation merely joins against by key.
+/// One `change_checkpoints` row: `(checkpoint_hash, group_id, snapshot_hash,
+/// encoded)`.
+type CheckpointRow = (Vec<u8>, String, Vec<u8>, Vec<u8>);
+
 pub(crate) fn validate_all(conn: &Connection) -> Result<(), SyncError> {
-    let rows: Vec<(Vec<u8>, String, Vec<u8>, Vec<u8>)> = {
+    let rows: Vec<CheckpointRow> = {
         let mut stmt = conn.prepare(
             "SELECT checkpoint_hash, group_id, snapshot_hash, encoded FROM change_checkpoints",
         )?;

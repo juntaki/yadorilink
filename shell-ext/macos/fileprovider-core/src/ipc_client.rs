@@ -230,12 +230,6 @@ async fn list_folder_files_inner(local_path: &str) -> Vec<FileEntryInfo> {
 pub struct StatusInfo {
     pub sync_state: String,
     pub materialization_state: String,
-    /// Empty if not open elsewhere or the signal has expired —
-    /// a non-empty device id here is what drives the
-    /// `YadoriLinkBadgeStatusOpenElsewhere` badge in `core::lib` and, for a
-    /// File-Provider item, is folded into `NSFileProviderItem`'s
-    /// `tagData`/label to surface the same advisory signal.
-    pub open_elsewhere_device_id: String,
 }
 
 /// Same query `core::ipc_client::query_status` makes, reimplemented here
@@ -249,7 +243,6 @@ pub fn query_status(path: &str) -> StatusInfo {
         tokio::time::timeout(STATUS_TIMEOUT, query_status_inner(path)).await.unwrap_or(StatusInfo {
             sync_state: "unspecified".to_string(),
             materialization_state: "unspecified".to_string(),
-            open_elsewhere_device_id: String::new(),
         })
     })
 }
@@ -258,7 +251,6 @@ async fn query_status_inner(path: &str) -> StatusInfo {
     let unspecified = || StatusInfo {
         sync_state: "unspecified".to_string(),
         materialization_state: "unspecified".to_string(),
-        open_elsewhere_device_id: String::new(),
     };
     let Ok(mut stream) = connect().await else { return unspecified() };
     let msg = ShellIpcMessage {
@@ -278,7 +270,6 @@ async fn query_status_inner(path: &str) -> StatusInfo {
                     .unwrap_or(MaterializationState::Unspecified),
             )
             .to_string(),
-            open_elsewhere_device_id: r.open_elsewhere_device_id,
         },
         _ => unspecified(),
     }

@@ -155,9 +155,13 @@ fn drop_orphan_change(conn: &Connection, change_hash: &[u8]) -> Result<(), SyncE
 /// for every version its ops reference; `repair_change_file_versions`
 /// resolves or clones that, and reports `false` (also dropped) when it
 /// cannot.
+/// One buffered `orphan_changes` row: `(change_hash, group_id, device_id,
+/// lamport, encoded)`.
+type OrphanRow = (Vec<u8>, String, String, i64, Vec<u8>);
+
 pub(crate) fn repair(conn: &Connection) -> Result<(), SyncError> {
     let tx = conn.unchecked_transaction()?;
-    let buffered_rows: Vec<(Vec<u8>, String, String, i64, Vec<u8>)> = {
+    let buffered_rows: Vec<OrphanRow> = {
         let mut stmt = tx.prepare(
             "SELECT change_hash, group_id, device_id, lamport, encoded FROM orphan_changes",
         )?;

@@ -11,17 +11,17 @@
 //! `sync-deterministic-testing` "Hydration Under Network Fault Coverage"
 //! requirement's three scenarios):
 //!  1. Placeholders hydrate to the correct content despite faults — no
-//!  data loss, no corruption (Phase A).
+//!     data loss, no corruption (Phase A).
 //!  2. No placeholder is left stuck mid-hydration: after heal + quiesce
-//!  every index row is `Placeholder` or `Hydrated`, never `Hydrating`,
-//!  and `check_structural` finds no live row without a file (Phase A).
+//!     every index row is `Placeholder` or `Hydrated`, never `Hydrating`,
+//!     and `check_structural` finds no live row without a file (Phase A).
 //!  3. A conflicting write that lands while a path's hydration is in
-//!  flight preserves both sides — the losing write becomes a conflict
-//!  copy and the hydrated content is not lost (Phase B). The block
-//!  fetch a conflict resolution must perform to materialize the
-//!  incoming side *is* a hydration, so faulting it exercises exactly
-//!  the "BlockRequest lost during conflict resolution" recovery the
-//!  audit's `dst_two_device_chaos.rs` history documents.
+//!     flight preserves both sides — the losing write becomes a conflict
+//!     copy and the hydrated content is not lost (Phase B). The block
+//!     fetch a conflict resolution must perform to materialize the
+//!     incoming side *is* a hydration, so faulting it exercises exactly
+//!     the "BlockRequest lost during conflict resolution" recovery the
+//!     audit's `dst_two_device_chaos.rs` history documents.
 //!
 //! **Bold note (fault seam):** an earlier design named `dst_support::fault::
 //! FaultingChannel` as the injection seam, but that decorator is a pure

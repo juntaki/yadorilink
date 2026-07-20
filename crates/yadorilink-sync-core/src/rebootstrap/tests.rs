@@ -97,8 +97,7 @@ impl CheckpointStore for FakeStore {
 
 fn store_with_checkpoint() -> FakeStore {
     let group = FolderGroupId("g".into());
-    let mut store = FakeStore::default();
-    store.heads = vec![h(3)];
+    let mut store = FakeStore { heads: vec![h(3)], ..Default::default() };
     store.parents.insert(h(2), vec![]);
     store.parents.insert(h(3), vec![h(2)]);
     store.pruned.insert(h(1));
@@ -360,5 +359,5 @@ fn verified_response_and_snapshot_cross_the_atomic_installer_once() {
 
 #[test]
 fn compaction_scheduling_remains_explicitly_gated_off() {
-    assert!(!COMPACTION_SCHEDULING_READY);
+    const { assert!(!COMPACTION_SCHEDULING_READY) };
 }

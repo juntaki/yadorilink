@@ -934,7 +934,7 @@ mod unix_socket_tests {
         // never having been obtained through the group, and refuses it.
         state
             .sync_state
-            .record_group_block_provenance("group-versions", &[v1_block.hash.clone()])
+            .record_group_block_provenance("group-versions", std::slice::from_ref(&v1_block.hash))
             .unwrap();
         let mut v1_version = yadorilink_sync_core::version_vector::VersionVector::new();
         v1_version.increment("device-a");
@@ -962,7 +962,7 @@ mod unix_socket_tests {
         };
         state
             .sync_state
-            .record_group_block_provenance("group-versions", &[v2_block.hash.clone()])
+            .record_group_block_provenance("group-versions", std::slice::from_ref(&v2_block.hash))
             .unwrap();
         let mut v2_version = yadorilink_sync_core::version_vector::VersionVector::new();
         v2_version.increment("device-a");
@@ -1050,7 +1050,10 @@ mod unix_socket_tests {
         // round_trips_through_control_socket` above.
         state
             .sync_state
-            .record_group_block_provenance("group-default-restore", &[v1_block.hash.clone()])
+            .record_group_block_provenance(
+                "group-default-restore",
+                std::slice::from_ref(&v1_block.hash),
+            )
             .unwrap();
         let mut v1_version = yadorilink_sync_core::version_vector::VersionVector::new();
         v1_version.increment("device-a");
@@ -1073,7 +1076,7 @@ mod unix_socket_tests {
         let v2_hash = hex::decode(state.block_store.put(b"second content").unwrap()).unwrap();
         state
             .sync_state
-            .record_group_block_provenance("group-default-restore", &[v2_hash.clone()])
+            .record_group_block_provenance("group-default-restore", std::slice::from_ref(&v2_hash))
             .unwrap();
         let mut v2_version = yadorilink_sync_core::version_vector::VersionVector::new();
         v2_version.increment("device-a");
@@ -1262,7 +1265,7 @@ mod unix_socket_tests {
         // round_trips_through_control_socket` above.
         state
             .sync_state
-            .record_group_block_provenance("group-trash", &[block.hash.clone()])
+            .record_group_block_provenance("group-trash", std::slice::from_ref(&block.hash))
             .unwrap();
         let mut version = yadorilink_sync_core::version_vector::VersionVector::new();
         version.increment("device-a");

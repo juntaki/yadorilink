@@ -60,11 +60,9 @@ char *yadorilink_fp_list_folder_files(const char *local_path);
 
 /*
  * Returns a JSON object {"sync_state": string, "materialization_state":
- * string, "open_elsewhere_device_id": string} for `path`.
- * `open_elsewhere_device_id` is empty if the file is not currently
- * reported open elsewhere (an advisory-only signal). Falls back to
- * an all-"unspecified"/empty-string object on a NULL path or any
- * failure. Caller must free with yadorilink_fp_free_string.
+ * string} for `path`. Falls back to an all-"unspecified" object on a
+ * NULL path or any failure. Caller must free with
+ * yadorilink_fp_free_string.
  *
  * `path` must be a null-terminated UTF-8 C string, or NULL.
  */

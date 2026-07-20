@@ -112,18 +112,17 @@ pub unsafe extern "C" fn yadorilink_fp_list_folder_files(local_path: *const c_ch
     }
 }
 
-/// Queries combined sync/materialization/open-elsewhere status for
-/// `path`, as a JSON object `{"sync_state", "materialization_state",
-/// "open_elsewhere_device_id"}` (the `item(for:request:
-/// completionHandler:)` data source). Falls back to all-"unspecified"/
-/// empty-string JSON on a null path or any failure. Caller must free
-/// with `yadorilink_fp_free_string`.
+/// Queries combined sync/materialization status for `path`, as a JSON
+/// object `{"sync_state", "materialization_state"}` (the `item(for:request:
+/// completionHandler:)` data source). Falls back to all-"unspecified"
+/// JSON on a null path or any failure. Caller must free with
+/// `yadorilink_fp_free_string`.
 ///
 /// # Safety
 /// `path` must be a valid, null-terminated C string, or NULL.
 #[no_mangle]
 pub unsafe extern "C" fn yadorilink_fp_query_status(path: *const c_char) -> *mut c_char {
-    const FALLBACK: &str = r#"{"sync_state":"unspecified","materialization_state":"unspecified","open_elsewhere_device_id":""}"#;
+    const FALLBACK: &str = r#"{"sync_state":"unspecified","materialization_state":"unspecified"}"#;
     let Some(path) = path_from_c_str(path) else {
         return CString::new(FALLBACK).unwrap().into_raw();
     };

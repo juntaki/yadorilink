@@ -3799,7 +3799,6 @@ impl PeerSyncSession {
                 data: vec![],
                 not_found: true,
                 compression: proto::Compression::None as i32,
-                ..Default::default()
             };
             return self
                 .send(proto::SyncMessage {
@@ -3820,7 +3819,6 @@ impl PeerSyncSession {
                 data: vec![],
                 not_found: true,
                 compression: proto::Compression::None as i32,
-                ..Default::default()
             };
             return self
                 .send(proto::SyncMessage {
@@ -3841,7 +3839,6 @@ impl PeerSyncSession {
                 data: vec![],
                 not_found: true,
                 compression: proto::Compression::None as i32,
-                ..Default::default()
             };
             return self
                 .send(proto::SyncMessage {
@@ -3885,7 +3882,6 @@ impl PeerSyncSession {
                         data,
                         not_found: false,
                         compression: compression as i32,
-                        ..Default::default()
                     },
                     // A panicking compression task is folded into
                     // `not_found`, mirroring how a panicking `store.get`
@@ -3897,7 +3893,6 @@ impl PeerSyncSession {
                         data: vec![],
                         not_found: true,
                         compression: proto::Compression::None as i32,
-                        ..Default::default()
                     },
                 }
             }
@@ -3906,7 +3901,6 @@ impl PeerSyncSession {
                 data: vec![],
                 not_found: true,
                 compression: proto::Compression::None as i32,
-                ..Default::default()
             },
         };
         // Gate the outbound block

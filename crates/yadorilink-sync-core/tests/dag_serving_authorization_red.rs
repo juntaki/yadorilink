@@ -1,4 +1,3 @@
-use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 use yadorilink_sync_core::change::{
     BlockHash, ChangeAuth, FileMeta, FileVersion, Op, SyncPath, VersionBlock,

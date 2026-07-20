@@ -80,7 +80,15 @@ impl DaemonInstanceLock {
 
         std::fs::create_dir_all(config_dir)?;
         let lock_path = config_dir.join(DAEMON_INSTANCE_LOCK_FILE);
-        let file = OpenOptions::new().create(true).read(true).write(true).open(&lock_path)?;
+        // `truncate(false)` is explicit, not incidental: this is a lock file,
+        // never a content file, so an existing file's bytes (if any) are
+        // irrelevant and must not be discarded just by opening it.
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1061,8 +1069,7 @@ mod instance_lock_tests {
         let owner = DaemonInstanceLock::acquire(dir.path()).unwrap();
 
         let error = DaemonInstanceLock::acquire(dir.path())
-            .err()
-            .expect("a second daemon must not acquire the same config lock");
+            .expect_err("a second daemon must not acquire the same config lock");
         assert!(error.to_string().contains("already running"));
 
         drop(owner);

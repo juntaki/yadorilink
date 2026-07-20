@@ -1180,7 +1180,6 @@ fn local_path_for_group(
 /// (`set_coordination_client_config` is `#[cfg(not(madsim))]`), a promotion
 /// still proceeds local-only, just like a madsim demotion.
 ///
-
 /// The readiness confirmation above is itself a network round trip, so there
 /// is a real window between it returning and the local policy flip below
 /// actually committing during which this device's own durability-root set

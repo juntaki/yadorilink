@@ -182,7 +182,7 @@ async fn exclude_target_readiness_false_when_only_ready_replica_is_the_excluded_
     // (`record_group_block_provenance`'s doc comment): without this, the
     // real peer-to-peer readiness confirmation this file exercises refuses
     // the block as never having been obtained through the group.
-    a.state.sync_state.record_group_block_provenance(GROUP, &[bytes.clone()]).unwrap();
+    a.state.sync_state.record_group_block_provenance(GROUP, std::slice::from_ref(&bytes)).unwrap();
     let record = record_referencing("held.bin", bytes, content.len() as u64);
     a.state.sync_state.upsert_file(GROUP, &record).unwrap();
     b.state.sync_state.upsert_file(GROUP, &record).unwrap();
@@ -222,7 +222,10 @@ async fn exclude_target_readiness_true_when_a_different_replica_is_ready() {
     // independently confirm holding it when queried.
     let block_hash = record.blocks[0].hash.clone();
     a.state.block_store.put(content).unwrap();
-    a.state.sync_state.record_group_block_provenance(GROUP, &[block_hash.clone()]).unwrap();
+    a.state
+        .sync_state
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&block_hash))
+        .unwrap();
     c.state.block_store.put(content).unwrap();
     c.state.sync_state.record_group_block_provenance(GROUP, &[block_hash]).unwrap();
 
@@ -272,7 +275,7 @@ async fn unlink_setup(
     // (`record_group_block_provenance`'s doc comment): without this, the
     // real peer-to-peer readiness confirmation this file exercises refuses
     // the block as never having been obtained through the group.
-    a.state.sync_state.record_group_block_provenance(GROUP, &[bytes.clone()]).unwrap();
+    a.state.sync_state.record_group_block_provenance(GROUP, std::slice::from_ref(&bytes)).unwrap();
     let record = record_referencing("only.bin", bytes, content.len() as u64);
     a.state.sync_state.upsert_file(GROUP, &record).unwrap();
     b.state.sync_state.upsert_file(GROUP, &record).unwrap();

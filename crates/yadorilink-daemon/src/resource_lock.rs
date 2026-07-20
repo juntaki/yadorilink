@@ -268,8 +268,7 @@ mod tests {
         let _owner = ResourceLock::lock_block_store(&root).unwrap();
 
         let err = ResourceLock::lock_block_store(&root)
-            .err()
-            .expect("a second holder of the same block-store root must be rejected");
+            .expect_err("a second holder of the same block-store root must be rejected");
         assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
     }
 
@@ -284,8 +283,7 @@ mod tests {
         // collapse.
         let alias = root.join("sub").join("..");
         let err = ResourceLock::lock_block_store(&alias)
-            .err()
-            .expect("a `..`-relative alias of the block-store root must be rejected");
+            .expect_err("a `..`-relative alias of the block-store root must be rejected");
         assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
     }
 
@@ -304,8 +302,7 @@ mod tests {
         let aliased_root = link_parent.join("blocks");
 
         let err = ResourceLock::lock_block_store(&aliased_root)
-            .err()
-            .expect("a symlinked-parent alias of the block-store root must be rejected");
+            .expect_err("a symlinked-parent alias of the block-store root must be rejected");
         assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
     }
 
@@ -318,8 +315,7 @@ mod tests {
         let _owner = ResourceLock::lock_sync_db(&db).unwrap();
 
         let err = ResourceLock::lock_sync_db(&db)
-            .err()
-            .expect("a second holder of the same sync database must be rejected");
+            .expect_err("a second holder of the same sync database must be rejected");
         assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
     }
 
@@ -333,8 +329,7 @@ mod tests {
         // `<dir>/sub/../sync-state.sqlite3` names the same database.
         let alias = dir.path().join("sub").join("..").join("sync-state.sqlite3");
         let err = ResourceLock::lock_sync_db(&alias)
-            .err()
-            .expect("a `..`-relative alias of the sync database must be rejected");
+            .expect_err("a `..`-relative alias of the sync database must be rejected");
         assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
     }
 
@@ -351,8 +346,7 @@ mod tests {
         let db_link = dir.path().join("db-link.sqlite3");
         std::os::unix::fs::symlink(&db, &db_link).unwrap();
         let err = ResourceLock::lock_sync_db(&db_link)
-            .err()
-            .expect("a symlink to the existing sync database file must be rejected");
+            .expect_err("a symlink to the existing sync database file must be rejected");
         assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
     }
 
@@ -458,8 +452,7 @@ mod tests {
         let b = tempfile::tempdir().unwrap();
         let b_store = b.path().join("blocks");
         let err = DataResourceLocks::acquire(&b_store, &shared_db)
-            .err()
-            .expect("sharing A's database must make B fail");
+            .expect_err("sharing A's database must make B fail");
         assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
 
         // Rollback check: B's block-store lock was released on failure, so it is

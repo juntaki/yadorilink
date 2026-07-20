@@ -28,10 +28,8 @@ extern "C" {
 
 /*
  * Mirrors `YadoriLinkBadgeStatus` in src/lib.rs. Priority order (highest
- * first): a non-empty `open_elsewhere_device_id` always wins as
- * `OpenElsewhere`; then `MaterializationState::Placeholder`
- * (the "online-only" state) takes priority over the raw
- * sync state; `Hydrating` folds into `Syncing`.
+ * first): `MaterializationState::Placeholder` (the "online-only" state)
+ * takes priority over the raw sync state; `Hydrating` folds into `Syncing`.
  */
 typedef enum {
     YadoriLinkBadgeStatusUnspecified = 0,
@@ -40,7 +38,6 @@ typedef enum {
     YadoriLinkBadgeStatusPending = 3,
     YadoriLinkBadgeStatusError = 4,
     YadoriLinkBadgeStatusOnlineOnly = 5,
-    YadoriLinkBadgeStatusOpenElsewhere = 6,
 } YadoriLinkBadgeStatus;
 
 /*

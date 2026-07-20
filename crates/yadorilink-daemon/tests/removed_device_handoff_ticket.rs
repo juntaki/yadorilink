@@ -104,7 +104,11 @@ fn give_file(daemon: &Daemon, file_name: &str, content: &[u8], author: &str) {
     // (`record_group_block_provenance`'s doc comment): without this, the
     // real peer-to-peer durability confirmation this file exercises
     // refuses the block as never having been obtained through the group.
-    daemon.state.sync_state.record_group_block_provenance(GROUP, &[bytes.clone()]).unwrap();
+    daemon
+        .state
+        .sync_state
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&bytes))
+        .unwrap();
     let record = record_referencing(file_name, author, bytes, content.len() as u64);
     daemon.state.sync_state.upsert_file(GROUP, &record).unwrap();
 }

@@ -43,7 +43,6 @@ mod tests {
             data: b"plain block".to_vec(),
             not_found: false,
             compression: Compression::None as i32,
-            ..Default::default()
         }
         .encode_to_vec();
 

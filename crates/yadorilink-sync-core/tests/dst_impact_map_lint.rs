@@ -6,10 +6,10 @@
 //! `cargo test` and thus guards the map on every CI run — the map "cannot
 //! silently rot" (the design). It checks both directions:
 //!  - every `src/*.rs` top-level module has a `[modules]` entry, and every
-//!  `[modules]` key names a module file that exists;
+//!    `[modules]` key names a module file that exists;
 //!  - every `tests/dst_*.rs` scenario has a `[scenarios]` entry, and every
-//!  `[scenarios]` key (and every scenario referenced from `[modules]`)
-//!  names a scenario file that exists.
+//!    `[scenarios]` key (and every scenario referenced from `[modules]`)
+//!    names a scenario file that exists.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

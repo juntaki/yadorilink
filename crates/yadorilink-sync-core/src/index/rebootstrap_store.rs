@@ -1776,8 +1776,13 @@ mod tests {
                 "g",
                 &file_record(&v1, "a.bin"),
                 "device-a",
-                vec![Op::Create { path: SyncPath("a.bin".into()), version: v1.version_hash }],
-                std::slice::from_ref(&v1),
+                ChangeContent {
+                    ops: vec![Op::Create {
+                        path: SyncPath("a.bin".into()),
+                        version: v1.version_hash,
+                    }],
+                    versions: std::slice::from_ref(&v1),
+                },
                 None,
                 &emitter,
             )
@@ -1787,8 +1792,13 @@ mod tests {
                 "g",
                 &file_record(&v2, "a.bin"),
                 "device-a",
-                vec![Op::Update { path: SyncPath("a.bin".into()), version: v2.version_hash }],
-                std::slice::from_ref(&v2),
+                ChangeContent {
+                    ops: vec![Op::Update {
+                        path: SyncPath("a.bin".into()),
+                        version: v2.version_hash,
+                    }],
+                    versions: std::slice::from_ref(&v2),
+                },
                 None,
                 &emitter,
             )

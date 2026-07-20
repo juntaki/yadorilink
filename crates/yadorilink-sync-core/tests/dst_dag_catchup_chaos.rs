@@ -94,16 +94,16 @@
 //!
 //!   - **Its `MAX_VV_COUNTER_JUMP_PER_MESSAGE` assertion** — that an honest
 //!     >10,000 counter advance still fully heals despite the anti-forgery
-//!     clamp. This one is genuinely unsatisfiable now, and the mechanism is
-//!     gone rather than merely unused: `sanitize_against` has exactly one call
-//!     site (`apply_locked_record`), which has exactly one caller
-//!     (`rematerialize_one_record`), whose incoming record is a snapshot of
-//!     *this* device's own committed rows. The bound no longer sits on a peer
-//!     trust boundary at all, and a propagated record carries an empty vector
-//!     anyway. Its honest-growth-is-a-no-op property keeps unit coverage in
-//!     `version_vector.rs`. Note this assertion was flag-gated (first seed
-//!     only, and off entirely under a reduced ops budget) — it was that file's
-//!     soak dimension, not its core.
+//!     > clamp. This one is genuinely unsatisfiable now, and the mechanism is
+//!     > gone rather than merely unused: `sanitize_against` has exactly one call
+//!     > site (`apply_locked_record`), which has exactly one caller
+//!     > (`rematerialize_one_record`), whose incoming record is a snapshot of
+//!     > *this* device's own committed rows. The bound no longer sits on a peer
+//!     > trust boundary at all, and a propagated record carries an empty vector
+//!     > anyway. Its honest-growth-is-a-no-op property keeps unit coverage in
+//!     > `version_vector.rs`. Note this assertion was flag-gated (first seed
+//!     > only, and off entirely under a reduced ops budget) — it was that file's
+//!     > soak dimension, not its core.
 //!
 //! Genuinely not covered, by this file or that one:
 //!

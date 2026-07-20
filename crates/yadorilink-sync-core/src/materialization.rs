@@ -103,6 +103,17 @@ pub fn check_disk_headroom(
     Ok(())
 }
 
+/// The handles a materialization/eviction operation needs: the index, the
+/// block-liveness gate, the block store, and the linked folder's local root.
+/// Shared by [`evict_file`], [`run_eviction_sweep`], and
+/// [`run_disk_pressure_eviction_sweep`].
+pub struct MaterializationContext<'a> {
+    pub state: &'a SyncState,
+    pub liveness_gate: &'a BlockLivenessGate,
+    pub store: &'a dyn BlockStore,
+    pub root: &'a Path,
+}
+
 /// Evicts one hydrated, unpinned file back to a placeholder and, on an
 /// on-demand device, reclaims its now-cached blocks from the block store to
 /// free real disk space — the sync state (version, block list) is untouched.
@@ -136,15 +147,13 @@ pub fn check_disk_headroom(
 /// suppression, which only works if the index already says `Placeholder`
 /// by the time the watcher processes the resulting filesystem event).
 pub fn evict_file(
-    state: &SyncState,
-    liveness_gate: &BlockLivenessGate,
-    store: &dyn BlockStore,
-    root: &Path,
+    ctx: MaterializationContext<'_>,
     group_id: &str,
     path: &str,
     is_full_replica: bool,
     custody: &dyn FullReplicaCustody,
 ) -> Result<EvictionOutcome, SyncError> {
+    let MaterializationContext { state, liveness_gate, store, root } = ctx;
     let reference_write = liveness_gate.begin_reference_write();
     if state.is_pinned(group_id, path)? {
         return Err(SyncError::EvictionRejected(path.to_string()));
@@ -311,15 +320,13 @@ pub fn evict_file(
 /// releases the materialized copy without treating retained cache blocks as
 /// physically reclaimed custody-backed storage.
 pub fn run_eviction_sweep(
-    state: &SyncState,
-    liveness_gate: &BlockLivenessGate,
-    store: &dyn BlockStore,
-    root: &Path,
+    ctx: MaterializationContext<'_>,
     group_id: &str,
     is_full_replica: bool,
     max_local_size_bytes: Option<i64>,
     custody: &dyn FullReplicaCustody,
 ) -> Result<Vec<String>, SyncError> {
+    let MaterializationContext { state, liveness_gate, store, root } = ctx;
     // A full replica is the group's durable holder and never evicts.
     if is_full_replica {
         return Ok(vec![]);
@@ -356,10 +363,7 @@ pub fn run_eviction_sweep(
         // hydrated-usage figure this sweep tracks, so gate the accounting on
         // it rather than assuming every candidate was reclaimed.
         let outcome = evict_file(
-            state,
-            liveness_gate,
-            store,
-            root,
+            MaterializationContext { state, liveness_gate, store, root },
             group_id,
             &candidate.path,
             false,
@@ -420,15 +424,13 @@ fn refresh_missing_last_accessed(
 /// Without crash-durable remote custody leases, candidates may still become
 /// placeholders while their CAS blocks remain retained.
 pub fn run_disk_pressure_eviction_sweep(
-    state: &SyncState,
-    liveness_gate: &BlockLivenessGate,
-    store: &dyn BlockStore,
-    root: &Path,
+    ctx: MaterializationContext<'_>,
     group_id: &str,
     is_full_replica: bool,
     headroom_override_bytes: Option<u64>,
     custody: &dyn FullReplicaCustody,
 ) -> Result<Vec<String>, SyncError> {
+    let MaterializationContext { state, liveness_gate, store, root } = ctx;
     // A full replica is the group's durable holder and never evicts.
     if is_full_replica {
         return Ok(vec![]);
@@ -466,10 +468,7 @@ pub fn run_disk_pressure_eviction_sweep(
         // dehydrated — otherwise the sweep over-estimates reclaimed space and
         // can stop while the volume is still under pressure.
         let outcome = evict_file(
-            state,
-            liveness_gate,
-            store,
-            root,
+            MaterializationContext { state, liveness_gate, store, root },
             group_id,
             &candidate.path,
             false,
@@ -1357,10 +1356,12 @@ mod tests {
         std::fs::write(root.path().join("a.bin"), vec![9u8; 1000]).unwrap();
 
         evict_file(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             "a.bin",
             false,
@@ -1392,10 +1393,12 @@ mod tests {
 
         let (store, _store_dir) = new_store();
         let err = evict_file(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             "a.bin",
             false,
@@ -1422,10 +1425,12 @@ mod tests {
         let path_lock = state.path_lock("group-1", "busy.bin");
         let _active_operation = path_lock.try_lock().unwrap();
         let result = evict_file(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             "busy.bin",
             false,
@@ -1490,10 +1495,12 @@ mod tests {
             };
 
         let outcome = evict_file(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             "race.bin",
             false,
@@ -1537,10 +1544,12 @@ mod tests {
         std::fs::write(root.path().join("plain.bin"), b"plain file, evicted cleanly").unwrap();
 
         let baseline = evict_file(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             "plain.bin",
             false,
@@ -1570,10 +1579,12 @@ mod tests {
             };
 
         let outcome = evict_file(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             "meta.bin",
             false,
@@ -1611,10 +1622,12 @@ mod tests {
         // (800 bytes freed) to get to 400, but stop before evicting new.bin.
         let (store, _store_dir) = new_store();
         let evicted = run_eviction_sweep(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             false,
             Some(500),
@@ -1655,10 +1668,12 @@ mod tests {
 
         let (store, _store_dir) = new_store();
         let evicted = run_eviction_sweep(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             false,
             Some(1000),
@@ -1678,10 +1693,12 @@ mod tests {
 
         let (store, _store_dir) = new_store();
         let evicted = run_eviction_sweep(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             false,
             Some(0),
@@ -1719,10 +1736,12 @@ mod tests {
         // and evict nothing.
         let (store, _store_dir) = new_store();
         let evicted = run_eviction_sweep(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             false,
             Some(1000),
@@ -1774,10 +1793,12 @@ mod tests {
         // Total hydrated usage is 2000, cap 500 — both files are candidates,
         // dirty.bin first. Only clean.bin actually dehydrates.
         let evicted = run_eviction_sweep(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             false,
             Some(500),
@@ -1811,10 +1832,12 @@ mod tests {
 
         let (store, _store_dir) = new_store();
         let evicted = run_eviction_sweep(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             false,
             None,
@@ -1848,10 +1871,12 @@ mod tests {
         assert!(store.exists(&hash_hex).unwrap(), "block present before eviction");
 
         let outcome = evict_file(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             "doc.bin",
             false,
@@ -1890,10 +1915,12 @@ mod tests {
         std::fs::write(root.path().join("edit.bin"), &content).unwrap();
 
         let outcome = evict_file(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             "edit.bin",
             false,
@@ -1922,10 +1949,12 @@ mod tests {
         std::fs::write(root.path().join("keep.bin"), &content).unwrap();
 
         let outcome = evict_file(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             "keep.bin",
             true, // this device is a full replica
@@ -1963,10 +1992,12 @@ mod tests {
         };
 
         evict_file(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             "race.bin",
             false,
@@ -2002,10 +2033,12 @@ mod tests {
             true
         };
         let outcome = evict_file(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             "disk-race.bin",
             false,
@@ -2041,10 +2074,12 @@ mod tests {
         std::fs::write(&root_path, b"not a directory").unwrap();
 
         let result = evict_file(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            &root_path,
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: &root_path,
+            },
             "group-1",
             "write-fails.bin",
             false,
@@ -2113,10 +2148,12 @@ mod tests {
 
         // b.bin stays hydrated, so the shared block must survive evicting a.bin.
         evict_file(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             "a.bin",
             false,
@@ -2148,10 +2185,12 @@ mod tests {
         std::fs::write(root.path().join("group-a.bin"), &content).unwrap();
 
         evict_file(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-a",
             "group-a.bin",
             false,
@@ -2210,10 +2249,12 @@ mod tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     evict_file(
-                        state.as_ref(),
-                        liveness_gate.as_ref(),
-                        store.as_ref(),
-                        root.as_ref(),
+                        MaterializationContext {
+                            state: state.as_ref(),
+                            liveness_gate: liveness_gate.as_ref(),
+                            store: store.as_ref(),
+                            root: root.as_ref(),
+                        },
                         group,
                         path,
                         false,
@@ -2259,10 +2300,12 @@ mod tests {
             path == "confirmed.bin"
         };
         let evicted = run_eviction_sweep(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             false,
             Some(0),
@@ -2336,10 +2379,12 @@ mod tests {
         // but reached with *no* cap configured at all.
         let (store, _store_dir) = new_store();
         let evicted = run_disk_pressure_eviction_sweep(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             false,
             Some(u64::MAX / 2),
@@ -2363,10 +2408,12 @@ mod tests {
 
         let (store, _store_dir) = new_store();
         let evicted = run_disk_pressure_eviction_sweep(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             false,
             Some(u64::MAX / 2),
@@ -2392,10 +2439,12 @@ mod tests {
 
         let (store, _store_dir) = new_store();
         let evicted = run_disk_pressure_eviction_sweep(
-            &state,
-            &BlockLivenessGate::default(),
-            &store,
-            root.path(),
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+            },
             "group-1",
             false,
             Some(0),
@@ -2944,7 +2993,7 @@ mod tests {
         assert_eq!(report.offline_deleted, vec!["gone.txt".to_string()]);
         // Tombstoned locally AND propagated through the change seam.
         assert!(
-            state.get_file("group-1", "gone.txt").unwrap().map_or(true, |r| r.deleted),
+            state.get_file("group-1", "gone.txt").unwrap().is_none_or(|r| r.deleted),
             "the index row must be a tombstone, not a live Hydrated record"
         );
         assert_eq!(

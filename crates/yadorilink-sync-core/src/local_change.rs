@@ -23,7 +23,7 @@ use crate::dag_store::ChangeEmitter;
 use crate::debounce::DebounceFlush;
 use crate::error::SyncError;
 use crate::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
-use crate::index::{LocalFileMetaColumns, SyncState};
+use crate::index::{ChangeContent, LocalFileMetaColumns, SyncState};
 use crate::root_identity::{is_root_marker_relative_path, VerifiedRoot};
 use crate::types::{owner_exec_bit_from_metadata, FileRecord, MaterializationState, RecordKind};
 use crate::watcher::{FsChangeEvent, FsChangeKind};
@@ -831,8 +831,7 @@ impl LocalChangeProcessor {
                     group_id,
                     chunk_records,
                     &self.device_id,
-                    chunk_ops,
-                    &chunk_versions,
+                    ChangeContent { ops: chunk_ops, versions: &chunk_versions },
                     chunk_metas,
                     emitter,
                 ) {
@@ -1154,8 +1153,10 @@ impl LocalChangeProcessor {
                                 group_id,
                                 record,
                                 &self.device_id,
-                                vec![op],
-                                std::slice::from_ref(&version),
+                                ChangeContent {
+                                    ops: vec![op],
+                                    versions: std::slice::from_ref(&version),
+                                },
                                 Some(&meta),
                                 emitter,
                             )?;
@@ -1943,7 +1944,11 @@ mod tests {
     // Serializes the two tests that install the process-wide scan hook so they
     // never observe each other's hook. Other scan tests use different group ids,
     // and the hook no-ops for any group but `RACE_GROUP`, so they are unaffected.
-    static SCAN_RACE_TEST_GUARD: Mutex<()> = Mutex::new(());
+    // An async-aware `Mutex`, not `std::sync::Mutex`: both tests hold this guard
+    // across `.await` points for their entire body (that's the point -- the
+    // whole test, not just its setup, must stay serialized against the other),
+    // which a `std::sync::MutexGuard` cannot safely do.
+    static SCAN_RACE_TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct Latch {
         raised: Mutex<bool>,
@@ -2029,7 +2034,7 @@ mod tests {
     /// completes and is NOT overwritten by the scan's stale-snapshot record.
     #[tokio::test]
     async fn startup_barrier_prevents_stale_overwrite_of_concurrent_peer_change() {
-        let _serial = SCAN_RACE_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SCAN_RACE_TEST_GUARD.lock().await;
         let (processor, state, root, ignore_set, _store_dir, _root_dir) = build_race_fixture();
 
         // As `start_link_watch` does synchronously before spawning the executor.
@@ -2098,7 +2103,7 @@ mod tests {
     /// the gate does not admit it.
     #[tokio::test]
     async fn startup_scan_stale_overwrites_concurrent_peer_change_without_barrier() {
-        let _serial = SCAN_RACE_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SCAN_RACE_TEST_GUARD.lock().await;
         let (processor, state, root, ignore_set, _store_dir, _root_dir) = build_race_fixture();
         // Deliberately no `begin_group_startup`: models a startup that never
         // registered a gate for a link that is nonetheless live.
@@ -4479,7 +4484,7 @@ mod tests {
                 1,
                 "a chunked reconciliation must form a linear chain (exactly one parent per change)"
             );
-            let parent = change.parents[0].clone();
+            let parent = change.parents[0];
             chain.push(change);
             cur = parent;
         }
@@ -4550,7 +4555,7 @@ mod tests {
         // exactly (same single committed state, not a later reconciliation).
         let heads_after = state.dag_group_heads(group).unwrap();
         assert_ne!(heads_after, heads_before, "the symlink must have emitted a change");
-        let chain = linear_chain_back_to(&state, heads_after[0].clone(), &heads_before[0]);
+        let chain = linear_chain_back_to(&state, heads_after[0], &heads_before[0]);
         let vh = version_hash_for_path(&chain[chain.len() - 1], "link");
         let version = state.dag_get_file_version(group, &vh).unwrap().unwrap();
         assert_eq!(version.meta.record_kind, RecordKind::Symlink);
@@ -4596,7 +4601,7 @@ mod tests {
         assert_eq!(state.get_symlink_target(group, "run.sh").unwrap(), None);
 
         let heads_after = state.dag_group_heads(group).unwrap();
-        let chain = linear_chain_back_to(&state, heads_after[0].clone(), &heads_before[0]);
+        let chain = linear_chain_back_to(&state, heads_after[0], &heads_before[0]);
         let vh = version_hash_for_path(&chain[chain.len() - 1], "run.sh");
         let version = state.dag_get_file_version(group, &vh).unwrap().unwrap();
         assert!(version.meta.exec_bit, "the emitted FileVersion carries the exec bit too");
@@ -4638,7 +4643,7 @@ mod tests {
 
         let heads_after = state.dag_group_heads(group).unwrap();
         assert_eq!(heads_after.len(), 1, "the chunk chain must converge on a single head");
-        let chain = linear_chain_back_to(&state, heads_after[0].clone(), &heads_before[0]);
+        let chain = linear_chain_back_to(&state, heads_after[0], &heads_before[0]);
         assert!(
             chain.len() >= 2,
             "{n} changed paths must split into >= 2 chained changes, got {}",
@@ -4696,7 +4701,7 @@ mod tests {
         proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
 
         let heads_after = state.dag_group_heads(group).unwrap();
-        let chain = linear_chain_back_to(&state, heads_after[0].clone(), &heads_before[0]);
+        let chain = linear_chain_back_to(&state, heads_after[0], &heads_before[0]);
         assert!(
             chain.len() >= 2,
             "a >256 KiB diff of {n} (< op-count-cap) paths must split by bytes into >= 2 changes, \
