@@ -22,6 +22,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
@@ -57,17 +58,25 @@ jobs:
         if: matrix.os != 'ubuntu-latest'
         run: cargo build --workspace --all-targets
 
+      # Two yadorilink-sync-core lib tests install a process-wide scan hook
+      # and must never observe a sibling test's own hook -- they serialize
+      # against each other internally, but running alongside the rest of a
+      # multi-threaded workspace pass under host load has been observed to
+      # hang the whole `cargo test` invocation, not just flake. Skipped here
+      # (workspace-wide, but these two names are unique enough that this
+      # can't accidentally skip anything unrelated) and run on their own
+      # below instead.
       - name: Test (Linux, desktop app excluded)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
+        run: cargo test --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app -- --skip startup_barrier_prevents_stale_overwrite_of_concurrent_peer_change --skip startup_scan_stale_overwrites_concurrent_peer_change_without_barrier
 
       - name: Test
         if: matrix.os == 'macos-latest'
-        run: cargo test --workspace --exclude yadorilink-daemon
+        run: cargo test --workspace --exclude yadorilink-daemon -- --skip startup_barrier_prevents_stale_overwrite_of_concurrent_peer_change --skip startup_scan_stale_overwrites_concurrent_peer_change_without_barrier
 
       - name: Test
         if: matrix.os == 'windows-latest'
-        run: cargo test --workspace --exclude yadorilink-daemon -- --test-threads=4
+        run: cargo test --workspace --exclude yadorilink-daemon -- --test-threads=4 --skip startup_barrier_prevents_stale_overwrite_of_concurrent_peer_change --skip startup_scan_stale_overwrites_concurrent_peer_change_without_barrier
 
       # yadorilink-daemon's integration tests spin up multiple real
       # in-process daemons over real loopback UDP/Unix sockets and real
@@ -80,6 +89,26 @@ jobs:
       # depends on that contention.
       - name: Daemon tests (isolated from the rest of the workspace, single-threaded)
         run: cargo test -p yadorilink-daemon -- --test-threads=1
+
+      # yadorilink-sync-core's own real-UDP-peer-session/crash-recovery
+      # integration tests carry the same class of real-socket/real-disk
+      # timing-sensitive assertions as the daemon crate above -- its own
+      # dev-side CI runs a matching sync-core-wire lane in exactly this
+      # isolated, single-threaded form for exactly this reason. NOT
+      # excluded from the main Test step above (unlike yadorilink-daemon):
+      # sync-core also carries much slower dst_*.rs scenario binaries that
+      # are fine running multi-threaded there but far too slow to also
+      # duplicate single-threaded here, so this crate is double-run rather
+      # than fully carved out -- these four are cheap enough that the
+      # redundancy is worth the extra reliability.
+      - name: Sync-core wire integration tests (isolated, single-threaded)
+        run: cargo test -p yadorilink-sync-core --test peer_session --test crash_recovery --test watcher_decompose_conformance --test dag_two_device_wire_convergence -- --test-threads=1
+
+      # The two lib tests skipped above, run alone and single-threaded so
+      # their internal scan-hook serialization is never itself the thing
+      # contending with the rest of the workspace under host load.
+      - name: Sync-core scan-hook lib tests (isolated, single-threaded)
+        run: cargo test -p yadorilink-sync-core --lib -- --test-threads=1 startup_barrier_prevents_stale_overwrite_of_concurrent_peer_change startup_scan_stale_overwrites_concurrent_peer_change_without_barrier
 
   shell-ext-windows:
     runs-on: windows-latest
