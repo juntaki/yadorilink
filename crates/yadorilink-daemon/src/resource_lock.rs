@@ -367,8 +367,7 @@ mod tests {
         // The two paths really are the same inode but distinct sidecars, so the
         // rejection can only come from the live-inode flock.
         let err = ResourceLock::lock_sync_db(&hard)
-            .err()
-            .expect("a hard link to the same DB inode must be rejected by the live-inode flock");
+            .expect_err("a hard link to the same DB inode must be rejected by the live-inode flock");
         assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
     }
 
