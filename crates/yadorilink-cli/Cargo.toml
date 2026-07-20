@@ -1,0 +1,73 @@
+[package]
+name = "yadorilink-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yadorilink"
+path = "src/main.rs"
+
+[dependencies]
+yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+yadorilink-transport = { path = "../yadorilink-transport" }
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+yadorilink-sync-core = { path = "../yadorilink-sync-core" }
+yadorilink-reporting = { path = "../yadorilink-reporting" }
+# Promoted from dev-dependency (it was already one, for this crate's own
+# daemon-backed integration tests) to a real dependency — the CLI-only
+# reporting fallback reuses
+# `yadorilink_daemon::reporting`'s `ConsentStore`/`ErrorCandidateStore`
+# directly rather than re-implementing local JSON-file storage a second
+# time (see `commands/report.rs`'s module doc comment). `yadorilink-daemon`
+# has no dependency back on `yadorilink-cli`, so this doesn't create a
+# cycle.
+yadorilink-daemon = { path = "../yadorilink-daemon" }
+tokio.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+thiserror.workspace = true
+# Audit-trail logging for the `--force` durability-gate override on
+# `unlink`/`share revoke`/`device remove` (see `commands::durability_force`).
+tracing.workspace = true
+tracing-subscriber.workspace = true
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+serde.workspace = true
+serde_json = "1"
+# HTTP+WebSocket client for the Cloudflare-hosted coordination plane.
+# rustls (not native-tls) matches yadorilink-reporting's existing choice
+# elsewhere in this workspace, for the same reason (no system OpenSSL dep).
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+] }
+# OAuth 2.0 client (RFC 6749 Authorization Code + PKCE per RFC 7636,
+# RFC 8628 Device Authorization Grant) for `google_auth.rs`. Same
+# rustls-tls choice as this crate's own `reqwest` dep.
+oauth2 = { version = "5", default-features = false, features = ["reqwest", "rustls-tls"] }
+# Matches yadorilink-daemon's existing version pin -- only needed to encode
+# WireGuard public keys as base64 for the coordination service's JSON routes.
+base64 = { version = "0.22" }
+# `http_client.rs`'s coordination-address validation (http(s)/loopback
+# check) -- deliberately not hand-rolled string splitting,
+# which mishandled IPv6 literal addresses (`http://[::1]:8787`) in an
+# earlier version of this file. Same crate `oauth2`/`google_login.rs` use.
+url = { version = "2" }
+# Operation ids for `share.rs`'s crash-safe create/join enrollment: a random
+# per-attempt operation id, the idempotency key for the coordination plane's
+# prepare/activate/cancel routes and the compensation trail. Same version pin
+# as `yadorilink-daemon`'s existing `uuid` dependency.
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+hex = "0.4"
+sha2.workspace = true
+# Mocks Google's device authorization/token endpoints for
+# `google_auth.rs`'s device-grant
+# polling/backoff test. Same version already used by `yadorilink-daemon`'s
+# and `yadorilink-reporting`'s own local-HTTP-listener integration tests.
+wiremock = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }

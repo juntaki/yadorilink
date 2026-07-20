@@ -1,0 +1,140 @@
+name: Update channel controls
+
+# Operator surface for the update manifest: change a channel's rollout
+# percentage, flip the
+# kill-switch, or raise the minimum supported version WITHOUT rebuilding any
+# release artifact. The change is applied as re-generate -> re-validate ->
+# re-sign -> republish of the single per-channel manifest, leaving the
+# referenced artifacts untouched. This workflow's run history is the audit
+# trail (actor, timestamp, inputs); it is additionally written to the run
+# summary.
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Channel whose manifest to update"
+        required: true
+        type: choice
+        options: [nightly, beta]
+      rollout_percentage:
+        description: "New rollout percentage (0-100); leave blank to keep current"
+        required: false
+        type: string
+      kill_switch:
+        description: "Kill-switch state"
+        required: true
+        type: choice
+        default: "unchanged"
+        options: [unchanged, "on", "off"]
+      min_version:
+        description: "New minimum supported version (semver); leave blank to keep current"
+        required: false
+        type: string
+      reason:
+        description: "Why (recorded in the audit trail)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  update-manifest:
+    runs-on: ubuntu-latest
+    environment: release-signing
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Require manifest signing key
+        env:
+          MANIFEST_KEY: ${{ secrets.MANIFEST_SIGNING_KEY }}
+          PRIVATE_KEY_ID: ${{ secrets.MANIFEST_SIGNING_KEY_ID }}
+          PUBLIC_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+        run: |
+          if [ -z "$MANIFEST_KEY" ] || [ -z "$PRIVATE_KEY_ID" ] || \
+             [ -z "$PUBLIC_KEY_ID" ] || [ -z "$PUBLIC_KEY_HEX" ]; then
+            echo "Complete release-signing secrets and public key variables are required." >&2
+            exit 1
+          fi
+          if [ "$PRIVATE_KEY_ID" != "$PUBLIC_KEY_ID" ]; then
+            echo "Manifest key id mismatch between release-signing secret and repository variable." >&2
+            exit 1
+          fi
+
+      - name: Build manifest signer
+        run: cargo build --release -p yadorilink-daemon --bin yadorilink-sign-manifest
+
+      - name: Re-sign and republish the channel manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANIFEST_SIGNING_KEY: ${{ secrets.MANIFEST_SIGNING_KEY }}
+          MANIFEST_SIGNING_KEY_ID: ${{ secrets.MANIFEST_SIGNING_KEY_ID }}
+          RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CHANNEL: ${{ inputs.channel }}
+          ROLLOUT: ${{ inputs.rollout_percentage }}
+          KILL: ${{ inputs.kill_switch }}
+          MIN_VERSION: ${{ inputs.min_version }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+
+          # Fetch the current signed manifest (exact bytes) from the stable
+          # edge URL — this is what clients currently see, so we mutate from it.
+          url="https://yadorilink.juntaki.com/updates/${CHANNEL}/manifest.json"
+          if ! curl -fsSL "$url" -o current-manifest.json; then
+            echo "Could not fetch current manifest at $url. Publish the channel first." >&2
+            exit 1
+          fi
+
+          args=(resign --input current-manifest.json --out new-manifest.json --require-signature)
+          if [ -n "${ROLLOUT}" ]; then args+=(--rollout-percentage "${ROLLOUT}"); fi
+          if [ -n "${MIN_VERSION}" ]; then args+=(--min-version "${MIN_VERSION}"); fi
+          case "${KILL}" in
+            on)  args+=(--kill-switch) ;;
+            off) args+=(--clear-kill-switch) ;;
+            unchanged) : ;;
+          esac
+
+          python3 scripts/generate-update-manifest.py "${args[@]}"
+
+          # Gate: re-verify signature + consistency before republish.
+          python3 -m pip install --quiet --disable-pip-version-check cryptography
+          python3 scripts/verify-update-manifest.py new-manifest.json \
+            --key-id "${MANIFEST_SIGNING_KEY_ID}" \
+            --public-key-hex "${RELEASE_MANIFEST_PUBLIC_KEY_HEX}"
+
+          # Republish: R2 edge host (no worker redeploy) + the channel's
+          # GitHub Release asset so the exact bytes have a durable audit copy.
+          if [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            npx --yes wrangler@3 r2 object put \
+              "yadorilink-update-manifests/${CHANNEL}/manifest.json" \
+              --file new-manifest.json --content-type application/json --remote
+          fi
+          release_tag="${CHANNEL}"
+          if [ "${CHANNEL}" = "beta" ]; then
+            # Beta manifests live on their versioned tag; derive it from the body.
+            release_tag="$(python3 -c 'import json,sys; e=json.load(open("new-manifest.json")); m=json.loads(e["manifest_json"]); print("v"+m["releases"][0]["version"])')"
+          fi
+          canonical_asset="manifest-${CHANNEL}.json"
+          cp new-manifest.json "$canonical_asset"
+          gh release upload "$release_tag" "$canonical_asset" --clobber || \
+            echo "note: could not attach to release $release_tag (R2 remains the source of truth)"
+
+          # Audit trail: actor, timestamp, and new values.
+          {
+            echo "### Manifest control change"
+            echo ""
+            echo "- **Actor:** ${GITHUB_ACTOR}"
+            echo "- **When:** $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "- **Channel:** ${CHANNEL}"
+            echo "- **Rollout %:** ${ROLLOUT:-unchanged}"
+            echo "- **Kill-switch:** ${KILL}"
+            echo "- **Min version:** ${MIN_VERSION:-unchanged}"
+            echo "- **Reason:** ${REASON}"
+          } >> "$GITHUB_STEP_SUMMARY"

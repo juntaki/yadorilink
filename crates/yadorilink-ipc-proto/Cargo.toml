@@ -1,0 +1,24 @@
+[package]
+name = "yadorilink-ipc-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The wire types here are plain protobuf messages (peer-to-peer sync,
+# daemon control, shell IPC, local discovery). They are exchanged over
+# length-prefixed framing on local sockets and the sync transport, not a
+# gRPC service, so only `prost` is needed — no `tonic`.
+[dependencies]
+prost = "0.14.4"
+tokio = { version = "1", features = ["io-util"] }
+
+[build-dependencies]
+prost-build = "0.14"
+
+# `io-util` is inherited from the dependency above; the test target
+# additionally needs `macros` for `#[tokio::test]` and `rt` for the
+# `tokio::spawn` the framing tests drive their duplex halves with. Without
+# these the whole `cfg(test)` target fails to compile, which silently takes
+# every test in this crate with it.
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt"] }

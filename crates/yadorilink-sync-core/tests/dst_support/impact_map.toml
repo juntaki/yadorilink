@@ -1,0 +1,167 @@
+# DST module -> scenario impact map.
+#
+# Purpose: an agent (or developer) that touched `src/<module>.rs` reads this
+# file to answer "which DST scenarios plausibly cover my diff, and which do I
+# run *first*?" without reading every 1300-line scenario source. It is small,
+# reviewable data, not a build-graph analysis.
+#
+# Two tables, both lint-enforced by `tests/dst_impact_map_lint.rs`:
+#  [modules] every top-level `src/*.rs` module -> the scenarios exercising
+#  it, ordered most-directly-relevant first ("run-this-first").
+#  An empty list is legal and meaningful: it says "no DST
+#  scenario targets this module yet" (a coverage signal, not an
+#  error). The lint fails only when a module file exists with no
+#  entry here, or an entry names a module file that does not
+#  exist.
+#  [scenarios] every `tests/dst_*.rs` scenario -> the oracle kinds it runs.
+#  The lint fails when a `dst_*.rs` file has no entry, or an
+#  entry names a scenario file that does not exist.
+#
+# Oracle kinds mirror `dst_support::oracle::ViolationKind`. Derived from each
+# scenario's `check_*` oracle calls; keep in sync when a scenario gains/drops
+# an oracle.
+
+schema_version = 1
+
+[modules]
+# The indexing/state core is touched by every scenario.
+index = [
+    "dst_two_device_chaos",
+    "dst_three_device_mesh_chaos",
+    "dst_network_fault_chaos",
+    "dst_directory_chaos",
+    "dst_disk_crash_chaos",
+    "dst_peer_reconcile_race",
+    "dst_materialization_crash_recovery",
+    "dst_hydration_under_fault_chaos",
+    "dst_watcher_debounce",
+]
+local_change = [
+    "dst_two_device_chaos",
+    "dst_three_device_mesh_chaos",
+    "dst_network_fault_chaos",
+    "dst_directory_chaos",
+    "dst_disk_crash_chaos",
+    "dst_peer_reconcile_race",
+    "dst_watcher_debounce",
+]
+watcher = [
+    "dst_watcher_debounce",
+    "dst_directory_chaos",
+    "dst_two_device_chaos",
+    "dst_three_device_mesh_chaos",
+    "dst_network_fault_chaos",
+    "dst_disk_crash_chaos",
+    "dst_peer_reconcile_race",
+]
+debounce = [
+    "dst_watcher_debounce",
+    "dst_two_device_chaos",
+    "dst_three_device_mesh_chaos",
+    "dst_network_fault_chaos",
+    "dst_directory_chaos",
+    "dst_disk_crash_chaos",
+    "dst_peer_reconcile_race",
+]
+ignore_patterns = [
+    "dst_watcher_debounce",
+    "dst_two_device_chaos",
+    "dst_three_device_mesh_chaos",
+    "dst_network_fault_chaos",
+    "dst_directory_chaos",
+    "dst_disk_crash_chaos",
+    "dst_peer_reconcile_race",
+]
+peer_session = [
+    "dst_two_device_chaos",
+    "dst_three_device_mesh_chaos",
+    "dst_network_fault_chaos",
+    "dst_peer_reconcile_race",
+    "dst_disk_crash_chaos",
+    "dst_directory_chaos",
+]
+conflict = [
+    "dst_two_device_chaos",
+    "dst_three_device_mesh_chaos",
+    "dst_directory_chaos",
+    "dst_network_fault_chaos",
+    "dst_disk_crash_chaos",
+]
+version_vector = [
+    "dst_two_device_chaos",
+    "dst_three_device_mesh_chaos",
+    "dst_network_fault_chaos",
+    "dst_directory_chaos",
+    "dst_disk_crash_chaos",
+    "dst_materialization_crash_recovery",
+]
+materialization = [
+    "dst_materialization_crash_recovery",
+    "dst_hydration_under_fault_chaos",
+    "dst_disk_crash_chaos",
+    "dst_network_fault_chaos",
+    "dst_two_device_chaos",
+    "dst_three_device_mesh_chaos",
+    "dst_directory_chaos",
+]
+types = [
+    "dst_materialization_crash_recovery",
+    "dst_disk_crash_chaos",
+    "dst_three_device_mesh_chaos",
+]
+# Modules with no DST scenario targeting them yet. Kept explicit so the lint
+# proves the list is complete (not silently forgotten) and so the emptiness is
+# itself a visible coverage gap an agent can pick up as a detection target.
+# TODO(coverage): adaptive_window/chunker/hazard/
+# rate_limiter/link_preflight have unit tests in `src/` but no DST scenario
+# drives them through the simulated envelope.
+adaptive_window = []
+authenticated_history = []
+block_deletion = []
+block_liveness = []
+change = []
+chunker = []
+compaction = []
+custody = []
+dag_import = []
+hazard = []
+error = []
+rate_limiter = []
+link_preflight = []
+rebootstrap = []
+rebootstrap_snapshot = []
+# Sync-root identity: exercised only by unit tests so far; no DST scenario drives
+# an unmounted-volume or wrong-root boot yet.
+root_identity = []
+
+[scenarios]
+# scenario -> oracle kinds it asserts (mirrors ViolationKind). `first_divergence`
+# is true once the scenario routes failures through the first-divergence
+# observer; currently pending the
+# triage-replay integration, so all are false. See INTEGRATION.md.
+dst_two_device_chaos = { oracles = ["Convergence", "NoLoss", "Corruption", "ConflictCopyAccounting", "StructuralIndexDiskMismatch", "StructuralOrphanIndexRow", "SlowConvergence"], first_divergence = false }
+# The self-driving generated seed-sweep: generate_case -> op_applier -> full
+# oracle suite (gates on Convergence + Corruption; the rest run advisory).
+dst_generated_sweep = { oracles = ["Convergence", "NoLoss", "Corruption", "ConflictCopyAccounting", "StructuralIndexDiskMismatch", "StructuralOrphanIndexRow", "StructuralMaterializationMismatch", "ConvergedToWrongWinner"], first_divergence = false }
+# Strong-eventual-consistency suite for the change-history DAG reference model:
+# convergence, no resurrection, deterministic conflict-copy naming, and
+# store-and-forward semantics.
+dst_sec_convergence = { oracles = ["Convergence", "ConflictCopyAccounting"], first_divergence = false }
+dst_three_device_mesh_chaos = { oracles = ["Convergence", "NoLoss", "Corruption", "ConflictCopyAccounting", "StructuralIndexDiskMismatch", "StructuralOrphanIndexRow", "SlowConvergence"], first_divergence = false }
+dst_network_fault_chaos = { oracles = ["Convergence", "NoLoss", "Corruption", "ConflictCopyAccounting", "StructuralIndexDiskMismatch", "StructuralOrphanIndexRow", "SlowConvergence"], first_divergence = false }
+dst_directory_chaos = { oracles = ["Convergence", "NoLoss", "Corruption", "ConflictCopyAccounting", "StructuralIndexDiskMismatch", "StructuralOrphanIndexRow", "SlowConvergence"], first_divergence = false }
+dst_disk_crash_chaos = { oracles = ["Convergence", "NoLoss", "Corruption", "ConflictCopyAccounting", "StructuralIndexDiskMismatch", "StructuralOrphanIndexRow"], first_divergence = false }
+dst_hydration_under_fault_chaos = { oracles = ["Convergence", "NoLoss", "Corruption", "StructuralIndexDiskMismatch", "StructuralOrphanIndexRow"], first_divergence = false }
+dst_peer_reconcile_race = { oracles = ["NoLoss"], first_divergence = false }
+dst_watcher_debounce = { oracles = ["NoLoss"], first_divergence = false }
+# Drives its own materialization/crash asserts rather than the shared oracle
+# kinds; no `check_*` oracle call, so no ViolationKind is listed.
+dst_materialization_crash_recovery = { oracles = [], first_divergence = false }
+# A targeted regression guard for directory-rename vs a concurrent child edit:
+# asserts the edited bytes survive in both orderings with its own assert rather
+# than a `check_*` oracle, so no ViolationKind is listed.
+dst_directory_move_edit_race = { oracles = [], first_divergence = false }
+# Repeated long-offline -> reconnect -> heal against the DAG heads-announce
+# catch-up. Drives its own terminal convergence assertion rather than a `check_*`
+# oracle, so no ViolationKind is listed.
+dst_dag_catchup_chaos = { oracles = [], first_divergence = false }

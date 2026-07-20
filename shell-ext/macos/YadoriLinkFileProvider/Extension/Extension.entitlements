@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  Entitlements for the File Provider extension
+  point (com.apple.fileprovider-nonui), same App Sandbox + App Group
+  shape as ../../YadoriLinkFinderSync/Extension/Extension.entitlements
+  (read that file's doc comment in full for the hard-won reasoning this
+  was derived from — it is not repeated verbatim here to avoid drift
+  between two copies of the same long explanation; only what's
+  specific to this target is noted below).
+
+  1. App Sandbox must be ON — PlugInKit/ExtensionKit reject unsandboxed
+     extensions outright, confirmed for FinderSync this session and
+     expected to hold equally for the File Provider extension point
+     (both are System Extensions-adjacent app-extension mechanisms
+     gated by the same OS-level discovery process).
+  2. Real Apple Development (or better) signing is required to *launch*
+     a sandboxed extension at all — ad-hoc signing lets the process
+     spawn but it dies silently right after AppSandbox init. Automatic
+     signing (project.yml: CODE_SIGN_STYLE Automatic, DEVELOPMENT_TEAM
+     594UQF7QX3) is reused unchanged from YadoriLinkFinderSync's target.
+  3. `com.apple.security.application-groups` = group.com.juntaki.yadorilink.shared
+     is the confirmed-working mechanism for this sandboxed extension to
+     reach the daemon's Unix socket (`fileprovider-core/src/ipc_client.rs`
+     mirrors `core/src/ipc_client.rs`'s socket_path() resolution:
+     `~/Library/Group Containers/group.com.juntaki.yadorilink.shared/shell.sock`,
+     no Team ID prefix). NOT independently re-verified end-to-end for
+     this specific extension point in this session (only FinderSync's
+     use of the same entitlement was confirmed via a real Finder
+     badge/menu render) — flagged as a residual verification gap,
+     not assumed proven by analogy alone.
+
+  This extension additionally needs no entitlement for the File Provider
+  domain mechanism itself (NSFileProviderManager/domain registration is
+  not gated by an entitlement beyond normal App Sandbox membership plus
+  the NSExtensionFileProviderDocumentGroup Info.plist key — see
+  Info.plist's doc comment).
+-->
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.network.client</key>
+	<false/>
+	<key>com.apple.security.network.server</key>
+	<false/>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.juntaki.yadorilink.shared</string>
+	</array>
+</dict>
+</plist>

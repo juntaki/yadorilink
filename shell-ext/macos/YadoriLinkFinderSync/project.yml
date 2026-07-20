@@ -1,0 +1,129 @@
+name: YadoriLinkFinderSync
+options:
+  bundleIdPrefix: com.juntaki.yadorilink
+  deploymentTarget:
+    macOS: "11.0"
+
+settings:
+  base:
+    SWIFT_VERSION: 5.0
+    MACOSX_DEPLOYMENT_TARGET: "11.0"
+    DEVELOPMENT_TEAM: 594UQF7QX3
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  # NOTE: this.xcodeproj/project.yml keeps its
+  # original name/directory (YadoriLinkFinderSync) even though it now also
+  # hosts the YadoriLinkFileProvider extension target below — one host app
+  # embedding both extensions was chosen over a second host app because
+  # a single "yadorilink" entry in System Settings > Extensions covering
+  # both the Eager-folder Finder integration and the OnDemand File
+  # Provider domain is simpler for a user to find/enable than two
+  # separate apps, and both extensions already share one App Group
+  # (group.com.juntaki.yadorilink.shared) and one signing identity — there is no
+  # real isolation benefit to splitting them.
+  YadoriLinkFinderSyncHost:
+    type: application
+    platform: macOS
+    sources:
+      - path: HostApp/main.swift
+      - path: HostApp/DomainRegistration.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.juntaki.yadorilink
+        INFOPLIST_FILE: HostApp/Info.plist
+        PRODUCT_NAME: YadoriLinkFinderSyncHost
+        # HostApp/DomainRegistration.swift needs the
+        # fileprovider-core FFI (yadorilink_fp_list_on_demand_folders) to
+        # discover which OnDemand folder groups to register as File
+        # Provider domains, and the FileProvider.framework for
+        # NSFileProviderManager/NSFileProviderDomain themselves.
+        SWIFT_OBJC_BRIDGING_HEADER: HostApp/YadoriLinkFinderSyncHost-Bridging-Header.h
+        HEADER_SEARCH_PATHS: ../fileprovider-core/include
+        LIBRARY_SEARCH_PATHS: ../fileprovider-core/target/aarch64-apple-darwin/release
+        OTHER_LDFLAGS: -lyadorilink_fileprovider_core -liconv
+    prebuildScripts:
+      - name: Build Rust FFI core (fileprovider-core)
+        script: |
+          set -euo pipefail
+          cd "$SRCROOT/../fileprovider-core"
+          cargo build --release --target aarch64-apple-darwin
+        basedOnDependencyAnalysis: false
+    frameworks:
+      - Cocoa.framework
+      - FileProvider.framework
+    dependencies:
+      - target: YadoriLinkFinderSync
+        embed: true
+      - target: YadoriLinkFileProvider
+        embed: true
+
+  YadoriLinkFinderSync:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Extension/FinderSync.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.juntaki.yadorilink.FinderSync
+        INFOPLIST_FILE: Extension/Info.plist
+        PRODUCT_NAME: YadoriLinkFinderSync
+        CODE_SIGN_ENTITLEMENTS: Extension/Extension.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: Extension/YadoriLinkFinderSync-Bridging-Header.h
+        HEADER_SEARCH_PATHS: ../core/include
+        LIBRARY_SEARCH_PATHS: ../core/target/aarch64-apple-darwin/release
+        OTHER_LDFLAGS: -lyadorilink_shell_core -liconv
+    prebuildScripts:
+      - name: Build Rust FFI core
+        script: |
+          set -euo pipefail
+          cd "$SRCROOT/../core"
+          cargo build --release --target aarch64-apple-darwin
+        basedOnDependencyAnalysis: false
+    frameworks:
+      - Cocoa.framework
+      - FinderSync.framework
+
+  # NSFileProviderReplicatedExtension
+  # target. Deployment target deliberately left at the project-wide 11.0
+  # base (NOT bumped, despite the task brief's expectation that it would
+  # need to be higher) — verified directly against this build machine's
+  # SDK headers (FileProvider.framework's NSFileProviderReplicatedExtension.h:
+  # `FILEPROVIDER_API_AVAILABILITY_V3_IOS` on the protocol itself expands
+  # to `API_AVAILABLE(macos(11.0), ios(16.0))` in NSFileProviderDefines.h —
+  # the replicated-extension API has been available since macOS 11, the
+  # same release FinderSync's own deployment target already targets.
+  YadoriLinkFileProvider:
+    type: app-extension
+    platform: macOS
+    sources:
+      # YadoriLinkFileProvider lives in a sibling directory
+      # (shell-ext/macos/YadoriLinkFileProvider/), not nested under this
+      # project.yml's own YadoriLinkFinderSync/ directory — matching
+      # fileprovider-core's own sibling-of-core layout. All paths below
+      # are relative to this project.yml's location, per xcodegen's
+      # convention.
+      - path: ../YadoriLinkFileProvider/Extension/FileProviderModel.swift
+      - path: ../YadoriLinkFileProvider/Extension/FileProviderItem.swift
+      - path: ../YadoriLinkFileProvider/Extension/FileProviderEnumerator.swift
+      - path: ../YadoriLinkFileProvider/Extension/FileProviderExtension.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.juntaki.yadorilink.FileProvider
+        INFOPLIST_FILE: ../YadoriLinkFileProvider/Extension/Info.plist
+        PRODUCT_NAME: YadoriLinkFileProvider
+        CODE_SIGN_ENTITLEMENTS: ../YadoriLinkFileProvider/Extension/Extension.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: ../YadoriLinkFileProvider/Extension/YadoriLinkFileProvider-Bridging-Header.h
+        HEADER_SEARCH_PATHS: ../fileprovider-core/include
+        LIBRARY_SEARCH_PATHS: ../fileprovider-core/target/aarch64-apple-darwin/release
+        OTHER_LDFLAGS: -lyadorilink_fileprovider_core -liconv
+    prebuildScripts:
+      - name: Build Rust FFI core (fileprovider-core)
+        script: |
+          set -euo pipefail
+          cd "$SRCROOT/../fileprovider-core"
+          cargo build --release --target aarch64-apple-darwin
+        basedOnDependencyAnalysis: false
+    frameworks:
+      - FileProvider.framework
+      - UniformTypeIdentifiers.framework

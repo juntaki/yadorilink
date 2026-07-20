@@ -1,0 +1,84 @@
+[package]
+name = "yadorilink-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# See yadorilink-local-storage/Cargo.toml's identical section for why.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
+
+[dependencies]
+yadorilink-ipc-proto.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+# Pinned exactly: the WireGuard engine seam depends on 0.7.1's public API
+# (rate_limiter::RateLimiter for MAC1 verification, Tunn decapsulate for
+# bounded per-peer initiation trials). Upstream master is a separate rebuild
+# and explicitly not for direct use, so this must not float.
+boringtun = { version = "=0.7.1", default-features = false }
+rand = "0.10.2"
+hex = "0.4"
+prost = "0.14.4"
+if-addrs = "0.15"
+zeroize = "1"
+ed25519-dalek = "2"
+# RFC 8489 binding-message codec only (encode a binding request, parse the
+# mapped address out of a success response). Pure Rust, no networking of its
+# own, so it is madsim-safe and shared across real and simulated builds; the
+# prober loop and the socket it runs over stay ours.
+stun = { version = "0.17", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
+
+# Windows-only: tighten a freshly written private-key file's DACL to the
+# current user with inheritance disabled (the practical equivalent of unix
+# `0o600`, since a new file would otherwise inherit the parent directory's
+# weaker ACL). Same crate/version the daemon uses for its named-pipe DACL.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
+# The NAT-suite unit tests drive timers with tokio's paused test clock, which
+# lives behind the `test-util` feature; simulation builds use madsim's own
+# deterministic clock instead.
+[target.'cfg(not(madsim))'.dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
+# See yadorilink-sync-core/Cargo.toml's identical section for why. This
+# crate's real networking (`tokio::net::UdpSocket` in peer_channel.rs) is
+# exactly the surface the madsim tokio shim intercepts, so `PeerTransport`
+# needs no manual trait.
+[target.'cfg(not(madsim))'.dependencies]
+tokio.workspace = true
+# OS-native credential store (macOS Keychain / Windows Credential Manager /
+# Linux Secret Service) for storing device private keys at rest, the same crate
+# and native backends the coordination-token store uses. Kept out of madsim
+# builds so simulation never reaches for a real OS keychain and stays
+# deterministic; the on-disk hardened-file fallback is used there instead.
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+# Router port mapping (PCP / NAT-PMP / UPnP-IGD probing, mapping acquisition,
+# lease renewal, external-address events). Does OS-level gateway discovery and
+# multicast, which has no meaning under simulation, so it stays out of madsim
+# builds entirely — the same reasoning that kept the earlier port-mapping
+# dependency non-madsim.
+portmapper = "0.19"
+# Socket construction only: bind the IPv6 half of the dual-stack endpoint
+# v6-only on the same port as the IPv4 half. Not used under simulation (madsim
+# provides a single shimmed socket), so it stays out of madsim builds.
+socket2 = "0.6"
+
+[target.'cfg(madsim)'.dependencies]
+tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }
+# Under deterministic simulation the candidate-race backoff jitter is drawn
+# from madsim's seed-derived global RNG (see supervise.rs
+# `fastrand_unit_interval`) so a given run seed always yields the same retry
+# schedule; production keeps real wall-clock entropy and never pulls this in.
+madsim = "0.2"

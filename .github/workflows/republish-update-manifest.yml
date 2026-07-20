@@ -1,0 +1,117 @@
+name: Republish update manifest
+
+# Disaster-recovery path for a missing/corrupt R2 object. This workflow copies
+# the already-signed, durable GitHub Release asset back to R2 byte-for-byte. It
+# never rebuilds artifacts and never has access to the manifest private key.
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Channel to restore"
+        required: true
+        type: choice
+        options: [nightly, beta]
+      release_tag:
+        description: "Source release tag (nightly, or immutable v* tag for beta)"
+        required: true
+        type: string
+      reason:
+        description: "Recovery reason (recorded in the audit trail)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  republish:
+    runs-on: ubuntu-latest
+    environment: release-signing
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate recovery request
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          PUBLIC_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          [ -n "$PUBLIC_KEY_ID" ] && [ -n "$PUBLIC_KEY_HEX" ] || {
+            echo "Release manifest public verification variables are required." >&2
+            exit 1
+          }
+          [ -n "$CLOUDFLARE_API_TOKEN" ] && [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || {
+            echo "Cloudflare R2 credentials are required in the release-signing Environment." >&2
+            exit 1
+          }
+          case "$CHANNEL:$RELEASE_TAG" in
+            nightly:nightly) ;;
+            beta:v*) ;;
+            *) echo "nightly must use tag nightly; beta must use an immutable v* tag" >&2; exit 1 ;;
+          esac
+
+      - name: Download canonical release audit copy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ inputs.channel }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          asset="manifest-${CHANNEL}.json"
+          gh release download "$RELEASE_TAG" --pattern "$asset" --dir recovery
+          test -f "recovery/$asset"
+
+      - name: Verify channel, version and signature
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          PUBLIC_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+        run: |
+          set -euo pipefail
+          manifest="recovery/manifest-${CHANNEL}.json"
+          python3 -m pip install --quiet --disable-pip-version-check cryptography
+          python3 scripts/verify-update-manifest.py "$manifest" \
+            --key-id "$PUBLIC_KEY_ID" --public-key-hex "$PUBLIC_KEY_HEX"
+          python3 - "$manifest" "$CHANNEL" "$RELEASE_TAG" <<'PY'
+          import json, sys
+          path, channel, tag = sys.argv[1:]
+          envelope = json.load(open(path, encoding="utf-8"))
+          body = json.loads(envelope["manifest_json"])
+          releases = body.get("releases") or []
+          if not releases or any(entry.get("channel") != channel for entry in releases):
+              raise SystemExit("manifest channel does not match recovery request")
+          if channel == "beta" and any("v" + entry.get("version", "") != tag for entry in releases):
+              raise SystemExit("beta manifest version does not match immutable source tag")
+          PY
+
+      - name: Republish exact signed bytes to R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CHANNEL: ${{ inputs.channel }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          manifest="recovery/manifest-${CHANNEL}.json"
+          before="$(sha256sum "$manifest" | awk '{print $1}')"
+          npx --yes wrangler@3 r2 object put \
+            "yadorilink-update-manifests/${CHANNEL}/manifest.json" \
+            --file "$manifest" --content-type application/json --remote
+          after="$(sha256sum "$manifest" | awk '{print $1}')"
+          [ "$before" = "$after" ] || { echo "local audit bytes changed during publish" >&2; exit 1; }
+          {
+            echo "### Update manifest recovery"
+            echo ""
+            echo "- **Actor:** ${GITHUB_ACTOR}"
+            echo "- **When:** $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "- **Channel:** ${CHANNEL}"
+            echo "- **Source release:** ${RELEASE_TAG}"
+            echo "- **Envelope SHA-256:** ${before}"
+            echo "- **Reason:** ${REASON}"
+          } >> "$GITHUB_STEP_SUMMARY"

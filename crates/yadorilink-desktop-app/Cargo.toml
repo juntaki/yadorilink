@@ -1,0 +1,98 @@
+[package]
+name = "yadorilink-desktop-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# A single cross-platform tray/menu-bar binary for both the macOS menu
+# bar and the Windows notification area, rather than two separate
+# native-shell crates. `tray-icon`+`tao` (used by `tauri`) are the
+# smallest maintained Rust crates that cover both target platforms
+# without hand-writing NSStatusItem/Shell_NotifyIcon bindings — a
+# minimal, real, working tray app was judged more valuable than two
+# unverifiable hand-rolled native shells.
+[lib]
+name = "yadorilink_desktop_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "yadorilink-status-app"
+path = "src/main.rs"
+
+[dependencies]
+yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+# Reuses `yadorilink-cli`'s already-tested coordination-plane
+# access-token/group-resolution code (`http_client::require_access_token`/
+# `resolve_group_id`) for "Add Synced Folder" rather than re-implementing
+# keyring/auth calls a second, independent way in this crate — a
+# security-sensitive code path should have exactly one implementation.
+# `google_login.rs`'s loopback-redirect flow also calls
+# `yadorilink_cli::google_auth` directly.
+yadorilink-cli = { path = "../yadorilink-cli" }
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# Cross-platform tray icon + menu (muda, re-exported by tray-icon) and the
+# native event loop tao pumps them on. Both are macOS/Windows/Linux capable;
+# only macOS and Windows are exercised/shipped here (spec's two target
+# platforms), matching this workspace's existing "no Linux desktop target"
+# scope (shell-ext/ is macOS+Windows only too).
+tray-icon = "0.24"
+tao = "0.35"
+# Cross-platform "reveal this path in the native file manager" helper for
+# the Open Folder / reveal-diagnostics-bundle actions -- avoids
+# hand-rolling `open`/`explorer.exe` invocations per platform.
+opener = { version = "0.8", features = ["reveal"] }
+# Parses the OAuth loopback callback's query string (`google_login.rs`)
+# -- deliberately not hand-
+# rolled percent-decoding; `url` is the same widely-used, battle-tested
+# crate `reqwest` itself depends on for URL handling, and `oauth2`'s own
+# examples use it for exactly this (parsing a redirect callback).
+url = "2"
+# The onboarding executor converts the shared
+# link preflight report (`link_preflight::LinkPreflightReport`) into the
+# window's warning cards, so this is now a normal dependency (it was already a
+# dev-dependency for the daemon-backed integration tests). It is pulled in
+# transitively via `yadorilink-cli` regardless, so this adds nothing to the
+# shipped binary's dependency closure.
+yadorilink-sync-core = { path = "../yadorilink-sync-core" }
+# The onboarding wizard window. egui/eframe is
+# pure Rust with its own winit event loop (run as a separate process from the
+# tao tray) — no webview/JS asset pipeline, consistent with the workspace's
+# single-language discipline and trivially unit-testable around the pure state
+# machine. `rfd` provides the cross-platform native folder picker/dialogs,
+# replacing the macOS-only `osascript` path.
+eframe = "0.29"
+rfd = "0.15"
+
+[target.'cfg(unix)'.dependencies]
+# Advisory file locking (`flock` under the hood) to serialize the
+# onboarding window's single-instance stale-socket recovery so two
+# concurrent launches can't both unlink+rebind the same path -- already a
+# workspace dependency via `yadorilink-local-storage`, used here for
+# `FileExt::lock_exclusive` rather than its disk-space helpers.
+fs2 = "0.4"
+# `getuid()` for verifying the private per-user directory that holds the
+# single-instance socket is actually owned by the current user before it is
+# trusted (see `window.rs`'s `verify_private_dir`) -- already resolved in
+# the workspace's dependency graph transitively.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+# The per-user HKCU Run-key
+# launch-at-login toggle. `winreg` is the idiomatic Rust registry wrapper
+# (ergonomic create/set/delete over the raw Win32 Reg* calls); Windows-only.
+winreg = "0.52"
+
+[dev-dependencies]
+tempfile = "3"
+# Dev-only: this crate's `tests/` spin up a real daemon over the actual
+# control socket (same harness `yadorilink-cli`'s integration tests use)
+# to exercise this crate's own `ipc_client`/`actions` end to end — these
+# are test-harness dependencies only, never linked into the shipped
+# `yadorilink-status-app` binary itself.
+yadorilink-daemon = { path = "../yadorilink-daemon" }
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }

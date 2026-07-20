@@ -1,0 +1,30 @@
+# gitleaks configuration.
+# Extends the bundled default ruleset; only adds narrowly-scoped allowlists for
+# confirmed non-secrets.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = """
+Redaction module unit tests. This file's purpose is to exercise the secret
+redaction logic, so it deliberately contains synthetic, non-secret values shaped
+like real credentials (e.g. a base64 WireGuard-style key built from the bytes
+0x00..0x1F). They are not real secrets.
+"""
+paths = ['''crates/yadorilink-reporting/src/redact\.rs''']
+
+[[allowlists]]
+description = """
+Known development manifest public key embedded in the historical macOS
+installer guard. The script explicitly rejects this public value for release
+builds; it is neither a private signing key nor a credential.
+"""
+regexes = ['''00e033f866c263139ff4afd165e75bae3cfca67eb32399dddd6e33a3251af1e3''']
+
+[[allowlists]]
+description = """
+Synthetic root-identity token used in local_change.rs unit tests exercising
+VerifiedRoot / root_token adoption semantics (crates/yadorilink-sync-core). A
+fixed placeholder hex string, not a real credential.
+"""
+regexes = ['''0123456789abcdef''']

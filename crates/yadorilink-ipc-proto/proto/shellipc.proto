@@ -1,0 +1,141 @@
+syntax = "proto3";
+package yadorilink.shellipc.v1;
+
+// Local IPC between yadorilink-daemon and the OS shell extensions
+// (Windows Explorer / macOS Finder). Framed as length-prefixed messages
+// over a local transport (named pipe / Unix domain socket), not full gRPC —
+// this schema is reused for both, only the framing
+// differs from the gRPC services above.
+
+enum SyncState {
+  SYNC_STATE_UNSPECIFIED = 0;
+  SYNC_STATE_SYNCED = 1;
+  SYNC_STATE_SYNCING = 2;
+  SYNC_STATE_PENDING = 3;
+  SYNC_STATE_ERROR = 4;
+}
+
+enum ContextAction {
+  CONTEXT_ACTION_UNSPECIFIED = 0;
+  CONTEXT_ACTION_VIEW_STATUS = 1;
+  CONTEXT_ACTION_PAUSE_ITEM = 2;
+  CONTEXT_ACTION_RESUME_ITEM = 3;
+  // Context menu actions include Pin and Evict
+  // (shell extension context menus).
+  CONTEXT_ACTION_PIN_ITEM = 4;
+  CONTEXT_ACTION_EVICT_ITEM = 5;
+}
+
+// Independent of `SyncState` above, which
+// tracks convergence with peers, not whether the file's content is
+// actually present on disk.
+enum MaterializationState {
+  MATERIALIZATION_STATE_UNSPECIFIED = 0;
+  MATERIALIZATION_STATE_HYDRATED = 1;
+  MATERIALIZATION_STATE_PLACEHOLDER = 2;
+  MATERIALIZATION_STATE_HYDRATING = 3;
+}
+
+message StatusQuery {
+  string path = 1;
+}
+
+message StatusResponse {
+  string path = 1;
+  SyncState state = 2;
+  MaterializationState materialization_state = 3;
+  // Field 4 was `string open_elsewhere_device_id`, removed with the
+  // edit-presence-awareness capability.
+  reserved 4;
+  reserved "open_elsewhere_device_id";
+}
+
+// Daemon-initiated push so the shell extension can serve most queries from
+// a local cache instead of round-tripping per file manager call.
+message StatusPush {
+  string path = 1;
+  SyncState state = 2;
+  MaterializationState materialization_state = 3;
+  // Field 4 was `string open_elsewhere_device_id`, removed with the
+  // edit-presence-awareness capability.
+  reserved 4;
+  reserved "open_elsewhere_device_id";
+}
+
+// The OS virtual-filesystem callback path
+// (Windows cfapi's `CF_CALLBACK_TYPE_FETCH_DATA`, macOS's
+// `fetchContentsForItemWithIdentifier:`) asks the daemon to synchronously
+// hydrate one placeholder file before completing the OS's own callback.
+message HydrateRequest {
+  string path = 1;
+}
+
+message HydrateResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message ContextActionRequest {
+  string path = 1;
+  ContextAction action = 2;
+}
+
+message ContextActionResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+// `daemon_control.proto`'s `ListLinks`
+// reports per-folder-group aggregates but never a per-file
+// listing, which a platform virtual-filesystem provider (Windows cfapi)
+// needs in order to know which local paths to register as
+// sync roots and which files to create placeholders for. Rather than
+// invent a whole new IPC surface, this reuses the existing shell-IPC
+// persistent connection (already the shell extension's channel to the
+// daemon) with two small additional request/response pairs, matching the
+// existing `StatusQuery`/`HydrateRequest` request-response style on the
+// same connection.
+message ListOnDemandFoldersRequest {}
+
+message OnDemandFolder {
+  string local_path = 1;
+  string group_id = 2;
+}
+
+message ListOnDemandFoldersResponse {
+  repeated OnDemandFolder folders = 1;
+}
+
+message ListFolderFilesRequest {
+  // Must match a `local_path` returned by `ListOnDemandFoldersResponse`.
+  string local_path = 1;
+}
+
+message FolderFileEntry {
+  // Forward-slash-separated, relative to `local_path` — matches the
+  // convention `resolve_group_and_rel_path` already uses internally.
+  string relative_path = 1;
+  uint64 size = 2;
+  int64 mtime_unix_nanos = 3;
+  MaterializationState materialization_state = 4;
+}
+
+message ListFolderFilesResponse {
+  repeated FolderFileEntry entries = 1;
+}
+
+message ShellIpcMessage {
+  oneof payload {
+    StatusQuery status_query = 1;
+    StatusResponse status_response = 2;
+    StatusPush status_push = 3;
+    ContextActionRequest context_action_request = 4;
+    ContextActionResponse context_action_response = 5;
+    HydrateRequest hydrate_request = 6;
+    HydrateResponse hydrate_response = 7;
+    ListOnDemandFoldersRequest list_on_demand_folders_request = 8;
+    ListOnDemandFoldersResponse list_on_demand_folders_response = 9;
+    ListFolderFilesRequest list_folder_files_request = 10;
+    ListFolderFilesResponse list_folder_files_response = 11;
+  }
+}

@@ -1,0 +1,11 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: yadorilink
+Source: https://github.com/juntaki/yadorilink
+
+Files: *
+Copyright: yadorilink project contributors
+License: MIT
+
+License: MIT
+ See /usr/share/doc/yadorilink/LICENSE-MIT (installed from this
+ repository's LICENSE-MIT at build time).

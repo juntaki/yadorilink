@@ -1,0 +1,16 @@
+# The single documented entry point
+# for DST replay and tiered lanes. A tiny bin crate in the workspace so it
+# builds once and is cached; it wraps the exact madsim invocation (RUSTFLAGS,
+# seed env, scenario selection) an operator would otherwise have to remember.
+# It does NOT depend on the `#![cfg(madsim)]` test-side `dst_support` crate —
+# it only reads the bundle JSON and shells out to `cargo test`.
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = "1"

@@ -1,0 +1,141 @@
+[package]
+name = "yadorilink-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Deterministic-simulation testing swaps `tokio` for `madsim`'s
+# tokio-compatible shim only when built with `RUSTFLAGS="--cfg madsim"`.
+# See yadorilink-sync-core/Cargo.toml for the identical pattern.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
+
+[[bin]]
+name = "yadorilink-daemon"
+path = "src/main.rs"
+
+[[bin]]
+# Offline release-manifest signing tool —
+# a maintainer-only helper, not shipped to end users, so it lives as a
+# second bin target in this same crate (reusing `update::manifest`'s
+# types directly) rather than a whole new workspace member.
+name = "yadorilink-sign-manifest"
+path = "src/bin/sign_manifest.rs"
+
+[features]
+# Turns the update trust-root release gate into a HARD startup tripwire: a
+# daemon built with this feature requires the release key id/public key at
+# compile time and refuses to start if they resolve to the development key (or
+# no real key), unless the explicit dev override is set. Off by default so
+# ordinary developer builds retain deterministic update fixtures. Release
+# builds MUST set YADORILINK_RELEASE_MANIFEST_KEY_ID and
+# YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX and enable this feature. See
+# `update::manifest::enforce_release_trust_root_gate`.
+enforce-release-trust-root = []
+
+[dependencies]
+yadorilink-sync-core = { path = "../yadorilink-sync-core" }
+yadorilink-transport = { path = "../yadorilink-transport" }
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+yadorilink-reporting = { path = "../yadorilink-reporting" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+prost = "0.14.4"
+tokio-stream = { version = "0.1", features = ["net"] }
+hex = "0.4"
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+serde.workspace = true
+serde_json = "1"
+boringtun = { version = "0.7", default-features = false }
+sha2.workspace = true
+uuid = { version = "1", features = ["v4"] }
+# Signed-manifest HTTPS fetch and artifact
+# download. Same rustls-tls + minimal-features shape as
+# `yadorilink-reporting`'s own `reqwest` dependency (its own HTTPS-only
+# submission client) — this crate already depends on that pattern
+# transitively, this makes it a direct, explicit dependency for the
+# update manifest/artifact fetch path specifically.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Manifest-signature verification: Ed25519 over the exact
+# signed payload bytes, matching `yadorilink-transport`'s existing "dalek"
+# family curve/signature crate choice (x25519-dalek) rather than introducing
+# an unrelated crypto library for this one signature scheme.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Strict semantic-version parsing/comparison for manifest version fields
+# — already present in Cargo.lock as a transitive dependency
+# elsewhere in the workspace; this is its first direct use.
+semver = "1"
+base64 = "0.22"
+rand = "0.10.2"
+# WebSocket client for the coordination plane's `/netmap/subscribe` route,
+# the sole netmap subscription transport. rustls-tls-webpki-roots to match
+# this workspace's existing rustls-only choice (reqwest above, and
+# yadorilink-reporting's own client) rather than pulling in native-tls.
+tokio-tungstenite = { version = "0.24", default-features = false, features = [
+    "connect",
+    "rustls-tls-webpki-roots",
+] }
+# `peer_orchestrator.rs`'s http(s)->ws(s) URL rewrite (`netmap_ws_url`) --
+# deliberately not hand-rolled string splitting, which mishandled IPv6
+# literal addresses in an earlier version of this file. Same crate
+# `yadorilink-cli`/`yadorilink-desktop-app` use for the same reason.
+url = { version = "2" }
+fs2 = "0.4"
+
+# `tokio` is swapped for `madsim`'s tokio-compatible shim only when the
+# DST binary is built with `RUSTFLAGS="--cfg madsim"` (never for a normal
+# build/test run). Mirrors yadorilink-sync-core/Cargo.toml.
+[target.'cfg(not(madsim))'.dependencies]
+tokio.workspace = true
+
+[target.'cfg(madsim)'.dependencies]
+tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }
+
+# The `madsim` runtime itself is a dev-dependency only under `--cfg madsim`,
+# used by the `#![cfg(madsim)]`-gated DST test binaries to build a seeded
+# simulated runtime. Mirrors yadorilink-sync-core/Cargo.toml.
+[target.'cfg(madsim)'.dev-dependencies]
+madsim = "0.2"
+
+[dev-dependencies]
+# Test-only: the one-live-link-per-group guards make the two-live-roots state
+# unreachable through the ordinary API, so a test that pins what the daemon does
+# about an ALREADY-duplicated database has to forge it.
+yadorilink-sync-core = { path = "../yadorilink-sync-core", features = ["test-support"] }
+tempfile = "3"
+rand = "0.10.2"
+# Test-only: lets a handoff-lease test open a second connection to a
+# file-backed sync database and drop a table out from under an in-flight
+# operation, deterministically forcing a local storage error to exercise the
+# error-cleanup path. Matches the version sync-core links so the bundled
+# SQLite is unified to one copy. Dev-dependency features only affect the test
+# build, never `cargo build`.
+rusqlite = { version = "0.31", features = ["bundled"] }
+# The in-process fake coordination service the full-stack E2E tests point the
+# real `peer_orchestrator` at needs a WebSocket *server* (the netmap
+# subscription). The crate's own (non-dev) dependency is client-only
+# (`connect`); the `handshake` feature adds `derive_accept_key` +
+# `WebSocketStream::from_raw_socket` for accepting an upgraded connection.
+# Dev-dependency features only affect the test build, never `cargo build`.
+tokio-tungstenite = { version = "0.24", features = ["handshake"] }
+futures-util = "0.3"
+# A real local HTTP listener for
+# the daemon-side queue-retry integration tests (mirrors
+# yadorilink-reporting's own use of the same crate).
+wiremock = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }

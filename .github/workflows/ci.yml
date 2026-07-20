@@ -1,0 +1,909 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    # Versioned beta releases are cut by pushing an immutable semver tag,
+    # e.g. v0.1.0-beta.1.
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-public-ci
+
+      - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (Linux, desktop app excluded)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --workspace --exclude yadorilink-desktop-app --all-targets -- -D warnings
+
+      - name: Clippy
+        if: matrix.os != 'ubuntu-latest'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build (Linux, desktop app excluded)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build --workspace --exclude yadorilink-desktop-app --all-targets
+
+      - name: Build
+        if: matrix.os != 'ubuntu-latest'
+        run: cargo build --workspace --all-targets
+
+      - name: Test (Linux, desktop app excluded)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --workspace --exclude yadorilink-desktop-app
+
+      - name: Test
+        if: matrix.os == 'macos-latest'
+        run: cargo test --workspace
+
+      - name: Test
+        if: matrix.os == 'windows-latest'
+        run: cargo test --workspace -- --test-threads=4
+
+  shell-ext-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: shell-ext/windows
+
+      - name: Check formatting
+        working-directory: shell-ext/windows
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: shell-ext/windows
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        working-directory: shell-ext/windows
+        run: cargo build --release
+
+  shell-ext-macos-rust:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [core, fileprovider-core]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: shell-ext/macos/${{ matrix.crate }}
+
+      - name: Check formatting
+        working-directory: shell-ext/macos/${{ matrix.crate }}
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: shell-ext/macos/${{ matrix.crate }}
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        working-directory: shell-ext/macos/${{ matrix.crate }}
+        run: cargo build --release
+
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+      - name: Audit
+        run: cargo audit
+
+  linux-artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-release
+
+      - name: Build release binaries
+        run: cargo build --workspace --release --exclude yadorilink-desktop-app
+
+      - name: Package Linux binary archive
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          arch="$(uname -m)"
+          mkdir -p release/linux/bin
+          cp target/release/yadorilink \
+             target/release/yadorilink-daemon \
+             target/release/yadorilink-relay \
+             release/linux/bin/
+          tar -C release/linux/bin -czf "release/linux/yadorilink-${version}-linux-${arch}-binaries.tar.gz" .
+          python3 scripts/ci/generate-release-checksums.py \
+            --sidecars \
+            "release/linux/yadorilink-${version}-linux-${arch}-binaries.tar.gz"
+
+      - name: Build Debian package
+        run: ./installer/linux/build-deb.sh
+
+      - name: Install lintian
+        run: sudo apt-get update && sudo apt-get install -y lintian
+
+      - name: Verify Debian package
+        run: |
+          set -euo pipefail
+          deb_file="$(find installer/linux/dist -maxdepth 1 -name '*.deb' -print -quit)"
+          if [ -z "$deb_file" ]; then
+            echo "No .deb file found under installer/linux/dist" >&2
+            exit 1
+          fi
+          ./installer/linux/verify-deb.sh "$deb_file"
+
+      - name: Collect Linux artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p release/linux
+          cp installer/linux/dist/*.deb installer/linux/dist/*.deb.sha256 release/linux/
+          version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          arch="$(uname -m)"
+          python3 scripts/ci/generate-release-checksums.py \
+            --out release/linux/SHA256SUMS \
+            "release/linux/yadorilink-${version}-linux-${arch}-binaries.tar.gz" \
+            release/linux/*.deb
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: yadorilink-linux-artifacts
+          path: release/linux
+          if-no-files-found: error
+
+  windows-build-health:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-release
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build release binaries
+        run: cargo build --workspace --release
+
+      - name: Build Windows shell extension
+        working-directory: shell-ext/windows
+        run: cargo build --release
+
+      - name: Package Windows binary archive
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force -Path release/windows/bin | Out-Null
+          Copy-Item target/release/yadorilink.exe,
+                    target/release/yadorilink-daemon.exe,
+                    target/release/yadorilink-relay.exe,
+                    target/release/yadorilink-status-app.exe -Destination release/windows/bin
+          Copy-Item shell-ext/windows/target/release/yadorilink_shell_ext.dll,
+                    shell-ext/windows/target/release/yadorilink-cfapi-host.exe -Destination release/windows/bin
+          $zipPath = "release/windows/yadorilink-$version-windows-x86_64-binaries.zip"
+          Compress-Archive -Path release/windows/bin/* -DestinationPath $zipPath -Force
+          py -3 scripts/ci/generate-release-checksums.py --sidecars $zipPath
+
+      - name: Build Windows installer (unsigned build-health)
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File installer\windows\build-installer.ps1
+
+      - name: Verify Windows installer (build health)
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File installer\windows\verify-installer.ps1 -Path installer\windows\Output\yadorilink-setup.exe
+
+      - name: Collect Windows artifacts
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
+          Copy-Item installer/windows/Output/yadorilink-setup.exe,
+                    installer/windows/Output/yadorilink-setup.exe.sha256 -Destination release/windows
+          $artifacts = @(
+            "release/windows/yadorilink-$version-windows-x86_64-binaries.zip",
+            "release/windows/yadorilink-setup.exe"
+          )
+          py -3 scripts/ci/generate-release-checksums.py --out release/windows/SHA256SUMS @artifacts
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: yadorilink-windows-build-health
+          path: release/windows
+          if-no-files-found: error
+
+  windows-signed-artifacts:
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs: windows-build-health
+    runs-on: windows-latest
+    environment: release-signing
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download unsigned Windows build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: yadorilink-windows-build-health
+          path: unsigned
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Require and import code-signing certificate
+        shell: pwsh
+        env:
+          WIN_CERT_BASE64: ${{ secrets.WINDOWS_CODE_SIGN_PFX_BASE64 }}
+          WIN_CERT_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGN_PFX_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WIN_CERT_BASE64) -or
+              [string]::IsNullOrWhiteSpace($env:WIN_CERT_PASSWORD)) {
+            throw 'Windows signing secrets are required in the release-signing environment'
+          }
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'yadorilink-codesign.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WIN_CERT_BASE64))
+          $securePwd = ConvertTo-SecureString $env:WIN_CERT_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePwd
+          Remove-Item -LiteralPath $pfxPath -Force
+          "WIN_CERT_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Extract release binaries
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem unsigned -Filter 'yadorilink-*-windows-x86_64-binaries.zip' | Select-Object -First 1
+          if (-not $archive) { throw 'Windows binary archive missing from build-health artifacts' }
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath release-input -Force
+
+      - name: Build signed Windows installer
+        shell: pwsh
+        env:
+          YADORILINK_RELEASE_MANIFEST_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+        run: |
+          $signtool = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' |
+                       Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          if (-not $signtool) { throw 'signtool.exe not found in the Windows 10 SDK' }
+          $signCmd = "`"$signtool`" sign /fd sha256 /sha1 $env:WIN_CERT_THUMBPRINT /tr http://timestamp.digicert.com /td sha256 `$f"
+          powershell -ExecutionPolicy Bypass -File installer\windows\build-installer.ps1 `
+            -ShellExtDir release-input -Release `
+            -SignToolName yadorilink -SignToolCommand $signCmd
+
+      - name: Verify and collect signed Windows artifacts
+        shell: pwsh
+        run: |
+          $exe = 'installer\windows\Output\yadorilink-setup.exe'
+          $signtool = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' |
+                       Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          & $signtool verify /pa /all $exe
+          if ($LASTEXITCODE -ne 0) { throw "signtool verify failed for $exe" }
+          $sig = Get-AuthenticodeSignature -LiteralPath $exe
+          if ($sig.Status -ne 'Valid') { throw "installer Authenticode status is $($sig.Status)" }
+          powershell -ExecutionPolicy Bypass -File installer\windows\verify-installer.ps1 -Path $exe -Release
+
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force -Path release/windows | Out-Null
+          Copy-Item unsigned/yadorilink-*-windows-x86_64-binaries.zip release/windows
+          Copy-Item $exe, "$exe.sha256" release/windows
+          $archive = Get-ChildItem release/windows -Filter 'yadorilink-*-windows-x86_64-binaries.zip' | Select-Object -First 1
+          py -3 scripts/ci/generate-release-checksums.py --out release/windows/SHA256SUMS $archive.FullName release/windows/yadorilink-setup.exe
+
+      - name: Remove imported signing certificate
+        if: always()
+        shell: pwsh
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:WIN_CERT_THUMBPRINT)) {
+            Remove-Item -LiteralPath ('Cert:\CurrentUser\My\' + $env:WIN_CERT_THUMBPRINT) -Force -ErrorAction SilentlyContinue
+          }
+          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'yadorilink-codesign.pfx') -Force -ErrorAction SilentlyContinue
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: yadorilink-windows-artifacts
+          path: release/windows
+          if-no-files-found: error
+
+  macos-build-health:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-release
+
+      - name: Build release binaries
+        run: cargo build --workspace --release
+
+      - name: Package macOS binary archive
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          arch="$(uname -m)"
+          mkdir -p release/macos/bin
+          cp target/release/yadorilink \
+             target/release/yadorilink-daemon \
+             target/release/yadorilink-relay \
+             target/release/yadorilink-status-app \
+             release/macos/bin/
+          cat > release/macos/README.txt <<'EOF'
+          This tar.gz contains the bare, unsigned macOS binaries for build-health checks.
+          This build-health artifact is always unsigned and receives no signing secrets.
+          Official releases consume the separate, protected macos-signed-artifacts job.
+          EOF
+          tar -C release/macos -czf "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz" bin README.txt
+          python3 scripts/ci/generate-release-checksums.py \
+            --sidecars \
+            "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz"
+          python3 scripts/ci/generate-release-checksums.py \
+            --out release/macos/SHA256SUMS \
+            "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: yadorilink-macos-build-health
+          path: release/macos
+          if-no-files-found: error
+
+  # Private keys are available only after approval of the protected
+  # release-signing Environment. Pull requests can reach macos-build-health,
+  # but can never schedule this job. Do not use pull_request_target here.
+  macos-signed-artifacts:
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs: macos-build-health
+    runs-on: macos-latest
+    environment: release-signing
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-release-signed
+
+      - name: Require complete macOS signing configuration
+        env:
+          APP_CERT_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_APP_P12_BASE64 }}
+          APP_CERT_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_APP_P12_PASSWORD }}
+          INSTALLER_CERT_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          INSTALLER_CERT_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_INSTALLER_P12_PASSWORD }}
+          NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          for name in APP_CERT_BASE64 APP_CERT_PASSWORD INSTALLER_CERT_BASE64 \
+            INSTALLER_CERT_PASSWORD NOTARY_KEY_BASE64 NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+            [ -n "${!name:-}" ] || { echo "Missing release-signing Environment secret: $name" >&2; exit 1; }
+          done
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Set up ephemeral signing keychain
+        env:
+          APP_CERT_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_APP_P12_BASE64 }}
+          APP_CERT_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_APP_P12_PASSWORD }}
+          INSTALLER_CERT_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          INSTALLER_CERT_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_INSTALLER_P12_PASSWORD }}
+          NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/yadorilink-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 24)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+
+          app_p12="$RUNNER_TEMP/app.p12"
+          installer_p12="$RUNNER_TEMP/installer.p12"
+          printf '%s' "$APP_CERT_BASE64" | base64 --decode > "$app_p12"
+          printf '%s' "$INSTALLER_CERT_BASE64" | base64 --decode > "$installer_p12"
+          security import "$app_p12" -k "$keychain" -P "$APP_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productsign
+          security import "$installer_p12" -k "$keychain" -P "$INSTALLER_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productsign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | sed s/\"//g)
+
+          notary_key="$RUNNER_TEMP/notary.p8"
+          printf '%s' "$NOTARY_KEY_BASE64" | base64 --decode > "$notary_key"
+          rm -f "$app_p12" "$installer_p12"
+
+          app_identity="$(security find-identity -v -p codesigning "$keychain" | grep 'Developer ID Application' | head -1 | sed -E 's/.*"(.*)".*/\1/')"
+          installer_identity="$(security find-identity -v "$keychain" | grep 'Developer ID Installer' | head -1 | sed -E 's/.*"(.*)".*/\1/')"
+          [ -n "$app_identity" ] && [ -n "$installer_identity" ] || {
+            echo "Developer ID Application/Installer identity missing from imported keychain" >&2
+            exit 1
+          }
+          {
+            echo "SIGNING_KEYCHAIN=$keychain"
+            echo "NOTARY_KEY_PATH=$notary_key"
+            echo "APP_SIGN_IDENTITY=$app_identity"
+            echo "PKG_SIGN_IDENTITY=$installer_identity"
+          } >> "$GITHUB_ENV"
+
+      - name: Build, sign, notarize and staple the .pkg
+        env:
+          YADORILINK_RELEASE_BUILD: "1"
+          YADORILINK_RELEASE_MANIFEST_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+          YADORILINK_APP_SIGN_IDENTITY: ${{ env.APP_SIGN_IDENTITY }}
+          YADORILINK_PKG_SIGN_IDENTITY: ${{ env.PKG_SIGN_IDENTITY }}
+          YADORILINK_NOTARY_KEY: ${{ env.NOTARY_KEY_PATH }}
+          YADORILINK_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          YADORILINK_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: ./installer/macos/build-pkg.sh
+
+      - name: Collect and verify the signed .pkg
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          pkg="installer/macos/dist/yadorilink-${version}.pkg"
+          test -f "$pkg" || { echo "signed pkg not found: $pkg" >&2; exit 1; }
+          pkgutil --check-signature "$pkg"
+          spctl -a -vvv -t install "$pkg"
+          mkdir -p release/macos
+          cp "$pkg" "$pkg.sha256" release/macos/
+          python3 scripts/ci/generate-release-checksums.py \
+            --out release/macos/SHA256SUMS \
+            "release/macos/yadorilink-${version}.pkg"
+
+      - name: Tear down signing material
+        if: always()
+        run: |
+          set +e
+          [ -n "${SIGNING_KEYCHAIN:-}" ] && security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null
+          rm -f "${NOTARY_KEY_PATH:-}" "$RUNNER_TEMP"/*.p12 "$RUNNER_TEMP"/*.p8
+          true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: yadorilink-macos-artifacts
+          path: release/macos
+          if-no-files-found: error
+
+  nightly-release:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs:
+      - build-and-test
+      - shell-ext-windows
+      - shell-ext-macos-rust
+      - cargo-audit
+      - linux-artifacts
+      - windows-signed-artifacts
+      - macos-build-health
+      - macos-signed-artifacts
+    runs-on: ubuntu-latest
+    # Main pushes wait for an explicit reviewer before any release or manifest
+    # signing secret is made available. Nightly publication is intentionally
+    # approval-gated rather than unattended.
+    environment: release-signing
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Flatten release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find release-assets/yadorilink-linux-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
+          find release-assets/yadorilink-windows-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
+          find release-assets/yadorilink-macos-build-health -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
+          find release-assets/yadorilink-macos-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
+          cp release-assets/yadorilink-linux-artifacts/SHA256SUMS dist/SHA256SUMS-linux
+          cp release-assets/yadorilink-windows-artifacts/SHA256SUMS dist/SHA256SUMS-windows
+          cat release-assets/yadorilink-macos-build-health/SHA256SUMS \
+              release-assets/yadorilink-macos-artifacts/SHA256SUMS \
+              > dist/SHA256SUMS-macos
+          cp dist/yadorilink-*-linux-x86_64-binaries.tar.gz dist/yadorilink-linux-x86_64.tar.gz
+          cp dist/yadorilink_*_amd64.deb dist/yadorilink-linux-amd64.deb
+          cp dist/yadorilink-*-windows-x86_64-binaries.zip dist/yadorilink-windows-x86_64.zip
+          cp dist/yadorilink-*-macos-*-binaries.tar.gz dist/yadorilink-macos.tar.gz
+          sidecar_targets=(
+            dist/yadorilink-linux-x86_64.tar.gz
+            dist/yadorilink-linux-amd64.deb
+            dist/yadorilink-windows-x86_64.zip
+            dist/yadorilink-setup.exe
+            dist/yadorilink-macos.tar.gz
+          )
+          # The signed, notarized .pkg is only present when the macos job ran
+          # with signing secrets (trusted events). Publish it under a stable
+          # name with its checksum when it exists; skip it otherwise.
+          macos_pkg="$(find dist -maxdepth 1 -name 'yadorilink-*.pkg' ! -name 'yadorilink-macos.pkg' -print -quit)"
+          if [ -n "$macos_pkg" ]; then
+            cp "$macos_pkg" dist/yadorilink-macos.pkg
+            sidecar_targets+=(dist/yadorilink-macos.pkg)
+          fi
+          python3 scripts/ci/generate-release-checksums.py --sidecars "${sidecar_targets[@]}"
+          ls -la dist
+
+      # --- Signed nightly update manifest ---------
+      - name: Require nightly manifest signing configuration
+        id: manifest
+        env:
+          MANIFEST_KEY: ${{ secrets.MANIFEST_SIGNING_KEY }}
+          PRIVATE_KEY_ID: ${{ secrets.MANIFEST_SIGNING_KEY_ID }}
+          PUBLIC_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$MANIFEST_KEY" ] || [ -z "$PRIVATE_KEY_ID" ] || [ -z "$PUBLIC_KEY_ID" ]; then
+            echo "Complete release-signing manifest configuration is required for nightly publication." >&2
+            exit 1
+          elif [ "$PRIVATE_KEY_ID" != "$PUBLIC_KEY_ID" ]; then
+            echo "Manifest key id mismatch between release-signing secret and repository variable." >&2
+            exit 1
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f nightly "$GITHUB_SHA"
+          git push origin refs/tags/nightly --force
+
+          notes="Approved build from main at ${GITHUB_SHA}. Pre-1.0 development build. Release installers are produced only by protected code-signing jobs."
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release edit nightly \
+              --title "Nightly build" \
+              --notes "$notes" \
+              --prerelease \
+              --target "$GITHUB_SHA"
+          else
+            gh release create nightly \
+              --title "Nightly build" \
+              --notes "$notes" \
+              --prerelease \
+              --target "$GITHUB_SHA"
+          fi
+
+          gh release upload nightly dist/* --clobber
+
+      - name: Build manifest signer
+        if: steps.manifest.outputs.enabled == 'true'
+        run: cargo build --release -p yadorilink-daemon --bin yadorilink-sign-manifest
+
+      - name: Generate, sign, verify and publish the nightly manifest
+        if: steps.manifest.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANIFEST_SIGNING_KEY: ${{ secrets.MANIFEST_SIGNING_KEY }}
+          MANIFEST_SIGNING_KEY_ID: ${{ secrets.MANIFEST_SIGNING_KEY_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          ts="$(date -u +%Y%m%d%H%M%S)"
+          base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/nightly"
+          # Nightly is rolling: use a monotonic prerelease version so a nightly
+          # client always sees the newest build as newer. (Exact nightly
+          # versioning is an open question; this is the "exercise
+          # the path" scheme.) min_version 0.0.0 forces no one.
+          bash scripts/ci/build-channel-manifest.sh \
+            --channel nightly \
+            --version "${version}-nightly.${ts}" \
+            --min-version "0.0.0" \
+            --notes-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/nightly" \
+            --dist dist --base-url "$base_url" \
+            --out manifest-nightly.json
+          # CI gate: re-verify signature + internal consistency before publish.
+          python3 -m pip install --quiet --disable-pip-version-check cryptography
+          python3 scripts/verify-update-manifest.py manifest-nightly.json
+          # Publish: as a release asset (immutable audit trail of exact bytes)
+          # and to the R2-backed edge host when Cloudflare creds are present.
+          gh release upload nightly manifest-nightly.json --clobber
+          if [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            npx --yes wrangler@3 r2 object put \
+              yadorilink-update-manifests/nightly/manifest.json \
+              --file manifest-nightly.json --content-type application/json --remote
+          else
+            echo "Cloudflare creds absent; nightly manifest uploaded as release asset only."
+          fi
+
+  beta-release:
+    # Versioned, immutable beta releases are cut by pushing a semver tag
+    # (v*). Never force-moved; never overwritten.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-and-test
+      - shell-ext-windows
+      - shell-ext-macos-rust
+      - cargo-audit
+      - linux-artifacts
+      - windows-signed-artifacts
+      - macos-build-health
+      - macos-signed-artifacts
+    runs-on: ubuntu-latest
+    # The production manifest key exists only in this protected environment.
+    # Required reviewers keep signing an explicit operation in the public repo.
+    environment: release-signing
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve tag and enforce immutability
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # A prior runner failure can leave an invisible draft. It is owned by
+          # this tag-triggered workflow and is safe to remove before retrying.
+          # Published releases remain immutable and are never deleted here.
+          if release_json="$(gh release view "$tag" --json isDraft 2>/dev/null)"; then
+            if [ "$(printf '%s' "$release_json" | jq -r '.isDraft')" = "true" ]; then
+              echo "Removing incomplete draft from a previous $tag attempt."
+              gh release delete "$tag" --yes
+              if gh release view "$tag" >/dev/null 2>&1; then
+                echo "Incomplete draft $tag still exists after deletion; refusing to continue." >&2
+                exit 1
+              fi
+            else
+              echo "Refusing to publish: release $tag already exists (beta releases are immutable)." >&2
+              exit 1
+            fi
+          fi
+
+      - name: Verify beta release gate is complete
+        env:
+          GATE_ACK: ${{ vars.BETA_RELEASE_GATE_ACK }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Promotion nightly -> beta requires the beta-release-gate checklist
+          # complete with pass/fail evidence. CI cannot execute
+          # the manual gate; it enforces an explicit, per-tag human sign-off:
+          # the repo variable BETA_RELEASE_GATE_ACK must equal the tag being
+          # published (set it after recording gate evidence). This blocks a
+          # beta tag whose gate has not been acknowledged.
+          if [ "${GATE_ACK:-}" != "$TAG" ]; then
+            echo "beta-release-gate not acknowledged for $TAG." >&2
+            echo "Set repo variable BETA_RELEASE_GATE_ACK=$TAG after completing docs/BETA_RELEASE_GATE.md." >&2
+            exit 1
+          fi
+
+      - name: Extract CHANGELOG section for this tag
+        id: notes
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$TAG"
+          # Pull the section whose heading references this tag; require it to
+          # exist so every beta ships human-readable notes + a CHANGELOG entry.
+          notes="$(awk -v tag="$tag" '
+            $0 ~ "^## \\[" tag "\\]" {grab=1; next}
+            grab && /^## \[/ {exit}
+            grab {print}
+          ' CHANGELOG.md)"
+          if [ -z "$(echo "$notes" | tr -d '[:space:]')" ]; then
+            echo "No CHANGELOG.md section for $tag. Add a '## [$tag] - YYYY-MM-DD' entry." >&2
+            exit 1
+          fi
+          {
+            echo "body<<EOF_NOTES"
+            echo "$notes"
+            echo "EOF_NOTES"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Flatten release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find release-assets/yadorilink-linux-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
+          find release-assets/yadorilink-windows-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
+          find release-assets/yadorilink-macos-build-health -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
+          find release-assets/yadorilink-macos-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
+          cp dist/yadorilink-*-linux-x86_64-binaries.tar.gz dist/yadorilink-linux-x86_64.tar.gz
+          cp dist/yadorilink_*_amd64.deb dist/yadorilink-linux-amd64.deb
+          cp dist/yadorilink-*-windows-x86_64-binaries.zip dist/yadorilink-windows-x86_64.zip
+          cp dist/yadorilink-*-macos-*-binaries.tar.gz dist/yadorilink-macos.tar.gz
+          sidecar_targets=(
+            dist/yadorilink-linux-x86_64.tar.gz
+            dist/yadorilink-linux-amd64.deb
+            dist/yadorilink-windows-x86_64.zip
+            dist/yadorilink-setup.exe
+            dist/yadorilink-macos.tar.gz
+          )
+          macos_pkg="$(find dist -maxdepth 1 -name 'yadorilink-*.pkg' ! -name 'yadorilink-macos.pkg' -print -quit)"
+          if [ -n "$macos_pkg" ]; then
+            cp "$macos_pkg" dist/yadorilink-macos.pkg
+            sidecar_targets+=(dist/yadorilink-macos.pkg)
+          fi
+          python3 scripts/ci/generate-release-checksums.py --sidecars "${sidecar_targets[@]}"
+
+      - name: Require beta manifest signing configuration
+        id: manifest
+        env:
+          MANIFEST_KEY: ${{ secrets.MANIFEST_SIGNING_KEY }}
+          PRIVATE_KEY_ID: ${{ secrets.MANIFEST_SIGNING_KEY_ID }}
+          PUBLIC_KEY_ID: ${{ vars.RELEASE_MANIFEST_KEY_ID }}
+          PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+        run: |
+          set -euo pipefail
+          if [ -z "$MANIFEST_KEY" ] || [ -z "$PRIVATE_KEY_ID" ] || \
+             [ -z "$PUBLIC_KEY_ID" ] || [ -z "$PUBLIC_KEY_HEX" ]; then
+            echo "Complete release-signing secrets and public key variables are required." >&2
+            exit 1
+          fi
+          if [ "$PRIVATE_KEY_ID" != "$PUBLIC_KEY_ID" ]; then
+            echo "Manifest key id mismatch between release-signing secret and repository variable." >&2
+            exit 1
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build manifest signer
+        if: steps.manifest.outputs.enabled == 'true'
+        run: cargo build --release -p yadorilink-daemon --bin yadorilink-sign-manifest
+
+      - name: Generate, sign and verify the beta manifest
+        if: steps.manifest.outputs.enabled == 'true'
+        env:
+          MANIFEST_SIGNING_KEY: ${{ secrets.MANIFEST_SIGNING_KEY }}
+          MANIFEST_SIGNING_KEY_ID: ${{ secrets.MANIFEST_SIGNING_KEY_ID }}
+          RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="$TAG"
+          version="$VERSION"
+          base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+          bash scripts/ci/build-channel-manifest.sh \
+            --channel beta \
+            --version "$version" \
+            --min-version "0.0.0" \
+            --notes-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${tag}" \
+            --dist dist --base-url "$base_url" \
+            --out manifest-beta.json
+          python3 -m pip install --quiet --disable-pip-version-check cryptography
+          python3 scripts/verify-update-manifest.py manifest-beta.json \
+            --key-id "${MANIFEST_SIGNING_KEY_ID}" \
+            --public-key-hex "${RELEASE_MANIFEST_PUBLIC_KEY_HEX}"
+
+      - name: Publish immutable beta release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          NOTES: ${{ steps.notes.outputs.body }}
+        run: |
+          set -euo pipefail
+          created_draft=0
+          cleanup_failed_draft() {
+            status=$?
+            if [ "$status" -ne 0 ] && [ "$created_draft" -eq 1 ]; then
+              echo "Release publication failed; deleting incomplete draft $TAG." >&2
+              gh release delete "$TAG" --yes || true
+            fi
+            exit "$status"
+          }
+          trap cleanup_failed_draft EXIT
+
+          printf '%s\n' "$NOTES" > release-notes.md
+          # Keep the release invisible until every required asset is present.
+          # No --target force-move; the tag already exists (this job runs on it).
+          gh release create "$TAG" \
+            --title "yadorilink $TAG" \
+            --notes-file release-notes.md \
+            --draft \
+            --prerelease \
+            --verify-tag
+          created_draft=1
+          gh release upload "$TAG" dist/* manifest-beta.json
+          gh release edit "$TAG" --draft=false --prerelease
+          created_draft=0
+
+      - name: Publish beta manifest to update storage
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            if ! npx --yes wrangler@3 r2 object put \
+              yadorilink-update-manifests/beta/manifest.json \
+              --file manifest-beta.json --content-type application/json --remote; then
+              echo "::warning::GitHub beta release is complete, but publishing its manifest to R2 failed. Republish it before announcing the beta."
+            fi
+          else
+            echo "Cloudflare creds absent; beta manifest uploaded as release asset only."
+          fi

@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Third-party licenses</title>
+    <style>
+      body { font-family: system-ui, -apple-system, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+      h1 { border-bottom: 2px solid #ddd; padding-bottom: .3rem; }
+      .intro { color: #444; }
+      .license { border-top: 1px solid #eee; margin-top: 2rem; padding-top: 1rem; }
+      .used-by { columns: 2; font-size: .9rem; }
+      .used-by a { text-decoration: none; }
+      pre { background: #f6f8fa; padding: 1rem; overflow-x: auto; white-space: pre-wrap; font-size: .8rem; }
+      .overview li { margin: .15rem 0; }
+    </style>
+  </head>
+  <body>
+    <h1>Third-party licenses</h1>
+    <p class="intro">
+      This product bundles the following third-party Rust crates. Each is
+      distributed under the license shown; the full license texts follow.
+    </p>
+
+    <h2>Overview</h2>
+    <ul class="overview">
+      {{#each overview}}
+      <li><a href="#{{id}}">{{name}}</a>: {{count}} crate{{#if (gt count 1)}}s{{/if}}</li>
+      {{/each}}
+    </ul>
+
+    {{#each licenses}}
+    <div class="license">
+      <h2 id="{{id}}">{{name}}</h2>
+      <p>Used by:</p>
+      <ul class="used-by">
+        {{#each used_by}}
+        <li>
+          <a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">
+            {{crate.name}} {{crate.version}}
+          </a>
+        </li>
+        {{/each}}
+      </ul>
+      <pre>{{text}}</pre>
+    </div>
+    {{/each}}
+  </body>
+</html>

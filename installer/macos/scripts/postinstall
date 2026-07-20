@@ -1,0 +1,293 @@
+#!/bin/bash
+#
+# installer/macos/scripts/postinstall
+#
+# Runs as root, during/after `installer -pkg` (or the Installer.app GUI)
+# places these payloads:
+#   /usr/local/bin/yadorilink
+#   /usr/local/bin/yadorilink-daemon
+#   /usr/local/bin/yadorilink-status-app
+#   /Applications/YadoriLinkFinderSyncHost.app
+#
+# Two things a plain file-copy pkg cannot do on its own, handled here:
+#
+#   1. Register + load a per-user launchd LaunchAgent so yadorilink-daemon
+#      (and yadorilink-status-app too — see section 2b below) starts
+#      automatically at login. This MUST be a
+#      LaunchAgent (runs in
+#      the logged-in user's session), not a LaunchDaemon (runs as root
+#      with no user session) — the daemon needs the interactive user's
+#      Keychain to read/write the access/refresh tokens `yadorilink login`
+#      stores there (see README.md's "Configuration reference": "Access/
+#      refresh tokens ... live in the OS credential store ... Keychain").
+#      A LaunchDaemon has no Keychain session to unlock and would just
+#      fail every credentialed operation.
+#
+#   2. Give PlugInKit a chance to discover the FinderSync + File Provider
+#      extensions embedded in the just-installed .app, and launch the
+#      host app once so it can self-register any already-known OnDemand
+#      File Provider domains (HostApp/DomainRegistration.swift).
+#
+# CLASSIC GOTCHA this script exists to avoid: postinstall scripts run as
+# root even during a normal GUI-driven install — `$HOME` here is root's
+# home, not the human's. The only reliable way to find the actual
+# logged-in (GUI console) user from a root postinstall script is to ask
+# who owns /dev/console, not to trust $HOME, $USER, $SUDO_USER (unset for
+# GUI-driven Installer.app runs), or `logname`.
+
+set -uo pipefail
+
+log() { echo "[yadorilink postinstall] $*"; }
+
+assert_user_home_path_has_no_symlink_component() {
+    local path="$1"
+    case "$path" in
+        "$USER_HOME"/*) ;;
+        *)
+            log "ERROR: refusing to operate outside console user's home: $path"
+            exit 1
+            ;;
+    esac
+
+    local rel="${path#"$USER_HOME"/}"
+    local current="$USER_HOME"
+    local component
+    while [ -n "$rel" ]; do
+        component="${rel%%/*}"
+        current="$current/$component"
+        if [ -L "$current" ]; then
+            log "ERROR: refusing to follow symlink in user-writable install path: $current"
+            exit 1
+        fi
+        if [ "$rel" = "$component" ]; then
+            break
+        fi
+        rel="${rel#*/}"
+    done
+}
+
+ensure_user_dir() {
+    local path="$1"
+    local mode="$2"
+    assert_user_home_path_has_no_symlink_component "$path"
+    /usr/bin/sudo -u "$CONSOLE_USER" /bin/mkdir -p "$path"
+    assert_user_home_path_has_no_symlink_component "$path"
+    /usr/sbin/chown -h "$CONSOLE_USER" "$path"
+    /bin/chmod "$mode" "$path"
+}
+
+install_user_file() {
+    local path="$1"
+    local mode="$2"
+    local tmp
+    tmp="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/yadorilink-postinstall.XXXXXX")"
+    cat > "$tmp"
+    /usr/sbin/chown "$CONSOLE_USER" "$tmp"
+    /bin/chmod "$mode" "$tmp"
+    assert_user_home_path_has_no_symlink_component "$path"
+    /usr/bin/install -o "$CONSOLE_USER" -m "$mode" "$tmp" "$path"
+    /bin/rm -f "$tmp"
+}
+
+APP_PATH="/Applications/YadoriLinkFinderSyncHost.app"
+DAEMON_PATH="/usr/local/bin/yadorilink-daemon"
+AGENT_LABEL="com.yadorilink.daemon"
+# The menu-bar status app's own
+# LaunchAgent, installed and loaded the same way as the daemon's just
+# above (see this script's header comment point 1 for why a LaunchAgent,
+# not a LaunchDaemon).
+STATUS_APP_PATH="/usr/local/bin/yadorilink-status-app"
+STATUS_APP_AGENT_LABEL="com.yadorilink.status-app"
+FINDER_SYNC_EXT_ID="com.juntaki.yadorilink.FinderSync"
+FILE_PROVIDER_EXT_ID="com.juntaki.yadorilink.FileProvider"
+
+# --- 1. Find the console (GUI-logged-in) user, not root -------------------
+CONSOLE_USER="$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)"
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
+    # Fallback for edge cases (e.g. `installer -pkg ... -target /` run over
+    # SSH with nobody at the physical console): ask `who` for whoever owns
+    # the console tty session.
+    CONSOLE_USER="$(/usr/bin/who 2>/dev/null | /usr/bin/awk '$2 == "console" { print $1; exit }')"
+fi
+
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
+    log "WARNING: no GUI console user detected (headless install, or run before anyone logged in)."
+    log "Skipping per-user LaunchAgent setup and extension registration."
+    log "After logging in as the real user, re-run this installer."
+    exit 0
+fi
+
+CONSOLE_UID="$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null || true)"
+USER_HOME="$(/usr/bin/dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')"
+
+if [ -z "$CONSOLE_UID" ] || [ -z "$USER_HOME" ] || [ ! -d "$USER_HOME" ]; then
+    log "WARNING: could not resolve uid/home directory for console user '$CONSOLE_USER'."
+    log "Skipping per-user LaunchAgent setup and extension registration."
+    exit 0
+fi
+
+log "Console user: $CONSOLE_USER (uid $CONSOLE_UID), home: $USER_HOME"
+
+# --- 2. Write + load the per-user LaunchAgent ------------------------------
+LAUNCH_AGENTS_DIR="$USER_HOME/Library/LaunchAgents"
+PLIST_PATH="$LAUNCH_AGENTS_DIR/${AGENT_LABEL}.plist"
+LOG_DIR="$USER_HOME/Library/Logs/yadorilink"
+# Non-obvious, hard-won path (see shell-ext/macos/YadoriLinkFinderSync/Extension/
+# Extension.entitlements's doc comment): the App Group container the
+# sandboxed FinderSync/File Provider extensions can actually reach has NO
+# Team ID prefix, despite the usual ~/Library/Containers/<TeamID>.<bundle-id>/
+# convention App Sandbox itself uses elsewhere.
+GROUP_CONTAINER="$USER_HOME/Library/Group Containers/group.com.juntaki.yadorilink.shared"
+
+ensure_user_dir "$LAUNCH_AGENTS_DIR" 755
+ensure_user_dir "$LOG_DIR" 700
+ensure_user_dir "$GROUP_CONTAINER" 700
+
+install_user_file "$PLIST_PATH" 644 <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>${AGENT_LABEL}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>${DAEMON_PATH}</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>YADORILINK_SHELL_IPC_SOCKET</key>
+		<string>${GROUP_CONTAINER}/shell.sock</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>${LOG_DIR}/daemon.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>${LOG_DIR}/daemon.err.log</string>
+</dict>
+</plist>
+PLIST
+
+log "Wrote $PLIST_PATH"
+
+# `launchctl load` (the pre-10.11 API) is deprecated in favor of the
+# bootstrap/bootout subcommands, and — more importantly for a root
+# postinstall script — plain `launchctl bootstrap`/`load` run as root
+# targets ROOT's own launchd domain, not the console user's per-user GUI
+# domain a LaunchAgent needs to actually run in. `launchctl asuser
+# <uid> ...` (equivalently `launchctl bootstrap gui/<uid> ...`) is the
+# documented way to reach into a specific user's GUI session from root.
+/bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl bootout "gui/${CONSOLE_UID}/${AGENT_LABEL}" >/dev/null 2>&1 || true
+if /bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl bootstrap "gui/${CONSOLE_UID}" "$PLIST_PATH" 2>&1; then
+    /bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl enable "gui/${CONSOLE_UID}/${AGENT_LABEL}" >/dev/null 2>&1 || true
+    log "Loaded LaunchAgent $AGENT_LABEL into gui/$CONSOLE_UID"
+else
+    log "WARNING: launchctl bootstrap failed; the LaunchAgent is installed but not yet loaded."
+    log "It will still start automatically at the next login (RunAtLoad)."
+fi
+
+# --- 2b. Status app LaunchAgent ---------
+# Unlike the daemon's plist above, this one has no `KeepAlive` — the
+# status app is a user-facing tray icon, not an essential background
+# service; if the user deliberately quits it from its own "Quit" menu item
+# it should stay quit until the next login, not have launchd immediately
+# relaunch it.
+STATUS_PLIST_PATH="$LAUNCH_AGENTS_DIR/${STATUS_APP_AGENT_LABEL}.plist"
+
+if [ -x "$STATUS_APP_PATH" ]; then
+    install_user_file "$STATUS_PLIST_PATH" 644 <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>${STATUS_APP_AGENT_LABEL}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>${STATUS_APP_PATH}</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>${LOG_DIR}/status-app.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>${LOG_DIR}/status-app.err.log</string>
+</dict>
+</plist>
+PLIST
+
+    log "Wrote $STATUS_PLIST_PATH"
+
+    /bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl bootout "gui/${CONSOLE_UID}/${STATUS_APP_AGENT_LABEL}" >/dev/null 2>&1 || true
+    if /bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl bootstrap "gui/${CONSOLE_UID}" "$STATUS_PLIST_PATH" 2>&1; then
+        /bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl enable "gui/${CONSOLE_UID}/${STATUS_APP_AGENT_LABEL}" >/dev/null 2>&1 || true
+        log "Loaded LaunchAgent $STATUS_APP_AGENT_LABEL into gui/$CONSOLE_UID"
+    else
+        log "WARNING: launchctl bootstrap failed for the status app; it will still start at next login (RunAtLoad)."
+    fi
+else
+    log "WARNING: $STATUS_APP_PATH not found or not executable; skipping status app LaunchAgent."
+fi
+
+# --- 3. Extension discovery + first launch --------------------------------
+# Apple provides no supported, programmatic "enable my extension" API —
+# the user still has to flip the toggle in System Settings > General >
+# Login Items & Extensions themselves (see HostApp/main.swift's own
+# in-app instructions). What this installer *can* do is make sure
+# PlugInKit knows the extensions exist right away, rather than waiting on
+# a Launch Services / Spotlight rescan of /Applications to notice them:
+if [ -d "$APP_PATH" ]; then
+    FINDER_SYNC_APPEX="$APP_PATH/Contents/PlugIns/YadoriLinkFinderSync.appex"
+    FILE_PROVIDER_APPEX="$APP_PATH/Contents/PlugIns/YadoriLinkFileProvider.appex"
+
+    if [ -d "$FINDER_SYNC_APPEX" ]; then
+        /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/pluginkit -a "$FINDER_SYNC_APPEX" >/dev/null 2>&1 || true
+        /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/pluginkit -e use -i "$FINDER_SYNC_EXT_ID" >/dev/null 2>&1 || true
+    fi
+    if [ -d "$FILE_PROVIDER_APPEX" ]; then
+        /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/pluginkit -a "$FILE_PROVIDER_APPEX" >/dev/null 2>&1 || true
+        /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/pluginkit -e use -i "$FILE_PROVIDER_EXT_ID" >/dev/null 2>&1 || true
+    fi
+    log "Registered extensions with pluginkit (best-effort; user must still enable them in System Settings)."
+
+    # Launch the host app once, hidden/backgrounded, so
+    # applicationDidFinishLaunching -> DomainRegistration.registerOnDemandDomains()
+    # runs (it needs a running host app process — an extension can't
+    # register its own File Provider domain, see DomainRegistration.swift).
+    /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/open -g -j -a "$APP_PATH" >/dev/null 2>&1 || true
+    log "Launched $APP_PATH once (hidden) to trigger extension/domain discovery."
+else
+    log "WARNING: $APP_PATH not found; skipping extension registration."
+fi
+
+# --- 4. First-run onboarding window --
+# On a FRESH install only — i.e. this machine has never registered a device,
+# so `~/.yadorilink/device.json` does not yet exist — open the GUI onboarding
+# wizard for the console user. On an upgrade (device.json already
+# present) this is skipped, so re-installing never re-pops the wizard.
+# `launchctl asuser` runs it in the console user's GUI session (the same
+# mechanism the LaunchAgents above use); it is backgrounded so this root
+# postinstall doesn't block on the window, and reparents to launchd when
+# postinstall exits. Honors YADORILINK_CONFIG_DIR by falling back to the
+# default `~/.yadorilink` only (an installer can't know a per-user override).
+DEVICE_JSON="$USER_HOME/.yadorilink/device.json"
+if [ -x "$STATUS_APP_PATH" ] && [ ! -f "$DEVICE_JSON" ]; then
+    ( /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" \
+        "$STATUS_APP_PATH" --window onboarding >/dev/null 2>&1 & ) || true
+    log "Fresh install: opened the onboarding window for $CONSOLE_USER."
+else
+    log "device.json present (upgrade) or status app missing; skipping first-run onboarding."
+fi
+
+log "Postinstall complete."
+exit 0

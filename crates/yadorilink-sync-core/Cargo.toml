@@ -1,0 +1,82 @@
+[package]
+name = "yadorilink-sync-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# See yadorilink-local-storage/Cargo.toml's identical section for why.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
+
+[features]
+# Exposes test-only helpers (see `SyncState::force_second_live_link_for_test`)
+# to OTHER crates' test builds. Never enabled by a normal dependency edge, so
+# these helpers -- which deliberately bypass the schema's safety triggers to
+# forge states production code refuses to create -- cannot reach a release
+# binary.
+test-support = []
+
+[dependencies]
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+yadorilink-transport = { path = "../yadorilink-transport" }
+yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+thiserror.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json = "1"
+bytes.workspace = true
+# `FuturesUnordered` substitutes for
+# `tokio::task::JoinSet` in `peer_session.rs`'s bounded-concurrency
+# reconcile loop — `madsim`'s tokio shim has no `JoinSet` at all. Same
+# dependency shape as `yadorilink-daemon`'s existing `futures-util` use.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+prost = "0.14.4"
+rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
+notify = "8"
+hex = "0.4"
+walkdir = "2"
+fastcdc = "4.0.1"
+# Negotiated zstd compression for block and index-exchange payloads
+# (peer_session.rs) — scoped to this crate only.
+zstd = { workspace = true }
+# Retry-jitter randomness (`not_found_retry_delay`) and deterministic
+# pseudo-random content generation in tests.
+rand = "0.10.2"
+# Per-change signing/verification for the change-history DAG. Sign and
+# verify only (key generation lives in the transport crate next to the
+# WireGuard key), so no RNG feature is pulled in here.
+ed25519-dalek = "2"
+
+[dev-dependencies]
+tempfile = "3"
+boringtun = { version = "0.7", default-features = false }
+tracing-subscriber.workspace = true
+# The impact-map completeness lint
+# (`tests/dst_impact_map_lint.rs`) and the runbook freshness lint
+# (`tests/dst_runbook_freshness_lint.rs`) parse `impact_map.toml` / the cargo
+# aliases as TOML. Both are plain (non-madsim) tests so the guards run on
+# every `cargo test`; `toml` is only needed by those test binaries.
+toml = "0.8"
+
+# `tokio` is swapped for `madsim`'s
+# tokio-compatible shim only when the deterministic-simulation test
+# binary is built with `RUSTFLAGS="--cfg madsim"` (never for a normal
+# build/test run). Real
+# `notify`-based filesystem watching still isn't simulated by this (it's
+# native OS callback machinery, not tokio); DST scenarios use
+# `watcher::FolderWatchSource`'s simulated implementation instead.
+[target.'cfg(not(madsim))'.dependencies]
+tokio.workspace = true
+
+[target.'cfg(madsim)'.dependencies]
+tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }
+
+# The simulator itself (Runtime/Config),
+# used directly by tests/dst_*.rs to drive many independently-seeded
+# simulated runs. dev-only: never needed by the library itself, only by
+# `#![cfg(madsim)]`-gated test files.
+[target.'cfg(madsim)'.dev-dependencies]
+madsim = "0.2"

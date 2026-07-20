@@ -1,0 +1,541 @@
+syntax = "proto3";
+package yadorilink.sync.v1;
+
+// Peer-to-peer sync protocol exchanged directly between devices over a
+// `yadorilink-transport::PeerChannel` (a raw encrypted message channel, not
+// gRPC — only the coordination plane uses
+// gRPC; peer sync traffic rides the WireGuard-encrypted PeerChannel
+// established per session). Every message exchanged between two
+// syncing devices is one prost-encoded `SyncMessage`.
+
+message VersionVector {
+  // device_id -> monotonically increasing counter for that device's edits.
+  map<string, uint64> counters = 1;
+}
+
+message BlockInfo {
+  bytes hash = 1; // SHA-256 of block content
+  uint64 offset = 2;
+  uint32 size = 3;
+}
+
+// The kind of filesystem entry `FileInfo`
+// describes, mirroring `yadorilink_sync_core::types::RecordKind`.
+// `RECORD_KIND_UNSPECIFIED` is the proto3
+// zero-value — a message from a peer build that predates this change
+// (and any FileInfo this build itself doesn't set the field on) decodes
+// as UNSPECIFIED, which a receiver treats identically to
+// RECORD_KIND_FILE (the pre-existing, only-possible-before-this-change
+// behavior). An old regular-file record
+// is never retroactively reclassified as a symlink just because this
+// field happens to be absent.
+enum RecordKind {
+  RECORD_KIND_UNSPECIFIED = 0;
+  RECORD_KIND_FILE = 1;
+  RECORD_KIND_DIRECTORY = 2;
+  RECORD_KIND_SYMLINK = 3;
+}
+
+// Negotiated wire compression for
+// selected sync payloads. `COMPRESSION_NONE` is the proto3 zero-value so
+// messages encoded by older peers, or by newer peers that intentionally
+// leave the field unset, decode as uncompressed.
+enum Compression {
+  COMPRESSION_NONE = 0;
+  COMPRESSION_ZSTD = 1;
+}
+
+// No longer carried by any message here: the `Index`/`IndexUpdate` that
+// once put it on the wire went with the mtime index-convergence engine, and
+// the change DAG moves metadata as `Change`s instead. It is retained because
+// the generated Rust type is still used in-process as a plain record carrier
+// on the materialization-repair path (`peer_session.rs`'s
+// `file_info_for_record` -> `rematerialize_local_records`), so deleting it
+// breaks that build rather than shrinking the wire. Nothing sends or
+// receives it; do not add fields here expecting a peer to see them.
+message FileInfo {
+  string path = 1;
+  uint64 size = 2;
+  int64 mtime_unix_nanos = 3;
+  VersionVector version = 4;
+  repeated BlockInfo blocks = 5;
+  bool deleted = 6;
+  // Symlink-record and exec-bit fidelity
+  // fields. Additive (fields 7-10) — `BlockInfo` and
+  // this message's pre-existing fields 1-6 are unchanged, so an older
+  // peer decoding a message from a newer peer simply ignores these
+  // (standard proto3 forward compatibility), and a newer peer decoding a
+  // message from an older peer sees them at their zero values (see
+  // `RecordKind`'s doc comment above).
+  RecordKind record_kind = 7;
+  // Raw, unresolved symlink target path text (never
+  // dereferenced, synced as opaque text). Meaningful only when
+  // `record_kind == RECORD_KIND_SYMLINK`; unset/empty otherwise.
+  // `optional` so "not set" is distinguishable from "empty target
+  // string" at the wire level, even though today's receivers treat a
+  // symlink record with no usable target the same way either way (see
+  // `yadorilink_sync_core::peer_session::materialize_symlink_at`).
+  optional string symlink_target = 8;
+  // Set when a symlink's target is absolute or resolves
+  // outside the sending peer's linked-folder root — flagged, never
+  // dereferenced or gated on, so a receiver has the data point even
+  // though no policy currently changes behavior based on it. Meaningless
+  // when `record_kind != RECORD_KIND_SYMLINK`.
+  bool symlink_out_of_root_or_absolute = 9;
+  // The POSIX owner-executable bit captured from the
+  // source file. Meaningless for a symlink (no content) or directory
+  // record. A change to only this bit (content/blocks unchanged) is
+  // intended to propagate as a metadata-only update — see
+  // `yadorilink_sync_core::peer_session::try_apply_metadata_only_update`.
+  bool exec_bit = 10;
+  // The device id that
+  // actually produced this record's content — set once at genuine
+  // origination (a real local edit: that device's own id; a freshly
+  // adopted remote version: the sending peer's id) and thereafter
+  // preserved as records are re-materialized (e.g. across chained
+  // pairwise conflict resolution rounds), rather than re-derived from
+  // whichever peer session happens to be doing the processing. Additive
+  // (field 11) — an older peer that doesn't send this falls back to the
+  // previous (occasionally incorrect, for a 3+-way conflict) behavior of
+  // inferring origin from the local peer-session identity; see
+  // `yadorilink_sync_core::peer_session::resolve_and_apply_conflict`'s
+  // doc comment.
+  string origin_device_id = 11;
+}
+
+message ClusterConfig {
+  repeated string folder_group_ids = 1;
+  repeated string known_peer_device_ids = 2;
+  // Compression algorithms this peer can receive on subsequent messages.
+  repeated Compression supported_compression = 3;
+  // Field 4 was `bool supports_encrypted_storage_peer`, removed together
+  // with the untrusted ciphertext-only peer kind and its encrypted-index
+  // path. Every peer exchanges plaintext records/blocks over
+  // WireGuard-encrypted transport.
+  reserved 4;
+  reserved "supports_encrypted_storage_peer";
+  // Whether this peer understands the
+  // marker-byte-framed reliable-delivery wire format (`yadorilink_
+  // transport::peer_channel`'s seq/ack DATA and standalone-ACK frames,
+  // distinguished by a leading byte a legacy `SyncMessage` encoding can
+  // never produce — see that module's doc comment). An old peer that
+  // predates this field leaves it `false`, exactly like `supported_
+  // compression`'s empty-list default; this device only starts sending
+  // the new framing to a peer once *both* sides have advertised support
+  // (a both-sides-advertise negotiation, like `supported_compression`)
+  // — receiving is always format-agnostic regardless of
+  // negotiation state, so there is no race on which side flips first.
+  bool supports_reliable_delivery = 5;
+  // True once this
+  // device has itself received a `ClusterConfig` from the peer this
+  // message is addressed to. This is a genuine bidirectional-delivery
+  // confirmation, NOT the same thing as "I received something from the
+  // peer" alone: a device that has received from its peer sets this
+  // `true` on every `ClusterConfig` it sends afterward, so the peer can
+  // tell, from this flag, that *its own* earlier advertisement actually
+  // arrived. Receiving from a peer proves nothing about whether that
+  // peer received from *you* — under asymmetric datagram loss (one
+  // direction healthy, the other persistently dropped), a stop condition
+  // based only on "I received something" lets the broken direction's
+  // sender give up immediately, exactly defeating the retry loop this
+  // field supports (see `peer_session.rs`'s `spawn_cluster_config_retry`
+  // and `peer_acked_my_cluster_config`). An old peer that predates this
+  // field always leaves it `false`, so a legacy connection simply retries
+  // its bounded schedule and falls back — no different from today.
+  bool acked_peer_cluster_config = 6;
+  // Whether this peer speaks the
+  // change-history DAG protocol (heads exchange + change transfer), now the
+  // sole metadata-convergence path: the mtime index-exchange engine that
+  // once backed it up is gone, along with the `full_index`/`index_update`
+  // messages it ran on (reserved in `SyncMessage` below). Two peers that
+  // both advertise this converge via heads-exchange; this build always
+  // speaks it, so the flag reduces to "has the peer advertised it too"
+  // (`peer_session.rs`'s `change_dag_negotiated`, which gates head
+  // announces).
+  //
+  // An old peer that predates this field leaves it `false`, exactly like
+  // `supported_compression`'s empty-list default — but unlike compression,
+  // `false` is not a conservative fallback: there is nothing left to fall
+  // back to, so no metadata converges with such a peer at all. It is not
+  // treated as an error (there is no peer<->peer version handshake to
+  // report one through); the session simply never announces heads.
+  bool supports_change_dag = 7;
+  // Whether this peer implements the `VersionPresentQuery`/
+  // `VersionPresentAck` custody-confirmation exchange (see those messages
+  // below). An old peer that predates this field leaves it `false`, exactly
+  // like `supported_compression`'s empty-list default. Unlike the other
+  // capabilities here, an old peer isn't merely conservative about a query
+  // it doesn't understand — a `VersionPresentQuery` decodes on an old peer
+  // as an unrecognized `SyncMessage` oneof case (`peer_session.rs`'s
+  // `handle_message` documents prost's forward-compat handling of that), so
+  // it is silently dropped and never answered. Without this flag, querying
+  // such a peer would burn its full request timeout for nothing; callers
+  // must skip any peer that hasn't advertised this rather than query and
+  // wait it out.
+  bool supports_version_present = 8;
+  // Whether this peer's `VersionPresentQuery` responder enforces the
+  // `change::VersionHash` exact-identity check (`holds_version_durably`'s
+  // step 3: the recomputed hash of the matched root must equal the query's
+  // `version_hash`), rather than a build that predates that check and
+  // answers on `block_hashes`/`block_sizes` alone. This is strictly
+  // narrower than `supports_version_present` above: a peer can implement
+  // the query/ack exchange itself (and so advertise that field) while still
+  // running a build from before the exact-hash requirement existed, in
+  // which case its responder never even looks at `version_hash` and would
+  // answer a `for_handoff = true` whole-group durability-handoff query on
+  // block-hash agreement alone -- exactly the false-positive (two distinct
+  // versions sharing an identical ordered block list, e.g. an mtime-only
+  // edit) `version_hash` matching exists to close. An old peer that
+  // predates this field leaves it `false`, exactly like `supported_
+  // compression`'s empty-list default. `yadorilink_daemon::daemon_state`'s
+  // `peer_holds_entire_group` (the whole-group durability-handoff querier)
+  // must skip any peer that hasn't advertised this rather than send it a
+  // `for_handoff = true` query and trust a block-hash-only answer as
+  // exact-version proof; the per-file eviction custody path is unaffected
+  // by this field.
+  bool supports_version_hash_exact = 9;
+}
+
+message BlockRequest {
+  string folder_group_id = 1;
+  string file_path = 2;
+  // The plaintext content hash of the requested block.
+  bytes block_hash = 3;
+}
+
+message BlockResponse {
+  bytes block_hash = 1;
+  // The block's content bytes: plaintext, optionally zstd-compressed per
+  // `compression` below.
+  bytes data = 2;
+  // Set (with `data` empty) when the responder no longer has this block,
+  // so the requester doesn't hang waiting for a response that never comes.
+  bool not_found = 3;
+  Compression compression = 4;
+  // Fields 5-6 were `bool is_ciphertext` and `bytes ciphertext_nonce`,
+  // removed together with the untrusted ciphertext-only peer kind. Block
+  // `data` is always plaintext (optionally compressed), never AEAD
+  // ciphertext.
+  reserved 5, 6;
+  reserved "is_ciphertext", "ciphertext_nonce";
+}
+
+// Change-history DAG exchange. Sent only between two peers that have both
+// advertised `ClusterConfig.supports_change_dag`. The receiver diffs the
+// announced heads against its own store, requests the hashes it is missing,
+// walks the returned changes' parents, and repeats until closed — so the
+// bytes moved are proportional to the divergence between the replicas, not
+// to folder or total-history size.
+//
+// A change hash is the 32-byte SHA-256 of a change's canonical encoding; an
+// encoded change is its canonical encoding followed by its 64-byte Ed25519
+// signature (`yadorilink_sync_core::change::Change::to_wire_bytes`), so a
+// relayed change carries its original signature and cannot be forged or
+// altered by an intermediary without detection at the receiver.
+
+// Sent at session start and after every local commit: the sender's current
+// DAG heads for a group, plus an optional frontier hint used for compaction
+// bookkeeping (the sender's own acknowledged frontier).
+message HeadsAnnounce {
+  string folder_group_id = 1;
+  repeated bytes heads = 2;        // each = 32-byte change hash
+  // Optional: the sender's own delivered frontier head, so the receiver can
+  // advance its `device_frontier` record for the sender. Empty when unknown.
+  bytes frontier_hint = 3;
+}
+
+// The set of change hashes the requester is missing, computed by walking the
+// announced heads' ancestry against its own store.
+message ChangeRequest {
+  string folder_group_id = 1;
+  repeated bytes want = 2;         // each = 32-byte change hash
+}
+
+// A bounded, oldest-first batch of encoded changes answering a
+// `ChangeRequest`. Oldest-first so a receiver's ancestry completes as it
+// applies the batch, keeping orphaning the exception rather than the rule.
+// Bounded like today's index batches, and rides the existing compression
+// negotiation (changes compress well).
+message ChangeBatch {
+  string folder_group_id = 1;
+  // Each entry is one change's `to_wire_bytes` encoding (canonical bytes +
+  // 64-byte signature). When `compression != COMPRESSION_NONE`, `changes` is
+  // left empty and `compressed_changes` instead carries the zstd-compressed
+  // encoding of a temporary `ChangeBatch` submessage whose only meaningful
+  // field is `changes`, mirroring how `Index.compressed_files` and
+  // `BlockResponse.data` already carry compressed-or-raw payloads.
+  repeated bytes changes = 2;
+  Compression compression = 3;
+  bytes compressed_changes = 4;
+  // The canonical encodings of every file version referenced by the ops in
+  // this batch's `changes` (a create/update/move op carries only a version's
+  // content hash, not its block list). Each entry is one version's
+  // `yadorilink_sync_core::change::FileVersion::canonical_encoding`, whose
+  // SHA-256 is that version's hash — so a receiver re-derives and verifies the
+  // hash on arrival and a tampered version simply fails to match the hash any
+  // op references. Deduplicated within the batch and always sent uncompressed
+  // (versions are small relative to the block content they describe); a
+  // receiver stores these before admitting any change so a surviving-content
+  // path can be materialized from the version's block list. An older peer that
+  // predates this field leaves it empty, so a change referencing a version the
+  // receiver lacks is simply held and re-requested rather than admitted
+  // unmaterializable.
+  repeated bytes file_versions = 5;
+}
+
+// An on-demand device asks a full replica whether it durably holds an exact
+// file version, so the on-demand device may reclaim its own cached copy only
+// when a full replica confirms it holds that exact version. The version is
+// identified by `version_hash` — the change-DAG's own `change::VersionHash`
+// (SHA-256 of the canonical `FileVersion` encoding: the ordered block list
+// with each block's size, the total size, and the version's metadata — mtime,
+// exec bit, symlink target, record kind). That hash is the PRIMARY binding:
+// the responder recomputes it from its own index record and answers present
+// only on an exact match, never on a bare block-hash coincidence, so the
+// answer is bound to precisely this content-and-metadata identity, not a
+// causal "has the change" that a superseded version's blocks may no longer
+// back after retention/GC. `block_hashes`/`block_sizes` (parallel arrays, in
+// file-byte order) restate the same version's block list explicitly, so the
+// responder can run its own block/size comparison and its per-block `get()`
+// checksum-verification loop without a second round trip. `request_id`
+// correlates the asynchronous reply. Peer-to-peer only; the coordination
+// plane never sees this.
+message VersionPresentQuery {
+  uint64 request_id = 1;
+  string folder_group_id = 2;
+  string file_path = 3;
+  repeated bytes block_hashes = 4;   // each = 32-byte SHA-256 block hash, in file-byte order
+  // What the querier is trying to prove, which changes which of the
+  // responder's own versions may satisfy the query:
+  //   false (default, per-file eviction custody): the queried version must
+  //     match the responder's CURRENT record for the path. An on-demand
+  //     device asking "may I drop my last cached copy of this file's current
+  //     version?" must only be told yes by a full replica whose *current*
+  //     version is that exact content -- a match against a merely retained
+  //     (superseded/trashed) version is unsafe, because that retained row
+  //     can expire under version retention and be reclaimed, after which the
+  //     device that already dropped its cache would have no holder left.
+  //   true (whole-group durability handoff): the queried version may match
+  //     ANY version the responder still retains at the path -- current,
+  //     superseded, or trashed. A handoff must confirm the peer covers every
+  //     durability root of the group, including retained history, not only
+  //     current heads.
+  // Absent (proto3 default false) on a query from a peer built before this
+  // field existed, which is exactly the safe per-file-custody meaning, so an
+  // older querier keeps the strict current-only semantics.
+  bool for_handoff = 5;
+  // The queried version's `change::VersionHash` — 32-byte SHA-256 of its
+  // canonical `FileVersion` encoding. This is the exact-version identifier
+  // the responder recomputes and compares against, not `block_hashes` alone:
+  // two versions can share every block hash while differing in size, mtime,
+  // exec bit, symlink target, or record kind, and `version_hash` is what
+  // makes those distinct identities. Absent on a query from a peer built
+  // before this field existed decodes as EMPTY bytes (proto3's default for
+  // `bytes`, not an all-zero 32-byte value); the responder rejects any value
+  // that is not exactly 32 bytes, so an old querier talking to a new
+  // responder simply never confirms (fail closed, never misidentified).
+  bytes version_hash = 6;
+  // Each block's declared byte size, parallel to `block_hashes` (same index,
+  // same order) — lets the responder run an explicit block/size comparison
+  // against its own record in addition to the `version_hash` match, even
+  // though the outcome is already implied by that hash (size is one of its
+  // hashed inputs).
+  repeated uint32 block_sizes = 7;
+}
+
+// A full replica's answer to a `VersionPresentQuery`: whether it durably holds
+// every queried block. The answer is trusted because it arrives over the
+// authenticated peer channel from a device the netmap currently authorizes as a
+// full-replica member of the group, and the querier re-verifies that
+// authorization — and that its membership view is unchanged — after the reply,
+// rather than via a signature. `signature` is reserved for a future signed
+// attestation and is currently left empty and unverified; do not treat it as
+// populated.
+message VersionPresentAck {
+  uint64 request_id = 1;
+  string folder_group_id = 2;
+  string file_path = 3;
+  bool present = 4;                  // true only if every queried block is durably present
+  bytes signature = 5;              // reserved for a future signed attestation; currently unused
+}
+
+// A source device, about to give up its own full-replica role (unlink or
+// demote), asks a specific already-confirmed target peer to verify and pin
+// its own durability-root set and hand back a coordination-plane lease
+// naming that peer — so the source's role-loss commit can present a live
+// lease rather than relying on the eligibility guard alone. Sent only to a
+// peer the source has already confirmed (via the `VersionPresentQuery`/
+// `VersionPresentAck` whole-group durability handoff) holds every root the
+// source itself holds. `request_id` correlates the asynchronous reply.
+// Peer-to-peer only, over the authenticated channel; the coordination plane
+// is contacted separately, by the RESPONDER, and never sees this message or
+// `HandoffLeaseGrant` below.
+message HandoffLeaseRequest {
+  uint64 request_id = 1;
+  string folder_group_id = 2;
+}
+
+// The target's answer to a `HandoffLeaseRequest`: whether it could verify
+// and pin its own durability-root set for the group and obtain a
+// coordination-plane lease naming it as the confirmed target, plus the
+// digest of exactly the root set it attested and pinned. The source compares
+// this against its own local digest itself, daemon-local only — this digest
+// is never sent to, or read back from, the coordination plane; it is
+// exchanged directly between the two peers here and nowhere else.
+// `granted = false` (or an empty `lease_id`) means the target could not
+// obtain a live lease this round (not yet caught up with the source's exact
+// root set, the target's own coordination-plane request failed, etc.) — the
+// source must treat this exactly like a timeout: do not relinquish its role.
+message HandoffLeaseGrant {
+  uint64 request_id = 1;
+  bool granted = 2;
+  string lease_id = 3;
+  // The target's own durability-roots digest: the same 32-byte SHA-256 that
+  // the source's own readiness check computes, over the sorted
+  // (path, change::VersionHash) set of every durability root it retains.
+  // Empty when `granted = false`.
+  bytes root_digest = 4;
+  int64 expires_at_unix = 5;
+}
+
+// Best-effort cancellation of a lease already granted to the requesting
+// source. Used when the source can identify the lease but cannot use it
+// (for example, its digest does not match the target's attestation).
+// Carries ids only; the target owns both the local pin and Worker lease.
+message HandoffLeaseRelease {
+  uint64 request_id = 1;
+  string folder_group_id = 2;
+  string lease_id = 3;
+}
+
+// A device about to lose access to a folder group entirely (revoke/
+// device-remove of THIS device by a DIFFERENT device, not this device
+// giving up its own role voluntarily) asks a specific already-confirmed
+// peer to verify and pin ITS OWN durability-root set and hand back a
+// coordination-plane lease -- the removed-device "ticket" the operating
+// device (X) presents so a cross-device removal can proceed without
+// assuming the risk of permanently losing history only the removed device
+// (B) held. This is the same verify+pin+lease exchange as
+// `HandoffLeaseRequest`/`HandoffLeaseGrant` above, run by B against a peer
+// that holds B's own root set -- but triggered by a DIFFERENT peer (X, the
+// operating device) asking B to run it, kept as its own message pair
+// rather than reusing `HandoffLeaseRequest` directly because the trigger
+// and trust relationship are distinct: `HandoffLeaseRequest` only ever
+// flows from a source about to relinquish its OWN role to an
+// already-confirmed target, while this flows from the operating device to
+// the device actually being removed, asking it to attest itself -- an
+// operation with no equivalent in the ordinary handoff. `request_id`
+// correlates the asynchronous reply. Peer-to-peer only, over the
+// authenticated channel.
+message HandoffTicketRequest {
+  uint64 request_id = 1;
+  string folder_group_id = 2;
+}
+
+// B's answer to a `HandoffTicketRequest`: whether it could verify and pin
+// its own durability-root set for the group at some other confirmed peer
+// and obtain a coordination-plane lease for it. X trusts `granted` as B's
+// authenticated attestation over this session -- the same trust model
+// every other peer-session message here already uses -- and does not need
+// or compare a root digest (unlike `HandoffLeaseGrant`): B is the sole
+// authority on its own roots, and the whole point of this exchange is that
+// X cannot attest them itself. `lease_id`/`target_device_id`/
+// `expires_at_unix` are empty/zero when B's root set was empty (vacuously
+// ready -- nothing to hand off) or when `granted = false`. Unlike
+// `lease_id`/`expires_at_unix` (carried only for X to record/log),
+// `target_device_id` -- the confirming peer C that B pinned its roots
+// at -- is REQUIRED input to X's own removal: X presents `(lease_id,
+// target_device_id)` together to the coordination plane's lease-guarded
+// role-loss commit so the commit can atomically re-verify the lease is
+// still live for that exact `(group, target)` pair at the moment B is
+// actually removed, closing the time-of-check/time-of-use gap between
+// obtaining this ticket and performing the removal.
+message HandoffTicketGrant {
+  uint64 request_id = 1;
+  bool granted = 2;
+  string lease_id = 3;
+  int64 expires_at_unix = 4;
+  string target_device_id = 5;
+}
+
+
+// Cancels a removed-device ticket that the operating device obtained but
+// will not consume. The removed device forwards an id-only lease release to
+// the target that owns the pin; no reply is required because TTL remains the
+// fail-safe when either peer is no longer reachable.
+message HandoffTicketRelease {
+  uint64 request_id = 1;
+  string folder_group_id = 2;
+  string target_device_id = 3;
+  string lease_id = 4;
+}
+
+// A device asks a peer for a re-bootstrap snapshot proving it intentionally
+// pruned `requested_hash` -- sent when this device's own retained head
+// cannot reach the peer's advertised frontier through ordinary incremental
+// sync, the signal that ordinary `ChangeRequest`/`ChangeBatch` sync can no
+// longer converge and a HistoryBase re-bootstrap is needed instead.
+// `request_id` correlates the asynchronous reply.
+message RebootstrapSnapshotRequest {
+  uint64 request_id = 1;
+  string folder_group_id = 2;
+  bytes requested_hash = 3;
+}
+
+// The peer's answer to a `RebootstrapSnapshotRequest`: a signed
+// `RebootstrapRequired` (encoded via
+// `yadorilink_sync_core::rebootstrap::RebootstrapRequired::canonical_encoding`,
+// decoded and verified with `RebootstrapRequired::decode`/`verify` before
+// anything in it is trusted) bound to the exact `requested_hash`, plus the
+// snapshot bytes it proves via `manifest.checkpoint.snapshot_hash`.
+// `granted = false` (or an empty `required_encoded`) means the peer has no
+// local evidence it pruned that hash -- the requester must treat this
+// exactly like the unknown-vs-pruned boundary `prepare_rebootstrap_required`
+// already preserves locally, and like a timeout (this also covers a peer
+// running a build that predates this message, which decodes it as an
+// unrecognized `SyncMessage` oneof case and never replies).
+message RebootstrapSnapshotResponse {
+  uint64 request_id = 1;
+  bool granted = 2;
+  bytes required_encoded = 3;
+  bytes snapshot_bytes = 4;
+}
+
+message SyncMessage {
+  // Fields 2-3 were `Index full_index` and `IndexUpdate index_update` (the
+  // `oneof` cases below), removed with the mtime index-convergence engine
+  // they drove; the change DAG (`heads_announce`/`change_request`/
+  // `change_batch`) is the sole convergence authority. A peer old enough to
+  // still send them cannot converge with this build regardless, and prost
+  // decodes their now-unknown oneof cases as an unset `payload`, so they are
+  // silently dropped like any unrecognized variant.
+  reserved 2, 3;
+  reserved "full_index", "index_update";
+  // Field 6 was `PresenceSignal presence` (the `oneof` case below), removed
+  // with the edit-presence-awareness capability.
+  reserved 6;
+  reserved "presence";
+  // Fields 7-9 were `encrypted_full_index`, `encrypted_index_update`, and
+  // `wrapped_group_key`, removed together with the untrusted
+  // ciphertext-only peer kind.
+  reserved 7, 8, 9;
+  reserved "encrypted_full_index", "encrypted_index_update", "wrapped_group_key";
+  oneof payload {
+    ClusterConfig cluster_config = 1;
+    BlockRequest block_request = 4;
+    BlockResponse block_response = 5;
+    HeadsAnnounce heads_announce = 10;
+    ChangeRequest change_request = 11;
+    ChangeBatch change_batch = 12;
+    VersionPresentQuery version_present_query = 13;
+    VersionPresentAck version_present_ack = 14;
+    HandoffLeaseRequest handoff_lease_request = 15;
+    HandoffLeaseGrant handoff_lease_grant = 16;
+    HandoffTicketRequest handoff_ticket_request = 17;
+    HandoffTicketGrant handoff_ticket_grant = 18;
+    HandoffLeaseRelease handoff_lease_release = 19;
+    HandoffTicketRelease handoff_ticket_release = 20;
+    RebootstrapSnapshotRequest rebootstrap_snapshot_request = 21;
+    RebootstrapSnapshotResponse rebootstrap_snapshot_response = 22;
+  }
+}
