@@ -59,15 +59,27 @@ jobs:
 
       - name: Test (Linux, desktop app excluded)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test --workspace --exclude yadorilink-desktop-app
+        run: cargo test --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
 
       - name: Test
         if: matrix.os == 'macos-latest'
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude yadorilink-daemon
 
       - name: Test
         if: matrix.os == 'windows-latest'
-        run: cargo test --workspace -- --test-threads=4
+        run: cargo test --workspace --exclude yadorilink-daemon -- --test-threads=4
+
+      # yadorilink-daemon's integration tests spin up multiple real
+      # in-process daemons over real loopback UDP/Unix sockets and real
+      # SQLite databases; run concurrently with the rest of the workspace's
+      # tests (or with each other), they contend for those real resources
+      # and can flake under host load -- the same reason the daemon's own
+      # dev-side CI runs them in an isolated single-threaded lane instead of
+      # folding them into a workspace-wide test run. Excluded above and run
+      # here alone, single-threaded, so this job's pass/fail signal never
+      # depends on that contention.
+      - name: Daemon tests (isolated from the rest of the workspace, single-threaded)
+        run: cargo test -p yadorilink-daemon -- --test-threads=1
 
   shell-ext-windows:
     runs-on: windows-latest
