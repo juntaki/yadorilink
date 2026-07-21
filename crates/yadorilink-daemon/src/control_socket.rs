@@ -202,14 +202,37 @@ async fn handle_request(
     state: &Arc<DaemonState>,
     req: DaemonControlRequest,
 ) -> DaemonControlResponse {
-    // Read before `req.payload` is matched (and partially moved) below —
-    // a `u32` copy, not a borrow, so this doesn't fight the match on
-    // `req.payload` for ownership. Absent on a request from a CLI build
-    // that predates this field, decodes as 0, which is
-    // `< CONTROL_PROTOCOL_VERSION` and thus handled by the same
-    // "older/unversioned client" branch below as a real old version would
-    // be.
-    let client_protocol_version = req.protocol_version;
+    // This repository has not shipped a public release yet, so the CLI,
+    // desktop app, and daemon are always built and deployed as one unit —
+    // a genuine version skew has no supported recovery path and must fail
+    // clearly before touching any daemon state, not be executed anyway and
+    // only surface as a mismatch once the CLI inspects the response. Absent
+    // on a request from a build that predates this field, `protocol_version`
+    // decodes as 0, which is `!= CONTROL_PROTOCOL_VERSION` and thus rejected
+    // the same as any other mismatch.
+    if req.protocol_version != yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION {
+        let message =
+            if req.protocol_version > yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION {
+                format!(
+                    "this daemon (protocol version {}) does not support this request (client is \
+                 protocol version {}); upgrade the daemon and try again",
+                    yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+                    req.protocol_version,
+                )
+            } else {
+                format!(
+                    "this daemon requires exactly protocol version {} (client is protocol version \
+                 {}); this is a pre-release build with no client/daemon compatibility path — run \
+                 matching CLI and daemon binaries",
+                    yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+                    req.protocol_version,
+                )
+            };
+        return DaemonControlResponse {
+            payload: Some(RespPayload::Error(message)),
+            daemon_protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+        };
+    }
     let payload = match req.payload {
         Some(ReqPayload::Link(r)) => match link(state, r) {
             Ok(()) => RespPayload::Link(LinkResponse {}),
@@ -830,25 +853,6 @@ async fn handle_request(
             RespPayload::ReleaseHandoffTicket(ReleaseHandoffTicketResponse {})
         }
 
-        // Per spec "New CLI talks to older supported daemon": an unset
-        // `oneof payload` is what a
-        // *this* daemon build's proto decodes an unrecognized request
-        // variant number as — the shape a newer CLI's request takes once
-        // it reaches an older daemon that predates that variant entirely
-        // (protobuf drops fields it has no definition for). Distinguish
-        // that case, using the version each side already stamped on every
-        // request/response, from a genuinely malformed/empty request, so
-        // the CLI gets "upgrade the daemon" rather than an ambiguous
-        // "empty request" for what's really a version mismatch.
-        None if client_protocol_version
-            > yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION =>
-        {
-            RespPayload::Error(format!(
-                "this daemon (protocol version {}) does not support this request (client is \
-                 protocol version {client_protocol_version}); upgrade the daemon and try again",
-                yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
-            ))
-        }
         None => RespPayload::Error("empty request".to_string()),
     };
 
@@ -2398,12 +2402,9 @@ mod overall_status_tests {
     }
 }
 
-// --- Old-CLI/new-daemon and new-CLI/old-daemon compatibility, exercised
-// directly against `handle_request` (the actual dispatch a real
-// control-socket connection runs through) rather than only at the
-// wire-decode level (see `yadorilink_ipc_proto`'s own
-// `old_daemon_control_request_bytes_decode_with_zero_protocol_version`/
-// `..._response_...` tests for that layer).
+// --- Control-protocol exact-version enforcement, exercised directly
+// against `handle_request` (the actual dispatch a real control-socket
+// connection runs through).
 
 #[cfg(test)]
 mod migration_safety_tests {
@@ -2724,14 +2725,15 @@ mod migration_safety_tests {
         );
     }
 
-    /// Spec "Old CLI talks to newer daemon": a request shaped exactly the
-    /// way older CLI builds built one — a real payload
-    /// set, `protocol_version` left at its default (0) rather than the
-    /// current daemon's own `CONTROL_PROTOCOL_VERSION` — is handled
-    /// normally using backward-compatible defaults, not rejected just
-    /// because the version field is unset.
+    /// A request shaped exactly the way older CLI builds built one — a
+    /// real payload set, `protocol_version` left at its default (0)
+    /// rather than the current daemon's own `CONTROL_PROTOCOL_VERSION` —
+    /// is rejected before the payload is ever dispatched, not answered
+    /// using backward-compatible defaults: this repository has not
+    /// shipped a public release, so there is no supported skew to be
+    /// lenient about.
     #[tokio::test]
-    async fn old_cli_request_with_zero_protocol_version_still_succeeds() {
+    async fn old_cli_request_with_zero_protocol_version_is_rejected() {
         let state = test_state();
         let req = DaemonControlRequest {
             payload: Some(ReqPayload::Status(StatusRequest {})),
@@ -2740,28 +2742,32 @@ mod migration_safety_tests {
 
         let resp = super::handle_request(&state, req).await;
 
-        assert!(
-            matches!(resp.payload, Some(RespPayload::Status(_))),
-            "an old-shaped (unversioned) request must still get a normal response, not an \
-             error: {:?}",
-            resp.payload
-        );
+        match resp.payload {
+            Some(RespPayload::Error(msg)) => {
+                assert!(
+                    msg.contains("requires exactly protocol version"),
+                    "expected a version-mismatch message, got {msg:?}"
+                );
+            }
+            other => panic!("expected RespPayload::Error, got {other:?}"),
+        }
         assert_eq!(
             resp.daemon_protocol_version,
             yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
             "the daemon still stamps its own current version on the response even when \
-             answering an old-shaped request"
+             rejecting an old-shaped request"
         );
     }
 
-    /// Spec "New CLI talks to older supported daemon": stands in for a
-    /// newer CLI sending a request variant *this* daemon build has never
-    /// heard of — protobuf drops an unrecognized oneof field number
-    /// entirely, so from the daemon's point of view that decodes as
-    /// `payload: None`, exactly as constructed here, alongside a
-    /// `protocol_version` newer than what this daemon reports. The CLI
-    /// must be told to upgrade the daemon, not given the same generic
-    /// "empty request" a truly malformed/empty request gets.
+    /// Stands in for a newer CLI build sending a request variant *this*
+    /// daemon build has never heard of — protobuf drops an unrecognized
+    /// oneof field number entirely, so from the daemon's point of view
+    /// that decodes as `payload: None`, exactly as constructed here,
+    /// alongside a `protocol_version` newer than what this daemon
+    /// reports. The CLI must be told to upgrade the daemon, not given the
+    /// same generic "empty request" a truly malformed/empty request gets
+    /// — and the request must never reach payload dispatch to produce
+    /// that message, since it's rejected by the upfront version check.
     #[tokio::test]
     async fn newer_client_unset_payload_reports_upgrade_the_daemon() {
         let state = test_state();
@@ -2782,13 +2788,17 @@ mod migration_safety_tests {
     }
 
     /// Control case for the test above: a genuinely empty/malformed
-    /// request (no payload, and no newer-than-this-daemon version either)
-    /// still gets the plain "empty request" message, not the
-    /// version-mismatch one — the two failure modes stay distinguishable.
+    /// request from a *version-matched* client (no payload, but the
+    /// correct current `protocol_version`) gets the plain "empty
+    /// request" message, not a version-mismatch one — the two failure
+    /// modes stay distinguishable once the exact-version check passes.
     #[tokio::test]
     async fn truly_empty_request_still_reports_generic_empty_request() {
         let state = test_state();
-        let req = DaemonControlRequest { payload: None, protocol_version: 0 };
+        let req = DaemonControlRequest {
+            payload: None,
+            protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+        };
 
         let resp = super::handle_request(&state, req).await;
 

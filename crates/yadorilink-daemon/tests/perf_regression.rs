@@ -88,6 +88,13 @@ async fn large_file_scan_does_not_block_concurrent_async_work() {
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
     let sync_state = Arc::new(SyncState::open_in_memory().unwrap());
     let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
+    // A registered (non-empty device_id) DaemonState with no signing key
+    // fails closed in `link_manager::build_change_processor` -- see that
+    // function's own doc comment: without one, this device's local edits
+    // would be indexed but never recorded as DAG changes, which is silent
+    // data loss from the group's perspective, not a legitimate no-emitter
+    // path.
+    state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]));
     let root = tempfile::tempdir().unwrap();
 
     std::fs::write(root.path().join("large.bin"), large_content()).unwrap();
@@ -211,6 +218,16 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
     source_sync_state.add_link(&source_dir.path().to_string_lossy(), GROUP).unwrap();
     let source_record = dest_sync_state.get_file(GROUP, "large.bin").unwrap().unwrap();
     source_sync_state.upsert_file(GROUP, &source_record).unwrap();
+    // `chunk_file` above only writes these blocks into the source's own CAS
+    // store -- it does not record group provenance for them, which the real
+    // local-write path (`local_change.rs`) always does alongside a chunk
+    // write. `handle_block_request`'s serving-authorization gate refuses any
+    // block without it (`group_has_block_provenance`), so without this the
+    // source would refuse every block request from the dest side as
+    // not_found, and hydration would exhaust its retries and time out
+    // instead of exercising the concurrent-async-work property under test.
+    let block_hashes: Vec<Vec<u8>> = blocks.iter().map(|block| block.hash.clone()).collect();
+    source_sync_state.record_group_block_provenance(GROUP, &block_hashes).unwrap();
     let generation = source_sync_state.begin_group_startup(GROUP);
     source_sync_state.mark_group_ready(GROUP, generation);
     let session_source = PeerSyncSession::new(

@@ -1493,9 +1493,13 @@ impl DaemonState {
 
     /// Records this device's Ed25519 change-history signing key. The real
     /// daemon binary calls this once at startup when the device is
-    /// registered; a `DaemonState` built without it (every test that goes
-    /// through `new` without wiring one) leaves change-history emission off,
-    /// so behavior is byte-identical to before change history existed.
+    /// registered. A registered (non-empty `device_id`) `DaemonState` built
+    /// without one is a fail-closed condition, not a legitimate no-emitter
+    /// path — see `link_manager::ensure_initial_change_history`'s own doc
+    /// comment for why: local edits would be indexed but never recorded as
+    /// DAG changes, which is silent data loss from the group's perspective.
+    /// Only a genuinely unregistered device (empty `device_id`) tolerates
+    /// this being unset.
     pub fn set_device_signing_key(&self, signing_key: ed25519_dalek::SigningKey) {
         *self.device_signing_key.lock().unwrap_or_else(|p| p.into_inner()) = Some(signing_key);
     }

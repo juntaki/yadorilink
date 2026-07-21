@@ -1963,11 +1963,61 @@ mod tests {
             *self.raised.lock().unwrap_or_else(|p| p.into_inner()) = true;
             self.cv.notify_all();
         }
+        /// Unbounded wait, for the scan thread's own use (waiting on
+        /// `release_scan`, which the main test thread always raises promptly
+        /// once it reaches that point) -- the main test thread's wait on
+        /// `snapshot_read` is the one at risk of the scan never reaching the
+        /// hook at all, so that call site uses `wait_timeout` below instead.
         fn wait(&self) {
             let mut raised = self.raised.lock().unwrap_or_else(|p| p.into_inner());
             while !*raised {
                 raised = self.cv.wait(raised).unwrap_or_else(|p| p.into_inner());
             }
+        }
+        /// Bounded wait: returns whether the latch was actually raised, rather
+        /// than blocking forever. The scan thread this waits on can fail
+        /// *before* ever reaching the hook that raises it (e.g. `VerifiedRoot::
+        /// open`'s root-marker write hitting a full disk) -- an unbounded
+        /// `Condvar::wait` would then hang the test indefinitely instead of
+        /// failing, since nothing else in the test is ever going to raise it.
+        fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
+            let raised = self.raised.lock().unwrap_or_else(|p| p.into_inner());
+            let (raised, result) = self
+                .cv
+                .wait_timeout_while(raised, timeout, |raised| !*raised)
+                .unwrap_or_else(|p| p.into_inner());
+            *raised && !result.timed_out()
+        }
+    }
+
+    /// Extracts a readable message from a `std::thread::JoinHandle::join`
+    /// panic payload, for a clearer failure than "the latch never raised" when
+    /// the actual cause is the scan thread panicking before it could.
+    fn scan_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        }
+    }
+
+    /// Diagnoses why `snapshot_read.wait_timeout(..)` returned `false`:
+    /// joins the scan thread (already finished if it panicked before
+    /// reaching the hook; still running only if the hook itself is somehow
+    /// stuck, which the hook's own bodies below never do) and reports what
+    /// happened.
+    fn describe_scan_timeout(scan_handle: std::thread::JoinHandle<()>) -> String {
+        if scan_handle.is_finished() {
+            match scan_handle.join() {
+                Err(payload) => format!("scan thread panicked: {}", scan_panic_message(&*payload)),
+                Ok(()) => "scan thread returned Ok without ever reaching the post-snapshot hook \
+                           -- reconcile_disk_with_ignore must not have called it"
+                    .to_string(),
+            }
+        } else {
+            "scan thread is still running".to_string()
         }
     }
 
@@ -1990,6 +2040,19 @@ mod tests {
 
         state.add_link(&root.to_string_lossy(), RACE_GROUP).unwrap();
 
+        let processor = LocalChangeProcessor::new(state.clone(), store, "device-a".into());
+
+        // Adopt the root identity here, while the index is still empty --
+        // matching `adopt_root`'s own doc comment (a real first link always
+        // does this before indexing anything). Otherwise the *scan itself*
+        // performs first-adoption lazily inside `VerifiedRoot::open`, which
+        // includes a marker-file write; if that write fails for any reason
+        // (e.g. a full disk), the scan thread panics before ever reaching
+        // the race tests' post-snapshot hook, and the test hangs on an
+        // unbounded latch wait instead of failing. Adopting up front makes
+        // that failure mode surface immediately, in fixture setup, instead.
+        adopt_root(&processor, RACE_GROUP, &root);
+
         let mut base_version = VersionVector::new();
         base_version.increment("device-a");
         state
@@ -2009,7 +2072,6 @@ mod tests {
         std::fs::write(root.join(RACE_PATH), b"offline-local-edit-content").unwrap();
 
         let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
-        let processor = LocalChangeProcessor::new(state.clone(), store, "device-a".into());
         (processor, state, root, ignore_set, store_dir, root_dir)
     }
 
@@ -2060,7 +2122,12 @@ mod tests {
         });
 
         // Scan has read the old snapshot and is paused before its commit.
-        snapshot_read.wait();
+        if !snapshot_read.wait_timeout(std::time::Duration::from_secs(10)) {
+            panic!(
+                "scan never reached its post-snapshot hook within 10s: {}",
+                describe_scan_timeout(scan_handle)
+            );
+        }
 
         // Inject the peer change through the same gated sequence production uses:
         // wait for the group to be ready, then apply under the path lock. The
@@ -2132,7 +2199,12 @@ mod tests {
             processor.scan_existing_files_with_ignore(RACE_GROUP, &scan_root, &ignore_set).unwrap();
         });
 
-        snapshot_read.wait();
+        if !snapshot_read.wait_timeout(std::time::Duration::from_secs(10)) {
+            panic!(
+                "scan never reached its post-snapshot hook within 10s: {}",
+                describe_scan_timeout(scan_handle)
+            );
+        }
 
         // The peer apply runs immediately in the snapshot-vs-commit window,
         // bypassing the gate that just refused it (asserted above) to show what
@@ -4164,6 +4236,7 @@ mod tests {
             processor_with_toggleable_policy();
         let root = canonical_root(&root_dir);
         let group = "group-1";
+        adopt_root(&proc, group, &root);
         let file_path = root.join("report.txt");
 
         // A healthy-policy live edit establishes the group's first DAG history.
@@ -4284,6 +4357,12 @@ mod tests {
         let (proc, state, emitter, _store_dir, root_dir) = processor_with_emitter();
         let root = canonical_root(&root_dir);
         let group = "group-1";
+        // As `offline_delete_after_existing_dag_history_must_append_delete_
+        // change` documents: the later offline edit leaves the index and
+        // disk disagreeing on the same path, indistinguishable from an
+        // unmounted volume unless the folder's identity was established
+        // first, as a real link's would have been.
+        adopt_root(&proc, group, &root);
         let file_path = root.join("report.txt");
 
         // A live edit while the daemon is running establishes the group's
@@ -4401,6 +4480,12 @@ mod tests {
         let (proc, state, emitter, _store_dir, root_dir) = processor_with_emitter();
         let root = canonical_root(&root_dir);
         let group = "group-1";
+        // See `offline_edit_after_existing_dag_history_must_append_new_head_
+        // on_restart`'s identical adoption for why: the offline edit below
+        // leaves the index and disk disagreeing, indistinguishable from an
+        // unmounted volume unless the folder's identity was established
+        // first.
+        adopt_root(&proc, group, &root);
         let file_path = root.join("report.txt");
 
         std::fs::write(&file_path, b"version one").unwrap();

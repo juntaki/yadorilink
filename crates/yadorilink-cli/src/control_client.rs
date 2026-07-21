@@ -12,17 +12,22 @@ pub async fn send(
     payload: yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload,
 ) -> Result<DaemonControlResponse, CliError> {
     let mut stream = connect().await.map_err(|_| CliError::DaemonNotRunning)?;
-    write_message(
-        &mut stream,
-        &DaemonControlRequest {
-            payload: Some(payload),
-            protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
-        },
-    )
-    .await?;
+    let protocol_version = yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION;
+    write_message(&mut stream, &DaemonControlRequest { payload: Some(payload), protocol_version })
+        .await?;
     let resp = read_message::<DaemonControlResponse>(&mut stream)
         .await?
         .ok_or(CliError::DaemonNotRunning)?;
+
+    // Pre-release binaries are one release unit. Do not interpret a response
+    // from an older/newer development daemon using protobuf zero/default
+    // behavior; fail fast and require matching binaries instead.
+    if resp.daemon_protocol_version != protocol_version {
+        return Err(CliError::Other(format!(
+            "CLI/daemon protocol version mismatch (CLI {protocol_version}, daemon {}); run matching YadoriLink CLI and daemon binaries",
+            resp.daemon_protocol_version
+        )));
+    }
     if let Some(RespPayload::Error(msg)) = &resp.payload {
         return Err(CliError::Other(msg.clone()));
     }

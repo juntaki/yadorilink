@@ -283,7 +283,10 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         // Matched exhaustively with no catch-all arm, so a variant added
         // later must state its own case here instead of silently inheriting
         // a wrong one.
-        Err(e @ device_config::DeviceConfigError::UnsupportedConfigDowngrade { .. }) => {
+        Err(
+            e @ (device_config::DeviceConfigError::UnsupportedConfigDowngrade { .. }
+            | device_config::DeviceConfigError::StaleConfigVersion { .. }),
+        ) => {
             return Err(anyhow::anyhow!(
                 "refusing to start: {e}. Nothing on disk has been modified, and this device is \
                  still registered: do not delete device.json and do not run `yadorilink device \
@@ -1124,7 +1127,7 @@ mod startup_config_validation_tests {
     /// build supports — the "unsupported downgrade" case.
     fn too_new_device_json() -> String {
         format!(
-            r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","config_version":{}}}"#,
+            r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","nat":{{}},"wireguard_public_key":"wg-pub","signing_public_key":"signing-pub","config_version":{}}}"#,
             device_config::CONFIG_VERSION + 1
         )
     }
@@ -1186,7 +1189,7 @@ mod startup_config_validation_tests {
 
     fn current_device_json() -> String {
         format!(
-            r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","config_version":{}}}"#,
+            r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","nat":{{}},"wireguard_public_key":"wg-pub","signing_public_key":"signing-pub","config_version":{}}}"#,
             device_config::CONFIG_VERSION
         )
     }
@@ -1247,7 +1250,7 @@ mod startup_config_validation_tests {
         let too_new = start_daemon_with_device_json(&too_new_device_json()).await;
 
         assert!(
-            corrupt.error.contains("is not a valid device config"),
+            corrupt.error.contains("is not a valid current device config"),
             "a corrupt device.json must say so: {}",
             corrupt.error
         );

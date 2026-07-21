@@ -182,12 +182,22 @@ impl GlobalOracle {
     /// per-round convergence that
     /// took longer than `sla` to settle, without itself gating round
     /// progression (that's `converge_path`'s own, deliberately generous,
-    /// bound in the harness). Keeps a real, measured cost (self-echo
-    /// re-index churn's ~30s hydration-timeout cycle -- confirmed
-    /// production-real, not a harness/madsim artifact, by investigation)
-    /// visible in the oracle's own findings rather than silently
-    /// tolerated just because the round-progression gate is loose enough
-    /// to not fail on it.
+    /// bound in the harness). Keeps a real, measured cost visible in the
+    /// oracle's own findings rather than silently tolerated just because
+    /// the round-progression gate is loose enough to not fail on it.
+    /// Only ever called with a latency from a round that actually
+    /// converged (a budget-exhausted round is a separate failure/skip
+    /// path in each scenario, not a measured latency) -- so every finding
+    /// here genuinely did settle, just slower than `sla`.
+    ///
+    /// Deliberately does not guess at *why* a given round was slow: this
+    /// oracle is shared across scenario files with different fault-
+    /// injection semantics (e.g. self-echo re-index churn was confirmed
+    /// production-real for one prior investigation, but under a scenario
+    /// that injects packet loss the more parsimonious explanation is a
+    /// dropped `BlockRequest` driving a hydration-timeout/reconcile-retry
+    /// cycle instead) -- asserting one specific mechanism here would be
+    /// speculative for scenarios where it wasn't actually diagnosed.
     pub fn check_convergence_promptness(&self, sla: std::time::Duration) -> Vec<Violation> {
         self.convergence_latencies
             .iter()
@@ -198,9 +208,8 @@ impl GlobalOracle {
                 content_ids: Vec::new(),
                 devices: Vec::new(),
                 detail: format!(
-                    "convergence took {elapsed:?}, exceeding the {sla:?} promptness SLA -- likely \
-                     self-echo re-index churn driving a hydration-timeout cycle, not itself a \
-                     correctness bug (round progression still succeeded)"
+                    "convergence took {elapsed:?}, exceeding the {sla:?} promptness SLA, not \
+                     itself a correctness bug (round progression still succeeded)"
                 ),
             })
             .collect()

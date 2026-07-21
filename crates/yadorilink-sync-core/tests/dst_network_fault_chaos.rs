@@ -758,11 +758,22 @@ async fn run_scenario(
         }
         let (round_converged, round_convergence_elapsed) =
             converge_path(&device_a, &device_b, path).await;
-        oracle.record_round_convergence_latency(path, round_convergence_elapsed);
-        if !round_converged {
+        if round_converged {
+            // Only a genuinely-converged round has a real "how long did
+            // convergence take" latency to feed the promptness oracle --
+            // a round that hit `ROUND_SETTLE_BUDGET` without converging
+            // has an *unmeasured* true convergence time (it could be
+            // anywhere beyond the budget), not a measured "took 45s".
+            // Recording it here would print as "convergence took
+            // 45.000045s" alongside `check_convergence_promptness`'s SLA
+            // message, reading as a completed-but-slow convergence when
+            // it is actually a still-diverged timeout.
+            oracle.record_round_convergence_latency(path, round_convergence_elapsed);
+        } else {
             eprintln!(
-                "  NETWORK-FAULT: seed {seed} round {round} path {path} did not converge before \
-                 the next op; continuing so final heal/resync oracle decides pass/fail"
+                "  NETWORK-FAULT: seed {seed} round {round} path {path} did not converge \
+                 within the {ROUND_SETTLE_BUDGET:?} round-settle budget; continuing so final \
+                 heal/resync oracle decides pass/fail"
             );
         }
         match kind_roll {
@@ -1216,9 +1227,6 @@ fn network_fault_chaos_scenario() {
     // is a simulated-runtime/session-establishment infra condition
     // unrelated to this scenario's own sync-correctness assertions (see
     // each marker's own doc comment).
-    let mut skipped_baseline = 0;
-    let mut skipped_time_limit = 0;
-    let mut skipped_resource_exhaustion = 0;
     let mut failures = Vec::new();
 
     // replay every corpus case
@@ -1231,43 +1239,82 @@ fn network_fault_chaos_scenario() {
     // case's own recorded seed (see `run_scenario`'s doc comment on
     // `record_failing_case` for why the full `Case` is still persisted
     // even though replay is seed-driven for now).
+    //
+    // Kept as its own counter, never summed into the fresh-sweep
+    // `generated_skipped`/`exercised` accounting below: a corpus infra
+    // skip must never count toward the requested `variations` of *fresh*
+    // seeds actually exercised, and the final gate must never blame the
+    // wrong marker when a corpus replay is what skipped. Mirrors
+    // `dst_hydration_under_fault_chaos.rs`'s equivalent split.
+    let mut corpus_skipped: u64 = 0;
     for case in load_corpus_cases() {
         match run_seed_catching_time_limit(case.seed, ops_per_run) {
             Ok(()) => {}
-            Err(e) if e.starts_with(BASELINE_TIMEOUT_MARKER) => skipped_baseline += 1,
-            Err(e) if e.starts_with(TIME_LIMIT_MARKER) => skipped_time_limit += 1,
-            Err(e) if e.starts_with(RESOURCE_EXHAUSTION_MARKER) => skipped_resource_exhaustion += 1,
+            Err(e)
+                if e.starts_with(BASELINE_TIMEOUT_MARKER)
+                    || e.starts_with(TIME_LIMIT_MARKER)
+                    || e.starts_with(RESOURCE_EXHAUSTION_MARKER) =>
+            {
+                eprintln!("NETWORK-FAULT corpus infra skip seed {}: {e}", case.seed);
+                corpus_skipped += 1;
+            }
             Err(e) => failures.push(format!("[corpus replay] {e}")),
         }
     }
 
-    for i in 0..variations {
-        let seed = base_seed.wrapping_add(i);
+    // An explicit DST_BASE_SEED is a caller pinning down one specific
+    // reproduction range -- silently substituting a different seed's
+    // outcome for one in that range would defeat the documented
+    // DST_BASE_SEED=<seed> DST_VARIATIONS=<n> reproduction recipe, so
+    // max_attempts is bounded to exactly the requested range rather than
+    // widened. A skip within that exact range still fails the final gate
+    // below (it does not retry past the pinned range), which is the
+    // correct outcome for a targeted reproduction.
+    let targeted = std::env::var("DST_BASE_SEED").is_ok();
+    let max_attempts =
+        if targeted { variations.max(1) } else { variations.saturating_mul(8).max(8) };
+
+    let mut attempted: u64 = 0;
+    let mut exercised: u64 = 0;
+    let mut generated_skipped: HashMap<&'static str, u64> = HashMap::new();
+    while exercised < variations && attempted < max_attempts {
+        let seed = base_seed.wrapping_add(attempted);
+        attempted += 1;
         match run_seed_catching_time_limit(seed, ops_per_run) {
-            Ok(()) => {}
-            Err(e) if e.starts_with(BASELINE_TIMEOUT_MARKER) => skipped_baseline += 1,
-            Err(e) if e.starts_with(TIME_LIMIT_MARKER) => skipped_time_limit += 1,
-            Err(e) if e.starts_with(RESOURCE_EXHAUSTION_MARKER) => skipped_resource_exhaustion += 1,
+            Ok(()) => exercised += 1,
+            Err(e)
+                if e.starts_with(BASELINE_TIMEOUT_MARKER)
+                    || e.starts_with(TIME_LIMIT_MARKER)
+                    || e.starts_with(RESOURCE_EXHAUSTION_MARKER) =>
+            {
+                let kind = if e.starts_with(BASELINE_TIMEOUT_MARKER) {
+                    "baseline_timeout"
+                } else if e.starts_with(TIME_LIMIT_MARKER) {
+                    "time_limit"
+                } else {
+                    "resource_exhaustion"
+                };
+                eprintln!("NETWORK-FAULT infra skip seed {seed}: {e}");
+                *generated_skipped.entry(kind).or_insert(0) += 1;
+            }
             Err(e) => failures.push(e),
         }
     }
     std::panic::set_hook(previous_hook);
 
-    let skipped = skipped_baseline + skipped_time_limit + skipped_resource_exhaustion;
     assert!(
         failures.is_empty(),
-        "{}/{variations} network-fault chaos variations found an oracle violation (skipped {skipped_baseline} \
-         on baseline timeout, {skipped_time_limit} on the madsim time limit, \
-         {skipped_resource_exhaustion} on OS thread-creation exhaustion -- see \
-         RESOURCE_EXHAUSTION_MARKER's doc comment if this count is high; a round-convergence \
-         timeout is no longer skipped -- it appears among the failures below):\n{}\n\
+        "{}/{variations} network-fault chaos variations found an oracle violation \
+         (fresh-sweep infra skips={generated_skipped:?}, corpus infra skips={corpus_skipped} -- a \
+         round-convergence timeout is no longer skipped -- it appears among the failures below):\n{}\n\
          (reproduce one with DST_BASE_SEED=<seed> DST_VARIATIONS=1 cargo test ... \
          network_fault_chaos_scenario, then narrow to run_scenario(seed, ops) directly)",
         failures.len(),
         failures.join("\n---\n")
     );
     assert!(
-        skipped < variations,
-        "every seed hit BASELINE_TIMEOUT -- nothing was actually exercised"
+        exercised >= variations,
+        "requested {variations} exercised network-fault seeds, but exercised only {exercised} \
+         after {attempted} attempts; generated skips={generated_skipped:?}, corpus skips={corpus_skipped}"
     );
 }

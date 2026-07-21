@@ -45,6 +45,26 @@ fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
     link_manager::start_link_watch(state.clone(), local_path, group_id.to_string()).unwrap();
 }
 
+/// Diagnostic-only: one device's index state for `path` -- distinguishes
+/// "never arrived in the index at all" (delivery/DAG-admission never
+/// reached it) from "indexed but not materialized" (e.g. stuck
+/// `Hydrating`/`Placeholder`, or held) from "DAG head advanced, index says
+/// live, but the bytes never landed on disk" (a materialization bug).
+/// Mirrors `monkey_chaos.rs`'s `describe_index_state`.
+fn describe_index_state(state: &DaemonState, group_id: &str, path: &str) -> String {
+    let record = state.sync_state.get_file(group_id, path);
+    let materialization = state.sync_state.get_materialization_state(group_id, path);
+    let held = state.sync_state.get_held_state(group_id, path);
+    let heads = state
+        .sync_state
+        .dag_group_heads(group_id)
+        .map(|hs| hs.iter().map(|h| h.to_hex()).collect::<Vec<_>>());
+    format!(
+        "record={record:?} materialization={materialization:?} held={held:?} \
+         dag_group_heads={heads:?}"
+    )
+}
+
 fn spawn_orchestrator(
     coordination_addr: String,
     device_id: String,
@@ -139,6 +159,32 @@ async fn peers_keep_syncing_after_coordination_plane_goes_unreachable() {
     )
     .await;
 
+    // Confirm the LIVE watcher -> debounce -> DAG-emit -> announce path also
+    // works before the outage, not just the initial-scan path
+    // `before-outage.txt` exercised above. Without this, a post-outage sync
+    // failure below is ambiguous between "coordination unavailability broke
+    // peer sync" (what this test exists to catch) and "the live watcher
+    // pipeline has an unrelated bug" (this test's post-outage writes would
+    // otherwise be the *first* time either device's live watcher is
+    // exercised at all in this scenario) -- indistinguishable failure modes
+    // without a working live-watcher baseline recorded first.
+    std::fs::write(root_a.path().join("live-before-outage.txt"), b"live watcher works").unwrap();
+    wait_until_with_context(
+        || root_b.path().join("live-before-outage.txt").exists(),
+        Duration::from_secs(30),
+        || {
+            format!(
+                "pre-outage LIVE watcher sync failed (coordination plane is still up here -- \
+                 this isolates a live-watcher-pipeline bug from a coordination-availability bug)\n\
+                 daemon-a: {}\ndaemon-b: {}\ndaemon-a live-before-outage.txt: {}",
+                daemon_status_summary(&daemon_a.state),
+                daemon_status_summary(&daemon_b.state),
+                describe_index_state(&daemon_a.state, group_id, "live-before-outage.txt"),
+            )
+        },
+    )
+    .await;
+
     // Simulate the coordination plane vanishing completely: abort its accept
     // loop (freeing the port, so every future reconnect fails immediately —
     // connection refused, not just slow) and drop every live netmap
@@ -166,9 +212,12 @@ async fn peers_keep_syncing_after_coordination_plane_goes_unreachable() {
         Duration::from_secs(30),
         || {
             format!(
-                "post-outage A-to-B sync failed\ndaemon-a: {}\ndaemon-b: {}",
+                "post-outage A-to-B sync failed\ndaemon-a: {}\ndaemon-b: {}\n\
+                 daemon-a after-outage-from-a.txt: {}\ndaemon-b after-outage-from-a.txt: {}",
                 daemon_status_summary(&daemon_a.state),
-                daemon_status_summary(&daemon_b.state)
+                daemon_status_summary(&daemon_b.state),
+                describe_index_state(&daemon_a.state, group_id, "after-outage-from-a.txt"),
+                describe_index_state(&daemon_b.state, group_id, "after-outage-from-a.txt"),
             )
         },
     )
@@ -178,9 +227,12 @@ async fn peers_keep_syncing_after_coordination_plane_goes_unreachable() {
         Duration::from_secs(30),
         || {
             format!(
-                "post-outage B-to-A sync failed\ndaemon-a: {}\ndaemon-b: {}",
+                "post-outage B-to-A sync failed\ndaemon-a: {}\ndaemon-b: {}\n\
+                 daemon-a after-outage-from-b.txt: {}\ndaemon-b after-outage-from-b.txt: {}",
                 daemon_status_summary(&daemon_a.state),
-                daemon_status_summary(&daemon_b.state)
+                daemon_status_summary(&daemon_b.state),
+                describe_index_state(&daemon_a.state, group_id, "after-outage-from-b.txt"),
+                describe_index_state(&daemon_b.state, group_id, "after-outage-from-b.txt"),
             )
         },
     )

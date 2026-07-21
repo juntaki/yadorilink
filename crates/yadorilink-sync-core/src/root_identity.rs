@@ -155,6 +155,13 @@ impl VerifiedRoot {
     pub fn verify(root: &Path, group_id: &str, state: &SyncState) -> Result<Self, SyncError> {
         let path = root.canonicalize()?;
         ensure_single_root(group_id, state)?;
+        // Same lock `open` takes: without it, a `verify` racing a concurrent
+        // `open`'s in-progress adoption (marker just written, DB persist not
+        // yet committed, or vice versa) could read a transiently torn pair
+        // and fail spuriously. `verify` never writes, so this only ever
+        // waits for an adoption in flight, never contends against another
+        // `verify`.
+        let _adoption_guard = state.root_adoption_lock.lock().unwrap_or_else(|p| p.into_inner());
         let persisted = state.link_root_token_for_group(group_id)?.ok_or_else(|| {
             root_identity_mismatch(&path, group_id, "the link has no previously-adopted root token")
         })?;
@@ -169,6 +176,20 @@ impl VerifiedRoot {
             ));
         }
         if marker.root_token != persisted {
+            // The token values are logged (not just "they differ") because a
+            // future recurrence of this is exactly the shape of bug
+            // `root_adoption_lock` was added to close (two concurrent
+            // adoptions minting different tokens) -- seeing two genuinely
+            // different, well-formed hex tokens here means that race is back,
+            // versus e.g. an empty/malformed value pointing at a different
+            // cause entirely.
+            tracing::warn!(
+                ?path,
+                group_id,
+                persisted_token = %persisted,
+                marker_token = %marker.root_token,
+                "root identity check failed: marker's root token does not match the persisted one"
+            );
             return Err(root_identity_mismatch(
                 &path,
                 group_id,
@@ -202,6 +223,24 @@ impl VerifiedRoot {
         // permanent and invisible. Refusing here is what keeps that from being
         // laundered into a "valid" state.
         ensure_single_root(group_id, state)?;
+        // Serializes the read-marker-then-adopt-if-unmarked decision below.
+        // Without this, two concurrent `open()` calls for the same root that
+        // both observe no marker and no persisted token (e.g. this device's
+        // own startup scan racing an early peer reconcile, both opening the
+        // link for the first time) each mint their own fresh token and each
+        // write it to disk and to the DB independently — `write_marker` and
+        // `set_link_root_token_for_group` are two separate, non-atomic
+        // writes, so with two concurrent writers the *final* marker-on-disk
+        // and the *final* persisted-in-DB token can come from different
+        // callers and disagree forever afterward (root adoption has no
+        // automatic recovery from that state — `readopt` is explicit-user-
+        // action only). Held only across this synchronous section (a DB
+        // read, a marker read, and — on the unmarked path — a marker write
+        // and a DB write), never across an await, so a `std::sync::Mutex` is
+        // safe here. Confirmed empirically: traced two `adopt_unmarked_root`
+        // calls for the same root ~90us apart, both `had_persisted=false`,
+        // minting two different tokens.
+        let _adoption_guard = state.root_adoption_lock.lock().unwrap_or_else(|p| p.into_inner());
         let persisted = state.link_root_token_for_group(group_id)?;
 
         let Some(marker) = read_marker(&path)? else {
@@ -219,13 +258,25 @@ impl VerifiedRoot {
             ));
         }
         match persisted {
-            Some(token) if token != marker.root_token => Err(root_identity_mismatch(
-                &path,
-                group_id,
-                "its marker's root token is not the one this link adopted, so this is a \
-                 different folder for the same group (a restored backup, a re-created folder, \
-                 or another device's copy)",
-            )),
+            Some(token) if token != marker.root_token => {
+                // See `verify`'s identical log line: the actual token values
+                // matter for telling a `root_adoption_lock` regression (two
+                // different well-formed tokens) apart from any other cause.
+                tracing::warn!(
+                    ?path,
+                    group_id,
+                    persisted_token = %token,
+                    marker_token = %marker.root_token,
+                    "root identity check failed: marker's root token does not match the persisted one"
+                );
+                Err(root_identity_mismatch(
+                    &path,
+                    group_id,
+                    "its marker's root token is not the one this link adopted, so this is a \
+                     different folder for the same group (a restored backup, a re-created folder, \
+                     or another device's copy)",
+                ))
+            }
             Some(_) => Ok(Self { path }),
             // A marker with nothing persisted to check it against: the token
             // column was added after this link was created, or a previous
@@ -329,7 +380,15 @@ impl VerifiedRoot {
         // an otherwise-healthy folder (e.g. a user cleaned it out), so
         // re-minting would gratuitously invalidate a token other state may
         // already reference.
+        let had_persisted = persisted.is_some();
         let token = persisted.unwrap_or_else(mint_root_token);
+        tracing::debug!(
+            ?path,
+            group_id,
+            token = %token,
+            had_persisted,
+            "adopting an unmarked root: writing a fresh identity marker"
+        );
         write_marker(&path, group_id, &token)?;
         state.set_link_root_token_for_group(group_id, &token)?;
         Ok(Self { path })
@@ -565,6 +624,67 @@ mod tests {
 
         assert!(VerifiedRoot::open(&root, "group-1", &state).is_err());
         assert!(!root.join(ROOT_MARKER_FILE_NAME).exists());
+    }
+
+    /// Regression test for the race `root_adoption_lock` closes: two
+    /// concurrent callers racing to adopt the same still-unmarked root must
+    /// not each mint and write their own token -- `write_marker` and
+    /// `set_link_root_token_for_group` are two separate, non-atomic writes,
+    /// so two unsynchronized adopters can leave the marker-on-disk and the
+    /// persisted-in-DB token disagreeing forever (found via a self-hosted
+    /// Linux CI runner tracing `directory_conflict_matrix.rs`'s concurrent-
+    /// rename scenario: two `adopt_unmarked_root` calls for the same root
+    /// ~90us apart, both `had_persisted=false`, minting two different
+    /// tokens). Real OS threads plus a barrier force the two `open()` calls
+    /// to actually overlap; looped since the original race was probabilistic
+    /// (roughly 1 in 40 adoptions on a loaded host).
+    #[test]
+    fn concurrent_adoption_of_the_same_unmarked_root_never_disagrees_with_itself() {
+        for _ in 0..50 {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            // File-backed (WAL), not `open_in_memory`: that backend's
+            // shared-cache mode manufactures `SQLITE_LOCKED` under this
+            // test's deliberately extreme 8-way concurrency -- a lock class
+            // `busy_timeout` does not retry and production's real WAL+pool
+            // path essentially never reaches. That's a harness artifact of
+            // the in-memory backend, not the race this test exists to catch.
+            let db_dir = tempfile::tempdir().unwrap();
+            let state = SyncState::open(db_dir.path().join("state.sqlite3")).unwrap();
+            state.add_link(&root.to_string_lossy(), "group-1").unwrap();
+            let state = std::sync::Arc::new(state);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+
+            let results: Vec<_> = (0..8)
+                .map(|_| {
+                    let state = state.clone();
+                    let root = root.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        VerifiedRoot::open(&root, "group-1", &state)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect();
+
+            // A racing adoption of a still-unmarked root must still succeed
+            // for both callers -- losing the race to adopt first is not
+            // itself an error, only disagreeing about the outcome is.
+            for r in &results {
+                assert!(r.is_ok(), "a racing adoption must still succeed: {r:?}");
+            }
+            // Decisive check: re-opening afterward must succeed cleanly. If
+            // the two racers had written disagreeing tokens, this would fail
+            // with a permanent "root token is not the one this link adopted"
+            // error.
+            assert!(
+                VerifiedRoot::open(&root, "group-1", &state).is_ok(),
+                "re-opening after a racing adoption must not find a mismatched token"
+            );
+        }
     }
 
     /// The token is an identity nonce, not a derivation: two folders alike in

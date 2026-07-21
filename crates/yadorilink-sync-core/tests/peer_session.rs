@@ -4160,6 +4160,14 @@ async fn large_mostly_unchanged_index_resync_still_correctly_reconciles_the_few_
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // Initial full sync over the DAG — every file materializes on device_b.
+    // 150 sequential local commits form a 150-deep linear chain; this relies
+    // on `handle_change_request`'s ancestor-closure walk to serve that whole
+    // chain in one round trip instead of one request/response per
+    // generation (see its doc comment) and on `promote_orphans` being
+    // seeded/dependency-driven rather than doing a full-buffer rescan per
+    // promotion (see its doc comment) — without both, this used to take
+    // well over a minute and get slower, not faster, as more headroom was
+    // given it.
     announce_until(
         &session_a,
         GROUP,

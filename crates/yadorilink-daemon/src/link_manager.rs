@@ -471,11 +471,11 @@ impl PendingLocalChangeFlush for DaemonState {
 /// been established as the root of its change history
 /// (`ensure_initial_import`). That ordering is required: the import must
 /// precede the first live mutation or any admitted peer change so history
-/// starts at the observed present rather than fabricating a past. Both the
-/// import and the processor are byte-identical to the pre-change-history
-/// behavior when no emitter is wired (an unregistered device, or one whose
-/// signing key can't be loaded), so this never changes behavior without an
-/// identity to sign under.
+/// starts at the observed present rather than fabricating a past. Behavior
+/// is byte-identical to before change history existed only for a genuinely
+/// *unregistered* device (empty `device_id`) — a *registered* device with no
+/// signing key wired is a fail-closed condition instead, not a legitimate
+/// no-emitter path; see `ensure_initial_change_history`'s own doc comment.
 fn build_change_processor(
     state: &Arc<DaemonState>,
     group_id: &str,
@@ -485,10 +485,11 @@ fn build_change_processor(
         state.block_store.clone(),
         state.device_id.clone(),
     );
-    // Emission needs both a stable device id to attribute changes to and a
-    // signing key wired at startup. A device with no identity, or a code path
-    // (tests) that never wired a signing key, leaves emission off — behavior
-    // byte-identical to before change history existed.
+    // Emission needs a stable device id to attribute changes to. A device
+    // with no identity leaves emission off — behavior byte-identical to
+    // before change history existed. A registered device with no signing
+    // key is NOT handled here: `ensure_initial_change_history` below fails
+    // closed for that case instead of silently leaving emission off.
     if state.device_id.is_empty() {
         return Ok(processor);
     }

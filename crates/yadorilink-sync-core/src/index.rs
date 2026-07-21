@@ -428,6 +428,14 @@ pub struct SyncState {
     /// DAG changes. Daemon builds set this from their netmap policy state;
     /// tests and standalone sync-core users fall back to `ChangeAuth::PLACEHOLDER`.
     local_change_auth_provider: Mutex<Option<Arc<LocalChangeAuthProvider>>>,
+    /// Serializes `root_identity::VerifiedRoot::open`'s read-marker-then-
+    /// adopt-if-unmarked decision — see that function's use of this lock for
+    /// the race it closes. One lock for the whole `SyncState` (not
+    /// per-group): root adoption is a rare, one-time-per-link event, never a
+    /// hot path, so process-wide serialization here costs nothing observable
+    /// while being trivially correct (no per-group registry to keep in sync
+    /// with `path_locks`/`group_startup_gates`'s own lazy-cleanup logic).
+    pub(crate) root_adoption_lock: Mutex<()>,
 }
 
 /// Rebuilds `files` from its pre-this-
@@ -918,6 +926,7 @@ impl SyncState {
             path_locks: Mutex::new(HashMap::new()),
             group_startup_gates: Mutex::new(HashMap::new()),
             local_change_auth_provider: Mutex::new(None),
+            root_adoption_lock: Mutex::new(()),
         })
     }
 
@@ -955,6 +964,7 @@ impl SyncState {
             path_locks: Mutex::new(HashMap::new()),
             group_startup_gates: Mutex::new(HashMap::new()),
             local_change_auth_provider: Mutex::new(None),
+            root_adoption_lock: Mutex::new(()),
         })
     }
 
@@ -2058,6 +2068,12 @@ impl SyncState {
     /// Whether a change is already present in the applied store.
     pub fn dag_has_change(&self, hash: &ChangeHash) -> Result<bool, SyncError> {
         dag_store::has_change(&*self.pool.get()?, hash)
+    }
+
+    /// Whether a change is already known locally at all — admitted or still
+    /// buffered as an orphan. See `dag_store::has_change_or_buffered_orphan`.
+    pub fn dag_has_change_or_buffered_orphan(&self, hash: &ChangeHash) -> Result<bool, SyncError> {
+        dag_store::has_change_or_buffered_orphan(&*self.pool.get()?, hash)
     }
 
     /// A stored change decoded from its persisted bytes.

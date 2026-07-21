@@ -2751,6 +2751,7 @@ mod tests {
         let hash = hex::decode(store.put(&indexed).unwrap()).unwrap();
         let state = SyncState::open_in_memory().unwrap();
         let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-1", root.path());
         state.upsert_file("group-1", &record_with_blocks("offline.txt", &indexed, hash)).unwrap();
 
         let offline_edit = b"newer offline user edit with a different size".to_vec();
@@ -2779,6 +2780,7 @@ mod tests {
         let hash = hex::decode(store.put(&indexed).unwrap()).unwrap();
         let state = SyncState::open_in_memory().unwrap();
         let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-1", root.path());
         state.upsert_file("group-1", &record_with_blocks("same.txt", &indexed, hash)).unwrap();
 
         let offline_edit = b"offline-change!".to_vec();

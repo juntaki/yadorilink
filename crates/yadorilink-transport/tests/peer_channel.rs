@@ -110,9 +110,29 @@ async fn large_message_is_fragmented_and_reassembled() {
     .await
     .unwrap();
 
+    // Warm up with small messages first, then upgrade to reliable delivery,
+    // before sending the large payload. A 128 KiB message fragments into
+    // ~110 UDP datagrams (1200 bytes/fragment); the reassembler only
+    // completes a message once every one of its fragments has arrived, so
+    // sending it immediately over plain (non-reliable) UDP -- while the
+    // WireGuard handshake itself is still in flight -- makes this
+    // integration test hostage to a single dropped datagram out of ~110,
+    // with nothing to retransmit it. Pure fragmentation/reassembly logic
+    // (including out-of-order arrival) is already covered directly by
+    // `framing::tests::fragment_and_reassemble_roundtrip`; this test only
+    // needs to prove it also works end-to-end over a real channel, which
+    // doesn't require exercising loss-sensitive plain UDP delivery too.
+    a.send(b"warmup".to_vec()).await.unwrap();
+    assert_eq!(recv_within(&b, Duration::from_secs(5)).await, b"warmup");
+    b.send(b"warmup-ack".to_vec()).await.unwrap();
+    assert_eq!(recv_within(&a, Duration::from_secs(5)).await, b"warmup-ack");
+
+    a.enable_reliable_delivery();
+    b.enable_reliable_delivery();
+
     let big_payload = vec![0x42u8; 128 * 1024]; // matches the sync-engine's default block size
     a.send(big_payload.clone()).await.unwrap();
-    let received = recv_within(&b, Duration::from_secs(5)).await;
+    let received = recv_within(&b, Duration::from_secs(10)).await;
     assert_eq!(received, big_payload);
 }
 

@@ -124,14 +124,60 @@ async fn start_watching(device: &TestDevice, group_id: &str) {
     link_manager::start_link_watch(device.state.clone(), local_path, group_id.to_string()).unwrap();
 }
 
+/// Tears down one seed's daemon mesh when dropped: aborts every paired
+/// session's `run()` task and stops every device's link watch (the
+/// watcher/debounce/executor/repair tasks `link_manager::start_link_watch`
+/// spawned).
+///
+/// Without this, nothing in this file ever tears a seed's mesh down --
+/// `connect_two_daemons`'s session tasks hold *strong* `Arc<DaemonState>`
+/// references (via `set_pending_local_change_flush` and friends) and run
+/// forever since nothing closes their channel or aborts them, and
+/// `start_link_watch`'s tasks are equally permanent until `stop_link_watch`
+/// is called. `replay_known_failing_seeds` runs every corpus seed's
+/// `run_chaos` sequentially in the *same* process, so without teardown each
+/// seed leaves its entire 4-device mesh (12 session tasks plus each
+/// device's watcher/debounce/executor/repair tasks and SQLite pool) running
+/// underneath the next one -- confirmed as the actual cause of a real CI
+/// failure: the second of two corpus seeds failed initial DAG handshake
+/// negotiation within its 10s budget, competing with the first seed's
+/// still-fully-running mesh for the same process's CPU/disk.
+///
+/// A plain end-of-function cleanup call would not be enough: a panic (a
+/// genuine convergence-divergence failure, the exact thing this test exists
+/// to catch) must tear the mesh down too, or the *next* seed inherits it.
+/// `Drop` runs during unwinding as well as on a normal return, so
+/// constructing this right after the mesh connects and letting it fall out
+/// of scope covers both paths uniformly.
+struct MeshTeardownGuard {
+    session_handles: Vec<tokio::task::JoinHandle<()>>,
+    links: Vec<(Arc<DaemonState>, String)>,
+}
+
+impl Drop for MeshTeardownGuard {
+    fn drop(&mut self) {
+        for handle in &self.session_handles {
+            handle.abort();
+        }
+        for (state, local_path) in &self.links {
+            link_manager::stop_link_watch(state, local_path);
+        }
+    }
+}
+
 /// Pairs every device with every other over loopback (a full mesh), the
 /// direct-transport stand-in for the coordination-driven peer connections
-/// the orchestrator would establish for an authorized group.
-async fn connect_mesh(devices: &[TestDevice], group_id: &str) {
+/// the orchestrator would establish for an authorized group. Returns every
+/// paired session's `JoinHandle` so the caller can build a
+/// [`MeshTeardownGuard`] -- see that type's doc comment for why leaving them
+/// running is a real bug, not just tidiness.
+#[must_use]
+async fn connect_mesh(devices: &[TestDevice], group_id: &str) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut handles = Vec::new();
     let groups = [group_id.to_string()];
     for i in 0..devices.len() {
         for j in (i + 1)..devices.len() {
-            support::connect_two_daemons(
+            let pair_handles = support::connect_two_daemons_with_handles(
                 &devices[i].state,
                 &devices[i].device_id,
                 &devices[j].state,
@@ -139,8 +185,10 @@ async fn connect_mesh(devices: &[TestDevice], group_id: &str) {
                 &groups,
             )
             .await;
+            handles.extend(pair_handles);
         }
     }
+    handles
 }
 
 #[derive(Clone, Copy)]
@@ -159,8 +207,18 @@ fn snapshot(root: &std::path::Path) -> HashMap<String, String> {
     real_entry_names(root)
         .into_iter()
         .map(|name| {
-            let content = std::fs::read(root.join(&name)).unwrap_or_default();
-            let hash = hex::encode(Sha256::digest(&content));
+            let hash = match std::fs::read(root.join(&name)) {
+                Ok(content) => hex::encode(Sha256::digest(&content)),
+                // Distinct from a genuinely empty file's hash
+                // (`hex::encode(Sha256::digest(b""))`): collapsing a read
+                // error (e.g. a materialization rename racing this exact
+                // read, or a real "file vanished mid-poll") into "empty"
+                // would make an in-flight write look identical to a real
+                // zero-byte file, hiding exactly the kind of transient
+                // mid-flight state this snapshot exists to distinguish from
+                // genuine divergence.
+                Err(e) => format!("<read-error: {e}>"),
+            };
             (name, hash)
         })
         .collect()
@@ -176,6 +234,51 @@ fn describe_index_state(state: &DaemonState, group_id: &str, path: &str) -> Stri
     let materialization = state.sync_state.get_materialization_state(group_id, path);
     let held = state.sync_state.get_held_state(group_id, path);
     format!("record={record:?} materialization={materialization:?} held={held:?}")
+}
+
+/// Detailed per-device diagnostics for every path that currently differs
+/// across `snapshots` (relative to device-0): each device's DAG group heads
+/// (do the devices even agree on the same frontier?) plus `describe_index_state`
+/// for each affected path. Shared by both the timeout-path context dump
+/// below and the final strict-equality check, so a run that times out
+/// *inside* `wait_until_with_context` -- never reaching the code after it --
+/// still surfaces the same DAG-level diagnostics a slower or CI-only
+/// divergence would otherwise only reveal on a later reproduction attempt.
+/// Empty when nothing currently differs.
+fn diff_diagnostics(
+    devices: &[TestDevice],
+    group_id: &str,
+    snapshots: &[HashMap<String, String>],
+) -> String {
+    let reference = &snapshots[0];
+    let mut affected: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for snap in &snapshots[1..] {
+        affected.extend(reference.keys().filter(|k| !snap.contains_key(*k)).cloned());
+        affected.extend(snap.keys().filter(|k| !reference.contains_key(*k)).cloned());
+        affected.extend(
+            reference.keys().filter(|k| snap.get(*k).is_some_and(|v| v != &reference[*k])).cloned(),
+        );
+    }
+    if affected.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (d, device) in devices.iter().enumerate() {
+        let heads = match device.state.sync_state.dag_group_heads(group_id) {
+            Ok(hs) => hs.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
+            Err(e) => vec![format!("<error reading heads: {e}>")],
+        };
+        out.push_str(&format!("  device-{d} dag_group_heads={heads:?}\n"));
+    }
+    for name in &affected {
+        for (d, device) in devices.iter().enumerate() {
+            out.push_str(&format!(
+                "  device-{d} sync_state[{name:?}]: {}\n",
+                describe_index_state(&device.state, group_id, name)
+            ));
+        }
+    }
+    out
 }
 
 async fn run_chaos(seed: u64) {
@@ -194,7 +297,20 @@ async fn run_chaos(seed: u64) {
     for device in &devices {
         start_watching(device, &group_id).await;
     }
-    connect_mesh(&devices, &group_id).await;
+    let session_handles = connect_mesh(&devices, &group_id).await;
+    // Constructed immediately after the mesh connects (before any chaos
+    // operation that could panic) and never explicitly dropped early: `Drop`
+    // runs whether this function returns normally or panics, so this seed's
+    // entire mesh is guaranteed torn down before `replay_known_failing_
+    // seeds`'s loop -- or `random_concurrent_operations...`'s own single
+    // run -- moves on. See `MeshTeardownGuard`'s doc comment.
+    let _mesh_teardown = MeshTeardownGuard {
+        session_handles,
+        links: devices
+            .iter()
+            .map(|d| (d.state.clone(), d.root.path().to_string_lossy().into_owned()))
+            .collect(),
+    };
 
     // Give peer sessions a moment to establish before the chaos begins.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -347,16 +463,26 @@ async fn run_chaos(seed: u64) {
             // content" (a real bug) from "stable_polls kept resetting for
             // some other reason despite nothing actually differing"
             // (e.g. a test-timing artifact in this wait itself).
-            let dump = devices_ref
+            let current: Vec<HashMap<String, String>> =
+                devices_ref.iter().map(|d| snapshot(d.root.path())).collect();
+            let dump = current
                 .iter()
                 .enumerate()
-                .map(|(i, d)| format!("device-{i} snapshot={:?}", snapshot(d.root.path())))
+                .map(|(i, snap)| format!("device-{i} snapshot={snap:?}"))
                 .collect::<Vec<_>>()
                 .join("\n");
+            // DAG-heads + index-state detail for whatever currently differs.
+            // A timeout here means the code after this `.await` (which would
+            // otherwise produce this same detail) never runs, so without
+            // this the only diagnostic a CI-only timeout leaves behind is
+            // raw file content -- not enough to tell a stalled delivery/
+            // admission from a materialization determinism bug apart.
+            let diag = diff_diagnostics(devices_ref, &group_id, &current);
             format!(
                 "stability_reset_count={} (how many times the wait's own stability window \
                  restarted; a large count with names already matching suggests content is \
-                 still genuinely changing, not just a slow one-time convergence)\n{dump}",
+                 still genuinely changing, not just a slow one-time convergence)\n{dump}\n\
+                 --- DAG heads / sync_state detail for currently-differing paths ---\n{diag}",
                 reset_count.get()
             )
         },
@@ -378,21 +504,7 @@ async fn run_chaos(seed: u64) {
             .keys()
             .filter(|k| snap.get(*k).is_some_and(|v| v != &reference[*k]))
             .collect();
-        let affected: Vec<&String> = only_in_reference
-            .iter()
-            .chain(&only_in_other)
-            .chain(&differing_content)
-            .copied()
-            .collect();
-        let mut index_dump = String::new();
-        for name in &affected {
-            for (d, device) in devices.iter().enumerate() {
-                index_dump.push_str(&format!(
-                    "  device-{d} sync_state[{name:?}]: {}\n",
-                    describe_index_state(&device.state, &group_id, name)
-                ));
-            }
-        }
+        let index_dump = diff_diagnostics(&devices, &group_id, &final_snapshots);
         panic!(
             "device-{i} diverged from device-0's final file set after {ROUNDS} random operations\n\
              only on device-0: {only_in_reference:?}\n\
@@ -441,6 +553,14 @@ async fn random_concurrent_operations_converge_to_an_identical_file_set() {
 async fn replay_known_failing_seeds() {
     let _ = tracing_subscriber::fmt::try_init();
     for seed in load_corpus_seeds() {
+        // Plain stdout, not just `tracing::info!`: a corpus replay failure
+        // in ordinary CI output (no RUST_LOG set) previously gave no way to
+        // tell which of possibly several corpus seeds actually failed.
+        eprintln!(
+            "MONKEY_CHAOS replaying corpus seed={seed} (reproduce with: MONKEY_CHAOS_SEED={seed} \
+             cargo test -p yadorilink-daemon --test monkey_chaos random_concurrent_operations -- \
+             --nocapture)"
+        );
         tracing::info!(seed, "replaying corpus seed");
         run_chaos_recording_seed_on_failure(seed).await;
     }

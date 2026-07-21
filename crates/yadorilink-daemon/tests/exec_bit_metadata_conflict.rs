@@ -438,10 +438,19 @@ async fn exec_bit_set_on_brand_new_file_propagates_to_peer() {
         std::fs::write(&path_a, b"#!/bin/sh\necho hi\n").unwrap();
         std::fs::set_permissions(&path_a, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+        // Waits for content AND the exec bit together, not just content:
+        // materialization writes content via reconstruct_file's atomic
+        // rename and then applies the exec bit as a separate, subsequent
+        // apply_exec_bit call (see peer_session.rs) -- not one atomic step.
+        // Polling for content alone would observe that always-present (if
+        // usually sub-millisecond) window between the two and could assert
+        // on the exec bit before it's actually applied, especially under
+        // host load where the gap between the two syscalls widens.
+        let script_b = device_b.root.path().join("script.sh");
         wait_until_with_context(
             || {
-                std::fs::read(device_b.root.path().join("script.sh")).ok()
-                    == Some(b"#!/bin/sh\necho hi\n".to_vec())
+                std::fs::read(&script_b).ok() == Some(b"#!/bin/sh\necho hi\n".to_vec())
+                    && is_executable(&script_b)
             },
             Duration::from_secs(10),
             || format!("device-b entries: {:?}", real_entry_names(device_b.root.path())),
@@ -453,7 +462,7 @@ async fn exec_bit_set_on_brand_new_file_propagates_to_peer() {
             "sanity: device-a's own file must still be executable after its own chmod"
         );
         assert!(
-            is_executable(&device_b.root.path().join("script.sh")),
+            is_executable(&script_b),
             "device-b must receive the SAME owner-exec bit device-a set on a brand-new file, \
              not just the same content"
         );

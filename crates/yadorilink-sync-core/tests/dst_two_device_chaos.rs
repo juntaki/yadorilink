@@ -803,7 +803,6 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
         }
         let (round_converged, round_convergence_elapsed) =
             converge_path(&device_a, &device_b, path).await;
-        oracle.record_round_convergence_latency(path, round_convergence_elapsed);
         if !round_converged {
             // a convergence
             // timeout is now a genuine scenario FAILURE, not a skip --
@@ -824,6 +823,11 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
                  propagation bug, or the poll timeout is too tight for this host's current load"
             ));
         }
+        // Only a genuinely-converged round has a real "how long did
+        // convergence take" latency to feed the promptness oracle -- see
+        // the `!round_converged` arm above, which already returns before
+        // reaching here on a budget-exhausted round.
+        oracle.record_round_convergence_latency(path, round_convergence_elapsed);
         match kind_roll {
             0..=3 => {
                 // Solo write (40%): cleanly supersedes this path's prior
