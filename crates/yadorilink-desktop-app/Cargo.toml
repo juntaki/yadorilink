@@ -96,3 +96,8 @@ tempfile = "3"
 # `yadorilink-status-app` binary itself.
 yadorilink-daemon = { path = "../yadorilink-daemon" }
 yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+# For DeviceSigningKeyPair::generate() only, wiring a registered test
+# device's change-signing key -- already transitively present via
+# yadorilink-cli's own dependency on this crate, so this adds no new
+# crate to the build graph, only a direct name the test file can use.
+yadorilink-transport = { path = "../yadorilink-transport" }

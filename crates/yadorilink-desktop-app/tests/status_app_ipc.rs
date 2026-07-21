@@ -29,6 +29,10 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
     let sync_state = Arc::new(SyncState::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
+    // A registered (non-empty device_id) device with no signing key fails
+    // closed (`link_manager::ensure_initial_change_history`) -- see
+    // `yadorilink-cli`'s `tests/desktop_status_parity.rs`'s identical setup.
+    state.set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
     // Pin volume classification to "ok" regardless of this sandbox's real
     // (possibly near-full) host disk — see `yadorilink-cli`'s
     // `tests/desktop_status_parity.rs`' identical comment for the full

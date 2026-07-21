@@ -13,6 +13,17 @@ fn gen_keypair() -> (StaticSecret, PublicKey) {
     (secret, public)
 }
 
+// No test in this file previously initialized a tracing subscriber, so
+// RUST_LOG had silently had zero effect on any investigation of a failure
+// here -- discovered while chasing large_message_is_fragmented_and_
+// reassembled's 100%-reproducing mf1 failure (identical every run, no
+// tracing output of any kind despite RUST_LOG being set).
+fn init_test_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+}
+
 async fn recv_within(channel: &PeerChannel, d: Duration) -> Vec<u8> {
     timeout(d, channel.recv())
         .await
@@ -83,6 +94,7 @@ async fn direct_path_delivers_messages_both_ways() {
 /// transparently fragmented and reassembled over the direct path.
 #[tokio::test]
 async fn large_message_is_fragmented_and_reassembled() {
+    init_test_tracing();
     let (secret_a, public_a) = gen_keypair();
     let (secret_b, public_b) = gen_keypair();
 
