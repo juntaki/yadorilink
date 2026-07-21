@@ -3504,6 +3504,28 @@ impl PeerSyncSession {
                     // if the index still shows it live. A stale content change
                     // that is an ancestor of the tombstone never reaches the live
                     // set, so this can never resurrect a deleted file.
+                    //
+                    // Held across the still-live check AND the materialize call
+                    // below, matching `materialize_dag_content_head`'s identical
+                    // discipline for the Present branch (see its own comment on
+                    // why). Without this, a concurrent local write to this same
+                    // path -- e.g. the filename being reused by a brand-new
+                    // local create shortly after this device's own earlier
+                    // delete, which `local_change.rs`'s own commit path takes
+                    // this same lock for -- can interleave between the check and
+                    // the previously-unlocked materialize() below: the new
+                    // create's content and index row land first, then this
+                    // stale tombstone's materialize() removes that brand-new
+                    // file and overwrites its live index row with `deleted:
+                    // true` -- an index-says-deleted/disk-had-content mismatch
+                    // that no later re-resolution can detect, since every
+                    // device involved already believes it is consistent.
+                    // Confirmed as the actual cause of a real, reproduced
+                    // divergence: four devices with byte-identical DAG heads
+                    // each ended up with their own un-merged local tombstone
+                    // for the same repeatedly-recreated path.
+                    let path_lock = self.state.path_lock(group_id, path);
+                    let _guard = path_lock.lock().await;
                     let still_live =
                         self.state.get_file(group_id, path)?.map(|r| !r.deleted).unwrap_or(false);
                     if still_live {
