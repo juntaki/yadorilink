@@ -10,6 +10,7 @@ mod unix_socket_tests {
 
     use tokio::net::UnixStream;
     use yadorilink_daemon::daemon_state::DaemonState;
+    use yadorilink_daemon::link_manager;
     use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
     use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
     use yadorilink_ipc_proto::daemonctl::{
@@ -796,7 +797,7 @@ mod unix_socket_tests {
         send(
             &socket_path,
             ReqPayload::Link(LinkRequest {
-                local_path,
+                local_path: local_path.clone(),
                 group_id: "group-7".into(),
                 on_demand: false,
                 max_local_size_bytes: None,
@@ -807,6 +808,23 @@ mod unix_socket_tests {
             }),
         )
         .await;
+        // `Link` starts a real, live filesystem watcher for `folder`
+        // (`link_manager::start_link_watch`, called from the daemon's own
+        // Link handler) -- the write-then-index-directly setup below is
+        // meant to bypass that watcher pipeline entirely (see
+        // `start_daemon_with_state`'s own doc comment), but the watcher
+        // itself does not know that: it can independently notice
+        // `report.pdf` appearing on disk and start processing it
+        // concurrently with this test's own direct `upsert_file` +
+        // immediate `Evict`, racing for the same per-path lock
+        // `evict_file`'s non-blocking `try_lock` refuses to wait for.
+        // Confirmed as the actual cause of a real CI failure: the eviction
+        // was rejected with "it is pinned", but that error variant is also
+        // used for a busy path lock (`{path} is busy`), which is what the
+        // rejection message actually said -- the watcher, not a real pin,
+        // held the lock. Stopping the watch makes the bypass genuine
+        // instead of merely likely on a fast host.
+        link_manager::stop_link_watch(&state, &local_path);
 
         let content = vec![7u8; 1000];
         std::fs::write(folder.join("report.pdf"), &content).unwrap();
