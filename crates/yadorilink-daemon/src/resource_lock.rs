@@ -211,6 +211,13 @@ fn open_sidecar_file(lock_path: &Path) -> anyhow::Result<std::fs::File> {
 
 /// Take a non-blocking exclusive OS lock on `file`, mapping contention to a
 /// clear "already in use" error and any other failure to a lock-path error.
+///
+/// Compares against `fs2::lock_contended_error()`'s raw OS error rather than
+/// `ErrorKind::WouldBlock`: on Windows, `try_lock_exclusive`'s real
+/// contention error is `ERROR_LOCK_VIOLATION` (raw os error 33), which does
+/// not map to `ErrorKind::WouldBlock` in std's Windows error-kind mapping
+/// (unlike Unix's `EWOULDBLOCK`, which does) -- `fs2`'s own test suite
+/// compares the same way for the same reason.
 fn take_exclusive_lock(
     file: &std::fs::File,
     resource_label: &str,
@@ -218,7 +225,7 @@ fn take_exclusive_lock(
 ) -> anyhow::Result<()> {
     match fs2::FileExt::try_lock_exclusive(file) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
             anyhow::bail!("{resource_label} is already in use by another YadoriLink daemon")
         }
         Err(error) => {
