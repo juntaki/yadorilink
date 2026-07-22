@@ -1,6 +1,6 @@
 # installer/windows: registers/unregisters yadorilink-status-app.exe (the
 # menu-bar/notification-area status app) as a
-# per-user Scheduled Task that starts at logon — mirrors daemon-task.ps1's
+# per-user Scheduled Task that starts at logon -- mirrors daemon-task.ps1's
 # own approach for yadorilink-daemon.exe almost exactly (see that script's
 # comments for the full rationale on why a Scheduled Task rather than a
 # Service, and -LogonType Interactive rather than a batch/system logon:
@@ -14,7 +14,7 @@
 #
 # UNVERIFIED IN THIS ENVIRONMENT: this script was written and syntax
 # checked (`Test-ScriptFileInfo`/parser-level) but never run against a
-# real Windows machine — the status app was implemented in a
+# real Windows machine -- the status app was implemented in a
 # macOS-only sandbox with no Windows VM available this pass, unlike
 # daemon-task.ps1 and shell-ext/windows/install.ps1, which this project's
 # history says were verified against a real Windows 11 VM earlier. Treat
@@ -74,7 +74,7 @@ $trigger = New-ScheduledTaskTrigger -AtLogOn
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 # No -RestartCount/-RestartInterval (unlike daemon-task.ps1's essential-
 # service settings): the status app is a user-facing tray icon a user can
-# deliberately quit from its own "Quit" menu item — it shouldn't be force-
+# deliberately quit from its own "Quit" menu item -- it shouldn't be force-
 # relaunched by Task Scheduler within the same session, only at the next
 # logon (same discipline the macOS LaunchAgent plist uses: no `KeepAlive`).
 $settings = New-ScheduledTaskSettingsSet `

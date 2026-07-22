@@ -1346,7 +1346,7 @@ mod windows_pipe_tests {
     use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
     use yadorilink_ipc_proto::daemonctl::{
         DaemonControlRequest, DaemonControlResponse, LinkRequest, ListLinksRequest, PauseRequest,
-        ResumeRequest, StatusRequest,
+        PendingEnrollmentKind, ResumeRequest, StatusRequest,
     };
     use yadorilink_ipc_proto::framing::{read_message, write_message};
     use yadorilink_local_storage::FsBlockStore;

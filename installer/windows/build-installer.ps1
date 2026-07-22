@@ -1,6 +1,6 @@
 # Builds the Windows installer and enforces the SEC-LOCAL-3 release policy:
 # release builds must be Authenticode-signed through an Inno Setup SignTool
-# profile. Every build, signed or unsigned, gets a SHA-256 sidecar — every
+# profile. Every build, signed or unsigned, gets a SHA-256 sidecar -- every
 # downloadable release artifact must have a published checksum regardless
 # of signing status (a signed
 # installer can still be checksummed to detect corruption/tampering in
