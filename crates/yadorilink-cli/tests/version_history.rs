@@ -60,7 +60,10 @@ static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 fn put_and_record(state: &DaemonState, group_id: &str, data: &[u8]) -> Vec<u8> {
     let hash_hex = state.block_store.put(data).unwrap();
     let hash_bytes = hex::decode(&hash_hex).unwrap();
-    state.sync_state.record_group_block_provenance(group_id, &[hash_bytes.clone()]).unwrap();
+    state
+        .sync_state
+        .record_group_block_provenance(group_id, std::slice::from_ref(&hash_bytes))
+        .unwrap();
     hash_bytes
 }
 

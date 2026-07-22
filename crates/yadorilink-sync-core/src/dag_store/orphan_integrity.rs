@@ -5,7 +5,7 @@
 //! ready row into `super::retained_history_integrity`'s `changes` table once
 //! its parents are present.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::change::{Change, ChangeHash};
 use crate::error::SyncError;
@@ -62,41 +62,54 @@ pub(crate) fn insert_orphan(
 }
 
 /// Promotes every orphan whose ancestry is now complete into the applied
-/// store, repeating until no orphan can be promoted (promoting one may
-/// unblock another). Returns the hashes of the changes that were promoted, in
-/// the order they were appended — the caller projects each promoted orphan's
-/// paths, so it needs the identities, not just a count.
-pub fn promote_orphans(conn: &Connection) -> Result<Vec<ChangeHash>, SyncError> {
+/// store, seeded from the change hashes that just became durable (`seeds`).
+/// A currently-buffered orphan can only become promotable when one of its
+/// own parents lands, so walking outward from exactly those parent hashes
+/// (via the `change_parents_by_parent` index) finds every newly-promotable
+/// orphan in work proportional to what actually got unblocked. A prior
+/// version re-scanned the *entire* orphan buffer once per promotion, which
+/// is quadratic for a long chain of orphans that each unblock exactly one
+/// more (received out of order, then promoted one generation at a time).
+/// Returns the hashes of the changes that were promoted, oldest-first — the
+/// caller projects each promoted orphan's paths, so it needs the identities,
+/// not just a count.
+pub fn promote_orphans(
+    conn: &Connection,
+    seeds: &[ChangeHash],
+) -> Result<Vec<ChangeHash>, SyncError> {
     let mut promoted: Vec<ChangeHash> = Vec::new();
-    loop {
-        // Orphans with no still-missing parent.
-        let ready: Vec<(Vec<u8>, Vec<u8>, bool)> = {
+    let mut queue: std::collections::VecDeque<ChangeHash> = seeds.iter().copied().collect();
+    while let Some(parent_hash) = queue.pop_front() {
+        // Orphans that declare `parent_hash` as one of their own parents and
+        // are still buffered, oldest-arrived first.
+        let candidates: Vec<Vec<u8>> = {
             let mut stmt = conn.prepare(
-                "SELECT o.change_hash, o.encoded, o.applied FROM orphan_changes o \
-                 WHERE NOT EXISTS (\
-                     SELECT 1 FROM change_parents cp \
-                     WHERE cp.child_hash = o.change_hash \
-                       AND NOT EXISTS (SELECT 1 FROM changes c WHERE c.change_hash = cp.parent_hash))\
+                "SELECT cp.child_hash FROM change_parents cp \
+                 JOIN orphan_changes o ON o.change_hash = cp.child_hash \
+                 WHERE cp.parent_hash = ?1 \
                  ORDER BY o.received_seq",
             )?;
-            let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, i64>(2)? != 0))
-            })?;
-            let mut v = Vec::new();
-            for row in rows {
-                v.push(row?);
-            }
-            v
+            let rows = stmt.query_map([&parent_hash.0[..]], |r| r.get::<_, Vec<u8>>(0))?;
+            rows.collect::<Result<_, _>>()?
         };
-        // An orphan whose parent edges were never recorded (its parents were
-        // unknown at insert) still needs checking against the decoded change.
-        let mut made_progress = false;
-        for (hash_blob, encoded, applied) in ready {
+        for child_hash_blob in candidates {
+            // Re-fetch fresh rather than trust the query snapshot above: an
+            // earlier candidate processed in this same pass may already have
+            // promoted or dropped this exact row (e.g. two of its parents
+            // both land within the same seed set).
+            let row: Option<(Vec<u8>, bool)> = conn
+                .query_row(
+                    "SELECT encoded, applied FROM orphan_changes WHERE change_hash = ?1",
+                    [&child_hash_blob[..]],
+                    |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)? != 0)),
+                )
+                .optional()?;
+            let Some((encoded, applied)) = row else { continue };
             let change = match Change::from_wire_bytes(&encoded) {
                 Ok(c) => c,
                 Err(_) => {
                     // Corrupt buffered bytes: drop it rather than wedge the loop.
-                    drop_orphan_change(conn, &hash_blob)?;
+                    drop_orphan_change(conn, &child_hash_blob)?;
                     continue;
                 }
             };
@@ -105,9 +118,12 @@ pub fn promote_orphans(conn: &Connection) -> Result<Vec<ChangeHash>, SyncError> 
             }
             super::serving_authorization_index::validate_referenced_versions(conn, &change)?;
             super::retained_history_integrity::validate_present_parent_shape(conn, &change)?;
-            conn.execute("DELETE FROM orphan_changes WHERE change_hash = ?1", [&hash_blob[..]])?;
+            conn.execute(
+                "DELETE FROM orphan_changes WHERE change_hash = ?1",
+                [&child_hash_blob[..]],
+            )?;
             let real_hash = change.compute_hash();
-            if real_hash.0[..] != hash_blob[..] {
+            if real_hash.0[..] != child_hash_blob[..] {
                 // Stored under a key that disagrees with its own encoded
                 // hash (corrupted/tampered storage key, not the content
                 // itself, which is otherwise valid and admissible under its
@@ -115,18 +131,41 @@ pub fn promote_orphans(conn: &Connection) -> Result<Vec<ChangeHash>, SyncError> 
                 // keyed by that bogus hash, not the real one `append_change`
                 // is about to use, so they would become permanently
                 // unreachable ghost ancestry once the row above is gone.
-                conn.execute("DELETE FROM change_parents WHERE child_hash = ?1", [&hash_blob[..]])?;
+                conn.execute(
+                    "DELETE FROM change_parents WHERE child_hash = ?1",
+                    [&child_hash_blob[..]],
+                )?;
             }
             if super::retained_history_integrity::append_change(conn, &change, applied)? {
                 promoted.push(real_hash);
+                queue.push_back(real_hash);
             }
-            made_progress = true;
-        }
-        if !made_progress {
-            break;
         }
     }
     Ok(promoted)
+}
+
+/// The seeds for a startup self-heal pass: every hash that is both durably
+/// admitted and still named as a parent by a buffered orphan. Ordinary
+/// operation always promotes an orphan in the same call that admits its
+/// parent (see `admit_change`'s `seeds` argument), but a crash between those
+/// two steps — or an orphan buffered directly out of band — can leave a
+/// promotable orphan with nothing left to seed a promotion pass. Schema init
+/// calls this once so restart self-heals any such gap; it is not used on the
+/// hot admission path, where the seed is already known from the change that
+/// was just admitted.
+pub(crate) fn already_satisfied_parents(conn: &Connection) -> Result<Vec<ChangeHash>, SyncError> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT cp.parent_hash FROM change_parents cp \
+         JOIN changes c ON c.change_hash = cp.parent_hash \
+         JOIN orphan_changes o ON o.change_hash = cp.child_hash",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(super::retained_history_integrity::hash_from_blob(row?)?);
+    }
+    Ok(out)
 }
 
 /// Evicts an orphan repair could not give a verifiable version to (or whose
@@ -155,9 +194,13 @@ fn drop_orphan_change(conn: &Connection, change_hash: &[u8]) -> Result<(), SyncE
 /// for every version its ops reference; `repair_change_file_versions`
 /// resolves or clones that, and reports `false` (also dropped) when it
 /// cannot.
+/// One buffered `orphan_changes` row: `(change_hash, group_id, device_id,
+/// lamport, encoded)`.
+type OrphanRow = (Vec<u8>, String, String, i64, Vec<u8>);
+
 pub(crate) fn repair(conn: &Connection) -> Result<(), SyncError> {
     let tx = conn.unchecked_transaction()?;
-    let buffered_rows: Vec<(Vec<u8>, String, String, i64, Vec<u8>)> = {
+    let buffered_rows: Vec<OrphanRow> = {
         let mut stmt = tx.prepare(
             "SELECT change_hash, group_id, device_id, lamport, encoded FROM orphan_changes",
         )?;

@@ -104,9 +104,7 @@ fn run_scenario(seed: u64) -> Result<(), String> {
     // after it completes). Its presence is what tells startup repair this is a
     // crash to recover, not a file the user deleted while the daemon was stopped
     // (which would carry no intent). Seed it here to model the real crash state.
-    state
-        .begin_materialization_intent(GROUP_ID, PATH, &[0u8; 32])
-        .map_err(|e| e.to_string())?;
+    state.begin_materialization_intent(GROUP_ID, PATH, &[0u8; 32]).map_err(|e| e.to_string())?;
 
     // About half the seeds also leave a stale leftover temp file, the
     // shape a crash *during* reconstruct_file's write (rather than

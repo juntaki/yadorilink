@@ -15,16 +15,11 @@ pub mod local_discovery {
 pub mod daemonctl {
     include!(concat!(env!("OUT_DIR"), "/yadorilink.daemonctl.v1.rs"));
 
-    /// This crate's own control-protocol version marker — bump it whenever
-    /// a change to this wire format needs the daemon/CLI to actively
-    /// distinguish "I'm talking to an old peer" rather than relying on
-    /// protobuf's ordinary unknown-field/zero-default forward compatibility
-    /// alone (e.g. a request variant that isn't safe to silently ignore).
-    /// Every `DaemonControlRequest`/`DaemonControlResponse` carries this via
-    /// its own `protocol_version`/`daemon_protocol_version` field (see
-    /// those fields' doc comments in `daemon_control.proto`) so either side
-    /// can tell a genuinely pre-versioning peer (field absent, decodes as
-    /// 0) apart from a peer that's simply one version behind.
+    /// Exact daemon-control protocol generation for the current pre-release
+    /// source tree. The CLI, desktop app, and daemon are shipped as one unit;
+    /// development builds are not required to interoperate across protocol
+    /// generations. A version mismatch should fail clearly rather than select a
+    /// backward-compatibility path.
     pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
 }
 
@@ -33,7 +28,7 @@ mod tests {
     use prost::Message;
 
     use crate::daemonctl::daemon_control_request::Payload as ReqPayload;
-    use crate::daemonctl::{DaemonControlRequest, DaemonControlResponse, StatusRequest};
+    use crate::daemonctl::{DaemonControlRequest, StatusRequest};
     use crate::sync::{BlockResponse, Compression, SyncMessage};
 
     #[test]
@@ -43,7 +38,6 @@ mod tests {
             data: b"plain block".to_vec(),
             not_found: false,
             compression: Compression::None as i32,
-            ..Default::default()
         }
         .encode_to_vec();
 
@@ -89,9 +83,8 @@ mod tests {
         for field_number in [2u8, 3u8] {
             let old_peer_bytes = legacy_index_shaped_field(field_number);
 
-            let decoded = SyncMessage::decode(old_peer_bytes.as_slice()).unwrap_or_else(|e| {
-                panic!("field {field_number} must decode, not error: {e}")
-            });
+            let decoded = SyncMessage::decode(old_peer_bytes.as_slice())
+                .unwrap_or_else(|e| panic!("field {field_number} must decode, not error: {e}"));
 
             assert!(
                 decoded.payload.is_none(),
@@ -101,47 +94,6 @@ mod tests {
                 decoded.payload
             );
         }
-    }
-
-    /// Covers the "old CLI talks to newer daemon" scenario: a
-    /// `DaemonControlRequest` built the way every CLI build before this
-    /// change built one — only `payload` set, no `protocol_version` field
-    /// at all — decodes with `protocol_version == 0`, not an error and not
-    /// some other sentinel. A current daemon must treat that 0 as
-    /// "pre-versioning client," never as a literal invalid version number.
-    #[test]
-    fn old_daemon_control_request_bytes_decode_with_zero_protocol_version() {
-        let old_format = DaemonControlRequest {
-            payload: Some(ReqPayload::Status(StatusRequest {})),
-            ..Default::default()
-        }
-        .encode_to_vec();
-
-        let decoded = DaemonControlRequest::decode(old_format.as_slice()).unwrap();
-
-        assert_eq!(decoded.protocol_version, 0);
-        assert!(matches!(decoded.payload, Some(ReqPayload::Status(_))));
-    }
-
-    /// Converse of the above, "New CLI talks to older supported
-    /// daemon": a `DaemonControlResponse` from a daemon build that
-    /// predates `daemon_protocol_version` decodes that field as 0 — the
-    /// CLI-side signal that it's talking to a pre-versioning daemon,
-    /// distinguishable from any real daemon protocol version (which starts
-    /// at 1, see `CONTROL_PROTOCOL_VERSION`).
-    #[test]
-    fn old_daemon_control_response_bytes_decode_with_zero_daemon_protocol_version() {
-        let old_format = DaemonControlResponse {
-            payload: Some(crate::daemonctl::daemon_control_response::Payload::Error(
-                "empty request".into(),
-            )),
-            ..Default::default()
-        }
-        .encode_to_vec();
-
-        let decoded = DaemonControlResponse::decode(old_format.as_slice()).unwrap();
-
-        assert_eq!(decoded.daemon_protocol_version, 0);
     }
 
     /// A request built by a current CLI carries `protocol_version ==

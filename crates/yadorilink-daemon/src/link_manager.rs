@@ -471,11 +471,11 @@ impl PendingLocalChangeFlush for DaemonState {
 /// been established as the root of its change history
 /// (`ensure_initial_import`). That ordering is required: the import must
 /// precede the first live mutation or any admitted peer change so history
-/// starts at the observed present rather than fabricating a past. Both the
-/// import and the processor are byte-identical to the pre-change-history
-/// behavior when no emitter is wired (an unregistered device, or one whose
-/// signing key can't be loaded), so this never changes behavior without an
-/// identity to sign under.
+/// starts at the observed present rather than fabricating a past. Behavior
+/// is byte-identical to before change history existed only for a genuinely
+/// *unregistered* device (empty `device_id`) — a *registered* device with no
+/// signing key wired is a fail-closed condition instead, not a legitimate
+/// no-emitter path; see `ensure_initial_change_history`'s own doc comment.
 fn build_change_processor(
     state: &Arc<DaemonState>,
     group_id: &str,
@@ -485,10 +485,11 @@ fn build_change_processor(
         state.block_store.clone(),
         state.device_id.clone(),
     );
-    // Emission needs both a stable device id to attribute changes to and a
-    // signing key wired at startup. A device with no identity, or a code path
-    // (tests) that never wired a signing key, leaves emission off — behavior
-    // byte-identical to before change history existed.
+    // Emission needs a stable device id to attribute changes to. A device
+    // with no identity leaves emission off — behavior byte-identical to
+    // before change history existed. A registered device with no signing
+    // key is NOT handled here: `ensure_initial_change_history` below fails
+    // closed for that case instead of silently leaving emission off.
     if state.device_id.is_empty() {
         return Ok(processor);
     }
@@ -886,9 +887,7 @@ fn start_link_watch_inner(
                         }
                     }
                     let recovery_complete = matches!(
-                        executor_state
-                            .sync_state
-                            .duplicate_recovery_pending(&executor_group_id),
+                        executor_state.sync_state.duplicate_recovery_pending(&executor_group_id),
                         Ok(false)
                     );
                     if recovery_complete {
@@ -927,9 +926,8 @@ fn start_link_watch_inner(
                                 error = %error,
                                 "post-scan change-history bootstrap failed; group startup remains closed"
                             );
-                            history_failure = Some(format!(
-                                "post-scan change-history bootstrap failed: {error}"
-                            ));
+                            history_failure =
+                                Some(format!("post-scan change-history bootstrap failed: {error}"));
                         }
                     }
                     // One batched broadcast for the whole initial scan
@@ -1466,7 +1464,10 @@ pub async fn run_disk_reconcile_backstop_sweep(state: &Arc<DaemonState>) {
 fn link_should_propagate(state: &DaemonState, local_path: &str, group_id: &str) -> bool {
     match state.sync_state.link_gate_for_group(group_id) {
         Ok(yadorilink_sync_core::index::LinkGate::Live { local_path: live_path, .. })
-            if live_path == local_path => true,
+            if live_path == local_path =>
+        {
+            true
+        }
         Ok(_) => false,
         Err(e) => {
             tracing::warn!(
@@ -1929,18 +1930,19 @@ mod tests {
         // this branch just restored). This test is about tombstone-
         // suppression/duplicate-recovery scan behavior, not policy
         // resolution, so bypass it the same way `index.rs`'s own tests do.
-        state
-            .sync_state
-            .set_local_change_auth_provider(std::sync::Arc::new(|_group_id| {
-                Ok(yadorilink_sync_core::change::ChangeAuth::PLACEHOLDER)
-            }));
+        state.sync_state.set_local_change_auth_provider(std::sync::Arc::new(|_group_id| {
+            Ok(yadorilink_sync_core::change::ChangeAuth::PLACEHOLDER)
+        }));
         // The survivor's own file, indexed and present: that is what corroborates
         // the root, so the root-identity check adopts rather than refusing it as
         // a possible bare mountpoint. Without it this test would never reach the
         // tombstone decision it is about. Must actually match the bytes just
         // written above — `sample_record`'s placeholder size/blocks would not
         // corroborate and `VerifiedRoot::open` below would refuse.
-        state.sync_state.upsert_file(group, &record_matching_disk_content("in-a.txt", b"aaa")).unwrap();
+        state
+            .sync_state
+            .upsert_file(group, &record_matching_disk_content("in-a.txt", b"aaa"))
+            .unwrap();
         yadorilink_sync_core::root_identity::VerifiedRoot::open(
             root.path(),
             group,

@@ -1,6 +1,10 @@
 //! Local config file recording this device's identity and the
 //! coordination-plane address to use — written here on successful
 //! `yadorilink device register`, read by `yadorilink-daemon` on startup.
+//!
+//! YadoriLink has not shipped yet. `device.json` therefore has one canonical
+//! shape; development builds are not required to read configs written by older
+//! development revisions.
 
 use std::path::{Path, PathBuf};
 
@@ -10,28 +14,23 @@ use serde::{Deserialize, Serialize};
 pub struct DeviceConfig {
     pub device_id: String,
     pub coordination_addr: String,
-    /// NAT-traversal settings written into `device.json` at register time
-    /// so a user has a documented, editable starting point; the daemon
-    /// reads them. Duplicated from
-    /// `yadorilink_daemon::device_config::NatConfig`, matching this file's
-    /// existing "both crates carry an identical `DeviceConfig`" pattern.
-    #[serde(default)]
+    /// NAT-traversal settings written at registration time and consumed by the
+    /// daemon. The top-level field is required; `NatConfig` itself still uses
+    /// defaults so a user can edit only the settings they want to override.
     pub nat: NatConfig,
-    /// Mirrors
-    /// `yadorilink_daemon::device_config::DeviceConfig::config_version` —
-    /// see that field's doc comment for the full rationale. `#[serde(default)]`
-    /// so a `device.json` from before this field existed decodes as
-    /// `config_version: 0` (the correct "pre-versioning" value) instead of
-    /// failing to parse.
-    #[serde(default)]
+    /// Base64-encoded public half of the registered WireGuard/X25519 identity.
+    pub wireguard_public_key: String,
+    /// Base64-encoded public half of the registered Ed25519 change-signing key.
+    pub signing_public_key: String,
+    /// Exact development config shape. Pre-release builds intentionally do not
+    /// migrate older `device.json` revisions; a mismatch must be recreated by
+    /// registering the device with the current build.
     pub config_version: u32,
 }
 
-/// NAT-traversal settings written into `device.json`. Duplicated verbatim
-/// from `yadorilink_daemon::device_config::NatConfig` (the daemon is the
-/// consumer); see that copy for the per-field rationale. Conservative
-/// defaults: STUN on against a well-known public set, router port mapping
-/// off until opted into.
+/// NAT-traversal settings written into `device.json`. Duplicated from
+/// `yadorilink_daemon::device_config::NatConfig` because the CLI owns creation
+/// of the file while the daemon owns consumption of it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NatConfig {
@@ -39,8 +38,7 @@ pub struct NatConfig {
     pub stun_servers: Vec<String>,
     /// STUN re-probe interval, in seconds.
     pub stun_refresh_secs: u64,
-    /// Whether to actively request a router port mapping (on by default;
-    /// the lease is finite, renewed, and released on shutdown).
+    /// Whether to actively request a router port mapping.
     pub port_mapping_enabled: bool,
     /// Requested router port-mapping lease lifetime, in seconds.
     pub port_mapping_lease_secs: u32,
@@ -57,12 +55,12 @@ impl Default for NatConfig {
     }
 }
 
-/// The well-known public STUN servers used when a config specifies none.
 fn default_stun_servers() -> Vec<String> {
     vec!["stun.l.google.com:19302".to_string(), "stun1.l.google.com:19302".to_string()]
 }
 
-/// The current `device.json` shape, as of the first public beta baseline.
+/// Current pre-release `device.json` shape. This is an exact-match marker, not
+/// a migration boundary: older development shapes are intentionally rejected.
 pub const CONFIG_VERSION: u32 = 1;
 
 pub fn config_dir() -> PathBuf {
@@ -86,13 +84,8 @@ pub fn control_socket_path() -> PathBuf {
     config_dir().join("daemon.sock")
 }
 
-/// The Windows equivalent of
-/// `control_socket_path` — a pipe name, not a filesystem path. Mirrors
-/// `yadorilink_daemon::device_config::control_pipe_name` exactly (same env
-/// var, same derivation); duplicated rather than shared because
-/// `yadorilink-cli`'s production code doesn't depend on `yadorilink-daemon` (only
-/// its integration tests do), the same reason `config_dir` above is
-/// already duplicated between the two crates rather than shared.
+/// The Windows equivalent of `control_socket_path` — a pipe name, not a
+/// filesystem path. Mirrors the daemon's derivation.
 #[cfg(windows)]
 pub fn control_pipe_name() -> String {
     if let Ok(name) = std::env::var("YADORILINK_CONTROL_PIPE") {
@@ -107,35 +100,21 @@ pub fn save(cfg: &DeviceConfig) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Always stamp the current version on write, regardless of what
-    // `cfg.config_version` the caller happened to pass in — mirrors the DB
-    // migrations' "stamp unconditionally" idempotency (see
-    // `SyncState::init`'s doc comment on its own `pragma_update` call).
     let cfg = DeviceConfig { config_version: CONFIG_VERSION, ..cfg.clone() };
     write_config_file(&path, &serde_json::to_string_pretty(&cfg)?)
 }
 
-/// Reads back this device's local identity, written by a prior successful
-/// `yadorilink device register` (see `save` above). Used by `share join`
-/// so the caller doesn't have to pass an explicit `--device-id` — "which
-/// device am I" is already recorded locally.
+/// Reads the canonical pre-release device config. No development-version
+/// migration or compatibility fallback is attempted.
 pub fn load() -> std::io::Result<DeviceConfig> {
     let contents = std::fs::read_to_string(config_path())?;
     let config: DeviceConfig = serde_json::from_str(&contents)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    // Downgrade blocked: this `device.json` was written by a newer
-    // CLI/daemon than this one — refuse it with a clear message rather
-    // than silently using a config this build may not fully understand.
-    // Mirrors
-    // `SyncState::init`'s `check_schema_not_newer_than_supported`/
-    // `SyncError::UnsupportedSchemaDowngrade` for the DB case.
-    if config.config_version > CONFIG_VERSION {
+    if config.config_version != CONFIG_VERSION {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "device.json version {} is newer than this build supports (supports up to \
-                 version {CONFIG_VERSION}) — this looks like an unsupported downgrade; \
-                 reinstall the version that last wrote this file, or a newer one",
+                "unsupported device.json version {}; this pre-release build requires exactly version {CONFIG_VERSION}. Re-register the device with the current build instead of migrating an old development config",
                 config.config_version,
             ),
         ));
@@ -163,18 +142,7 @@ fn write_config_file(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::write(path, contents)
 }
 
-/// `YADORILINK_CONFIG_DIR` is process-global and Rust runs `#[test]`
-/// functions concurrently by default, so *every* test anywhere in this
-/// crate that sets it (this module's own version-safety tests below, and
-/// `commands::account`'s pre-existing `export_then_import_round_trips_
-/// through_real_files`) must serialize on this lock — otherwise two of
-/// them race and one reads back a directory the other wrote (or removed a
-/// file from), exactly what surfaced as a spurious
-/// `std::fs::remove_file(...).unwrap` "No such file or directory" panic
-/// in `commands::account`'s test once more tests were added that touch
-/// the same env var. `pub(crate)` (not private to this module's own
-/// `#[cfg(test)]` block) specifically so `commands::account`'s test can
-/// share it.
+/// `YADORILINK_CONFIG_DIR` is process-global and Rust runs tests concurrently.
 #[cfg(test)]
 pub(crate) static CONFIG_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -191,56 +159,51 @@ mod tests {
         result
     }
 
-    /// `save` always writes the current `CONFIG_VERSION`, even
-    /// if the caller (as every real call site does — `save` always
-    /// overwrites it) passed a different value — mirrors the DB
-    /// migrations' unconditional version-stamping idempotency.
+    fn current_config() -> DeviceConfig {
+        DeviceConfig {
+            device_id: "device-a".into(),
+            coordination_addr: "http://127.0.0.1:1".into(),
+            nat: NatConfig::default(),
+            wireguard_public_key: "wg-public".into(),
+            signing_public_key: "signing-public".into(),
+            config_version: 0,
+        }
+    }
+
     #[test]
-    fn save_always_stamps_current_config_version() {
+    fn save_stamps_and_round_trips_the_current_shape() {
         with_isolated_config_dir(|| {
-            save(&DeviceConfig {
-                device_id: "device-a".into(),
-                coordination_addr: "http://127.0.0.1:1".into(),
-                nat: NatConfig::default(),
-                config_version: 0,
-            })
-            .unwrap();
+            save(&current_config()).unwrap();
 
             let loaded = load().unwrap();
             assert_eq!(loaded.config_version, CONFIG_VERSION);
+            assert_eq!(loaded.device_id, "device-a");
+            assert_eq!(loaded.wireguard_public_key, "wg-public");
+            assert_eq!(loaded.signing_public_key, "signing-public");
         });
     }
 
-    /// A `device.json` written before this
-    /// field existed (no `config_version` key at all) still parses, with
-    /// `config_version` defaulting to 0, not a deserialization error —
-    /// the same "no behavior change without opt-in" guarantee the DB
-    /// migrations document.
     #[test]
-    fn load_defaults_a_pre_versioning_file_to_version_zero() {
+    fn load_rejects_a_pre_versioning_development_config() {
         with_isolated_config_dir(|| {
             std::fs::write(
                 config_path(),
-                r#"{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","relay_addr":"127.0.0.1:2"}"#,
+                r#"{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","nat":{}}"#,
             )
             .unwrap();
 
-            let loaded = load().unwrap();
-            assert_eq!(loaded.config_version, 0);
-            assert_eq!(loaded.device_id, "device-a");
+            let err = load().unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         });
     }
 
-    /// A `device.json` stamped with a version newer than this build supports
-    /// must make `load` fail clearly, not silently return a config this build
-    /// doesn't fully understand.
     #[test]
-    fn load_rejects_a_newer_config_version_as_unsupported_downgrade() {
+    fn load_requires_the_exact_current_config_version() {
         with_isolated_config_dir(|| {
             std::fs::write(
                 config_path(),
                 format!(
-                    r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","relay_addr":"127.0.0.1:2","config_version":{}}}"#,
+                    r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","nat":{{}},"wireguard_public_key":"wg","signing_public_key":"signing","config_version":{}}}"#,
                     CONFIG_VERSION + 1
                 ),
             )
@@ -248,7 +211,7 @@ mod tests {
 
             let err = load().unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-            assert!(err.to_string().contains("unsupported downgrade"));
+            assert!(err.to_string().contains("requires exactly"));
         });
     }
 

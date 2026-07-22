@@ -75,10 +75,10 @@ fn join(dir: &str, child: &str) -> String {
 /// - delete -> `Removed(path)`
 /// - rename -> `Removed(from)` then `CreatedOrModified(to)` (`RenameMode::Both`)
 /// - directory rename -> `Removed(from_dir)` then one `CreatedOrModified`
-///  per child at its new location under `to_dir` (the `deliver_local_dir_
-///  rename` fan-out; the vacated directory's single `Removed` is what
-///  `local_change.rs`'s orphan cascade turns into a tombstone for every
-///  nested live row).
+///   per child at its new location under `to_dir` (the `deliver_local_dir_
+///   rename` fan-out; the vacated directory's single `Removed` is what
+///   `local_change.rs`'s orphan cascade turns into a tombstone for every
+///   nested live row).
 pub fn decompose(op: &FsOp) -> Vec<WatchEvent> {
     match op {
         FsOp::Create { path } | FsOp::Modify { path } => vec![WatchEvent::created(path.clone())],

@@ -113,6 +113,27 @@ impl std::error::Error for StartupFailed {}
 type LocalChangeAuthProvider =
     dyn Fn(&str) -> Result<ChangeAuth, PolicyUnavailable> + Send + Sync + 'static;
 pub type ContentHash = String;
+/// A pinned file's `(path, version_seq)`, as recorded by a handoff lease.
+pub type PinnedVersion = (String, i64);
+
+/// The fields of a role-loss operation row not already carried by its
+/// `(operation_id, group_id)` key.
+pub struct RoleLossOperationParams<'a> {
+    pub source_device_id: &'a str,
+    pub target_device_id: &'a str,
+    pub lease_id: Option<&'a str>,
+    pub action: RoleLossAction,
+    pub local_path: Option<&'a str>,
+    pub now_unix: i64,
+}
+
+/// The DAG-facing content of a local edit: the ops to sign into the emitted
+/// `Change`, and the `FileVersion`s those ops reference (written to
+/// `file_versions` in the same transaction as the change/index update).
+pub struct ChangeContent<'a> {
+    pub ops: Vec<Op>,
+    pub versions: &'a [FileVersion],
+}
 
 /// every connection made by the pool waits at
 /// most this long for the SQLite write lock (`PRAGMA busy_timeout`)
@@ -407,6 +428,14 @@ pub struct SyncState {
     /// DAG changes. Daemon builds set this from their netmap policy state;
     /// tests and standalone sync-core users fall back to `ChangeAuth::PLACEHOLDER`.
     local_change_auth_provider: Mutex<Option<Arc<LocalChangeAuthProvider>>>,
+    /// Serializes `root_identity::VerifiedRoot::open`'s read-marker-then-
+    /// adopt-if-unmarked decision — see that function's use of this lock for
+    /// the race it closes. One lock for the whole `SyncState` (not
+    /// per-group): root adoption is a rare, one-time-per-link event, never a
+    /// hot path, so process-wide serialization here costs nothing observable
+    /// while being trivially correct (no per-group registry to keep in sync
+    /// with `path_locks`/`group_startup_gates`'s own lazy-cleanup logic).
+    pub(crate) root_adoption_lock: Mutex<()>,
 }
 
 /// Rebuilds `files` from its pre-this-
@@ -897,6 +926,7 @@ impl SyncState {
             path_locks: Mutex::new(HashMap::new()),
             group_startup_gates: Mutex::new(HashMap::new()),
             local_change_auth_provider: Mutex::new(None),
+            root_adoption_lock: Mutex::new(()),
         })
     }
 
@@ -934,6 +964,7 @@ impl SyncState {
             path_locks: Mutex::new(HashMap::new()),
             group_startup_gates: Mutex::new(HashMap::new()),
             local_change_auth_provider: Mutex::new(None),
+            root_adoption_lock: Mutex::new(()),
         })
     }
 
@@ -1712,8 +1743,7 @@ impl SyncState {
         group_id: &str,
         record: &FileRecord,
         origin_device_id: &str,
-        ops: Vec<Op>,
-        versions: &[FileVersion],
+        content: ChangeContent<'_>,
         meta: Option<&LocalFileMetaColumns>,
         emitter: &ChangeEmitter,
     ) -> Result<ChangeHash, SyncError> {
@@ -1727,8 +1757,9 @@ impl SyncState {
         retry_on_database_locked(|| {
             let mut conn = self.pool.get()?;
             let tx = new_immediate_write_transaction(&mut conn)?;
-            let change = dag_store::emit_local_change(&tx, group_id, ops.clone(), auth, emitter)?;
-            for version in versions {
+            let change =
+                dag_store::emit_local_change(&tx, group_id, content.ops.clone(), auth, emitter)?;
+            for version in content.versions {
                 dag_store::put_file_version(&tx, group_id, version)?;
             }
             upsert_file_in_tx(&tx, group_id, record, origin_device_id)?;
@@ -1763,8 +1794,7 @@ impl SyncState {
         group_id: &str,
         records: &[FileRecord],
         origin_device_id: &str,
-        ops: Vec<Op>,
-        versions: &[FileVersion],
+        content: ChangeContent<'_>,
         metas: &[Option<LocalFileMetaColumns>],
         emitter: &ChangeEmitter,
     ) -> Result<Option<ChangeHash>, SyncError> {
@@ -1777,10 +1807,10 @@ impl SyncState {
         // prevent. It can only arise from a caller bug (the one production
         // caller slices `records`/`ops`/`metas` in lockstep), so fail fast here,
         // before the transaction opens, rather than let it reach the write.
-        if ops.len() != records.len() {
+        if content.ops.len() != records.len() {
             return Err(SyncError::CorruptState(format!(
                 "upsert_files_batch length mismatch: {} ops for {} records (one op per record is required)",
-                ops.len(),
+                content.ops.len(),
                 records.len()
             )));
         }
@@ -1798,8 +1828,9 @@ impl SyncState {
         retry_on_database_locked(|| {
             let mut conn = self.pool.get()?;
             let tx = new_immediate_write_transaction(&mut conn)?;
-            let change = dag_store::emit_local_change(&tx, group_id, ops.clone(), auth, emitter)?;
-            for version in versions {
+            let change =
+                dag_store::emit_local_change(&tx, group_id, content.ops.clone(), auth, emitter)?;
+            for version in content.versions {
                 dag_store::put_file_version(&tx, group_id, version)?;
             }
             for (idx, record) in records.iter().enumerate() {
@@ -1895,7 +1926,7 @@ impl SyncState {
 
     /// Clears the materialization intent for `(group_id, path)` once the write
     /// + rename + fsync has completed. Idempotent: a no-op when no intent
-    /// exists (e.g. a redundant clear, or a path that was never journaled).
+    ///   exists (e.g. a redundant clear, or a path that was never journaled).
     pub fn clear_materialization_intent(
         &self,
         group_id: &str,
@@ -2037,6 +2068,12 @@ impl SyncState {
     /// Whether a change is already present in the applied store.
     pub fn dag_has_change(&self, hash: &ChangeHash) -> Result<bool, SyncError> {
         dag_store::has_change(&*self.pool.get()?, hash)
+    }
+
+    /// Whether a change is already known locally at all — admitted or still
+    /// buffered as an orphan. See `dag_store::has_change_or_buffered_orphan`.
+    pub fn dag_has_change_or_buffered_orphan(&self, hash: &ChangeHash) -> Result<bool, SyncError> {
+        dag_store::has_change_or_buffered_orphan(&*self.pool.get()?, hash)
     }
 
     /// A stored change decoded from its persisted bytes.
@@ -4301,8 +4338,10 @@ impl SyncState {
         // `authority_key_fingerprint` is NULL for a row written before that
         // column existed, so read it as an `Option<Vec<u8>>` — a legacy row
         // yields `None`, which the daemon's verifier treats as "unknown", not
-        // as a fork.
-        let row: Option<(i64, Vec<u8>, i64, Option<Vec<u8>>)> = conn
+        // as a fork. Row shape: `(highest_verified_seq, highest_verified_head,
+        // authority_key_generation, authority_key_fingerprint)`.
+        type WatermarkRow = (i64, Vec<u8>, i64, Option<Vec<u8>>);
+        let row: Option<WatermarkRow> = conn
             .query_row(
                 "SELECT highest_verified_seq, highest_verified_head, authority_key_generation, \
                  authority_key_fingerprint \
@@ -4869,7 +4908,7 @@ impl SyncState {
         lease_id: &str,
         created_at_unix: i64,
         ttl_seconds: i64,
-    ) -> Result<([u8; 32], Vec<(String, i64)>), SyncError> {
+    ) -> Result<([u8; 32], Vec<PinnedVersion>), SyncError> {
         // A non-positive TTL cannot produce a safe pin: it yields a deadline
         // at or before `created_at_unix`, so the pin would lapse immediately
         // and reopen the retention/GC race this lease exists to close. Reject
@@ -4897,7 +4936,7 @@ impl SyncState {
             // Same category/ordering as `enumerate_group_durability_root_
             // versions`, run on the same `tx` so it sees the identical
             // snapshot `current` was just computed from.
-            let pinned_versions: Vec<(String, i64)> = {
+            let pinned_versions: Vec<PinnedVersion> = {
                 let mut stmt = tx.prepare(
                     "SELECT path, version_seq FROM files \
                      WHERE group_id = ?1 AND deleted = 0 AND record_kind = 'file' \
@@ -5113,12 +5152,7 @@ impl SyncState {
         &self,
         operation_id: &str,
         group_id: &str,
-        source_device_id: &str,
-        target_device_id: &str,
-        lease_id: Option<&str>,
-        action: RoleLossAction,
-        local_path: Option<&str>,
-        now_unix: i64,
+        op: RoleLossOperationParams<'_>,
     ) -> Result<(), SyncError> {
         self.pool.get()?.execute(
             "INSERT INTO role_loss_operations \
@@ -5136,12 +5170,12 @@ impl SyncState {
             rusqlite::params![
                 operation_id,
                 group_id,
-                source_device_id,
-                target_device_id,
-                lease_id,
-                action.as_db_str(),
-                local_path,
-                now_unix,
+                op.source_device_id,
+                op.target_device_id,
+                op.lease_id,
+                op.action.as_db_str(),
+                op.local_path,
+                op.now_unix,
             ],
         )?;
         Ok(())
@@ -7826,9 +7860,9 @@ mod tests {
         let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert!(table_exists(&conn, "group_block_provenance").unwrap());
-        let provenance_rows: i64 =
-            conn.query_row("SELECT COUNT(*) FROM group_block_provenance", [], |row| row.get(0))
-                .unwrap();
+        let provenance_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM group_block_provenance", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(
             provenance_rows, 0,
             "v4 metadata must not be treated as proof that block bytes came through a group"
@@ -9031,12 +9065,14 @@ mod tests {
             .insert_role_loss_operation(
                 "op-1",
                 "group-1",
-                "device-b",
-                "device-a",
-                Some("lease-1"),
-                RoleLossAction::Demote,
-                Some("/local/photos"),
-                1_000,
+                RoleLossOperationParams {
+                    source_device_id: "device-b",
+                    target_device_id: "device-a",
+                    lease_id: Some("lease-1"),
+                    action: RoleLossAction::Demote,
+                    local_path: Some("/local/photos"),
+                    now_unix: 1_000,
+                },
             )
             .unwrap();
         let op = state.get_role_loss_operation("op-1").unwrap().unwrap();
@@ -9090,24 +9126,28 @@ mod tests {
             .insert_role_loss_operation(
                 "op-a",
                 "group-1",
-                "device-b",
-                "device-a",
-                Some("lease-a"),
-                RoleLossAction::Demote,
-                Some("/local/a"),
-                1_000,
+                RoleLossOperationParams {
+                    source_device_id: "device-b",
+                    target_device_id: "device-a",
+                    lease_id: Some("lease-a"),
+                    action: RoleLossAction::Demote,
+                    local_path: Some("/local/a"),
+                    now_unix: 1_000,
+                },
             )
             .unwrap();
         state
             .insert_role_loss_operation(
                 "op-b",
                 "group-2",
-                "device-b",
-                "device-c",
-                Some("lease-b"),
-                RoleLossAction::Unlink,
-                Some("/local/b"),
-                1_000,
+                RoleLossOperationParams {
+                    source_device_id: "device-b",
+                    target_device_id: "device-c",
+                    lease_id: Some("lease-b"),
+                    action: RoleLossAction::Unlink,
+                    local_path: Some("/local/b"),
+                    now_unix: 1_000,
+                },
             )
             .unwrap();
         state
@@ -9117,12 +9157,14 @@ mod tests {
             .insert_role_loss_operation(
                 "op-c",
                 "group-3",
-                "device-b",
-                "device-d",
-                Some("lease-c"),
-                RoleLossAction::Demote,
-                None,
-                1_000,
+                RoleLossOperationParams {
+                    source_device_id: "device-b",
+                    target_device_id: "device-d",
+                    lease_id: Some("lease-c"),
+                    action: RoleLossAction::Demote,
+                    local_path: None,
+                    now_unix: 1_000,
+                },
             )
             .unwrap();
         state
@@ -9166,12 +9208,14 @@ mod tests {
             .insert_role_loss_operation(
                 "op-1",
                 "group-1",
-                "device-b",
-                "device-a",
-                Some("lease-1"),
-                RoleLossAction::Demote,
-                Some("/local/photos"),
-                1_000,
+                RoleLossOperationParams {
+                    source_device_id: "device-b",
+                    target_device_id: "device-a",
+                    lease_id: Some("lease-1"),
+                    action: RoleLossAction::Demote,
+                    local_path: Some("/local/photos"),
+                    now_unix: 1_000,
+                },
             )
             .unwrap();
         assert_eq!(state.increment_role_loss_operation_attempts("op-1", 1_001).unwrap(), 1);
@@ -9192,12 +9236,14 @@ mod tests {
             .insert_role_loss_operation(
                 "op-1",
                 "group-1",
-                "device-b",
-                "device-a",
-                Some("lease-1"),
-                RoleLossAction::Demote,
-                Some("/local/photos"),
-                1_000,
+                RoleLossOperationParams {
+                    source_device_id: "device-b",
+                    target_device_id: "device-a",
+                    lease_id: Some("lease-1"),
+                    action: RoleLossAction::Demote,
+                    local_path: Some("/local/photos"),
+                    now_unix: 1_000,
+                },
             )
             .unwrap();
         state
@@ -9209,12 +9255,14 @@ mod tests {
             .insert_role_loss_operation(
                 "op-1",
                 "group-1",
-                "device-b",
-                "device-a",
-                Some("lease-2"),
-                RoleLossAction::Demote,
-                Some("/local/photos"),
-                2_000,
+                RoleLossOperationParams {
+                    source_device_id: "device-b",
+                    target_device_id: "device-a",
+                    lease_id: Some("lease-2"),
+                    action: RoleLossAction::Demote,
+                    local_path: Some("/local/photos"),
+                    now_unix: 2_000,
+                },
             )
             .unwrap();
         let op = state.get_role_loss_operation("op-1").unwrap().unwrap();

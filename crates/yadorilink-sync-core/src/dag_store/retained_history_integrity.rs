@@ -556,7 +556,10 @@ pub(crate) fn repair(conn: &Connection) -> Result<(), SyncError> {
     validate_prune_proofs(conn)?;
 
     let tx = conn.unchecked_transaction()?;
-    let admitted_rows: Vec<(Vec<u8>, String, String, i64, i64, Vec<u8>)> = {
+    // One admitted `changes` row: `(change_hash, group_id, device_id, lamport,
+    // applied, encoded)`.
+    type AdmittedRow = (Vec<u8>, String, String, i64, i64, Vec<u8>);
+    let admitted_rows: Vec<AdmittedRow> = {
         let mut stmt = tx.prepare(
             "SELECT change_hash, group_id, device_id, lamport, applied, encoded FROM changes",
         )?;

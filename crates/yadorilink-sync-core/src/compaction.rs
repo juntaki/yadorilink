@@ -70,11 +70,8 @@ pub trait DeviceFrontierStore {
 pub trait CheckpointStore {
     fn latest_checkpoint(&self, group: &FolderGroupId) -> Result<Option<Checkpoint>, SyncError>;
 
-    fn commit_prune(
-        &self,
-        checkpoint: &Checkpoint,
-        pruned: &[ChangeHash],
-    ) -> Result<(), SyncError>;
+    fn commit_prune(&self, checkpoint: &Checkpoint, pruned: &[ChangeHash])
+        -> Result<(), SyncError>;
 
     /// The checkpoint hash that immediately preceded this store's own
     /// *current* HistoryBase for `group` — `None` if this store has never

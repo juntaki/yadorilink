@@ -23,7 +23,7 @@ use crate::dag_store::ChangeEmitter;
 use crate::debounce::DebounceFlush;
 use crate::error::SyncError;
 use crate::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
-use crate::index::{LocalFileMetaColumns, SyncState};
+use crate::index::{ChangeContent, LocalFileMetaColumns, SyncState};
 use crate::root_identity::{is_root_marker_relative_path, VerifiedRoot};
 use crate::types::{owner_exec_bit_from_metadata, FileRecord, MaterializationState, RecordKind};
 use crate::watcher::{FsChangeEvent, FsChangeKind};
@@ -530,8 +530,7 @@ impl LocalChangeProcessor {
                             // matches for every path — i.e. the whole tree is
                             // suppressed, the correct outcome when the root is
                             // unreadable.
-                            failed_prefixes
-                                .push(rel.to_string_lossy().replace('\\', "/"));
+                            failed_prefixes.push(rel.to_string_lossy().replace('\\', "/"));
                         }
                         None => {
                             // No attributable path — cannot scope the
@@ -832,8 +831,7 @@ impl LocalChangeProcessor {
                     group_id,
                     chunk_records,
                     &self.device_id,
-                    chunk_ops,
-                    &chunk_versions,
+                    ChangeContent { ops: chunk_ops, versions: &chunk_versions },
                     chunk_metas,
                     emitter,
                 ) {
@@ -1155,8 +1153,10 @@ impl LocalChangeProcessor {
                                 group_id,
                                 record,
                                 &self.device_id,
-                                vec![op],
-                                std::slice::from_ref(&version),
+                                ChangeContent {
+                                    ops: vec![op],
+                                    versions: std::slice::from_ref(&version),
+                                },
                                 Some(&meta),
                                 emitter,
                             )?;
@@ -1944,7 +1944,11 @@ mod tests {
     // Serializes the two tests that install the process-wide scan hook so they
     // never observe each other's hook. Other scan tests use different group ids,
     // and the hook no-ops for any group but `RACE_GROUP`, so they are unaffected.
-    static SCAN_RACE_TEST_GUARD: Mutex<()> = Mutex::new(());
+    // An async-aware `Mutex`, not `std::sync::Mutex`: both tests hold this guard
+    // across `.await` points for their entire body (that's the point -- the
+    // whole test, not just its setup, must stay serialized against the other),
+    // which a `std::sync::MutexGuard` cannot safely do.
+    static SCAN_RACE_TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct Latch {
         raised: Mutex<bool>,
@@ -1959,20 +1963,75 @@ mod tests {
             *self.raised.lock().unwrap_or_else(|p| p.into_inner()) = true;
             self.cv.notify_all();
         }
+        /// Unbounded wait, for the scan thread's own use (waiting on
+        /// `release_scan`, which the main test thread always raises promptly
+        /// once it reaches that point) -- the main test thread's wait on
+        /// `snapshot_read` is the one at risk of the scan never reaching the
+        /// hook at all, so that call site uses `wait_timeout` below instead.
         fn wait(&self) {
             let mut raised = self.raised.lock().unwrap_or_else(|p| p.into_inner());
             while !*raised {
                 raised = self.cv.wait(raised).unwrap_or_else(|p| p.into_inner());
             }
         }
+        /// Bounded wait: returns whether the latch was actually raised, rather
+        /// than blocking forever. The scan thread this waits on can fail
+        /// *before* ever reaching the hook that raises it (e.g. `VerifiedRoot::
+        /// open`'s root-marker write hitting a full disk) -- an unbounded
+        /// `Condvar::wait` would then hang the test indefinitely instead of
+        /// failing, since nothing else in the test is ever going to raise it.
+        fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
+            let raised = self.raised.lock().unwrap_or_else(|p| p.into_inner());
+            let (raised, result) = self
+                .cv
+                .wait_timeout_while(raised, timeout, |raised| !*raised)
+                .unwrap_or_else(|p| p.into_inner());
+            *raised && !result.timed_out()
+        }
+    }
+
+    /// Extracts a readable message from a `std::thread::JoinHandle::join`
+    /// panic payload, for a clearer failure than "the latch never raised" when
+    /// the actual cause is the scan thread panicking before it could.
+    fn scan_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        }
+    }
+
+    /// Diagnoses why `snapshot_read.wait_timeout(..)` returned `false`:
+    /// joins the scan thread (already finished if it panicked before
+    /// reaching the hook; still running only if the hook itself is somehow
+    /// stuck, which the hook's own bodies below never do) and reports what
+    /// happened.
+    fn describe_scan_timeout(scan_handle: std::thread::JoinHandle<()>) -> String {
+        if scan_handle.is_finished() {
+            match scan_handle.join() {
+                Err(payload) => format!("scan thread panicked: {}", scan_panic_message(&*payload)),
+                Ok(()) => "scan thread returned Ok without ever reaching the post-snapshot hook \
+                           -- reconcile_disk_with_ignore must not have called it"
+                    .to_string(),
+            }
+        } else {
+            "scan thread is still running".to_string()
+        }
     }
 
     /// Builds a fixture whose index already holds an *old* row for `RACE_PATH`
     /// and whose on-disk file has different content — so the real scan detects a
     /// change and commits a fresh (stale-relative-to-any-peer-write) record.
-    fn build_race_fixture(
-    ) -> (LocalChangeProcessor, Arc<SyncState>, std::path::PathBuf, EffectiveIgnoreSet, tempfile::TempDir, tempfile::TempDir)
-    {
+    fn build_race_fixture() -> (
+        LocalChangeProcessor,
+        Arc<SyncState>,
+        std::path::PathBuf,
+        EffectiveIgnoreSet,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
         let state = Arc::new(SyncState::open_in_memory().unwrap());
@@ -1980,6 +2039,19 @@ mod tests {
         let root = root_dir.path().canonicalize().unwrap();
 
         state.add_link(&root.to_string_lossy(), RACE_GROUP).unwrap();
+
+        let processor = LocalChangeProcessor::new(state.clone(), store, "device-a".into());
+
+        // Adopt the root identity here, while the index is still empty --
+        // matching `adopt_root`'s own doc comment (a real first link always
+        // does this before indexing anything). Otherwise the *scan itself*
+        // performs first-adoption lazily inside `VerifiedRoot::open`, which
+        // includes a marker-file write; if that write fails for any reason
+        // (e.g. a full disk), the scan thread panics before ever reaching
+        // the race tests' post-snapshot hook, and the test hangs on an
+        // unbounded latch wait instead of failing. Adopting up front makes
+        // that failure mode surface immediately, in fixture setup, instead.
+        adopt_root(&processor, RACE_GROUP, &root);
 
         let mut base_version = VersionVector::new();
         base_version.increment("device-a");
@@ -2000,7 +2072,6 @@ mod tests {
         std::fs::write(root.join(RACE_PATH), b"offline-local-edit-content").unwrap();
 
         let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
-        let processor = LocalChangeProcessor::new(state.clone(), store, "device-a".into());
         (processor, state, root, ignore_set, store_dir, root_dir)
     }
 
@@ -2025,7 +2096,7 @@ mod tests {
     /// completes and is NOT overwritten by the scan's stale-snapshot record.
     #[tokio::test]
     async fn startup_barrier_prevents_stale_overwrite_of_concurrent_peer_change() {
-        let _serial = SCAN_RACE_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SCAN_RACE_TEST_GUARD.lock().await;
         let (processor, state, root, ignore_set, _store_dir, _root_dir) = build_race_fixture();
 
         // As `start_link_watch` does synchronously before spawning the executor.
@@ -2051,7 +2122,12 @@ mod tests {
         });
 
         // Scan has read the old snapshot and is paused before its commit.
-        snapshot_read.wait();
+        if !snapshot_read.wait_timeout(std::time::Duration::from_secs(10)) {
+            panic!(
+                "scan never reached its post-snapshot hook within 10s: {}",
+                describe_scan_timeout(scan_handle)
+            );
+        }
 
         // Inject the peer change through the same gated sequence production uses:
         // wait for the group to be ready, then apply under the path lock. The
@@ -2094,7 +2170,7 @@ mod tests {
     /// the gate does not admit it.
     #[tokio::test]
     async fn startup_scan_stale_overwrites_concurrent_peer_change_without_barrier() {
-        let _serial = SCAN_RACE_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SCAN_RACE_TEST_GUARD.lock().await;
         let (processor, state, root, ignore_set, _store_dir, _root_dir) = build_race_fixture();
         // Deliberately no `begin_group_startup`: models a startup that never
         // registered a gate for a link that is nonetheless live.
@@ -2123,7 +2199,12 @@ mod tests {
             processor.scan_existing_files_with_ignore(RACE_GROUP, &scan_root, &ignore_set).unwrap();
         });
 
-        snapshot_read.wait();
+        if !snapshot_read.wait_timeout(std::time::Duration::from_secs(10)) {
+            panic!(
+                "scan never reached its post-snapshot hook within 10s: {}",
+                describe_scan_timeout(scan_handle)
+            );
+        }
 
         // The peer apply runs immediately in the snapshot-vs-commit window,
         // bypassing the gate that just refused it (asserted above) to show what
@@ -4155,6 +4236,7 @@ mod tests {
             processor_with_toggleable_policy();
         let root = canonical_root(&root_dir);
         let group = "group-1";
+        adopt_root(&proc, group, &root);
         let file_path = root.join("report.txt");
 
         // A healthy-policy live edit establishes the group's first DAG history.
@@ -4180,8 +4262,7 @@ mod tests {
         // must withhold both the DAG change and the index write and journal the
         // path dirty. The old silent fallback wrote the index here.
         let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
-        let scan_records =
-            proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
+        let scan_records = proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
         assert!(
             scan_records.is_empty(),
             "a stale-policy scan must announce nothing — no record ever entered the DAG"
@@ -4238,9 +4319,13 @@ mod tests {
     /// direct access to the underlying `SyncState` and `ChangeEmitter` so a
     /// test can inspect DAG heads and re-run the DAG-import path the same
     /// way the daemon's restart sequence does.
-    fn processor_with_emitter(
-    ) -> (LocalChangeProcessor, Arc<SyncState>, Arc<ChangeEmitter>, tempfile::TempDir, tempfile::TempDir)
-    {
+    fn processor_with_emitter() -> (
+        LocalChangeProcessor,
+        Arc<SyncState>,
+        Arc<ChangeEmitter>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
         use ed25519_dalek::SigningKey;
 
         let store_dir = tempfile::tempdir().unwrap();
@@ -4272,6 +4357,12 @@ mod tests {
         let (proc, state, emitter, _store_dir, root_dir) = processor_with_emitter();
         let root = canonical_root(&root_dir);
         let group = "group-1";
+        // As `offline_delete_after_existing_dag_history_must_append_delete_
+        // change` documents: the later offline edit leaves the index and
+        // disk disagreeing on the same path, indistinguishable from an
+        // unmounted volume unless the folder's identity was established
+        // first, as a real link's would have been.
+        adopt_root(&proc, group, &root);
         let file_path = root.join("report.txt");
 
         // A live edit while the daemon is running establishes the group's
@@ -4298,8 +4389,7 @@ mod tests {
         // then re-runs the idempotent initial import, mirroring
         // `yadorilink-daemon`'s restart sequence exactly.
         let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
-        let scan_records =
-            proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
+        let scan_records = proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
         assert!(!scan_records.is_empty(), "sanity: the restart scan must notice the offline edit");
         crate::dag_import::ensure_initial_import(&state, group, &emitter).unwrap();
 
@@ -4357,8 +4447,7 @@ mod tests {
 
         // Restart: scan + re-run the idempotent import, exactly as above.
         let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
-        let scan_records =
-            proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
+        let scan_records = proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
         assert!(
             scan_records.iter().any(|r| r.path == "report.txt" && r.deleted),
             "sanity: the restart scan must tombstone the offline delete"
@@ -4391,6 +4480,12 @@ mod tests {
         let (proc, state, emitter, _store_dir, root_dir) = processor_with_emitter();
         let root = canonical_root(&root_dir);
         let group = "group-1";
+        // See `offline_edit_after_existing_dag_history_must_append_new_head_
+        // on_restart`'s identical adoption for why: the offline edit below
+        // leaves the index and disk disagreeing, indistinguishable from an
+        // unmounted volume unless the folder's identity was established
+        // first.
+        adopt_root(&proc, group, &root);
         let file_path = root.join("report.txt");
 
         std::fs::write(&file_path, b"version one").unwrap();
@@ -4474,13 +4569,15 @@ mod tests {
                 1,
                 "a chunked reconciliation must form a linear chain (exactly one parent per change)"
             );
-            let parent = change.parents[0].clone();
+            let parent = change.parents[0];
             chain.push(change);
             cur = parent;
         }
         chain
     }
 
+    // Only called by the #[cfg(unix)] symlink/exec-bit atomicity tests below.
+    #[cfg(unix)]
     fn version_hash_for_path(
         change: &crate::change::Change,
         path: &str,
@@ -4518,8 +4615,12 @@ mod tests {
         // Establish DAG history so the scan takes the emitting path.
         std::fs::write(root.join("seed.txt"), b"seed").unwrap();
         proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
-        crate::dag_import::ensure_initial_import(&state, group, proc.change_emitter.as_ref().unwrap())
-            .unwrap();
+        crate::dag_import::ensure_initial_import(
+            &state,
+            group,
+            proc.change_emitter.as_ref().unwrap(),
+        )
+        .unwrap();
         let heads_before = state.dag_group_heads(group).unwrap();
 
         // Offline: a new symlink whose raw target escapes the root.
@@ -4530,7 +4631,10 @@ mod tests {
         // Index metadata columns are correct right after the single emitting
         // scan call — no post-commit setter was needed.
         assert_eq!(state.get_record_kind(group, "link").unwrap(), Some(RecordKind::Symlink));
-        assert_eq!(state.get_symlink_target(group, "link").unwrap(), Some("../outside".to_string()));
+        assert_eq!(
+            state.get_symlink_target(group, "link").unwrap(),
+            Some("../outside".to_string())
+        );
         assert!(state.get_symlink_out_of_root(group, "link").unwrap());
         assert!(!state.get_exec_bit(group, "link").unwrap());
 
@@ -4538,17 +4642,14 @@ mod tests {
         // exactly (same single committed state, not a later reconciliation).
         let heads_after = state.dag_group_heads(group).unwrap();
         assert_ne!(heads_after, heads_before, "the symlink must have emitted a change");
-        let chain = linear_chain_back_to(&state, heads_after[0].clone(), &heads_before[0]);
+        let chain = linear_chain_back_to(&state, heads_after[0], &heads_before[0]);
         let vh = version_hash_for_path(&chain[chain.len() - 1], "link");
         let version = state.dag_get_file_version(group, &vh).unwrap().unwrap();
         assert_eq!(version.meta.record_kind, RecordKind::Symlink);
         assert_eq!(version.meta.symlink_target.as_deref(), Some("../outside"));
         assert!(!version.meta.exec_bit);
         // The two views are one and the same commit — the whole point of FIX A.
-        assert_eq!(
-            state.get_record_kind(group, "link").unwrap(),
-            Some(version.meta.record_kind),
-        );
+        assert_eq!(state.get_record_kind(group, "link").unwrap(), Some(version.meta.record_kind),);
         assert_eq!(state.get_symlink_target(group, "link").unwrap(), version.meta.symlink_target);
     }
 
@@ -4568,8 +4669,12 @@ mod tests {
 
         std::fs::write(root.join("seed.txt"), b"seed").unwrap();
         proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
-        crate::dag_import::ensure_initial_import(&state, group, proc.change_emitter.as_ref().unwrap())
-            .unwrap();
+        crate::dag_import::ensure_initial_import(
+            &state,
+            group,
+            proc.change_emitter.as_ref().unwrap(),
+        )
+        .unwrap();
         let heads_before = state.dag_group_heads(group).unwrap();
 
         // Offline: a new executable script.
@@ -4583,7 +4688,7 @@ mod tests {
         assert_eq!(state.get_symlink_target(group, "run.sh").unwrap(), None);
 
         let heads_after = state.dag_group_heads(group).unwrap();
-        let chain = linear_chain_back_to(&state, heads_after[0].clone(), &heads_before[0]);
+        let chain = linear_chain_back_to(&state, heads_after[0], &heads_before[0]);
         let vh = version_hash_for_path(&chain[chain.len() - 1], "run.sh");
         let version = state.dag_get_file_version(group, &vh).unwrap().unwrap();
         assert!(version.meta.exec_bit, "the emitted FileVersion carries the exec bit too");
@@ -4608,8 +4713,12 @@ mod tests {
         }
         // Seed history from the initial index, then take it offline.
         proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
-        crate::dag_import::ensure_initial_import(&state, group, proc.change_emitter.as_ref().unwrap())
-            .unwrap();
+        crate::dag_import::ensure_initial_import(
+            &state,
+            group,
+            proc.change_emitter.as_ref().unwrap(),
+        )
+        .unwrap();
         let heads_before = state.dag_group_heads(group).unwrap();
         assert_eq!(heads_before.len(), 1, "sanity: import converged on one head");
 
@@ -4621,7 +4730,7 @@ mod tests {
 
         let heads_after = state.dag_group_heads(group).unwrap();
         assert_eq!(heads_after.len(), 1, "the chunk chain must converge on a single head");
-        let chain = linear_chain_back_to(&state, heads_after[0].clone(), &heads_before[0]);
+        let chain = linear_chain_back_to(&state, heads_after[0], &heads_before[0]);
         assert!(
             chain.len() >= 2,
             "{n} changed paths must split into >= 2 chained changes, got {}",
@@ -4634,7 +4743,10 @@ mod tests {
                 "every chunk must stay within the op-count bound"
             );
             let bytes: usize = change.ops.iter().map(encoded_op_len).sum();
-            assert!(bytes <= RECONCILE_CHUNK_BYTE_LIMIT, "every chunk must stay within the byte bound");
+            assert!(
+                bytes <= RECONCILE_CHUNK_BYTE_LIMIT,
+                "every chunk must stay within the byte bound"
+            );
             total_ops += change.ops.len();
         }
         assert_eq!(total_ops, n, "the chain's ops must cover every changed path exactly once");
@@ -4662,8 +4774,12 @@ mod tests {
             std::fs::write(root.join(name(i)), b"a").unwrap();
         }
         proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
-        crate::dag_import::ensure_initial_import(&state, group, proc.change_emitter.as_ref().unwrap())
-            .unwrap();
+        crate::dag_import::ensure_initial_import(
+            &state,
+            group,
+            proc.change_emitter.as_ref().unwrap(),
+        )
+        .unwrap();
         let heads_before = state.dag_group_heads(group).unwrap();
 
         for i in 0..n {
@@ -4672,7 +4788,7 @@ mod tests {
         proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
 
         let heads_after = state.dag_group_heads(group).unwrap();
-        let chain = linear_chain_back_to(&state, heads_after[0].clone(), &heads_before[0]);
+        let chain = linear_chain_back_to(&state, heads_after[0], &heads_before[0]);
         assert!(
             chain.len() >= 2,
             "a >256 KiB diff of {n} (< op-count-cap) paths must split by bytes into >= 2 changes, \
@@ -5076,19 +5192,20 @@ mod tests {
         // Recovery, exactly as `SyncError::AmbiguousLink` instructs, plus the
         // additive-scan flag the daemon's unlink handler arms on the survivor.
         processor.state.remove_link(&root_b.path().to_string_lossy()).unwrap();
-        processor
-            .state
-            .set_suppress_tombstones(&root_a.path().to_string_lossy(), true)
-            .unwrap();
+        processor.state.set_suppress_tombstones(&root_a.path().to_string_lossy(), true).unwrap();
 
         let ignore_set = EffectiveIgnoreSet::load_for_link_root(root_a.path()).unwrap();
         let emit_tombstones = !processor.state.suppress_tombstones_for_group(group).unwrap();
         let out = processor
-            .scan_existing_files_with_ignore_gated(group, root_a.path(), &ignore_set, emit_tombstones)
+            .scan_existing_files_with_ignore_gated(
+                group,
+                root_a.path(),
+                &ignore_set,
+                emit_tombstones,
+            )
             .unwrap();
 
-        let tombstoned: Vec<_> =
-            out.iter().filter(|r| r.deleted).map(|r| r.path.clone()).collect();
+        let tombstoned: Vec<_> = out.iter().filter(|r| r.deleted).map(|r| r.path.clone()).collect();
         assert!(
             tombstoned.is_empty(),
             "the survivor's first scan after recovery must delete nothing -- these paths can \

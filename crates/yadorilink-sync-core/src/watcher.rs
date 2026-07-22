@@ -666,11 +666,16 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    // Only ever constructed by the #[cfg(unix)] symlink-safety tests below
+    // (they exercise std::os::unix::fs::symlink), so this whole stand-in
+    // Watcher is unix-only too -- otherwise it's dead code on Windows.
+    #[cfg(unix)]
     #[derive(Default)]
     struct RecordingWatcher {
         watched: Vec<PathBuf>,
     }
 
+    #[cfg(unix)]
     impl Watcher for RecordingWatcher {
         fn new<F: notify::EventHandler>(
             _event_handler: F,

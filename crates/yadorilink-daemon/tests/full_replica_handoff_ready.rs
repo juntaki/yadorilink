@@ -60,7 +60,11 @@ fn record_referencing(path: &str, hash_bytes: Vec<u8>, size: u64) -> FileRecord 
 fn put_and_record(daemon: &Daemon, data: &[u8]) -> Vec<u8> {
     let hash_hex = daemon.state.block_store.put(data).unwrap();
     let hash_bytes = hex::decode(&hash_hex).unwrap();
-    daemon.state.sync_state.record_group_block_provenance(GROUP, &[hash_bytes.clone()]).unwrap();
+    daemon
+        .state
+        .sync_state
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash_bytes))
+        .unwrap();
     hash_bytes
 }
 

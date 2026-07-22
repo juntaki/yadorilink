@@ -121,8 +121,7 @@ impl RebootstrapSnapshot {
                 .then(a.state.cmp(&b.state))
         });
         if files.windows(2).any(|pair| {
-            pair[0].record.path == pair[1].record.path
-                && pair[0].version_seq == pair[1].version_seq
+            pair[0].record.path == pair[1].record.path && pair[0].version_seq == pair[1].version_seq
         }) {
             return Err(SyncError::CorruptState(
                 "re-bootstrap snapshot contains duplicate (path, version_seq) rows".into(),
@@ -400,16 +399,17 @@ impl RebootstrapSnapshot {
             .frontier_changes
             .iter()
             .map(|encoded| {
-                Change::from_wire_bytes(encoded)
-                    .map(|change| change.compute_hash())
-                    .map_err(|error| {
+                Change::from_wire_bytes(encoded).map(|change| change.compute_hash()).map_err(
+                    |error| {
                         SyncError::CorruptState(format!(
                             "re-bootstrap snapshot contains an invalid frontier change: {error}"
                         ))
-                    })
+                    },
+                )
             })
             .collect::<Result<_, _>>()?;
-        let checkpoint_frontier: BTreeSet<ChangeHash> = checkpoint.frontier.iter().copied().collect();
+        let checkpoint_frontier: BTreeSet<ChangeHash> =
+            checkpoint.frontier.iter().copied().collect();
         if snapshot_frontier != checkpoint_frontier {
             return Err(SyncError::CorruptState(
                 "re-bootstrap snapshot frontier changes do not match checkpoint frontier".into(),
@@ -444,7 +444,8 @@ impl RebootstrapSnapshot {
                 };
                 if version.is_some_and(|hash| !version_hashes.contains(&hash)) {
                     return Err(SyncError::CorruptState(
-                        "re-bootstrap snapshot is missing a frontier-referenced file version".into(),
+                        "re-bootstrap snapshot is missing a frontier-referenced file version"
+                            .into(),
                     ));
                 }
             }
@@ -494,9 +495,7 @@ impl<'a> Reader<'a> {
             SyncError::CorruptState("re-bootstrap snapshot length overflow".into())
         })?;
         if end > self.bytes.len() {
-            return Err(SyncError::CorruptState(
-                "truncated re-bootstrap snapshot".into(),
-            ));
+            return Err(SyncError::CorruptState("truncated re-bootstrap snapshot".into()));
         }
         let slice = &self.bytes[self.pos..end];
         self.pos = end;
@@ -551,9 +550,7 @@ impl<'a> Reader<'a> {
     fn bytes(&mut self, max: usize) -> Result<Vec<u8>, SyncError> {
         let len = self.u32()? as usize;
         if len > max {
-            return Err(SyncError::CorruptState(
-                "re-bootstrap snapshot item exceeds bound".into(),
-            ));
+            return Err(SyncError::CorruptState("re-bootstrap snapshot item exceeds bound".into()));
         }
         Ok(self.take(len)?.to_vec())
     }
@@ -580,9 +577,7 @@ impl<'a> Reader<'a> {
 
     fn finish(self) -> Result<(), SyncError> {
         if self.pos != self.bytes.len() {
-            return Err(SyncError::CorruptState(
-                "re-bootstrap snapshot has trailing bytes".into(),
-            ));
+            return Err(SyncError::CorruptState("re-bootstrap snapshot has trailing bytes".into()));
         }
         Ok(())
     }
@@ -645,7 +640,8 @@ mod tests {
         let decoded = RebootstrapSnapshot::decode(&encoded).unwrap();
         assert_eq!(decoded, snapshot);
         assert_eq!(decoded.snapshot_hash(), snapshot.snapshot_hash());
-        let checkpoint = Checkpoint::new(group, vec![change.compute_hash()], snapshot.snapshot_hash());
+        let checkpoint =
+            Checkpoint::new(group, vec![change.compute_hash()], snapshot.snapshot_hash());
         decoded.validate_against_checkpoint(&checkpoint).unwrap();
     }
 

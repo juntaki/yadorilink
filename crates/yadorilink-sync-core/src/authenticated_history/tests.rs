@@ -83,8 +83,7 @@ fn signed_chain_with_auth(
     );
     let child_hash = child.compute_hash();
 
-    let mut source = FakeSource::default();
-    source.heads = vec![child_hash];
+    let mut source = FakeSource { heads: vec![child_hash], ..Default::default() };
     source.changes.insert(root_hash, root);
     source.changes.insert(child_hash, child);
 
@@ -169,8 +168,7 @@ fn signed_child_with_missing_parent(
         &key,
     );
     let child_hash = child.compute_hash();
-    let mut source = FakeSource::default();
-    source.heads = vec![child_hash];
+    let mut source = FakeSource { heads: vec![child_hash], ..Default::default() };
     source.changes.insert(child_hash, child);
 
     let mut trust = FakeTrust { authorized: true, ..Default::default() };

@@ -10,31 +10,31 @@
 //! (enforcing a single consent-check path). When the
 //! daemon is unreachable:
 //! - `usage`: falls back to a genuinely limited report (this process's
-//!  own version/OS/arch only, no command/sync counters — those are
-//!  daemon-owned runtime state this crate deliberately does not read
-//!  directly, even though `counters.json` happens to be a plain file,
-//!  because a stale on-disk snapshot masquerading as "current usage"
-//!  would be misleading).
+//!   own version/OS/arch only, no command/sync counters — those are
+//!   daemon-owned runtime state this crate deliberately does not read
+//!   directly, even though `counters.json` happens to be a plain file,
+//!   because a stale on-disk snapshot masquerading as "current usage"
+//!   would be misleading).
 //! - `error --last`/`--id`: reads directly from the *shared*
-//!  `<config_dir>/reporting/error-candidates/` store via
-//!  `yadorilink_daemon::reporting::error_candidates::ErrorCandidateStore`
-//!  — this is deliberately **not** treated as daemon-only. See the
-//!  module doc comment on `handle_reportable_error` below for why: a
-//!  candidate is a finished, self-contained document (unlike the
-//!  continuously-mutating counters), and this crate's own error-reporting hook
-//!  writes into the exact same store, so "read the shared store
-//!  directly" is what makes daemon-created and CLI-created candidates
-//!  both show up under `--last` regardless of whether the daemon
-//!  happens to be running right now.
+//!   `<config_dir>/reporting/error-candidates/` store via
+//!   `yadorilink_daemon::reporting::error_candidates::ErrorCandidateStore`
+//!   — this is deliberately **not** treated as daemon-only. See the
+//!   module doc comment on `handle_reportable_error` below for why: a
+//!   candidate is a finished, self-contained document (unlike the
+//!   continuously-mutating counters), and this crate's own error-reporting hook
+//!   writes into the exact same store, so "read the shared store
+//!   directly" is what makes daemon-created and CLI-created candidates
+//!   both show up under `--last` regardless of whether the daemon
+//!   happens to be running right now.
 //! - `consent *`: same reasoning as error candidates — consent state is
-//!  plain local config, not daemon-owned runtime state, so every consent
-//!  command works directly against `ConsentStore` when the daemon isn't
-//!  reachable, keeping it easy for forks/offline users to disable or
-//!  inspect.
+//!   plain local config, not daemon-owned runtime state, so every consent
+//!   command works directly against `ConsentStore` when the daemon isn't
+//!   reachable, keeping it easy for forks/offline users to disable or
+//!   inspect.
 //! - `error --submit`: **does** require the daemon and fails with a clear,
-//!  reporting-specific error (`CliError::ReportingDaemonRequired`) when
-//!  it's unavailable — submission is the one network path this crate keeps
-//!  exclusively behind the daemon.
+//!   reporting-specific error (`CliError::ReportingDaemonRequired`) when
+//!   it's unavailable — submission is the one network path this crate keeps
+//!   exclusively behind the daemon.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -364,14 +364,14 @@ pub async fn consent_prompts(enabled: bool) -> Result<(), CliError> {
 /// both best-effort and both entirely local (no network call is
 /// reachable from this function, ensuring no data is sent automatically):
 /// 1. Persists a local error candidate directly into the *shared*
-///  `error-candidates` store (see module doc comment) — capturing
-///  CLI-command failures alongside daemon-side severe errors: both write into the
-///  exact same on-disk store via the exact same `ErrorCandidateStore`
-///  API, just from two different processes/call sites. No IPC message
-///  was added for this because a local file write needs no daemon
-///  round trip either way, and it means `report error --last` finds
-///  whichever kind of candidate (daemon- or CLI-originated) is newest,
-///  without the CLI needing to know or care which process created it.
+///    `error-candidates` store (see module doc comment) — capturing
+///    CLI-command failures alongside daemon-side severe errors: both write into the
+///    exact same on-disk store via the exact same `ErrorCandidateStore`
+///    API, just from two different processes/call sites. No IPC message
+///    was added for this because a local file write needs no daemon
+///    round trip either way, and it means `report error --last` finds
+///    whichever kind of candidate (daemon- or CLI-originated) is newest,
+///    without the CLI needing to know or care which process created it.
 /// 2. Prints a one-line hint suggesting `yadorilink report error --last
 ///  --preview`.
 ///

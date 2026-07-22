@@ -126,7 +126,8 @@ impl SnapshotManifest {
         if current_heads.len() > MAX_REBOOTSTRAP_HEADS {
             return Err(SyncError::CorruptState(format!(
                 "re-bootstrap current-head count {} exceeds {}",
-                current_heads.len(), MAX_REBOOTSTRAP_HEADS
+                current_heads.len(),
+                MAX_REBOOTSTRAP_HEADS
             )));
         }
         let mut manifest = Self {

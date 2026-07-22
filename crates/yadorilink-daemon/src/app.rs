@@ -80,7 +80,15 @@ impl DaemonInstanceLock {
 
         std::fs::create_dir_all(config_dir)?;
         let lock_path = config_dir.join(DAEMON_INSTANCE_LOCK_FILE);
-        let file = OpenOptions::new().create(true).read(true).write(true).open(&lock_path)?;
+        // `truncate(false)` is explicit, not incidental: this is a lock file,
+        // never a content file, so an existing file's bytes (if any) are
+        // irrelevant and must not be discarded just by opening it.
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -88,10 +96,17 @@ impl DaemonInstanceLock {
         }
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(Self { _file: file }),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => anyhow::bail!(
-                "another YadoriLink daemon is already running for {}",
-                config_dir.display()
-            ),
+            // Compared by raw OS error, not ErrorKind: see resource_lock.rs's
+            // take_exclusive_lock doc comment for why ErrorKind::WouldBlock
+            // does not reliably match Windows' real contention error.
+            Err(error)
+                if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+            {
+                anyhow::bail!(
+                    "another YadoriLink daemon is already running for {}",
+                    config_dir.display()
+                )
+            }
             Err(error) => Err(anyhow::anyhow!(
                 "failed to acquire daemon instance lock {}: {error}",
                 lock_path.display()
@@ -275,7 +290,10 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         // Matched exhaustively with no catch-all arm, so a variant added
         // later must state its own case here instead of silently inheriting
         // a wrong one.
-        Err(e @ device_config::DeviceConfigError::UnsupportedConfigDowngrade { .. }) => {
+        Err(
+            e @ (device_config::DeviceConfigError::UnsupportedConfigDowngrade { .. }
+            | device_config::DeviceConfigError::StaleConfigVersion { .. }),
+        ) => {
             return Err(anyhow::anyhow!(
                 "refusing to start: {e}. Nothing on disk has been modified, and this device is \
                  still registered: do not delete device.json and do not run `yadorilink device \
@@ -1061,8 +1079,7 @@ mod instance_lock_tests {
         let owner = DaemonInstanceLock::acquire(dir.path()).unwrap();
 
         let error = DaemonInstanceLock::acquire(dir.path())
-            .err()
-            .expect("a second daemon must not acquire the same config lock");
+            .expect_err("a second daemon must not acquire the same config lock");
         assert!(error.to_string().contains("already running"));
 
         drop(owner);
@@ -1117,7 +1134,7 @@ mod startup_config_validation_tests {
     /// build supports — the "unsupported downgrade" case.
     fn too_new_device_json() -> String {
         format!(
-            r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","config_version":{}}}"#,
+            r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","nat":{{}},"wireguard_public_key":"wg-pub","signing_public_key":"signing-pub","config_version":{}}}"#,
             device_config::CONFIG_VERSION + 1
         )
     }
@@ -1179,7 +1196,7 @@ mod startup_config_validation_tests {
 
     fn current_device_json() -> String {
         format!(
-            r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","config_version":{}}}"#,
+            r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","nat":{{}},"wireguard_public_key":"wg-pub","signing_public_key":"signing-pub","config_version":{}}}"#,
             device_config::CONFIG_VERSION
         )
     }
@@ -1240,7 +1257,7 @@ mod startup_config_validation_tests {
         let too_new = start_daemon_with_device_json(&too_new_device_json()).await;
 
         assert!(
-            corrupt.error.contains("is not a valid device config"),
+            corrupt.error.contains("is not a valid current device config"),
             "a corrupt device.json must say so: {}",
             corrupt.error
         );

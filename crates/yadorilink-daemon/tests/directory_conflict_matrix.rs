@@ -132,6 +132,22 @@ fn is_conflict_copy(name: &str) -> bool {
     name.contains("conflicted copy")
 }
 
+/// Diagnostic-only: one device's index state for `path` plus its group DAG
+/// heads. Mirrors `monkey_chaos.rs`'s `describe_index_state`.
+fn describe_index_state(state: &DaemonState, group_id: &str, path: &str) -> String {
+    let record = state.sync_state.get_file(group_id, path);
+    let materialization = state.sync_state.get_materialization_state(group_id, path);
+    let held = state.sync_state.get_held_state(group_id, path);
+    let heads = state
+        .sync_state
+        .dag_group_heads(group_id)
+        .map(|hs| hs.iter().map(|h| h.to_hex()).collect::<Vec<_>>());
+    format!(
+        "record={record:?} materialization={materialization:?} held={held:?} \
+         dag_group_heads={heads:?}"
+    )
+}
+
 /// A recursive relative-path -> content-hash snapshot of everything under
 /// `root`, for scenarios where the flat, non-recursive `real_entry_names`
 /// (top-level only, by design -- see its own doc comment) isn't enough to
@@ -207,9 +223,9 @@ fn recursive_snapshot(root: &Path) -> HashMap<String, String> {
 /// each other's rename), not a flake.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_directory_rename_to_different_targets() {
+    let _ = tracing_subscriber::fmt::try_init();
     let (device_a, device_b, group_id) =
         two_synced_devices("dir-collision-rename-rename-diff").await;
-    let _ = group_id;
 
     let dir_a = device_a.root.path().join("shared_dir");
     std::fs::create_dir_all(&dir_a).unwrap();
@@ -247,15 +263,30 @@ async fn concurrent_directory_rename_to_different_targets() {
     // The one certainty regardless of how (or whether) the rename's
     // contents propagate: each device physically renamed its *own*
     // "shared_dir" away, so that name is gone from both, unconditionally.
+    let diag = || {
+        ["a.txt", "b.txt", "c.txt"]
+            .iter()
+            .map(|f| {
+                let p = format!("shared_dir/{f}");
+                format!(
+                    "  device-a[{p:?}]: {}\n  device-b[{p:?}]: {}\n",
+                    describe_index_state(&device_a.state, &group_id, &p),
+                    describe_index_state(&device_b.state, &group_id, &p),
+                )
+            })
+            .collect::<String>()
+    };
     assert!(
         !real_entry_names(device_a.root.path()).contains(&"shared_dir".to_string()),
-        "{:?}",
-        real_entry_names(device_a.root.path())
+        "{:?}\n{}",
+        real_entry_names(device_a.root.path()),
+        diag()
     );
     assert!(
         !real_entry_names(device_b.root.path()).contains(&"shared_dir".to_string()),
-        "{:?}",
-        real_entry_names(device_b.root.path())
+        "{:?}\n{}",
+        real_entry_names(device_b.root.path()),
+        diag()
     );
 }
 

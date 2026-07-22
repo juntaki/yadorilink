@@ -26,6 +26,7 @@
 //!   - INV-4: the compensating Worker call carries only
 //!     `(group_id, device_id, storage_mode)` -- never a digest, path, or
 //!     version.
+#![cfg(unix)]
 
 mod support;
 
@@ -44,7 +45,9 @@ use yadorilink_ipc_proto::daemonctl::{
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_sync_core::index::{RoleLossAction, RoleLossOperationState};
+use yadorilink_sync_core::index::{
+    RoleLossAction, RoleLossOperationParams, RoleLossOperationState,
+};
 use yadorilink_sync_core::types::{BlockInfo, FileRecord, MaterializationPolicy};
 use yadorilink_sync_core::version_vector::VersionVector;
 
@@ -165,8 +168,20 @@ async fn demoting_setup(server: &MockServer) -> (Daemon, Daemon, std::path::Path
 
     let content = b"the file device-a confirms holding";
     let hash = a.state.block_store.put(content).unwrap();
+    a.state
+        .sync_state
+        .record_group_block_provenance(GROUP, &[hex::decode(hash.as_str()).unwrap()])
+        .unwrap();
     b.state.block_store.put(content).unwrap();
     let bytes = hex::decode(hash.as_str()).unwrap();
+    // Device-b is the confirmed-ready target's OWN peer: device-a's mandatory
+    // lease issuance (`DaemonState::request_handoff_lease`) re-verifies ITS
+    // OWN readiness by querying device-b to confirm device-b durably holds
+    // this file (`peer_holds_entire_group` -> `holds_version_durably`, which
+    // requires group block provenance on the ANSWERING side, not just the
+    // asker's) -- without this, device-a's own readiness check fails and no
+    // lease is ever issued, regardless of the mocked Worker endpoint below.
+    b.state.sync_state.record_group_block_provenance(GROUP, std::slice::from_ref(&bytes)).unwrap();
     let record = record_referencing("only.bin", "device-b", bytes, content.len() as u64);
     a.state.sync_state.upsert_file(GROUP, &record).unwrap();
     b.state.sync_state.upsert_file(GROUP, &record).unwrap();
@@ -515,12 +530,14 @@ async fn prepared_reconcile_restores_worker_eager_after_response_loss() {
         .insert_role_loss_operation(
             "op-ambiguous-prepared",
             GROUP,
-            "device-b",
-            "device-a",
-            Some("lease-prepared"),
-            RoleLossAction::Demote,
-            Some(&b.root.path().to_string_lossy()),
-            now,
+            RoleLossOperationParams {
+                source_device_id: "device-b",
+                target_device_id: "device-a",
+                lease_id: Some("lease-prepared"),
+                action: RoleLossAction::Demote,
+                local_path: Some(&b.root.path().to_string_lossy()),
+                now_unix: now,
+            },
         )
         .unwrap();
 
@@ -561,12 +578,14 @@ async fn worker_committed_row_found_at_startup_is_compensated_by_the_sweep() {
         .insert_role_loss_operation(
             "op-crash-1",
             GROUP,
-            "device-b",
-            "device-a",
-            Some("lease-crash-1"),
-            RoleLossAction::Demote,
-            Some(&b.root.path().to_string_lossy()),
-            now,
+            RoleLossOperationParams {
+                source_device_id: "device-b",
+                target_device_id: "device-a",
+                lease_id: Some("lease-crash-1"),
+                action: RoleLossAction::Demote,
+                local_path: Some(&b.root.path().to_string_lossy()),
+                now_unix: now,
+            },
         )
         .unwrap();
     b.state
@@ -616,12 +635,14 @@ async fn compensation_unreachable_leaves_the_row_compensating_and_retries() {
         .insert_role_loss_operation(
             "op-crash-2",
             GROUP,
-            "device-b",
-            "device-a",
-            Some("lease-crash-2"),
-            RoleLossAction::Demote,
-            Some(&b.root.path().to_string_lossy()),
-            now,
+            RoleLossOperationParams {
+                source_device_id: "device-b",
+                target_device_id: "device-a",
+                lease_id: Some("lease-crash-2"),
+                action: RoleLossAction::Demote,
+                local_path: Some(&b.root.path().to_string_lossy()),
+                now_unix: now,
+            },
         )
         .unwrap();
     b.state

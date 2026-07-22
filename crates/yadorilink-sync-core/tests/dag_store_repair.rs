@@ -327,7 +327,7 @@ fn promoting_hash_mismatched_orphan_does_not_leave_ghost_parent_edges() {
     )
     .unwrap();
 
-    let promoted = promote_orphans(&conn).unwrap();
+    let promoted = promote_orphans(&conn, &[parent.compute_hash()]).unwrap();
     assert_eq!(promoted, vec![orphan.compute_hash()]);
 
     let ghost_edge_count: i64 = conn

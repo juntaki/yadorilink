@@ -23,6 +23,7 @@ use yadorilink_sync_core::change::VersionBlock;
 use yadorilink_sync_core::chunker::reconstruct_file;
 use yadorilink_sync_core::materialization::{
     disk_bytes_match_indexed_blocks, evict_file, run_disk_pressure_eviction_sweep,
+    MaterializationContext,
 };
 use yadorilink_sync_core::peer_session::PeerSyncSession;
 use yadorilink_sync_core::types::{BlockInfo, MaterializationPolicy, MaterializationState};
@@ -749,10 +750,12 @@ fn preflight_disk_pressure(
         // GC sweep already uses; see `gc::run_sweep_with_grace_cutoff`.
         let run_sweep = || {
             let _ = run_disk_pressure_eviction_sweep(
-                &state.sync_state,
-                state.block_liveness_gate(),
-                state.block_store.as_ref(),
-                root,
+                MaterializationContext {
+                    state: &state.sync_state,
+                    liveness_gate: state.block_liveness_gate(),
+                    store: state.block_store.as_ref(),
+                    root,
+                },
                 group_id,
                 false,
                 headroom_override,
@@ -763,8 +766,7 @@ fn preflight_disk_pressure(
         {
             match tokio::runtime::Handle::try_current() {
                 Ok(handle)
-                    if handle.runtime_flavor()
-                        == tokio::runtime::RuntimeFlavor::MultiThread =>
+                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
                 {
                     tokio::task::block_in_place(run_sweep);
                 }
@@ -836,10 +838,12 @@ pub fn evict(state: &DaemonState, group_id: &str, path: &str) -> Result<(), Sync
     let root = local_root_for_group(state, group_id)?;
     let is_full_replica = state.is_local_full_replica(group_id);
     evict_file(
-        &state.sync_state,
-        state.block_liveness_gate(),
-        state.block_store.as_ref(),
-        &root,
+        MaterializationContext {
+            state: &state.sync_state,
+            liveness_gate: state.block_liveness_gate(),
+            store: state.block_store.as_ref(),
+            root: &root,
+        },
         group_id,
         path,
         is_full_replica,
@@ -1635,7 +1639,10 @@ mod tests {
     fn put_block(state: &DaemonState, group_id: &str, data: &[u8]) -> BlockInfo {
         let hash = state.block_store.put(data).unwrap();
         let hash_bytes = hex::decode(&hash).unwrap();
-        state.sync_state.record_group_block_provenance(group_id, &[hash_bytes.clone()]).unwrap();
+        state
+            .sync_state
+            .record_group_block_provenance(group_id, std::slice::from_ref(&hash_bytes))
+            .unwrap();
         BlockInfo { hash: hash_bytes, offset: 0, size: data.len() as u32 }
     }
 

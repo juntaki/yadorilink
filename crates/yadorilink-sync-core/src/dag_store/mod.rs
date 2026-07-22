@@ -46,14 +46,14 @@ pub use retained_history_integrity::{
     get_encoded, group_history_paths, has_all_parents, has_change, is_ancestor, lamport_of,
     list_unapplied, mark_applied, parents_of,
 };
+pub(crate) use serving_authorization_index::sweep_unreferenced_file_versions;
 pub use serving_authorization_index::{
     get_file_version, group_file_version_references_block, group_has_block_provenance,
     has_file_version, put_file_version, record_compacted_file_version_authorization,
     record_group_block_provenance,
 };
-pub(crate) use serving_authorization_index::sweep_unreferenced_file_versions;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 #[cfg(test)]
 use crate::change::FileVersion;
@@ -266,6 +266,17 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncError> {
     )?;
     retained_history_integrity::repair(conn)?;
     orphan_integrity::repair(conn)?;
+    // Self-heal: an orphan whose parent is already durably admitted but that
+    // was never promoted (a crash between `append_change` and
+    // `promote_orphans`, or an orphan buffered directly out of band) has no
+    // future admission left to seed a promotion pass for it, since ordinary
+    // operation only seeds from the change that was just admitted. This is
+    // the one place a full-buffer sweep is appropriate: it runs once at
+    // startup, not once per admission.
+    let self_heal_seeds = orphan_integrity::already_satisfied_parents(conn)?;
+    if !self_heal_seeds.is_empty() {
+        orphan_integrity::promote_orphans(conn, &self_heal_seeds)?;
+    }
     frontier_index::repair(conn)?;
     // The checkpoint table is created in the same step as the other DAG
     // tables so the whole change-history schema is provisioned by one call and
@@ -350,8 +361,9 @@ pub fn admit_change(
         // unblocked. All of them became durable in this call, so the caller
         // must project and gate every one — return the full set in append
         // order (current change first).
-        let mut newly_admitted = vec![change.compute_hash()];
-        newly_admitted.extend(orphan_integrity::promote_orphans(conn)?);
+        let hash = change.compute_hash();
+        let mut newly_admitted = vec![hash];
+        newly_admitted.extend(orphan_integrity::promote_orphans(conn, &[hash])?);
         Ok(AdmitResult { outcome: AdmitOutcome::Applied, newly_admitted })
     } else {
         // Record the edges now so `promote_orphans` can test completeness
@@ -366,6 +378,31 @@ pub fn admit_change(
         orphan_integrity::insert_orphan(conn, change, applied)?;
         Ok(AdmitResult { outcome: AdmitOutcome::Orphaned, newly_admitted: Vec::new() })
     }
+}
+
+/// Whether a change is already known locally — either durably admitted or
+/// already buffered in the orphan holding area awaiting its own ancestry.
+/// Deliberately distinct from `has_change`, which existing callers rely on to
+/// mean "durably admitted" specifically (e.g. deciding whether a change still
+/// needs promoting). This one is for a different question: whether a peer
+/// needs to (re-)send a hash at all. A hash already sitting in the orphan
+/// buffer need not be re-requested on every repeated frontier announce while
+/// its own ancestors are still in flight — only the genuinely-unknown hashes
+/// do, so re-requesting an already-buffered one is pure waste that scales
+/// with how often the peer re-announces during a long catch-up.
+pub fn has_change_or_buffered_orphan(
+    conn: &Connection,
+    hash: &ChangeHash,
+) -> Result<bool, SyncError> {
+    if retained_history_integrity::has_change(conn, hash)? {
+        return Ok(true);
+    }
+    let present: Option<i64> = conn
+        .query_row("SELECT 1 FROM orphan_changes WHERE change_hash = ?1", [&hash.0[..]], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    Ok(present.is_some())
 }
 
 /// Builds, signs, and appends a change for a local mutation. Its parents are
@@ -470,6 +507,7 @@ pub fn emit_local_change_onto(
 mod tests {
     use super::*;
     use crate::change::{BlockHash, FileMeta, SyncPath, VersionBlock};
+    use crate::index::ChangeContent;
     use crate::types::RecordKind;
     use ed25519_dalek::SigningKey;
 
@@ -798,7 +836,9 @@ mod tests {
         change.lamport = 99;
         change.sign(&signing);
 
-        assert!(state.dag_admit_change_with_versions(&change, &[version.clone()], false).is_err());
+        assert!(state
+            .dag_admit_change_with_versions(&change, std::slice::from_ref(&version), false)
+            .is_err());
         assert!(!state.dag_has_file_version("group-a", &version.version_hash).unwrap());
         assert!(!state.dag_group_file_version_references_block("group-a", &block_hash).unwrap());
     }
@@ -1024,7 +1064,7 @@ mod tests {
         // Land the root directly and promote: c1 unblocks first (its parent is
         // the root), then c2 (its parent is c1).
         assert!(append_change(&recv, &root, true).unwrap());
-        let promoted = promote_orphans(&recv).unwrap();
+        let promoted = promote_orphans(&recv, &[root.compute_hash()]).unwrap();
         assert_eq!(promoted, vec![c1.compute_hash(), c2.compute_hash()]);
     }
 
@@ -1190,8 +1230,7 @@ mod tests {
                 "g",
                 &record,
                 "device-A",
-                vec![create_op("a.txt")],
-                &[],
+                ChangeContent { ops: vec![create_op("a.txt")], versions: &[] },
                 None,
                 &em,
             )

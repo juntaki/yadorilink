@@ -434,7 +434,7 @@ mod tests {
             let change = state.dag_get_change(&hash).unwrap().unwrap();
             cursor = match change.parents.as_slice() {
                 [] => None,
-                [parent] => Some(parent.clone()),
+                [parent] => Some(*parent),
                 more => {
                     panic!("expected a linear chain, found a change with {} parents", more.len())
                 }
@@ -475,7 +475,7 @@ mod tests {
         // The chunk chain converges on a single head and is linear to the root.
         let heads = state.dag_group_heads("g").unwrap();
         assert_eq!(heads.len(), 1, "the chunk chain must converge on a single head");
-        let chain = linear_chain_to_root(&state, heads[0].clone());
+        let chain = linear_chain_to_root(&state, heads[0]);
         assert_eq!(chain.len(), changes, "walked chain length must equal the emitted change count");
 
         let mut total_ops = 0usize;

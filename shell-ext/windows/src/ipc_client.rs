@@ -211,34 +211,6 @@ async fn is_placeholder_inner(path: &str) -> bool {
     }
 }
 
-/// Edit-presence awareness's "open
-/// elsewhere" overlay — `true` when a peer device currently has this file
-/// open for editing (Office's `~$*` lock-file convention, detected and
-/// broadcast entirely daemon-side; this is purely a render
-/// of `StatusResponse.open_elsewhere_device_id`). Advisory only, same
-/// fail-soft-to-`false` contract as `is_placeholder`.
-pub fn is_open_elsewhere(path: &str) -> bool {
-    runtime().block_on(async {
-        tokio::time::timeout(DEFAULT_TIMEOUT, is_open_elsewhere_inner(path)).await.unwrap_or(false)
-    })
-}
-
-async fn is_open_elsewhere_inner(path: &str) -> bool {
-    let Ok(mut stream) = connect().await else { return false };
-    let msg = ShellIpcMessage {
-        payload: Some(Payload::StatusQuery(StatusQuery { path: path.to_string() })),
-    };
-    if write_message(&mut stream, &msg).await.is_err() {
-        return false;
-    }
-    match read_message::<ShellIpcMessage>(&mut stream).await {
-        Ok(Some(ShellIpcMessage { payload: Some(Payload::StatusResponse(r)) })) => {
-            !r.open_elsewhere_device_id.is_empty()
-        }
-        _ => false,
-    }
-}
-
 /// Sends a context-menu action ("view status", "pause", "resume", "pin",
 /// "evict") for `path`. Returns `true` on a confirmed success response
 /// from the daemon; `false` for any failure, timeout, or unreachable

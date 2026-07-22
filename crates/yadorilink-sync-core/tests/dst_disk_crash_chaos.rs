@@ -333,8 +333,9 @@ fn setup_device(
     // DAG change, propagated over the change-history path instead of the
     // legacy index wire.
     let processor = Arc::new(
-        LocalChangeProcessor::new(state.clone(), store, device_id.to_string())
-            .with_change_emitter(Arc::new(ChangeEmitter::new(device_id, device_signing_key(device_id)))),
+        LocalChangeProcessor::new(state.clone(), store, device_id.to_string()).with_change_emitter(
+            Arc::new(ChangeEmitter::new(device_id, device_signing_key(device_id))),
+        ),
     );
     let (flush_request_tx, flush_request_rx) = tokio::sync::mpsc::channel(4);
     let (watch_source, _events_tx) = SimulatedFolderWatchSource::new(32);
@@ -658,14 +659,12 @@ async fn run_scenario(seed: u64) -> Result<(Vec<String>, Vec<String>), String> {
 
     {
         let state = SyncState::open(&db_a).map_err(|e| e.to_string())?;
-        dst_support::link::link_and_start(&state, &root_a, GROUP_ID)
-            .map_err(|e| e.to_string())?;
+        dst_support::link::link_and_start(&state, &root_a, GROUP_ID).map_err(|e| e.to_string())?;
         seed_interrupted_materialization(&state, &root_a, &store_a)?;
     }
     {
         let state = SyncState::open(&db_b).map_err(|e| e.to_string())?;
-        dst_support::link::link_and_start(&state, &root_b, GROUP_ID)
-            .map_err(|e| e.to_string())?;
+        dst_support::link::link_and_start(&state, &root_b, GROUP_ID).map_err(|e| e.to_string())?;
     }
 
     let state_a = restart_recovery(&db_a, &root_a, &store_a, "device-a")?;

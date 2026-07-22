@@ -1393,7 +1393,8 @@ pub struct PeerSyncSession {
     /// Correlates outstanding `RebootstrapSnapshotRequest`s to the oneshot
     /// `request_rebootstrap_snapshot_from_peer` awaits: request_id ->
     /// reply sender. Mirrors `pending_handoff_lease` exactly.
-    pending_rebootstrap_snapshot: StdMutex<HashMap<u64, oneshot::Sender<Option<PreparedRebootstrap>>>>,
+    pending_rebootstrap_snapshot:
+        StdMutex<HashMap<u64, oneshot::Sender<Option<PreparedRebootstrap>>>>,
     /// Monotonic id used to correlate a `RebootstrapSnapshotRequest` with
     /// its reply.
     next_rebootstrap_snapshot_request_id: std::sync::atomic::AtomicU64,
@@ -2565,7 +2566,13 @@ impl PeerSyncSession {
         }
         let mut missing: Vec<ChangeHash> = Vec::new();
         for h in &announced {
-            if !self.state.dag_has_change(h)? {
+            // A hash already sitting in the orphan buffer is not re-requested
+            // here: it is already known, only its own ancestors are
+            // outstanding, and those are (or will be) requested separately
+            // as its admission discovers them. Without this, a peer that
+            // re-announces the same still-catching-up head every cycle would
+            // re-trigger a full duplicate resend on every single cycle.
+            if !self.state.dag_has_change_or_buffered_orphan(h)? {
                 missing.push(*h);
             }
         }
@@ -2688,25 +2695,77 @@ impl PeerSyncSession {
             );
             return Ok(());
         }
-        // Serve in bounded batches: a want-list larger than one batch is
-        // split across several `ChangeBatch` messages, each capped at
-        // `MAX_CHANGES_PER_BATCH`, so no single reply can be made
-        // unboundedly large.
-        let mut batch: Vec<Vec<u8>> = Vec::new();
+        // Expand every requested hash into its full retained ancestor
+        // closure (oldest-first), not just the single hash asked for. The
+        // requester names a hash it does not have without knowing what else
+        // is missing behind it — e.g. a whole undiscovered chain during
+        // initial catch-up — so serving exactly `req.want` forced one
+        // request/response round trip per generation of a long linear
+        // history to walk back to a common ancestor. This is what makes the
+        // wire contract's "bounded, oldest-first batch" actually bounded by
+        // *batches*, not by *round trips*. The walk stops wherever this
+        // replica's own retained history stops: a compacted/pruned ancestor
+        // has no recorded `change_parents` edge left to follow, so it
+        // terminates cleanly at the checkpoint boundary instead of erroring.
+        let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        let mut ordered: Vec<ChangeHash> = Vec::new();
         for want in &req.want {
             let Some(hash) = change_hash_from_wire(want) else { continue };
+            self.collect_ancestor_closure(&hash, &mut seen, &mut ordered)?;
+        }
+        // Bounded the same way an oversized flat want-list already was.
+        // Truncating from the end keeps the oldest slice, closest to
+        // whatever retained root this replica has, so the peer can always
+        // make forward progress and its own next round re-requests the
+        // continuation — truncating from the front would instead hand it a
+        // dangling prefix with no reachable root.
+        ordered.truncate(MAX_CHANGES_PER_BATCH);
+
+        let mut batch: Vec<Vec<u8>> = Vec::new();
+        for hash in ordered {
             if let Some(encoded) = self.state.dag_get_encoded(&hash)? {
                 batch.push(encoded);
-                if batch.len() >= MAX_CHANGES_PER_BATCH {
-                    let taken = std::mem::take(&mut batch);
-                    let versions = self.file_versions_for_changes(&taken)?;
-                    self.send_change_batch(&group_id, taken, versions).await?;
-                }
             }
         }
         if !batch.is_empty() {
             let versions = self.file_versions_for_changes(&batch)?;
             self.send_change_batch(&group_id, batch, versions).await?;
+        }
+        Ok(())
+    }
+
+    /// Iterative post-order walk of `hash`'s retained ancestry via the
+    /// `change_parents` index, appending newly-discovered hashes to
+    /// `ordered` in oldest-first (every parent before its children) order,
+    /// `hash` itself last. Iterative rather than recursive so a genuinely
+    /// deep single-branch history cannot blow the stack.
+    fn collect_ancestor_closure(
+        &self,
+        root: &ChangeHash,
+        seen: &mut std::collections::HashSet<[u8; 32]>,
+        ordered: &mut Vec<ChangeHash>,
+    ) -> Result<(), SyncError> {
+        enum Frame {
+            Discover(ChangeHash),
+            Emit(ChangeHash),
+        }
+        if seen.contains(&root.0) {
+            return Ok(());
+        }
+        let mut stack = vec![Frame::Discover(*root)];
+        while let Some(frame) = stack.pop() {
+            match frame {
+                Frame::Discover(hash) => {
+                    if !seen.insert(hash.0) {
+                        continue;
+                    }
+                    stack.push(Frame::Emit(hash));
+                    for parent in self.state.dag_parents_of(&hash)? {
+                        stack.push(Frame::Discover(parent));
+                    }
+                }
+                Frame::Emit(hash) => ordered.push(hash),
+            }
         }
         Ok(())
     }
@@ -3049,9 +3108,11 @@ impl PeerSyncSession {
                 if parent_pin_unreadable {
                     // Hold, don't admit: re-request the missing ancestry so the
                     // change is re-delivered and re-checked once every parent's
-                    // pinned coordinate is readable.
+                    // pinned coordinate is readable. A parent already sitting
+                    // in the orphan buffer is skipped — it is already known,
+                    // only its own ancestors are still outstanding.
                     for parent in &change.parents {
-                        if !self.state.dag_has_change(parent)? {
+                        if !self.state.dag_has_change_or_buffered_orphan(parent)? {
                             missing_parents.push(*parent);
                         }
                     }
@@ -3202,9 +3263,12 @@ impl PeerSyncSession {
                     AdmitOutcome::Orphaned => {
                         // Ask the peer for the parents this change descends from
                         // that we don't yet hold, so the walk completes
-                        // oldest-first over further rounds.
+                        // oldest-first over further rounds. A parent already
+                        // sitting in the orphan buffer is skipped — it is
+                        // already known, only its own ancestors are still
+                        // outstanding.
                         for parent in &change.parents {
-                            if !self.state.dag_has_change(parent)? {
+                            if !self.state.dag_has_change_or_buffered_orphan(parent)? {
                                 missing_parents.push(*parent);
                             }
                         }
@@ -3440,6 +3504,28 @@ impl PeerSyncSession {
                     // if the index still shows it live. A stale content change
                     // that is an ancestor of the tombstone never reaches the live
                     // set, so this can never resurrect a deleted file.
+                    //
+                    // Held across the still-live check AND the materialize call
+                    // below, matching `materialize_dag_content_head`'s identical
+                    // discipline for the Present branch (see its own comment on
+                    // why). Without this, a concurrent local write to this same
+                    // path -- e.g. the filename being reused by a brand-new
+                    // local create shortly after this device's own earlier
+                    // delete, which `local_change.rs`'s own commit path takes
+                    // this same lock for -- can interleave between the check and
+                    // the previously-unlocked materialize() below: the new
+                    // create's content and index row land first, then this
+                    // stale tombstone's materialize() removes that brand-new
+                    // file and overwrites its live index row with `deleted:
+                    // true` -- an index-says-deleted/disk-had-content mismatch
+                    // that no later re-resolution can detect, since every
+                    // device involved already believes it is consistent.
+                    // Confirmed as the actual cause of a real, reproduced
+                    // divergence: four devices with byte-identical DAG heads
+                    // each ended up with their own un-merged local tombstone
+                    // for the same repeatedly-recreated path.
+                    let path_lock = self.state.path_lock(group_id, path);
+                    let _guard = path_lock.lock().await;
                     let still_live =
                         self.state.get_file(group_id, path)?.map(|r| !r.deleted).unwrap_or(false);
                     if still_live {
@@ -3798,7 +3884,6 @@ impl PeerSyncSession {
                 data: vec![],
                 not_found: true,
                 compression: proto::Compression::None as i32,
-                ..Default::default()
             };
             return self
                 .send(proto::SyncMessage {
@@ -3819,7 +3904,6 @@ impl PeerSyncSession {
                 data: vec![],
                 not_found: true,
                 compression: proto::Compression::None as i32,
-                ..Default::default()
             };
             return self
                 .send(proto::SyncMessage {
@@ -3840,7 +3924,6 @@ impl PeerSyncSession {
                 data: vec![],
                 not_found: true,
                 compression: proto::Compression::None as i32,
-                ..Default::default()
             };
             return self
                 .send(proto::SyncMessage {
@@ -3884,7 +3967,6 @@ impl PeerSyncSession {
                         data,
                         not_found: false,
                         compression: compression as i32,
-                        ..Default::default()
                     },
                     // A panicking compression task is folded into
                     // `not_found`, mirroring how a panicking `store.get`
@@ -3896,7 +3978,6 @@ impl PeerSyncSession {
                         data: vec![],
                         not_found: true,
                         compression: proto::Compression::None as i32,
-                        ..Default::default()
                     },
                 }
             }
@@ -3905,7 +3986,6 @@ impl PeerSyncSession {
                 data: vec![],
                 not_found: true,
                 compression: proto::Compression::None as i32,
-                ..Default::default()
             },
         };
         // Gate the outbound block
@@ -7886,9 +7966,7 @@ mod promoted_orphan_projection_tests {
         assert!(state.dag_has_change(&parent.compute_hash()).unwrap());
         assert!(!state.dag_has_change(&rejected.compute_hash()).unwrap());
         assert!(!state.dag_has_file_version(GROUP, &poisoned_version.version_hash).unwrap());
-        assert!(!state
-            .dag_group_file_version_references_block(GROUP, &block_hash)
-            .unwrap());
+        assert!(!state.dag_group_file_version_references_block(GROUP, &block_hash).unwrap());
     }
 
     #[tokio::test]
@@ -8756,6 +8834,15 @@ mod version_hash_exact_capability_tests {
         // reconstruct during repair needs no network.
         let content = b"a freshly received file the crash must not destroy".to_vec();
         let hash = hex::decode(store.put(&content).unwrap()).unwrap();
+        // `ensure_blocks_present` only short-circuits a block already in the
+        // CAS store when this group also has recorded provenance for it (a
+        // physical hit alone might belong to another group) -- production's
+        // real fetch path always records this alongside the store write, so
+        // seed it here too, or the eager materialize below goes looking for
+        // this "missing" block over the (deliberately unreachable) peer
+        // channel and blocks for the full 30s hydration timeout instead of
+        // exercising the crash-before-rename path this test is about.
+        state.record_group_block_provenance(GROUP, std::slice::from_ref(&hash)).unwrap();
 
         let mut version = VersionVector::new();
         version.increment("device-a");
@@ -8872,6 +8959,12 @@ mod version_hash_exact_capability_tests {
 
         let content = b"received, materialized cleanly, later deleted offline".to_vec();
         let hash = hex::decode(store.put(&content).unwrap()).unwrap();
+        // See the sibling crash-before-rename test's identical seed for why:
+        // without recorded group provenance, `ensure_blocks_present` treats
+        // this block as missing for this group and the eager materialize
+        // blocks on the unreachable peer channel for the full hydration
+        // timeout instead of completing.
+        state.record_group_block_provenance(GROUP, std::slice::from_ref(&hash)).unwrap();
 
         let mut version = VersionVector::new();
         version.increment("device-a");
@@ -9521,7 +9614,10 @@ mod rebootstrap_wire_tests {
             Ok(self.0.clone())
         }
 
-        fn verify_rebootstrap(&self, _required: &RebootstrapRequired) -> Result<(), crate::SyncError> {
+        fn verify_rebootstrap(
+            &self,
+            _required: &RebootstrapRequired,
+        ) -> Result<(), crate::SyncError> {
             Ok(())
         }
 
@@ -9788,6 +9884,12 @@ mod dag_negotiated_restart_regression_tests {
         let processor =
             LocalChangeProcessor::new(state_a.clone(), store_a.clone(), "device-a".to_string())
                 .with_change_emitter(emitter.clone());
+        // As the peer side below already does: the later offline edit and
+        // restart scan leave the index and disk disagreeing on the same
+        // path, indistinguishable from an unmounted volume unless the
+        // folder's identity was established first, as a real link's would
+        // have been.
+        crate::root_identity::VerifiedRoot::open(&root, GROUP, &state_a).unwrap();
 
         let file_path = root.join("notes.txt");
         std::fs::write(&file_path, b"version one").unwrap();
@@ -9850,7 +9952,20 @@ mod dag_negotiated_restart_regression_tests {
 
         // The peer fetches v1's block content as part of pulling the
         // pre-restart head (a live channel carries it in a `BlockResponse`).
-        store_b_seed.put(b"version one").unwrap();
+        // Seeding the bytes straight into the peer's own CAS store models
+        // that fetch's *end state*, but skips the provenance record the real
+        // fetch path (`ensure_blocks_present`) always writes alongside it --
+        // without it, `handle_change_batch`'s materialize sees the block
+        // physically present but not provenanced for this group, so it
+        // tries to re-fetch over the (deliberately unreachable) channel and
+        // blocks for the full 30s hydration timeout instead of using it.
+        let hash_v1 = store_b_seed.put(b"version one").unwrap();
+        state_b
+            .record_group_block_provenance(
+                GROUP,
+                std::slice::from_ref(&hex::decode(&hash_v1).unwrap()),
+            )
+            .unwrap();
         let batch = proto::ChangeBatch {
             folder_group_id: GROUP.to_string(),
             changes: vec![change_v1.to_wire_bytes()],
@@ -9915,8 +10030,16 @@ mod dag_negotiated_restart_regression_tests {
         let version_v2 = state_a.dag_get_file_version(GROUP, &version_hash_v2).unwrap().unwrap();
         // The peer fetches the offline edit's block content, exactly as it
         // would over a live channel in response to the change request the
-        // announce triggered above.
-        store_b_seed.put(b"version two, edited while the daemon was stopped").unwrap();
+        // announce triggered above -- same provenance seed as v1 above, for
+        // the same reason.
+        let hash_v2 =
+            store_b_seed.put(b"version two, edited while the daemon was stopped").unwrap();
+        state_b
+            .record_group_block_provenance(
+                GROUP,
+                std::slice::from_ref(&hex::decode(&hash_v2).unwrap()),
+            )
+            .unwrap();
         let batch_v2 = proto::ChangeBatch {
             folder_group_id: GROUP.to_string(),
             changes: vec![change_v2.to_wire_bytes()],

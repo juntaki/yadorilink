@@ -94,16 +94,16 @@
 //!
 //!   - **Its `MAX_VV_COUNTER_JUMP_PER_MESSAGE` assertion** — that an honest
 //!     >10,000 counter advance still fully heals despite the anti-forgery
-//!     clamp. This one is genuinely unsatisfiable now, and the mechanism is
-//!     gone rather than merely unused: `sanitize_against` has exactly one call
-//!     site (`apply_locked_record`), which has exactly one caller
-//!     (`rematerialize_one_record`), whose incoming record is a snapshot of
-//!     *this* device's own committed rows. The bound no longer sits on a peer
-//!     trust boundary at all, and a propagated record carries an empty vector
-//!     anyway. Its honest-growth-is-a-no-op property keeps unit coverage in
-//!     `version_vector.rs`. Note this assertion was flag-gated (first seed
-//!     only, and off entirely under a reduced ops budget) — it was that file's
-//!     soak dimension, not its core.
+//!     > clamp. This one is genuinely unsatisfiable now, and the mechanism is
+//!     > gone rather than merely unused: `sanitize_against` has exactly one call
+//!     > site (`apply_locked_record`), which has exactly one caller
+//!     > (`rematerialize_one_record`), whose incoming record is a snapshot of
+//!     > *this* device's own committed rows. The bound no longer sits on a peer
+//!     > trust boundary at all, and a propagated record carries an empty vector
+//!     > anyway. Its honest-growth-is-a-no-op property keeps unit coverage in
+//!     > `version_vector.rs`. Note this assertion was flag-gated (first seed
+//!     > only, and off entirely under a reduced ops budget) — it was that file's
+//!     > soak dimension, not its core.
 //!
 //! Genuinely not covered, by this file or that one:
 //!
@@ -195,12 +195,23 @@ struct Device {
     session: OnceLock<Arc<PeerSyncSession>>,
 }
 
-fn setup_device(device_id: &str, root: PathBuf, state: Arc<SyncState>, store: Arc<FsBlockStore>) -> Arc<Device> {
+fn setup_device(
+    device_id: &str,
+    root: PathBuf,
+    state: Arc<SyncState>,
+    store: Arc<FsBlockStore>,
+) -> Arc<Device> {
     let processor = Arc::new(
         LocalChangeProcessor::new(state.clone(), store, device_id.to_string())
             .with_change_emitter(dst_dag_migrate_b2::emitter_for(device_id)),
     );
-    Arc::new(Device { device_id: device_id.to_string(), root, state, processor, session: OnceLock::new() })
+    Arc::new(Device {
+        device_id: device_id.to_string(),
+        root,
+        state,
+        processor,
+        session: OnceLock::new(),
+    })
 }
 
 fn gen_keypair(rng: &mut StdRng) -> (StaticSecret, PublicKey) {
@@ -502,8 +513,7 @@ fn stem_of(path: &str) -> &str {
 }
 
 fn run_in_madsim(seed: u64) -> Result<(), String> {
-    let mut rt =
-        madsim::runtime::Runtime::with_seed_and_config(seed, madsim::Config::default());
+    let mut rt = madsim::runtime::Runtime::with_seed_and_config(seed, madsim::Config::default());
     // Comfortable margin over the cycles' own windows plus
     // FINAL_CONVERGENCE_BUDGET.
     rt.set_time_limit(Duration::from_secs(240));

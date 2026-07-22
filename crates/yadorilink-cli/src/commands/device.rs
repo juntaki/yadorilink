@@ -41,10 +41,9 @@ mod http {
         devices: Vec<DeviceInfo>,
     }
 
-    /// The library form the onboarding
-    /// wizard drives — registers the device and persists `device.json`,
-    /// returning the assigned `device_id` as a typed result instead of
-    /// printing it. `register` below is the thin CLI caller.
+    /// The library form the onboarding wizard drives — registers the device and
+    /// persists the one canonical pre-release `device.json` shape, returning the
+    /// assigned `device_id` as a typed result instead of printing it.
     pub async fn register_device(device_name: String) -> Result<String, CliError> {
         let access_token = require_access_token()?;
         let keypair = yadorilink_transport::DeviceKeyPair::load_or_generate(super::keypair_path())
@@ -54,14 +53,17 @@ mod http {
         )
         .map_err(|e| CliError::Other(e.to_string()))?;
 
+        let wireguard_public_key_base64 =
+            base64::engine::general_purpose::STANDARD.encode(keypair.public_bytes());
+        let signing_public_key_base64 =
+            base64::engine::general_purpose::STANDARD.encode(signing_keypair.public_bytes());
+
         let resp: RegisterDeviceResponse = post_json(
             "/devices/register",
             &RegisterDeviceRequest {
                 device_name: &device_name,
-                wireguard_public_key_base64: base64::engine::general_purpose::STANDARD
-                    .encode(keypair.public_bytes()),
-                signing_public_key_base64: base64::engine::general_purpose::STANDARD
-                    .encode(signing_keypair.public_bytes()),
+                wireguard_public_key_base64: wireguard_public_key_base64.clone(),
+                signing_public_key_base64: signing_public_key_base64.clone(),
             },
             Some(&access_token),
         )
@@ -71,7 +73,9 @@ mod http {
             device_id: resp.device_id.clone(),
             coordination_addr: crate::http_client::coordination_addr(),
             nat: crate::device_config::NatConfig::default(),
-            config_version: 0,
+            wireguard_public_key: wireguard_public_key_base64,
+            signing_public_key: signing_public_key_base64,
+            config_version: crate::device_config::CONFIG_VERSION,
         })?;
         Ok(resp.device_id)
     }

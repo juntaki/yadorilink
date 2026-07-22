@@ -344,10 +344,12 @@ pub fn run_periodic_capacity_eviction_sweep(state: &DaemonState) {
         // replica of the group; custody is consulted per file so the sweep only
         // reclaims blocks a full replica is confirmed to hold.
         match yadorilink_sync_core::materialization::run_eviction_sweep(
-            &state.sync_state,
-            state.block_liveness_gate(),
-            state.block_store.as_ref(),
-            root,
+            yadorilink_sync_core::materialization::MaterializationContext {
+                state: &state.sync_state,
+                liveness_gate: state.block_liveness_gate(),
+                store: state.block_store.as_ref(),
+                root,
+            },
             &link.group_id,
             false,
             link.max_local_size_bytes,
@@ -453,7 +455,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn eviction_without_remote_lease_never_reaches_physical_reclaim() {
         use yadorilink_sync_core::change::{VersionBlock, VersionHash};
-        use yadorilink_sync_core::materialization::evict_file;
+        use yadorilink_sync_core::materialization::{evict_file, MaterializationContext};
 
         let store_dir = tempfile::tempdir().unwrap();
         let (reclaim_started_tx, reclaim_started_rx) = std::sync::mpsc::sync_channel(1);
@@ -495,10 +497,12 @@ mod tests {
         let reclaim_root = materialized_root.path().to_path_buf();
         let outcome = tokio::task::spawn_blocking(move || {
             evict_file(
-                &reclaim_state.sync_state,
-                reclaim_state.block_liveness_gate(),
-                reclaim_state.block_store.as_ref(),
-                &reclaim_root,
+                MaterializationContext {
+                    state: &reclaim_state.sync_state,
+                    liveness_gate: reclaim_state.block_liveness_gate(),
+                    store: reclaim_state.block_store.as_ref(),
+                    root: &reclaim_root,
+                },
                 "group-a",
                 "evicted.txt",
                 false,

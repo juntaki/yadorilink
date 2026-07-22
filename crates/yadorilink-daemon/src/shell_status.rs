@@ -61,11 +61,7 @@ pub fn resolve_group_and_rel_path(
     matches.sort_by_key(|(_, root)| std::cmp::Reverse(root.components().count()));
     let (link, canonical_root) = matches.first()?;
     let best_depth = canonical_root.components().count();
-    if matches
-        .iter()
-        .skip(1)
-        .any(|(_, root)| root.components().count() == best_depth)
-    {
+    if matches.iter().skip(1).any(|(_, root)| root.components().count() == best_depth) {
         tracing::warn!(
             absolute_path,
             "path resolves equally well to multiple linked roots; refusing to choose a sync group"
@@ -205,9 +201,7 @@ mod tests {
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
         let sync_state =
             Arc::new(yadorilink_sync_core::index::SyncState::open_in_memory().unwrap());
-        sync_state
-            .add_link(&parent.path().to_string_lossy(), "parent-group")
-            .unwrap();
+        sync_state.add_link(&parent.path().to_string_lossy(), "parent-group").unwrap();
         sync_state.add_link(&child.to_string_lossy(), "child-group").unwrap();
         let state = DaemonState::new("device-a".into(), sync_state, store);
 

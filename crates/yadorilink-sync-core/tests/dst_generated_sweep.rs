@@ -448,6 +448,7 @@ async fn drive_case(case: &Case, profile: &HarnessProfile) -> Result<Vec<Violati
     let store_a = Arc::new(FsBlockStore::new(store_dir_a.path()).map_err(|e| e.to_string())?);
     let recovery_store_a = store_a.clone();
     let state_a = Arc::new(SyncState::open_in_memory().map_err(|e| e.to_string())?);
+    dst_support::link::link_and_start(&state_a, &root_a, GROUP_ID)?;
 
     let root_dir_b = tempfile::tempdir().map_err(|e| e.to_string())?;
     let root_b = root_dir_b.path().canonicalize().map_err(|e| e.to_string())?;
@@ -455,6 +456,7 @@ async fn drive_case(case: &Case, profile: &HarnessProfile) -> Result<Vec<Violati
     let store_b = Arc::new(FsBlockStore::new(store_dir_b.path()).map_err(|e| e.to_string())?);
     let recovery_store_b = store_b.clone();
     let state_b = Arc::new(SyncState::open_in_memory().map_err(|e| e.to_string())?);
+    dst_support::link::link_and_start(&state_b, &root_b, GROUP_ID)?;
 
     let device_a = setup_device("device-0", root_a.clone(), state_a.clone(), store_a.clone());
     let device_b = setup_device("device-1", root_b.clone(), state_b.clone(), store_b.clone());
@@ -924,7 +926,6 @@ fn dst_generated_sweep() {
     }
 
     let mut coverage = CoverageAccumulator::new();
-    let mut seeds_run = 0u64;
     let mut clean = 0u64;
     let mut skipped: HashMap<&'static str, u64> = HashMap::new();
     let mut total_artifacts = 0usize;
@@ -950,8 +951,35 @@ fn dst_generated_sweep() {
         }
     }
 
-    for i in 0..variations {
-        let seed = base_seed.wrapping_add(i);
+    // A seed can land on an infra skip (most commonly the startup canary's
+    // known WireGuard-handshake-under-simulated-time livelock) independent of
+    // whether it would otherwise have exercised anything interesting -- that
+    // is a property of the seed's RNG-derived timing draw, not of sync
+    // correctness. A flat `0..variations` loop therefore made the sweep's
+    // actual coverage hostage to how many of exactly `variations` sequential
+    // seeds happened to skip: at `DST_VARIATIONS=1` (lane1's per-scenario
+    // smoke budget), a single unlucky seed meant zero cases ever ran and the
+    // sweep failed having tested nothing, on every single run, since lane1
+    // pins a fixed base seed with no variation. Attempt further seeds instead
+    // until `variations` many are actually exercised (skips don't count
+    // against the target), bounded so a genuinely broken harness still fails
+    // fast rather than retrying forever.
+    // A `DST_BASE_SEED`-targeted run is an explicit "reproduce exactly
+    // DST_VARIATIONS seeds starting at DST_BASE_SEED" request (the assert
+    // below's own advertised recipe); silently advancing past that pinned
+    // range when one of them hits an infra skip would defeat the
+    // reproduction, not help it. Bounding max_attempts to variations itself
+    // (rather than widening) keeps the range exact -- a skip within it still
+    // fails the final gate rather than being backfilled by a seed outside
+    // the range. The bounded-retry widening below is only for the untargeted
+    // sweep/lane1 case.
+    let max_attempts =
+        if targeted { variations.max(1) } else { variations.saturating_mul(8).max(8) };
+    let mut attempted = 0u64;
+    let mut exercised = 0u64;
+    while exercised < variations && attempted < max_attempts {
+        let seed = base_seed.wrapping_add(attempted);
+        attempted += 1;
         let case = generator::generate_case(seed);
 
         // Sanity guard: the generator must produce a well-formed Case.
@@ -961,14 +989,16 @@ fn dst_generated_sweep() {
             "generator produced an invalid case for seed {seed}: {invalid:?}"
         );
 
-        coverage.record_case(&case);
-        seeds_run += 1;
-
         let r = process_case(&case);
         if let Some(kind) = r.skip {
             *skipped.entry(kind).or_default() += 1;
             continue;
         }
+        // Coverage counts only cases that actually ran: a skipped case never
+        // applied a single Op, so recording it here would claim op/topology
+        // coverage the run never touched.
+        coverage.record_case(&case);
+        exercised += 1;
         total_artifacts += r.artifacts;
         total_advisory += r.advisory;
         if r.product_bugs.is_empty() && r.artifacts == 0 && r.advisory == 0 {
@@ -989,7 +1019,11 @@ fn dst_generated_sweep() {
 
     let total_skipped: u64 = skipped.values().sum();
     println!("\n=== dst_generated_sweep summary ===");
-    println!("seeds run: {seeds_run} (clean: {clean}, skipped: {total_skipped} {:?})", skipped);
+    println!(
+        "seeds attempted: {attempted} (exercised: {exercised}/{variations} requested, clean: \
+         {clean}, skipped: {total_skipped} {:?})",
+        skipped
+    );
     println!(
         "violations: {} product-bug (gating), {} harness-artifact (gating oracles), \
          {} advisory (version-vector-model-dependent oracles, non-gating this cut)",
@@ -1022,7 +1056,10 @@ fn dst_generated_sweep() {
         product_bug_report.join("\n---\n"),
     );
     assert!(
-        total_skipped < variations.max(1),
-        "every seed hit an infra skip — nothing was actually exercised"
+        exercised >= variations,
+        "could not exercise the requested {variations} seed(s): only {exercised} landed after \
+         {attempted} attempt(s) (skips: {skipped:?}) — an infra skip (baseline handshake \
+         timeout, madsim time limit, resource exhaustion) consumed the rest of the attempt \
+         budget without a corresponding correctness signal"
     );
 }

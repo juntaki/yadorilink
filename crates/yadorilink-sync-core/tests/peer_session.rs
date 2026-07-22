@@ -1579,10 +1579,12 @@ async fn evict_then_rehydrate_round_trips_to_identical_content() {
     }
 
     yadorilink_sync_core::materialization::evict_file(
-        &device_b.state,
-        &yadorilink_sync_core::block_liveness::BlockLivenessGate::default(),
-        device_b.store.as_ref(),
-        &device_b.root_path(),
+        yadorilink_sync_core::materialization::MaterializationContext {
+            state: &device_b.state,
+            liveness_gate: &yadorilink_sync_core::block_liveness::BlockLivenessGate::default(),
+            store: device_b.store.as_ref(),
+            root: &device_b.root_path(),
+        },
         GROUP,
         "archive.zip",
         false,
@@ -1862,7 +1864,6 @@ async fn hydration_rejects_block_response_with_wrong_hash_or_size() {
                                 data: bad_data,
                                 not_found: false,
                                 compression: proto::Compression::None as i32,
-                                ..Default::default()
                             },
                         )),
                     }
@@ -2384,8 +2385,10 @@ async fn eager_materialize_leaves_placeholder_when_peer_cannot_supply_a_block() 
             GROUP,
             &record,
             "device-a",
-            vec![create_op],
-            std::slice::from_ref(&absent_version),
+            yadorilink_sync_core::index::ChangeContent {
+                ops: vec![create_op],
+                versions: std::slice::from_ref(&absent_version),
+            },
             None,
             &device_a.emitter(),
         )
@@ -2469,10 +2472,7 @@ async fn eager_materialize_leaves_placeholder_when_peer_cannot_supply_a_block() 
     device_a.store.put(content.as_slice()).unwrap();
     // See the identical comment in
     // `block_request_is_refused_after_mid_session_group_revocation` above.
-    device_a
-        .state
-        .record_group_block_provenance(GROUP, std::slice::from_ref(&block_hash))
-        .unwrap();
+    device_a.state.record_group_block_provenance(GROUP, std::slice::from_ref(&block_hash)).unwrap();
     session_b.hydrate_file(GROUP, "loser.bin").await.unwrap();
     let out = device_b.root_path().join("loser.bin");
     assert_eq!(
@@ -3870,7 +3870,6 @@ async fn hydration_rejects_a_decompression_bomb_block_response() {
                                 data: bomb,
                                 not_found: false,
                                 compression: proto::Compression::Zstd as i32,
-                                ..Default::default()
                             },
                         )),
                     }
@@ -3976,7 +3975,6 @@ async fn hydration_rejects_a_corrupt_compressed_block_response() {
                                 data: vec![0xFFu8; 256], // not a valid zstd frame
                                 not_found: false,
                                 compression: proto::Compression::Zstd as i32,
-                                ..Default::default()
                             },
                         )),
                     }
@@ -4162,6 +4160,14 @@ async fn large_mostly_unchanged_index_resync_still_correctly_reconciles_the_few_
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // Initial full sync over the DAG — every file materializes on device_b.
+    // 150 sequential local commits form a 150-deep linear chain; this relies
+    // on `handle_change_request`'s ancestor-closure walk to serve that whole
+    // chain in one round trip instead of one request/response per
+    // generation (see its doc comment) and on `promote_orphans` being
+    // seeded/dependency-driven rather than doing a full-buffer rescan per
+    // promotion (see its doc comment) — without both, this used to take
+    // well over a minute and get slower, not faster, as more headroom was
+    // given it.
     announce_until(
         &session_a,
         GROUP,

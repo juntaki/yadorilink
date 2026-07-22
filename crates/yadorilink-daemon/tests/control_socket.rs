@@ -10,6 +10,7 @@ mod unix_socket_tests {
 
     use tokio::net::UnixStream;
     use yadorilink_daemon::daemon_state::DaemonState;
+    use yadorilink_daemon::link_manager;
     use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
     use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
     use yadorilink_ipc_proto::daemonctl::{
@@ -40,7 +41,8 @@ mod unix_socket_tests {
         // key is fail-closed (`link_manager::ensure_initial_change_history`):
         // linking a folder refuses index-only sync rather than leave
         // emission silently off. Wire one before any test here links.
-        state.set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
+        state
+            .set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
         let socket_path = dir.path().join("daemon.sock");
 
         let serve_path = socket_path.clone();
@@ -795,7 +797,7 @@ mod unix_socket_tests {
         send(
             &socket_path,
             ReqPayload::Link(LinkRequest {
-                local_path,
+                local_path: local_path.clone(),
                 group_id: "group-7".into(),
                 on_demand: false,
                 max_local_size_bytes: None,
@@ -806,6 +808,23 @@ mod unix_socket_tests {
             }),
         )
         .await;
+        // `Link` starts a real, live filesystem watcher for `folder`
+        // (`link_manager::start_link_watch`, called from the daemon's own
+        // Link handler) -- the write-then-index-directly setup below is
+        // meant to bypass that watcher pipeline entirely (see
+        // `start_daemon_with_state`'s own doc comment), but the watcher
+        // itself does not know that: it can independently notice
+        // `report.pdf` appearing on disk and start processing it
+        // concurrently with this test's own direct `upsert_file` +
+        // immediate `Evict`, racing for the same per-path lock
+        // `evict_file`'s non-blocking `try_lock` refuses to wait for.
+        // Confirmed as the actual cause of a real CI failure: the eviction
+        // was rejected with "it is pinned", but that error variant is also
+        // used for a busy path lock (`{path} is busy`), which is what the
+        // rejection message actually said -- the watcher, not a real pin,
+        // held the lock. Stopping the watch makes the bypass genuine
+        // instead of merely likely on a fast host.
+        link_manager::stop_link_watch(&state, &local_path);
 
         let content = vec![7u8; 1000];
         std::fs::write(folder.join("report.pdf"), &content).unwrap();
@@ -931,7 +950,10 @@ mod unix_socket_tests {
         // (`record_group_block_provenance`'s doc comment): without this, a
         // restore treats a block this test poked directly into the store as
         // never having been obtained through the group, and refuses it.
-        state.sync_state.record_group_block_provenance("group-versions", &[v1_block.hash.clone()]).unwrap();
+        state
+            .sync_state
+            .record_group_block_provenance("group-versions", std::slice::from_ref(&v1_block.hash))
+            .unwrap();
         let mut v1_version = yadorilink_sync_core::version_vector::VersionVector::new();
         v1_version.increment("device-a");
         state
@@ -956,7 +978,10 @@ mod unix_socket_tests {
             offset: 0,
             size: 12,
         };
-        state.sync_state.record_group_block_provenance("group-versions", &[v2_block.hash.clone()]).unwrap();
+        state
+            .sync_state
+            .record_group_block_provenance("group-versions", std::slice::from_ref(&v2_block.hash))
+            .unwrap();
         let mut v2_version = yadorilink_sync_core::version_vector::VersionVector::new();
         v2_version.increment("device-a");
         v2_version.increment("device-a");
@@ -1043,7 +1068,10 @@ mod unix_socket_tests {
         // round_trips_through_control_socket` above.
         state
             .sync_state
-            .record_group_block_provenance("group-default-restore", &[v1_block.hash.clone()])
+            .record_group_block_provenance(
+                "group-default-restore",
+                std::slice::from_ref(&v1_block.hash),
+            )
             .unwrap();
         let mut v1_version = yadorilink_sync_core::version_vector::VersionVector::new();
         v1_version.increment("device-a");
@@ -1064,7 +1092,10 @@ mod unix_socket_tests {
             .unwrap();
 
         let v2_hash = hex::decode(state.block_store.put(b"second content").unwrap()).unwrap();
-        state.sync_state.record_group_block_provenance("group-default-restore", &[v2_hash.clone()]).unwrap();
+        state
+            .sync_state
+            .record_group_block_provenance("group-default-restore", std::slice::from_ref(&v2_hash))
+            .unwrap();
         let mut v2_version = yadorilink_sync_core::version_vector::VersionVector::new();
         v2_version.increment("device-a");
         v2_version.increment("device-a");
@@ -1250,7 +1281,10 @@ mod unix_socket_tests {
         };
         // See the identical comment in `list_versions_then_restore_version_
         // round_trips_through_control_socket` above.
-        state.sync_state.record_group_block_provenance("group-trash", &[block.hash.clone()]).unwrap();
+        state
+            .sync_state
+            .record_group_block_provenance("group-trash", std::slice::from_ref(&block.hash))
+            .unwrap();
         let mut version = yadorilink_sync_core::version_vector::VersionVector::new();
         version.increment("device-a");
         state
@@ -1312,7 +1346,7 @@ mod windows_pipe_tests {
     use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
     use yadorilink_ipc_proto::daemonctl::{
         DaemonControlRequest, DaemonControlResponse, LinkRequest, ListLinksRequest, PauseRequest,
-        ResumeRequest, StatusRequest,
+        PendingEnrollmentKind, ResumeRequest, StatusRequest,
     };
     use yadorilink_ipc_proto::framing::{read_message, write_message};
     use yadorilink_local_storage::FsBlockStore;
@@ -1331,7 +1365,8 @@ mod windows_pipe_tests {
         let state_db = Arc::new(SyncState::open(dir.path().join("sync.sqlite3")).unwrap());
         let state = DaemonState::new("device-under-test".into(), state_db, store);
         // See the identical comment in the Unix `start_daemon_with_state` above.
-        state.set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
+        state
+            .set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
         let pipe_name = unique_pipe_name();
 
         let serve_name = pipe_name.clone();

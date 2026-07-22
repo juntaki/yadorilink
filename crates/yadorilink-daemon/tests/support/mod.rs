@@ -269,6 +269,54 @@ pub async fn connect_two_daemons(
     device_b_id: &str,
     shared_group_ids: &[String],
 ) {
+    // Discards the session tasks' `JoinHandle`s: every existing caller pairs a
+    // fixed, small set of devices once per test process and lets the process
+    // exit, so an unbounded `PeerSyncSession::run()` task per pairing is not a
+    // leak in practice. A caller that runs many short-lived pairings in a
+    // loop -- and so needs to actually bound how much accumulates -- wants
+    // `connect_two_daemons_with_handles` instead; see its doc comment.
+    let _handles = connect_two_daemons_with_handles(
+        state_a,
+        device_a_id,
+        state_b,
+        device_b_id,
+        shared_group_ids,
+    )
+    .await;
+}
+
+/// Like [`connect_two_daemons`], but also returns the two spawned
+/// `PeerSyncSession::run()` tasks' `JoinHandle`s.
+///
+/// `spawn_paired_session`'s spawned task holds a *strong* `Arc<PeerSyncSession>`
+/// (deliberately -- see its own `resync_handle`'s doc comment on why that
+/// inner task holds only a `Weak` one), and through the session, strong
+/// references to `DaemonState` (via `set_pending_local_change_flush`/
+/// `set_change_authenticator`/etc.), its `SyncState` connection pool, and
+/// everything reachable from those. Nothing about `connect_two_daemons`
+/// closes the channel or aborts that task, so it runs for the rest of the
+/// process. Fine for a test that pairs its (small, fixed) device set once;
+/// a test that calls this inside a loop -- pairing a fresh device set per
+/// iteration, as `monkey_chaos.rs`'s `replay_known_failing_seeds` does per
+/// corpus seed -- leaks a full daemon mesh's worth of tasks, SQLite pools,
+/// and periodic timers *per iteration*, with nothing ever torn down between
+/// them. Confirmed as the actual cause of a real CI failure: the second of
+/// two corpus seeds failed DAG handshake negotiation within its 10s budget,
+/// with the first seed's entire 4-device mesh (12 session tasks, their
+/// watcher/debounce/executor/repair tasks, and four SQLite pools) still
+/// running underneath it and competing for the same process's CPU/disk.
+/// A caller in that shape should abort the returned handles (and call
+/// `link_manager::stop_link_watch` for each device's link) once each
+/// iteration is done -- ideally from an RAII guard, since a panic mid-
+/// iteration must still tear the mesh down before the next one starts.
+#[allow(dead_code)]
+pub async fn connect_two_daemons_with_handles(
+    state_a: &Arc<DaemonState>,
+    device_a_id: &str,
+    state_b: &Arc<DaemonState>,
+    device_b_id: &str,
+    shared_group_ids: &[String],
+) -> [tokio::task::JoinHandle<()>; 2] {
     // Direct-pairing tests stand in for the coordination plane, so install the
     // verified empty policy snapshot that plane supplies during a group's
     // bootstrap phase. A linked group is intentionally fail-closed when its
@@ -309,7 +357,7 @@ pub async fn connect_two_daemons(
     let channel_b = Arc::new(
         PeerChannel::connect(secret_b, public_a, index_b, vec![addr_a], shared_b).await.unwrap(),
     );
-    let session_a = spawn_paired_session(
+    let (session_a, handle_a) = spawn_paired_session(
         state_a,
         device_a_id,
         device_b_id,
@@ -317,7 +365,7 @@ pub async fn connect_two_daemons(
         shared_group_ids,
         verifying_b,
     );
-    let session_b = spawn_paired_session(
+    let (session_b, handle_b) = spawn_paired_session(
         state_b,
         device_b_id,
         device_a_id,
@@ -338,6 +386,8 @@ pub async fn connect_two_daemons(
         std::time::Duration::from_secs(10),
     )
     .await;
+
+    [handle_a, handle_b]
 }
 
 fn install_bootstrap_policies(state: &DaemonState, group_ids: &[String]) {
@@ -530,7 +580,7 @@ fn spawn_paired_session(
     channel: Arc<PeerChannel>,
     shared_group_ids: &[String],
     peer_verifying_key: [u8; 32],
-) -> Arc<PeerSyncSession> {
+) -> (Arc<PeerSyncSession>, tokio::task::JoinHandle<()>) {
     // Mirror the netmap-derived authorization the real orchestrator installs
     // (`record_peer_change_authz`): pin the peer's actual change-signing key so
     // its changes' signatures verify, and mark it a writer for every shared
@@ -584,12 +634,12 @@ fn spawn_paired_session(
         .insert(peer_device_id.to_string(), session.clone());
     let peer_id = peer_device_id.to_string();
     let running_session = session.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         if let Err(error) = running_session.run().await {
             tracing::error!(%error, peer = %peer_id, "paired peer session exited");
         }
     });
-    session
+    (session, handle)
 }
 
 /// The local materialization root for each of `group_ids`, read from this

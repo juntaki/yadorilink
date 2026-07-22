@@ -72,10 +72,8 @@ impl ChangeAuthenticator for PinnedKeysAuthenticator {
 /// `(device_id, signing_key)` pair's verifying key. Wire this onto both sides of
 /// a DAG session so each admits the other's signed changes.
 pub fn pinned_authenticator(pairs: &[(&str, &SigningKey)]) -> Arc<dyn ChangeAuthenticator> {
-    let keys = pairs
-        .iter()
-        .map(|(id, key)| (id.to_string(), key.verifying_key().to_bytes()))
-        .collect();
+    let keys =
+        pairs.iter().map(|(id, key)| (id.to_string(), key.verifying_key().to_bytes())).collect();
     Arc::new(PinnedKeysAuthenticator { keys })
 }
 
@@ -160,8 +158,10 @@ impl DagProducer {
                 group_id,
                 &record,
                 &self.device_id,
-                vec![op],
-                std::slice::from_ref(&version),
+                yadorilink_sync_core::index::ChangeContent {
+                    ops: vec![op],
+                    versions: std::slice::from_ref(&version),
+                },
                 // A plain single-block file carries no special local metadata
                 // columns (kind=File, no symlink, exec-bit clear), so pass no
                 // meta — matching the `dag_store` unit test's File-create call.
@@ -209,8 +209,10 @@ impl DagProducer {
                 group_id,
                 &record,
                 &self.device_id,
-                vec![op],
-                std::slice::from_ref(&version),
+                yadorilink_sync_core::index::ChangeContent {
+                    ops: vec![op],
+                    versions: std::slice::from_ref(&version),
+                },
                 None,
                 &self.emitter,
             )

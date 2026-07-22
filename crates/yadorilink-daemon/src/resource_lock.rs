@@ -211,6 +211,13 @@ fn open_sidecar_file(lock_path: &Path) -> anyhow::Result<std::fs::File> {
 
 /// Take a non-blocking exclusive OS lock on `file`, mapping contention to a
 /// clear "already in use" error and any other failure to a lock-path error.
+///
+/// Compares against `fs2::lock_contended_error()`'s raw OS error rather than
+/// `ErrorKind::WouldBlock`: on Windows, `try_lock_exclusive`'s real
+/// contention error is `ERROR_LOCK_VIOLATION` (raw os error 33), which does
+/// not map to `ErrorKind::WouldBlock` in std's Windows error-kind mapping
+/// (unlike Unix's `EWOULDBLOCK`, which does) -- `fs2`'s own test suite
+/// compares the same way for the same reason.
 fn take_exclusive_lock(
     file: &std::fs::File,
     resource_label: &str,
@@ -218,7 +225,7 @@ fn take_exclusive_lock(
 ) -> anyhow::Result<()> {
     match fs2::FileExt::try_lock_exclusive(file) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
             anyhow::bail!("{resource_label} is already in use by another YadoriLink daemon")
         }
         Err(error) => {
@@ -268,8 +275,7 @@ mod tests {
         let _owner = ResourceLock::lock_block_store(&root).unwrap();
 
         let err = ResourceLock::lock_block_store(&root)
-            .err()
-            .expect("a second holder of the same block-store root must be rejected");
+            .expect_err("a second holder of the same block-store root must be rejected");
         assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
     }
 
@@ -284,8 +290,7 @@ mod tests {
         // collapse.
         let alias = root.join("sub").join("..");
         let err = ResourceLock::lock_block_store(&alias)
-            .err()
-            .expect("a `..`-relative alias of the block-store root must be rejected");
+            .expect_err("a `..`-relative alias of the block-store root must be rejected");
         assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
     }
 
@@ -304,8 +309,7 @@ mod tests {
         let aliased_root = link_parent.join("blocks");
 
         let err = ResourceLock::lock_block_store(&aliased_root)
-            .err()
-            .expect("a symlinked-parent alias of the block-store root must be rejected");
+            .expect_err("a symlinked-parent alias of the block-store root must be rejected");
         assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
     }
 
@@ -318,8 +322,7 @@ mod tests {
         let _owner = ResourceLock::lock_sync_db(&db).unwrap();
 
         let err = ResourceLock::lock_sync_db(&db)
-            .err()
-            .expect("a second holder of the same sync database must be rejected");
+            .expect_err("a second holder of the same sync database must be rejected");
         assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
     }
 
@@ -333,8 +336,7 @@ mod tests {
         // `<dir>/sub/../sync-state.sqlite3` names the same database.
         let alias = dir.path().join("sub").join("..").join("sync-state.sqlite3");
         let err = ResourceLock::lock_sync_db(&alias)
-            .err()
-            .expect("a `..`-relative alias of the sync database must be rejected");
+            .expect_err("a `..`-relative alias of the sync database must be rejected");
         assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
     }
 
@@ -351,8 +353,7 @@ mod tests {
         let db_link = dir.path().join("db-link.sqlite3");
         std::os::unix::fs::symlink(&db, &db_link).unwrap();
         let err = ResourceLock::lock_sync_db(&db_link)
-            .err()
-            .expect("a symlink to the existing sync database file must be rejected");
+            .expect_err("a symlink to the existing sync database file must be rejected");
         assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
     }
 
@@ -372,9 +373,9 @@ mod tests {
         std::fs::hard_link(&db, &hard).unwrap();
         // The two paths really are the same inode but distinct sidecars, so the
         // rejection can only come from the live-inode flock.
-        let err = ResourceLock::lock_sync_db(&hard)
-            .err()
-            .expect("a hard link to the same DB inode must be rejected by the live-inode flock");
+        let err = ResourceLock::lock_sync_db(&hard).expect_err(
+            "a hard link to the same DB inode must be rejected by the live-inode flock",
+        );
         assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
     }
 
@@ -450,8 +451,7 @@ mod tests {
         // Owner A holds distinct block store A + DB S.
         let a = tempfile::tempdir().unwrap();
         let shared_db = a.path().join("sync-state.sqlite3");
-        let _owner_a =
-            DataResourceLocks::acquire(&a.path().join("blocks"), &shared_db).unwrap();
+        let _owner_a = DataResourceLocks::acquire(&a.path().join("blocks"), &shared_db).unwrap();
 
         // Daemon B has a *distinct* block store but shares A's DB. Acquisition
         // order is block store (succeeds) then DB (conflicts) — B must fail and
@@ -459,8 +459,7 @@ mod tests {
         let b = tempfile::tempdir().unwrap();
         let b_store = b.path().join("blocks");
         let err = DataResourceLocks::acquire(&b_store, &shared_db)
-            .err()
-            .expect("sharing A's database must make B fail");
+            .expect_err("sharing A's database must make B fail");
         assert!(err.to_string().contains("already in use"), "unexpected error: {err}");
 
         // Rollback check: B's block-store lock was released on failure, so it is

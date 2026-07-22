@@ -11,17 +11,17 @@
 //! `sync-deterministic-testing` "Hydration Under Network Fault Coverage"
 //! requirement's three scenarios):
 //!  1. Placeholders hydrate to the correct content despite faults — no
-//!  data loss, no corruption (Phase A).
+//!     data loss, no corruption (Phase A).
 //!  2. No placeholder is left stuck mid-hydration: after heal + quiesce
-//!  every index row is `Placeholder` or `Hydrated`, never `Hydrating`,
-//!  and `check_structural` finds no live row without a file (Phase A).
+//!     every index row is `Placeholder` or `Hydrated`, never `Hydrating`,
+//!     and `check_structural` finds no live row without a file (Phase A).
 //!  3. A conflicting write that lands while a path's hydration is in
-//!  flight preserves both sides — the losing write becomes a conflict
-//!  copy and the hydrated content is not lost (Phase B). The block
-//!  fetch a conflict resolution must perform to materialize the
-//!  incoming side *is* a hydration, so faulting it exercises exactly
-//!  the "BlockRequest lost during conflict resolution" recovery the
-//!  audit's `dst_two_device_chaos.rs` history documents.
+//!     flight preserves both sides — the losing write becomes a conflict
+//!     copy and the hydrated content is not lost (Phase B). The block
+//!     fetch a conflict resolution must perform to materialize the
+//!     incoming side *is* a hydration, so faulting it exercises exactly
+//!     the "BlockRequest lost during conflict resolution" recovery the
+//!     audit's `dst_two_device_chaos.rs` history documents.
 //!
 //! **Bold note (fault seam):** an earlier design named `dst_support::fault::
 //! FaultingChannel` as the injection seam, but that decorator is a pure
@@ -212,8 +212,7 @@ impl Device {
         let store_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
         let store = Arc::new(FsBlockStore::new(store_dir.path()).map_err(|e| e.to_string())?);
         let state = Arc::new(SyncState::open_in_memory().map_err(|e| e.to_string())?);
-        dst_support::link::link_and_start(&state, &root, GROUP_ID)
-            .map_err(|e| e.to_string())?;
+        dst_support::link::link_and_start(&state, &root, GROUP_ID).map_err(|e| e.to_string())?;
         Ok((
             Self { id: id.to_string(), root, state, store, session: std::sync::OnceLock::new() },
             root_dir,
@@ -251,6 +250,15 @@ fn seed_holder_file(dev: &Device, path: &str, content: &[u8]) -> Result<FileReco
     dev.state
         .set_materialization_state(GROUP_ID, path, MaterializationState::Hydrated)
         .map_err(|e| e.to_string())?;
+    // The real local-write path (`local_change.rs`) always records group
+    // block provenance alongside a local commit; `handle_block_request`'s
+    // serving-authorization gate refuses any block without it. Seeding the
+    // index/store directly here bypasses that pipeline, so without this
+    // call the holder would refuse the peer's own block request as
+    // not_found on every attempt, deterministically failing hydration
+    // regardless of seed or fault profile.
+    let block_hashes: Vec<_> = record.blocks.iter().map(|b| b.hash.clone()).collect();
+    dev.state.record_group_block_provenance(GROUP_ID, &block_hashes).map_err(|e| e.to_string())?;
     let full = dev.root.join(path);
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -914,11 +922,23 @@ fn hydration_under_fault_chaos_scenario() {
         .unwrap_or(DEFAULT_VARIATIONS);
     let base_seed: u64 =
         std::env::var("DST_BASE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0x4879_4400);
+    // A `DST_BASE_SEED`-targeted run is an explicit "reproduce exactly this
+    // seed" request (the assert below's own advertised recipe); silently
+    // advancing to a *different* seed when that one hits an infra skip would
+    // defeat the reproduction, not help it. The bounded-retry widening below
+    // is only for the untargeted sweep/lane1 case. Mirrors
+    // `dst_generated_sweep.rs`'s identical `targeted` handling.
+    let targeted = std::env::var("DST_BASE_SEED").is_ok();
 
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
 
-    let mut skipped = 0u64;
+    // Corpus-replay skips are reported but never gate `exercised >=
+    // variations` below: a corpus entry hitting an infra skip on replay
+    // says nothing about whether the *fresh* sweep below found variations
+    // worth of real coverage, so counting it there would make an
+    // unrelated corpus flake fail (or silently forgive) the sweep gate.
+    let mut corpus_skipped = 0u64;
     let mut failures = Vec::new();
 
     for case in load_corpus_cases() {
@@ -929,21 +949,60 @@ fn hydration_under_fault_chaos_scenario() {
                     || e.starts_with(TIME_LIMIT_MARKER)
                     || e.starts_with(RESOURCE_EXHAUSTION_MARKER) =>
             {
-                skipped += 1
+                // Logged, not silently counted: previously the *reason*
+                // (baseline handshake timeout vs. madsim time limit vs.
+                // resource exhaustion) and the seed were both discarded, so
+                // a CI failure gave no way to tell which of the three infra
+                // conditions actually fired.
+                eprintln!("hydration DST infra skip [corpus replay] seed {}: {e}", case.seed);
+                corpus_skipped += 1
             }
             Err(e) => failures.push(format!("[corpus replay] {e}")),
         }
     }
-    for i in 0..variations {
-        let seed = base_seed.wrapping_add(i);
+
+    // A seed can land on an infra skip (most commonly the startup canary's
+    // known WireGuard-handshake-under-simulated-time livelock) independent
+    // of whether it would otherwise have exercised anything interesting. A
+    // flat `0..variations` loop therefore made this sweep's actual coverage
+    // hostage to how many of exactly `variations` sequential seeds happened
+    // to skip: at `DST_VARIATIONS=1` (lane1's per-scenario smoke budget), a
+    // single unlucky seed meant zero fault-hydration scenarios ever ran and
+    // the sweep failed having tested nothing, on every single run, since
+    // lane1 pins a fixed base seed with no variation. Attempt further seeds
+    // instead until `variations` many are actually exercised (skips don't
+    // count against the target), bounded so a genuinely broken harness
+    // still fails fast rather than retrying forever. Matches
+    // `dst_generated_sweep.rs`'s identical fix for the identical shape of
+    // bug. A `DST_BASE_SEED`-targeted run bounds max_attempts to exactly
+    // `variations` (not 1): the caller asked for `variations` seeds
+    // starting at that exact base, and a skip within that pinned range
+    // must fail the final gate rather than being silently backfilled by a
+    // seed outside the requested range.
+    let max_attempts =
+        if targeted { variations.max(1) } else { variations.saturating_mul(8).max(8) };
+    let mut attempted = 0u64;
+    let mut exercised = 0u64;
+    let mut generated_skipped: HashMap<&'static str, u64> = HashMap::new();
+    while exercised < variations && attempted < max_attempts {
+        let seed = base_seed.wrapping_add(attempted);
+        attempted += 1;
         match run_seed_catching_time_limit(seed) {
-            Ok(()) => {}
+            Ok(()) => exercised += 1,
             Err(e)
                 if e.starts_with(BASELINE_TIMEOUT_MARKER)
                     || e.starts_with(TIME_LIMIT_MARKER)
                     || e.starts_with(RESOURCE_EXHAUSTION_MARKER) =>
             {
-                skipped += 1
+                let kind = if e.starts_with(BASELINE_TIMEOUT_MARKER) {
+                    "baseline_timeout"
+                } else if e.starts_with(TIME_LIMIT_MARKER) {
+                    "time_limit"
+                } else {
+                    "resource_exhaustion"
+                };
+                eprintln!("hydration DST infra skip seed {seed}: {e}");
+                *generated_skipped.entry(kind).or_default() += 1;
             }
             Err(e) => failures.push(e),
         }
@@ -952,11 +1011,17 @@ fn hydration_under_fault_chaos_scenario() {
 
     assert!(
         failures.is_empty(),
-        "{}/{variations} hydration-under-fault variations found a violation (skipped {skipped} on \
-         baseline/time-limit/resource-exhaustion infra conditions):\n{}\n(reproduce one with \
-         DST_BASE_SEED=<seed> DST_VARIATIONS=1)",
+        "{}/{variations} hydration-under-fault variations found a violation (corpus skipped \
+         {corpus_skipped}, generated attempted {attempted} skipped {generated_skipped:?}):\n{}\n\
+         (reproduce one with DST_BASE_SEED=<seed> DST_VARIATIONS=1)",
         failures.len(),
         failures.join("\n---\n")
     );
-    assert!(skipped < variations, "every seed hit an infra skip -- nothing was actually exercised");
+    assert!(
+        exercised >= variations,
+        "could not exercise the requested {variations} seed(s): only {exercised} landed after \
+         {attempted} attempt(s) (skips: {generated_skipped:?}) -- an infra skip (baseline \
+         handshake timeout, madsim time limit, resource exhaustion) consumed the rest of the \
+         attempt budget without a corresponding correctness signal"
+    );
 }

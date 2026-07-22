@@ -22,8 +22,8 @@ use yadorilink_sync_core::block_liveness::{
 use yadorilink_sync_core::change::{ChangeAuth, PolicyUnavailable, VersionBlock, VersionHash};
 use yadorilink_sync_core::custody::{CustodyStamp, FullReplicaCustody};
 use yadorilink_sync_core::index::{
-    DurabilityRoot, DurabilityRoots, HandoffLeaseState, RoleLossAction, RoleLossOperationState,
-    SyncState,
+    DurabilityRoot, DurabilityRoots, HandoffLeaseState, RoleLossAction, RoleLossOperationParams,
+    RoleLossOperationState, SyncState,
 };
 use yadorilink_sync_core::peer_session::{
     BlockWriteActivityProvider, HandoffLeaseResponder, HandoffTicketResponder,
@@ -426,9 +426,7 @@ impl CustodyConfirmer for P2pCustodyConfirmer {
         version_hash: &VersionHash,
         blocks: &[VersionBlock],
     ) -> Option<CustodyStamp> {
-        let Some(state) = self.state.upgrade() else {
-            return None;
-        };
+        let state = self.state.upgrade()?;
         let group_id = group_id.to_string();
         let path = path.to_string();
         let version_hash = *version_hash;
@@ -1495,9 +1493,13 @@ impl DaemonState {
 
     /// Records this device's Ed25519 change-history signing key. The real
     /// daemon binary calls this once at startup when the device is
-    /// registered; a `DaemonState` built without it (every test that goes
-    /// through `new` without wiring one) leaves change-history emission off,
-    /// so behavior is byte-identical to before change history existed.
+    /// registered. A registered (non-empty `device_id`) `DaemonState` built
+    /// without one is a fail-closed condition, not a legitimate no-emitter
+    /// path — see `link_manager::ensure_initial_change_history`'s own doc
+    /// comment for why: local edits would be indexed but never recorded as
+    /// DAG changes, which is silent data loss from the group's perspective.
+    /// Only a genuinely unregistered device (empty `device_id`) tolerates
+    /// this being unset.
     pub fn set_device_signing_key(&self, signing_key: ed25519_dalek::SigningKey) {
         *self.device_signing_key.lock().unwrap_or_else(|p| p.into_inner()) = Some(signing_key);
     }
@@ -1964,12 +1966,14 @@ impl DaemonState {
             .insert_role_loss_operation(
                 &operation_id,
                 group_id,
-                &self.device_id,
-                target_device_id,
-                Some(lease_id),
-                action,
-                Some(local_path),
-                now_unix(),
+                RoleLossOperationParams {
+                    source_device_id: &self.device_id,
+                    target_device_id,
+                    lease_id: Some(lease_id),
+                    action,
+                    local_path: Some(local_path),
+                    now_unix: now_unix(),
+                },
             )
             .map(|()| operation_id)
             .map_err(|e| {
@@ -1991,11 +1995,11 @@ impl DaemonState {
     /// called immediately after the coordination-worker role-loss commit
     /// succeeds, so a crash from this point on is reconciled by the startup
     /// + periodic sweep (`run_role_loss_reconciliation_sweep`) instead of
-    /// left as a split state. Best-effort: even if this write itself fails
-    /// (row stays `Prepared`), the sweep treats a `Prepared` row the same as
-    /// `WorkerCommitted` at reconciliation time — see
-    /// [`yadorilink_sync_core::index::RoleLossOperationState::Prepared`]'s
-    /// doc comment for why that's safe.
+    ///   left as a split state. Best-effort: even if this write itself fails
+    ///   (row stays `Prepared`), the sweep treats a `Prepared` row the same as
+    ///   `WorkerCommitted` at reconciliation time — see
+    ///   [`yadorilink_sync_core::index::RoleLossOperationState::Prepared`]'s
+    ///   doc comment for why that's safe.
     pub fn mark_role_loss_worker_committed(&self, operation_id: &str, membership_generation: i64) {
         if let Err(e) = self.sync_state.mark_role_loss_worker_committed(
             operation_id,
@@ -3850,8 +3854,13 @@ mod tests {
             group,
             &record,
             "device-a",
-            vec![Op::Create { path: SyncPath("note.txt".into()), version: version.version_hash }],
-            &[version],
+            yadorilink_sync_core::index::ChangeContent {
+                ops: vec![Op::Create {
+                    path: SyncPath("note.txt".into()),
+                    version: version.version_hash,
+                }],
+                versions: &[version],
+            },
             None,
             &emitter,
         );

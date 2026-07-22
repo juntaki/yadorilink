@@ -96,11 +96,15 @@ struct ChannelEntry {
     candidate_ips: HashSet<IpAddr>,
 }
 
+/// A raw inbound datagram handed to whoever is currently registered to
+/// receive STUN replies (`(payload, sender address)`).
+type StunDatagram = (Vec<u8>, SocketAddr);
+
 /// The demux routing table, shared between [`TransportHub`] and its receive
 /// loop.
 struct DemuxRegistry {
     channels: Mutex<HashMap<u32, ChannelEntry>>,
-    stun_tx: Mutex<Option<mpsc::Sender<(Vec<u8>, SocketAddr)>>>,
+    stun_tx: Mutex<Option<mpsc::Sender<StunDatagram>>>,
     /// Transaction ids of binding requests sent but not yet answered (bounded
     /// ring; a response with an unknown id is dropped).
     stun_pending: Mutex<VecDeque<[u8; 12]>>,
@@ -264,6 +268,41 @@ impl UdpEndpoint {
     }
 }
 
+/// Widens a UDP socket's kernel receive/send buffers well past the OS
+/// default, which is far too small for this application's actual traffic
+/// pattern: a single large sync-engine block (default 128 KiB) fragments
+/// into ~110 datagrams that this device's actor loop enqueues in one burst
+/// (`handle_outbound_batch`), and on the receiving side must all land in the
+/// kernel's per-socket receive queue before user space drains any of them.
+/// Confirmed as the actual root cause of a 100%-reproducing transport test
+/// failure on Linux (never on macOS): Linux's default UDP receive buffer
+/// (`net.core.rmem_default`, 208 KiB on a stock kernel) is smaller than one
+/// burst's real kernel-accounted footprint (raw payload plus per-datagram
+/// `sk_buff` overhead), so datagrams beyond the buffer's capacity are
+/// silently dropped by the kernel before this process ever sees them --
+/// deterministically, not as transient loss -- while macOS's much larger
+/// default (`net.inet.udp.recvspace`, ~768 KiB) happens to comfortably
+/// absorb the same burst. Reliable delivery retransmits the *whole* message
+/// (not just the missing fragment) on timeout, so this repeats identically
+/// on every retry: no timeout or retry budget fixes a genuine kernel-level
+/// drop. 4 MiB comfortably covers several concurrent large-block transfers
+/// on the one shared socket every channel funnels through, with real
+/// margin above a single burst. Best-effort: some sandboxed environments
+/// refuse to raise a socket's buffer past a lower administrative cap, which
+/// is not fatal (the OS default is merely a worse starting point for the
+/// same traffic, not a hard failure), so a rejection is only logged.
+#[cfg(not(madsim))]
+fn widen_socket_buffers(socket: &UdpSocket) {
+    const BUFFER_SIZE: usize = 4 * 1024 * 1024;
+    let sock_ref = socket2::SockRef::from(socket);
+    if let Err(e) = sock_ref.set_recv_buffer_size(BUFFER_SIZE) {
+        tracing::debug!(error = %e, "failed to widen UDP socket receive buffer");
+    }
+    if let Err(e) = sock_ref.set_send_buffer_size(BUFFER_SIZE) {
+        tracing::debug!(error = %e, "failed to widen UDP socket send buffer");
+    }
+}
+
 /// Binds a v6-only UDP socket on `port` (the same port the v4 half holds). The
 /// `only_v6` flag is essential: without it the OS default (dual-stack on Linux)
 /// would also claim v4 on `port` and collide with the separate v4 socket.
@@ -276,7 +315,9 @@ fn bind_v6_only(port: u16) -> io::Result<UdpSocket> {
     sock.set_only_v6(true)?;
     sock.set_nonblocking(true)?;
     sock.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
-    UdpSocket::from_std(sock.into())
+    let socket = UdpSocket::from_std(sock.into())?;
+    widen_socket_buffers(&socket);
+    Ok(socket)
 }
 
 /// The single per-device transport endpoint. Cloneable-by-`Arc`; every peer
@@ -310,7 +351,10 @@ impl TransportHub {
     /// MAC1 initiation gate; `None` degrades the gate to offering initiations
     /// to every authorized channel.
     pub async fn bind(addr: SocketAddr, device_public: Option<PublicKey>) -> io::Result<Arc<Self>> {
-        let primary = Arc::new(UdpSocket::bind(addr).await?);
+        let primary = UdpSocket::bind(addr).await?;
+        #[cfg(not(madsim))]
+        widen_socket_buffers(&primary);
+        let primary = Arc::new(primary);
         let local_addr = primary.local_addr()?;
         let (v4, v6) = if addr.is_ipv4() {
             #[cfg(not(madsim))]
@@ -330,9 +374,15 @@ impl TransportHub {
     }
 
     /// Adopts an already-bound socket (the deterministic-simulation harness
-    /// pre-binds one per device) as the endpoint's single half and starts its
-    /// receive loop.
+    /// pre-binds one per device, as do most integration tests) as the
+    /// endpoint's single half and starts its receive loop. Widens the
+    /// adopted socket's kernel buffers the same way `bind`'s own sockets
+    /// are (see `widen_socket_buffers`'s doc comment) -- skipped under
+    /// simulation, where the shimmed socket has no real kernel buffer to
+    /// widen.
     pub fn from_socket(socket: UdpSocket, device_public: Option<PublicKey>) -> Arc<Self> {
+        #[cfg(not(madsim))]
+        widen_socket_buffers(&socket);
         let local_addr =
             socket.local_addr().unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
         let socket = Arc::new(socket);
@@ -643,11 +693,8 @@ mod tests {
         assert!(hub.endpoint.v4.is_some());
         // The v6 half is present whenever the host could bind it on the same
         // port; when it is, it shares the v4 half's port.
-        if hub.endpoint.v6.is_some() {
-            assert_eq!(
-                hub.endpoint.v6.as_ref().unwrap().local_addr().unwrap().port(),
-                hub.local_port()
-            );
+        if let Some(v6) = hub.endpoint.v6.as_ref() {
+            assert_eq!(v6.local_addr().unwrap().port(), hub.local_port());
         }
     }
 

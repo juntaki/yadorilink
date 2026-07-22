@@ -209,7 +209,14 @@ impl SingleInstance {
         use std::os::unix::net::{UnixListener, UnixStream};
 
         let lock_path = path.with_extension("lock");
-        let lock_file = match std::fs::OpenOptions::new().create(true).write(true).open(&lock_path)
+        // `truncate(false)` is explicit, not incidental: this is a lock
+        // file, never a content file, so an existing file's bytes (if any)
+        // are irrelevant and must not be discarded just by opening it.
+        let lock_file = match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
         {
             Ok(f) => f,
             Err(_) => return Acquire::Unavailable,
