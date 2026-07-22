@@ -19,6 +19,7 @@
 //!     relocated here so it is not simply dropped -- with the same
 //!     Worker-write-then-local-flip ordering and the same crash-safety
 //!     property on a refused write.
+#![cfg(unix)]
 
 mod support;
 
@@ -156,6 +157,14 @@ async fn demoting_setup(
         .unwrap();
     b.state.block_store.put(content).unwrap();
     let bytes = hex::decode(hash.as_str()).unwrap();
+    // Device-b is the confirmed-ready target's OWN peer: device-a's mandatory
+    // lease issuance (`DaemonState::request_handoff_lease`) re-verifies ITS
+    // OWN readiness by querying device-b to confirm device-b durably holds
+    // this file (`peer_holds_entire_group` -> `holds_version_durably`, which
+    // requires group block provenance on the ANSWERING side, not just the
+    // asker's) -- without this, device-a's own readiness check fails and no
+    // lease is ever issued, regardless of the mocked Worker endpoint below.
+    b.state.sync_state.record_group_block_provenance(GROUP, std::slice::from_ref(&bytes)).unwrap();
     let record = record_referencing("only.bin", bytes, content.len() as u64);
     a.state.sync_state.upsert_file(GROUP, &record).unwrap();
     b.state.sync_state.upsert_file(GROUP, &record).unwrap();

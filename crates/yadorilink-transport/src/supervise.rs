@@ -133,6 +133,28 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
+    /// Polls for `attempts` to reach `target` instead of sleeping a fixed
+    /// duration and then asserting a threshold. A fixed sleep + count
+    /// assertion assumes the host scheduler gives this task's ~1-5ms backoff
+    /// loop enough real wall-clock progress within that fixed window; under
+    /// heavy concurrent CPU load (many parallel builds/tests contending for
+    /// cores) that assumption can be false even though the supervised task's
+    /// actual restart behavior is correct — this waits (bounded by a
+    /// generous `timeout`) for the real condition instead, so the test still
+    /// fails (via the caller's own assertion) on a genuine regression where
+    /// restarts stop happening, but tolerates transient scheduling delays
+    /// rather than racing a fixed clock. Mirrors
+    /// `yadorilink_daemon::supervise`'s own `wait_for_attempts`.
+    async fn wait_for_attempts(attempts: &AtomicU32, target: u32, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while attempts.load(Ordering::SeqCst) < target {
+            if tokio::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     #[tokio::test]
     async fn spawn_restarting_retries_after_a_returning_task() {
         let attempts = Arc::new(AtomicU32::new(0));
@@ -146,11 +168,11 @@ mod tests {
             }
         });
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_for_attempts(&attempts, 3, Duration::from_secs(10)).await;
         handle.abort();
         assert!(
             attempts.load(Ordering::SeqCst) >= 3,
-            "expected several restarts within 50ms of ~1-5ms backoff"
+            "expected several restarts of ~1-5ms backoff within 10s of polling"
         );
     }
 
@@ -170,11 +192,11 @@ mod tests {
             }
         });
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_for_attempts(&attempts, 3, Duration::from_secs(10)).await;
         handle.abort();
         assert!(
             attempts.load(Ordering::SeqCst) >= 3,
-            "expected retries past the panicking attempts"
+            "expected retries past the panicking attempts within 10s of polling"
         );
     }
 

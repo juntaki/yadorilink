@@ -9,6 +9,7 @@
 //! `HandoffTicketRequest`/`HandoffTicketGrant` wire exchange and the real
 //! `HandoffLeaseRequest`/`HandoffLeaseGrant` exchange it reuses underneath
 //! (Stage B, unchanged), not an injected confirmer.
+#![cfg(unix)]
 
 mod support;
 

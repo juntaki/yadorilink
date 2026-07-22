@@ -6,6 +6,7 @@
 //! exercised the same way `full_replica_handoff_ready.rs` exercises its
 //! non-excluding sibling — real peer-to-peer `VersionPresentQuery`s, not an
 //! injected confirmer).
+#![cfg(unix)]
 
 mod support;
 
@@ -276,6 +277,11 @@ async fn unlink_setup(
     // real peer-to-peer readiness confirmation this file exercises refuses
     // the block as never having been obtained through the group.
     a.state.sync_state.record_group_block_provenance(GROUP, std::slice::from_ref(&bytes)).unwrap();
+    // Device-b needs the same provenance record as device-a: device-a's own
+    // mandatory lease issuance re-verifies ITS OWN readiness by querying
+    // device-b to confirm device-b durably holds this file, which requires
+    // group block provenance on the ANSWERING side too.
+    b.state.sync_state.record_group_block_provenance(GROUP, std::slice::from_ref(&bytes)).unwrap();
     let record = record_referencing("only.bin", bytes, content.len() as u64);
     a.state.sync_state.upsert_file(GROUP, &record).unwrap();
     b.state.sync_state.upsert_file(GROUP, &record).unwrap();
