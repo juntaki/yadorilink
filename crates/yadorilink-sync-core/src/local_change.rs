@@ -4576,6 +4576,8 @@ mod tests {
         chain
     }
 
+    // Only called by the #[cfg(unix)] symlink/exec-bit atomicity tests below.
+    #[cfg(unix)]
     fn version_hash_for_path(
         change: &crate::change::Change,
         path: &str,
