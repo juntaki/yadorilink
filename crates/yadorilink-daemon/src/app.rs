@@ -96,10 +96,17 @@ impl DaemonInstanceLock {
         }
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(Self { _file: file }),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => anyhow::bail!(
-                "another YadoriLink daemon is already running for {}",
-                config_dir.display()
-            ),
+            // Compared by raw OS error, not ErrorKind: see resource_lock.rs's
+            // take_exclusive_lock doc comment for why ErrorKind::WouldBlock
+            // does not reliably match Windows' real contention error.
+            Err(error)
+                if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+            {
+                anyhow::bail!(
+                    "another YadoriLink daemon is already running for {}",
+                    config_dir.display()
+                )
+            }
             Err(error) => Err(anyhow::anyhow!(
                 "failed to acquire daemon instance lock {}: {error}",
                 lock_path.display()
