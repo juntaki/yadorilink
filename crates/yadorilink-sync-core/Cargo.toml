@@ -59,7 +59,7 @@ tracing-subscriber.workspace = true
 # (`tests/dst_runbook_freshness_lint.rs`) parse `impact_map.toml` / the cargo
 # aliases as TOML. Both are plain (non-madsim) tests so the guards run on
 # every `cargo test`; `toml` is only needed by those test binaries.
-toml = "0.8"
+toml = "0.9"
 
 # `tokio` is swapped for `madsim`'s
 # tokio-compatible shim only when the deterministic-simulation test
