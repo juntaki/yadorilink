@@ -31,9 +31,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use yadorilink_filesystem_sync::watcher::{FolderWatchSource, RealFolderWatchSource};
 #[cfg(test)]
 use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
-use yadorilink_filesystem_sync::watcher::{FolderWatchSource, RealFolderWatchSource};
 
 use crate::daemon_state::DaemonState;
 use crate::error::DaemonError;
@@ -396,12 +396,11 @@ impl LinkRuntimeController {
         let state = &self.state;
         let link = state
             .replica_coordinator
-            .link_repository().list_links()?
+            .link_repository()
+            .list_links()?
             .into_iter()
             .find(|l| l.local_path == local_path)
-            .ok_or_else(|| {
-                crate::sync_error::SyncError::NotFound(format!("link {local_path}"))
-            })?;
+            .ok_or_else(|| crate::sync_error::SyncError::NotFound(format!("link {local_path}")))?;
         if link.orphaned {
             return Err(crate::sync_error::SyncError::InvalidInput(format!(
                 "cannot resume orphaned link {local_path}: its coordination-side authorization is gone"
@@ -411,8 +410,10 @@ impl LinkRuntimeController {
         state.replica_coordinator.link_repository().set_paused(local_path, false)?;
         let group_id = link.group_id;
         match state.replica_coordinator.link_repository().link_gate_for_group(&group_id)? {
-            yadorilink_replica_domain::session_state::LinkGate::Live { local_path: live_path, .. }
-                if live_path == local_path => {}
+            yadorilink_replica_domain::session_state::LinkGate::Live {
+                local_path: live_path,
+                ..
+            } if live_path == local_path => {}
             _ => {
                 return Err(crate::sync_error::SyncError::InvalidInput(format!(
                     "cannot resume {local_path}: it is not the group's single live link"
@@ -598,8 +599,8 @@ impl LinkRuntimeController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yadorilink_local_storage::FsBlockStore;
     use crate::replica_coordinator::ReplicaCoordinator;
+    use yadorilink_local_storage::FsBlockStore;
 
     fn test_state() -> Arc<DaemonState> {
         let store_dir = tempfile::tempdir().unwrap();
@@ -718,7 +719,8 @@ mod tests {
         state.replica_coordinator.link_repository().add_link(&local_path, "g").unwrap();
         state
             .replica_coordinator
-            .link_repository().set_materialization_policy(
+            .link_repository()
+            .set_materialization_policy(
                 &local_path,
                 yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand,
             )
@@ -777,16 +779,21 @@ mod tests {
             record.size = size;
             state
                 .replica_coordinator
-                .file_index_repository().upsert_file_with_origin("group-1", &record, "device-a", &permit)
+                .file_index_repository()
+                .upsert_file_with_origin("group-1", &record, "device-a", &permit)
                 .unwrap();
         }
 
-        assert_eq!(state.replica_coordinator.sqlite().dag_list_versions("group-1", "a.jpg").unwrap().len(), 13);
+        assert_eq!(
+            state.replica_coordinator.sqlite().dag_list_versions("group-1", "a.jpg").unwrap().len(),
+            13
+        );
 
         let controller = LinkRuntimeController::new(state.clone());
         controller.run_retention_expiry_sweep();
 
-        let remaining = state.replica_coordinator.sqlite().dag_list_versions("group-1", "a.jpg").unwrap();
+        let remaining =
+            state.replica_coordinator.sqlite().dag_list_versions("group-1", "a.jpg").unwrap();
         assert_eq!(
             remaining.len(),
             11,
@@ -804,9 +811,16 @@ mod tests {
         controller.run_retention_expiry_sweep(); // no links registered at all
         state.replica_coordinator.link_repository().add_link("/tmp/photos", "group-1").unwrap();
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-        state.replica_coordinator.file_index_repository().upsert_file("group-1", &sample_record("a.jpg"), &permit).unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file("group-1", &sample_record("a.jpg"), &permit)
+            .unwrap();
         controller.run_retention_expiry_sweep(); // one link, only a current version
-        assert_eq!(state.replica_coordinator.sqlite().dag_list_versions("group-1", "a.jpg").unwrap().len(), 1);
+        assert_eq!(
+            state.replica_coordinator.sqlite().dag_list_versions("group-1", "a.jpg").unwrap().len(),
+            1
+        );
     }
 
     // --- The two-live-roots recovery, at the daemon seam ---------------------
@@ -855,7 +869,11 @@ mod tests {
         let group = "group-1";
         std::fs::write(root.path().join("in-a.txt"), b"aaa").unwrap();
 
-        state.replica_coordinator.link_repository().add_link(&root.path().to_string_lossy(), group).unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link(&root.path().to_string_lossy(), group)
+            .unwrap();
         // Unlike the other tests sharing `test_state()`, this one pre-seeds
         // the index with rows (below) before the watch starts, so
         // `ensure_initial_change_history` has real DAG history to establish
@@ -869,9 +887,9 @@ mod tests {
         // (7D-10.9 removed `DaemonState.replica_coordinator`) -- `DaemonState::new`'s
         // real provider would otherwise withhold exactly as the comment
         // above describes.
-        state.replica_coordinator.set_local_change_auth_provider(std::sync::Arc::new(|_group_id| {
-            Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER)
-        }));
+        state.replica_coordinator.set_local_change_auth_provider(std::sync::Arc::new(
+            |_group_id| Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER),
+        ));
         // The survivor's own file, indexed and present: that is what corroborates
         // the root, so the root-identity check adopts rather than refusing it as
         // a possible bare mountpoint. Without it this test would never reach the
@@ -881,7 +899,8 @@ mod tests {
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         state
             .replica_coordinator
-            .file_index_repository().upsert_file(group, &record_matching_disk_content("in-a.txt", b"aaa"), &permit)
+            .file_index_repository()
+            .upsert_file(group, &record_matching_disk_content("in-a.txt", b"aaa"), &permit)
             .unwrap();
         yadorilink_root_authority::root_identity::VerifiedRoot::open(
             root.path(),
@@ -899,7 +918,8 @@ mod tests {
         // (the whole point: it only ever existed on the departed root).
         state
             .replica_coordinator
-            .file_index_repository().upsert_file(group, &record_matching_disk_content("only-in-b.txt", b"bbb"), &permit)
+            .file_index_repository()
+            .upsert_file(group, &record_matching_disk_content("only-in-b.txt", b"bbb"), &permit)
             .unwrap();
 
         // Exactly what the unlink handler's recovery arms on the survivor:
@@ -907,18 +927,31 @@ mod tests {
         // reappear before `duplicate_recovery_pending` will call it resolved
         // (see `control_socket::unlink`'s own pairing of these two calls).
         state.replica_coordinator.link_repository().arm_duplicate_recovery_paths(group).unwrap();
-        state.replica_coordinator.link_repository().set_suppress_tombstones(&root.path().to_string_lossy(), true).unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .set_suppress_tombstones(&root.path().to_string_lossy(), true)
+            .unwrap();
 
         start_watch_and_await_scan(&state, root.path(), group).await;
 
-        let departed = state.replica_coordinator.file_index_repository().get_file(group, "only-in-b.txt").unwrap().unwrap();
+        let departed = state
+            .replica_coordinator
+            .file_index_repository()
+            .get_file(group, "only-in-b.txt")
+            .unwrap()
+            .unwrap();
         assert!(
             !departed.deleted,
             "the survivor's first scan after a two-live-roots recovery must delete nothing -- \
              this path can still hydrate from a peer that holds it"
         );
         assert!(
-            state.replica_coordinator.link_repository().suppress_tombstones_for_group(group).unwrap(),
+            state
+                .replica_coordinator
+                .link_repository()
+                .suppress_tombstones_for_group(group)
+                .unwrap(),
             "the gate must remain armed while a live indexed row is still absent from disk"
         );
     }
@@ -933,13 +966,25 @@ mod tests {
         let group = "group-1";
         std::fs::write(root.path().join("in-a.txt"), b"aaa").unwrap();
 
-        state.replica_coordinator.link_repository().add_link(&root.path().to_string_lossy(), group).unwrap();
-        state.replica_coordinator.link_repository().set_suppress_tombstones(&root.path().to_string_lossy(), true).unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link(&root.path().to_string_lossy(), group)
+            .unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .set_suppress_tombstones(&root.path().to_string_lossy(), true)
+            .unwrap();
 
         start_watch_and_await_scan(&state, root.path(), group).await;
 
         assert!(
-            !state.replica_coordinator.link_repository().suppress_tombstones_for_group(group).unwrap(),
+            !state
+                .replica_coordinator
+                .link_repository()
+                .suppress_tombstones_for_group(group)
+                .unwrap(),
             "one clean full scan must close the additive window, or ordinary delete propagation \
              is broken for this link forever"
         );
@@ -958,7 +1003,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let group = "group-1";
         std::fs::write(root.path().join("in-a.txt"), b"aaa").unwrap();
-        state.replica_coordinator.link_repository().add_link(&root.path().to_string_lossy(), group).unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link(&root.path().to_string_lossy(), group)
+            .unwrap();
 
         start_watch_and_await_scan(&state, root.path(), group).await;
 
@@ -969,8 +1018,10 @@ mod tests {
         let controller = LinkRuntimeController::new(state.clone());
         controller.stop(&root.path().to_string_lossy()).await;
 
-        let _reacquired = yadorilink_root_authority::sync_root_lock::SyncRootLock::acquire(root.path())
-            .expect("stopping the watch must release the sync-root lock so it can be re-acquired");
+        let _reacquired = yadorilink_root_authority::sync_root_lock::SyncRootLock::acquire(
+            root.path(),
+        )
+        .expect("stopping the watch must release the sync-root lock so it can be re-acquired");
     }
 
     /// HIGH-1 concurrent-stop regression: the control socket spawns one
@@ -1034,12 +1085,21 @@ mod tests {
         let root_b = tempfile::tempdir().unwrap();
         let root_c = tempfile::tempdir().unwrap();
 
-        state.replica_coordinator.link_repository().add_link(&root_a.path().to_string_lossy(), "group-1").unwrap();
         state
             .replica_coordinator
-            .link_repository().force_second_live_link_for_test(&root_b.path().to_string_lossy(), "group-1")
+            .link_repository()
+            .add_link(&root_a.path().to_string_lossy(), "group-1")
             .unwrap();
-        state.replica_coordinator.link_repository().add_link(&root_c.path().to_string_lossy(), "group-2").unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .force_second_live_link_for_test(&root_b.path().to_string_lossy(), "group-1")
+            .unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link(&root_c.path().to_string_lossy(), "group-2")
+            .unwrap();
 
         let controller = LinkRuntimeController::new(state.clone());
         let err = controller

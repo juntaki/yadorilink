@@ -9,11 +9,11 @@
 use std::sync::Arc;
 
 use yadorilink_daemon::daemon_state::DaemonState;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::StatusRequest;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
@@ -35,11 +35,9 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
         yadorilink_daemon::control_context::ControlContext::from_state(state.clone()),
     );
     tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
-            &serve_path,
-            serve_context,
-        )
-            .await;
+        let _ =
+            yadorilink_daemon::control_socket::unix_transport::serve(&serve_path, serve_context)
+                .await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     (dir, state)
@@ -126,7 +124,11 @@ async fn status_reports_free_space_state_from_local_storage_classification() {
     let (dir, state) = start_daemon().await;
     let folder = dir.path().join("shared");
     std::fs::create_dir_all(&folder).unwrap();
-    state.replica_coordinator.link_repository().add_link(&folder.to_string_lossy(), "group-1").unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&folder.to_string_lossy(), "group-1")
+        .unwrap();
 
     state.governance_config.set_headroom_override_bytes(Some(u64::MAX / 2)).unwrap();
 

@@ -25,10 +25,10 @@
 
 use std::path::Path;
 
-use yadorilink_local_storage::BlockStore;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_filesystem_sync::stale_temp_files::cleanup_stale_temp_files;
 use yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations;
+use yadorilink_filesystem_sync::stale_temp_files::cleanup_stale_temp_files;
+use yadorilink_local_storage::BlockStore;
 
 use super::oracle::{Violation, ViolationKind};
 
@@ -91,8 +91,8 @@ mod tests {
     use super::super::oracle::GlobalOracle;
     use super::*;
     use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_replica_domain::session_state::MaterializationState;
     use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
+    use yadorilink_replica_domain::session_state::MaterializationState;
 
     const GROUP_ID: &str = "sweep-test-group";
 
@@ -123,8 +123,12 @@ mod tests {
         // against the index. That is not a bug in root-identity: it is this
         // fixture skipping the boot-time adoption a running install already
         // completed before any crash could interrupt a materialize.
-        yadorilink_root_authority::root_identity::VerifiedRoot::readopt(root.path(), GROUP_ID, &state)
-            .unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::readopt(
+            root.path(),
+            GROUP_ID,
+            &state,
+        )
+        .unwrap();
         let content = b"pre-crash acknowledged content".repeat(8);
         let hash_hex = store.put(&content).unwrap();
         let record = FileRecord {

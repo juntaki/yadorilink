@@ -101,7 +101,11 @@ pub fn resolve_materialization_state(
     absolute_path: &str,
 ) -> Option<yadorilink_replica_domain::session_state::MaterializationState> {
     let (group_id, rel_path) = resolve_group_and_rel_path(sync_state, absolute_path)?;
-    sync_state.materialization_state_repository().get_materialization_state(&group_id, &rel_path).ok().flatten()
+    sync_state
+        .materialization_state_repository()
+        .get_materialization_state(&group_id, &rel_path)
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]
@@ -137,7 +141,8 @@ mod tests {
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         state
             .replica_coordinator
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "vacation.jpg".into(),
@@ -170,7 +175,8 @@ mod tests {
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         state
             .replica_coordinator
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "shared (conflicted copy, 2026-01-01-000000, device-b).txt".into(),
@@ -204,7 +210,10 @@ mod tests {
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
         let sync_state =
             Arc::new(crate::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap());
-        sync_state.link_repository().add_link(&parent.path().to_string_lossy(), "parent-group").unwrap();
+        sync_state
+            .link_repository()
+            .add_link(&parent.path().to_string_lossy(), "parent-group")
+            .unwrap();
         sync_state.link_repository().add_link(&child.to_string_lossy(), "child-group").unwrap();
         let state = DaemonState::new("device-a".into(), sync_state, store);
 
@@ -221,7 +230,8 @@ mod tests {
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         state
             .replica_coordinator
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "vacation.jpg".into(),
@@ -233,7 +243,11 @@ mod tests {
                 &permit,
             )
             .unwrap();
-        state.replica_coordinator.link_repository().mark_link_orphaned("/home/alice/Photos").unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .mark_link_orphaned("/home/alice/Photos")
+            .unwrap();
 
         assert_eq!(
             resolve_status(&state.replica_coordinator, "/home/alice/Photos/vacation.jpg"),
@@ -241,8 +255,11 @@ mod tests {
             "an orphaned link's files must not report a live sync status"
         );
         assert!(
-            resolve_group_and_rel_path(&state.replica_coordinator, "/home/alice/Photos/vacation.jpg")
-                .is_none(),
+            resolve_group_and_rel_path(
+                &state.replica_coordinator,
+                "/home/alice/Photos/vacation.jpg"
+            )
+            .is_none(),
             "an orphaned link must not resolve for the shell-IPC hydrate/pin/unpin/evict path \
              either"
         );

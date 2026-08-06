@@ -14,6 +14,7 @@ mod unix_socket_tests {
 
     use tokio::net::UnixStream;
     use yadorilink_daemon::daemon_state::DaemonState;
+    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
     use yadorilink_ipc_proto::framing::{read_message, write_message};
     use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
     use yadorilink_ipc_proto::shellipc::{
@@ -22,15 +23,16 @@ mod unix_socket_tests {
         SyncState as ShellSyncState,
     };
     use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
     use yadorilink_replica_domain::file::FileRecord;
 
     async fn start_daemon() -> (std::path::PathBuf, Arc<DaemonState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
-        let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
+        let sync_state =
+            Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
         sync_state
-            .link_repository().add_link(dir.path().join("photos").to_string_lossy().as_ref(), "group-1")
+            .link_repository()
+            .add_link(dir.path().join("photos").to_string_lossy().as_ref(), "group-1")
             .unwrap();
         std::fs::create_dir_all(dir.path().join("photos")).unwrap();
 
@@ -52,7 +54,8 @@ mod unix_socket_tests {
         let (socket_path, state, dir) = start_daemon().await;
         state
             .replica_coordinator
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "vacation.jpg".into(),
@@ -161,7 +164,8 @@ mod unix_socket_tests {
         let (socket_path, state, dir) = start_daemon().await;
         state
             .replica_coordinator
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "vacation.jpg".into(),
@@ -193,7 +197,11 @@ mod unix_socket_tests {
             panic!("expected a ContextActionResponse")
         };
         assert!(r.ok);
-        assert!(state.replica_coordinator.file_index_repository().is_pinned("group-1", "vacation.jpg").unwrap());
+        assert!(state
+            .replica_coordinator
+            .file_index_repository()
+            .is_pinned("group-1", "vacation.jpg")
+            .unwrap());
     }
 
     /// Evicting an unpinned, hydrated file via the shell extension's
@@ -248,7 +256,8 @@ mod unix_socket_tests {
         };
         state
             .replica_coordinator
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "notes.txt".into(),
@@ -285,7 +294,11 @@ mod unix_socket_tests {
         };
         assert!(r.ok);
         assert_eq!(
-            state.replica_coordinator.materialization_state_repository().get_materialization_state("group-1", "notes.txt").unwrap(),
+            state
+                .replica_coordinator
+                .materialization_state_repository()
+                .get_materialization_state("group-1", "notes.txt")
+                .unwrap(),
             Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
         );
         assert_ne!(std::fs::read(dir.path().join("photos/notes.txt")).unwrap(), content);
@@ -313,7 +326,8 @@ mod unix_socket_tests {
         let (socket_path, state, dir) = start_daemon().await;
         state
             .replica_coordinator
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "big.zip".into(),
@@ -331,7 +345,8 @@ mod unix_socket_tests {
             .unwrap();
         state
             .replica_coordinator
-            .materialization_state_repository().set_materialization_state(
+            .materialization_state_repository()
+            .set_materialization_state(
                 "group-1",
                 "big.zip",
                 yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
@@ -369,7 +384,8 @@ mod unix_socket_tests {
         let (socket_path, state, dir) = start_daemon().await;
         state
             .replica_coordinator
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "vacation.jpg".into(),
@@ -411,13 +427,13 @@ mod windows_pipe_tests {
 
     use tokio::net::windows::named_pipe::ClientOptions;
     use yadorilink_daemon::daemon_state::DaemonState;
+    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
     use yadorilink_ipc_proto::framing::{read_message, write_message};
     use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
     use yadorilink_ipc_proto::shellipc::{
         HydrateRequest, ShellIpcMessage, SyncState as ShellSyncState,
     };
     use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
     use yadorilink_replica_domain::file::FileRecord;
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -430,7 +446,8 @@ mod windows_pipe_tests {
     async fn start_daemon() -> (String, Arc<DaemonState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
-        let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
+        let sync_state =
+            Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
         sync_state
             .add_link(dir.path().join("photos").to_string_lossy().as_ref(), "group-1")
             .unwrap();

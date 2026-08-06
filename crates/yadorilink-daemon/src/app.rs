@@ -31,9 +31,9 @@ use yadorilink_local_storage::FsBlockStore;
 // pre-built-store seam (see `DaemonConfig::block_store_override` and its use
 // in `run`); production builds only ever construct the concrete
 // `FsBlockStore`, so importing the trait there would be an unused import.
+use crate::replica_coordinator::ReplicaCoordinator;
 #[cfg(madsim)]
 use yadorilink_local_storage::BlockStore;
-use crate::replica_coordinator::ReplicaCoordinator;
 use yadorilink_transport::DeviceKeyPair;
 
 use crate::adapters::runtime::link_runtime_controller::LinkRuntimeController;
@@ -394,16 +394,20 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // `SyncState::open`'s own field construction (same `SyncDatabase::open`
     // + schema-bootstrap sequence), just without the `sync-core`-owned
     // wrapper type.
-    let replica_coordinator = Arc::new(ReplicaCoordinator::open(&sync_db_path).inspect_err(|e| {
-        record_startup_error_best_effort("daemon_startup", "sync-state", e.to_string());
-    })?);
+    let replica_coordinator =
+        Arc::new(ReplicaCoordinator::open(&sync_db_path).inspect_err(|e| {
+            record_startup_error_best_effort("daemon_startup", "sync-state", e.to_string());
+        })?);
 
     // Recover any file left permanently stuck `Hydrating` by a
     // previous crash before anything else runs — see
     // `yadorilink_sync_core::index::SyncState::reset_stale_hydrating_to_placeholder`'s
     // doc comment (verbatim same behavior, now read through
     // `replica_coordinator`).
-    match replica_coordinator.materialization_state_repository().reset_stale_hydrating_to_placeholder() {
+    match replica_coordinator
+        .materialization_state_repository()
+        .reset_stale_hydrating_to_placeholder()
+    {
         Ok(0) => {}
         Ok(n) => tracing::info!(count = n, "reset stale Hydrating rows to Placeholder on startup"),
         Err(e) => tracing::warn!(error = %e, "failed to reset stale Hydrating rows on startup"),
@@ -415,7 +419,10 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // retained at this point), the state safe for both interrupted-eviction disk
     // cases — see `yadorilink_sync_core::index::SyncState::reset_stale_evicting_to_placeholder`'s
     // doc comment.
-    match replica_coordinator.materialization_state_repository().reset_stale_evicting_to_placeholder() {
+    match replica_coordinator
+        .materialization_state_repository()
+        .reset_stale_evicting_to_placeholder()
+    {
         Ok(0) => {}
         Ok(n) => tracing::info!(count = n, "reset stale Evicting rows to Placeholder on startup"),
         Err(e) => tracing::warn!(error = %e, "failed to reset stale Evicting rows on startup"),
@@ -471,7 +478,8 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // after `build` (before any of that later setup) preserves the exact
     // ordering `DaemonState::new` always had -- this is not a behavior
     // change, just the same two steps made explicit and separately owned.
-    let build = DaemonState::build(device_id.clone(), replica_coordinator.clone(), block_store.clone());
+    let build =
+        DaemonState::build(device_id.clone(), replica_coordinator.clone(), block_store.clone());
     crate::maintenance_coordinator::start(&build.state, build.forward_rx);
     let state = build.state;
     // Only the real `yadorilink-daemon`

@@ -34,8 +34,8 @@ use std::collections::{HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 
-use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId};
 use crate::error::ReplicaEngineError;
+use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId};
 
 // --- Store trait surface ----------------------------------------------------
 
@@ -62,7 +62,11 @@ pub trait CompactionDagStore {
     /// wired their prune-proof store must fail closed. Treating an unknown hash
     /// as pruned is unsafe because it may be a legitimate offline-created head
     /// this replica has never observed.
-    fn was_pruned(&self, _group: &FolderGroupId, _change: &ChangeHash) -> Result<bool, ReplicaEngineError> {
+    fn was_pruned(
+        &self,
+        _group: &FolderGroupId,
+        _change: &ChangeHash,
+    ) -> Result<bool, ReplicaEngineError> {
         Ok(false)
     }
 }
@@ -91,10 +95,16 @@ pub trait DeviceFrontierStore {
 
 /// Persistence for checkpoints and atomic prefix deletion.
 pub trait CheckpointStore {
-    fn latest_checkpoint(&self, group: &FolderGroupId) -> Result<Option<Checkpoint>, ReplicaEngineError>;
+    fn latest_checkpoint(
+        &self,
+        group: &FolderGroupId,
+    ) -> Result<Option<Checkpoint>, ReplicaEngineError>;
 
-    fn commit_prune(&self, checkpoint: &Checkpoint, pruned: &[ChangeHash])
-        -> Result<(), ReplicaEngineError>;
+    fn commit_prune(
+        &self,
+        checkpoint: &Checkpoint,
+        pruned: &[ChangeHash],
+    ) -> Result<(), ReplicaEngineError>;
 
     /// The checkpoint hash that immediately preceded this store's own
     /// *current* HistoryBase for `group` — `None` if this store has never
@@ -472,7 +482,11 @@ impl<'a> Reader<'a> {
         Ok(self.take(32)?.try_into().unwrap())
     }
 
-    fn bounded_count(&mut self, min_entry_size: usize, max: usize) -> Result<usize, ReplicaEngineError> {
+    fn bounded_count(
+        &mut self,
+        min_entry_size: usize,
+        max: usize,
+    ) -> Result<usize, ReplicaEngineError> {
         let count = self.u32()? as usize;
         if count > max {
             return Err(decode_err(&format!("count {count} exceeds bound {max}")));

@@ -12,9 +12,9 @@ pub mod control_context;
 pub mod control_socket;
 pub mod convergence;
 pub mod coordination_client;
-pub mod dag_import;
 pub mod daemon_runtime;
 pub mod daemon_state;
+pub mod dag_import;
 pub mod device_config;
 pub mod diagnostics_ipc;
 pub mod durability_service;
@@ -25,9 +25,9 @@ pub mod governance_config;
 pub mod hydration;
 pub mod link_registry;
 pub mod link_runtime;
-pub mod materialization_intent;
 pub(crate) mod maintenance;
 pub mod maintenance_coordinator;
+pub mod materialization_intent;
 pub mod metrics;
 pub mod metrics_config;
 // NAT traversal binds real UDP sockets, resolves DNS, and probes the local
@@ -39,12 +39,12 @@ pub mod nat_traversal;
 pub mod peer_orchestrator;
 pub mod peer_registry;
 pub mod queries;
-pub mod recovery;
-pub mod recovery_snapshot;
 pub mod rebootstrap_handler;
 pub mod recent_errors;
+pub mod recovery;
 pub mod recovery_diagnosis;
 pub mod recovery_evidence;
+pub mod recovery_snapshot;
 /// `ReplicaCoordinator` (Phase 7D-10.2) -- see that module's own doc
 /// comment for what it is and why it is additive alongside `SyncState`,
 /// not a replacement for it, in this sub-phase.

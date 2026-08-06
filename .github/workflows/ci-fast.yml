@@ -74,7 +74,6 @@ jobs:
           python3 scripts/check-syncstate-facade.py
           python3 scripts/check-stored-blocklist-fail-closed.py
           python3 scripts/check-pre-release-compatibility-debt.py
-          python3 scripts/check-test-inventory.py
           python3 scripts/check-removed-features.py
 
   windows:

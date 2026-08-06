@@ -75,11 +75,11 @@ use std::collections::{BTreeSet, HashSet};
 
 use rusqlite::{Connection, OptionalExtension};
 
+use crate::error::SyncSqliteError;
 use yadorilink_replica_domain::change::{Change, ChangePurpose, Op, PutOrigin};
 use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
 use yadorilink_replica_engine::conflict::{change_touches_path, path_head_from_change, PathHead};
 use yadorilink_replica_engine::conflict_authoring as decision;
-use crate::error::SyncSqliteError;
 
 use super::retained_history_integrity;
 
@@ -606,12 +606,12 @@ pub(crate) fn validate_carrier_conflict_copy_ops_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dag_store::{group_heads, init_dag_schema, max_parent_lamport, put_file_version};
+    use ed25519_dalek::SigningKey;
     use yadorilink_replica_domain::change::ChangeAuth;
     use yadorilink_replica_domain::file::FileMeta;
-    use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
-    use crate::dag_store::{group_heads, init_dag_schema, max_parent_lamport, put_file_version};
     use yadorilink_replica_domain::file::RecordKind;
-    use ed25519_dalek::SigningKey;
+    use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
 
     fn conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();

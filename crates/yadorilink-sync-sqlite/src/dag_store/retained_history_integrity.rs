@@ -16,9 +16,9 @@
 use rusqlite::{Connection, OptionalExtension};
 
 use super::serving_authorization_index::record_change_file_versions;
+use crate::error::SyncSqliteError;
 use yadorilink_replica_domain::change::{Change, Op, PRUNED_STUB_ENCODING_VERSION};
 use yadorilink_replica_domain::ids::ChangeHash;
-use crate::error::SyncSqliteError;
 
 /// Installs the compact proof tables used to distinguish intentional pruning
 /// from arbitrary history loss. `commit_prune` already has one stable sequence:
@@ -174,7 +174,10 @@ fn validate_prune_proofs(conn: &Connection) -> Result<(), SyncSqliteError> {
 /// Closes the short-lived prune context opened by checkpoint insertion. Called
 /// at the start of the sweep that `commit_prune` invokes after all Change
 /// deletions, so any later unrelated deletion cannot be mistaken for pruning.
-pub(crate) fn finish_prune_context(conn: &Connection, group_id: &str) -> Result<(), SyncSqliteError> {
+pub(crate) fn finish_prune_context(
+    conn: &Connection,
+    group_id: &str,
+) -> Result<(), SyncSqliteError> {
     conn.execute("DELETE FROM active_prune_context WHERE group_id = ?1", [group_id])?;
     Ok(())
 }
@@ -222,7 +225,10 @@ pub fn has_change(conn: &Connection, hash: &ChangeHash) -> Result<bool, SyncSqli
 
 /// The full encoded bytes (canonical + signature) of a stored change, for
 /// serving it onward to another peer without re-signing.
-pub fn get_encoded(conn: &Connection, hash: &ChangeHash) -> Result<Option<Vec<u8>>, SyncSqliteError> {
+pub fn get_encoded(
+    conn: &Connection,
+    hash: &ChangeHash,
+) -> Result<Option<Vec<u8>>, SyncSqliteError> {
     Ok(conn
         .query_row("SELECT encoded FROM changes WHERE change_hash = ?1", [&hash.0[..]], |r| {
             r.get(0)
@@ -266,7 +272,10 @@ pub fn lamport_of(conn: &Connection, hash: &ChangeHash) -> Result<Option<u64>, S
         .map(|v| v as u64))
 }
 
-fn parent_meta(conn: &Connection, hash: &ChangeHash) -> Result<Option<(String, u64)>, SyncSqliteError> {
+fn parent_meta(
+    conn: &Connection,
+    hash: &ChangeHash,
+) -> Result<Option<(String, u64)>, SyncSqliteError> {
     Ok(conn
         .query_row(
             "SELECT group_id, lamport FROM changes WHERE change_hash = ?1",
@@ -341,9 +350,9 @@ pub(crate) fn validate_present_parent_shape_parts(
         let expected = if parents.is_empty() {
             1
         } else {
-            max_parent_lamport
-                .checked_add(1)
-                .ok_or_else(|| SyncSqliteError::NotFound("change parent lamport would overflow".into()))?
+            max_parent_lamport.checked_add(1).ok_or_else(|| {
+                SyncSqliteError::NotFound("change parent lamport would overflow".into())
+            })?
         };
         if lamport != expected {
             return Err(SyncSqliteError::NotFound(format!(
@@ -359,7 +368,10 @@ pub(crate) fn validate_present_parent_shape_parts(
 /// prune tombstone exists. This preserves the logical clock relation across a
 /// pruning boundary instead of skipping Lamport validation merely because one
 /// parent row is gone.
-fn validate_retained_parent_shape(conn: &Connection, change: &Change) -> Result<(), SyncSqliteError> {
+fn validate_retained_parent_shape(
+    conn: &Connection,
+    change: &Change,
+) -> Result<(), SyncSqliteError> {
     let mut max_parent_lamport = 0u64;
     for parent in &change.parents {
         if let Some((parent_group, parent_lamport)) = parent_meta(conn, parent)? {
@@ -403,7 +415,10 @@ fn validate_retained_parent_shape(conn: &Connection, change: &Change) -> Result<
 }
 
 /// The stored parent edges of a change.
-pub fn parents_of(conn: &Connection, hash: &ChangeHash) -> Result<Vec<ChangeHash>, SyncSqliteError> {
+pub fn parents_of(
+    conn: &Connection,
+    hash: &ChangeHash,
+) -> Result<Vec<ChangeHash>, SyncSqliteError> {
     let mut stmt = conn.prepare("SELECT parent_hash FROM change_parents WHERE child_hash = ?1")?;
     let rows = stmt.query_map([&hash.0[..]], |r| r.get::<_, Vec<u8>>(0))?;
     let mut out = Vec::new();

@@ -366,7 +366,10 @@ pub fn materialize_symlink(out_path: &Path, target: &[u8]) -> Result<(), Storage
         fs::create_dir_all(parent)?;
     }
     let tmp_path = unique_tmp_path(out_path);
-    std::os::unix::fs::symlink(yadorilink_root_authority::fs_identity::bytes_to_target(target), &tmp_path)?;
+    std::os::unix::fs::symlink(
+        yadorilink_root_authority::fs_identity::bytes_to_target(target),
+        &tmp_path,
+    )?;
     fs::rename(&tmp_path, out_path)?;
     Ok(())
 }

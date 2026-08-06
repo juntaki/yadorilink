@@ -70,14 +70,14 @@ use dst_support::oracle::GlobalOracle;
 use dst_support::reference_model::{self, RefKind, RefOp};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
-use yadorilink_local_storage::FsBlockStore;
-use yadorilink_filesystem_sync::debounce::{self, DebounceConfig, FlushPathRequest};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
-use yadorilink_peer_session::peer_session::{PeerSyncSession, PendingLocalChangeFlush};
+use yadorilink_filesystem_sync::debounce::{self, DebounceConfig, FlushPathRequest};
 use yadorilink_filesystem_sync::watcher::{
     FolderWatchSource, FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
 };
+use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
+use yadorilink_local_storage::FsBlockStore;
+use yadorilink_peer_session::peer_session::{PeerSyncSession, PendingLocalChangeFlush};
 use yadorilink_transport::PeerChannel;
 
 /// The most recent change `device` authored touching `path`, read back after

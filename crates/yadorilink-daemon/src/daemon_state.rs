@@ -14,10 +14,10 @@ use std::time::Duration;
 
 use sha2::Digest;
 use tokio::sync::{broadcast, mpsc};
-use yadorilink_local_storage::BlockStore;
 use yadorilink_filesystem_sync::block_liveness::{
     BlockLivenessGate, BlockPhysicalDeletionGuard, BlockReferenceWriteGuard,
 };
+use yadorilink_local_storage::BlockStore;
 use yadorilink_replica_domain::change::{ChangeAuth, PolicyUnavailable};
 use yadorilink_replica_domain::file::VersionBlock;
 use yadorilink_replica_domain::ids::VersionHash;
@@ -27,19 +27,19 @@ use crate::daemon_runtime::{DaemonBuild, RuntimeComponents};
 #[cfg(test)]
 use crate::durability_service::CustodyConfirmer;
 use crate::durability_service::GroupDurabilityStatus;
-use yadorilink_replica_domain::session_state::{
-    DurabilityRoot, DurabilityRoots, MembershipCommitMode, MembershipDurabilityScope,
-    MembershipOperationAction, MembershipOperationState, RoleLossAction, RoleLossOperationParams,
-    RoleLossOperationState,
-};
-use yadorilink_sync_sqlite::handoff_lease::HandoffLeaseState;
 use yadorilink_peer_session::peer_session::{
     BlockWriteActivityProvider, HandoffLeaseResponder, HandoffTicketResponder,
     PeerHandoffLeaseGrant, PeerHandoffTicketGrant, PeerSyncSession,
 };
 use yadorilink_peer_session::rate_limiter::RateLimiters;
-use yadorilink_replica_engine::repair_election::{AuthorizedWriter, RepairElectionContext};
 use yadorilink_replica_domain::file::FileRecord;
+use yadorilink_replica_domain::session_state::{
+    DurabilityRoot, DurabilityRoots, MembershipCommitMode, MembershipDurabilityScope,
+    MembershipOperationAction, MembershipOperationState, RoleLossAction, RoleLossOperationParams,
+    RoleLossOperationState,
+};
+use yadorilink_replica_engine::repair_election::{AuthorizedWriter, RepairElectionContext};
+use yadorilink_sync_sqlite::handoff_lease::HandoffLeaseState;
 
 use crate::change_policy::GroupPolicyState;
 use crate::governance_config::GovernanceConfigStore;
@@ -173,13 +173,16 @@ pub async fn run_membership_recovery_sweep(state: &Arc<DaemonState>) {
 }
 
 pub async fn run_role_loss_reconciliation_sweep(state: &Arc<DaemonState>) {
-    let rows = match state.replica_coordinator.role_loss_operation_repository().list_role_loss_operations_in_states(&[
-        RoleLossOperationState::Prepared,
-        RoleLossOperationState::WorkerCommitted,
-        RoleLossOperationState::LocalCommitted,
-        RoleLossOperationState::Compensating,
-        RoleLossOperationState::Completed,
-    ]) {
+    let rows = match state
+        .replica_coordinator
+        .role_loss_operation_repository()
+        .list_role_loss_operations_in_states(&[
+            RoleLossOperationState::Prepared,
+            RoleLossOperationState::WorkerCommitted,
+            RoleLossOperationState::LocalCommitted,
+            RoleLossOperationState::Compensating,
+            RoleLossOperationState::Completed,
+        ]) {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!(error = %e, "role-loss reconciliation sweep failed to list journal rows");
@@ -189,7 +192,11 @@ pub async fn run_role_loss_reconciliation_sweep(state: &Arc<DaemonState>) {
     for op in rows {
         match op.state {
             RoleLossOperationState::LocalCommitted | RoleLossOperationState::Completed => {
-                if let Err(e) = state.replica_coordinator.role_loss_operation_repository().delete_role_loss_operation(&op.operation_id) {
+                if let Err(e) = state
+                    .replica_coordinator
+                    .role_loss_operation_repository()
+                    .delete_role_loss_operation(&op.operation_id)
+                {
                     tracing::warn!(
                         error = %e,
                         operation_id = %op.operation_id,
@@ -904,7 +911,8 @@ impl DaemonState {
         // "off by default" behavior at every other layer of this change.
         block_store.set_headroom_override_bytes(initial_governance.headroom_override_bytes);
         let (persisted_durability_latches, durability_latch_load_failed) = match replica_coordinator
-            .role_loss_operation_repository().list_durability_unknown_latches()
+            .role_loss_operation_repository()
+            .list_durability_unknown_latches()
         {
             Ok(groups) => (groups, false),
             Err(error) => {
@@ -912,8 +920,10 @@ impl DaemonState {
                 (Vec::new(), true)
             }
         };
-        let unknown_scope_membership_marker =
-            replica_coordinator.membership_operation_repository().has_open_unknown_durability_scope_operation().unwrap_or(true);
+        let unknown_scope_membership_marker = replica_coordinator
+            .membership_operation_repository()
+            .has_open_unknown_durability_scope_operation()
+            .unwrap_or(true);
         let (nat_sink, nat_candidates) = yadorilink_transport::CandidateSink::new();
         let state = Arc::new(Self {
             device_id,
@@ -1225,7 +1235,9 @@ impl DaemonState {
         &self,
         group_id: &str,
     ) -> Result<(), crate::sync_error::SyncError> {
-        self.replica_coordinator.role_loss_operation_repository().latch_group_durability_unknown(group_id)?;
+        self.replica_coordinator
+            .role_loss_operation_repository()
+            .latch_group_durability_unknown(group_id)?;
         self.durability.latch_unknown(group_id);
         Ok(())
     }
@@ -1243,7 +1255,9 @@ impl DaemonState {
         &self,
         group_id: &str,
     ) -> Result<(), crate::sync_error::SyncError> {
-        self.replica_coordinator.role_loss_operation_repository().clear_group_durability_unknown(group_id)?;
+        self.replica_coordinator
+            .role_loss_operation_repository()
+            .clear_group_durability_unknown(group_id)?;
         self.durability.clear_unknown(group_id);
         Ok(())
     }
@@ -1303,10 +1317,15 @@ impl DaemonState {
             scope_unknown: self.unknown_scope_membership_marker.load(Ordering::SeqCst),
             recovery_blocked: self
                 .replica_coordinator
-                .membership_operation_repository().has_recovery_blocked_membership_operation()
+                .membership_operation_repository()
+                .has_recovery_blocked_membership_operation()
                 .unwrap_or(true),
             latched_unknown: false,
-            materialization: match self.replica_coordinator.materialization_state_repository().materialization_counts(group_id) {
+            materialization: match self
+                .replica_coordinator
+                .materialization_state_repository()
+                .materialization_counts(group_id)
+            {
                 Ok(counts) if counts.placeholder == 0 && counts.hydrating == 0 => {
                     Ok(crate::durability_service::MaterializationHealth::FullyLocal)
                 }
@@ -1881,7 +1900,8 @@ impl DaemonState {
     ) -> Result<String, String> {
         let operation_id = uuid::Uuid::new_v4().to_string();
         self.replica_coordinator
-            .role_loss_operation_repository().insert_role_loss_operation(
+            .role_loss_operation_repository()
+            .insert_role_loss_operation(
                 &operation_id,
                 group_id,
                 RoleLossOperationParams {
@@ -1919,11 +1939,11 @@ impl DaemonState {
     ///   [`yadorilink_sync_core::index::RoleLossOperationState::Prepared`]'s
     ///   doc comment for why that's safe.
     pub fn mark_role_loss_worker_committed(&self, operation_id: &str, membership_generation: i64) {
-        if let Err(e) = self.replica_coordinator.role_loss_operation_repository().mark_role_loss_worker_committed(
-            operation_id,
-            membership_generation,
-            now_unix(),
-        ) {
+        if let Err(e) = self
+            .replica_coordinator
+            .role_loss_operation_repository()
+            .mark_role_loss_worker_committed(operation_id, membership_generation, now_unix())
+        {
             tracing::warn!(
                 error = %e,
                 operation_id,
@@ -1937,7 +1957,11 @@ impl DaemonState {
     /// — nothing was committed on either side, so the row never protected
     /// anything real.
     pub fn discard_role_loss_operation(&self, operation_id: &str) {
-        if let Err(e) = self.replica_coordinator.role_loss_operation_repository().delete_role_loss_operation(operation_id) {
+        if let Err(e) = self
+            .replica_coordinator
+            .role_loss_operation_repository()
+            .delete_role_loss_operation(operation_id)
+        {
             tracing::warn!(
                 error = %e,
                 operation_id,
@@ -1953,18 +1977,22 @@ impl DaemonState {
     /// just with a journal row written and cleaned up around it.
     pub fn settle_role_loss_operation_success(&self, operation_id: &str) {
         let now = now_unix();
-        if let Err(e) = self.replica_coordinator.role_loss_operation_repository().advance_role_loss_operation(
-            operation_id,
-            RoleLossOperationState::LocalCommitted,
-            now,
-        ) {
+        if let Err(e) = self
+            .replica_coordinator
+            .role_loss_operation_repository()
+            .advance_role_loss_operation(operation_id, RoleLossOperationState::LocalCommitted, now)
+        {
             tracing::warn!(
                 error = %e,
                 operation_id,
                 "failed to advance a role-loss operation journal row to LocalCommitted"
             );
         }
-        if let Err(e) = self.replica_coordinator.role_loss_operation_repository().delete_role_loss_operation(operation_id) {
+        if let Err(e) = self
+            .replica_coordinator
+            .role_loss_operation_repository()
+            .delete_role_loss_operation(operation_id)
+        {
             tracing::warn!(
                 error = %e,
                 operation_id,
@@ -2000,7 +2028,8 @@ impl DaemonState {
     ) -> Result<bool, String> {
         let inserted = self
             .replica_coordinator
-            .membership_operation_repository().try_insert_membership_operation(
+            .membership_operation_repository()
+            .try_insert_membership_operation(
                 operation_id,
                 action,
                 commit_mode,
@@ -2031,12 +2060,16 @@ impl DaemonState {
     /// [`yadorilink_sync_core::index::MembershipOperationState::Ambiguous`]'s
     /// doc comment for the analogous role-loss reasoning this mirrors).
     pub fn mark_membership_operation_ambiguous(&self, operation_id: &str, detail: &str) {
-        if let Err(e) = self.replica_coordinator.membership_operation_repository().mark_membership_operation_state(
-            operation_id,
-            MembershipOperationState::Ambiguous,
-            Some(detail),
-            now_unix(),
-        ) {
+        if let Err(e) = self
+            .replica_coordinator
+            .membership_operation_repository()
+            .mark_membership_operation_state(
+                operation_id,
+                MembershipOperationState::Ambiguous,
+                Some(detail),
+                now_unix(),
+            )
+        {
             tracing::warn!(
                 error = %e,
                 operation_id,
@@ -2060,7 +2093,11 @@ impl DaemonState {
         operation_id: &str,
         _final_state: MembershipOperationState,
     ) {
-        if let Err(e) = self.replica_coordinator.membership_operation_repository().delete_membership_operation(operation_id) {
+        if let Err(e) = self
+            .replica_coordinator
+            .membership_operation_repository()
+            .delete_membership_operation(operation_id)
+        {
             tracing::warn!(
                 error = %e,
                 operation_id,
@@ -2075,7 +2112,11 @@ impl DaemonState {
     /// (an unknown-scope marker converted to per-group latches) — matching
     /// [`Self::discard_role_loss_operation`].
     pub fn discard_membership_operation(&self, operation_id: &str) {
-        if let Err(e) = self.replica_coordinator.membership_operation_repository().delete_membership_operation(operation_id) {
+        if let Err(e) = self
+            .replica_coordinator
+            .membership_operation_repository()
+            .delete_membership_operation(operation_id)
+        {
             tracing::warn!(
                 error = %e,
                 operation_id,
@@ -2092,12 +2133,16 @@ impl DaemonState {
     /// to conclude here, so it stays for operator attention and is excluded
     /// from periodic resend/settlement.
     pub fn mark_membership_operation_recovery_blocked(&self, operation_id: &str, detail: &str) {
-        if let Err(e) = self.replica_coordinator.membership_operation_repository().mark_membership_operation_state(
-            operation_id,
-            MembershipOperationState::RecoveryBlocked,
-            Some(detail),
-            now_unix(),
-        ) {
+        if let Err(e) = self
+            .replica_coordinator
+            .membership_operation_repository()
+            .mark_membership_operation_state(
+                operation_id,
+                MembershipOperationState::RecoveryBlocked,
+                Some(detail),
+                now_unix(),
+            )
+        {
             tracing::warn!(
                 error = %e,
                 operation_id,
@@ -2117,12 +2162,16 @@ impl DaemonState {
         operation_id: &str,
         detail: &str,
     ) {
-        if let Err(e) = self.replica_coordinator.membership_operation_repository().mark_membership_operation_state(
-            operation_id,
-            MembershipOperationState::LocalSettlementPending,
-            Some(detail),
-            now_unix(),
-        ) {
+        if let Err(e) = self
+            .replica_coordinator
+            .membership_operation_repository()
+            .mark_membership_operation_state(
+                operation_id,
+                MembershipOperationState::LocalSettlementPending,
+                Some(detail),
+                now_unix(),
+            )
+        {
             tracing::warn!(
                 error = %e,
                 operation_id,
@@ -2137,8 +2186,11 @@ impl DaemonState {
     /// stops forcing `DurabilityUnknown` account-wide once every such row is
     /// resolved.
     fn refresh_unknown_scope_membership_marker(&self) {
-        let still_present =
-            self.replica_coordinator.membership_operation_repository().has_open_unknown_durability_scope_operation().unwrap_or(true);
+        let still_present = self
+            .replica_coordinator
+            .membership_operation_repository()
+            .has_open_unknown_durability_scope_operation()
+            .unwrap_or(true);
         self.unknown_scope_membership_marker.store(still_present, Ordering::SeqCst);
     }
 
@@ -2177,17 +2229,24 @@ impl DaemonState {
     /// coordination plane — no digest, path, or version content (INV-4;
     /// same as every other call in `coordination_client`).
     pub async fn compensate_role_loss_operation(&self, operation_id: &str) -> Result<(), String> {
-        let Some(op) =
-            self.replica_coordinator.role_loss_operation_repository().get_role_loss_operation(operation_id).map_err(|e| e.to_string())?
+        let Some(op) = self
+            .replica_coordinator
+            .role_loss_operation_repository()
+            .get_role_loss_operation(operation_id)
+            .map_err(|e| e.to_string())?
         else {
             return Ok(());
         };
         if op.state != RoleLossOperationState::Compensating {
-            if let Err(e) = self.replica_coordinator.role_loss_operation_repository().advance_role_loss_operation(
-                operation_id,
-                RoleLossOperationState::Compensating,
-                now_unix(),
-            ) {
+            if let Err(e) = self
+                .replica_coordinator
+                .role_loss_operation_repository()
+                .advance_role_loss_operation(
+                    operation_id,
+                    RoleLossOperationState::Compensating,
+                    now_unix(),
+                )
+            {
                 tracing::warn!(
                     error = %e,
                     operation_id,
@@ -2198,7 +2257,8 @@ impl DaemonState {
         let Some(config) = self.coordination_client_config() else {
             let attempts = self
                 .replica_coordinator
-                .role_loss_operation_repository().increment_role_loss_operation_attempts(operation_id, now_unix())
+                .role_loss_operation_repository()
+                .increment_role_loss_operation_attempts(operation_id, now_unix())
                 .unwrap_or(op.attempts + 1);
             tracing::warn!(
                 operation_id,
@@ -2218,7 +2278,10 @@ impl DaemonState {
                 operation_id,
                 "legacy role-loss journal has no lease; treating it as superseded"
             );
-            self.replica_coordinator.role_loss_operation_repository().delete_role_loss_operation(operation_id).map_err(|e| e.to_string())?;
+            self.replica_coordinator
+                .role_loss_operation_repository()
+                .delete_role_loss_operation(operation_id)
+                .map_err(|e| e.to_string())?;
             return Ok(());
         };
         match crate::coordination_client::compensate_handoff_role_loss(
@@ -2238,18 +2301,26 @@ impl DaemonState {
                     ?outcome,
                     "role-loss compensation reached a terminal outcome"
                 );
-                if let Err(e) = self.replica_coordinator.role_loss_operation_repository().advance_role_loss_operation(
-                    operation_id,
-                    RoleLossOperationState::Completed,
-                    now_unix(),
-                ) {
+                if let Err(e) = self
+                    .replica_coordinator
+                    .role_loss_operation_repository()
+                    .advance_role_loss_operation(
+                        operation_id,
+                        RoleLossOperationState::Completed,
+                        now_unix(),
+                    )
+                {
                     tracing::warn!(
                         error = %e,
                         operation_id,
                         "failed to advance a role-loss operation journal row to Completed"
                     );
                 }
-                if let Err(e) = self.replica_coordinator.role_loss_operation_repository().delete_role_loss_operation(operation_id) {
+                if let Err(e) = self
+                    .replica_coordinator
+                    .role_loss_operation_repository()
+                    .delete_role_loss_operation(operation_id)
+                {
                     tracing::warn!(
                         error = %e,
                         operation_id,
@@ -2262,7 +2333,8 @@ impl DaemonState {
             Err(e) => {
                 let attempts = self
                     .replica_coordinator
-                    .role_loss_operation_repository().increment_role_loss_operation_attempts(operation_id, now_unix())
+                    .role_loss_operation_repository()
+                    .increment_role_loss_operation_attempts(operation_id, now_unix())
                     .unwrap_or(op.attempts + 1);
                 if attempts >= ROLE_LOSS_COMPENSATION_ESCALATION_ATTEMPTS {
                     tracing::error!(
@@ -2422,12 +2494,8 @@ impl DaemonState {
         let (pinned_digest, _pinned_versions) = match self
             .replica_coordinator
             .handoff_lease_repository()
-            .record_handoff_lease_atomic(
-            group_id,
-            &grant.lease_id,
-            now_unix(),
-            grant.ttl_seconds,
-        ) {
+            .record_handoff_lease_atomic(group_id, &grant.lease_id, now_unix(), grant.ttl_seconds)
+        {
             Ok(pinned) => pinned,
             Err(e) => {
                 // The atomic local pin errored after the Worker already
@@ -2739,7 +2807,10 @@ impl DaemonState {
     /// roots`), plus its digest. `None` (fail closed) if the underlying
     /// enumeration errors.
     fn durability_roots_for_group(&self, group_id: &str) -> Option<DurabilityRoots> {
-        self.replica_coordinator.file_index_repository().enumerate_group_durability_roots(group_id).ok()
+        self.replica_coordinator
+            .file_index_repository()
+            .enumerate_group_durability_roots(group_id)
+            .ok()
     }
 
     /// Whether one specific peer — `peer_id`, reached over its own `session`
@@ -2867,7 +2938,8 @@ impl DaemonState {
             return true;
         }
         self.replica_coordinator
-            .link_repository().list_links()
+            .link_repository()
+            .list_links()
             .map(|links| links.iter().any(|link| link.group_id == group_id))
             .unwrap_or(false)
     }
@@ -3475,7 +3547,11 @@ mod tests {
 
         state.release_owned_handoff_lease("group-release", "lease-release").await;
 
-        let leases = state.replica_coordinator.handoff_lease_repository().list_handoff_leases_for_group("group-release").unwrap();
+        let leases = state
+            .replica_coordinator
+            .handoff_lease_repository()
+            .list_handoff_leases_for_group("group-release")
+            .unwrap();
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].state, HandoffLeaseState::Released);
     }
@@ -3508,7 +3584,8 @@ mod tests {
             .respond_with(move |_req: &Request| {
                 let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
                 sync_state_for_handler
-                    .file_index_repository().upsert_file_with_origin(
+                    .file_index_repository()
+                    .upsert_file_with_origin(
                         "group-1",
                         &FileRecord {
                             path: "b.txt".to_string(),
@@ -3549,7 +3626,11 @@ mod tests {
         // The local pin must have been written (provisionally) and then
         // explicitly released, not left dangling as a live-looking
         // 'provisional' row.
-        let local_leases = state.replica_coordinator.handoff_lease_repository().list_handoff_leases_for_group("group-1").unwrap();
+        let local_leases = state
+            .replica_coordinator
+            .handoff_lease_repository()
+            .list_handoff_leases_for_group("group-1")
+            .unwrap();
         assert_eq!(local_leases.len(), 1);
         assert_eq!(local_leases[0].lease_id, "lease-xyz");
         assert_eq!(local_leases[0].state, HandoffLeaseState::Released);
@@ -3686,7 +3767,11 @@ mod tests {
         let local_now_after_request = now_unix();
         assert_eq!(grant.ttl_seconds, ttl_seconds);
 
-        let leases = state.replica_coordinator.handoff_lease_repository().list_handoff_leases_for_group("group-1").unwrap();
+        let leases = state
+            .replica_coordinator
+            .handoff_lease_repository()
+            .list_handoff_leases_for_group("group-1")
+            .unwrap();
         assert_eq!(leases.len(), 1);
         let recorded = &leases[0];
         assert_eq!(recorded.lease_id, "lease-skewed");
@@ -3701,10 +3786,12 @@ mod tests {
             "the local pin must not read as already expired just because the Worker's absolute \
              expiresAt was stale relative to this device's own clock"
         );
-        let earliest_deadline =
-            earliest_local_now + ttl_seconds + yadorilink_sync_sqlite::handoff_lease::HANDOFF_LEASE_PIN_SAFETY_MARGIN_SECS;
-        let latest_deadline =
-            latest_local_now + ttl_seconds + yadorilink_sync_sqlite::handoff_lease::HANDOFF_LEASE_PIN_SAFETY_MARGIN_SECS;
+        let earliest_deadline = earliest_local_now
+            + ttl_seconds
+            + yadorilink_sync_sqlite::handoff_lease::HANDOFF_LEASE_PIN_SAFETY_MARGIN_SECS;
+        let latest_deadline = latest_local_now
+            + ttl_seconds
+            + yadorilink_sync_sqlite::handoff_lease::HANDOFF_LEASE_PIN_SAFETY_MARGIN_SECS;
         assert!(
             recorded.expires_at_unix >= earliest_deadline - 5
                 && recorded.expires_at_unix <= latest_deadline + 5,
@@ -3757,7 +3844,11 @@ mod tests {
             );
 
             // No local pin was written for the rejected grant.
-            let local_leases = state.replica_coordinator.handoff_lease_repository().list_handoff_leases_for_group("group-1").unwrap();
+            let local_leases = state
+                .replica_coordinator
+                .handoff_lease_repository()
+                .list_handoff_leases_for_group("group-1")
+                .unwrap();
             assert!(
                 local_leases.is_empty(),
                 "a rejected non-positive-ttl grant must record no local pin"
@@ -3816,7 +3907,10 @@ mod tests {
         let database_dir = tempfile::tempdir().unwrap();
         let database_path = database_dir.path().join("sync-state.sqlite");
         let before_restart = ReplicaCoordinator::open(&database_path).unwrap();
-        before_restart.role_loss_operation_repository().latch_group_durability_unknown("group-1").unwrap();
+        before_restart
+            .role_loss_operation_repository()
+            .latch_group_durability_unknown("group-1")
+            .unwrap();
         drop(before_restart);
 
         let restarted_store_dir = tempfile::tempdir().unwrap();
@@ -3833,7 +3927,11 @@ mod tests {
         );
         restarted.clear_group_durability_latch("group-1").unwrap();
         let after_clear = ReplicaCoordinator::open(&database_path).unwrap();
-        assert!(after_clear.role_loss_operation_repository().list_durability_unknown_latches().unwrap().is_empty());
+        assert!(after_clear
+            .role_loss_operation_repository()
+            .list_durability_unknown_latches()
+            .unwrap()
+            .is_empty());
     }
 
     // --- Startup-window placeholder-auth race (watcher before policy load) ---
@@ -3873,9 +3971,9 @@ mod tests {
     ) {
         use yadorilink_replica_domain::change::{Op, PutOrigin};
         use yadorilink_replica_domain::file::FileMeta;
+        use yadorilink_replica_domain::file::RecordKind;
         use yadorilink_replica_domain::ids::SyncPath;
         use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
-        use yadorilink_replica_domain::file::RecordKind;
 
         let state = test_state();
         let group = "group-1";

@@ -48,7 +48,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sha2::Digest;
-use support::{open_file_backed_replica_coordinator, wait_until, wait_until_with_context, TestAccount};
+use support::{
+    open_file_backed_replica_coordinator, wait_until, wait_until_with_context, TestAccount,
+};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::FsBlockStore;

@@ -14,10 +14,10 @@
 use std::sync::Arc;
 
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::FsBlockStore;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_replica_domain::session_state::MaterializationState;
+use yadorilink_local_storage::FsBlockStore;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
+use yadorilink_replica_domain::session_state::MaterializationState;
 
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
@@ -33,11 +33,9 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
         yadorilink_daemon::control_context::ControlContext::from_state(state.clone()),
     );
     tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
-            &serve_path,
-            serve_context,
-        )
-        .await;
+        let _ =
+            yadorilink_daemon::control_socket::unix_transport::serve(&serve_path, serve_context)
+                .await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     (dir, state)
@@ -55,11 +53,16 @@ async fn evict_command_turns_a_hydrated_file_into_a_placeholder() {
     // -- see `hydration::evict`'s own doc comment; this test exercises the
     // actual eviction mechanics, so it forces that gate open for its own
     // thread, the same way `yadorilink-daemon`'s own eviction tests do.
-    let _pipeline_connected = yadorilink_filesystem_sync::placeholder_backend::OverrideForTest::enable();
+    let _pipeline_connected =
+        yadorilink_filesystem_sync::placeholder_backend::OverrideForTest::enable();
     let (dir, state) = start_daemon().await;
     let folder = dir.path().join("shared");
     std::fs::create_dir_all(&folder).unwrap();
-    state.replica_coordinator.link_repository().add_link(&folder.to_string_lossy(), "group-1").unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&folder.to_string_lossy(), "group-1")
+        .unwrap();
     // A direct `add_link` (never a real `start_link_watch`) leaves no live
     // root lease behind for `evict`'s `root_lease_for` lookup to find --
     // `install_test_root_commit_authority` registers the same
@@ -71,8 +74,12 @@ async fn evict_command_turns_a_hydrated_file_into_a_placeholder() {
     // previously-adopted root token", the same fixture step
     // `yadorilink-daemon`'s own `hydration.rs::seed_link` test helper takes
     // for the identical reason.
-    yadorilink_root_authority::root_identity::VerifiedRoot::open(&folder, "group-1", state.replica_coordinator.as_ref())
-        .unwrap();
+    yadorilink_root_authority::root_identity::VerifiedRoot::open(
+        &folder,
+        "group-1",
+        state.replica_coordinator.as_ref(),
+    )
+    .unwrap();
 
     let content = vec![5u8; 500];
     std::fs::write(folder.join("notes.txt"), &content).unwrap();
@@ -88,7 +95,8 @@ async fn evict_command_turns_a_hydrated_file_into_a_placeholder() {
     };
     state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             "group-1",
             &FileRecord {
                 path: "notes.txt".into(),
@@ -108,7 +116,11 @@ async fn evict_command_turns_a_hydrated_file_into_a_placeholder() {
     .unwrap();
 
     assert_eq!(
-        state.replica_coordinator.materialization_state_repository().get_materialization_state("group-1", "notes.txt").unwrap(),
+        state
+            .replica_coordinator
+            .materialization_state_repository()
+            .get_materialization_state("group-1", "notes.txt")
+            .unwrap(),
         Some(MaterializationState::Placeholder)
     );
     assert_ne!(std::fs::read(folder.join("notes.txt")).unwrap(), content);
@@ -121,13 +133,18 @@ async fn evict_command_fails_for_a_pinned_file() {
     let (dir, state) = start_daemon().await;
     let folder = dir.path().join("shared");
     std::fs::create_dir_all(&folder).unwrap();
-    state.replica_coordinator.link_repository().add_link(&folder.to_string_lossy(), "group-1").unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&folder.to_string_lossy(), "group-1")
+        .unwrap();
 
     let content = vec![5u8; 500];
     std::fs::write(folder.join("notes.txt"), &content).unwrap();
     state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             "group-1",
             &FileRecord {
                 path: "notes.txt".into(),
@@ -139,7 +156,11 @@ async fn evict_command_fails_for_a_pinned_file() {
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
-    state.replica_coordinator.file_index_repository().set_pinned("group-1", "notes.txt", true).unwrap();
+    state
+        .replica_coordinator
+        .file_index_repository()
+        .set_pinned("group-1", "notes.txt", true)
+        .unwrap();
 
     let path = folder.join("notes.txt").to_string_lossy().to_string();
     let err = yadorilink_cli::commands::materialization::evict(path).await.unwrap_err();
@@ -147,7 +168,11 @@ async fn evict_command_fails_for_a_pinned_file() {
 
     // Still hydrated, untouched.
     assert_eq!(
-        state.replica_coordinator.materialization_state_repository().get_materialization_state("group-1", "notes.txt").unwrap(),
+        state
+            .replica_coordinator
+            .materialization_state_repository()
+            .get_materialization_state("group-1", "notes.txt")
+            .unwrap(),
         Some(MaterializationState::Hydrated)
     );
     assert_eq!(std::fs::read(folder.join("notes.txt")).unwrap(), content);
@@ -159,11 +184,16 @@ async fn unpin_then_evict_succeeds() {
     let _guard = TEST_MUTEX.lock().await;
     // See `evict_command_turns_a_hydrated_file_into_a_placeholder`'s
     // identical comment: `evict` refuses outright without this override.
-    let _pipeline_connected = yadorilink_filesystem_sync::placeholder_backend::OverrideForTest::enable();
+    let _pipeline_connected =
+        yadorilink_filesystem_sync::placeholder_backend::OverrideForTest::enable();
     let (dir, state) = start_daemon().await;
     let folder = dir.path().join("shared");
     std::fs::create_dir_all(&folder).unwrap();
-    state.replica_coordinator.link_repository().add_link(&folder.to_string_lossy(), "group-1").unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&folder.to_string_lossy(), "group-1")
+        .unwrap();
     // A direct `add_link` (never a real `start_link_watch`) leaves no live
     // root lease behind for `evict`'s `root_lease_for` lookup to find --
     // `install_test_root_commit_authority` registers the same
@@ -175,8 +205,12 @@ async fn unpin_then_evict_succeeds() {
     // previously-adopted root token", the same fixture step
     // `yadorilink-daemon`'s own `hydration.rs::seed_link` test helper takes
     // for the identical reason.
-    yadorilink_root_authority::root_identity::VerifiedRoot::open(&folder, "group-1", state.replica_coordinator.as_ref())
-        .unwrap();
+    yadorilink_root_authority::root_identity::VerifiedRoot::open(
+        &folder,
+        "group-1",
+        state.replica_coordinator.as_ref(),
+    )
+    .unwrap();
 
     let content = vec![5u8; 500];
     std::fs::write(folder.join("notes.txt"), &content).unwrap();
@@ -189,7 +223,8 @@ async fn unpin_then_evict_succeeds() {
     };
     state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             "group-1",
             &FileRecord {
                 path: "notes.txt".into(),
@@ -201,15 +236,27 @@ async fn unpin_then_evict_succeeds() {
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
-    state.replica_coordinator.file_index_repository().set_pinned("group-1", "notes.txt", true).unwrap();
+    state
+        .replica_coordinator
+        .file_index_repository()
+        .set_pinned("group-1", "notes.txt", true)
+        .unwrap();
 
     let path = folder.join("notes.txt").to_string_lossy().to_string();
     yadorilink_cli::commands::materialization::unpin(path.clone()).await.unwrap();
-    assert!(!state.replica_coordinator.file_index_repository().is_pinned("group-1", "notes.txt").unwrap());
+    assert!(!state
+        .replica_coordinator
+        .file_index_repository()
+        .is_pinned("group-1", "notes.txt")
+        .unwrap());
 
     yadorilink_cli::commands::materialization::evict(path).await.unwrap();
     assert_eq!(
-        state.replica_coordinator.materialization_state_repository().get_materialization_state("group-1", "notes.txt").unwrap(),
+        state
+            .replica_coordinator
+            .materialization_state_repository()
+            .get_materialization_state("group-1", "notes.txt")
+            .unwrap(),
         Some(MaterializationState::Placeholder)
     );
 }
@@ -222,12 +269,17 @@ async fn pin_command_succeeds_for_an_already_hydrated_file() {
     let (dir, state) = start_daemon().await;
     let folder = dir.path().join("shared");
     std::fs::create_dir_all(&folder).unwrap();
-    state.replica_coordinator.link_repository().add_link(&folder.to_string_lossy(), "group-1").unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&folder.to_string_lossy(), "group-1")
+        .unwrap();
 
     std::fs::write(folder.join("notes.txt"), b"hello").unwrap();
     state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             "group-1",
             &FileRecord {
                 path: "notes.txt".into(),
@@ -242,5 +294,9 @@ async fn pin_command_succeeds_for_an_already_hydrated_file() {
 
     let path = folder.join("notes.txt").to_string_lossy().to_string();
     yadorilink_cli::commands::materialization::pin(path).await.unwrap();
-    assert!(state.replica_coordinator.file_index_repository().is_pinned("group-1", "notes.txt").unwrap());
+    assert!(state
+        .replica_coordinator
+        .file_index_repository()
+        .is_pinned("group-1", "notes.txt")
+        .unwrap());
 }

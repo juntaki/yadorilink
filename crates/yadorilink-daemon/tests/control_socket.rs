@@ -11,6 +11,7 @@ mod unix_socket_tests {
     use tokio::net::UnixStream;
     use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
     use yadorilink_daemon::daemon_state::DaemonState;
+    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
     use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
     use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
     use yadorilink_ipc_proto::daemonctl::{
@@ -21,7 +22,6 @@ mod unix_socket_tests {
     };
     use yadorilink_ipc_proto::framing::{read_message, write_message};
     use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 
     async fn start_daemon() -> (std::path::PathBuf, tempfile::TempDir) {
         let (socket_path, dir, _state) = start_daemon_with_state().await;
@@ -323,10 +323,15 @@ mod unix_socket_tests {
         std::fs::create_dir_all(&folder_a).unwrap();
         std::fs::create_dir_all(&folder_b).unwrap();
 
-        state.replica_coordinator.link_repository().add_link(&folder_a.to_string_lossy(), "group-amb").unwrap();
         state
             .replica_coordinator
-            .link_repository().force_second_live_link_for_test(&folder_b.to_string_lossy(), "group-amb")
+            .link_repository()
+            .add_link(&folder_a.to_string_lossy(), "group-amb")
+            .unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .force_second_live_link_for_test(&folder_b.to_string_lossy(), "group-amb")
             .unwrap();
 
         let resp = send(&socket_path, ReqPayload::ListLinks(ListLinksRequest {})).await;
@@ -362,7 +367,11 @@ mod unix_socket_tests {
         let (socket_path, dir, state) = start_daemon_with_state().await;
         let folder = dir.path().join("photos");
         std::fs::create_dir_all(&folder).unwrap();
-        state.replica_coordinator.link_repository().add_link(&folder.to_string_lossy(), "group-ok").unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link(&folder.to_string_lossy(), "group-ok")
+            .unwrap();
 
         let resp = send(&socket_path, ReqPayload::ListLinks(ListLinksRequest {})).await;
         let Some(RespPayload::ListLinks(list)) = resp.payload else {
@@ -393,10 +402,15 @@ mod unix_socket_tests {
         std::fs::create_dir_all(&folder_a).unwrap();
         std::fs::create_dir_all(&folder_b).unwrap();
 
-        state.replica_coordinator.link_repository().add_link(&folder_a.to_string_lossy(), "group-amb").unwrap();
         state
             .replica_coordinator
-            .link_repository().force_second_live_link_for_test(&folder_b.to_string_lossy(), "group-amb")
+            .link_repository()
+            .add_link(&folder_a.to_string_lossy(), "group-amb")
+            .unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .force_second_live_link_for_test(&folder_b.to_string_lossy(), "group-amb")
             .unwrap();
         state.set_peer_group_full_replica("device-b", "group-amb", true);
 
@@ -417,7 +431,11 @@ mod unix_socket_tests {
         assert!(matches!(resp.payload, Some(RespPayload::Unlink(_))), "got {:?}", resp.payload);
 
         assert!(
-            state.replica_coordinator.link_repository().suppress_tombstones_for_group("group-amb").unwrap(),
+            state
+                .replica_coordinator
+                .link_repository()
+                .suppress_tombstones_for_group("group-amb")
+                .unwrap(),
             "unlinking one of two roots must make the survivor's next scan additive -- otherwise \
              the recovery this error message instructs deletes every file that only existed in \
              the folder the user unlinked, on every device"
@@ -437,8 +455,16 @@ mod unix_socket_tests {
         std::fs::create_dir_all(&folder_b).unwrap();
 
         // Two links, but on DIFFERENT groups: nothing ambiguous here.
-        state.replica_coordinator.link_repository().add_link(&folder_a.to_string_lossy(), "group-x").unwrap();
-        state.replica_coordinator.link_repository().add_link(&folder_b.to_string_lossy(), "group-y").unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link(&folder_a.to_string_lossy(), "group-x")
+            .unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link(&folder_b.to_string_lossy(), "group-y")
+            .unwrap();
         state.set_peer_group_full_replica("device-b", "group-y", true);
 
         send(
@@ -451,7 +477,11 @@ mod unix_socket_tests {
         .await;
 
         assert!(
-            !state.replica_coordinator.link_repository().suppress_tombstones_for_group("group-x").unwrap(),
+            !state
+                .replica_coordinator
+                .link_repository()
+                .suppress_tombstones_for_group("group-x")
+                .unwrap(),
             "an unrelated group's link must keep propagating deletions normally"
         );
     }
@@ -524,7 +554,8 @@ mod unix_socket_tests {
         };
         state
             .replica_coordinator
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 "group-held",
                 &record,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -532,7 +563,8 @@ mod unix_socket_tests {
             .unwrap();
         state
             .replica_coordinator
-            .materialization_state_repository().set_held(
+            .materialization_state_repository()
+            .set_held(
                 "group-held",
                 "a.txt",
                 "case-fold collision with existing sibling 'A.txt'",
@@ -769,7 +801,8 @@ mod unix_socket_tests {
         };
         state
             .replica_coordinator
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 "group-symlink-posix",
                 &record,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -777,7 +810,8 @@ mod unix_socket_tests {
             .unwrap();
         state
             .replica_coordinator
-            .file_index_repository().set_record_kind(
+            .file_index_repository()
+            .set_record_kind(
                 "group-symlink-posix",
                 "link-to-elsewhere",
                 RecordKind::Symlink,
@@ -786,7 +820,8 @@ mod unix_socket_tests {
             .unwrap();
         state
             .replica_coordinator
-            .file_index_repository().set_symlink_target("group-symlink-posix", "link-to-elsewhere", Some(b"target.txt"))
+            .file_index_repository()
+            .set_symlink_target("group-symlink-posix", "link-to-elsewhere", Some(b"target.txt"))
             .unwrap();
 
         let resp = send(&socket_path, ReqPayload::Status(StatusRequest {})).await;
@@ -905,7 +940,8 @@ mod unix_socket_tests {
         };
         state
             .replica_coordinator
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 "group-7",
                 &yadorilink_replica_domain::file::FileRecord {
                     path: "report.pdf".into(),
@@ -936,7 +972,11 @@ mod unix_socket_tests {
         );
 
         assert_eq!(
-            state.replica_coordinator.materialization_state_repository().get_materialization_state("group-7", "report.pdf").unwrap(),
+            state
+                .replica_coordinator
+                .materialization_state_repository()
+                .get_materialization_state("group-7", "report.pdf")
+                .unwrap(),
             Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
         );
         let metadata = std::fs::metadata(folder.join("report.pdf")).unwrap();
@@ -1025,11 +1065,13 @@ mod unix_socket_tests {
         // never having been obtained through the group, and refuses it.
         state
             .replica_coordinator
-            .change_history_repository().record_group_block_provenance("group-versions", std::slice::from_ref(&v1_block.hash))
+            .change_history_repository()
+            .record_group_block_provenance("group-versions", std::slice::from_ref(&v1_block.hash))
             .unwrap();
         state
             .replica_coordinator
-            .file_index_repository().upsert_file_with_origin(
+            .file_index_repository()
+            .upsert_file_with_origin(
                 "group-versions",
                 &yadorilink_replica_domain::file::FileRecord {
                     path: "notes.txt".into(),
@@ -1051,11 +1093,13 @@ mod unix_socket_tests {
         };
         state
             .replica_coordinator
-            .change_history_repository().record_group_block_provenance("group-versions", std::slice::from_ref(&v2_block.hash))
+            .change_history_repository()
+            .record_group_block_provenance("group-versions", std::slice::from_ref(&v2_block.hash))
             .unwrap();
         state
             .replica_coordinator
-            .file_index_repository().upsert_file_with_origin(
+            .file_index_repository()
+            .upsert_file_with_origin(
                 "group-versions",
                 &yadorilink_replica_domain::file::FileRecord {
                     path: "notes.txt".into(),
@@ -1096,7 +1140,11 @@ mod unix_socket_tests {
         assert!(matches!(resp.payload, Some(RespPayload::RestoreVersion(_))), "{resp:?}");
 
         assert_eq!(std::fs::read(folder.join("notes.txt")).unwrap(), b"version one");
-        let versions = state.replica_coordinator.sqlite().dag_list_versions("group-versions", "notes.txt").unwrap();
+        let versions = state
+            .replica_coordinator
+            .sqlite()
+            .dag_list_versions("group-versions", "notes.txt")
+            .unwrap();
         assert_eq!(versions.len(), 3, "restore must add a new version, not rewrite history");
         assert_eq!(versions[0].version_seq, 3);
         assert_eq!(versions[0].blocks, vec![v1_block]);
@@ -1136,14 +1184,16 @@ mod unix_socket_tests {
         // round_trips_through_control_socket` above.
         state
             .replica_coordinator
-            .change_history_repository().record_group_block_provenance(
+            .change_history_repository()
+            .record_group_block_provenance(
                 "group-default-restore",
                 std::slice::from_ref(&v1_block.hash),
             )
             .unwrap();
         state
             .replica_coordinator
-            .file_index_repository().upsert_file_with_origin(
+            .file_index_repository()
+            .upsert_file_with_origin(
                 "group-default-restore",
                 &yadorilink_replica_domain::file::FileRecord {
                     path: "todo.txt".into(),
@@ -1160,11 +1210,13 @@ mod unix_socket_tests {
         let v2_hash = hex::decode(state.block_store.put(b"second content").unwrap()).unwrap();
         state
             .replica_coordinator
-            .change_history_repository().record_group_block_provenance("group-default-restore", std::slice::from_ref(&v2_hash))
+            .change_history_repository()
+            .record_group_block_provenance("group-default-restore", std::slice::from_ref(&v2_hash))
             .unwrap();
         state
             .replica_coordinator
-            .file_index_repository().upsert_file_with_origin(
+            .file_index_repository()
+            .upsert_file_with_origin(
                 "group-default-restore",
                 &yadorilink_replica_domain::file::FileRecord {
                     path: "todo.txt".into(),
@@ -1213,7 +1265,8 @@ mod unix_socket_tests {
         .await;
         state
             .replica_coordinator
-            .file_index_repository().upsert_file_with_origin(
+            .file_index_repository()
+            .upsert_file_with_origin(
                 "group-no-superseded",
                 &yadorilink_replica_domain::file::FileRecord {
                     path: "solo.txt".into(),
@@ -1276,7 +1329,8 @@ mod unix_socket_tests {
         };
         state
             .replica_coordinator
-            .file_index_repository().upsert_file_with_origin(
+            .file_index_repository()
+            .upsert_file_with_origin(
                 "group-missing-blocks",
                 &yadorilink_replica_domain::file::FileRecord {
                     path: "phantom.bin".into(),
@@ -1342,11 +1396,13 @@ mod unix_socket_tests {
         // round_trips_through_control_socket` above.
         state
             .replica_coordinator
-            .change_history_repository().record_group_block_provenance("group-trash", std::slice::from_ref(&block.hash))
+            .change_history_repository()
+            .record_group_block_provenance("group-trash", std::slice::from_ref(&block.hash))
             .unwrap();
         state
             .replica_coordinator
-            .file_index_repository().upsert_file_with_origin(
+            .file_index_repository()
+            .upsert_file_with_origin(
                 "group-trash",
                 &yadorilink_replica_domain::file::FileRecord {
                     path: "gone.txt".into(),
@@ -1361,7 +1417,8 @@ mod unix_socket_tests {
             .unwrap();
         state
             .replica_coordinator
-            .file_index_repository().mark_deleted(
+            .file_index_repository()
+            .mark_deleted(
                 "group-trash",
                 "gone.txt",
                 "device-a",
@@ -1389,7 +1446,12 @@ mod unix_socket_tests {
         assert!(matches!(resp.payload, Some(RespPayload::RestoreTrash(_))), "{resp:?}");
 
         assert_eq!(std::fs::read(folder.join("gone.txt")).unwrap(), b"soon deleted");
-        let current = state.replica_coordinator.file_index_repository().get_file("group-trash", "gone.txt").unwrap().unwrap();
+        let current = state
+            .replica_coordinator
+            .file_index_repository()
+            .get_file("group-trash", "gone.txt")
+            .unwrap()
+            .unwrap();
         assert!(!current.deleted, "the file must be live again after a trash restore");
     }
 } // mod unix_socket_tests
@@ -1407,6 +1469,7 @@ mod windows_pipe_tests {
 
     use tokio::net::windows::named_pipe::ClientOptions;
     use yadorilink_daemon::daemon_state::DaemonState;
+    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
     use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
     use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
     use yadorilink_ipc_proto::daemonctl::{
@@ -1415,7 +1478,6 @@ mod windows_pipe_tests {
     };
     use yadorilink_ipc_proto::framing::{read_message, write_message};
     use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 

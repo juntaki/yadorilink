@@ -57,15 +57,15 @@ use dst_support::oracle::GlobalOracle;
 use ed25519_dalek::SigningKey;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
-use yadorilink_local_storage::FsBlockStore;
-use yadorilink_replica_domain::ids::ChangeHash;
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
-use yadorilink_filesystem_sync::debounce::{self, DebounceConfig, FlushPathRequest};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+use yadorilink_filesystem_sync::debounce::{self, DebounceConfig, FlushPathRequest};
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
+use yadorilink_local_storage::FsBlockStore;
 use yadorilink_peer_session::peer_session::{
     ChangeAuthenticator, PeerSyncSession, PendingLocalChangeFlush,
 };
+use yadorilink_replica_domain::ids::ChangeHash;
+use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
 /// The change-history DAG replaces the legacy index-convergence wire this
 /// scenario used to drive propagation over. Each device signs the changes it

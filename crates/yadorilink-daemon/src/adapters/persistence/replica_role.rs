@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
+use crate::sync_error::SyncError;
 use yadorilink_replica_domain::session_state::FolderLink;
 use yadorilink_replica_domain::session_state::MaterializationPolicy;
-use crate::sync_error::SyncError;
 
 use crate::application::ports::ReplicaRoleRepository;
 use crate::daemon_state::DaemonState;
@@ -68,7 +68,11 @@ impl ReplicaRoleRepository for SyncStateReplicaRoleRepository {
     }
 
     fn remove_link(&self, local_path: &str) -> Result<(), SyncError> {
-        self.state.replica_coordinator.link_repository().remove_link(local_path).map_err(SyncError::from)
+        self.state
+            .replica_coordinator
+            .link_repository()
+            .remove_link(local_path)
+            .map_err(SyncError::from)
     }
 
     fn set_materialization_policy(

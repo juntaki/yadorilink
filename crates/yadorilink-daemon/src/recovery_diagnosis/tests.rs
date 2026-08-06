@@ -2,11 +2,13 @@
 //! (`super::classifier`), on top of B1's own identity tests
 //! (`super::identity::tests`).
 
-use yadorilink_replica_domain::session_state::{EnrollmentOperation, EnrollmentOperationState, MembershipCommitMode, MembershipDurabilityScope, MembershipOperation, MembershipOperationAction, MembershipOperationState, RoleLossAction, RoleLossOperation, RoleLossOperationState};
-use crate::recovery::{
-    LocalLinkEvidence, LocalObservation, PendingEnrollmentEvidence,
-};
+use crate::recovery::{LocalLinkEvidence, LocalObservation, PendingEnrollmentEvidence};
 use yadorilink_replica_domain::session_state::{EnrollmentKind, MaterializationPolicy};
+use yadorilink_replica_domain::session_state::{
+    EnrollmentOperation, EnrollmentOperationState, MembershipCommitMode, MembershipDurabilityScope,
+    MembershipOperation, MembershipOperationAction, MembershipOperationState, RoleLossAction,
+    RoleLossOperation, RoleLossOperationState,
+};
 
 use super::*;
 use crate::coordination_client::{
@@ -14,10 +16,8 @@ use crate::coordination_client::{
     MembershipOperationRecord, MembershipRemoteResult, MembershipRemoteStatus,
     RemoteEvidenceErrorCategory, RoleLossOperationRecord,
 };
+use crate::recovery::{EnrollmentLocalEvidence, MembershipLocalEvidence, RoleLossLocalEvidence};
 use crate::recovery_evidence::RemoteEvidence;
-use crate::recovery::{
-    EnrollmentLocalEvidence, MembershipLocalEvidence, RoleLossLocalEvidence,
-};
 
 // ============================== Enrollment fixtures ==============================
 

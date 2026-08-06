@@ -6,7 +6,9 @@
 //! types (`recovery_diagnosis`, `control_socket`) keeps compiling against
 //! the identical type, unchanged.
 
-use yadorilink_replica_domain::session_state::{MembershipCommitMode, MembershipDurabilityScope, MembershipOperation, MembershipOperationAction};
+use yadorilink_replica_domain::session_state::{
+    MembershipCommitMode, MembershipDurabilityScope, MembershipOperation, MembershipOperationAction,
+};
 
 /// The result of a successful role-loss commit -- this is entirely the
 /// coordination-plane's own view: it carries no root-digest/content field,

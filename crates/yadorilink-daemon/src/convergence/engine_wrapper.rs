@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use yadorilink_replica_domain::ids::ChangeHash;
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 use yadorilink_replica_domain::session_state::RetroactiveRepairOutcome;
+use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
 use crate::daemon_state::DaemonState;
 
@@ -94,8 +94,10 @@ pub async fn run(state: Arc<DaemonState>) {
 async fn run_ephemeral_conflict_copy_retire_loop(state: Arc<DaemonState>) {
     loop {
         let replica_coordinator_for_links = state.replica_coordinator.clone();
-        let groups = match tokio::task::spawn_blocking(move || replica_coordinator_for_links.link_repository().list_links())
-            .await
+        let groups = match tokio::task::spawn_blocking(move || {
+            replica_coordinator_for_links.link_repository().list_links()
+        })
+        .await
         {
             Ok(Ok(links)) => links
                 .into_iter()
@@ -174,8 +176,10 @@ async fn run_retroactive_repair_loop(state: Arc<DaemonState>) {
 
     loop {
         let replica_coordinator_for_links = state.replica_coordinator.clone();
-        let groups = match tokio::task::spawn_blocking(move || replica_coordinator_for_links.link_repository().list_links())
-            .await
+        let groups = match tokio::task::spawn_blocking(move || {
+            replica_coordinator_for_links.link_repository().list_links()
+        })
+        .await
         {
             Ok(Ok(links)) => links
                 .into_iter()

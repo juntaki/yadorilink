@@ -29,7 +29,13 @@ impl HandoffReadinessPort for DaemonHandoffReadinessReader {
     ) -> BoxFutureAlias<'a, Result<Vec<String>, SyncError>> {
         Box::pin(async move {
             let candidate_groups: Vec<String> = if group_id.is_empty() {
-                self.state.replica_coordinator.link_repository().list_links()?.into_iter().map(|l| l.group_id).collect()
+                self.state
+                    .replica_coordinator
+                    .link_repository()
+                    .list_links()?
+                    .into_iter()
+                    .map(|l| l.group_id)
+                    .collect()
             } else {
                 vec![group_id.to_string()]
             };

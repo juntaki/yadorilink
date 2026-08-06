@@ -228,8 +228,7 @@ where
                 stack.push(*parent);
                 continue;
             }
-            if source.compacted_parent_auth(group_id, &hash, parent).map_err(store_err)?.is_none()
-            {
+            if source.compacted_parent_auth(group_id, &hash, parent).map_err(store_err)?.is_none() {
                 return Err(AuthenticatedHistoryError::InvalidHistory(format!(
                     "change {} parent {} is missing and not proven to be a compacted \
                      checkpoint-boundary parent under the group's current HistoryBase",

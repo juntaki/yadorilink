@@ -25,7 +25,11 @@ impl DaemonPauseResumeAdapter {
 
 impl LinkPauseResumePort for DaemonPauseResumeAdapter {
     fn pause(&self, local_path: &str) -> Result<(), SyncError> {
-        self.state.replica_coordinator.link_repository().set_paused(local_path, true).map_err(SyncError::from)
+        self.state
+            .replica_coordinator
+            .link_repository()
+            .set_paused(local_path, true)
+            .map_err(SyncError::from)
     }
 
     fn resume<'a>(&'a self, local_path: &'a str) -> BoxFuture<'a, Result<(), SyncError>> {

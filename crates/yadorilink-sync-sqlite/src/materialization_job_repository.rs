@@ -76,7 +76,8 @@ impl MaterializationJobRepository {
         group_id: &str,
         path: &str,
     ) -> Result<Option<MaterializationJob>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| materialization_jobs::get_job(conn, group_id, path))
+        self.database
+            .read::<_, SyncSqliteError>(|conn| materialization_jobs::get_job(conn, group_id, path))
     }
 
     /// Transitions `(group_id, path)`'s job state; see
@@ -223,8 +224,13 @@ impl MaterializationJobRepository {
     /// `materialization_jobs::recover_after_restart`'s doc comment for why
     /// this must NOT be implemented via `materialization_enqueue_pending`.
     /// Returns the number of rows re-armed.
-    pub fn materialization_recover_after_restart(&self, now: i64) -> Result<usize, SyncSqliteError> {
-        self.database.write::<_, SyncSqliteError>(|conn| materialization_jobs::recover_after_restart(conn, now))
+    pub fn materialization_recover_after_restart(
+        &self,
+        now: i64,
+    ) -> Result<usize, SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            materialization_jobs::recover_after_restart(conn, now)
+        })
     }
 
     /// Records the durable "materialization write in progress" intent for

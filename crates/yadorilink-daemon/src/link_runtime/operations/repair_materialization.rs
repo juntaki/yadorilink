@@ -19,12 +19,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use yadorilink_local_storage::BlockStore;
+use crate::sync_error::SyncError;
 use yadorilink_filesystem_sync::materialization_repair::{
     MaterializationRepairReport, RestoreRecoveryReport,
 };
+use yadorilink_local_storage::BlockStore;
 use yadorilink_root_authority::root_commit::RootLease;
-use crate::sync_error::SyncError;
 
 use crate::replica_coordinator::ReplicaCoordinator;
 

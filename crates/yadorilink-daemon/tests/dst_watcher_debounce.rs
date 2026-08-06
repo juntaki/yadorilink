@@ -28,13 +28,13 @@ use std::time::Duration;
 
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
-use yadorilink_local_storage::FsBlockStore;
-use yadorilink_filesystem_sync::debounce::{self, DebounceConfig};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_capture::LocalChangeProcessor;
+use yadorilink_filesystem_sync::debounce::{self, DebounceConfig};
 use yadorilink_filesystem_sync::watcher::{
     FolderWatchSource, FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
 };
+use yadorilink_local_capture::LocalChangeProcessor;
+use yadorilink_local_storage::FsBlockStore;
 
 use dst_support::{check_no_silent_data_loss, format_violations, WriteOracle};
 
@@ -74,7 +74,8 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
     let store_dir = tempfile::tempdir().map_err(|e| format!("store tempdir: {e}"))?;
     let store =
         Arc::new(FsBlockStore::new(store_dir.path()).map_err(|e| format!("block store: {e}"))?);
-    let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| format!("sync state: {e}"))?);
+    let sync_state =
+        Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| format!("sync state: {e}"))?);
     dst_support::link::link_and_start(&sync_state, &root, GROUP_ID)
         .map_err(|e| format!("link_and_start: {e}"))?;
     let processor =

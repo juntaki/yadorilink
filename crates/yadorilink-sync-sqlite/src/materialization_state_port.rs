@@ -131,7 +131,11 @@ pub trait MaterializationStatePort: Send + Sync {
         path: &str,
     ) -> Result<Option<CurrentVersionRecord>, SyncSqliteError>;
 
-    fn get_record_kind(&self, group_id: &str, path: &str) -> Result<Option<RecordKind>, SyncSqliteError>;
+    fn get_record_kind(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<RecordKind>, SyncSqliteError>;
 
     fn get_file(&self, group_id: &str, path: &str) -> Result<Option<FileRecord>, SyncSqliteError>;
 
@@ -191,7 +195,11 @@ pub trait MaterializationStatePort: Send + Sync {
         group_id: &str,
     ) -> Result<HashMap<String, MaterializationState>, SyncSqliteError>;
 
-    fn has_materialization_intent(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError>;
+    fn has_materialization_intent(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, SyncSqliteError>;
 
     /// Clears the durable materialization-write-in-progress intent once the
     /// write + rename + fsync has completed for `(group_id, path)`.
@@ -304,7 +312,10 @@ pub trait MaterializationStatePort: Send + Sync {
 
     /// Every open crash-safe restore-journal entry for `group_id` -- the
     /// engine's own startup recovery pass replays these.
-    fn list_restore_operations(&self, group_id: &str) -> Result<Vec<RestoreOperation>, SyncSqliteError>;
+    fn list_restore_operations(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<RestoreOperation>, SyncSqliteError>;
 
     /// Atomically publishes the exact journaled restore version and removes
     /// its recovery marker, so a second recovery pass observes no row and

@@ -73,7 +73,10 @@ pub fn block_size_for(file_size: u64) -> usize {
 /// Reads `path`, splits it into fixed-size blocks, stores each block via
 /// `store` (deduplicating against anything already held), and returns the
 /// block list describing how to reconstruct the file.
-pub fn chunk_file(store: &dyn BlockContentStore, path: &Path) -> Result<Vec<BlockInfo>, StorageError> {
+pub fn chunk_file(
+    store: &dyn BlockContentStore,
+    path: &Path,
+) -> Result<Vec<BlockInfo>, StorageError> {
     let metadata = fs::metadata(path)?;
     let block_size = block_size_for(metadata.len());
 

@@ -423,7 +423,10 @@ impl LinkRepository {
     /// sorting first, the LIVE folder is materialized under the DEAD folder's
     /// symlink policy. Pinned by
     /// `an_orphaned_rows_symlink_opt_in_does_not_decide_the_live_links_policy`.
-    pub fn windows_symlink_opt_in_for_group(&self, group_id: &str) -> Result<bool, SyncSqliteError> {
+    pub fn windows_symlink_opt_in_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<bool, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             Self::ensure_unambiguous_group_on_conn(conn, group_id, None)?;
             let opt_in: Option<i64> = conn
@@ -631,15 +634,20 @@ impl LinkRepository {
     /// read-side seam callers outside this module use to refuse an ambiguous
     /// group before doing anything else.
     pub fn ensure_unambiguous_group(&self, group_id: &str) -> Result<(), SyncSqliteError> {
-        self.database
-            .read::<_, SyncSqliteError>(|conn| Self::ensure_unambiguous_group_on_conn(conn, group_id, None))
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            Self::ensure_unambiguous_group_on_conn(conn, group_id, None)
+        })
     }
 
     /// Every live `local_path` for `group_id`, refusing the ambiguous case.
     /// The `Vec` is empty or one element; anything else is
     /// [`SyncSqliteError::AmbiguousLink`].
-    pub fn live_link_paths_for_group(&self, group_id: &str) -> Result<Vec<String>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| Self::live_link_paths_on_conn(conn, group_id))
+    pub fn live_link_paths_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<String>, SyncSqliteError> {
+        self.database
+            .read::<_, SyncSqliteError>(|conn| Self::live_link_paths_on_conn(conn, group_id))
     }
 
     /// The one live `local_path` for `group_id`, or `None` if the group has no

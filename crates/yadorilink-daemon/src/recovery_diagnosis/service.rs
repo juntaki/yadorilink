@@ -25,11 +25,11 @@
 //! unbounded wait on a reconciler that keeps moving the target.
 
 use crate::recovery::{
-    LocalRecoveryEvidence, RecoveryLocalSnapshot, RecoveryOperationKey,
-    RecoveryOperationSummary, RecoverySnapshotRevision,
+    LocalRecoveryEvidence, RecoveryLocalSnapshot, RecoveryOperationKey, RecoveryOperationSummary,
+    RecoverySnapshotRevision,
 };
-use yadorilink_replica_domain::recovery::RecoveryDomain;
 use crate::sync_error::SyncError;
+use yadorilink_replica_domain::recovery::RecoveryDomain;
 
 use crate::coordination_client::{
     EnrollmentOperationRecord, MembershipOperationRecord, RoleLossOperationRecord,
@@ -122,37 +122,39 @@ pub(crate) async fn diagnose_stable<S>(
 where
     S: RecoveryEvidenceSource,
 {
-    let before_evidence = match replica_coordinator.recovery_snapshot_reader().recovery_local_snapshot(key)? {
-        RecoveryLocalSnapshot::Found(evidence) => *evidence,
-        RecoveryLocalSnapshot::OperationNotFound { key } => {
-            return Ok(StableDiagnosisOutcome::OperationNotFound { key });
-        }
-        RecoveryLocalSnapshot::InvalidOperation { key, raw_state, detail } => {
-            return Ok(StableDiagnosisOutcome::InvalidOperation { key, raw_state, detail });
-        }
-    };
+    let before_evidence =
+        match replica_coordinator.recovery_snapshot_reader().recovery_local_snapshot(key)? {
+            RecoveryLocalSnapshot::Found(evidence) => *evidence,
+            RecoveryLocalSnapshot::OperationNotFound { key } => {
+                return Ok(StableDiagnosisOutcome::OperationNotFound { key });
+            }
+            RecoveryLocalSnapshot::InvalidOperation { key, raw_state, detail } => {
+                return Ok(StableDiagnosisOutcome::InvalidOperation { key, raw_state, detail });
+            }
+        };
     let before_revision = before_evidence.revision();
     let operation = before_evidence.summary();
 
     let remote = lookup_for_domain(evidence_source, key).await;
 
-    let after_evidence = match replica_coordinator.recovery_snapshot_reader().recovery_local_snapshot(key)? {
-        RecoveryLocalSnapshot::Found(evidence) => *evidence,
-        RecoveryLocalSnapshot::OperationNotFound { .. } => {
-            return Ok(StableDiagnosisOutcome::LocalEvidenceChanged {
-                key: key.clone(),
-                before: before_revision,
-                after: SnapshotAfterLookup::OperationNotFound,
-            });
-        }
-        RecoveryLocalSnapshot::InvalidOperation { raw_state, detail, .. } => {
-            return Ok(StableDiagnosisOutcome::LocalEvidenceChanged {
-                key: key.clone(),
-                before: before_revision,
-                after: SnapshotAfterLookup::InvalidOperation { raw_state, detail },
-            });
-        }
-    };
+    let after_evidence =
+        match replica_coordinator.recovery_snapshot_reader().recovery_local_snapshot(key)? {
+            RecoveryLocalSnapshot::Found(evidence) => *evidence,
+            RecoveryLocalSnapshot::OperationNotFound { .. } => {
+                return Ok(StableDiagnosisOutcome::LocalEvidenceChanged {
+                    key: key.clone(),
+                    before: before_revision,
+                    after: SnapshotAfterLookup::OperationNotFound,
+                });
+            }
+            RecoveryLocalSnapshot::InvalidOperation { raw_state, detail, .. } => {
+                return Ok(StableDiagnosisOutcome::LocalEvidenceChanged {
+                    key: key.clone(),
+                    before: before_revision,
+                    after: SnapshotAfterLookup::InvalidOperation { raw_state, detail },
+                });
+            }
+        };
 
     // The correctness check is this full-value comparison, not the
     // revisions -- see this module's own doc comment. `revision()` below
@@ -202,8 +204,12 @@ mod tests {
     use std::sync::Arc;
 
     use tokio::sync::Notify;
-    use yadorilink_replica_domain::session_state::{EnrollmentOperation, EnrollmentOperationState, MembershipCommitMode, MembershipDurabilityScope, MembershipOperationAction, MembershipOperationState, RoleLossAction, RoleLossOperationParams};
     use yadorilink_replica_domain::session_state::EnrollmentKind;
+    use yadorilink_replica_domain::session_state::{
+        EnrollmentOperation, EnrollmentOperationState, MembershipCommitMode,
+        MembershipDurabilityScope, MembershipOperationAction, MembershipOperationState,
+        RoleLossAction, RoleLossOperationParams,
+    };
 
     use super::*;
     use crate::coordination_client::{
@@ -233,7 +239,8 @@ mod tests {
 
     fn insert_enrollment_op(state: &ReplicaCoordinator, operation_id: &str) {
         state
-            .enrollment_repository().try_insert_enrollment_operation(&EnrollmentOperation {
+            .enrollment_repository()
+            .try_insert_enrollment_operation(&EnrollmentOperation {
                 operation_id: operation_id.to_string(),
                 kind: EnrollmentKind::Create,
                 group_id: Some("group-1".to_string()),
@@ -252,7 +259,8 @@ mod tests {
 
     fn insert_membership_op(state: &ReplicaCoordinator, operation_id: &str) {
         state
-            .membership_operation_repository().try_insert_membership_operation(
+            .membership_operation_repository()
+            .try_insert_membership_operation(
                 operation_id,
                 MembershipOperationAction::Revoke,
                 MembershipCommitMode::PlainRevoke,
@@ -271,7 +279,8 @@ mod tests {
 
     fn insert_role_loss_op(state: &ReplicaCoordinator, operation_id: &str) {
         state
-            .role_loss_operation_repository().insert_role_loss_operation(
+            .role_loss_operation_repository()
+            .insert_role_loss_operation(
                 operation_id,
                 "group-1",
                 RoleLossOperationParams {
@@ -591,7 +600,8 @@ mod tests {
 
         let outcome = run_race(state.clone(), key, source, entered, proceed, |state| {
             state
-                .enrollment_repository().mark_enrollment_operation_state(
+                .enrollment_repository()
+                .mark_enrollment_operation_state(
                     "op-1",
                     EnrollmentOperationState::CancelPending,
                     None,
@@ -623,7 +633,10 @@ mod tests {
         let outcome = run_race(state.clone(), key, source, entered, proceed, |state| {
             // Same `now_unix` (1) as the original row's own `updated_at_unix`
             // -- only `attempts` actually changes.
-            state.enrollment_repository().increment_enrollment_operation_attempts("op-1", 1).unwrap();
+            state
+                .enrollment_repository()
+                .increment_enrollment_operation_attempts("op-1", 1)
+                .unwrap();
         })
         .await;
 
@@ -664,7 +677,8 @@ mod tests {
 
         let outcome = run_race(state.clone(), key, source, entered, proceed, |state| {
             state
-                .enrollment_repository().add_link_with_pending_enrollment(
+                .enrollment_repository()
+                .add_link_with_pending_enrollment(
                     "/home/alice/Photos",
                     "group-1",
                     &PendingEnrollment {
@@ -694,7 +708,10 @@ mod tests {
         let key = membership_key("op-1");
 
         let outcome = run_race(state.clone(), key, source, entered, proceed, |state| {
-            state.role_loss_operation_repository().latch_group_durability_unknown("group-1").unwrap();
+            state
+                .role_loss_operation_repository()
+                .latch_group_durability_unknown("group-1")
+                .unwrap();
         })
         .await;
 
@@ -793,7 +810,10 @@ mod tests {
 
         assert_eq!(before, state.enrollment_repository().get_enrollment_operation("op-1").unwrap());
         assert_eq!(before_links, state.link_repository().list_links().unwrap());
-        assert_eq!(before_markers, state.enrollment_repository().list_pending_enrollments().unwrap());
+        assert_eq!(
+            before_markers,
+            state.enrollment_repository().list_pending_enrollments().unwrap()
+        );
     }
 
     // ===== Wire conversion (Phase 2.1-C2-C2) =====

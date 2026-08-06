@@ -117,8 +117,9 @@ mod tests {
         let peer_public = PublicKey::from(&StaticSecret::from([2u8; 32]));
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let hub = yadorilink_transport::TransportHub::from_socket(socket, None);
-        let channel: Arc<PeerChannel> =
-            Arc::new(PeerChannel::connect(local_secret, peer_public, 0, Vec::new(), hub).await.unwrap());
+        let channel: Arc<PeerChannel> = Arc::new(
+            PeerChannel::connect(local_secret, peer_public, 0, Vec::new(), hub).await.unwrap(),
+        );
 
         let port: Arc<dyn PeerMessageChannel> = channel;
         port.enable_reliable_delivery();

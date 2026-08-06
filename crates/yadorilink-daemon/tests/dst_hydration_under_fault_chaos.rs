@@ -61,14 +61,14 @@ use dst_support::case_ir::{
 use ed25519_dalek::SigningKey;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::{BlockStore, FsBlockStore};
+use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_replica_domain::change::{Change, ChangeAuth, Op as ChangeOp, PutOrigin};
+use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
 use yadorilink_replica_domain::ids::{BlockHash, DeviceId, FolderGroupId, SyncPath};
-use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
 use yadorilink_transport::PeerChannel;
 
 const GROUP_ID: &str = "dst-hydration-group";

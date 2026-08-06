@@ -19,11 +19,11 @@ use std::sync::Arc;
 use yadorilink_cli::control_client;
 use yadorilink_cli::error::CliError;
 use yadorilink_daemon::daemon_state::DaemonState;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{ListTrashRequest, ListVersionsRequest};
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
@@ -51,11 +51,9 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
         yadorilink_daemon::control_context::ControlContext::from_state(state.clone()),
     );
     tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
-            &serve_path,
-            serve_context,
-        )
-            .await;
+        let _ =
+            yadorilink_daemon::control_socket::unix_transport::serve(&serve_path, serve_context)
+                .await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     (dir, state)
@@ -77,7 +75,8 @@ fn put_and_record(state: &DaemonState, group_id: &str, data: &[u8]) -> Vec<u8> {
     let hash_bytes = hex::decode(&hash_hex).unwrap();
     state
         .replica_coordinator
-        .change_history_repository().record_group_block_provenance(group_id, std::slice::from_ref(&hash_bytes))
+        .change_history_repository()
+        .record_group_block_provenance(group_id, std::slice::from_ref(&hash_bytes))
         .unwrap();
     hash_bytes
 }
@@ -100,19 +99,35 @@ async fn versions_command_lists_all_retained_versions_newest_first_including_cur
     let (dir, state) = start_daemon().await;
     let folder = dir.path().join("docs");
     std::fs::create_dir_all(&folder).unwrap();
-    state.replica_coordinator.link_repository().add_link(&folder.to_string_lossy(), "group-1").unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&folder.to_string_lossy(), "group-1")
+        .unwrap();
 
     let v1_bytes = put_and_record(&state, "group-1", b"first");
     let v1_block = BlockInfo { hash: v1_bytes, offset: 0, size: 5 };
     state
         .replica_coordinator
-        .file_index_repository().upsert_file_with_origin("group-1", &record("notes.txt", 1, vec![v1_block], 5), "device-a", &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests())
+        .file_index_repository()
+        .upsert_file_with_origin(
+            "group-1",
+            &record("notes.txt", 1, vec![v1_block], 5),
+            "device-a",
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
         .unwrap();
     let v2_bytes = put_and_record(&state, "group-1", b"second!");
     let v2_block = BlockInfo { hash: v2_bytes, offset: 0, size: 7 };
     state
         .replica_coordinator
-        .file_index_repository().upsert_file_with_origin("group-1", &record("notes.txt", 2, vec![v2_block], 7), "device-a", &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests())
+        .file_index_repository()
+        .upsert_file_with_origin(
+            "group-1",
+            &record("notes.txt", 2, vec![v2_block], 7),
+            "device-a",
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
         .unwrap();
 
     let path = folder.join("notes.txt").to_string_lossy().to_string();
@@ -139,25 +154,40 @@ async fn restore_command_restores_a_specific_version_as_a_new_current_version() 
     let (dir, state) = start_daemon().await;
     let folder = dir.path().join("docs");
     std::fs::create_dir_all(&folder).unwrap();
-    state.replica_coordinator.link_repository().add_link(&folder.to_string_lossy(), "group-1").unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&folder.to_string_lossy(), "group-1")
+        .unwrap();
     // Writing a restored version back to disk verifies the root's adopted
     // identity first -- a direct `add_link` (never a real
     // `start_link_watch`) leaves no adopted root token behind, so this
     // fixture must adopt one itself, mirroring `yadorilink-daemon`'s own
     // `hydration.rs::seed_link` test helper.
-    yadorilink_root_authority::root_identity::VerifiedRoot::open(&folder, "group-1", state.replica_coordinator.as_ref())
-        .unwrap();
+    yadorilink_root_authority::root_identity::VerifiedRoot::open(
+        &folder,
+        "group-1",
+        state.replica_coordinator.as_ref(),
+    )
+    .unwrap();
 
     let v1_bytes = put_and_record(&state, "group-1", b"original");
     let v1_block = BlockInfo { hash: v1_bytes, offset: 0, size: 8 };
     state
         .replica_coordinator
-        .file_index_repository().upsert_file_with_origin("group-1", &record("todo.txt", 1, vec![v1_block], 8), "device-a", &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests())
+        .file_index_repository()
+        .upsert_file_with_origin(
+            "group-1",
+            &record("todo.txt", 1, vec![v1_block], 8),
+            "device-a",
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
         .unwrap();
     let v2_bytes = put_and_record(&state, "group-1", b"edited!!");
     state
         .replica_coordinator
-        .file_index_repository().upsert_file_with_origin(
+        .file_index_repository()
+        .upsert_file_with_origin(
             "group-1",
             &record("todo.txt", 2, vec![BlockInfo { hash: v2_bytes, offset: 0, size: 8 }], 8),
             "device-a",
@@ -169,7 +199,8 @@ async fn restore_command_restores_a_specific_version_as_a_new_current_version() 
     yadorilink_cli::commands::version_history::restore(path.clone(), Some(1)).await.unwrap();
 
     assert_eq!(std::fs::read(folder.join("todo.txt")).unwrap(), b"original");
-    let versions = state.replica_coordinator.sqlite().dag_list_versions("group-1", "todo.txt").unwrap();
+    let versions =
+        state.replica_coordinator.sqlite().dag_list_versions("group-1", "todo.txt").unwrap();
     assert_eq!(versions.len(), 3, "restore must add a new version, not rewrite history");
 }
 
@@ -181,21 +212,41 @@ async fn restore_command_without_version_defaults_to_most_recent_superseded() {
     let (dir, state) = start_daemon().await;
     let folder = dir.path().join("docs");
     std::fs::create_dir_all(&folder).unwrap();
-    state.replica_coordinator.link_repository().add_link(&folder.to_string_lossy(), "group-1").unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&folder.to_string_lossy(), "group-1")
+        .unwrap();
     // See `restore_command_restores_a_specific_version_as_a_new_current_version`'s
     // identical comment.
-    yadorilink_root_authority::root_identity::VerifiedRoot::open(&folder, "group-1", state.replica_coordinator.as_ref())
-        .unwrap();
+    yadorilink_root_authority::root_identity::VerifiedRoot::open(
+        &folder,
+        "group-1",
+        state.replica_coordinator.as_ref(),
+    )
+    .unwrap();
 
     let v1_bytes = put_and_record(&state, "group-1", b"first");
     let v1_block = BlockInfo { hash: v1_bytes, offset: 0, size: 5 };
     state
         .replica_coordinator
-        .file_index_repository().upsert_file_with_origin("group-1", &record("todo.txt", 1, vec![v1_block], 5), "device-a", &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests())
+        .file_index_repository()
+        .upsert_file_with_origin(
+            "group-1",
+            &record("todo.txt", 1, vec![v1_block], 5),
+            "device-a",
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
         .unwrap();
     state
         .replica_coordinator
-        .file_index_repository().upsert_file_with_origin("group-1", &record("todo.txt", 2, vec![], 0), "device-a", &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests())
+        .file_index_repository()
+        .upsert_file_with_origin(
+            "group-1",
+            &record("todo.txt", 2, vec![], 0),
+            "device-a",
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
         .unwrap();
 
     let path = folder.join("todo.txt").to_string_lossy().to_string();
@@ -214,7 +265,11 @@ async fn restore_command_fails_clearly_and_exits_non_zero_on_missing_blocks() {
     let (dir, state) = start_daemon().await;
     let folder = dir.path().join("docs");
     std::fs::create_dir_all(&folder).unwrap();
-    state.replica_coordinator.link_repository().add_link(&folder.to_string_lossy(), "group-1").unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&folder.to_string_lossy(), "group-1")
+        .unwrap();
 
     // A version referencing a block never actually written to this
     // device's block store.
@@ -228,7 +283,8 @@ async fn restore_command_fails_clearly_and_exits_non_zero_on_missing_blocks() {
     };
     state
         .replica_coordinator
-        .file_index_repository().upsert_file_with_origin(
+        .file_index_repository()
+        .upsert_file_with_origin(
             "group-1",
             &record("phantom.bin", 1, vec![phantom_block], 13),
             "device-a",
@@ -259,16 +315,35 @@ async fn trash_list_then_trash_restore_recovers_a_deleted_file() {
     state.replica_coordinator.link_repository().add_link(&local_path, "group-1").unwrap();
     // See `restore_command_restores_a_specific_version_as_a_new_current_version`'s
     // identical comment -- `trash restore` writes back to disk the same way.
-    yadorilink_root_authority::root_identity::VerifiedRoot::open(&folder, "group-1", state.replica_coordinator.as_ref())
-        .unwrap();
+    yadorilink_root_authority::root_identity::VerifiedRoot::open(
+        &folder,
+        "group-1",
+        state.replica_coordinator.as_ref(),
+    )
+    .unwrap();
 
     let hash_bytes = put_and_record(&state, "group-1", b"soon deleted");
     let block = BlockInfo { hash: hash_bytes, offset: 0, size: 12 };
     state
         .replica_coordinator
-        .file_index_repository().upsert_file_with_origin("group-1", &record("gone.txt", 1, vec![block], 12), "device-a", &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests())
+        .file_index_repository()
+        .upsert_file_with_origin(
+            "group-1",
+            &record("gone.txt", 1, vec![block], 12),
+            "device-a",
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
         .unwrap();
-    state.replica_coordinator.file_index_repository().mark_deleted("group-1", "gone.txt", "device-a", &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+    state
+        .replica_coordinator
+        .file_index_repository()
+        .mark_deleted(
+            "group-1",
+            "gone.txt",
+            "device-a",
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     yadorilink_cli::commands::version_history::trash_list().await.unwrap();
 
@@ -282,6 +357,11 @@ async fn trash_list_then_trash_restore_recovers_a_deleted_file() {
     yadorilink_cli::commands::version_history::trash_restore(path).await.unwrap();
 
     assert_eq!(std::fs::read(folder.join("gone.txt")).unwrap(), b"soon deleted");
-    let current = state.replica_coordinator.file_index_repository().get_file("group-1", "gone.txt").unwrap().unwrap();
+    let current = state
+        .replica_coordinator
+        .file_index_repository()
+        .get_file("group-1", "gone.txt")
+        .unwrap()
+        .unwrap();
     assert!(!current.deleted, "the file must be live again after trash restore");
 }

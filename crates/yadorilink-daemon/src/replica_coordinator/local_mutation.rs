@@ -59,10 +59,12 @@ use std::sync::Arc;
 use yadorilink_local_capture::ports::LocalMutationStore;
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 use yadorilink_replica_domain::ids::ChangeHash;
-use yadorilink_replica_domain::session_state::{ChangeContent, DirtyPath, LocalFileMetaColumns, MaterializationState};
+use yadorilink_replica_domain::session_state::{
+    ChangeContent, DirtyPath, LocalFileMetaColumns, MaterializationState,
+};
 use yadorilink_root_authority::root_commit::RootCommitPermit;
-use yadorilink_sync_sqlite::SyncSqliteError;
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
+use yadorilink_sync_sqlite::SyncSqliteError;
 
 use super::ReplicaCoordinator;
 
@@ -79,8 +81,7 @@ impl LocalMutationStore for ReplicaCoordinator {
         &self,
         group_id: &str,
     ) -> Result<HashMap<String, MaterializationState>, SyncSqliteError> {
-        self.materialization_state_repository()
-            .list_materialization_states(group_id)
+        self.materialization_state_repository().list_materialization_states(group_id)
     }
 
     fn get_materialization_state(
@@ -88,16 +89,22 @@ impl LocalMutationStore for ReplicaCoordinator {
         group_id: &str,
         path: &str,
     ) -> Result<Option<MaterializationState>, SyncSqliteError> {
-        self.materialization_state_repository()
-            .get_materialization_state(group_id, path)
+        self.materialization_state_repository().get_materialization_state(group_id, path)
     }
 
-    fn has_materialization_intent(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError> {
-        self.materialization_job_repository()
-            .has_materialization_intent(group_id, path)
+    fn has_materialization_intent(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, SyncSqliteError> {
+        self.materialization_job_repository().has_materialization_intent(group_id, path)
     }
 
-    fn get_record_kind(&self, group_id: &str, path: &str) -> Result<Option<RecordKind>, SyncSqliteError> {
+    fn get_record_kind(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<RecordKind>, SyncSqliteError> {
         self.file_index_repository().get_record_kind(group_id, path)
     }
 
@@ -108,11 +115,14 @@ impl LocalMutationStore for ReplicaCoordinator {
         kind: RecordKind,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.file_index_repository()
-            .set_record_kind(group_id, path, kind, permit)
+        self.file_index_repository().set_record_kind(group_id, path, kind, permit)
     }
 
-    fn get_symlink_target(&self, group_id: &str, path: &str) -> Result<Option<Vec<u8>>, SyncSqliteError> {
+    fn get_symlink_target(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, SyncSqliteError> {
         self.file_index_repository().get_symlink_target(group_id, path)
     }
 
@@ -122,8 +132,7 @@ impl LocalMutationStore for ReplicaCoordinator {
         path: &str,
         target: Option<&[u8]>,
     ) -> Result<(), SyncSqliteError> {
-        self.file_index_repository()
-            .set_symlink_target(group_id, path, target)
+        self.file_index_repository().set_symlink_target(group_id, path, target)
     }
 
     fn set_symlink_out_of_root(
@@ -132,8 +141,7 @@ impl LocalMutationStore for ReplicaCoordinator {
         path: &str,
         out_of_root: bool,
     ) -> Result<(), SyncSqliteError> {
-        self.file_index_repository()
-            .set_symlink_out_of_root(group_id, path, out_of_root)
+        self.file_index_repository().set_symlink_out_of_root(group_id, path, out_of_root)
     }
 
     fn get_exec_bit(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError> {
@@ -147,8 +155,7 @@ impl LocalMutationStore for ReplicaCoordinator {
         exec_bit: bool,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.file_index_repository()
-            .set_exec_bit(group_id, path, exec_bit, permit)
+        self.file_index_repository().set_exec_bit(group_id, path, exec_bit, permit)
     }
 
     fn dag_group_heads(&self, group_id: &str) -> Result<Vec<ChangeHash>, SyncSqliteError> {
@@ -185,8 +192,12 @@ impl LocalMutationStore for ReplicaCoordinator {
         origin_device_id: &str,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.file_index_repository()
-            .upsert_file_with_origin(group_id, record, origin_device_id, permit)
+        self.file_index_repository().upsert_file_with_origin(
+            group_id,
+            record,
+            origin_device_id,
+            permit,
+        )
     }
 
     fn upsert_files_batch(
@@ -196,8 +207,7 @@ impl LocalMutationStore for ReplicaCoordinator {
         origin_device_id: &str,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.file_index_repository()
-            .upsert_files_batch(group_id, records, origin_device_id, permit)
+        self.file_index_repository().upsert_files_batch(group_id, records, origin_device_id, permit)
     }
 
     fn upsert_files_batch_emitting_change(
@@ -231,8 +241,13 @@ impl LocalMutationStore for ReplicaCoordinator {
         observed_at_unix_nanos: i64,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.file_index_repository()
-            .mark_deleted_at(group_id, path, device_id, observed_at_unix_nanos, permit)
+        self.file_index_repository().mark_deleted_at(
+            group_id,
+            path,
+            device_id,
+            observed_at_unix_nanos,
+            permit,
+        )
     }
 
     fn mark_deleted_emitting_change(
@@ -270,8 +285,7 @@ impl LocalMutationStore for ReplicaCoordinator {
         group_id: &str,
         block_hashes: &[Vec<u8>],
     ) -> Result<(), SyncSqliteError> {
-        self.change_history_repository()
-            .record_group_block_provenance(group_id, block_hashes)
+        self.change_history_repository().record_group_block_provenance(group_id, block_hashes)
     }
 
     fn record_dirty_path(
@@ -282,8 +296,13 @@ impl LocalMutationStore for ReplicaCoordinator {
         observed_at_unix_nanos: i64,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.dirty_path_repository()
-            .record_dirty_path(group_id, path, change_kind, observed_at_unix_nanos, permit)
+        self.dirty_path_repository().record_dirty_path(
+            group_id,
+            path,
+            change_kind,
+            observed_at_unix_nanos,
+            permit,
+        )
     }
 
     fn mark_dirty_path_attempt(
@@ -293,8 +312,7 @@ impl LocalMutationStore for ReplicaCoordinator {
         last_error: &str,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.dirty_path_repository()
-            .mark_dirty_path_attempt(group_id, path, last_error, permit)
+        self.dirty_path_repository().mark_dirty_path_attempt(group_id, path, last_error, permit)
     }
 
     fn clear_dirty_path(
@@ -303,8 +321,7 @@ impl LocalMutationStore for ReplicaCoordinator {
         path: &str,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.dirty_path_repository()
-            .clear_dirty_path(group_id, path, permit)
+        self.dirty_path_repository().clear_dirty_path(group_id, path, permit)
     }
 
     fn list_dirty_paths(&self, group_id: &str) -> Result<Vec<DirtyPath>, SyncSqliteError> {

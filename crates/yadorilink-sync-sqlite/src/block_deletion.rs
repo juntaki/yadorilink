@@ -13,10 +13,10 @@
 //! `BlockDeletionReason` itself did not move forward with it (its only
 //! non-default variant is never constructed anywhere in the workspace).
 
+use crate::SyncSqliteError;
 use yadorilink_filesystem_sync::block_liveness::BlockPhysicalDeletionGuard;
 use yadorilink_local_storage::{BlockReclamationStore, GcReport};
 use yadorilink_replica_domain::session_state::MaterializationState;
-use crate::SyncSqliteError;
 
 pub struct BlockDeletionCoordinator<'a> {
     store: &'a dyn BlockReclamationStore,

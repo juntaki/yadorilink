@@ -42,15 +42,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_ipc_proto::sync as proto;
+use yadorilink_peer_session::peer_session::{ChangeAuthenticator, RootCommitAuthorityProvider};
 use yadorilink_replica_domain::change::{Op, PutOrigin};
+use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
 use yadorilink_replica_domain::ids::{BlockHash, SyncPath};
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
-use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_peer_session::peer_session::{ChangeAuthenticator, RootCommitAuthorityProvider};
 use yadorilink_root_authority::root_commit::{RootCommitPermit, RootLease};
-use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
+use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
 /// A `RootCommitAuthorityProvider` that always grants a lease, backed by one
 /// process-lifetime `RootLease::for_tests()` per provider instance — the same
@@ -163,7 +163,10 @@ impl DagProducer {
         // (`record_group_block_provenance`'s doc comment): without this, a
         // peer session's block-serving/restore path refuses this block as
         // never having been obtained through the group.
-        self.state.change_history_repository().record_group_block_provenance(group_id, std::slice::from_ref(&hash)).unwrap();
+        self.state
+            .change_history_repository()
+            .record_group_block_provenance(group_id, std::slice::from_ref(&hash))
+            .unwrap();
         let size = content.len();
 
         let version = FileVersion::new(
@@ -276,7 +279,8 @@ impl DagProducer {
         assert_eq!(heads.len(), 1, "expected a single head right after a local commit");
         let change = self
             .state
-            .sqlite().dag_get_change(&heads[0])
+            .sqlite()
+            .dag_get_change(&heads[0])
             .expect("read the just-committed change")
             .expect("the just-committed change must be present");
         proto::ChangeBatch {

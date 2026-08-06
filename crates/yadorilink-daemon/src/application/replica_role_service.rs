@@ -4,8 +4,8 @@ use yadorilink_replica_domain::session_state::MaterializationPolicy;
 
 use super::model::{HandoffCommitResult, RoleLossCommitOutcome};
 use super::ports::{
-    HandoffReadinessPort, LinkRuntimePort, PlaceholderPipelineCapabilityPort, ReplicaRoleRepository,
-    RoleLossCoordination, RoleLossJournal,
+    HandoffReadinessPort, LinkRuntimePort, PlaceholderPipelineCapabilityPort,
+    ReplicaRoleRepository, RoleLossCoordination, RoleLossJournal,
 };
 
 pub(crate) fn demotion_handoff_lease_failure_message() -> String {

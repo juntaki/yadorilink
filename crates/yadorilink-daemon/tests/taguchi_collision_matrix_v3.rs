@@ -231,7 +231,12 @@ fn is_conflict_copy(name: &str) -> bool {
 }
 
 fn pause(device: &TestDevice) {
-    device.state.replica_coordinator.link_repository().set_paused(device.root.path().to_str().unwrap(), true).unwrap();
+    device
+        .state
+        .replica_coordinator
+        .link_repository()
+        .set_paused(device.root.path().to_str().unwrap(), true)
+        .unwrap();
 }
 
 /// Resumes every device in `devices` -- per `partition_reconnect_matrix.

@@ -24,10 +24,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use yadorilink_peer_session::block_serve::BlockServeEngine;
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+use yadorilink_peer_session::block_serve::BlockServeEngine;
 use yadorilink_peer_session::peer_session::{ChangeAuthenticator, PeerSyncSession};
+use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
 /// Heads-announce re-drive cadence. The `run()` loop's periodic frontier
 /// audit re-sends an idempotent `HeadsAnnounce` every

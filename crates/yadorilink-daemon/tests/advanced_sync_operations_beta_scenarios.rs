@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use tokio::net::UnixStream;
 use yadorilink_daemon::daemon_state::DaemonState;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
@@ -21,7 +22,6 @@ use yadorilink_ipc_proto::daemonctl::{
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 
 async fn start_daemon_with_state() -> (std::path::PathBuf, tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();

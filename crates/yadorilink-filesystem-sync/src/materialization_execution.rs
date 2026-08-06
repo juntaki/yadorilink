@@ -178,7 +178,11 @@ impl From<yadorilink_local_storage::StorageError> for MaterializationExecutionEr
 /// wider surface (see this module's own doc comment for why the wider trait
 /// itself does not move).
 pub trait MaterializationExecutionPort: Send + Sync {
-    fn get_exec_bit(&self, group_id: &str, path: &str) -> Result<bool, MaterializationExecutionError>;
+    fn get_exec_bit(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, MaterializationExecutionError>;
 
     fn get_file(
         &self,
@@ -210,7 +214,10 @@ pub trait MaterializationExecutionPort: Send + Sync {
     fn list_materialization_states(
         &self,
         group_id: &str,
-    ) -> Result<std::collections::HashMap<String, MaterializationState>, MaterializationExecutionError>;
+    ) -> Result<
+        std::collections::HashMap<String, MaterializationState>,
+        MaterializationExecutionError,
+    >;
 
     fn has_materialization_intent(
         &self,
@@ -300,7 +307,10 @@ pub trait MaterializationExecutionPort: Send + Sync {
 
     /// Drops a restore-journal entry that recovery determined no longer
     /// needs replaying.
-    fn discard_restore_operation(&self, operation_id: &str) -> Result<(), MaterializationExecutionError>;
+    fn discard_restore_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<(), MaterializationExecutionError>;
 
     /// Re-verifies an already-established root's identity, requiring the
     /// persisted root-identity token. Added as a narrow delegate because
@@ -315,7 +325,11 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// Establishes a root's identity, which may silently adopt an
     /// unmarked-but-corroborated root. Added as a narrow delegate for the
     /// same reason as `verify_root` above.
-    fn open_root(&self, root: &Path, group_id: &str) -> Result<VerifiedRoot, MaterializationExecutionError>;
+    fn open_root(
+        &self,
+        root: &Path,
+        group_id: &str,
+    ) -> Result<VerifiedRoot, MaterializationExecutionError>;
 
     /// Opens the single sanctioned materialization-intent seam for
     /// `(group_id, path)`. Added as a narrow delegate (rather than exposing

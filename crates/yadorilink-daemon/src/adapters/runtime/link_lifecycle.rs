@@ -45,7 +45,11 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
     }
 
     fn commit_plain_link(&self, local_path: &str, group_id: &str) -> Result<(), SyncError> {
-        self.state.replica_coordinator.link_repository().add_link(local_path, group_id).map_err(SyncError::from)
+        self.state
+            .replica_coordinator
+            .link_repository()
+            .add_link(local_path, group_id)
+            .map_err(SyncError::from)
     }
 
     fn commit_link_with_pending_enrollment(
@@ -55,7 +59,9 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
         marker: &PendingEnrollmentLinkCommand,
     ) -> Result<(), SyncError> {
         let kind = match marker.kind {
-            EnrollmentKind::Create => yadorilink_replica_domain::session_state::EnrollmentKind::Create,
+            EnrollmentKind::Create => {
+                yadorilink_replica_domain::session_state::EnrollmentKind::Create
+            }
             EnrollmentKind::Join => yadorilink_replica_domain::session_state::EnrollmentKind::Join,
         };
         self.state
@@ -77,7 +83,11 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
     }
 
     fn remove_link(&self, local_path: &str) -> Result<(), SyncError> {
-        self.state.replica_coordinator.link_repository().remove_link(local_path).map_err(SyncError::from)
+        self.state
+            .replica_coordinator
+            .link_repository()
+            .remove_link(local_path)
+            .map_err(SyncError::from)
     }
 
     fn rollback_local_setup_to_cancel_pending(
@@ -128,7 +138,8 @@ impl LinkWatcherPort for DaemonLinkWatcherAdapter {
     ) -> BoxFuture<'a, Result<(), DaemonError>> {
         Box::pin(async move {
             if on_demand {
-                if !yadorilink_filesystem_sync::placeholder_backend::on_demand_pipeline_is_connected() {
+                if !yadorilink_filesystem_sync::placeholder_backend::on_demand_pipeline_is_connected(
+                ) {
                     return Err(DaemonError::Config(
                         "on-demand (placeholder) materialization is not available in this build \
                          yet -- link this folder in eager (full-copy) mode instead"

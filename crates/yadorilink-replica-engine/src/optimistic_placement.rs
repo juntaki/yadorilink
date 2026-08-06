@@ -9,8 +9,8 @@
 //! [`PlacementInputs`] snapshot and acts on the [`FastPathDecision`] it
 //! returns.
 
-use yadorilink_root_authority::fs_capabilities::FilesystemSafetyCapabilities;
 use std::path::Path;
+use yadorilink_root_authority::fs_capabilities::FilesystemSafetyCapabilities;
 
 /// Preparation's I/O fast paths, strongest (cheapest, least data moved)
 /// first. Selection never assumes a capability works — it is only chosen

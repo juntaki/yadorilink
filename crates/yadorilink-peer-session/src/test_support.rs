@@ -194,7 +194,11 @@ impl FakeReplicaState {
         self.lock().groups.entry(group_id.to_string()).or_default().link_gate = gate;
     }
 
-    pub fn set_materialization_policy(&self, group_id: &str, policy: Option<MaterializationPolicy>) {
+    pub fn set_materialization_policy(
+        &self,
+        group_id: &str,
+        policy: Option<MaterializationPolicy>,
+    ) {
         self.lock().groups.entry(group_id.to_string()).or_default().materialization_policy = policy;
     }
 
@@ -208,7 +212,13 @@ impl FakeReplicaState {
     /// it directly rather than through the port's `upsert_file_with_origin`.
     pub fn seed_file(&self, group_id: &str, record: &FileRecord) {
         let mut inner = self.lock();
-        let row = inner.groups.entry(group_id.to_string()).or_default().rows.entry(record.path.clone()).or_default();
+        let row = inner
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(record.path.clone())
+            .or_default();
         row.current = Some(record.clone());
     }
 
@@ -217,7 +227,13 @@ impl FakeReplicaState {
     /// `list_versions`.
     pub fn seed_version(&self, group_id: &str, path: &str, version: VersionRecord) {
         let mut inner = self.lock();
-        let row = inner.groups.entry(group_id.to_string()).or_default().rows.entry(path.to_string()).or_default();
+        let row = inner
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(path.to_string())
+            .or_default();
         row.versions.push(version);
     }
 
@@ -291,15 +307,23 @@ impl FakeReplicaState {
     }
 
     /// Mirrors `SyncState::dag_has_change_or_buffered_orphan`.
-    pub fn dag_has_change_or_buffered_orphan(&self, hash: &ChangeHash) -> Result<bool, PeerSessionError> {
+    pub fn dag_has_change_or_buffered_orphan(
+        &self,
+        hash: &ChangeHash,
+    ) -> Result<bool, PeerSessionError> {
         let inner = self.lock();
-        Ok(inner.changes.contains_key(hash) || inner.orphans.iter().any(|c| &c.compute_hash() == hash))
+        Ok(inner.changes.contains_key(hash)
+            || inner.orphans.iter().any(|c| &c.compute_hash() == hash))
     }
 
     /// Mirrors `SyncState::dag_admit_change` (no explicit `versions` --
     /// delegates to the same admission logic backing the port's own
     /// `dag_admit_change_with_versions` with an empty version list).
-    pub fn dag_admit_change(&self, change: &Change, applied: bool) -> Result<AdmitResult, PeerSessionError> {
+    pub fn dag_admit_change(
+        &self,
+        change: &Change,
+        applied: bool,
+    ) -> Result<AdmitResult, PeerSessionError> {
         PeerReplicaStatePort::dag_admit_change_with_versions(self, change, &[], applied)
     }
 
@@ -328,9 +352,10 @@ impl FakeReplicaState {
     /// recursively, appending each promoted hash to `newly_admitted`.
     fn promote_orphans_locked(inner: &mut Inner, newly_admitted: &mut Vec<ChangeHash>) {
         loop {
-            let ready_idx = inner.orphans.iter().position(|c| {
-                c.parents.iter().all(|p| inner.changes.contains_key(p))
-            });
+            let ready_idx = inner
+                .orphans
+                .iter()
+                .position(|c| c.parents.iter().all(|p| inner.changes.contains_key(p)));
             let Some(idx) = ready_idx else { break };
             let change = inner.orphans.remove(idx);
             let hash = change.compute_hash();
@@ -338,9 +363,9 @@ impl FakeReplicaState {
             inner.encoded.insert(hash, change.encode());
             inner.changes.insert(hash, change);
             let group = inner.groups.entry(group_id).or_default();
-            group.heads.retain(|h| {
-                !inner.changes.get(h).map(|c| c.parents.contains(h)).unwrap_or(false)
-            });
+            group
+                .heads
+                .retain(|h| !inner.changes.get(h).map(|c| c.parents.contains(h)).unwrap_or(false));
             group.heads.push(hash);
             newly_admitted.push(hash);
         }
@@ -412,11 +437,24 @@ impl PeerReplicaStatePort for FakeReplicaState {
             .unwrap_or(false))
     }
 
-    fn get_record_kind(&self, group_id: &str, path: &str) -> Result<Option<RecordKind>, PeerSessionError> {
-        Ok(self.lock().groups.get(group_id).and_then(|g| g.rows.get(path)).and_then(|r| r.record_kind))
+    fn get_record_kind(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<RecordKind>, PeerSessionError> {
+        Ok(self
+            .lock()
+            .groups
+            .get(group_id)
+            .and_then(|g| g.rows.get(path))
+            .and_then(|r| r.record_kind))
     }
 
-    fn get_symlink_target(&self, group_id: &str, path: &str) -> Result<Option<Vec<u8>>, PeerSessionError> {
+    fn get_symlink_target(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, PeerSessionError> {
         Ok(self
             .lock()
             .groups
@@ -425,7 +463,11 @@ impl PeerReplicaStatePort for FakeReplicaState {
             .and_then(|r| r.symlink_target.clone()))
     }
 
-    fn get_symlink_out_of_root(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
+    fn get_symlink_out_of_root(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, PeerSessionError> {
         Ok(self
             .lock()
             .groups
@@ -528,7 +570,13 @@ impl PeerReplicaStatePort for FakeReplicaState {
         next: MaterializationState,
     ) -> Result<bool, PeerSessionError> {
         let mut inner = self.lock();
-        let row = inner.groups.entry(group_id.to_string()).or_default().rows.entry(path.to_string()).or_default();
+        let row = inner
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(path.to_string())
+            .or_default();
         if row.materialization_state != Some(expected) {
             return Ok(false);
         }
@@ -540,11 +588,24 @@ impl PeerReplicaStatePort for FakeReplicaState {
     }
 
     fn is_pinned(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
-        Ok(self.lock().groups.get(group_id).and_then(|g| g.rows.get(path)).map(|r| r.pinned).unwrap_or(false))
+        Ok(self
+            .lock()
+            .groups
+            .get(group_id)
+            .and_then(|g| g.rows.get(path))
+            .map(|r| r.pinned)
+            .unwrap_or(false))
     }
 
     fn set_pinned(&self, group_id: &str, path: &str, pinned: bool) -> Result<(), PeerSessionError> {
-        self.lock().groups.entry(group_id.to_string()).or_default().rows.entry(path.to_string()).or_default().pinned = pinned;
+        self.lock()
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(path.to_string())
+            .or_default()
+            .pinned = pinned;
         Ok(())
     }
 
@@ -566,7 +627,14 @@ impl PeerReplicaStatePort for FakeReplicaState {
     }
 
     fn clear_held(&self, group_id: &str, path: &str) -> Result<(), PeerSessionError> {
-        self.lock().groups.entry(group_id.to_string()).or_default().rows.entry(path.to_string()).or_default().held = None;
+        self.lock()
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(path.to_string())
+            .or_default()
+            .held = None;
         Ok(())
     }
 
@@ -577,12 +645,22 @@ impl PeerReplicaStatePort for FakeReplicaState {
         reason: &str,
         since_unix_nanos: i64,
     ) -> Result<(), PeerSessionError> {
-        self.lock().groups.entry(group_id.to_string()).or_default().rows.entry(path.to_string()).or_default().held =
-            Some(HeldState { reason: reason.to_string(), since_unix_nanos });
+        self.lock()
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(path.to_string())
+            .or_default()
+            .held = Some(HeldState { reason: reason.to_string(), since_unix_nanos });
         Ok(())
     }
 
-    fn has_materialization_intent(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
+    fn has_materialization_intent(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, PeerSessionError> {
         Ok(self
             .lock()
             .groups
@@ -603,7 +681,9 @@ impl PeerReplicaStatePort for FakeReplicaState {
             .map(|g| {
                 g.rows
                     .iter()
-                    .filter(|(_, r)| r.materialization_state == Some(MaterializationState::Placeholder))
+                    .filter(|(_, r)| {
+                        r.materialization_state == Some(MaterializationState::Placeholder)
+                    })
                     .map(|(path, _)| path.clone())
                     .collect()
             })
@@ -626,7 +706,13 @@ impl PeerReplicaStatePort for FakeReplicaState {
     }
 
     fn is_path_dirty(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
-        Ok(self.lock().groups.get(group_id).and_then(|g| g.rows.get(path)).map(|r| r.dirty).unwrap_or(false))
+        Ok(self
+            .lock()
+            .groups
+            .get(group_id)
+            .and_then(|g| g.rows.get(path))
+            .map(|r| r.dirty)
+            .unwrap_or(false))
     }
 
     fn list_versions(
@@ -651,7 +737,13 @@ impl PeerReplicaStatePort for FakeReplicaState {
         _permit: &RootCommitPermit<'_>,
     ) -> Result<(), PeerSessionError> {
         let mut inner = self.lock();
-        let row = inner.groups.entry(group_id.to_string()).or_default().rows.entry(record.path.clone()).or_default();
+        let row = inner
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(record.path.clone())
+            .or_default();
         row.current = Some(record.clone());
         row.origin_device_id = Some(origin_device_id.to_string());
         Ok(())
@@ -666,7 +758,13 @@ impl PeerReplicaStatePort for FakeReplicaState {
         _permit: &RootCommitPermit<'_>,
     ) -> Result<(), PeerSessionError> {
         let mut inner = self.lock();
-        let row = inner.groups.entry(group_id.to_string()).or_default().rows.entry(record.path.clone()).or_default();
+        let row = inner
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(record.path.clone())
+            .or_default();
         row.current = Some(record.clone());
         row.origin_device_id = Some(origin_device_id.to_string());
         row.authoring_change_hash = Some(*authoring_change_hash);
@@ -812,7 +910,10 @@ impl PeerReplicaStatePort for FakeReplicaState {
             return Ok(AdmitResult { outcome: AdmitOutcome::Applied, newly_admitted: vec![] });
         }
         for version in versions {
-            inner.file_versions.insert((change.group_id.as_str().to_string(), version.compute_hash()), version.clone());
+            inner.file_versions.insert(
+                (change.group_id.as_str().to_string(), version.compute_hash()),
+                version.clone(),
+            );
         }
         let parents_present = change.parents.iter().all(|p| inner.changes.contains_key(p));
         if !parents_present {
@@ -854,7 +955,14 @@ impl PeerReplicaStatePort for FakeReplicaState {
         _target_version_hash: &[u8],
         _permit: &'a RootCommitPermit<'a>,
     ) -> Result<Box<dyn OpenMaterializationIntent + Send + 'a>, PeerSessionError> {
-        self.lock().groups.entry(group_id.to_string()).or_default().rows.entry(path.to_string()).or_default().materialization_intent_open = true;
+        self.lock()
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(path.to_string())
+            .or_default()
+            .materialization_intent_open = true;
         struct Guard<'a> {
             state: &'a FakeReplicaState,
             group_id: &'a str,
@@ -880,7 +988,9 @@ impl PeerReplicaStatePort for FakeReplicaState {
     fn verify_root(&self, root: &Path, _group_id: &str) -> Result<(), PeerSessionError> {
         let inner = self.lock();
         if inner.verify_root_fails {
-            return Err(PeerSessionError::InvalidInput("fake root verification forced to fail".to_string()));
+            return Err(PeerSessionError::InvalidInput(
+                "fake root verification forced to fail".to_string(),
+            ));
         }
         let marker = root.join(yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME);
         if marker.exists() {
@@ -920,9 +1030,10 @@ impl PeerReplicaStatePort for FakeReplicaState {
         block_hash: &[u8],
     ) -> Result<bool, PeerSessionError> {
         let inner = self.lock();
-        Ok(inner.file_versions.iter().any(|((g, _), v)| {
-            g == group_id && v.blocks.iter().any(|b| b.hash.0 == block_hash)
-        }))
+        Ok(inner
+            .file_versions
+            .iter()
+            .any(|((g, _), v)| g == group_id && v.blocks.iter().any(|b| b.hash.0 == block_hash)))
     }
 
     fn group_retained_version_references_block(
@@ -931,9 +1042,15 @@ impl PeerReplicaStatePort for FakeReplicaState {
         block_hash: &[u8],
     ) -> Result<bool, PeerSessionError> {
         let inner = self.lock();
-        Ok(inner.groups.get(group_id).map(|g| {
-            g.rows.values().any(|r| r.versions.iter().any(|v| v.blocks.iter().any(|b| b.hash == block_hash)))
-        }).unwrap_or(false))
+        Ok(inner
+            .groups
+            .get(group_id)
+            .map(|g| {
+                g.rows.values().any(|r| {
+                    r.versions.iter().any(|v| v.blocks.iter().any(|b| b.hash == block_hash))
+                })
+            })
+            .unwrap_or(false))
     }
 
     fn get_current_version_record(
@@ -955,8 +1072,17 @@ impl PeerReplicaStatePort for FakeReplicaState {
         }))
     }
 
-    fn get_held_state(&self, group_id: &str, path: &str) -> Result<Option<HeldState>, PeerSessionError> {
-        Ok(self.lock().groups.get(group_id).and_then(|g| g.rows.get(path)).and_then(|r| r.held.clone()))
+    fn get_held_state(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<HeldState>, PeerSessionError> {
+        Ok(self
+            .lock()
+            .groups
+            .get(group_id)
+            .and_then(|g| g.rows.get(path))
+            .and_then(|r| r.held.clone()))
     }
 
     fn ensure_bootstrap_row_for_metadata(
@@ -964,7 +1090,13 @@ impl PeerReplicaStatePort for FakeReplicaState {
         group_id: &str,
         path: &str,
     ) -> Result<(), PeerSessionError> {
-        self.lock().groups.entry(group_id.to_string()).or_default().rows.entry(path.to_string()).or_default();
+        self.lock()
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(path.to_string())
+            .or_default();
         Ok(())
     }
 
@@ -975,7 +1107,14 @@ impl PeerReplicaStatePort for FakeReplicaState {
         kind: RecordKind,
         _permit: &RootCommitPermit<'_>,
     ) -> Result<(), PeerSessionError> {
-        self.lock().groups.entry(group_id.to_string()).or_default().rows.entry(path.to_string()).or_default().record_kind = Some(kind);
+        self.lock()
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(path.to_string())
+            .or_default()
+            .record_kind = Some(kind);
         Ok(())
     }
 
@@ -985,8 +1124,14 @@ impl PeerReplicaStatePort for FakeReplicaState {
         path: &str,
         target: Option<&[u8]>,
     ) -> Result<(), PeerSessionError> {
-        self.lock().groups.entry(group_id.to_string()).or_default().rows.entry(path.to_string()).or_default().symlink_target =
-            target.map(|t| t.to_vec());
+        self.lock()
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(path.to_string())
+            .or_default()
+            .symlink_target = target.map(|t| t.to_vec());
         Ok(())
     }
 
@@ -996,7 +1141,14 @@ impl PeerReplicaStatePort for FakeReplicaState {
         path: &str,
         out_of_root: bool,
     ) -> Result<(), PeerSessionError> {
-        self.lock().groups.entry(group_id.to_string()).or_default().rows.entry(path.to_string()).or_default().symlink_out_of_root = out_of_root;
+        self.lock()
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(path.to_string())
+            .or_default()
+            .symlink_out_of_root = out_of_root;
         Ok(())
     }
 
@@ -1007,7 +1159,14 @@ impl PeerReplicaStatePort for FakeReplicaState {
         exec_bit: bool,
         _permit: &RootCommitPermit<'_>,
     ) -> Result<(), PeerSessionError> {
-        self.lock().groups.entry(group_id.to_string()).or_default().rows.entry(path.to_string()).or_default().exec_bit = exec_bit;
+        self.lock()
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(path.to_string())
+            .or_default()
+            .exec_bit = exec_bit;
         Ok(())
     }
 

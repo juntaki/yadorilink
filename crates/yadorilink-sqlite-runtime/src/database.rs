@@ -15,7 +15,9 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 
 use crate::error::{DatabaseError, SqlOperationError};
-use crate::pool::{checkout, madsim_or_default_pool, retry_on_database_locked, ConnectionPool, BUSY_TIMEOUT};
+use crate::pool::{
+    checkout, madsim_or_default_pool, retry_on_database_locked, ConnectionPool, BUSY_TIMEOUT,
+};
 
 pub struct SyncDatabase {
     /// Each call checks out its own pooled connection (`r2d2` +
@@ -282,8 +284,7 @@ mod tests {
     #[test]
     fn repositories_sharing_database_do_not_race_independent_writer_gates() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let database =
-            Arc::new(open_test_db(&dir.path().join("writer-gate-regression.sqlite3")));
+        let database = Arc::new(open_test_db(&dir.path().join("writer-gate-regression.sqlite3")));
 
         database
             .write::<_, DatabaseError>(|conn: &mut Connection| {
@@ -323,7 +324,9 @@ mod tests {
         );
 
         let b_count: i64 = database
-            .read::<i64, DatabaseError>(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM b", [], |row| row.get(0))?))
+            .read::<i64, DatabaseError>(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM b", [], |row| row.get(0))?)
+            })
             .expect("read back");
         assert_eq!(b_count, 1);
     }
@@ -336,18 +339,23 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let database = open_test_db(&dir.path().join("writer-gate-error-release.sqlite3"));
         database
-            .write::<_, DatabaseError>(|conn: &mut Connection| Ok(conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")?))
+            .write::<_, DatabaseError>(|conn: &mut Connection| {
+                Ok(conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")?)
+            })
             .expect("create table");
 
-        let failing: Result<(), DatabaseError> = database.write::<_, DatabaseError>(|conn: &mut Connection| {
-            conn.execute("INSERT INTO t (id) VALUES (1)", [])?;
-            Err(DatabaseError::CorruptSchema("deliberate test failure".into()))
-        });
+        let failing: Result<(), DatabaseError> =
+            database.write::<_, DatabaseError>(|conn: &mut Connection| {
+                conn.execute("INSERT INTO t (id) VALUES (1)", [])?;
+                Err(DatabaseError::CorruptSchema("deliberate test failure".into()))
+            });
         assert!(failing.is_err());
 
         // The gate must not be wedged: this write must still go through.
         database
-            .write::<_, DatabaseError>(|conn: &mut Connection| Ok(conn.execute("INSERT INTO t (id) VALUES (2)", [])?))
+            .write::<_, DatabaseError>(|conn: &mut Connection| {
+                Ok(conn.execute("INSERT INTO t (id) VALUES (2)", [])?)
+            })
             .expect("writer_gate must have been released after the prior error");
     }
 
@@ -359,17 +367,22 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let database = open_test_db(&dir.path().join("write-immediate-rollback.sqlite3"));
         database
-            .write::<_, DatabaseError>(|conn: &mut Connection| Ok(conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")?))
+            .write::<_, DatabaseError>(|conn: &mut Connection| {
+                Ok(conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")?)
+            })
             .expect("create table");
 
-        let failing: Result<(), DatabaseError> = database.write_immediate::<_, DatabaseError>(|tx| {
-            tx.execute("INSERT INTO t (id) VALUES (1)", [])?;
-            Err(DatabaseError::CorruptSchema("deliberate test failure".into()))
-        });
+        let failing: Result<(), DatabaseError> =
+            database.write_immediate::<_, DatabaseError>(|tx| {
+                tx.execute("INSERT INTO t (id) VALUES (1)", [])?;
+                Err(DatabaseError::CorruptSchema("deliberate test failure".into()))
+            });
         assert!(failing.is_err());
 
         let count: i64 = database
-            .read::<i64, DatabaseError>(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))?))
+            .read::<i64, DatabaseError>(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))?)
+            })
             .expect("read back");
         assert_eq!(count, 0, "a failed write_immediate must not leave a partial row committed");
     }
@@ -392,7 +405,9 @@ mod tests {
 
         let reopened = open_test_db(&path);
         let value: i64 = reopened
-            .read::<i64, DatabaseError>(|conn| Ok(conn.query_row("SELECT id FROM t", [], |row| row.get(0))?))
+            .read::<i64, DatabaseError>(|conn| {
+                Ok(conn.query_row("SELECT id FROM t", [], |row| row.get(0))?)
+            })
             .expect("read back after reopen");
         assert_eq!(value, 42);
     }

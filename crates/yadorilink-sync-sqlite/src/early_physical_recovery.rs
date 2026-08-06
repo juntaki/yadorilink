@@ -152,7 +152,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use crate::error::SyncSqliteError;
-use yadorilink_replica_domain::filesystem_placement::EpochState;
+use crate::file_identity_codec;
 use crate::filesystem_transaction::{self};
 use crate::filesystem_transaction::{
     encode_directory_identity, list_epochs_for_transaction, list_incomplete_transactions,
@@ -160,11 +160,13 @@ use crate::filesystem_transaction::{
     transition_epoch_unchecked, EpochRecord, EpochUpdate, FilesystemTransactionRecord,
     TransactionPhase,
 };
-use yadorilink_filesystem_sync::fs_commit::{ParentDirHandle, RecoveryObservation, RemoveChildIdentityError};
+use crate::retained_obligation::{self, NewObligation, RetainedObligationError};
+use yadorilink_filesystem_sync::fs_commit::{
+    ParentDirHandle, RecoveryObservation, RemoveChildIdentityError,
+};
+use yadorilink_replica_domain::filesystem_placement::EpochState;
 use yadorilink_root_authority::fs_identity::{DirectoryIdentity, FileIdentity, IdentityComparison};
 use yadorilink_root_authority::reserved_namespace::{self, ArtefactKind};
-use crate::retained_obligation::{self, NewObligation, RetainedObligationError};
-use crate::file_identity_codec;
 
 /// Everything one call to [`run`] found and did.
 #[derive(Debug, Default)]
@@ -803,7 +805,8 @@ fn recover_committed_custody_transfer(
     let Some(expected) = epoch.displaced_identity.as_ref() else {
         return block(conn, transaction, epoch, BlockReason::RetainedArtefactIdentityUnverifiable);
     };
-    let granularity = yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(parent_dir);
+    let granularity =
+        yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(parent_dir);
     if !matches!(observed.compare(expected, granularity), IdentityComparison::SameObject) {
         return block(conn, transaction, epoch, BlockReason::RetainedArtefactIdentityUnverifiable);
     }
@@ -915,15 +918,15 @@ fn recover_orphaned_custody_obligation(
             );
         }
     };
-    let granularity = yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(parent_dir);
+    let granularity =
+        yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(parent_dir);
     if !matches!(
         observed_identity.compare(expected_identity, granularity),
         IdentityComparison::SameObject
     ) {
         return block(conn, transaction, epoch, BlockReason::RetainedArtefactIdentityUnverifiable);
     }
-    let filesystem_identity =
-        file_identity_codec::encode_file_identity(&observed_identity);
+    let filesystem_identity = file_identity_codec::encode_file_identity(&observed_identity);
 
     if let Some(existing) = retained_obligation::get(conn, &transaction.group_id, &retained_id)? {
         let matches = existing.group_id == transaction.group_id
@@ -980,7 +983,10 @@ fn recover_orphaned_custody_obligation(
     Ok(EarlyRecoveryAction::OrphanedCustodyObligationRecovered { retained_id })
 }
 
-fn mark_owned(report: &mut EarlyRecoveryReport, epoch: &EpochRecord) -> Result<(), SyncSqliteError> {
+fn mark_owned(
+    report: &mut EarlyRecoveryReport,
+    epoch: &EpochRecord,
+) -> Result<(), SyncSqliteError> {
     report.owned_paths.insert(PathBuf::from(&epoch.target_path));
     for path in [&epoch.stage_path, &epoch.preimage_path, &epoch.backup_path].into_iter().flatten()
     {
@@ -1077,7 +1083,8 @@ fn verify_parent_directory(
     expected: &DirectoryIdentity,
 ) -> io::Result<bool> {
     let observed = handle.identity()?;
-    let granularity = yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(handle.path());
+    let granularity =
+        yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(handle.path());
     Ok(compare_directory_identity(&observed, expected, granularity))
 }
 
@@ -1313,7 +1320,9 @@ fn cleanup_unstarted_artefact(
     let Some(expected_identity) = &epoch.staged_identity else {
         return Ok(EarlyRecoveryAction::NoAction);
     };
-    let granularity = yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(parent_handle.path());
+    let granularity = yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(
+        parent_handle.path(),
+    );
     // Directory-handle-relative, not a path-string remove, and through the
     // exact same handle `recover_epoch` already verified the identity of
     // — not a second, freshly reopened one. Reopening by path here would
@@ -1357,16 +1366,16 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
-    use yadorilink_replica_domain::filesystem_placement::PlacementRole;
-    use crate::{dag_store, materialized_generation, resolution_planning};
     use crate::filesystem_transaction::{
         begin_transaction_unchecked, insert_epoch_unchecked, transition_epoch_unchecked,
         FilesystemTransactionKind, NewEpoch, NewFilesystemTransaction, TransactionCause,
     };
-    use yadorilink_root_authority::fs_capabilities::{Capability, FilesystemSafetyCapabilities};
+    use crate::{dag_store, materialized_generation, resolution_planning};
     use yadorilink_filesystem_sync::fs_commit::{
         CommitRequest, FilesystemCommitAdapter, NativeCommitAdapter, ParentDirHandle,
     };
+    use yadorilink_replica_domain::filesystem_placement::PlacementRole;
+    use yadorilink_root_authority::fs_capabilities::{Capability, FilesystemSafetyCapabilities};
     use yadorilink_root_authority::reserved_namespace::{artefact_component_name, ArtefactKind};
 
     fn open_db() -> Connection {
@@ -1424,7 +1433,8 @@ mod tests {
                 target_generation: b"opaque",
                 parent_directory_identity,
                 capability_snapshot: b"opaque",
-                durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+                durability_level:
+                    yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             },
             // `begin_sample_transaction` never bumps `execution_generation`
             // past the `0` it starts `begin_transaction_unchecked` at, and
@@ -1820,7 +1830,8 @@ mod tests {
                 transaction_id: &tx.transaction_id,
                 scope: yadorilink_replica_domain::filesystem_placement::ReservationScope::Exact,
                 path: "a.txt",
-                role: yadorilink_replica_domain::filesystem_placement::ReservationRole::CanonicalPath,
+                role:
+                    yadorilink_replica_domain::filesystem_placement::ReservationRole::CanonicalPath,
             }],
             0,
         )
@@ -2014,7 +2025,10 @@ mod tests {
         };
         let outcome = NativeCommitAdapter.commit_placement(&request);
         assert!(
-            matches!(outcome, yadorilink_filesystem_sync::fs_commit::FilesystemCommitOutcome::Committed(_)),
+            matches!(
+                outcome,
+                yadorilink_filesystem_sync::fs_commit::FilesystemCommitOutcome::Committed(_)
+            ),
             "the real commit must actually succeed for this scenario to test anything: {outcome:?}"
         );
         // The crash: no epoch/generation-publication transaction ever runs.
@@ -2022,9 +2036,8 @@ mod tests {
 
         let report = run(&conn).unwrap();
 
-        let reloaded = filesystem_transaction::lookup_epoch(&conn, &epoch.transaction_id, 0)
-            .unwrap()
-            .unwrap();
+        let reloaded =
+            filesystem_transaction::lookup_epoch(&conn, &epoch.transaction_id, 0).unwrap().unwrap();
         assert_eq!(reloaded.phase, EpochState::RequiresPhysicalRecovery);
         match &report.epochs[0].action {
             EarlyRecoveryAction::RoutedToPhysicalRecovery(observation) => {
@@ -2178,7 +2191,10 @@ mod tests {
             expected_stage_identity: &staged_identity,
         };
         let outcome = NativeCommitAdapter.commit_placement(&request);
-        assert!(matches!(outcome, yadorilink_filesystem_sync::fs_commit::FilesystemCommitOutcome::Committed(_)));
+        assert!(matches!(
+            outcome,
+            yadorilink_filesystem_sync::fs_commit::FilesystemCommitOutcome::Committed(_)
+        ));
         let live_identity = FileIdentity::observe_path(&live_path).unwrap();
 
         // The one durable transaction production code performs after a
@@ -2222,9 +2238,8 @@ mod tests {
             b"new content",
             "recovery must not touch it"
         );
-        let reloaded = filesystem_transaction::lookup_epoch(&conn, &epoch.transaction_id, 0)
-            .unwrap()
-            .unwrap();
+        let reloaded =
+            filesystem_transaction::lookup_epoch(&conn, &epoch.transaction_id, 0).unwrap().unwrap();
         assert_eq!(
             reloaded.phase,
             EpochState::Committed,
@@ -2344,7 +2359,10 @@ mod tests {
             expected_stage_identity: &staged_identity,
         };
         let outcome = NativeCommitAdapter.commit_placement(&request);
-        assert!(matches!(outcome, yadorilink_filesystem_sync::fs_commit::FilesystemCommitOutcome::Committed(_)));
+        assert!(matches!(
+            outcome,
+            yadorilink_filesystem_sync::fs_commit::FilesystemCommitOutcome::Committed(_)
+        ));
         let live_identity = FileIdentity::observe_path(&live_path).unwrap();
 
         // ...but the durability flush that must run before publishing
@@ -2389,9 +2407,8 @@ mod tests {
             "a RequiresPhysicalRecovery epoch's paths must stay protected on every cold start, \
              not only the pass that first reached this state"
         );
-        let reloaded = filesystem_transaction::lookup_epoch(&conn, &epoch.transaction_id, 0)
-            .unwrap()
-            .unwrap();
+        let reloaded =
+            filesystem_transaction::lookup_epoch(&conn, &epoch.transaction_id, 0).unwrap().unwrap();
         assert_eq!(
             reloaded.phase,
             EpochState::RequiresPhysicalRecovery,
@@ -2787,9 +2804,7 @@ mod tests {
             EarlyRecoveryAction::Blocked(BlockReason::ParentDirectoryUnverifiable)
         ));
         let reloaded_tx =
-            filesystem_transaction::lookup_transaction(&conn, &tx.transaction_id)
-                .unwrap()
-                .unwrap();
+            filesystem_transaction::lookup_transaction(&conn, &tx.transaction_id).unwrap().unwrap();
         assert_eq!(reloaded_tx.phase, TransactionPhase::Blocked);
     }
 
@@ -2936,8 +2951,7 @@ mod tests {
 
         std::fs::write(&target_path, b"new content").unwrap();
         let displaced_identity = FileIdentity::observe_path(&target_path).unwrap();
-        let displaced_generation_id =
-            file_identity_codec::GenerationId("basis-123".to_string());
+        let displaced_generation_id = file_identity_codec::GenerationId("basis-123".to_string());
         let stage_name = artefact_component_name(ArtefactKind::Stage, "ep0").unwrap();
         let stage_path = dir.path().join(&stage_name);
         drive_epoch_to_custody_transferred(
@@ -3007,8 +3021,7 @@ mod tests {
         let live_path = physical_dir.join("a.txt");
         std::fs::write(&live_path, b"new content").unwrap();
         let displaced_identity = FileIdentity::observe_path(&live_path).unwrap();
-        let displaced_generation_id =
-            file_identity_codec::GenerationId("basis-123".to_string());
+        let displaced_generation_id = file_identity_codec::GenerationId("basis-123".to_string());
         let stage_name = artefact_component_name(ArtefactKind::Stage, "ep0").unwrap();
         // The one durable, absolute physical location this row carries --
         // joined through the real directory, exactly as
@@ -3077,8 +3090,7 @@ mod tests {
 
         std::fs::write(&target_path, b"new content").unwrap();
         let displaced_identity = FileIdentity::observe_path(&target_path).unwrap();
-        let displaced_generation_id =
-            file_identity_codec::GenerationId("basis-123".to_string());
+        let displaced_generation_id = file_identity_codec::GenerationId("basis-123".to_string());
         let stage_name = artefact_component_name(ArtefactKind::Stage, "ep0").unwrap();
         let stage_path = dir.path().join(&stage_name);
         drive_epoch_to_custody_transferred(
@@ -3163,8 +3175,7 @@ mod tests {
 
         std::fs::write(&target_path, b"new content").unwrap();
         let displaced_identity = FileIdentity::observe_path(&target_path).unwrap();
-        let displaced_generation_id =
-            file_identity_codec::GenerationId("basis-123".to_string());
+        let displaced_generation_id = file_identity_codec::GenerationId("basis-123".to_string());
         let stage_name = artefact_component_name(ArtefactKind::Stage, "ep0").unwrap();
         let stage_path = dir.path().join(&stage_name);
         drive_epoch_to_custody_transferred(
@@ -3241,8 +3252,7 @@ mod tests {
 
         std::fs::write(&target_path, b"new content").unwrap();
         let displaced_identity = FileIdentity::observe_path(&target_path).unwrap();
-        let displaced_generation_id =
-            file_identity_codec::GenerationId("basis-123".to_string());
+        let displaced_generation_id = file_identity_codec::GenerationId("basis-123".to_string());
         let stage_path = dir.path().join("stage-a.txt");
         drive_epoch_to_committed(
             &conn,
@@ -3315,8 +3325,7 @@ mod tests {
 
         std::fs::write(&target_path, b"new content").unwrap();
         let displaced_identity = FileIdentity::observe_path(&target_path).unwrap();
-        let displaced_generation_id =
-            file_identity_codec::GenerationId("basis-123".to_string());
+        let displaced_generation_id = file_identity_codec::GenerationId("basis-123".to_string());
         let stage_path = dir.path().join("stage-a.txt");
         drive_epoch_to_committed(
             &conn,
@@ -3382,7 +3391,8 @@ mod tests {
                 target_generation: b"opaque",
                 parent_directory_identity: &parent_identity,
                 capability_snapshot: b"opaque",
-                durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+                durability_level:
+                    yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             },
             // `tx` (from `begin_sample_transaction`) is still at its
             // starting generation 0 here -- nothing bumps it before this.
@@ -3520,7 +3530,8 @@ mod tests {
                 target_generation: b"opaque",
                 parent_directory_identity: &parent_identity,
                 capability_snapshot: b"opaque",
-                durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+                durability_level:
+                    yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             },
             // Every transition on `epoch_committing` above used expected
             // generation 0, and nothing bumps the fence in this test.
@@ -3566,9 +3577,7 @@ mod tests {
         let report = run(&conn).unwrap();
 
         assert_eq!(
-            filesystem_transaction::list_reservations(&conn, &tx.transaction_id)
-                .unwrap()
-                .len(),
+            filesystem_transaction::list_reservations(&conn, &tx.transaction_id).unwrap().len(),
             2,
             "an epoch requiring physical recovery anywhere in the transaction must keep every \
              reservation held, even though a sibling epoch looks -- on its own -- exactly like \
@@ -3679,7 +3688,8 @@ mod tests {
                 transaction_id: &tx.transaction_id,
                 scope: yadorilink_replica_domain::filesystem_placement::ReservationScope::Exact,
                 path: "a.txt",
-                role: yadorilink_replica_domain::filesystem_placement::ReservationRole::CanonicalPath,
+                role:
+                    yadorilink_replica_domain::filesystem_placement::ReservationRole::CanonicalPath,
             }],
             0,
         )
@@ -3732,7 +3742,8 @@ mod tests {
                 transaction_id: &tx.transaction_id,
                 scope: yadorilink_replica_domain::filesystem_placement::ReservationScope::Exact,
                 path: "a.txt",
-                role: yadorilink_replica_domain::filesystem_placement::ReservationRole::CanonicalPath,
+                role:
+                    yadorilink_replica_domain::filesystem_placement::ReservationRole::CanonicalPath,
             }],
             0,
         )
@@ -3757,9 +3768,7 @@ mod tests {
             report.epochs[0].action
         );
         assert_eq!(
-            filesystem_transaction::list_reservations(&conn, &tx.transaction_id)
-                .unwrap()
-                .len(),
+            filesystem_transaction::list_reservations(&conn, &tx.transaction_id).unwrap().len(),
             1,
             "an unreadable parent directory proves nothing either way -- the reservation must \
              stay held, not be released as though this pass had confirmed nothing was left to \
@@ -3802,7 +3811,8 @@ mod tests {
                 transaction_id: &tx.transaction_id,
                 scope: yadorilink_replica_domain::filesystem_placement::ReservationScope::Exact,
                 path: "a.txt",
-                role: yadorilink_replica_domain::filesystem_placement::ReservationRole::CanonicalPath,
+                role:
+                    yadorilink_replica_domain::filesystem_placement::ReservationRole::CanonicalPath,
             }],
             0,
         )
@@ -3819,9 +3829,7 @@ mod tests {
             report.epochs[0].action
         );
         assert_eq!(
-            filesystem_transaction::list_reservations(&conn, &tx.transaction_id)
-                .unwrap()
-                .len(),
+            filesystem_transaction::list_reservations(&conn, &tx.transaction_id).unwrap().len(),
             1,
             "a group-relative target_path with no stage_path is a 'could not check' outcome, \
              not a confirmed absence -- the reservation must stay held"
@@ -3873,7 +3881,8 @@ mod tests {
                 target_generation: b"opaque",
                 parent_directory_identity: &parent_identity,
                 capability_snapshot: b"opaque",
-                durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+                durability_level:
+                    yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             },
             0,
             0,
@@ -3917,25 +3926,19 @@ mod tests {
                 outcome.action
             );
         }
-        let reloaded_a =
-            filesystem_transaction::lookup_epoch(&conn, &epoch_a.transaction_id, 0)
-                .unwrap()
-                .unwrap();
-        let reloaded_b =
-            filesystem_transaction::lookup_epoch(&conn, &epoch_b.transaction_id, 1)
-                .unwrap()
-                .unwrap();
+        let reloaded_a = filesystem_transaction::lookup_epoch(&conn, &epoch_a.transaction_id, 0)
+            .unwrap()
+            .unwrap();
+        let reloaded_b = filesystem_transaction::lookup_epoch(&conn, &epoch_b.transaction_id, 1)
+            .unwrap()
+            .unwrap();
         assert_eq!(reloaded_a.phase, EpochState::Blocked);
         assert_eq!(reloaded_b.phase, EpochState::Blocked);
         let reloaded_tx =
-            filesystem_transaction::lookup_transaction(&conn, &tx.transaction_id)
-                .unwrap()
-                .unwrap();
+            filesystem_transaction::lookup_transaction(&conn, &tx.transaction_id).unwrap().unwrap();
         assert_eq!(reloaded_tx.phase, TransactionPhase::Blocked);
         assert_eq!(
-            filesystem_transaction::list_reservations(&conn, &tx.transaction_id)
-                .unwrap()
-                .len(),
+            filesystem_transaction::list_reservations(&conn, &tx.transaction_id).unwrap().len(),
             2,
             "neither reservation has anything confirmed resolved about it -- both must stay held"
         );
@@ -3971,7 +3974,8 @@ mod tests {
                 transaction_id: &tx.transaction_id,
                 scope: yadorilink_replica_domain::filesystem_placement::ReservationScope::Exact,
                 path: "a.txt",
-                role: yadorilink_replica_domain::filesystem_placement::ReservationRole::CanonicalPath,
+                role:
+                    yadorilink_replica_domain::filesystem_placement::ReservationRole::CanonicalPath,
             }],
             0,
         )
@@ -3983,9 +3987,7 @@ mod tests {
             EarlyRecoveryAction::Blocked(BlockReason::ParentDirectoryUnresolvable)
         ));
         assert_eq!(
-            filesystem_transaction::list_reservations(&conn, &tx.transaction_id)
-                .unwrap()
-                .len(),
+            filesystem_transaction::list_reservations(&conn, &tx.transaction_id).unwrap().len(),
             1,
             "the first pass that produces the block must withhold, same as every other Blocked \
              case in this file"
@@ -3998,9 +4000,7 @@ mod tests {
         let second = run(&conn).unwrap();
         assert!(matches!(second.epochs[0].action, EarlyRecoveryAction::NoAction));
         assert_eq!(
-            filesystem_transaction::list_reservations(&conn, &tx.transaction_id)
-                .unwrap()
-                .len(),
+            filesystem_transaction::list_reservations(&conn, &tx.transaction_id).unwrap().len(),
             1,
             "a Blocked epoch's reservation must stay held on every pass, not only the one that \
              first produced the block -- nothing physically resolved the open BlockReason \
@@ -4062,7 +4062,8 @@ mod tests {
                 transaction_id: &tx.transaction_id,
                 scope: yadorilink_replica_domain::filesystem_placement::ReservationScope::Exact,
                 path: "a.txt",
-                role: yadorilink_replica_domain::filesystem_placement::ReservationRole::CanonicalPath,
+                role:
+                    yadorilink_replica_domain::filesystem_placement::ReservationRole::CanonicalPath,
             }],
             3,
         )
@@ -4070,9 +4071,7 @@ mod tests {
 
         run(&conn).unwrap();
         assert_eq!(
-            filesystem_transaction::list_reservations(&conn, &tx.transaction_id)
-                .unwrap()
-                .len(),
+            filesystem_transaction::list_reservations(&conn, &tx.transaction_id).unwrap().len(),
             0,
             "a stale `Blocked` row left behind by a SUCCESSFUL replan must not withhold: nothing \
              about it is physically unresolved, and nothing else ever reclaims the crashed \

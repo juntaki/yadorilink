@@ -192,10 +192,7 @@ impl StartupReadinessRegistry {
     /// Holds no lock while parked (the registry lock is released before
     /// awaiting), and must be called *before* acquiring any `path_lock`, so
     /// it can never deadlock against the startup writer.
-    pub async fn wait_group_ready(
-        &self,
-        group_id: &str,
-    ) -> Option<Result<(), StartupFailed>> {
+    pub async fn wait_group_ready(&self, group_id: &str) -> Option<Result<(), StartupFailed>> {
         let gate = self.gate(group_id)?;
         loop {
             // Arm the notification *before* reading state so a mark that lands

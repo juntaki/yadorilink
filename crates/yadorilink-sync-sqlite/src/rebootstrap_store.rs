@@ -79,8 +79,7 @@ impl RebootstrapStoreRepository {
         &self,
         group_id: &str,
     ) -> Result<Option<[u8; 32]>, SyncSqliteError> {
-        self.database
-            .read(|conn| history_base_previous_checkpoint_hash(conn, group_id))
+        self.database.read(|conn| history_base_previous_checkpoint_hash(conn, group_id))
     }
 
     pub fn checkpoint_snapshot(
@@ -97,8 +96,7 @@ impl RebootstrapStoreRepository {
         child_hash: &ChangeHash,
         parent_hash: &ChangeHash,
     ) -> Result<Option<(u64, u64)>, SyncSqliteError> {
-        self.database
-            .read(|conn| compacted_parent_auth(conn, group_id, child_hash, parent_hash))
+        self.database.read(|conn| compacted_parent_auth(conn, group_id, child_hash, parent_hash))
     }
 
     /// Builds the exact snapshot a destructive compaction will commit. See
@@ -378,15 +376,14 @@ pub fn build_compaction_snapshot(
             if !pruned.contains(parent_hash) {
                 continue;
             }
-            let parent_encoded = crate::dag_store::get_encoded(conn, parent_hash)?.ok_or_else(
-                || {
+            let parent_encoded =
+                crate::dag_store::get_encoded(conn, parent_hash)?.ok_or_else(|| {
                     SyncSqliteError::CorruptState(format!(
                         "pruned checkpoint-boundary parent {} disappeared before \
                          snapshot construction",
                         parent_hash.to_hex()
                     ))
-                },
-            )?;
+                })?;
             let parent = decode_stored_change(&parent_encoded)?;
             boundary_parent_auth.push(BoundaryParentAuth {
                 child_hash: *hash,
@@ -642,9 +639,8 @@ pub fn install_rebootstrap_snapshot(
     // `rebuild_group_heads` below (both recompute their state from
     // `changes`, so the squashed change must already be in it).
     for branch in &reachability.offline_branches {
-        let emitter = local_emitter.expect(
-            "checked above: offline_branches is non-empty only when local_emitter is Some",
-        );
+        let emitter = local_emitter
+            .expect("checked above: offline_branches is non-empty only when local_emitter is Some");
         let auth =
             local_auth.expect("checked above: local_auth is Some whenever local_emitter is Some");
         let ops = squash_offline_ops(&branch.chain);
@@ -709,10 +705,7 @@ pub fn install_rebootstrap_snapshot(
             authorized_versions.insert(VersionHash(array));
         }
     }
-    tx.execute(
-        "DELETE FROM compacted_file_version_authorization WHERE group_id = ?1",
-        [group_id],
-    )?;
+    tx.execute("DELETE FROM compacted_file_version_authorization WHERE group_id = ?1", [group_id])?;
     for version_hash in &authorized_versions {
         crate::dag_store::record_compacted_file_version_authorization(tx, group_id, version_hash)?;
     }

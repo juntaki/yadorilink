@@ -38,15 +38,15 @@ use std::path::Path;
 
 use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, HANDLE};
 use windows_sys::Win32::Storage::CloudFilters::{
-    CfConnectSyncRoot, CfCreatePlaceholders, CfDisconnectSyncRoot, CfExecute,
-    CfGetPlaceholderInfo, CfGetPlaceholderStateFromFileInfo, CfGetTransferKey, CfRegisterSyncRoot,
-    CfUnregisterSyncRoot, CfUpdatePlaceholder, CF_CALLBACK_REGISTRATION, CF_CALLBACK_TYPE_NONE,
-    CF_CONNECT_FLAG_NONE, CF_CONNECTION_KEY, CF_CREATE_FLAG_NONE, CF_FS_METADATA, CF_OPERATION_INFO,
+    CfConnectSyncRoot, CfCreatePlaceholders, CfDisconnectSyncRoot, CfExecute, CfGetPlaceholderInfo,
+    CfGetPlaceholderStateFromFileInfo, CfGetTransferKey, CfRegisterSyncRoot, CfUnregisterSyncRoot,
+    CfUpdatePlaceholder, CF_CALLBACK_REGISTRATION, CF_CALLBACK_TYPE_NONE, CF_CONNECTION_KEY,
+    CF_CONNECT_FLAG_NONE, CF_CREATE_FLAG_NONE, CF_FS_METADATA, CF_OPERATION_INFO,
     CF_OPERATION_PARAMETERS, CF_OPERATION_PARAMETERS_0, CF_OPERATION_PARAMETERS_0_6,
     CF_OPERATION_TRANSFER_DATA_FLAG_NONE, CF_OPERATION_TYPE_TRANSFER_DATA,
     CF_PLACEHOLDER_BASIC_INFO, CF_PLACEHOLDER_CREATE_FLAG_ALWAYS_FULL,
     CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC, CF_PLACEHOLDER_CREATE_INFO, CF_PLACEHOLDER_INFO_BASIC,
-    CF_PLACEHOLDER_STATE_IN_SYNC, CF_PLACEHOLDER_STATE_INVALID, CF_PLACEHOLDER_STATE_PLACEHOLDER,
+    CF_PLACEHOLDER_STATE_INVALID, CF_PLACEHOLDER_STATE_IN_SYNC, CF_PLACEHOLDER_STATE_PLACEHOLDER,
     CF_REGISTER_FLAG_UPDATE, CF_SYNC_POLICIES, CF_SYNC_REGISTRATION, CF_UPDATE_FLAG_MARK_IN_SYNC,
     CF_UPDATE_FLAG_VERIFY_IN_SYNC,
 };
@@ -259,7 +259,8 @@ impl WindowsCfApiBackend {
         // identity is a fixed 8 bytes (`PlaceholderGeneration`'s `u64`),
         // so 64 bytes of headroom is far more than ever needed.
         const IDENTITY_HEADROOM: usize = 64;
-        let mut buf = vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_BASIC_INFO>() + IDENTITY_HEADROOM];
+        let mut buf =
+            vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_BASIC_INFO>() + IDENTITY_HEADROOM];
         let mut returned: u32 = 0;
         // SAFETY: `handle` is a valid, open handle; `buf` is sized to hold
         // at least a full `CF_PLACEHOLDER_BASIC_INFO` plus headroom for
@@ -480,7 +481,11 @@ impl PlaceholderBackend for WindowsCfApiBackend {
         }
     }
 
-    fn hydrate(&self, path: &std::path::Path, content: &mut dyn std::io::Read) -> Result<(), RootAuthorityError> {
+    fn hydrate(
+        &self,
+        path: &std::path::Path,
+        content: &mut dyn std::io::Read,
+    ) -> Result<(), RootAuthorityError> {
         let handle = Self::open_reparse_handle(path, true)?;
         let outcome = self.hydrate_inner(handle, path, content);
         unsafe {

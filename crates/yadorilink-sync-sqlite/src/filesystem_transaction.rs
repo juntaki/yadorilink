@@ -48,16 +48,16 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
+use crate::error::SyncSqliteError;
+use crate::file_identity_codec::{self as materialized_generation, GenerationId};
 use yadorilink_replica_domain::filesystem_placement::{
     EpochState, NewReservation, PlacementRole, ReservationRole, ReservationScope,
 };
 use yadorilink_replica_domain::ids::ChangeHash;
-use crate::error::SyncSqliteError;
 use yadorilink_root_authority::fs_capabilities::DurabilityLevel;
 use yadorilink_root_authority::fs_identity::{
     DirectoryIdentity, FileIdentity, PlatformObjectId, Timestamp, VolumeIdentity, WindowsObjectId,
 };
-use crate::file_identity_codec::{self as materialized_generation, GenerationId};
 
 /// Whether the filesystem transaction engine is permitted to execute at
 /// all. `false` for the whole of this phase — see the module doc.
@@ -853,7 +853,9 @@ pub fn check_execution_generation(
             |r| r.get(0),
         )
         .optional()?
-        .ok_or_else(|| SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}")))?;
+        .ok_or_else(|| {
+            SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}"))
+        })?;
     if current != expected {
         return Err(SyncSqliteError::ExecutionGenerationFenced {
             transaction_id: transaction_id.to_string(),
@@ -886,7 +888,9 @@ pub fn increment_execution_generation_unchecked(
             |r| r.get(0),
         )
         .optional()?;
-    next.ok_or_else(|| SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}")))
+    next.ok_or_else(|| {
+        SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}"))
+    })
 }
 
 /// Sets `transaction_id`'s `plan_revision` to `new_plan_revision`, but only
@@ -951,7 +955,9 @@ pub fn set_plan_revision_unchecked(
             )
             .optional()?;
         return match current {
-            None => Err(SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}"))),
+            None => {
+                Err(SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}")))
+            }
             Some(current_plan_revision) => Err(SyncSqliteError::TransitionRaced {
                 subject: format!("filesystem transaction {transaction_id} plan_revision"),
                 expected_state: format!("plan_revision {expected_plan_revision}"),
@@ -1053,18 +1059,24 @@ pub fn set_desired_frontier_hash_unchecked(
             )
             .optional()?;
         return match current {
-            None => Err(SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}"))),
-            Some((current_generation, current_plan_revision)) => Err(SyncSqliteError::TransitionRaced {
-                subject: format!("filesystem transaction {transaction_id} desired_frontier_hash"),
-                expected_state: format!(
-                    "execution_generation {expected_execution_generation}, plan_revision \
+            None => {
+                Err(SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}")))
+            }
+            Some((current_generation, current_plan_revision)) => {
+                Err(SyncSqliteError::TransitionRaced {
+                    subject: format!(
+                        "filesystem transaction {transaction_id} desired_frontier_hash"
+                    ),
+                    expected_state: format!(
+                        "execution_generation {expected_execution_generation}, plan_revision \
                      {expected_plan_revision}"
-                ),
-                current_state: format!(
-                    "execution_generation {current_generation}, plan_revision \
+                    ),
+                    current_state: format!(
+                        "execution_generation {current_generation}, plan_revision \
                      {current_plan_revision}"
-                ),
-            }),
+                    ),
+                })
+            }
         };
     }
     Ok(())
@@ -1101,8 +1113,9 @@ pub fn set_transaction_phase_unchecked(
     now_unix_nanos: i64,
 ) -> Result<(), SyncSqliteError> {
     check_execution_generation(conn, transaction_id, expected_execution_generation)?;
-    let record = lookup_transaction(conn, transaction_id)?
-        .ok_or_else(|| SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}")))?;
+    let record = lookup_transaction(conn, transaction_id)?.ok_or_else(|| {
+        SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}"))
+    })?;
     if !record.phase.can_transition_to(to) {
         return Err(SyncSqliteError::InvalidInput(format!(
             "filesystem transaction {transaction_id}: {:?} -> {to:?} is not a legal phase transition",
@@ -2744,7 +2757,10 @@ pub fn list_reservations(
 
 /// Releases every reservation `transaction_id` holds — canonical locks and
 /// reservations are released immediately after a commit. Gated.
-pub fn release_reservations(conn: &Connection, transaction_id: &str) -> Result<(), SyncSqliteError> {
+pub fn release_reservations(
+    conn: &Connection,
+    transaction_id: &str,
+) -> Result<(), SyncSqliteError> {
     require_execution_enabled()?;
     release_reservations_unchecked(conn, transaction_id)
 }
@@ -3024,7 +3040,10 @@ mod tests {
         let conn = open();
         let hash = ChangeHash([1; 32]);
         let new_tx = sample_new_transaction(Some(&hash));
-        assert!(matches!(begin_transaction(&conn, &new_tx, 0), Err(SyncSqliteError::NotImplemented(_))));
+        assert!(matches!(
+            begin_transaction(&conn, &new_tx, 0),
+            Err(SyncSqliteError::NotImplemented(_))
+        ));
         assert!(matches!(
             increment_execution_generation(&conn, "whatever"),
             Err(SyncSqliteError::NotImplemented(_))
@@ -3045,7 +3064,10 @@ mod tests {
             capability_snapshot: b"opaque",
             durability_level: DurabilityLevel::PowerLossSafe,
         };
-        assert!(matches!(insert_epoch(&conn, &new_epoch, 0, 0), Err(SyncSqliteError::NotImplemented(_))));
+        assert!(matches!(
+            insert_epoch(&conn, &new_epoch, 0, 0),
+            Err(SyncSqliteError::NotImplemented(_))
+        ));
         assert!(matches!(
             transition_epoch(
                 &conn,
@@ -4402,7 +4424,8 @@ mod tests {
             matches!(result, Err(SyncSqliteError::TransitionRaced { .. })),
             "the UPDATE must re-check the source phase itself once unblocked, got {result:?}"
         );
-        if let Err(SyncSqliteError::TransitionRaced { expected_state, current_state, .. }) = &result {
+        if let Err(SyncSqliteError::TransitionRaced { expected_state, current_state, .. }) = &result
+        {
             assert_eq!(expected_state, EpochState::Committing.as_db_str());
             assert_eq!(current_state, EpochState::RequiresPhysicalRecovery.as_db_str());
         }
@@ -5185,7 +5208,10 @@ mod tests {
         // rather than silently resolved into a possibly-wrong key.
         for alias in ["a/./b", "a/x/../b"] {
             let result = path_key(alias);
-            assert!(matches!(result, Err(SyncSqliteError::InvalidInput(_))), "{alias:?} -> {result:?}");
+            assert!(
+                matches!(result, Err(SyncSqliteError::InvalidInput(_))),
+                "{alias:?} -> {result:?}"
+            );
         }
     }
 

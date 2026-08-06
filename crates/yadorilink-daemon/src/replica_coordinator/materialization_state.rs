@@ -25,22 +25,24 @@
 //! either: `MaterializationIntentGuard::open` already returns
 //! `SyncSqliteError` directly (narrowed from `SyncError`, Phase 7D-10).
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::collections::HashMap;
 
-use yadorilink_replica_domain::change::Change;
-use yadorilink_replica_domain::file::{FileRecord, RecordKind};
-use yadorilink_replica_domain::ids::ChangeHash;
-use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_root_authority::root_commit::RootCommitPermit;
-use yadorilink_root_authority::root_identity::VerifiedRoot;
 use yadorilink_filesystem_sync::materialization_types::{
     EvictableFile, RestoreCommitOutcome, RestoreOperation,
 };
+use yadorilink_replica_domain::change::Change;
+use yadorilink_replica_domain::file::{FileRecord, RecordKind};
+use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::session_state::CurrentVersionRecord;
-use yadorilink_sync_sqlite::{MaterializationStatePort, OpenMaterializationIntent, SyncSqliteError};
+use yadorilink_replica_domain::session_state::MaterializationState;
+use yadorilink_root_authority::root_commit::RootCommitPermit;
+use yadorilink_root_authority::root_identity::VerifiedRoot;
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
+use yadorilink_sync_sqlite::{
+    MaterializationStatePort, OpenMaterializationIntent, SyncSqliteError,
+};
 
 use super::ReplicaCoordinator;
 
@@ -53,8 +55,10 @@ impl MaterializationStatePort for ReplicaCoordinator {
         &self,
         group_id: &str,
         path: &str,
-    ) -> Result<std::collections::HashSet<yadorilink_local_storage::ContentHash>, SyncSqliteError> {
-        self.materialization_state_repository().blocks_referenced_outside_current_file(group_id, path)
+    ) -> Result<std::collections::HashSet<yadorilink_local_storage::ContentHash>, SyncSqliteError>
+    {
+        self.materialization_state_repository()
+            .blocks_referenced_outside_current_file(group_id, path)
     }
 
     fn get_current_version_record(
@@ -65,7 +69,11 @@ impl MaterializationStatePort for ReplicaCoordinator {
         self.sqlite().dag_get_current_version_record(group_id, path)
     }
 
-    fn get_record_kind(&self, group_id: &str, path: &str) -> Result<Option<RecordKind>, SyncSqliteError> {
+    fn get_record_kind(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<RecordKind>, SyncSqliteError> {
         self.file_index_repository().get_record_kind(group_id, path)
     }
 
@@ -136,7 +144,11 @@ impl MaterializationStatePort for ReplicaCoordinator {
         self.materialization_state_repository().list_materialization_states(group_id)
     }
 
-    fn has_materialization_intent(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError> {
+    fn has_materialization_intent(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, SyncSqliteError> {
         self.materialization_job_repository().has_materialization_intent(group_id, path)
     }
 
@@ -146,8 +158,7 @@ impl MaterializationStatePort for ReplicaCoordinator {
         path: &str,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.materialization_job_repository()
-            .clear_materialization_intent(group_id, path, permit)
+        self.materialization_job_repository().clear_materialization_intent(group_id, path, permit)
     }
 
     fn begin_materialization_intent(
@@ -157,8 +168,12 @@ impl MaterializationStatePort for ReplicaCoordinator {
         target_version_hash: &[u8],
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.materialization_job_repository()
-            .begin_materialization_intent(group_id, path, target_version_hash, permit)
+        self.materialization_job_repository().begin_materialization_intent(
+            group_id,
+            path,
+            target_version_hash,
+            permit,
+        )
     }
 
     fn mark_deleted(
@@ -200,8 +215,13 @@ impl MaterializationStatePort for ReplicaCoordinator {
         observed_at_unix_nanos: i64,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.dirty_path_repository()
-            .record_dirty_path(group_id, path, change_kind, observed_at_unix_nanos, permit)
+        self.dirty_path_repository().record_dirty_path(
+            group_id,
+            path,
+            change_kind,
+            observed_at_unix_nanos,
+            permit,
+        )
     }
 
     fn list_dirty_paths(
@@ -253,8 +273,12 @@ impl MaterializationStatePort for ReplicaCoordinator {
         origin_device_id: &str,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.file_index_repository()
-            .upsert_file_with_origin(group_id, record, origin_device_id, permit)
+        self.file_index_repository().upsert_file_with_origin(
+            group_id,
+            record,
+            origin_device_id,
+            permit,
+        )
     }
 
     fn list_versions(
@@ -265,7 +289,10 @@ impl MaterializationStatePort for ReplicaCoordinator {
         self.sqlite().dag_list_versions(group_id, path)
     }
 
-    fn list_restore_operations(&self, group_id: &str) -> Result<Vec<RestoreOperation>, SyncSqliteError> {
+    fn list_restore_operations(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<RestoreOperation>, SyncSqliteError> {
         self.restore_operation_repository().list_restore_operations(group_id)
     }
 

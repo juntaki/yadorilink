@@ -10,21 +10,21 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-use yadorilink_replica_domain::change;
-use yadorilink_replica_domain::change::{Change, ChangeAuth};
-use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId};
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
+use crate::sync_error::SyncError;
 use yadorilink_peer_session::peer_session::{
     ChangeAuthenticator, PreparedRebootstrap, RebootstrapHandler,
 };
 use yadorilink_peer_session::PeerSessionError;
+use yadorilink_replica_domain::change;
+use yadorilink_replica_domain::change::{Change, ChangeAuth};
+use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId};
 use yadorilink_replica_engine::error::ReplicaEngineError;
 use yadorilink_replica_engine::rebootstrap::{
     prepare_rebootstrap_required, verify_and_install_rebootstrap, AtomicRebootstrapInstaller,
     RebootstrapRequired, RebootstrapTrust,
 };
 use yadorilink_replica_engine::rebootstrap_snapshot::RebootstrapSnapshot;
-use crate::sync_error::SyncError;
+use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
 use crate::daemon_state::{DaemonState, GroupPolicyResolution};
 
@@ -263,8 +263,10 @@ impl RebootstrapHandler for DaemonRebootstrapHandler {
             .state
             .device_signing_key()
             .map(|key| ChangeEmitter::new(self.state.device_id.clone(), key));
-        let installer =
-            SyncStateRebootstrapInstaller { state: self.state.replica_coordinator.clone(), local_emitter };
+        let installer = SyncStateRebootstrapInstaller {
+            state: self.state.replica_coordinator.clone(),
+            local_emitter,
+        };
         Ok(verify_and_install_rebootstrap(
             &installer,
             required,
@@ -288,11 +290,11 @@ impl RebootstrapHandler for DaemonRebootstrapHandler {
 
 #[cfg(test)]
 mod tests {
+    use crate::replica_coordinator::ReplicaCoordinator;
     use ed25519_dalek::SigningKey;
     use yadorilink_local_storage::FsBlockStore;
     use yadorilink_replica_engine::compaction::Checkpoint;
     use yadorilink_replica_engine::rebootstrap::SnapshotManifest;
-    use crate::replica_coordinator::ReplicaCoordinator;
 
     use super::*;
 

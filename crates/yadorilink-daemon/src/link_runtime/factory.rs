@@ -33,8 +33,8 @@ use std::sync::Arc;
 
 use tokio::task::JoinHandle;
 use yadorilink_filesystem_sync::debounce;
-use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
 use yadorilink_filesystem_sync::watcher::FolderWatchSource;
+use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
 
 use crate::error::DaemonError;
 use crate::link_runtime::dependencies::LinkRuntimeDependencies;
@@ -136,8 +136,9 @@ impl LinkRuntimeFactory {
         // this same process's own abandoned attempt. It is moved into the
         // registry only by the caller's own `link_slot_guard.publish(...)`,
         // once this whole function has already succeeded.
-        let root_lock =
-            yadorilink_root_authority::sync_root_lock::SyncRootLock::acquire(Path::new(&local_path))?;
+        let root_lock = yadorilink_root_authority::sync_root_lock::SyncRootLock::acquire(
+            Path::new(&local_path),
+        )?;
         // Monotonic per-attempt identifier -- not persisted, not compared
         // against anything; exists purely so a `RootLease` (and every log line
         // that includes it) can be told apart from a previous or subsequent
@@ -241,7 +242,10 @@ impl LinkRuntimeFactory {
         //
         // A failure to READ the flag suppresses too: "I could not tell" must never
         // resolve to "deleting is fine".
-        let suppress_after_recovery = match deps.replica_coordinator.link_repository().suppress_tombstones_for_group(&group_id)
+        let suppress_after_recovery = match deps
+            .replica_coordinator
+            .link_repository()
+            .suppress_tombstones_for_group(&group_id)
         {
             Ok(suppress) => suppress,
             Err(e) => {

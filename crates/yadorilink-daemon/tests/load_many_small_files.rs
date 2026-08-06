@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use support::{real_entry_names, wait_until_with_context};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::FsBlockStore;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+use yadorilink_local_storage::FsBlockStore;
 use yadorilink_transport::DeviceKeyPair;
 
 const FILE_COUNT: usize = 200;

@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use uuid::Uuid;
-use yadorilink_replica_domain::session_state::{MembershipCommitMode, MembershipDurabilityScope, MembershipOperation, MembershipOperationAction, MembershipOperationState};
+use yadorilink_replica_domain::session_state::{
+    MembershipCommitMode, MembershipDurabilityScope, MembershipOperation,
+    MembershipOperationAction, MembershipOperationState,
+};
 
 use super::model::{MembershipCommitOutcome, MembershipOperationLookup, MembershipRemoteCommand};
 use super::ports::{
@@ -1111,10 +1114,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
-    use yadorilink_replica_domain::session_state::{FolderLink, InvalidMembershipOperation, MembershipOperationScan};
+    use crate::sync_error::SyncError;
     use yadorilink_peer_session::peer_session::PeerHandoffTicketGrant;
     use yadorilink_replica_domain::session_state::MaterializationPolicy;
-    use crate::sync_error::SyncError;
+    use yadorilink_replica_domain::session_state::{
+        FolderLink, InvalidMembershipOperation, MembershipOperationScan,
+    };
 
     use super::*;
     use crate::application::model::{

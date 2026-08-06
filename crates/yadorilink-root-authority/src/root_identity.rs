@@ -245,8 +245,7 @@ impl VerifiedRoot {
         // and fail spuriously. `verify` never writes, so this only ever
         // waits for an adoption in flight, never contends against another
         // `verify`.
-        let _adoption_guard =
-            state.root_adoption_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _adoption_guard = state.root_adoption_lock().lock().unwrap_or_else(|p| p.into_inner());
         let persisted = state.link_root_token_for_group(group_id)?.ok_or_else(|| {
             root_identity_mismatch(&path, group_id, "the link has no previously-adopted root token")
         })?;
@@ -327,8 +326,7 @@ impl VerifiedRoot {
         // read, a marker read, and — on the unmarked path — a marker write
         // and a DB write), never across an await, so a `std::sync::Mutex` is
         // safe here.
-        let _adoption_guard =
-            state.root_adoption_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _adoption_guard = state.root_adoption_lock().lock().unwrap_or_else(|p| p.into_inner());
         let persisted = state.link_root_token_for_group(group_id)?;
 
         let Some(marker) = read_marker(&path)? else {

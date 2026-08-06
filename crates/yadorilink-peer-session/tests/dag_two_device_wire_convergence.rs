@@ -29,8 +29,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use boringtun::x25519::{PublicKey, StaticSecret};
-use yadorilink_local_storage::FsBlockStore;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+use yadorilink_local_storage::FsBlockStore;
 use yadorilink_peer_session::peer_session::{PeerSyncSession, PeerSyncSessionDeps};
 use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_transport::PeerChannel;
@@ -80,7 +80,8 @@ fn setup_device(device_id: &str, signing_key: SigningKey) -> Device {
         Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
     let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     state.link_repository().add_link(&root.to_string_lossy(), GROUP).unwrap();
-    yadorilink_root_authority::root_identity::VerifiedRoot::open(&root, GROUP, state.as_ref()).unwrap();
+    yadorilink_root_authority::root_identity::VerifiedRoot::open(&root, GROUP, state.as_ref())
+        .unwrap();
     // Take this link's startup gate through to Ready, as every live link does in
     // a real daemon: `app::run` arms the gate for each non-orphaned link at boot
     // before any fallible watcher setup, and the `AddLink` control path arms it
@@ -191,7 +192,8 @@ fn live_record(state: &ReplicaCoordinator) -> Option<FileRecord> {
 /// The single non-deleted conflict-copy record for `PATH`, if any.
 fn conflict_copy(state: &ReplicaCoordinator) -> Option<FileRecord> {
     let mut copies: Vec<FileRecord> = state
-        .file_index_repository().list_files(GROUP)
+        .file_index_repository()
+        .list_files(GROUP)
         .unwrap()
         .into_iter()
         .filter(|r| !r.deleted && r.path.contains("(conflicted copy,"))
@@ -361,7 +363,13 @@ async fn run_scenario(announce_a_first: bool) -> Result<(i64, i64, String, Strin
                 live_record(&dev.state).map(|r| (r.mtime_unix_nanos, r.path)),
                 conflict_copy(&dev.state).map(|r| r.path),
                 dev.state.sqlite().dag_group_heads(GROUP).unwrap().len(),
-                dev.state.file_index_repository().list_files(GROUP).unwrap().iter().filter(|r| !r.deleted).count(),
+                dev.state
+                    .file_index_repository()
+                    .list_files(GROUP)
+                    .unwrap()
+                    .iter()
+                    .filter(|r| !r.deleted)
+                    .count(),
             ));
         }
     }

@@ -459,7 +459,10 @@ fn open_sidecar_file(
 /// [`open_sidecar_file`]'s own `object_kind` check right after this
 /// function returns.
 #[cfg(unix)]
-fn open_sidecar_file_platform(root: &Path, lock_path: &Path) -> Result<std::fs::File, RootAuthorityError> {
+fn open_sidecar_file_platform(
+    root: &Path,
+    lock_path: &Path,
+) -> Result<std::fs::File, RootAuthorityError> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -512,7 +515,10 @@ fn open_sidecar_file_platform(root: &Path, lock_path: &Path) -> Result<std::fs::
 /// crate's `fs_commit`/`fs_identity` modules, which carry the identical
 /// caveat for the identical reason.
 #[cfg(windows)]
-fn open_sidecar_file_platform(_root: &Path, lock_path: &Path) -> Result<std::fs::File, RootAuthorityError> {
+fn open_sidecar_file_platform(
+    _root: &Path,
+    lock_path: &Path,
+) -> Result<std::fs::File, RootAuthorityError> {
     use std::os::windows::fs::OpenOptionsExt;
 
     /// `FILE_FLAG_OPEN_REPARSE_POINT` — identical value, and identical

@@ -19,15 +19,17 @@ use std::path::Path;
 
 use yadorilink_local_storage::disk_bytes_match_indexed_blocks;
 use yadorilink_local_storage::free_space::{self, FreeSpaceState};
-use yadorilink_local_storage::{verify_write_target_within_root, write_placeholder};
 use yadorilink_local_storage::BlockReclamationStore;
+use yadorilink_local_storage::{verify_write_target_within_root, write_placeholder};
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_replica_engine::custody::FullReplicaCustody;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 
 use crate::block_liveness::BlockLivenessGate;
-use crate::materialization_execution::{MaterializationExecutionError, MaterializationExecutionPort};
+use crate::materialization_execution::{
+    MaterializationExecutionError, MaterializationExecutionPort,
+};
 use crate::materialization_types::EvictableFile;
 
 /// Reuses `yadorilink-peer-session`'s `disk_race_fingerprint` rather than a

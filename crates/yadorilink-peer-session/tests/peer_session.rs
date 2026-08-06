@@ -7,19 +7,19 @@ use ed25519_dalek::SigningKey;
 use prost::Message as _;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
-use yadorilink_ipc_proto::sync as proto;
-use yadorilink_local_storage::{BlockStore, FsBlockStore};
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
+use yadorilink_ipc_proto::sync as proto;
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
+use yadorilink_local_storage::{BlockStore, FsBlockStore};
 use yadorilink_peer_session::peer_session::{
     BlockWriteActivityProvider, ChangeAuthenticator, PeerSyncSession, PeerSyncSessionDeps,
     RootCommitAuthorityProvider,
 };
 use yadorilink_peer_session::rate_limiter::RateLimiters;
-use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_replica_domain::session_state::{MaterializationPolicy, MaterializationState};
-use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
+use yadorilink_root_authority::root_commit::RootCommitPermit;
+use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 use yadorilink_transport::PeerChannel;
 
 // Reusable non-madsim change-DAG test support (pinned-key authenticator +
@@ -96,9 +96,16 @@ impl Device {
         // for. Registering it here keeps the fixture's invariant the same as
         // production's; the tests that care about pause/unlink/policy still
         // drive those explicitly on top.
-        state.link_repository().add_link(&root.path().canonicalize().unwrap().to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(root.path(), GROUP, state.as_ref())
+        state
+            .link_repository()
+            .add_link(&root.path().canonicalize().unwrap().to_string_lossy(), GROUP)
             .unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            root.path(),
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
         // A linked group also owes a completed startup reconciliation before
         // the peer-apply path will admit anything for it: `wait_group_ready`
         // defers a batch for a live link whose startup never registered a gate,
@@ -127,8 +134,13 @@ impl Device {
     }
 
     fn processor(&self) -> LocalChangeProcessor {
-        LocalChangeProcessor::new(self.state.clone(), self.store.clone(), self.device_id.clone(), std::sync::Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()))
-            .with_change_emitter(self.emitter())
+        LocalChangeProcessor::new(
+            self.state.clone(),
+            self.store.clone(),
+            self.device_id.clone(),
+            std::sync::Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+        )
+        .with_change_emitter(self.emitter())
     }
 
     /// A signed-change producer over this device's state/store, for scenarios
@@ -413,7 +425,9 @@ struct AlwaysValidRootCommitAuthorityProvider {
 
 impl AlwaysValidRootCommitAuthorityProvider {
     fn new() -> Arc<dyn RootCommitAuthorityProvider> {
-        Arc::new(Self { lease: Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()) })
+        Arc::new(Self {
+            lease: Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+        })
     }
 }
 
@@ -617,7 +631,8 @@ fn spawn_session_configured_ex(
     let convergence_groups = shared_group_ids.clone();
     let convergence_state = device.state.clone();
 
-    let mut deps = PeerSyncSessionDeps { change_authenticator, ..PeerSyncSessionDeps::standalone() };
+    let mut deps =
+        PeerSyncSessionDeps { change_authenticator, ..PeerSyncSessionDeps::standalone() };
     if let Some(provider) = root_commit_authority_provider {
         deps.root_commit_authority_provider = provider;
     }
@@ -818,8 +833,10 @@ async fn initial_sync_replicates_existing_file_to_new_peer() {
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // device-a's pre-existing file is already in its DAG (process_event above);
@@ -831,7 +848,8 @@ async fn initial_sync_replicates_existing_file_to_new_peer() {
     let replicated = std::fs::read(&replicated_path).unwrap();
     assert_eq!(original, replicated);
 
-    let record = device_b.state.file_index_repository().get_file(GROUP, "vacation.jpg").unwrap().unwrap();
+    let record =
+        device_b.state.file_index_repository().get_file(GROUP, "vacation.jpg").unwrap().unwrap();
     assert!(!record.deleted);
     assert_eq!(record.size, 300_000);
 }
@@ -858,7 +876,8 @@ async fn eager_peer_adoption_waits_for_block_deletion_gate_before_index_commit()
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     // A short periodic heads-announce reliably carries device-a's committed
     // change to device-b over loopback so the eager adoption enters the gate.
     session_a.set_full_index_resync_interval(Duration::from_millis(100));
@@ -891,7 +910,12 @@ async fn eager_peer_adoption_waits_for_block_deletion_gate_before_index_commit()
     .await
     .unwrap();
     assert!(
-        !device_b.state.materialization_state_repository().live_block_hashes().unwrap().contains(&orphan_hash),
+        !device_b
+            .state
+            .materialization_state_repository()
+            .live_block_hashes()
+            .unwrap()
+            .contains(&orphan_hash),
         "eager adoption must not commit its first block reference during physical deletion"
     );
 
@@ -913,7 +937,11 @@ async fn ondemand_peer_adoption_waits_for_block_deletion_gate_before_index_commi
     let device_b = Device::new("device-b");
     let root_b = device_b.root_path().to_string_lossy().to_string();
     link_with_completed_startup(&device_b.state, &root_b);
-    device_b.state.link_repository().set_materialization_policy(&root_b, MaterializationPolicy::OnDemand).unwrap();
+    device_b
+        .state
+        .link_repository()
+        .set_materialization_policy(&root_b, MaterializationPolicy::OnDemand)
+        .unwrap();
     let content = b"old orphan block adopted as an on-demand placeholder";
 
     let orphan_hash = device_b.store.put(content).unwrap();
@@ -931,7 +959,8 @@ async fn ondemand_peer_adoption_waits_for_block_deletion_gate_before_index_commi
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     // A short periodic heads-announce reliably carries device-a's committed
     // change to device-b over loopback so the on-demand adoption enters the gate.
     session_a.set_full_index_resync_interval(Duration::from_millis(100));
@@ -966,7 +995,12 @@ async fn ondemand_peer_adoption_waits_for_block_deletion_gate_before_index_commi
     .await
     .unwrap();
     assert!(
-        !device_b.state.materialization_state_repository().live_block_hashes().unwrap().contains(&orphan_hash),
+        !device_b
+            .state
+            .materialization_state_repository()
+            .live_block_hashes()
+            .unwrap()
+            .contains(&orphan_hash),
         "on-demand adoption must not commit a block reference during physical deletion"
     );
 
@@ -976,14 +1010,31 @@ async fn ondemand_peer_adoption_waits_for_block_deletion_gate_before_index_commi
         wake.notify_all();
     }
     wait_until(
-        || device_b.state.file_index_repository().get_file(GROUP, "ondemand-restored.txt").ok().flatten().is_some(),
+        || {
+            device_b
+                .state
+                .file_index_repository()
+                .get_file(GROUP, "ondemand-restored.txt")
+                .ok()
+                .flatten()
+                .is_some()
+        },
         Duration::from_secs(10),
     )
     .await;
-    let adopted = device_b.state.file_index_repository().get_file(GROUP, "ondemand-restored.txt").unwrap().unwrap();
+    let adopted = device_b
+        .state
+        .file_index_repository()
+        .get_file(GROUP, "ondemand-restored.txt")
+        .unwrap()
+        .unwrap();
     assert!(adopted.blocks.iter().any(|block| hex::encode(&block.hash) == orphan_hash));
     assert_eq!(
-        device_b.state.materialization_state_repository().get_materialization_state(GROUP, "ondemand-restored.txt").unwrap(),
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "ondemand-restored.txt")
+            .unwrap(),
         Some(MaterializationState::Placeholder)
     );
 }
@@ -1012,8 +1063,10 @@ async fn same_version_resync_rehydrates_a_missing_eager_file() {
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     session_a.set_full_index_resync_interval(Duration::from_millis(100));
     session_b.set_full_index_resync_interval(Duration::from_millis(100));
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
@@ -1024,7 +1077,13 @@ async fn same_version_resync_rehydrates_a_missing_eager_file() {
     std::fs::remove_file(&replicated_path).unwrap();
     device_b
         .state
-        .materialization_state_repository().set_materialization_state(GROUP, file_name, MaterializationState::Placeholder, &RootCommitPermit::for_tests())
+        .materialization_state_repository()
+        .set_materialization_state(
+            GROUP,
+            file_name,
+            MaterializationState::Placeholder,
+            &RootCommitPermit::for_tests(),
+        )
         .unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -1039,7 +1098,11 @@ async fn same_version_resync_rehydrates_a_missing_eager_file() {
 
     assert_eq!(std::fs::read(&replicated_path).unwrap(), contents);
     assert_eq!(
-        device_b.state.materialization_state_repository().get_materialization_state(GROUP, file_name).unwrap(),
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, file_name)
+            .unwrap(),
         Some(MaterializationState::Hydrated)
     );
 }
@@ -1051,7 +1114,11 @@ async fn same_version_resync_does_not_hydrate_an_ondemand_placeholder() {
     let device_b = Device::new("device-b");
     let root_b = device_b.root_path().to_string_lossy().to_string();
     link_with_completed_startup(&device_b.state, &root_b);
-    device_b.state.link_repository().set_materialization_policy(&root_b, MaterializationPolicy::OnDemand).unwrap();
+    device_b
+        .state
+        .link_repository()
+        .set_materialization_policy(&root_b, MaterializationPolicy::OnDemand)
+        .unwrap();
 
     let file_name = "ondemand.bin";
     let contents = vec![0xA5u8; 300_000];
@@ -1069,8 +1136,10 @@ async fn same_version_resync_does_not_hydrate_an_ondemand_placeholder() {
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     session_a.set_full_index_resync_interval(Duration::from_millis(100));
     session_b.set_full_index_resync_interval(Duration::from_millis(100));
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
@@ -1080,7 +1149,12 @@ async fn same_version_resync_does_not_hydrate_an_ondemand_placeholder() {
         &session_a,
         GROUP,
         || {
-            device_b.state.materialization_state_repository().get_materialization_state(GROUP, file_name).ok().flatten()
+            device_b
+                .state
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, file_name)
+                .ok()
+                .flatten()
                 == Some(MaterializationState::Placeholder)
         },
         Duration::from_secs(20),
@@ -1091,7 +1165,11 @@ async fn same_version_resync_does_not_hydrate_an_ondemand_placeholder() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert_eq!(
-        device_b.state.materialization_state_repository().get_materialization_state(GROUP, file_name).unwrap(),
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, file_name)
+            .unwrap(),
         Some(MaterializationState::Placeholder)
     );
     assert!(replicated_path.exists());
@@ -1127,8 +1205,10 @@ async fn bidirectional_link_applies_incoming_change() {
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     announce_until(
@@ -1143,7 +1223,12 @@ async fn bidirectional_link_applies_incoming_change() {
         device_b.root_path().join("vacation.jpg").exists(),
         "a bidirectional link must materialize an incoming change to disk"
     );
-    assert!(device_b.state.file_index_repository().get_file(GROUP, "vacation.jpg").unwrap().is_some());
+    assert!(device_b
+        .state
+        .file_index_repository()
+        .get_file(GROUP, "vacation.jpg")
+        .unwrap()
+        .is_some());
     assert_eq!(std::fs::read(device_b.root_path().join("vacation.jpg")).unwrap(), contents);
 }
 
@@ -1175,8 +1260,10 @@ async fn paused_link_does_not_apply_an_incoming_change() {
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // Announce device-a's change repeatedly; a paused link must drop every
@@ -1187,7 +1274,12 @@ async fn paused_link_does_not_apply_an_incoming_change() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(!device_b.root_path().join("vacation.jpg").exists());
-    assert!(device_b.state.file_index_repository().get_file(GROUP, "vacation.jpg").unwrap().is_none());
+    assert!(device_b
+        .state
+        .file_index_repository()
+        .get_file(GROUP, "vacation.jpg")
+        .unwrap()
+        .is_none());
 }
 
 /// Unlinking a folder detaches it and leaves the user's files alone — the
@@ -1227,8 +1319,10 @@ async fn unlinked_folder_never_lets_a_peer_tombstone_delete_local_files() {
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let landed = device_b.root_path().join("vacation.jpg");
@@ -1331,8 +1425,10 @@ async fn unlinked_folder_does_not_apply_an_incoming_peer_change() {
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     for _ in 0..5 {
@@ -1344,7 +1440,12 @@ async fn unlinked_folder_does_not_apply_an_incoming_peer_change() {
         !device_b.root_path().join("vacation.jpg").exists(),
         "a peer change was written into a folder with no link row"
     );
-    assert!(device_b.state.file_index_repository().get_file(GROUP, "vacation.jpg").unwrap().is_none());
+    assert!(device_b
+        .state
+        .file_index_repository()
+        .get_file(GROUP, "vacation.jpg")
+        .unwrap()
+        .is_none());
 }
 
 /// sync-engine spec: "Local file edit detected" + incremental propagation
@@ -1360,8 +1461,10 @@ async fn incremental_change_after_initial_sync_propagates() {
     // Pin each device's signing key on both sessions so B admits A's signed
     // change, then wait for the automatic change-DAG negotiation.
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // A local edit on A: `process_event` emits a signed Create into the DAG.
@@ -1433,10 +1536,18 @@ async fn concurrent_edit_produces_conflict_copy_on_both_sides() {
     // Causality is DAG ancestry now: the two edits are concurrent exactly when
     // each device authored its own change for the path and neither has yet
     // admitted the other's, so neither can be the other's ancestor.
-    let author_a =
-        device_a.state.file_index_repository().get_authoring_change_hash(GROUP, "shared.txt").unwrap().expect("A authored");
-    let author_b =
-        device_b.state.file_index_repository().get_authoring_change_hash(GROUP, "shared.txt").unwrap().expect("B authored");
+    let author_a = device_a
+        .state
+        .file_index_repository()
+        .get_authoring_change_hash(GROUP, "shared.txt")
+        .unwrap()
+        .expect("A authored");
+    let author_b = device_b
+        .state
+        .file_index_repository()
+        .get_authoring_change_hash(GROUP, "shared.txt")
+        .unwrap()
+        .expect("B authored");
     assert_ne!(author_a, author_b, "the two devices must have authored distinct changes");
     assert!(
         device_a.state.sqlite().dag_get_change(&author_b).unwrap().is_none(),
@@ -1449,8 +1560,10 @@ async fn concurrent_edit_produces_conflict_copy_on_both_sides() {
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // Both devices should end up with two files: the winning content at
@@ -1576,7 +1689,14 @@ async fn delete_vs_edit_conflict_tombstone_as_loser_leaves_no_ghost_file() {
     std::fs::remove_file(device_b.root_path().join("shared.txt")).unwrap();
     device_b
         .state
-        .mark_deleted_emitting_change(GROUP, "shared.txt", "device-b", 1000, &device_b.emitter(), &RootCommitPermit::for_tests())
+        .mark_deleted_emitting_change(
+            GROUP,
+            "shared.txt",
+            "device-b",
+            1000,
+            &device_b.emitter(),
+            &RootCommitPermit::for_tests(),
+        )
         .unwrap();
 
     // Reconnect the link and let the concurrent changes cross and resolve.
@@ -1612,7 +1732,8 @@ async fn delete_vs_edit_conflict_tombstone_as_loser_leaves_no_ghost_file() {
             content_a,
             "disk content must match the winner's real content, not an empty ghost file"
         );
-        let record = device.state.file_index_repository().get_file(GROUP, "shared.txt").unwrap().unwrap();
+        let record =
+            device.state.file_index_repository().get_file(GROUP, "shared.txt").unwrap().unwrap();
         assert!(!record.deleted);
         assert_eq!(record.size, content_a.len() as u64);
     }
@@ -1658,7 +1779,12 @@ async fn unauthorized_group_id_in_incoming_message_is_ignored() {
         !device_b.root_path().join("private.txt").exists(),
         "file for an unauthorized group must never be written to disk"
     );
-    assert!(device_b.state.file_index_repository().get_file(GROUP, "private.txt").unwrap().is_none());
+    assert!(device_b
+        .state
+        .file_index_repository()
+        .get_file(GROUP, "private.txt")
+        .unwrap()
+        .is_none());
 }
 
 /// spec "OnDemand folder creates placeholders
@@ -1678,7 +1804,8 @@ async fn ondemand_folder_adopts_placeholder_without_fetching_blocks() {
     link_with_completed_startup(&device_b.state, &root_b);
     device_b
         .state
-        .link_repository().set_materialization_policy(
+        .link_repository()
+        .set_materialization_policy(
             &root_b,
             yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand,
         )
@@ -1711,9 +1838,14 @@ async fn ondemand_folder_adopts_placeholder_without_fetching_blocks() {
     let on_disk = std::fs::read(&placeholder_path).unwrap();
     assert_ne!(on_disk, content, "placeholder must not contain the real content");
 
-    let record = device_b.state.file_index_repository().get_file(GROUP, "big-video.mp4").unwrap().unwrap();
+    let record =
+        device_b.state.file_index_repository().get_file(GROUP, "big-video.mp4").unwrap().unwrap();
     assert_eq!(
-        device_b.state.materialization_state_repository().get_materialization_state(GROUP, "big-video.mp4").unwrap(),
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "big-video.mp4")
+            .unwrap(),
         Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
     );
     assert_eq!(record.size, 300_000);
@@ -1746,7 +1878,8 @@ async fn hydrate_file_fetches_and_materializes_placeholder_content() {
     link_with_completed_startup(&device_b.state, &root_b);
     device_b
         .state
-        .link_repository().set_materialization_policy(
+        .link_repository()
+        .set_materialization_policy(
             &root_b,
             yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand,
         )
@@ -1772,19 +1905,28 @@ async fn hydrate_file_fetches_and_materializes_placeholder_content() {
     let placeholder_path = device_b.root_path().join("report.pdf");
     wait_until(|| placeholder_path.exists(), Duration::from_secs(10)).await;
     assert_eq!(
-        device_b.state.materialization_state_repository().get_materialization_state(GROUP, "report.pdf").unwrap(),
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "report.pdf")
+            .unwrap(),
         Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
     );
 
     session_b.hydrate_file(GROUP, "report.pdf").await.unwrap();
 
     assert_eq!(
-        device_b.state.materialization_state_repository().get_materialization_state(GROUP, "report.pdf").unwrap(),
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "report.pdf")
+            .unwrap(),
         Some(yadorilink_replica_domain::session_state::MaterializationState::Hydrated)
     );
     assert_eq!(std::fs::read(&placeholder_path).unwrap(), content);
 
-    let record = device_b.state.file_index_repository().get_file(GROUP, "report.pdf").unwrap().unwrap();
+    let record =
+        device_b.state.file_index_repository().get_file(GROUP, "report.pdf").unwrap().unwrap();
     for block in &record.blocks {
         let hash_hex = hex::encode(&block.hash);
         assert!(yadorilink_local_storage::BlockStore::exists(device_b.store.as_ref(), &hash_hex)
@@ -1811,7 +1953,8 @@ async fn hydrate_file_detects_a_superseding_authoring_change_mid_fetch() {
     link_with_completed_startup(&device_b.state, &root_b);
     device_b
         .state
-        .link_repository().set_materialization_policy(
+        .link_repository()
+        .set_materialization_policy(
             &root_b,
             yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand,
         )
@@ -1864,8 +2007,12 @@ async fn hydrate_file_detects_a_superseding_authoring_change_mid_fetch() {
         Duration::from_secs(10),
     )
     .await;
-    let superseding_hash =
-        device_b.state.file_index_repository().get_authoring_change_hash(GROUP, "marker.txt").unwrap().unwrap();
+    let superseding_hash = device_b
+        .state
+        .file_index_repository()
+        .get_authoring_change_hash(GROUP, "marker.txt")
+        .unwrap()
+        .unwrap();
 
     let session_b_clone = session_b.clone();
     let hydrate_task =
@@ -1878,13 +2025,21 @@ async fn hydrate_file_detects_a_superseding_authoring_change_mid_fetch() {
     // would do to this same column.
     wait_until(
         || {
-            device_b.state.materialization_state_repository().get_materialization_state(GROUP, "bigfile.bin").unwrap()
+            device_b
+                .state
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, "bigfile.bin")
+                .unwrap()
                 == Some(yadorilink_replica_domain::session_state::MaterializationState::Hydrating)
         },
         Duration::from_secs(10),
     )
     .await;
-    device_b.state.file_index_repository().set_authoring_change_hash(GROUP, "bigfile.bin", &superseding_hash).unwrap();
+    device_b
+        .state
+        .file_index_repository()
+        .set_authoring_change_hash(GROUP, "bigfile.bin", &superseding_hash)
+        .unwrap();
 
     let result = hydrate_task.await.unwrap();
 
@@ -1900,7 +2055,11 @@ async fn hydrate_file_detects_a_superseding_authoring_change_mid_fetch() {
          different, newer row"
     );
     assert_eq!(
-        device_b.state.file_index_repository().get_authoring_change_hash(GROUP, "bigfile.bin").unwrap(),
+        device_b
+            .state
+            .file_index_repository()
+            .get_authoring_change_hash(GROUP, "bigfile.bin")
+            .unwrap(),
         Some(superseding_hash),
         "the superseding identity must survive untouched"
     );
@@ -1927,7 +2086,8 @@ async fn hydrate_file_detects_a_concurrent_disk_edit_mid_fetch() {
     link_with_completed_startup(&device_b.state, &root_b);
     device_b
         .state
-        .link_repository().set_materialization_policy(
+        .link_repository()
+        .set_materialization_policy(
             &root_b,
             yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand,
         )
@@ -1959,7 +2119,11 @@ async fn hydrate_file_detects_a_concurrent_disk_edit_mid_fetch() {
 
     wait_until(
         || {
-            device_b.state.materialization_state_repository().get_materialization_state(GROUP, "bigfile.bin").unwrap()
+            device_b
+                .state
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, "bigfile.bin")
+                .unwrap()
                 == Some(yadorilink_replica_domain::session_state::MaterializationState::Hydrating)
         },
         Duration::from_secs(10),
@@ -2012,7 +2176,8 @@ async fn hydrate_file_reports_held_not_hydrated_when_a_hazard_collision_exists()
     link_with_completed_startup(&device_b.state, &root_b);
     device_b
         .state
-        .link_repository().set_materialization_policy(
+        .link_repository()
+        .set_materialization_policy(
             &root_b,
             yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand,
         )
@@ -2023,7 +2188,8 @@ async fn hydrate_file_reports_held_not_hydrated_when_a_hazard_collision_exists()
     std::fs::write(device_b.root_path().join("Photo.jpg"), b"sibling bytes").unwrap();
     device_b
         .state
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &yadorilink_replica_domain::file::FileRecord {
                 path: "Photo.jpg".into(),
@@ -2122,7 +2288,8 @@ async fn hydrate_file_without_any_connected_peer_fails_immediately() {
 
     device_b
         .state
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &yadorilink_replica_domain::file::FileRecord {
                 path: "unreachable.bin".into(),
@@ -2140,7 +2307,8 @@ async fn hydrate_file_without_any_connected_peer_fails_immediately() {
         .unwrap();
     device_b
         .state
-        .materialization_state_repository().set_materialization_state(
+        .materialization_state_repository()
+        .set_materialization_state(
             GROUP,
             "unreachable.bin",
             yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
@@ -2159,7 +2327,11 @@ async fn hydrate_file_without_any_connected_peer_fails_immediately() {
 
     // Left as a placeholder, not stuck at `Hydrating`.
     assert_eq!(
-        device_b.state.materialization_state_repository().get_materialization_state(GROUP, "unreachable.bin").unwrap(),
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "unreachable.bin")
+            .unwrap(),
         Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
     );
 }
@@ -2178,7 +2350,8 @@ async fn evict_then_rehydrate_round_trips_to_identical_content() {
     link_with_completed_startup(&device_b.state, &root_b);
     device_b
         .state
-        .link_repository().set_materialization_policy(
+        .link_repository()
+        .set_materialization_policy(
             &root_b,
             yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand,
         )
@@ -2232,7 +2405,8 @@ async fn evict_then_rehydrate_round_trips_to_identical_content() {
     yadorilink_filesystem_sync::materialization_eviction::evict_file(
         yadorilink_filesystem_sync::materialization_eviction::MaterializationContext {
             state: device_b.state.as_ref(),
-            liveness_gate: &yadorilink_filesystem_sync::block_liveness::BlockLivenessGate::default(),
+            liveness_gate: &yadorilink_filesystem_sync::block_liveness::BlockLivenessGate::default(
+            ),
             store: device_b.store.as_ref(),
             root: &device_b.root_path(),
             permit: &permit,
@@ -2247,7 +2421,11 @@ async fn evict_then_rehydrate_round_trips_to_identical_content() {
     )
     .unwrap();
     assert_eq!(
-        device_b.state.materialization_state_repository().get_materialization_state(GROUP, "archive.zip").unwrap(),
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "archive.zip")
+            .unwrap(),
         Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
     );
     assert_ne!(
@@ -2258,7 +2436,11 @@ async fn evict_then_rehydrate_round_trips_to_identical_content() {
 
     session_b.hydrate_file(GROUP, "archive.zip").await.unwrap();
     assert_eq!(
-        device_b.state.materialization_state_repository().get_materialization_state(GROUP, "archive.zip").unwrap(),
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "archive.zip")
+            .unwrap(),
         Some(yadorilink_replica_domain::session_state::MaterializationState::Hydrated)
     );
     assert_eq!(
@@ -2284,7 +2466,8 @@ async fn three_devices_on_demand_hydration_is_per_device_not_group_wide() {
         link_with_completed_startup(&device.state, &root);
         device
             .state
-            .link_repository().set_materialization_policy(
+            .link_repository()
+            .set_materialization_policy(
                 &root,
                 yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand,
             )
@@ -2323,10 +2506,19 @@ async fn three_devices_on_demand_hydration_is_per_device_not_group_wide() {
         assert_eq!(std::fs::metadata(path).unwrap().len(), 300_000);
         assert_ne!(std::fs::read(path).unwrap(), content);
         assert_eq!(
-            device.state.materialization_state_repository().get_materialization_state(GROUP, "presentation.pptx").unwrap(),
+            device
+                .state
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, "presentation.pptx")
+                .unwrap(),
             Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
         );
-        let record = device.state.file_index_repository().get_file(GROUP, "presentation.pptx").unwrap().unwrap();
+        let record = device
+            .state
+            .file_index_repository()
+            .get_file(GROUP, "presentation.pptx")
+            .unwrap()
+            .unwrap();
         for block in &record.blocks {
             let hash_hex = hex::encode(&block.hash);
             assert!(
@@ -2340,18 +2532,31 @@ async fn three_devices_on_demand_hydration_is_per_device_not_group_wide() {
     // Opening it on B hydrates only B.
     session_b.hydrate_file(GROUP, "presentation.pptx").await.unwrap();
     assert_eq!(
-        device_b.state.materialization_state_repository().get_materialization_state(GROUP, "presentation.pptx").unwrap(),
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "presentation.pptx")
+            .unwrap(),
         Some(yadorilink_replica_domain::session_state::MaterializationState::Hydrated)
     );
     assert_eq!(std::fs::read(&path_on_b).unwrap(), content);
 
     // C was never asked to hydrate and remains an untouched placeholder.
     assert_eq!(
-        device_c.state.materialization_state_repository().get_materialization_state(GROUP, "presentation.pptx").unwrap(),
+        device_c
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "presentation.pptx")
+            .unwrap(),
         Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
     );
     assert_ne!(std::fs::read(&path_on_c).unwrap(), content);
-    let record_c = device_c.state.file_index_repository().get_file(GROUP, "presentation.pptx").unwrap().unwrap();
+    let record_c = device_c
+        .state
+        .file_index_repository()
+        .get_file(GROUP, "presentation.pptx")
+        .unwrap()
+        .unwrap();
     for block in &record_c.blocks {
         let hash_hex = hex::encode(&block.hash);
         assert!(
@@ -2378,7 +2583,8 @@ async fn hydration_chaos_no_reachable_peer_times_out_cleanly() {
     link_with_completed_startup(&device_b.state, &root_b);
     device_b
         .state
-        .link_repository().set_materialization_policy(
+        .link_repository()
+        .set_materialization_policy(
             &root_b,
             yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand,
         )
@@ -2388,7 +2594,8 @@ async fn hydration_chaos_no_reachable_peer_times_out_cleanly() {
     // but the connected peer never answers the resulting block request.
     device_b
         .state
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &yadorilink_replica_domain::file::FileRecord {
                 path: "orphaned.bin".into(),
@@ -2406,7 +2613,8 @@ async fn hydration_chaos_no_reachable_peer_times_out_cleanly() {
         .unwrap();
     device_b
         .state
-        .materialization_state_repository().set_materialization_state(
+        .materialization_state_repository()
+        .set_materialization_state(
             GROUP,
             "orphaned.bin",
             yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
@@ -2442,7 +2650,11 @@ async fn hydration_chaos_no_reachable_peer_times_out_cleanly() {
     // The failed attempt leaves the file as a placeholder, not stuck
     // "Hydrating" forever — a retry later is still possible.
     assert_eq!(
-        device_b.state.materialization_state_repository().get_materialization_state(GROUP, "orphaned.bin").unwrap(),
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "orphaned.bin")
+            .unwrap(),
         Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
     );
 }
@@ -2464,7 +2676,8 @@ async fn hydration_rejects_block_response_with_wrong_hash_or_size() {
 
     device_b
         .state
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &yadorilink_replica_domain::file::FileRecord {
                 path: "tampered.bin".into(),
@@ -2482,7 +2695,8 @@ async fn hydration_rejects_block_response_with_wrong_hash_or_size() {
         .unwrap();
     device_b
         .state
-        .materialization_state_repository().set_materialization_state(
+        .materialization_state_repository()
+        .set_materialization_state(
             GROUP,
             "tampered.bin",
             yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
@@ -2508,9 +2722,7 @@ async fn hydration_rejects_block_response_with_wrong_hash_or_size() {
     // otherwise make it fail fast with `NotFound` before ever sending the
     // `BlockRequest` this test's fake responder is waiting to answer.
     let session_b = spawn_session_without_convergence_driver_with_root_authority(
-        channel_b,
-        &device_b,
-        "device-a",
+        channel_b, &device_b, "device-a",
     );
     let handshake_session_b = session_b.clone();
     let responder = tokio::spawn(async move {
@@ -2564,7 +2776,11 @@ async fn hydration_rejects_block_response_with_wrong_hash_or_size() {
         "mismatched bytes must not be persisted under the expected block hash"
     );
     assert_eq!(
-        device_b.state.materialization_state_repository().get_materialization_state(GROUP, "tampered.bin").unwrap(),
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "tampered.bin")
+            .unwrap(),
         Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
     );
 }
@@ -2678,7 +2894,8 @@ async fn block_request_for_unreferenced_hash_is_refused() {
 
     device_a
         .state
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &yadorilink_replica_domain::file::FileRecord {
                 path: "public.bin".into(),
@@ -2760,23 +2977,25 @@ async fn hydration_block_request_is_refused_for_a_group_the_peer_does_not_author
     // group/path, as if adopted earlier while genuinely authorized.
     let root_b = device_b.root_path().to_string_lossy().to_string();
     link_with_completed_startup(&device_b.state, &root_b);
-    let record = device_a.state.file_index_repository().get_file(GROUP, "secret.bin").unwrap().unwrap();
-    device_b.state.file_index_repository().upsert_file(GROUP, &record, &RootCommitPermit::for_tests()).unwrap();
+    let record =
+        device_a.state.file_index_repository().get_file(GROUP, "secret.bin").unwrap().unwrap();
     device_b
         .state
-        .materialization_state_repository().set_materialization_state(
+        .file_index_repository()
+        .upsert_file(GROUP, &record, &RootCommitPermit::for_tests())
+        .unwrap();
+    device_b
+        .state
+        .materialization_state_repository()
+        .set_materialization_state(
             GROUP,
             "secret.bin",
             yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
             &RootCommitPermit::for_tests(),
         )
         .unwrap();
-    yadorilink_local_storage::write_placeholder(
-        &device_b.root_path().join("secret.bin"),
-        5_000,
-        0,
-    )
-    .unwrap();
+    yadorilink_local_storage::write_placeholder(&device_b.root_path().join("secret.bin"), 5_000, 0)
+        .unwrap();
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     // A's session (which will *answer* B's block requests) is constructed
@@ -2842,11 +3061,16 @@ async fn block_request_is_refused_after_mid_session_group_revocation() {
     // (`record_group_block_provenance`'s doc comment): without this, the
     // block-serving path refuses this block as never having been obtained
     // through the group.
-    device_a.state.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&hash)).unwrap();
+    device_a
+        .state
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
+        .unwrap();
 
     device_a
         .state
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &yadorilink_replica_domain::file::FileRecord {
                 path: "public.bin".into(),
@@ -2944,11 +3168,16 @@ async fn block_request_is_rejected_if_authorization_is_revoked_while_waiting_for
     let data = b"content revoked mid-dispatch-wait".to_vec();
     let hash = sha256_bytes(&data);
     device_a.store.put(&data).unwrap();
-    device_a.state.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&hash)).unwrap();
+    device_a
+        .state
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
+        .unwrap();
 
     device_a
         .state
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &yadorilink_replica_domain::file::FileRecord {
                 path: "dispatch-wait.bin".into(),
@@ -2967,8 +3196,12 @@ async fn block_request_is_rejected_if_authorization_is_revoked_while_waiting_for
 
     let (channel_a, requester_channel) = connect_pair(addr).await;
     let session_a = spawn_session(channel_a, &device_a, "device-b");
-    let engine =
-        yadorilink_peer_session::block_serve::BlockServeEngine::new(u64::MAX, u64::MAX, u64::MAX, 1);
+    let engine = yadorilink_peer_session::block_serve::BlockServeEngine::new(
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        1,
+    );
     session_a.set_block_serve_engine(engine.clone());
     assert!(session_a.shares_group(GROUP), "sanity: session starts out authorized for GROUP");
 
@@ -3029,8 +3262,10 @@ async fn index_update_from_just_revoked_peer_is_rejected() {
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     assert!(session_b.shares_group(GROUP), "sanity: B starts out authorizing A for GROUP");
@@ -3078,11 +3313,16 @@ async fn block_requests_are_served_to_an_authorized_peer() {
     device_a.store.put(&data).unwrap();
     // See the identical comment in
     // `block_request_is_refused_after_mid_session_group_revocation` above.
-    device_a.state.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&hash)).unwrap();
+    device_a
+        .state
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
+        .unwrap();
 
     device_a
         .state
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &yadorilink_replica_domain::file::FileRecord {
                 path: "readable.bin".into(),
@@ -3156,10 +3396,15 @@ async fn block_requests_are_served_to_an_authorized_peer() {
 fn seed_referenced_block(device: &Device, path: &str, data: &[u8]) -> Vec<u8> {
     let hash = sha256_bytes(data);
     device.store.put(data).unwrap();
-    device.state.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&hash)).unwrap();
     device
         .state
-        .file_index_repository().upsert_file(
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
+        .unwrap();
+    device
+        .state
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &yadorilink_replica_domain::file::FileRecord {
                 path: path.into(),
@@ -3189,7 +3434,8 @@ fn seed_referenced_block_without_provenance(device: &Device, path: &str, data: &
     device.store.put(data).unwrap();
     device
         .state
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &yadorilink_replica_domain::file::FileRecord {
                 path: path.into(),
@@ -3261,8 +3507,12 @@ fn engine_with_one_free_examination_slot() -> (
     Arc<yadorilink_peer_session::block_serve::BlockServeEngine>,
     Vec<yadorilink_peer_session::block_serve::ExaminationPermit>,
 ) {
-    let engine =
-        yadorilink_peer_session::block_serve::BlockServeEngine::new(u64::MAX, u64::MAX, u64::MAX, 4);
+    let engine = yadorilink_peer_session::block_serve::BlockServeEngine::new(
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        4,
+    );
     let mut held = Vec::new();
     while let Ok(permit) = engine.try_begin_examination() {
         held.push(permit);
@@ -3480,8 +3730,12 @@ async fn dispatch_wait_budget_timeout_returns_busy_within_a_bounded_window() {
 
     let (channel_a, requester_channel) = connect_pair(addr).await;
     let session_a = spawn_session(channel_a, &device_a, "device-b");
-    let engine =
-        yadorilink_peer_session::block_serve::BlockServeEngine::new(u64::MAX, u64::MAX, u64::MAX, 1);
+    let engine = yadorilink_peer_session::block_serve::BlockServeEngine::new(
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        1,
+    );
     session_a.set_block_serve_engine(engine.clone());
 
     // Occupy the one dispatch slot for this exact key and never release it.
@@ -3742,8 +3996,10 @@ async fn peer_reconciles_every_file_in_an_announced_frontier() {
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
     // The three edits are already committed to device-a's DAG by process_event
     // above; announcing the head carries the whole frontier to device-b at once.
@@ -3834,8 +4090,10 @@ async fn eager_materialize_leaves_placeholder_when_peer_cannot_supply_a_block() 
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // device-b eagerly materializes, cannot fetch the block, and (with the
@@ -3844,7 +4102,11 @@ async fn eager_materialize_leaves_placeholder_when_peer_cannot_supply_a_block() 
         &session_a,
         GROUP,
         || {
-            device_b.state.materialization_state_repository().get_materialization_state(GROUP, "loser.bin").unwrap()
+            device_b
+                .state
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, "loser.bin")
+                .unwrap()
                 == Some(MaterializationState::Placeholder)
         },
         Duration::from_secs(25),
@@ -3853,7 +4115,11 @@ async fn eager_materialize_leaves_placeholder_when_peer_cannot_supply_a_block() 
 
     // (a) Placeholder, never Hydrated.
     assert_eq!(
-        device_b.state.materialization_state_repository().get_materialization_state(GROUP, "loser.bin").unwrap(),
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "loser.bin")
+            .unwrap(),
         Some(MaterializationState::Placeholder),
         "an eager materialize whose block the peer can't supply must leave a retriable \
          placeholder, not a (fileless) Hydrated row",
@@ -3886,14 +4152,15 @@ async fn eager_materialize_leaves_placeholder_when_peer_cannot_supply_a_block() 
     // (c) The self-healing sweep has nothing to repair — the row is a
     // Placeholder, not a fileless Hydrated row, so it is never demoted (which
     // is what would have destroyed the pending write).
-    let report = yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations(
-        device_b.state.as_ref(),
-        device_b.store.as_ref(),
-        &device_b.root_path(),
-        GROUP,
-        &RootCommitPermit::for_tests(),
-    )
-    .unwrap();
+    let report =
+        yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations(
+            device_b.state.as_ref(),
+            device_b.store.as_ref(),
+            &device_b.root_path(),
+            GROUP,
+            &RootCommitPermit::for_tests(),
+        )
+        .unwrap();
     assert!(
         report.demoted_to_placeholder.is_empty() && report.reconstructed.is_empty(),
         "self-healing sweep must have nothing to repair for a retriable placeholder, got \
@@ -3907,7 +4174,11 @@ async fn eager_materialize_leaves_placeholder_when_peer_cannot_supply_a_block() 
     device_a.store.put(content.as_slice()).unwrap();
     // See the identical comment in
     // `block_request_is_refused_after_mid_session_group_revocation` above.
-    device_a.state.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&block_hash)).unwrap();
+    device_a
+        .state
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&block_hash))
+        .unwrap();
     session_b.hydrate_file(GROUP, "loser.bin").await.unwrap();
     let out = device_b.root_path().join("loser.bin");
     assert_eq!(
@@ -3916,7 +4187,11 @@ async fn eager_materialize_leaves_placeholder_when_peer_cannot_supply_a_block() 
         "the real content must materialize once the peer can serve the block"
     );
     assert_eq!(
-        device_b.state.materialization_state_repository().get_materialization_state(GROUP, "loser.bin").unwrap(),
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "loser.bin")
+            .unwrap(),
         Some(MaterializationState::Hydrated),
     );
 }
@@ -3963,8 +4238,10 @@ async fn symlinked_intermediate_component_does_not_let_a_write_escape_the_sync_r
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // Announce device-b's evil_link/pwned.txt commit and wait until device-a
@@ -3974,7 +4251,14 @@ async fn symlinked_intermediate_component_does_not_let_a_write_escape_the_sync_r
     announce_until(
         &session_b,
         GROUP,
-        || device_a.state.file_index_repository().get_file(GROUP, "evil_link/pwned.txt").unwrap().is_some(),
+        || {
+            device_a
+                .state
+                .file_index_repository()
+                .get_file(GROUP, "evil_link/pwned.txt")
+                .unwrap()
+                .is_some()
+        },
         Duration::from_secs(20),
     )
     .await;
@@ -4045,8 +4329,10 @@ async fn newly_ignored_file_drops_from_local_index_without_tombstoning_the_peers
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let replicated_path = device_b.root_path().join("cache.tmp");
@@ -4056,10 +4342,11 @@ async fn newly_ignored_file_drops_from_local_index_without_tombstoning_the_peers
     // Device A alone decides to ignore "*.tmp" — device-local and unsynced
     // ; device B's own config is untouched.
     std::fs::write(device_a.root_path().join(".yadorilinkignore"), "*.tmp\n").unwrap();
-    let ignore_set = yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet::load_for_link_root(
-        device_a.root_path(),
-    )
-    .unwrap();
+    let ignore_set =
+        yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet::load_for_link_root(
+            device_a.root_path(),
+        )
+        .unwrap();
     let changed = device_a
         .processor()
         .scan_existing_files_with_ignore(GROUP, &device_a.root_path(), &ignore_set)
@@ -4084,7 +4371,8 @@ async fn newly_ignored_file_drops_from_local_index_without_tombstoning_the_peers
         replicated_path.exists(),
         "peer's existing copy must be untouched by the other device choosing to ignore the path locally"
     );
-    let record_b = device_b.state.file_index_repository().get_file(GROUP, "cache.tmp").unwrap().unwrap();
+    let record_b =
+        device_b.state.file_index_repository().get_file(GROUP, "cache.tmp").unwrap().unwrap();
     assert!(
         !record_b.deleted,
         "no tombstone must reach the peer for a newly-ignored (not deleted) file"
@@ -4208,7 +4496,12 @@ async fn incoming_change_for_a_locally_ignored_path_is_not_projected_but_still_r
     // retryable failure. Heads advancing past it is what tells the peer "we
     // already hold this", so it is never re-sent.
     assert!(
-        device_b.state.change_history_repository().dag_list_unapplied_changes(GROUP).unwrap().is_empty(),
+        device_b
+            .state
+            .change_history_repository()
+            .dag_list_unapplied_changes(GROUP)
+            .unwrap()
+            .is_empty(),
         "an ignored path's change must retire as applied — recording the skip as a failure \
          would hold it unapplied forever and re-drive it every reprojection cycle"
     );
@@ -4272,10 +4565,18 @@ async fn conflict_on_a_locally_ignored_path_materializes_no_conflict_copy() {
     // Causality is DAG ancestry now: the two edits are concurrent exactly when
     // each device authored its own change for the path and neither has yet
     // admitted the other's, so neither can be the other's ancestor.
-    let author_a =
-        device_a.state.file_index_repository().get_authoring_change_hash(GROUP, "secret.log").unwrap().expect("A authored");
-    let author_b =
-        device_b.state.file_index_repository().get_authoring_change_hash(GROUP, "secret.log").unwrap().expect("B authored");
+    let author_a = device_a
+        .state
+        .file_index_repository()
+        .get_authoring_change_hash(GROUP, "secret.log")
+        .unwrap()
+        .expect("A authored");
+    let author_b = device_b
+        .state
+        .file_index_repository()
+        .get_authoring_change_hash(GROUP, "secret.log")
+        .unwrap()
+        .expect("B authored");
     assert_ne!(author_a, author_b, "the two devices must have authored distinct changes");
     assert!(
         device_a.state.sqlite().dag_get_change(&author_b).unwrap().is_none(),
@@ -4301,8 +4602,10 @@ async fn conflict_on_a_locally_ignored_path_materializes_no_conflict_copy() {
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // Settle on two positive signals, never a sleep — an absence assertion is
@@ -4324,7 +4627,8 @@ async fn conflict_on_a_locally_ignored_path_materializes_no_conflict_copy() {
             .unwrap()
             .any(|e| is_final_conflict_copy(&e.unwrap().file_name().to_string_lossy()))
     };
-    let b_has_a_change = || device_b.state.change_history_repository().dag_has_change(&a_change).unwrap();
+    let b_has_a_change =
+        || device_b.state.change_history_repository().dag_has_change(&a_change).unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
     while !(a_has_copy() && b_has_a_change()) && tokio::time::Instant::now() < deadline {
         let _ = session_a.announce_local_commit(GROUP).await;
@@ -4341,7 +4645,12 @@ async fn conflict_on_a_locally_ignored_path_materializes_no_conflict_copy() {
     // `applied = 0` here would mean the fix traded a privacy defect for an
     // endless churn loop.
     assert!(
-        device_b.state.change_history_repository().dag_list_unapplied_changes(GROUP).unwrap().is_empty(),
+        device_b
+            .state
+            .change_history_repository()
+            .dag_list_unapplied_changes(GROUP)
+            .unwrap()
+            .is_empty(),
         "an ignored path's change must still be marked applied, or the DAG never settles"
     );
 
@@ -4357,7 +4666,8 @@ async fn conflict_on_a_locally_ignored_path_materializes_no_conflict_copy() {
     // The index must agree with the disk: no row for a copy that was never written.
     let indexed_copy = device_b
         .state
-        .file_index_repository().list_files(GROUP)
+        .file_index_repository()
+        .list_files(GROUP)
         .unwrap()
         .into_iter()
         .any(|r| is_final_conflict_copy(&r.path));
@@ -4412,14 +4722,25 @@ async fn symlink_tombstone_removes_link_but_never_its_target() {
         blocks: vec![],
         deleted: false,
     };
-    device_b.state.file_index_repository().upsert_file(GROUP, &symlink_record, &RootCommitPermit::for_tests()).unwrap();
     device_b
         .state
-        .file_index_repository().set_record_kind(GROUP, "link.txt", yadorilink_replica_domain::file::RecordKind::Symlink, &RootCommitPermit::for_tests())
+        .file_index_repository()
+        .upsert_file(GROUP, &symlink_record, &RootCommitPermit::for_tests())
         .unwrap();
     device_b
         .state
-        .file_index_repository().set_symlink_target(GROUP, "link.txt", Some(target_path.as_os_str().as_encoded_bytes()))
+        .file_index_repository()
+        .set_record_kind(
+            GROUP,
+            "link.txt",
+            yadorilink_replica_domain::file::RecordKind::Symlink,
+            &RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    device_b
+        .state
+        .file_index_repository()
+        .set_symlink_target(GROUP, "link.txt", Some(target_path.as_os_str().as_encoded_bytes()))
         .unwrap();
     std::os::unix::fs::symlink(&target_path, device_b.root_path().join("link.txt")).unwrap();
     assert!(
@@ -4436,7 +4757,14 @@ async fn symlink_tombstone_removes_link_but_never_its_target() {
     // carries, unlike the symlink kind/target set up device-locally above.)
     device_a
         .state
-        .mark_deleted_emitting_change(GROUP, "link.txt", "device-a", 0, &device_a.emitter(), &RootCommitPermit::for_tests())
+        .mark_deleted_emitting_change(
+            GROUP,
+            "link.txt",
+            "device-a",
+            0,
+            &device_a.emitter(),
+            &RootCommitPermit::for_tests(),
+        )
         .unwrap();
 
     let (channel_a, channel_b) = connect_pair(addr).await;
@@ -4456,7 +4784,8 @@ async fn symlink_tombstone_removes_link_but_never_its_target() {
         b"do not delete me",
         "the tombstone must never touch the symlink's target, only the link itself"
     );
-    let record = device_b.state.file_index_repository().get_file(GROUP, "link.txt").unwrap().unwrap();
+    let record =
+        device_b.state.file_index_repository().get_file(GROUP, "link.txt").unwrap().unwrap();
     assert!(record.deleted, "the index must agree the record is now a tombstone");
 }
 
@@ -4497,7 +4826,11 @@ async fn tombstone_must_not_delete_through_an_intermediate_directory_symlink() {
         blocks: vec![],
         deleted: false,
     };
-    device_b.state.file_index_repository().upsert_file(GROUP, &record, &RootCommitPermit::for_tests()).unwrap();
+    device_b
+        .state
+        .file_index_repository()
+        .upsert_file(GROUP, &record, &RootCommitPermit::for_tests())
+        .unwrap();
 
     // device_a commits a tombstone for the same logical path; device_b
     // adopts it over the wire.
@@ -4557,10 +4890,23 @@ async fn held_file_tombstone_clears_held_state() {
         blocks: vec![],
         deleted: false,
     };
-    device_b.state.file_index_repository().upsert_file(GROUP, &held_record, &RootCommitPermit::for_tests()).unwrap();
-    device_b.state.materialization_state_repository().set_held(GROUP, "A.txt", "case_collision", 1_000).unwrap();
+    device_b
+        .state
+        .file_index_repository()
+        .upsert_file(GROUP, &held_record, &RootCommitPermit::for_tests())
+        .unwrap();
+    device_b
+        .state
+        .materialization_state_repository()
+        .set_held(GROUP, "A.txt", "case_collision", 1_000)
+        .unwrap();
     assert!(
-        device_b.state.materialization_state_repository().get_held_state(GROUP, "A.txt").unwrap().is_some(),
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_held_state(GROUP, "A.txt")
+            .unwrap()
+            .is_some(),
         "sanity check: the file really is held before the tombstone arrives"
     );
 
@@ -4569,7 +4915,14 @@ async fn held_file_tombstone_clears_held_state() {
     // Delete op carries; the held state was set up device-locally above.)
     device_a
         .state
-        .mark_deleted_emitting_change(GROUP, "A.txt", "device-a", 0, &device_a.emitter(), &RootCommitPermit::for_tests())
+        .mark_deleted_emitting_change(
+            GROUP,
+            "A.txt",
+            "device-a",
+            0,
+            &device_a.emitter(),
+            &RootCommitPermit::for_tests(),
+        )
         .unwrap();
 
     let (channel_a, channel_b) = connect_pair(addr).await;
@@ -4634,8 +4987,10 @@ async fn case_fold_collision_holds_the_second_arriving_file_without_touching_the
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let first_replicated = device_b.root_path().join("Photo.jpg");
@@ -4652,16 +5007,29 @@ async fn case_fold_collision_holds_the_second_arriving_file_without_touching_the
     announce_until(
         &session_a,
         GROUP,
-        || device_b.state.materialization_state_repository().get_held_state(GROUP, "photo.jpg").unwrap().is_some(),
+        || {
+            device_b
+                .state
+                .materialization_state_repository()
+                .get_held_state(GROUP, "photo.jpg")
+                .unwrap()
+                .is_some()
+        },
         Duration::from_secs(20),
     )
     .await;
 
-    let held = device_b.state.materialization_state_repository().get_held_state(GROUP, "photo.jpg").unwrap().unwrap();
+    let held = device_b
+        .state
+        .materialization_state_repository()
+        .get_held_state(GROUP, "photo.jpg")
+        .unwrap()
+        .unwrap();
     assert!(held.reason.starts_with("case_collision"), "unexpected reason: {}", held.reason);
 
     // A held record still keeps its own index row.
-    let stored = device_b.state.file_index_repository().get_file(GROUP, "photo.jpg").unwrap().unwrap();
+    let stored =
+        device_b.state.file_index_repository().get_file(GROUP, "photo.jpg").unwrap().unwrap();
     assert!(!stored.deleted);
     assert_eq!(stored.size, second_bytes.len() as u64);
 
@@ -4733,8 +5101,10 @@ async fn combined_case_and_normalization_collision_holds_the_second_arriving_fil
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let first_replicated = device_b.root_path().join("Caf\u{e9}.txt");
@@ -4750,12 +5120,24 @@ async fn combined_case_and_normalization_collision_holds_the_second_arriving_fil
     announce_until(
         &session_a,
         GROUP,
-        || device_b.state.materialization_state_repository().get_held_state(GROUP, second_path).unwrap().is_some(),
+        || {
+            device_b
+                .state
+                .materialization_state_repository()
+                .get_held_state(GROUP, second_path)
+                .unwrap()
+                .is_some()
+        },
         Duration::from_secs(20),
     )
     .await;
 
-    let held = device_b.state.materialization_state_repository().get_held_state(GROUP, second_path).unwrap().unwrap();
+    let held = device_b
+        .state
+        .materialization_state_repository()
+        .get_held_state(GROUP, second_path)
+        .unwrap()
+        .unwrap();
     assert!(
         held.reason.starts_with("case_and_normalization_collision"),
         "unexpected reason: {}",
@@ -4807,7 +5189,8 @@ async fn tombstone_of_a_case_fold_colliding_path_holds_rather_than_deletes_the_s
     std::fs::write(&first_path, b"original photo bytes").unwrap();
     device_b
         .state
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &yadorilink_replica_domain::file::FileRecord {
                 path: "Photo.jpg".into(),
@@ -4828,7 +5211,8 @@ async fn tombstone_of_a_case_fold_colliding_path_holds_rather_than_deletes_the_s
     // check being tested here.
     device_b
         .state
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &yadorilink_replica_domain::file::FileRecord {
                 path: "photo.jpg".into(),
@@ -4845,7 +5229,14 @@ async fn tombstone_of_a_case_fold_colliding_path_holds_rather_than_deletes_the_s
     // "photo.jpg" into the change DAG; device_b adopts it over the wire.
     device_a
         .state
-        .mark_deleted_emitting_change(GROUP, "photo.jpg", "device-a", 0, &device_a.emitter(), &RootCommitPermit::for_tests())
+        .mark_deleted_emitting_change(
+            GROUP,
+            "photo.jpg",
+            "device-a",
+            0,
+            &device_a.emitter(),
+            &RootCommitPermit::for_tests(),
+        )
         .unwrap();
 
     let (channel_a, channel_b) = connect_pair(addr).await;
@@ -4855,12 +5246,24 @@ async fn tombstone_of_a_case_fold_colliding_path_holds_rather_than_deletes_the_s
     announce_until(
         &session_a,
         GROUP,
-        || device_b.state.materialization_state_repository().get_held_state(GROUP, "photo.jpg").unwrap().is_some(),
+        || {
+            device_b
+                .state
+                .materialization_state_repository()
+                .get_held_state(GROUP, "photo.jpg")
+                .unwrap()
+                .is_some()
+        },
         Duration::from_secs(20),
     )
     .await;
 
-    let held = device_b.state.materialization_state_repository().get_held_state(GROUP, "photo.jpg").unwrap().unwrap();
+    let held = device_b
+        .state
+        .materialization_state_repository()
+        .get_held_state(GROUP, "photo.jpg")
+        .unwrap()
+        .unwrap();
     assert!(held.reason.starts_with("case_collision"), "unexpected reason: {}", held.reason);
 
     assert_eq!(
@@ -4895,7 +5298,8 @@ async fn tombstone_of_the_live_file_itself_does_not_corrupt_its_own_index_row_wh
     std::fs::write(&live_path, b"original photo bytes").unwrap();
     device_b
         .state
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &yadorilink_replica_domain::file::FileRecord {
                 path: "Photo.jpg".into(),
@@ -4912,7 +5316,8 @@ async fn tombstone_of_the_live_file_itself_does_not_corrupt_its_own_index_row_wh
     // create-collision -- present in the index, never materialized.
     device_b
         .state
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &yadorilink_replica_domain::file::FileRecord {
                 path: "photo.jpg".into(),
@@ -4929,7 +5334,14 @@ async fn tombstone_of_the_live_file_itself_does_not_corrupt_its_own_index_row_wh
     // path, not the sibling's.
     device_a
         .state
-        .mark_deleted_emitting_change(GROUP, "Photo.jpg", "device-a", 0, &device_a.emitter(), &RootCommitPermit::for_tests())
+        .mark_deleted_emitting_change(
+            GROUP,
+            "Photo.jpg",
+            "device-a",
+            0,
+            &device_a.emitter(),
+            &RootCommitPermit::for_tests(),
+        )
         .unwrap();
 
     let (channel_a, channel_b) = connect_pair(addr).await;
@@ -4939,12 +5351,20 @@ async fn tombstone_of_the_live_file_itself_does_not_corrupt_its_own_index_row_wh
     announce_until(
         &session_a,
         GROUP,
-        || device_b.state.materialization_state_repository().get_held_state(GROUP, "Photo.jpg").unwrap().is_some(),
+        || {
+            device_b
+                .state
+                .materialization_state_repository()
+                .get_held_state(GROUP, "Photo.jpg")
+                .unwrap()
+                .is_some()
+        },
         Duration::from_secs(20),
     )
     .await;
 
-    let record = device_b.state.file_index_repository().get_file(GROUP, "Photo.jpg").unwrap().unwrap();
+    let record =
+        device_b.state.file_index_repository().get_file(GROUP, "Photo.jpg").unwrap().unwrap();
     assert!(
         !record.deleted,
         "Photo.jpg's own index row must not become deleted=true while its bytes are still on \
@@ -4986,7 +5406,8 @@ async fn held_files_blocks_are_still_served_to_a_requesting_peer() {
     device_b.producer().commit_create(GROUP, "photo.jpg", content, 0);
     device_b
         .state
-        .materialization_state_repository().set_held(GROUP, "photo.jpg", "case_collision: collides with existing 'Photo.jpg'", 1_000)
+        .materialization_state_repository()
+        .set_held(GROUP, "photo.jpg", "case_collision: collides with existing 'Photo.jpg'", 1_000)
         .unwrap();
     assert!(
         !device_b.root_path().join("photo.jpg").exists(),
@@ -5007,7 +5428,12 @@ async fn held_files_blocks_are_still_served_to_a_requesting_peer() {
 
     // B's own held state and lack of an on-disk artifact are unaffected
     // by having served the block onward to C.
-    assert!(device_b.state.materialization_state_repository().get_held_state(GROUP, "photo.jpg").unwrap().is_some());
+    assert!(device_b
+        .state
+        .materialization_state_repository()
+        .get_held_state(GROUP, "photo.jpg")
+        .unwrap()
+        .is_some());
     assert!(!device_b.root_path().join("photo.jpg").exists());
 }
 
@@ -5205,8 +5631,10 @@ async fn exec_bit_only_change_propagates_over_the_wire_without_disturbing_conten
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let replicated_path = device_b.root_path().join("build.sh");
@@ -5609,7 +6037,8 @@ async fn hydration_rejects_a_decompression_bomb_block_response() {
 
     device_b
         .state
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &yadorilink_replica_domain::file::FileRecord {
                 path: "bomb.bin".into(),
@@ -5627,7 +6056,8 @@ async fn hydration_rejects_a_decompression_bomb_block_response() {
         .unwrap();
     device_b
         .state
-        .materialization_state_repository().set_materialization_state(
+        .materialization_state_repository()
+        .set_materialization_state(
             GROUP,
             "bomb.bin",
             yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
@@ -5665,9 +6095,7 @@ async fn hydration_rejects_a_decompression_bomb_block_response() {
     // to actually send the `BlockRequest` this fake responder is waiting
     // to answer.
     let session_b = spawn_session_without_convergence_driver_with_root_authority(
-        channel_b,
-        &device_b,
-        "device-a",
+        channel_b, &device_b, "device-a",
     );
     let handshake_session_b = session_b.clone();
     let responder = tokio::spawn(async move {
@@ -5728,7 +6156,11 @@ async fn hydration_rejects_a_decompression_bomb_block_response() {
         "a decompression-bomb payload must never be persisted under the expected block hash"
     );
     assert_eq!(
-        device_b.state.materialization_state_repository().get_materialization_state(GROUP, "bomb.bin").unwrap(),
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "bomb.bin")
+            .unwrap(),
         Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
     );
 }
@@ -5749,7 +6181,8 @@ async fn hydration_rejects_a_corrupt_compressed_block_response() {
 
     device_b
         .state
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &yadorilink_replica_domain::file::FileRecord {
                 path: "corrupt.bin".into(),
@@ -5767,7 +6200,8 @@ async fn hydration_rejects_a_corrupt_compressed_block_response() {
         .unwrap();
     device_b
         .state
-        .materialization_state_repository().set_materialization_state(
+        .materialization_state_repository()
+        .set_materialization_state(
             GROUP,
             "corrupt.bin",
             yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
@@ -5793,9 +6227,7 @@ async fn hydration_rejects_a_corrupt_compressed_block_response() {
     // to actually send the `BlockRequest` this fake responder is waiting
     // to answer.
     let session_b = spawn_session_without_convergence_driver_with_root_authority(
-        channel_b,
-        &device_b,
-        "device-a",
+        channel_b, &device_b, "device-a",
     );
     let handshake_session_b = session_b.clone();
     let responder = tokio::spawn(async move {
@@ -5873,7 +6305,8 @@ async fn fetch_window_grows_under_real_traffic_and_shrinks_after_timeouts_then_r
     link_with_completed_startup(&device_b.state, &root_b);
     device_b
         .state
-        .link_repository().set_materialization_policy(
+        .link_repository()
+        .set_materialization_policy(
             &root_b,
             yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand,
         )
@@ -5898,8 +6331,10 @@ async fn fetch_window_grows_under_real_traffic_and_shrinks_after_timeouts_then_r
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let placeholder_path = device_b.root_path().join("big-archive.tar");
@@ -5999,8 +6434,10 @@ async fn large_mostly_unchanged_index_resync_still_correctly_reconciles_the_few_
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a = spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b = spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // Initial full sync over the DAG — every file materializes on device_b.
@@ -6153,7 +6590,14 @@ async fn tombstone_adopted_from_a_peer_enters_recoverable_trash() {
     // device_a adopts it and moves its own last live content to trash.
     device_b
         .state
-        .mark_deleted_emitting_change(GROUP, "shared.txt", "device-b", 2000, &device_b.emitter(), &RootCommitPermit::for_tests())
+        .mark_deleted_emitting_change(
+            GROUP,
+            "shared.txt",
+            "device-b",
+            2000,
+            &device_b.emitter(),
+            &RootCommitPermit::for_tests(),
+        )
         .unwrap();
     announce_until(
         &session_b,
@@ -6164,7 +6608,8 @@ async fn tombstone_adopted_from_a_peer_enters_recoverable_trash() {
     .await;
 
     // The tombstone is now device A's current record for this path...
-    let current = device_a.state.file_index_repository().get_file(GROUP, "shared.txt").unwrap().unwrap();
+    let current =
+        device_a.state.file_index_repository().get_file(GROUP, "shared.txt").unwrap().unwrap();
     assert!(current.deleted, "device A must have adopted the peer's tombstone");
 
     // ...but its own prior real content is recoverable from trash, not
@@ -6175,8 +6620,9 @@ async fn tombstone_adopted_from_a_peer_enters_recoverable_trash() {
     assert_eq!(trashed[0].last_known_size, content_a.len() as u64);
 
     let versions = device_a.state.sqlite().dag_list_versions(GROUP, "shared.txt").unwrap();
-    let trashed_version =
-        versions.iter().find(|v| v.state == yadorilink_replica_domain::session_state::VersionState::Trashed);
+    let trashed_version = versions
+        .iter()
+        .find(|v| v.state == yadorilink_replica_domain::session_state::VersionState::Trashed);
     let trashed_version = trashed_version.expect("expected exactly one trashed version");
     assert!(
         !trashed_version.blocks.is_empty(),
@@ -6343,7 +6789,14 @@ async fn recv_loop_survives_a_catchup_batch_larger_than_the_permit_budget() {
     // sent, every one of `MAX_IN_FLIGHT_MESSAGES_PER_PEER` permits was
     // held by a task awaiting a `BlockReply` nobody had sent yet.
     wait_until(
-        || device_a.state.file_index_repository().get_file(GROUP, "stress-control-signal").unwrap().is_some(),
+        || {
+            device_a
+                .state
+                .file_index_repository()
+                .get_file(GROUP, "stress-control-signal")
+                .unwrap()
+                .is_some()
+        },
         Duration::from_secs(15),
     )
     .await;
@@ -6360,20 +6813,21 @@ async fn recv_loop_survives_a_catchup_batch_larger_than_the_permit_budget() {
     }
 }
 
-
 #[cfg(test)]
 mod promoted_orphan_projection_tests {
-    use yadorilink_peer_session::peer_session_impl::{ChangeAuthenticator, PeerSyncSession, PeerSyncSessionOneTimeDeps};
-    use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
-    use yadorilink_replica_domain::file::{FileMeta, FileVersion};
-    use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
-    use yadorilink_sync_sqlite::dag_store::{self, ChangeEmitter};
-    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-    use yadorilink_replica_domain::file::RecordKind;
     use ed25519_dalek::SigningKey;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
     use yadorilink_local_storage::FsBlockStore;
+    use yadorilink_peer_session::peer_session_impl::{
+        ChangeAuthenticator, PeerSyncSession, PeerSyncSessionOneTimeDeps,
+    };
+    use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
+    use yadorilink_replica_domain::file::RecordKind;
+    use yadorilink_replica_domain::file::{FileMeta, FileVersion};
+    use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
+    use yadorilink_sync_sqlite::dag_store::{self, ChangeEmitter};
 
     const GROUP: &str = "shared-group";
 
@@ -6491,7 +6945,12 @@ mod promoted_orphan_projection_tests {
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
         let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
         let generation = state.startup_readiness().begin_group_startup(GROUP);
         state.startup_readiness().mark_group_ready(GROUP, generation);
         let session = PeerSyncSession::new(
@@ -6553,7 +7012,12 @@ mod promoted_orphan_projection_tests {
         let sync_root = root_dir.path().canonicalize().unwrap();
         let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
         let generation = state.startup_readiness().begin_group_startup(GROUP);
         state.startup_readiness().mark_group_ready(GROUP, generation);
         let session = PeerSyncSession::new_with_forwarding(
@@ -6588,9 +7052,18 @@ mod promoted_orphan_projection_tests {
             .unwrap();
 
         assert!(state.change_history_repository().dag_has_change(&parent.compute_hash()).unwrap());
-        assert!(!state.change_history_repository().dag_has_change(&rejected.compute_hash()).unwrap());
-        assert!(!state.sqlite().dag_has_file_version(GROUP, &poisoned_version.version_hash).unwrap());
-        assert!(!state.change_history_repository().dag_group_file_version_references_block(GROUP, &block_hash).unwrap());
+        assert!(!state
+            .change_history_repository()
+            .dag_has_change(&rejected.compute_hash())
+            .unwrap());
+        assert!(!state
+            .sqlite()
+            .dag_has_file_version(GROUP, &poisoned_version.version_hash)
+            .unwrap());
+        assert!(!state
+            .change_history_repository()
+            .dag_group_file_version_references_block(GROUP, &block_hash)
+            .unwrap());
     }
 
     #[tokio::test]
@@ -6610,7 +7083,12 @@ mod promoted_orphan_projection_tests {
         // startup never registered a gate. Skipping either half here would
         // exercise a state the daemon cannot produce.
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
         let generation = state.startup_readiness().begin_group_startup(GROUP);
         state.startup_readiness().mark_group_ready(GROUP, generation);
         let sync_roots = HashMap::from([(GROUP.to_string(), sync_root.clone())]);
@@ -6690,7 +7168,12 @@ mod promoted_orphan_projection_tests {
         // reaches the barrier, so without it there would be no parking to
         // observe.
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
         let sync_roots = HashMap::from([(GROUP.to_string(), sync_root)]);
 
         let session = PeerSyncSession::new(
@@ -6792,7 +7275,12 @@ mod promoted_orphan_projection_tests {
         let sync_root = root_dir.path().canonicalize().unwrap();
         let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
         let generation = state.startup_readiness().begin_group_startup(GROUP);
         state.startup_readiness().mark_group_ready(GROUP, generation);
         let session = PeerSyncSession::new_with_forwarding(
@@ -6836,8 +7324,16 @@ mod promoted_orphan_projection_tests {
         // the change stays unapplied — a durable, not silently-dropped,
         // signal that this path still needs the Convergence Engine to make
         // progress on it once a reachable source exists.
-        assert!(state.file_index_repository().get_file(GROUP, "unfetchable.bin").unwrap().is_none());
-        assert!(!state.change_history_repository().dag_list_unapplied_changes(GROUP).unwrap().is_empty());
+        assert!(state
+            .file_index_repository()
+            .get_file(GROUP, "unfetchable.bin")
+            .unwrap()
+            .is_none());
+        assert!(!state
+            .change_history_repository()
+            .dag_list_unapplied_changes(GROUP)
+            .unwrap()
+            .is_empty());
     }
 
     // --- Characterization tests for `docs/design/phase7-peer-handler-
@@ -6879,7 +7375,12 @@ mod promoted_orphan_projection_tests {
         let sync_root = root_dir.path().canonicalize().unwrap();
         let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
         let generation = state.startup_readiness().begin_group_startup(GROUP);
         state.startup_readiness().mark_group_ready(GROUP, generation);
         let session = PeerSyncSession::new_with_forwarding(
@@ -6917,10 +7418,14 @@ mod promoted_orphan_projection_tests {
             "an orphaned change must not appear as admitted"
         );
         assert!(
-            state.change_history_repository().dag_has_change_or_buffered_orphan(&child.compute_hash()).unwrap(),
+            state
+                .change_history_repository()
+                .dag_has_change_or_buffered_orphan(&child.compute_hash())
+                .unwrap(),
             "the child must still be tracked, buffered as an orphan"
         );
-        let missing = state.sqlite().dag_missing_ancestor_frontier(vec![child.compute_hash()]).unwrap();
+        let missing =
+            state.sqlite().dag_missing_ancestor_frontier(vec![child.compute_hash()]).unwrap();
         assert_eq!(
             missing,
             vec![parent.compute_hash()],
@@ -6969,7 +7474,12 @@ mod promoted_orphan_projection_tests {
         let sync_root = root_dir.path().canonicalize().unwrap();
         let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
         let generation = state.startup_readiness().begin_group_startup(GROUP);
         state.startup_readiness().mark_group_ready(GROUP, generation);
         let session = PeerSyncSession::new_with_forwarding(
@@ -7000,7 +7510,8 @@ mod promoted_orphan_projection_tests {
         assert!(state.change_history_repository().dag_has_change(&parent.compute_hash()).unwrap());
         let heads_after_first = state.sqlite().dag_group_heads(GROUP).unwrap();
         let job_after_first = state
-            .materialization_job_repository().materialization_get_job(GROUP, "a.txt")
+            .materialization_job_repository()
+            .materialization_get_job(GROUP, "a.txt")
             .unwrap()
             .expect("a materialization job must be enqueued after the first admission");
 
@@ -7015,7 +7526,8 @@ mod promoted_orphan_projection_tests {
         session.handle_change_batch(batch()).await.unwrap();
         let heads_after_second = state.sqlite().dag_group_heads(GROUP).unwrap();
         let job_after_second = state
-            .materialization_job_repository().materialization_get_job(GROUP, "a.txt")
+            .materialization_job_repository()
+            .materialization_get_job(GROUP, "a.txt")
             .unwrap()
             .expect("the job row must still exist after a duplicate delivery");
 
@@ -7129,7 +7641,12 @@ mod promoted_orphan_projection_tests {
         let sync_root = root_dir.path().canonicalize().unwrap();
         let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
         let generation = state.startup_readiness().begin_group_startup(GROUP);
         state.startup_readiness().mark_group_ready(GROUP, generation);
         let session = PeerSyncSession::new_with_forwarding(
@@ -7180,7 +7697,10 @@ mod promoted_orphan_projection_tests {
             .await
             .unwrap();
         assert!(
-            state.change_history_repository().dag_has_change(&honest_parent.compute_hash()).unwrap(),
+            state
+                .change_history_repository()
+                .dag_has_change(&honest_parent.compute_hash())
+                .unwrap(),
             "a subsequent genuinely valid change from the real device must still admit normally"
         );
     }
@@ -7245,12 +7765,18 @@ mod promoted_orphan_projection_tests {
         // whole point of this test, which needs projection to genuinely be
         // unable to complete.
         state
-            .link_repository().set_materialization_policy(
+            .link_repository()
+            .set_materialization_policy(
                 &sync_root.to_string_lossy(),
                 yadorilink_replica_domain::session_state::MaterializationPolicy::Eager,
             )
             .unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
         let generation = state.startup_readiness().begin_group_startup(GROUP);
         state.startup_readiness().mark_group_ready(GROUP, generation);
         let session = PeerSyncSession::new_with_forwarding(
@@ -7281,7 +7807,11 @@ mod promoted_orphan_projection_tests {
             .await
             .unwrap();
         assert!(state.change_history_repository().dag_has_change(&change.compute_hash()).unwrap());
-        assert!(!state.change_history_repository().dag_list_unapplied_changes(GROUP).unwrap().is_empty());
+        assert!(!state
+            .change_history_repository()
+            .dag_list_unapplied_changes(GROUP)
+            .unwrap()
+            .is_empty());
 
         // Explicitly drive the same re-projection audit
         // `reconcile_local_materialization_audit` calls internally. The
@@ -7293,11 +7823,15 @@ mod promoted_orphan_projection_tests {
         // eager-fetch attempt was armed) but the block was never actually
         // obtained -- the file stays a `Placeholder`, never `Hydrated`.
         assert_eq!(
-            state.materialization_state_repository().get_materialization_state(GROUP, "still-unfetchable.bin").unwrap(),
+            state
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, "still-unfetchable.bin")
+                .unwrap(),
             Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder),
             "the file must still be a placeholder, not hydrated -- content was never obtained"
         );
-        let still_unapplied = state.change_history_repository().dag_list_unapplied_changes(GROUP).unwrap();
+        let still_unapplied =
+            state.change_history_repository().dag_list_unapplied_changes(GROUP).unwrap();
         assert!(
             still_unapplied.iter().any(|c| c.compute_hash() == change.compute_hash()),
             "a change whose projection still cannot succeed must remain unapplied after an audit \
@@ -7309,22 +7843,24 @@ mod promoted_orphan_projection_tests {
 
 #[cfg(test)]
 mod reconcile_group_paths_flush_tests {
-    use yadorilink_peer_session::peer_session_impl::{ChangeAuthenticator, PeerSyncSession, PeerSyncSessionOneTimeDeps, PendingLocalChangeFlush};
-    use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
-    use yadorilink_replica_domain::file::{FileMeta, FileVersion};
-    use yadorilink_replica_domain::ids::SyncPath;
-    use yadorilink_sync_sqlite::dag_store::{self, ChangeEmitter};
-    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-    use yadorilink_local_capture::LocalChangeProcessor;
-    use yadorilink_replica_domain::file::RecordKind;
-    use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
     use ed25519_dalek::SigningKey;
     use std::collections::{BTreeSet, HashMap};
     use std::future::Future;
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+    use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
+    use yadorilink_local_capture::LocalChangeProcessor;
     use yadorilink_local_storage::FsBlockStore;
+    use yadorilink_peer_session::peer_session_impl::{
+        ChangeAuthenticator, PeerSyncSession, PeerSyncSessionOneTimeDeps, PendingLocalChangeFlush,
+    };
+    use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
+    use yadorilink_replica_domain::file::RecordKind;
+    use yadorilink_replica_domain::file::{FileMeta, FileVersion};
+    use yadorilink_replica_domain::ids::SyncPath;
+    use yadorilink_sync_sqlite::dag_store::{self, ChangeEmitter};
 
     const GROUP: &str = "flush-guard-group";
     const REMOTE: &str = "device-remote";
@@ -7539,7 +8075,12 @@ mod reconcile_group_paths_flush_tests {
         let store: Arc<dyn yadorilink_local_storage::BlockContentStore> = fs_store.clone();
         let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
         // A live link always reaches Ready in a real daemon: app::run starts a
         // watcher for every link at boot, and add_link starts one immediately.
         // Peer apply for a live link that never registered a gate defers, so a
@@ -7555,8 +8096,13 @@ mod reconcile_group_paths_flush_tests {
         // (which used to be unnecessary when the flush handle was wired in
         // after the fact) since the session now needs it at construction.
         let local_processor = Arc::new(
-            LocalChangeProcessor::new(state.clone(), fs_store.clone(), LOCAL.to_string(), std::sync::Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()))
-                .with_change_emitter(Arc::new(ChangeEmitter::new(LOCAL, local_key()))),
+            LocalChangeProcessor::new(
+                state.clone(),
+                fs_store.clone(),
+                LOCAL.to_string(),
+                std::sync::Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+            )
+            .with_change_emitter(Arc::new(ChangeEmitter::new(LOCAL, local_key()))),
         );
         let flush = Arc::new(RecordingFlush::new(local_processor.clone(), sync_root.clone()));
 
@@ -7823,14 +8369,16 @@ mod reconcile_group_paths_flush_tests {
 
 #[cfg(test)]
 mod version_hash_exact_capability_tests {
-    use yadorilink_peer_session::peer_session_impl::{durable_version_query_from_wire, PeerSyncSession};
-    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-    use yadorilink_replica_domain::session_state::{MaterializationPolicy, MaterializationState};
-    use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
     use std::collections::HashMap;
     use std::sync::Arc;
+    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
     use yadorilink_ipc_proto::sync as proto;
     use yadorilink_local_storage::FsBlockStore;
+    use yadorilink_peer_session::peer_session_impl::{
+        durable_version_query_from_wire, PeerSyncSession,
+    };
+    use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
+    use yadorilink_replica_domain::session_state::{MaterializationPolicy, MaterializationState};
 
     const GROUP: &str = "handoff-group";
 
@@ -7991,7 +8539,12 @@ mod version_hash_exact_capability_tests {
         // a full replica (Eager materialization policy, the default) of the
         // group.
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
 
         let content = b"same bytes, different metadata";
         let hash_hex = store.put(content).unwrap();
@@ -8008,7 +8561,14 @@ mod version_hash_exact_capability_tests {
             }],
             deleted: false,
         };
-        state.file_index_repository().upsert_file(GROUP, &record, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+        state
+            .file_index_repository()
+            .upsert_file(
+                GROUP,
+                &record,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
         let retained = state.sqlite().dag_list_versions(GROUP, "a.bin").unwrap();
         assert_eq!(retained.len(), 1, "the single upsert retains exactly one version");
         let actual_version_hash = retained[0].version_hash.0.to_vec();
@@ -8046,7 +8606,10 @@ mod version_hash_exact_capability_tests {
         let mismatched =
             proto::VersionPresentQuery { version_hash: vec![0xEEu8; 32], ..base_query.clone() };
         assert!(
-            !session.replica_engine.holds_version_durably(&durable_version_query_from_wire(&frame(&mismatched))).present,
+            !session
+                .replica_engine
+                .holds_version_durably(&durable_version_query_from_wire(&frame(&mismatched)))
+                .present,
             "block_hashes matching alone must not satisfy a for_handoff query whose \
              version_hash does not equal the retained version's actual identity"
         );
@@ -8054,21 +8617,31 @@ mod version_hash_exact_capability_tests {
         let matching =
             proto::VersionPresentQuery { version_hash: actual_version_hash, ..base_query.clone() };
         assert!(
-            !session.replica_engine.holds_version_durably(&durable_version_query_from_wire(&frame(&matching))).present,
+            !session
+                .replica_engine
+                .holds_version_durably(&durable_version_query_from_wire(&frame(&matching)))
+                .present,
             "global block presence without this group's provenance must not prove custody"
         );
 
         state
-            .change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&matching.block_hashes[0]))
+            .change_history_repository()
+            .record_group_block_provenance(GROUP, std::slice::from_ref(&matching.block_hashes[0]))
             .unwrap();
         assert!(
-            session.replica_engine.holds_version_durably(&durable_version_query_from_wire(&frame(&matching))).present,
+            session
+                .replica_engine
+                .holds_version_durably(&durable_version_query_from_wire(&frame(&matching)))
+                .present,
             "the retained version's own exact version_hash alongside matching block_hashes/\
              block_sizes and group provenance must be confirmed present"
         );
 
         assert!(
-            !session.replica_engine.holds_version_durably(&durable_version_query_from_wire(&frame(&base_query))).present,
+            !session
+                .replica_engine
+                .holds_version_durably(&durable_version_query_from_wire(&frame(&base_query)))
+                .present,
             "an absent version_hash (a querier that predates the field) must still fail closed, \
              not fall back to a block-hash-only match"
         );
@@ -8118,7 +8691,10 @@ mod version_hash_exact_capability_tests {
         // this "missing" block over the (deliberately unreachable) peer
         // channel and blocks for the full 30s hydration timeout instead of
         // exercising the crash-before-rename path this test is about.
-        state.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&hash)).unwrap();
+        state
+            .change_history_repository()
+            .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
+            .unwrap();
 
         let record = FileRecord {
             path: "doc.txt".to_string(),
@@ -8133,7 +8709,12 @@ mod version_hash_exact_capability_tests {
         // table on every call, and `wait_group_ready` defers a live link whose
         // startup never registered a gate.
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
         let generation = state.startup_readiness().begin_group_startup(GROUP);
         state.startup_readiness().mark_group_ready(GROUP, generation);
         let sync_roots = HashMap::from([(GROUP.to_string(), sync_root.clone())]);
@@ -8166,13 +8747,19 @@ mod version_hash_exact_capability_tests {
         // Hydrated row, blocks present, no file on disk — and, with the fix in
         // place, a materialization intent the live path wrote itself.
         assert_eq!(
-            state.materialization_state_repository().get_materialization_state(GROUP, "doc.txt").unwrap(),
+            state
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, "doc.txt")
+                .unwrap(),
             Some(MaterializationState::Hydrated),
             "the durable row must have committed as Hydrated before the crash window"
         );
         assert!(!out_path.exists(), "no file was written before the simulated crash");
         assert!(
-            state.materialization_job_repository().has_materialization_intent(GROUP, "doc.txt").unwrap(),
+            state
+                .materialization_job_repository()
+                .has_materialization_intent(GROUP, "doc.txt")
+                .unwrap(),
             "the LIVE materialize path must journal a durable intent before committing the \
              brand-new Hydrated row, so a crash in this window is recoverable"
         );
@@ -8204,7 +8791,11 @@ mod version_hash_exact_capability_tests {
             "the reconstructed file must have exactly the received bytes"
         );
         assert!(
-            state.file_index_repository().get_file(GROUP, "doc.txt").unwrap().is_some_and(|r| !r.deleted),
+            state
+                .file_index_repository()
+                .get_file(GROUP, "doc.txt")
+                .unwrap()
+                .is_some_and(|r| !r.deleted),
             "the index row must remain a live (not-deleted) record — no tombstone"
         );
     }
@@ -8230,7 +8821,12 @@ mod version_hash_exact_capability_tests {
         let outside_dir = tempfile::tempdir().unwrap();
 
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
 
         // "evil_link" inside the sync root points OUTSIDE it -- this
         // device's own local state, not anything peer-controlled.
@@ -8238,10 +8834,14 @@ mod version_hash_exact_capability_tests {
 
         let content = b"attacker-controlled content";
         let hash = hex::decode(store.put(content).unwrap()).unwrap();
-        state.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&hash)).unwrap();
+        state
+            .change_history_repository()
+            .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
+            .unwrap();
 
         state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &FileRecord {
                     path: "evil_link/pwned.txt".into(),
@@ -8254,7 +8854,8 @@ mod version_hash_exact_capability_tests {
             )
             .unwrap();
         state
-            .materialization_state_repository().set_materialization_state(
+            .materialization_state_repository()
+            .set_materialization_state(
                 GROUP,
                 "evil_link/pwned.txt",
                 MaterializationState::Placeholder,
@@ -8285,7 +8886,10 @@ mod version_hash_exact_capability_tests {
 
         assert!(result.is_err(), "the symlink-escape write must be refused, not silently written");
         assert_eq!(
-            state.materialization_state_repository().get_materialization_state(GROUP, "evil_link/pwned.txt").unwrap(),
+            state
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, "evil_link/pwned.txt")
+                .unwrap(),
             Some(MaterializationState::Placeholder),
             "a post-fetch failure must revert the row, not leave it stuck at Hydrating"
         );
@@ -8315,13 +8919,22 @@ mod version_hash_exact_capability_tests {
         let sync_root = root_dir.path().canonicalize().unwrap();
 
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
 
         let content = b"hydrated content";
         let hash = hex::decode(store.put(content).unwrap()).unwrap();
-        state.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&hash)).unwrap();
         state
-            .file_index_repository().upsert_file(
+            .change_history_repository()
+            .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
+            .unwrap();
+        state
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &FileRecord {
                     path: "doc.txt".into(),
@@ -8334,7 +8947,13 @@ mod version_hash_exact_capability_tests {
             )
             .unwrap();
         state
-            .materialization_state_repository().set_materialization_state(GROUP, "doc.txt", MaterializationState::Placeholder, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests())
+            .materialization_state_repository()
+            .set_materialization_state(
+                GROUP,
+                "doc.txt",
+                MaterializationState::Placeholder,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
             .unwrap();
 
         let generation = state.startup_readiness().begin_group_startup(GROUP);
@@ -8364,7 +8983,10 @@ mod version_hash_exact_capability_tests {
         // hydration must not have even reached `Hydrating` yet.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(
-            state.materialization_state_repository().get_materialization_state(GROUP, "doc.txt").unwrap(),
+            state
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, "doc.txt")
+                .unwrap(),
             Some(MaterializationState::Placeholder),
             "hydrate_file must block on the held path_lock, not proceed concurrently with it"
         );
@@ -8372,7 +8994,10 @@ mod version_hash_exact_capability_tests {
         drop(external_guard);
         let result = hydrate_task.await.unwrap();
 
-        assert!(matches!(result, Ok(yadorilink_peer_session::peer_session_impl::HydrationOutcome::Hydrated)));
+        assert!(matches!(
+            result,
+            Ok(yadorilink_peer_session::peer_session_impl::HydrationOutcome::Hydrated)
+        ));
         assert_eq!(std::fs::read(sync_root.join("doc.txt")).unwrap(), content);
     }
 
@@ -8395,10 +9020,16 @@ mod version_hash_exact_capability_tests {
         let root_dir = tempfile::tempdir().unwrap();
         let sync_root = root_dir.path().canonicalize().unwrap();
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
 
         state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &FileRecord {
                     path: "doc.txt".into(),
@@ -8410,7 +9041,15 @@ mod version_hash_exact_capability_tests {
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
-        state.materialization_state_repository().set_materialization_state(GROUP, "doc.txt", MaterializationState::Hydrating, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(
+                GROUP,
+                "doc.txt",
+                MaterializationState::Hydrating,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
 
         // This attempt's own guard, not yet committed -- as if this
         // attempt is still in flight (e.g. about to fail).
@@ -8424,7 +9063,15 @@ mod version_hash_exact_capability_tests {
 
         // A DIFFERENT, concurrent attempt for the same path finishes
         // first and genuinely completes.
-        state.materialization_state_repository().set_materialization_state(GROUP, "doc.txt", MaterializationState::Hydrated, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(
+                GROUP,
+                "doc.txt",
+                MaterializationState::Hydrated,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
 
         // This attempt's own guard now drops (uncommitted, simulating its
         // own late failure) -- it must NOT downgrade the row the
@@ -8432,7 +9079,10 @@ mod version_hash_exact_capability_tests {
         drop(guard);
 
         assert_eq!(
-            state.materialization_state_repository().get_materialization_state(GROUP, "doc.txt").unwrap(),
+            state
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, "doc.txt")
+                .unwrap(),
             Some(MaterializationState::Hydrated),
             "a losing guard's revert-on-drop must not clobber a concurrently-completed \
              hydration's Hydrated state"
@@ -8454,10 +9104,16 @@ mod version_hash_exact_capability_tests {
         let root_dir = tempfile::tempdir().unwrap();
         let sync_root = root_dir.path().canonicalize().unwrap();
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
 
         state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &FileRecord {
                     path: "doc.txt".into(),
@@ -8470,8 +9126,19 @@ mod version_hash_exact_capability_tests {
             )
             .unwrap();
         let old_hash = yadorilink_replica_domain::ids::ChangeHash([1u8; 32]);
-        state.file_index_repository().set_authoring_change_hash(GROUP, "doc.txt", &old_hash).unwrap();
-        state.materialization_state_repository().set_materialization_state(GROUP, "doc.txt", MaterializationState::Hydrating, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+        state
+            .file_index_repository()
+            .set_authoring_change_hash(GROUP, "doc.txt", &old_hash)
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(
+                GROUP,
+                "doc.txt",
+                MaterializationState::Hydrating,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
 
         // This attempt's own guard, capturing the OLD version's authoring
         // identity, as `hydrate_file_with_timeout` does before it marks
@@ -8488,8 +9155,19 @@ mod version_hash_exact_capability_tests {
         // NEWER version, which independently starts its OWN hydration --
         // landing back at `Hydrating`, but for a different identity.
         let new_hash = yadorilink_replica_domain::ids::ChangeHash([2u8; 32]);
-        state.file_index_repository().set_authoring_change_hash(GROUP, "doc.txt", &new_hash).unwrap();
-        state.materialization_state_repository().set_materialization_state(GROUP, "doc.txt", MaterializationState::Hydrating, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+        state
+            .file_index_repository()
+            .set_authoring_change_hash(GROUP, "doc.txt", &new_hash)
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(
+                GROUP,
+                "doc.txt",
+                MaterializationState::Hydrating,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
 
         // The OLD attempt's guard now drops (uncommitted) -- state alone
         // matches (`Hydrating`), but the authoring identity does not, so
@@ -8497,7 +9175,10 @@ mod version_hash_exact_capability_tests {
         drop(guard);
 
         assert_eq!(
-            state.materialization_state_repository().get_materialization_state(GROUP, "doc.txt").unwrap(),
+            state
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, "doc.txt")
+                .unwrap(),
             Some(MaterializationState::Hydrating),
             "an old attempt's guard must not touch a newer version's own in-flight hydration \
              just because the state value happens to match"
@@ -8531,7 +9212,12 @@ mod version_hash_exact_capability_tests {
         let sync_root = root_dir.path().canonicalize().unwrap();
 
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
 
         let generation = state.startup_readiness().begin_group_startup(GROUP);
         state.startup_readiness().mark_group_ready(GROUP, generation);
@@ -8555,7 +9241,10 @@ mod version_hash_exact_capability_tests {
         // directory itself still canonicalizes and still lexically
         // contains `out_path`, but it no longer carries this group's
         // identity marker.
-        std::fs::remove_file(sync_root.join(yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME)).unwrap();
+        std::fs::remove_file(
+            sync_root.join(yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME),
+        )
+        .unwrap();
 
         let result = session.verify_write_target(GROUP, &out_path);
         assert!(
@@ -8594,13 +9283,19 @@ mod version_hash_exact_capability_tests {
         // this module -- `VerifiedRoot::open` refuses a folder that already
         // has un-adopted content on disk with no root marker.
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
 
         // "Photo.jpg" is live and materialized -- the sibling the tombstone
         // will collide with.
         std::fs::write(sync_root.join("Photo.jpg"), b"original photo bytes").unwrap();
         state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &FileRecord {
                     path: "Photo.jpg".into(),
@@ -8666,12 +9361,19 @@ mod version_hash_exact_capability_tests {
             .unwrap();
 
         assert!(
-            state.materialization_state_repository().get_held_state(GROUP, "photo.jpg").unwrap().is_none(),
+            state
+                .materialization_state_repository()
+                .get_held_state(GROUP, "photo.jpg")
+                .unwrap()
+                .is_none(),
             "a hazardous tombstone must not be held on a bootstrap-only scaffold -- there was \
              never any genuine content here to protect"
         );
         assert!(
-            matches!(result, yadorilink_peer_session::peer_session_impl::MaterializeResult::RetryRequired),
+            matches!(
+                result,
+                yadorilink_peer_session::peer_session_impl::MaterializeResult::RetryRequired
+            ),
             "nothing was actually recorded (no hold, no delete) -- a caller must not treat this \
              path as resolved for this attempt, or a sending peer that later disappears leaves \
              this deletion permanently unconverged"
@@ -8707,7 +9409,12 @@ mod version_hash_exact_capability_tests {
         }
 
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
 
         // "Photo.jpg" is live and materialized -- the sibling the tombstone
         // will collide with. On a case-insensitive filesystem "Photo.jpg"
@@ -8716,7 +9423,8 @@ mod version_hash_exact_capability_tests {
         // test in this file that constructs this scenario.
         std::fs::write(sync_root.join("Photo.jpg"), b"original photo bytes").unwrap();
         state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &FileRecord {
                     path: "Photo.jpg".into(),
@@ -8731,7 +9439,8 @@ mod version_hash_exact_capability_tests {
         // "photo.jpg" itself already has a GENUINE (version_seq > 0), live
         // (not deleted) row -- unlike the bootstrap-scaffold test above.
         state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &FileRecord {
                     path: "photo.jpg".into(),
@@ -8770,17 +9479,28 @@ mod version_hash_exact_capability_tests {
             .unwrap();
 
         assert!(
-            state.materialization_state_repository().get_held_state(GROUP, "photo.jpg").unwrap().is_some(),
+            state
+                .materialization_state_repository()
+                .get_held_state(GROUP, "photo.jpg")
+                .unwrap()
+                .is_some(),
             "the genuine live row must still be marked held"
         );
         assert!(
-            matches!(result, yadorilink_peer_session::peer_session_impl::MaterializeResult::RetryRequired),
+            matches!(
+                result,
+                yadorilink_peer_session::peer_session_impl::MaterializeResult::RetryRequired
+            ),
             "holding a genuine live row is not durable convergence -- the pending tombstone's \
              identity is nowhere recorded, so this must not be reported as settled"
         );
 
-        let first_held_since =
-            state.materialization_state_repository().get_held_state(GROUP, "photo.jpg").unwrap().unwrap().since_unix_nanos;
+        let first_held_since = state
+            .materialization_state_repository()
+            .get_held_state(GROUP, "photo.jpg")
+            .unwrap()
+            .unwrap()
+            .since_unix_nanos;
         // `RetryRequired` means the periodic materialization audit
         // re-drives this exact path every tick while the collision
         // persists -- re-materializing the identical tombstone must not
@@ -8791,8 +9511,12 @@ mod version_hash_exact_capability_tests {
             .materialize(GROUP, &tombstone, MaterializationPolicy::Eager, "device-a", None)
             .await
             .unwrap();
-        let second_held_since =
-            state.materialization_state_repository().get_held_state(GROUP, "photo.jpg").unwrap().unwrap().since_unix_nanos;
+        let second_held_since = state
+            .materialization_state_repository()
+            .get_held_state(GROUP, "photo.jpg")
+            .unwrap()
+            .unwrap()
+            .since_unix_nanos;
         assert_eq!(
             first_held_since, second_held_since,
             "held_since_unix_nanos must not advance on a re-drive with the same hold reason"
@@ -8819,12 +9543,18 @@ mod version_hash_exact_capability_tests {
         }
 
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
 
         // "photo.jpg" already landed as a clean tombstone -- no collision
         // existed when it was applied, so nothing is held.
         state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &FileRecord {
                     path: "photo.jpg".into(),
@@ -8836,13 +9566,18 @@ mod version_hash_exact_capability_tests {
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
-        assert!(state.materialization_state_repository().get_held_state(GROUP, "photo.jpg").unwrap().is_none());
+        assert!(state
+            .materialization_state_repository()
+            .get_held_state(GROUP, "photo.jpg")
+            .unwrap()
+            .is_none());
 
         // "Photo.jpg" now becomes live -- a fresh collision the original
         // tombstone application never saw.
         std::fs::write(sync_root.join("Photo.jpg"), b"fresh photo bytes").unwrap();
         state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &FileRecord {
                     path: "Photo.jpg".into(),
@@ -8889,12 +9624,19 @@ mod version_hash_exact_capability_tests {
             .unwrap();
 
         assert!(
-            matches!(result, yadorilink_peer_session::peer_session_impl::MaterializeResult::Settled),
+            matches!(
+                result,
+                yadorilink_peer_session::peer_session_impl::MaterializeResult::Settled
+            ),
             "this deletion already converged (the row is already a genuine tombstone, not a \
              scaffold) -- reporting RetryRequired here would churn forever on a redundant resend"
         );
         assert!(
-            state.materialization_state_repository().get_held_state(GROUP, "photo.jpg").unwrap().is_none(),
+            state
+                .materialization_state_repository()
+                .get_held_state(GROUP, "photo.jpg")
+                .unwrap()
+                .is_none(),
             "redelivering an already-landed tombstone must not mark its own (already deleted) \
              row held"
         );
@@ -8930,10 +9672,16 @@ mod version_hash_exact_capability_tests {
         }
 
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
 
         state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &FileRecord {
                     path: "photo.jpg".into(),
@@ -8953,7 +9701,8 @@ mod version_hash_exact_capability_tests {
 
         std::fs::write(sync_root.join("Photo.jpg"), b"fresh photo bytes").unwrap();
         state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &FileRecord {
                     path: "Photo.jpg".into(),
@@ -8998,7 +9747,10 @@ mod version_hash_exact_capability_tests {
             .await
             .unwrap();
 
-        assert!(matches!(result, yadorilink_peer_session::peer_session_impl::MaterializeResult::Settled));
+        assert!(matches!(
+            result,
+            yadorilink_peer_session::peer_session_impl::MaterializeResult::Settled
+        ));
         assert_eq!(
             state.file_index_repository().get_authoring_change_hash(GROUP, "photo.jpg").unwrap(),
             Some(newer_hash),
@@ -9092,7 +9844,8 @@ mod version_hash_exact_capability_tests {
             sync_roots,
         );
 
-        let lock_path = yadorilink_root_authority::sync_root_lock::SYNC_ROOT_LOCK_FILE_NAME.to_string();
+        let lock_path =
+            yadorilink_root_authority::sync_root_lock::SYNC_ROOT_LOCK_FILE_NAME.to_string();
         let record = FileRecord {
             path: lock_path.clone(),
             size: 0,
@@ -9205,7 +9958,10 @@ mod version_hash_exact_capability_tests {
 
         let content = b"my actual notes, not a temp file".to_vec();
         let hash = hex::decode(store.put(&content).unwrap()).unwrap();
-        state.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&hash)).unwrap();
+        state
+            .change_history_repository()
+            .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
+            .unwrap();
         let path = "report.yadorilink-tmp.old".to_string();
         let record = FileRecord {
             path: path.clone(),
@@ -9265,7 +10021,10 @@ mod version_hash_exact_capability_tests {
 
         let content = b"my actual notes, not a temp file".to_vec();
         let hash = hex::decode(store.put(&content).unwrap()).unwrap();
-        state.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&hash)).unwrap();
+        state
+            .change_history_repository()
+            .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
+            .unwrap();
         let path = "report.yadorilink-tmp.old ".to_string();
         let record = FileRecord {
             path: path.clone(),
@@ -9333,7 +10092,10 @@ mod version_hash_exact_capability_tests {
 
         let original_content = b"the original file, must survive untouched".to_vec();
         let original_hash = hex::decode(store.put(&original_content).unwrap()).unwrap();
-        state.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&original_hash)).unwrap();
+        state
+            .change_history_repository()
+            .record_group_block_provenance(GROUP, std::slice::from_ref(&original_hash))
+            .unwrap();
         let original_path = "a".to_string();
         let original_record = FileRecord {
             path: original_path.clone(),
@@ -9357,7 +10119,10 @@ mod version_hash_exact_capability_tests {
         // an undetected collision would silently destroy `original_content`.
         let colliding_content = b"a different peer's write, must never land here".to_vec();
         let colliding_hash = hex::decode(store.put(&colliding_content).unwrap()).unwrap();
-        state.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&colliding_hash)).unwrap();
+        state
+            .change_history_repository()
+            .record_group_block_provenance(GROUP, std::slice::from_ref(&colliding_hash))
+            .unwrap();
         let colliding_path = "a ".to_string();
         let colliding_record = FileRecord {
             path: colliding_path.clone(),
@@ -9526,7 +10291,10 @@ mod version_hash_exact_capability_tests {
         // this block as missing for this group and the eager materialize
         // blocks on the unreachable peer channel for the full hydration
         // timeout instead of completing.
-        state.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&hash)).unwrap();
+        state
+            .change_history_repository()
+            .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
+            .unwrap();
 
         let record = FileRecord {
             path: "doc.txt".to_string(),
@@ -9541,7 +10309,12 @@ mod version_hash_exact_capability_tests {
         // table on every call, and `wait_group_ready` defers a live link whose
         // startup never registered a gate.
         state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&sync_root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
         let generation = state.startup_readiness().begin_group_startup(GROUP);
         state.startup_readiness().mark_group_ready(GROUP, generation);
         let sync_roots = HashMap::from([(GROUP.to_string(), sync_root.clone())]);
@@ -9563,12 +10336,18 @@ mod version_hash_exact_capability_tests {
             .expect("a clean materialize must succeed");
         assert_eq!(std::fs::read(&out_path).unwrap(), content, "the file must be materialized");
         assert_eq!(
-            state.materialization_state_repository().get_materialization_state(GROUP, "doc.txt").unwrap(),
+            state
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, "doc.txt")
+                .unwrap(),
             Some(MaterializationState::Hydrated)
         );
         // The crux: the success path cleared the intent after the durable rename.
         assert!(
-            !state.materialization_job_repository().has_materialization_intent(GROUP, "doc.txt").unwrap(),
+            !state
+                .materialization_job_repository()
+                .has_materialization_intent(GROUP, "doc.txt")
+                .unwrap(),
             "a completed materialize must leave NO materialization intent"
         );
 
@@ -9600,18 +10379,20 @@ mod version_hash_exact_capability_tests {
 
 #[cfg(test)]
 mod dag_negotiated_restart_regression_tests {
-    use yadorilink_peer_session::peer_session_impl::{change_hash_to_wire, ChangeAuthenticator, PeerSyncSession, PeerSyncSessionOneTimeDeps};
-    use yadorilink_replica_domain::change::Op;
-    use yadorilink_daemon::dag_import;
-    use yadorilink_replica_domain::admission::ChangeEmitter;
-    use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
-    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-    use yadorilink_local_capture::LocalChangeProcessor;
-    use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
     use ed25519_dalek::SigningKey;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use yadorilink_daemon::dag_import;
+    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+    use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
+    use yadorilink_local_capture::LocalChangeProcessor;
     use yadorilink_local_storage::FsBlockStore;
+    use yadorilink_peer_session::peer_session_impl::{
+        change_hash_to_wire, ChangeAuthenticator, PeerSyncSession, PeerSyncSessionOneTimeDeps,
+    };
+    use yadorilink_replica_domain::admission::ChangeEmitter;
+    use yadorilink_replica_domain::change::Op;
+    use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
 
     const GROUP: &str = "restart-dag-negotiated-group";
 
@@ -9671,9 +10452,13 @@ mod dag_negotiated_restart_regression_tests {
         let root = root_dir.path().canonicalize().unwrap();
 
         let emitter = Arc::new(ChangeEmitter::new("device-a", signing_key.clone()));
-        let processor =
-            LocalChangeProcessor::new(state_a.clone(), store_a.clone(), "device-a".to_string(), std::sync::Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()))
-                .with_change_emitter(emitter.clone());
+        let processor = LocalChangeProcessor::new(
+            state_a.clone(),
+            store_a.clone(),
+            "device-a".to_string(),
+            std::sync::Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+        )
+        .with_change_emitter(emitter.clone());
         // As the peer side below already does: the later offline edit and
         // restart scan leave the index and disk disagreeing on the same
         // path, indistinguishable from an unmounted volume unless the
@@ -9685,7 +10470,12 @@ mod dag_negotiated_restart_regression_tests {
         // persisted token, unlike `open`) fails with "no previously-adopted
         // root token".
         state_a.link_repository().add_link(&root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&root, GROUP, state_a.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &root,
+            GROUP,
+            state_a.as_ref(),
+        )
+        .unwrap();
 
         let file_path = root.join("notes.txt");
         std::fs::write(&file_path, b"version one").unwrap();
@@ -9704,7 +10494,8 @@ mod dag_negotiated_restart_regression_tests {
             Op::Put { version, .. } => *version,
             other => panic!("expected the initial edit to be a Put op, got {other:?}"),
         };
-        let version_v1 = state_a.sqlite().dag_get_file_version(GROUP, &version_hash_v1).unwrap().unwrap();
+        let version_v1 =
+            state_a.sqlite().dag_get_file_version(GROUP, &version_hash_v1).unwrap().unwrap();
 
         // ---- The peer: a change-history-aware device that already synced
         // ---- up to the pre-restart head, exactly as if it had connected
@@ -9727,7 +10518,12 @@ mod dag_negotiated_restart_regression_tests {
         // startup never registered a gate. Skipping either half here would
         // exercise a state the daemon cannot produce.
         state_b.link_repository().add_link(&peer_root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&peer_root, GROUP, state_b.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &peer_root,
+            GROUP,
+            state_b.as_ref(),
+        )
+        .unwrap();
         let generation = state_b.startup_readiness().begin_group_startup(GROUP);
         state_b.startup_readiness().mark_group_ready(GROUP, generation);
         let sync_roots = HashMap::from([(GROUP.to_string(), peer_root)]);
@@ -9761,7 +10557,8 @@ mod dag_negotiated_restart_regression_tests {
         // blocks for the full 30s hydration timeout instead of using it.
         let hash_v1 = store_b_seed.put(b"version one").unwrap();
         state_b
-            .change_history_repository().record_group_block_provenance(
+            .change_history_repository()
+            .record_group_block_provenance(
                 GROUP,
                 std::slice::from_ref(&hex::decode(&hash_v1).unwrap()),
             )
@@ -9781,7 +10578,8 @@ mod dag_negotiated_restart_regression_tests {
             state_b.change_history_repository().dag_has_change(&heads_v1[0]).unwrap(),
             "sanity: the peer admitted the pre-restart change the normal way"
         );
-        let peer_record_v1 = state_b.file_index_repository().get_file(GROUP, "notes.txt").unwrap().unwrap();
+        let peer_record_v1 =
+            state_b.file_index_repository().get_file(GROUP, "notes.txt").unwrap().unwrap();
 
         // ---- The local device "restarts": the file was edited offline, so
         // ---- only the startup scan (never a live `process_event`) notices
@@ -9829,7 +10627,8 @@ mod dag_negotiated_restart_regression_tests {
                 _ => None,
             })
             .expect("the offline edit change must carry a content op");
-        let version_v2 = state_a.sqlite().dag_get_file_version(GROUP, &version_hash_v2).unwrap().unwrap();
+        let version_v2 =
+            state_a.sqlite().dag_get_file_version(GROUP, &version_hash_v2).unwrap().unwrap();
         // The peer fetches the offline edit's block content, exactly as it
         // would over a live channel in response to the change request the
         // announce triggered above -- same provenance seed as v1 above, for
@@ -9837,7 +10636,8 @@ mod dag_negotiated_restart_regression_tests {
         let hash_v2 =
             store_b_seed.put(b"version two, edited while the daemon was stopped").unwrap();
         state_b
-            .change_history_repository().record_group_block_provenance(
+            .change_history_repository()
+            .record_group_block_provenance(
                 GROUP,
                 std::slice::from_ref(&hex::decode(&hash_v2).unwrap()),
             )
@@ -9853,7 +10653,8 @@ mod dag_negotiated_restart_regression_tests {
 
         // ---- The peer must have learned about the offline edit. It must
         // ---- not still be sitting on the pre-restart (V1) content.
-        let peer_record_after = state_b.file_index_repository().get_file(GROUP, "notes.txt").unwrap().unwrap();
+        let peer_record_after =
+            state_b.file_index_repository().get_file(GROUP, "notes.txt").unwrap().unwrap();
         assert_ne!(
             peer_record_after.blocks, peer_record_v1.blocks,
             "a DAG-heads-negotiated peer must receive the offline edit the restart scan \
@@ -9865,18 +10666,20 @@ mod dag_negotiated_restart_regression_tests {
 
 #[cfg(test)]
 mod dag_convergence_authority_tests {
-    use yadorilink_peer_session::peer_session_impl::{ChangeAuthenticator, PeerSyncSession, PeerSyncSessionOneTimeDeps};
+    use yadorilink_peer_session::peer_session_impl::{
+        ChangeAuthenticator, PeerSyncSession, PeerSyncSessionOneTimeDeps,
+    };
 
-    use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
-    use yadorilink_replica_domain::file::{FileMeta, FileVersion};
-    use yadorilink_replica_domain::ids::SyncPath;
-    use yadorilink_sync_sqlite::dag_store::{self, ChangeEmitter};
-    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-    use yadorilink_replica_domain::file::{FileRecord, RecordKind};
     use ed25519_dalek::SigningKey;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
     use yadorilink_local_storage::FsBlockStore;
+    use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
+    use yadorilink_replica_domain::file::{FileMeta, FileVersion};
+    use yadorilink_replica_domain::file::{FileRecord, RecordKind};
+    use yadorilink_replica_domain::ids::SyncPath;
+    use yadorilink_sync_sqlite::dag_store::{self, ChangeEmitter};
 
     const GROUP: &str = "shared-group";
     const OLD_MTIME: i64 = 1_000; // lamport WINNER carries the OLDER mtime …
@@ -9915,8 +10718,13 @@ mod dag_convergence_authority_tests {
     }
 
     async fn harness(local: &str, peer: &str, dag_negotiated: bool) -> Harness {
-        harness_with_deps(local, peer, dag_negotiated, PeerSyncSessionOneTimeDeps::test_permissive())
-            .await
+        harness_with_deps(
+            local,
+            peer,
+            dag_negotiated,
+            PeerSyncSessionOneTimeDeps::test_permissive(),
+        )
+        .await
     }
 
     /// Like `harness`, but takes the session's 8 one-time capability
@@ -9938,7 +10746,8 @@ mod dag_convergence_authority_tests {
         // startup never registered a gate. Skipping either half here would
         // exercise a state the daemon cannot produce.
         state.link_repository().add_link(&root.to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(&root, GROUP, state.as_ref()).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(&root, GROUP, state.as_ref())
+            .unwrap();
         let generation = state.startup_readiness().begin_group_startup(GROUP);
         state.startup_readiness().mark_group_ready(GROUP, generation);
         let sync_roots = HashMap::from([(GROUP.to_string(), root.clone())]);
@@ -9976,9 +10785,20 @@ mod dag_convergence_authority_tests {
     async fn projected_rows_without_authoring_identity_are_rejected() {
         let h = harness("device-local", "device-p", /*dag*/ true).await;
         let local = empty_record("split.txt", OLD_MTIME);
-        h.state.file_index_repository().upsert_file(GROUP, &local, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+        h.state
+            .file_index_repository()
+            .upsert_file(
+                GROUP,
+                &local,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
         assert!(
-            h.state.materialization_job_repository().materialization_get_job(GROUP, "split.txt").unwrap().is_none(),
+            h.state
+                .materialization_job_repository()
+                .materialization_get_job(GROUP, "split.txt")
+                .unwrap()
+                .is_none(),
             "precondition: no job enqueued yet"
         );
 
@@ -9991,7 +10811,8 @@ mod dag_convergence_authority_tests {
             origin_device_id: None,
             authoring_change_hash: None,
         };
-        let yadorilink_replica_domain::session_state::LinkGate::Live { policy, .. } = h.state.link_repository().link_gate_for_group(GROUP).unwrap()
+        let yadorilink_replica_domain::session_state::LinkGate::Live { policy, .. } =
+            h.state.link_repository().link_gate_for_group(GROUP).unwrap()
         else {
             panic!("link must be live");
         };
@@ -10000,12 +10821,22 @@ mod dag_convergence_authority_tests {
             Err(error) => error,
         };
         assert!(matches!(error, yadorilink_peer_session::error::PeerSessionError::InvalidInput(_)));
-        let record = h.state.file_index_repository().get_file(GROUP, "split.txt").unwrap().expect("row still present");
+        let record = h
+            .state
+            .file_index_repository()
+            .get_file(GROUP, "split.txt")
+            .unwrap()
+            .expect("row still present");
         assert_eq!(
             record.mtime_unix_nanos, OLD_MTIME,
             "neither side may be adopted by the legacy exchange -- the DAG decides"
         );
-        assert!(h.state.materialization_job_repository().materialization_get_job(GROUP, "split.txt").unwrap().is_none());
+        assert!(h
+            .state
+            .materialization_job_repository()
+            .materialization_get_job(GROUP, "split.txt")
+            .unwrap()
+            .is_none());
     }
 
     /// An independent review's finding: `apply_locked_record`'s own
@@ -10050,7 +10881,8 @@ mod dag_convergence_authority_tests {
             &key,
         );
         h.state
-            .change_history_repository().dag_admit_change_with_versions(&change, std::slice::from_ref(&version), true)
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change, std::slice::from_ref(&version), true)
             .unwrap();
         let author = yadorilink_replica_domain::ids::ChangeHash(change.compute_hash().0);
 
@@ -10059,7 +10891,8 @@ mod dag_convergence_authority_tests {
         // -- simulating an interrupted `apply_exec_bit`, with nothing
         // else about the record having changed.
         h.state
-            .file_index_repository().upsert_file_with_origin_and_author(
+            .file_index_repository()
+            .upsert_file_with_origin_and_author(
                 GROUP,
                 &FileRecord {
                     path: "run.sh".into(),
@@ -10073,7 +10906,15 @@ mod dag_convergence_authority_tests {
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
-        h.state.file_index_repository().set_exec_bit(GROUP, "run.sh", false, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+        h.state
+            .file_index_repository()
+            .set_exec_bit(
+                GROUP,
+                "run.sh",
+                false,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
 
         let incoming = FileRecord {
             path: "run.sh".into(),
@@ -10090,14 +10931,18 @@ mod dag_convergence_authority_tests {
             origin_device_id: None,
             authoring_change_hash: Some(author),
         };
-        let yadorilink_replica_domain::session_state::LinkGate::Live { policy, .. } = h.state.link_repository().link_gate_for_group(GROUP).unwrap()
+        let yadorilink_replica_domain::session_state::LinkGate::Live { policy, .. } =
+            h.state.link_repository().link_gate_for_group(GROUP).unwrap()
         else {
             panic!("link must be live");
         };
         let outcome = h.session.apply_locked_record(GROUP, incoming, meta, policy).await.unwrap();
 
         assert!(
-            matches!(outcome, yadorilink_peer_session::peer_session_impl::LockedRecordOutcome::Settled),
+            matches!(
+                outcome,
+                yadorilink_peer_session::peer_session_impl::LockedRecordOutcome::Settled
+            ),
             "an equal-authoring repair must settle, not error or defer: {outcome:?}"
         );
         assert!(
@@ -10124,7 +10969,14 @@ mod dag_convergence_authority_tests {
         // An indexed (empty-content) record whose on-disk file is missing — the
         // shape the audit exists to repair.
         let rec = empty_record("audit.txt", OLD_MTIME);
-        h.state.file_index_repository().upsert_file(GROUP, &rec, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+        h.state
+            .file_index_repository()
+            .upsert_file(
+                GROUP,
+                &rec,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
         let emitter = ChangeEmitter::new("device-d", SigningKey::from_bytes(&[41; 32]));
         let author = h
             .state
@@ -10135,7 +10987,10 @@ mod dag_convergence_authority_tests {
                 &emitter,
             )
             .unwrap();
-        h.state.file_index_repository().set_authoring_change_hash(GROUP, "audit.txt", &author).unwrap();
+        h.state
+            .file_index_repository()
+            .set_authoring_change_hash(GROUP, "audit.txt", &author)
+            .unwrap();
         let on_disk = h.root.join("audit.txt");
         assert!(!on_disk.exists(), "precondition: the file is not yet materialized");
 
@@ -10170,7 +11025,8 @@ mod dag_convergence_authority_tests {
             &key_a,
         );
         h.state
-            .change_history_repository().dag_admit_change_with_versions(&change_old, std::slice::from_ref(&version_old), true)
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change_old, std::slice::from_ref(&version_old), true)
             .unwrap();
         // A newer change by the same author supersedes it while the stale
         // caller is (conceptually) waiting for the lock.
@@ -10189,7 +11045,8 @@ mod dag_convergence_authority_tests {
             &key_a,
         );
         h.state
-            .change_history_repository().dag_admit_change_with_versions(&change_new, std::slice::from_ref(&version_new), true)
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change_new, std::slice::from_ref(&version_new), true)
             .unwrap();
 
         let stale_head = yadorilink_replica_engine::conflict::PathHead {
@@ -10201,7 +11058,8 @@ mod dag_convergence_authority_tests {
                 mtime_unix_nanos: version_old.meta.mtime_unix_nanos,
             }),
         };
-        let yadorilink_replica_domain::session_state::LinkGate::Live { policy, .. } = h.state.link_repository().link_gate_for_group(GROUP).unwrap()
+        let yadorilink_replica_domain::session_state::LinkGate::Live { policy, .. } =
+            h.state.link_repository().link_gate_for_group(GROUP).unwrap()
         else {
             panic!("link must be live");
         };
@@ -10211,10 +11069,18 @@ mod dag_convergence_authority_tests {
             .await
             .unwrap();
         assert!(
-            matches!(result, yadorilink_peer_session::peer_session_impl::MaterializeResult::Settled),
+            matches!(
+                result,
+                yadorilink_peer_session::peer_session_impl::MaterializeResult::Settled
+            ),
             "the upgraded materialize must settle, not defer to a retry"
         );
-        let record = h.state.file_index_repository().get_file(GROUP, "shared.bin").unwrap().expect("record exists");
+        let record = h
+            .state
+            .file_index_repository()
+            .get_file(GROUP, "shared.bin")
+            .unwrap()
+            .expect("record exists");
         assert_eq!(
             record.mtime_unix_nanos, version_new.meta.mtime_unix_nanos,
             "the CURRENT winner's version must be what actually landed, not the stale head's"
@@ -10254,7 +11120,8 @@ mod dag_convergence_authority_tests {
             &key_a,
         );
         h.state
-            .change_history_repository().dag_admit_change_with_versions(&change_w, std::slice::from_ref(&version_w), false)
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change_w, std::slice::from_ref(&version_w), false)
             .unwrap();
         h.session
             .reconcile_paths_directly(
@@ -10276,13 +11143,16 @@ mod dag_convergence_authority_tests {
             ChangeAuth::PLACEHOLDER,
             yadorilink_replica_domain::ids::DeviceId("device-local".into()),
             yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
-            vec![yadorilink_replica_domain::change::Op::Delete { path: SyncPath("shared.bin".into()) }],
+            vec![yadorilink_replica_domain::change::Op::Delete {
+                path: SyncPath("shared.bin".into()),
+            }],
             &key_local,
         );
         h.state.change_history_repository().dag_admit_change(&change_t, true).unwrap();
         std::fs::remove_file(h.root.join("shared.bin")).unwrap();
         h.state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &FileRecord {
                     path: "shared.bin".into(),
@@ -10306,7 +11176,8 @@ mod dag_convergence_authority_tests {
                 mtime_unix_nanos: version_w.meta.mtime_unix_nanos,
             }),
         };
-        let yadorilink_replica_domain::session_state::LinkGate::Live { policy, .. } = h.state.link_repository().link_gate_for_group(GROUP).unwrap()
+        let yadorilink_replica_domain::session_state::LinkGate::Live { policy, .. } =
+            h.state.link_repository().link_gate_for_group(GROUP).unwrap()
         else {
             panic!("link must be live");
         };
@@ -10321,11 +11192,18 @@ mod dag_convergence_authority_tests {
             "a stale materialize must not resurrect a file a newer local tombstone removed"
         );
         assert!(
-            h.state.file_index_repository().get_file(GROUP, "shared.bin").unwrap().is_none_or(|r| r.deleted),
+            h.state
+                .file_index_repository()
+                .get_file(GROUP, "shared.bin")
+                .unwrap()
+                .is_none_or(|r| r.deleted),
             "the tombstone's index row must survive the stale attempt"
         );
         assert!(
-            matches!(result, yadorilink_peer_session::peer_session_impl::MaterializeResult::RetryRequired),
+            matches!(
+                result,
+                yadorilink_peer_session::peer_session_impl::MaterializeResult::RetryRequired
+            ),
             "a declined stale write must not report the path as settled"
         );
     }
@@ -10356,7 +11234,9 @@ mod dag_convergence_authority_tests {
             ChangeAuth::PLACEHOLDER,
             yadorilink_replica_domain::ids::DeviceId("device-p".into()),
             yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
-            vec![yadorilink_replica_domain::change::Op::Delete { path: SyncPath("gone.txt".into()) }],
+            vec![yadorilink_replica_domain::change::Op::Delete {
+                path: SyncPath("gone.txt".into()),
+            }],
             &key_a,
         );
         h.state.change_history_repository().dag_admit_change(&change_t, false).unwrap();
@@ -10379,9 +11259,12 @@ mod dag_convergence_authority_tests {
             symlink_out_of_root: true,
             exec_bit: true,
             origin_device_id: None,
-            authoring_change_hash: Some(yadorilink_replica_domain::ids::ChangeHash(change_t.compute_hash().0)),
+            authoring_change_hash: Some(yadorilink_replica_domain::ids::ChangeHash(
+                change_t.compute_hash().0,
+            )),
         };
-        let yadorilink_replica_domain::session_state::LinkGate::Live { policy, .. } = h.state.link_repository().link_gate_for_group(GROUP).unwrap()
+        let yadorilink_replica_domain::session_state::LinkGate::Live { policy, .. } =
+            h.state.link_repository().link_gate_for_group(GROUP).unwrap()
         else {
             panic!("link must be live");
         };
@@ -10437,7 +11320,8 @@ mod dag_convergence_authority_tests {
         // will collide with.
         std::fs::write(h.root.join("Gone.txt"), b"sibling bytes").unwrap();
         h.state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &FileRecord {
                     path: "Gone.txt".into(),
@@ -10486,7 +11370,9 @@ mod dag_convergence_authority_tests {
             ChangeAuth::PLACEHOLDER,
             yadorilink_replica_domain::ids::DeviceId("device-p".into()),
             yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
-            vec![yadorilink_replica_domain::change::Op::Delete { path: SyncPath("gone.txt".into()) }],
+            vec![yadorilink_replica_domain::change::Op::Delete {
+                path: SyncPath("gone.txt".into()),
+            }],
             &key_p,
         );
         h.state.change_history_repository().dag_admit_change(&change_t, false).unwrap();
@@ -10511,7 +11397,12 @@ mod dag_convergence_authority_tests {
             "the DAG projection layer must never mark this path resolved while it never actually \
              applied the deletion anywhere"
         );
-        assert!(h.state.materialization_state_repository().get_held_state(GROUP, "gone.txt").unwrap().is_none());
+        assert!(h
+            .state
+            .materialization_state_repository()
+            .get_held_state(GROUP, "gone.txt")
+            .unwrap()
+            .is_none());
         assert_eq!(
             std::fs::read(h.root.join("Gone.txt")).unwrap(),
             b"sibling bytes",
@@ -10539,7 +11430,8 @@ mod dag_convergence_authority_tests {
 
         std::fs::write(h.root.join("Gone.txt"), b"sibling bytes").unwrap();
         h.state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &FileRecord {
                     path: "Gone.txt".into(),
@@ -10563,7 +11455,9 @@ mod dag_convergence_authority_tests {
             ChangeAuth::PLACEHOLDER,
             yadorilink_replica_domain::ids::DeviceId("device-p".into()),
             yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
-            vec![yadorilink_replica_domain::change::Op::Delete { path: SyncPath("gone.txt".into()) }],
+            vec![yadorilink_replica_domain::change::Op::Delete {
+                path: SyncPath("gone.txt".into()),
+            }],
             &key_p,
         );
         h.state.change_history_repository().dag_admit_change(&change_t, false).unwrap();
@@ -10581,16 +11475,22 @@ mod dag_convergence_authority_tests {
             symlink_out_of_root: false,
             exec_bit: false,
             origin_device_id: None,
-            authoring_change_hash: Some(yadorilink_replica_domain::ids::ChangeHash(change_t.compute_hash().0)),
+            authoring_change_hash: Some(yadorilink_replica_domain::ids::ChangeHash(
+                change_t.compute_hash().0,
+            )),
         };
-        let yadorilink_replica_domain::session_state::LinkGate::Live { policy, .. } = h.state.link_repository().link_gate_for_group(GROUP).unwrap()
+        let yadorilink_replica_domain::session_state::LinkGate::Live { policy, .. } =
+            h.state.link_repository().link_gate_for_group(GROUP).unwrap()
         else {
             panic!("link must be live");
         };
         let outcome = h.session.apply_locked_record(GROUP, incoming, meta, policy).await.unwrap();
 
         assert!(
-            matches!(outcome, yadorilink_peer_session::peer_session_impl::LockedRecordOutcome::RetryRequired),
+            matches!(
+                outcome,
+                yadorilink_peer_session::peer_session_impl::LockedRecordOutcome::RetryRequired
+            ),
             "a dropped hazard-collision tombstone must propagate RetryRequired through the legacy \
              path too, not just the DAG path -- got {outcome:?}"
         );
@@ -10629,7 +11529,8 @@ mod dag_convergence_authority_tests {
         // own authoring change is irrelevant to what this test exercises.
         std::fs::write(h.root.join("Photo.jpg"), b"fresh photo bytes").unwrap();
         h.state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &FileRecord {
                     path: "Photo.jpg".into(),
@@ -10649,15 +11550,19 @@ mod dag_convergence_authority_tests {
             ChangeAuth::PLACEHOLDER,
             yadorilink_replica_domain::ids::DeviceId("device-p".into()),
             yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
-            vec![yadorilink_replica_domain::change::Op::Delete { path: SyncPath("photo.jpg".into()) }],
+            vec![yadorilink_replica_domain::change::Op::Delete {
+                path: SyncPath("photo.jpg".into()),
+            }],
             &key_parent,
         );
         h.state.change_history_repository().dag_admit_change(&parent_change, true).unwrap();
-        let parent_hash = yadorilink_replica_domain::ids::ChangeHash(parent_change.compute_hash().0);
+        let parent_hash =
+            yadorilink_replica_domain::ids::ChangeHash(parent_change.compute_hash().0);
         // This device already applied the parent tombstone: a genuine
         // (version_seq > 0) row stamped with its authoring identity.
         h.state
-            .file_index_repository().upsert_file_with_origin_and_author(
+            .file_index_repository()
+            .upsert_file_with_origin_and_author(
                 GROUP,
                 &FileRecord {
                     path: "photo.jpg".into(),
@@ -10681,11 +11586,14 @@ mod dag_convergence_authority_tests {
             ChangeAuth::PLACEHOLDER,
             yadorilink_replica_domain::ids::DeviceId("device-q".into()),
             yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
-            vec![yadorilink_replica_domain::change::Op::Delete { path: SyncPath("photo.jpg".into()) }],
+            vec![yadorilink_replica_domain::change::Op::Delete {
+                path: SyncPath("photo.jpg".into()),
+            }],
             &key_descendant,
         );
         h.state.change_history_repository().dag_admit_change(&descendant_change, false).unwrap();
-        let descendant_hash = yadorilink_replica_domain::ids::ChangeHash(descendant_change.compute_hash().0);
+        let descendant_hash =
+            yadorilink_replica_domain::ids::ChangeHash(descendant_change.compute_hash().0);
 
         let incoming = FileRecord {
             path: "photo.jpg".into(),
@@ -10702,14 +11610,18 @@ mod dag_convergence_authority_tests {
             origin_device_id: None,
             authoring_change_hash: Some(descendant_hash),
         };
-        let yadorilink_replica_domain::session_state::LinkGate::Live { policy, .. } = h.state.link_repository().link_gate_for_group(GROUP).unwrap()
+        let yadorilink_replica_domain::session_state::LinkGate::Live { policy, .. } =
+            h.state.link_repository().link_gate_for_group(GROUP).unwrap()
         else {
             panic!("link must be live");
         };
         let outcome = h.session.apply_locked_record(GROUP, incoming, meta, policy).await.unwrap();
 
         assert!(
-            matches!(outcome, yadorilink_peer_session::peer_session_impl::LockedRecordOutcome::Settled),
+            matches!(
+                outcome,
+                yadorilink_peer_session::peer_session_impl::LockedRecordOutcome::Settled
+            ),
             "this deletion already converged (already a genuine tombstone on both sides) -- got \
              {outcome:?}"
         );
@@ -10780,10 +11692,12 @@ mod dag_convergence_authority_tests {
             &key_b,
         );
         h.state
-            .change_history_repository().dag_admit_change_with_versions(&change_w, std::slice::from_ref(&version_w), true)
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change_w, std::slice::from_ref(&version_w), true)
             .unwrap();
         h.state
-            .change_history_repository().dag_admit_change_with_versions(&change_l, std::slice::from_ref(&version_l), true)
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change_l, std::slice::from_ref(&version_l), true)
             .unwrap();
 
         // Reconcile at the transient frontier: the fixpoint derives and
@@ -10818,7 +11732,11 @@ mod dag_convergence_authority_tests {
             .unwrap()
             .expect("audit guard must be free");
         assert!(
-            h.state.file_index_repository().get_file(GROUP, &copy_path).unwrap().is_some_and(|r| !r.deleted),
+            h.state
+                .file_index_repository()
+                .get_file(GROUP, &copy_path)
+                .unwrap()
+                .is_some_and(|r| !r.deleted),
             "precondition: the transient-frontier reconcile derived and indexed the loser's copy \
              at {copy_path:?}"
         );
@@ -10827,7 +11745,11 @@ mod dag_convergence_authority_tests {
         // While the loser is still live, the audit must NOT retire it.
         h.session.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
         assert!(
-            h.state.file_index_repository().get_file(GROUP, &copy_path).unwrap().is_some_and(|r| !r.deleted),
+            h.state
+                .file_index_repository()
+                .get_file(GROUP, &copy_path)
+                .unwrap()
+                .is_some_and(|r| !r.deleted),
             "a copy still justified by a live loser must survive the audit"
         );
 
@@ -10848,7 +11770,8 @@ mod dag_convergence_authority_tests {
             if loser_head.device_id.0 == "device-a" { &key_a } else { &key_b },
         );
         h.state
-            .change_history_repository().dag_admit_change_with_versions(&loser_child, std::slice::from_ref(&version_l2), true)
+            .change_history_repository()
+            .dag_admit_change_with_versions(&loser_child, std::slice::from_ref(&version_l2), true)
             .unwrap();
         let _ = winner_head; // winner stays live; only the loser was superseded
 
@@ -10858,7 +11781,11 @@ mod dag_convergence_authority_tests {
             "the no-longer-justified, never-carried copy must be retired from disk"
         );
         assert!(
-            h.state.file_index_repository().get_file(GROUP, &copy_path).unwrap().is_none_or(|r| r.deleted),
+            h.state
+                .file_index_repository()
+                .get_file(GROUP, &copy_path)
+                .unwrap()
+                .is_none_or(|r| r.deleted),
             "the retired copy's index row must not remain live"
         );
     }
@@ -11005,7 +11932,12 @@ mod dag_convergence_authority_tests {
         // the Convergence Engine would, exactly as it would call it.
         h.session.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
 
-        h.state.file_index_repository().get_file(GROUP, "file.bin").unwrap().unwrap().mtime_unix_nanos
+        h.state
+            .file_index_repository()
+            .get_file(GROUP, "file.bin")
+            .unwrap()
+            .unwrap()
+            .mtime_unix_nanos
     }
 
     #[tokio::test]
@@ -11023,18 +11955,20 @@ mod dag_convergence_authority_tests {
 
 #[cfg(test)]
 mod authorization_monotonicity_tests {
-    use yadorilink_peer_session::peer_session_impl::{ChangeAuthenticator, PeerSyncSession, PeerSyncSessionOneTimeDeps};
-    use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
-    use yadorilink_replica_domain::file::{FileMeta, FileVersion};
-    use yadorilink_replica_domain::ids::SyncPath;
-    use yadorilink_sync_sqlite::dag_store::{self, ChangeEmitter};
-    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-    use yadorilink_replica_domain::file::RecordKind;
     use ed25519_dalek::SigningKey;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
+    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
     use yadorilink_local_storage::FsBlockStore;
+    use yadorilink_peer_session::peer_session_impl::{
+        ChangeAuthenticator, PeerSyncSession, PeerSyncSessionOneTimeDeps,
+    };
+    use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
+    use yadorilink_replica_domain::file::RecordKind;
+    use yadorilink_replica_domain::file::{FileMeta, FileVersion};
+    use yadorilink_replica_domain::ids::SyncPath;
+    use yadorilink_sync_sqlite::dag_store::{self, ChangeEmitter};
 
     const GROUP: &str = "shared-group";
 

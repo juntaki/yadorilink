@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::FsBlockStore;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+use yadorilink_local_storage::FsBlockStore;
 
 /// Tests in this file share two process-global env vars
 /// (`YADORILINK_CONFIG_DIR`, `YADORILINK_CONTROL_SOCKET`) and so must not
@@ -33,11 +33,9 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
         yadorilink_daemon::control_context::ControlContext::from_state(state.clone()),
     );
     tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
-            &serve_path,
-            serve_context,
-        )
-            .await;
+        let _ =
+            yadorilink_daemon::control_socket::unix_transport::serve(&serve_path, serve_context)
+                .await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     (dir, state)

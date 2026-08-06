@@ -25,7 +25,10 @@ fn render_membership_outcome_to(
         let _ = writeln!(
             out,
             "handoff completed: group={} target={} generation={} lease={}",
-            handoff.group_id, handoff.target_device_id, handoff.membership_generation, handoff.lease_id,
+            handoff.group_id,
+            handoff.target_device_id,
+            handoff.membership_generation,
+            handoff.lease_id,
         );
     }
     if !outcome.forced_group_ids.is_empty() {

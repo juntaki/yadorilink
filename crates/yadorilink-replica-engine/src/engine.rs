@@ -10,6 +10,7 @@ use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId, VersionHash};
 
 use crate::change_ops;
+use crate::error::AdmissionStoreError;
 use crate::error::ReplicaEngineError;
 use crate::outcomes::{
     AdmittedChange, CausalAuthOutcome, ChangeAdmissionOutcome, ChangeAdmissionRejection,
@@ -17,7 +18,6 @@ use crate::outcomes::{
 };
 use crate::ports::{AdmissionStoreOutcome, DurabilityRoot, ReplicaRetentionPolicy};
 use crate::ReplicaEngineDependencies;
-use crate::error::AdmissionStoreError;
 
 /// Domain-level equivalent of `proto::VersionPresentQuery`, holding only the
 /// fields `PeerReplicaEngine::holds_version_durably` actually needs.
@@ -132,8 +132,11 @@ impl PeerReplicaEngine {
                 batch.push(encoded);
             }
         }
-        let versions =
-            if batch.is_empty() { Vec::new() } else { self.file_versions_for_changes(group_id, &batch)? };
+        let versions = if batch.is_empty() {
+            Vec::new()
+        } else {
+            self.file_versions_for_changes(group_id, &batch)?
+        };
         Ok((batch, versions))
     }
 
@@ -182,8 +185,10 @@ impl PeerReplicaEngine {
         //    on-demand device may hold these blocks only transiently and can
         //    evict them at any moment, so it must never authorize a peer to
         //    drop its own copy on the strength of this device's cache.
-        if !matches!(self.deps.durability.retention_policy(&group), Ok(Some(ReplicaRetentionPolicy::Eager)))
-        {
+        if !matches!(
+            self.deps.durability.retention_policy(&group),
+            Ok(Some(ReplicaRetentionPolicy::Eager))
+        ) {
             return CustodyEvaluation { present: false, warning: None };
         }
         let Ok(query_hash_bytes): Result<[u8; 32], _> = query.version_hash.as_slice().try_into()
@@ -200,10 +205,9 @@ impl PeerReplicaEngine {
                 Ok(roots) => roots,
                 Err(_) => return CustodyEvaluation { present: false, warning: None },
             };
-            match roots
-                .into_iter()
-                .find(|root: &DurabilityRoot| !root.deleted && root.version.version_hash == query_hash)
-            {
+            match roots.into_iter().find(|root: &DurabilityRoot| {
+                !root.deleted && root.version.version_hash == query_hash
+            }) {
                 Some(root) => root.version.blocks,
                 None => return CustodyEvaluation { present: false, warning: None },
             }
@@ -250,7 +254,8 @@ impl PeerReplicaEngine {
         }
 
         // 6. Full checksum verification.
-        let present = matching_blocks.iter().all(|b| self.deps.durability.verify_block(&b.hash).is_ok());
+        let present =
+            matching_blocks.iter().all(|b| self.deps.durability.verify_block(&b.hash).is_ok());
         CustodyEvaluation { present, warning: None }
     }
 
@@ -290,8 +295,7 @@ impl PeerReplicaEngine {
             }
         }
         if parent_pin_unreadable {
-            let missing_parents =
-                self.deps.history.missing_ancestor_frontier(&change.parents)?;
+            let missing_parents = self.deps.history.missing_ancestor_frontier(&change.parents)?;
             return Ok(CausalAuthOutcome::Hold { missing_parents });
         }
         if change.auth_seq < max_parent_seq || change.auth_epoch < max_parent_epoch {
@@ -338,14 +342,16 @@ impl PeerReplicaEngine {
         referenced_versions: &[FileVersion],
     ) -> Result<ChangeAdmissionOutcome, ReplicaEngineError> {
         match self.deps.admission.admit_unprojected_change(change, referenced_versions) {
-            Err(AdmissionStoreError::ReservedNamespaceCollision { path }) => Ok(
-                ChangeAdmissionOutcome::Rejected {
+            Err(AdmissionStoreError::ReservedNamespaceCollision { path }) => {
+                Ok(ChangeAdmissionOutcome::Rejected {
                     reason: ChangeAdmissionRejection::ReservedNamespaceCollision { path },
-                },
-            ),
-            Err(AdmissionStoreError::NonPortablePath { path }) => Ok(ChangeAdmissionOutcome::Rejected {
-                reason: ChangeAdmissionRejection::NonPortablePath { path },
-            }),
+                })
+            }
+            Err(AdmissionStoreError::NonPortablePath { path }) => {
+                Ok(ChangeAdmissionOutcome::Rejected {
+                    reason: ChangeAdmissionRejection::NonPortablePath { path },
+                })
+            }
             Err(AdmissionStoreError::Other(message)) => Ok(ChangeAdmissionOutcome::Rejected {
                 reason: ChangeAdmissionRejection::StorageFailure { message },
             }),

@@ -58,7 +58,8 @@ impl EnrollmentLinkPort for DaemonEnrollmentLinkAdapter {
         Box::pin(async move {
             self.state
                 .replica_coordinator
-                .enrollment_repository().orphan_link_and_remove_pending_enrollment(local_path, operation_id)
+                .enrollment_repository()
+                .orphan_link_and_remove_pending_enrollment(local_path, operation_id)
                 .map_err(|e| e.to_string())?;
             self.controller.stop(local_path).await;
             self.state.clear_pending_enrollment_transient_attempts(operation_id);
@@ -92,7 +93,8 @@ async fn classify_link_failure(
         return Ok(());
     };
     let detail = link_error.to_string();
-    match state.replica_coordinator.enrollment_repository().get_enrollment_operation(&operation_id) {
+    match state.replica_coordinator.enrollment_repository().get_enrollment_operation(&operation_id)
+    {
         // The link/marker/LocalSetupPending commit was never reached (a
         // preflight check failed) or was already rolled back to
         // CancelPending by `link()` itself -- safe to compensate now.
@@ -181,23 +183,30 @@ mod tests {
         // to `classify_link_failure`, only the row's own state at read-back
         // time matters.
         let other = tempfile::tempdir().unwrap();
-        state.replica_coordinator.link_repository().add_link(&other.path().to_string_lossy(), "group-1").unwrap();
         state
             .replica_coordinator
-            .enrollment_repository().try_insert_enrollment_operation(&yadorilink_replica_domain::session_state::EnrollmentOperation {
-                operation_id: "op-1".to_string(),
-                kind: yadorilink_replica_domain::session_state::EnrollmentKind::Create,
-                group_id: Some("group-1".to_string()),
-                group_name: None,
-                device_id: "device-a".to_string(),
-                local_path: "/home/alice/Photos".to_string(),
-                storage_mode: "eager".to_string(),
-                state: EnrollmentOperationState::Prepared,
-                last_error: None,
-                attempts: 0,
-                created_at_unix: 1,
-                updated_at_unix: 1,
-            })
+            .link_repository()
+            .add_link(&other.path().to_string_lossy(), "group-1")
+            .unwrap();
+        state
+            .replica_coordinator
+            .enrollment_repository()
+            .try_insert_enrollment_operation(
+                &yadorilink_replica_domain::session_state::EnrollmentOperation {
+                    operation_id: "op-1".to_string(),
+                    kind: yadorilink_replica_domain::session_state::EnrollmentKind::Create,
+                    group_id: Some("group-1".to_string()),
+                    group_name: None,
+                    device_id: "device-a".to_string(),
+                    local_path: "/home/alice/Photos".to_string(),
+                    storage_mode: "eager".to_string(),
+                    state: EnrollmentOperationState::Prepared,
+                    last_error: None,
+                    attempts: 0,
+                    created_at_unix: 1,
+                    updated_at_unix: 1,
+                },
+            )
             .unwrap();
 
         let result = classify_link_failure(
@@ -225,23 +234,30 @@ mod tests {
     async fn classify_link_failure_returns_commit_uncertain_for_a_local_setup_pending_row() {
         let state = test_state();
         let other = tempfile::tempdir().unwrap();
-        state.replica_coordinator.link_repository().add_link(&other.path().to_string_lossy(), "group-1").unwrap();
         state
             .replica_coordinator
-            .enrollment_repository().try_insert_enrollment_operation(&yadorilink_replica_domain::session_state::EnrollmentOperation {
-                operation_id: "op-1".to_string(),
-                kind: yadorilink_replica_domain::session_state::EnrollmentKind::Create,
-                group_id: Some("group-1".to_string()),
-                group_name: None,
-                device_id: "device-a".to_string(),
-                local_path: "/home/alice/Photos".to_string(),
-                storage_mode: "eager".to_string(),
-                state: EnrollmentOperationState::LocalSetupPending,
-                last_error: None,
-                attempts: 0,
-                created_at_unix: 1,
-                updated_at_unix: 1,
-            })
+            .link_repository()
+            .add_link(&other.path().to_string_lossy(), "group-1")
+            .unwrap();
+        state
+            .replica_coordinator
+            .enrollment_repository()
+            .try_insert_enrollment_operation(
+                &yadorilink_replica_domain::session_state::EnrollmentOperation {
+                    operation_id: "op-1".to_string(),
+                    kind: yadorilink_replica_domain::session_state::EnrollmentKind::Create,
+                    group_id: Some("group-1".to_string()),
+                    group_name: None,
+                    device_id: "device-a".to_string(),
+                    local_path: "/home/alice/Photos".to_string(),
+                    storage_mode: "eager".to_string(),
+                    state: EnrollmentOperationState::LocalSetupPending,
+                    last_error: None,
+                    attempts: 0,
+                    created_at_unix: 1,
+                    updated_at_unix: 1,
+                },
+            )
             .unwrap();
 
         let result = classify_link_failure(
@@ -264,7 +280,11 @@ mod tests {
     async fn classify_link_failure_fails_closed_when_the_journal_row_is_missing() {
         let state = test_state();
         let other = tempfile::tempdir().unwrap();
-        state.replica_coordinator.link_repository().add_link(&other.path().to_string_lossy(), "group-1").unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link(&other.path().to_string_lossy(), "group-1")
+            .unwrap();
         // No `enrollment_operations` row at all for "op-missing".
 
         let result = classify_link_failure(

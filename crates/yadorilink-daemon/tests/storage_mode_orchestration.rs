@@ -26,7 +26,9 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use support::{connect_two_daemons, ensure_device_signing_key, open_file_backed_replica_coordinator};
+use support::{
+    connect_two_daemons, ensure_device_signing_key, open_file_backed_replica_coordinator,
+};
 use tokio::net::UnixStream;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -38,8 +40,8 @@ use yadorilink_ipc_proto::daemonctl::{
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_replica_domain::session_state::MaterializationPolicy;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
+use yadorilink_replica_domain::session_state::MaterializationPolicy;
 
 const GROUP: &str = "storage-mode-group";
 
@@ -57,7 +59,11 @@ fn new_daemon(device_id: &str) -> Daemon {
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
     let root = tempfile::tempdir().unwrap();
-    state.replica_coordinator.link_repository().add_link(&root.path().to_string_lossy(), GROUP).unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&root.path().to_string_lossy(), GROUP)
+        .unwrap();
     Daemon { state, _store_dir: store_dir, _index_dir: index_dir, root }
 }
 
@@ -108,7 +114,12 @@ async fn serve(state: Arc<DaemonState>, root: &std::path::Path) -> std::path::Pa
 }
 
 fn policy_of(state: &DaemonState, group_id: &str) -> MaterializationPolicy {
-    state.replica_coordinator.link_repository().materialization_policy_for_group(group_id).unwrap().unwrap()
+    state
+        .replica_coordinator
+        .link_repository()
+        .materialization_policy_for_group(group_id)
+        .unwrap()
+        .unwrap()
 }
 
 /// Counts requests the mock coordination plane received matching `method`
@@ -151,18 +162,19 @@ async fn demoting_setup(
     support::ensure_isolated_config_dir();
     let a = new_daemon("device-a"); // full replica: durably holds every block
     let b = new_daemon("device-b"); // eager device asking to demote
-    // Every test in this file exercises the demotion orchestration itself,
-    // not the on-demand pipeline's own real-vs-fake state -- see
-    // `role_loss_saga.rs`'s identical `demoting_setup` override for why a
-    // daemon integration test needs this instead of the production probe
-    // (unconditionally `false`) or a thread-local override.
+                                    // Every test in this file exercises the demotion orchestration itself,
+                                    // not the on-demand pipeline's own real-vs-fake state -- see
+                                    // `role_loss_saga.rs`'s identical `demoting_setup` override for why a
+                                    // daemon integration test needs this instead of the production probe
+                                    // (unconditionally `false`) or a thread-local override.
     b.state.set_test_placeholder_pipeline_connected(true);
 
     let content = b"the file device-a confirms holding";
     let hash = a.state.block_store.put(content).unwrap();
     a.state
         .replica_coordinator
-        .change_history_repository().record_group_block_provenance(GROUP, &[hex::decode(hash.as_str()).unwrap()])
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, &[hex::decode(hash.as_str()).unwrap()])
         .unwrap();
     b.state.block_store.put(content).unwrap();
     let bytes = hex::decode(hash.as_str()).unwrap();
@@ -173,10 +185,30 @@ async fn demoting_setup(
     // requires group block provenance on the ANSWERING side, not just the
     // asker's) -- without this, device-a's own readiness check fails and no
     // lease is ever issued, regardless of the mocked Worker endpoint below.
-    b.state.replica_coordinator.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&bytes)).unwrap();
+    b.state
+        .replica_coordinator
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&bytes))
+        .unwrap();
     let record = record_referencing("only.bin", bytes, content.len() as u64);
-    a.state.replica_coordinator.file_index_repository().upsert_file(GROUP, &record, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
-    b.state.replica_coordinator.file_index_repository().upsert_file(GROUP, &record, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+    a.state
+        .replica_coordinator
+        .file_index_repository()
+        .upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository()
+        .upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
     b.state.set_peer_group_full_replica("device-a", GROUP, true);
@@ -436,12 +468,29 @@ async fn demotion_refused_when_a_target_is_confirmed_but_this_device_has_no_conf
     let hash = a.state.block_store.put(content).unwrap();
     a.state
         .replica_coordinator
-        .change_history_repository().record_group_block_provenance(GROUP, &[hex::decode(hash.as_str()).unwrap()])
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, &[hex::decode(hash.as_str()).unwrap()])
         .unwrap();
     let bytes = hex::decode(hash.as_str()).unwrap();
     let record = record_referencing("only.bin", bytes, content.len() as u64);
-    a.state.replica_coordinator.file_index_repository().upsert_file(GROUP, &record, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
-    b.state.replica_coordinator.file_index_repository().upsert_file(GROUP, &record, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+    a.state
+        .replica_coordinator
+        .file_index_repository()
+        .upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository()
+        .upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
     b.state.set_peer_group_full_replica("device-a", GROUP, true);
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -526,7 +575,8 @@ fn promoting_setup(server: &MockServer) -> Daemon {
     let b = new_daemon("device-b");
     b.state
         .replica_coordinator
-        .link_repository().set_materialization_policy(
+        .link_repository()
+        .set_materialization_policy(
             &b.root.path().to_string_lossy(),
             MaterializationPolicy::OnDemand,
         )
@@ -602,7 +652,8 @@ async fn promotion_without_coordination_config_fails_closed_and_leaves_local_unt
     let b = new_daemon("device-b");
     b.state
         .replica_coordinator
-        .link_repository().set_materialization_policy(
+        .link_repository()
+        .set_materialization_policy(
             &b.root.path().to_string_lossy(),
             MaterializationPolicy::OnDemand,
         )

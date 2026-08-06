@@ -266,8 +266,8 @@ pub struct ProtobufPeerWireCodec;
 
 impl PeerWireCodec for ProtobufPeerWireCodec {
     fn decode(&self, bytes: &[u8]) -> Result<InboundFrame, WireError> {
-        let message = proto::SyncMessage::decode(bytes)
-            .map_err(|e| WireError::Decode(e.to_string()))?;
+        let message =
+            proto::SyncMessage::decode(bytes).map_err(|e| WireError::Decode(e.to_string()))?;
         match message.payload {
             Some(proto::sync_message::Payload::VersionPresentQuery(query)) => {
                 Ok(InboundFrame::VersionPresentQuery(query.try_into()?))
@@ -1031,14 +1031,12 @@ mod outbound_parity_tests {
         .encode_to_vec();
 
         let migrated = ProtobufPeerWireCodec
-            .encode(OutboundFrame::RebootstrapSnapshotResponse(
-                RebootstrapSnapshotResponseFrame {
-                    request_id: 5,
-                    granted: true,
-                    required_encoded: vec![1, 2, 3, 4],
-                    snapshot_bytes: vec![5, 6, 7, 8, 9],
-                },
-            ))
+            .encode(OutboundFrame::RebootstrapSnapshotResponse(RebootstrapSnapshotResponseFrame {
+                request_id: 5,
+                granted: true,
+                required_encoded: vec![1, 2, 3, 4],
+                snapshot_bytes: vec![5, 6, 7, 8, 9],
+            }))
             .unwrap();
 
         assert_eq!(migrated, legacy);
@@ -1435,9 +1433,7 @@ mod tests {
             InboundFrame::BlockReply(reply) => {
                 assert_eq!(
                     reply.outcome,
-                    Some(BlockReplyOutcomeFrame::Rejected {
-                        reason: "not authorized".to_string(),
-                    })
+                    Some(BlockReplyOutcomeFrame::Rejected { reason: "not authorized".to_string() })
                 );
             }
             other => panic!("expected BlockReply, got {other:?}"),

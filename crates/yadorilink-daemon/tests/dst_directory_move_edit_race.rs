@@ -85,15 +85,15 @@ use std::time::Duration;
 use boringtun::x25519::{PublicKey, StaticSecret};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
-use yadorilink_local_storage::FsBlockStore;
-use yadorilink_filesystem_sync::debounce::{self, DebounceConfig, FlushPathRequest};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
-use yadorilink_peer_session::peer_session::{PeerSyncSession, PendingLocalChangeFlush};
-use yadorilink_replica_domain::file::FileRecord;
+use yadorilink_filesystem_sync::debounce::{self, DebounceConfig, FlushPathRequest};
 use yadorilink_filesystem_sync::watcher::{
     FolderWatchSource, FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
 };
+use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
+use yadorilink_local_storage::FsBlockStore;
+use yadorilink_peer_session::peer_session::{PeerSyncSession, PendingLocalChangeFlush};
+use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_transport::PeerChannel;
 
 const GROUP_ID: &str = "dst-dirmove-group";
@@ -216,7 +216,11 @@ struct DeviceA {
     events_tx: tokio::sync::mpsc::Sender<FsChangeEvent>,
 }
 
-fn setup_device_a(root: PathBuf, sync_state: Arc<ReplicaCoordinator>, store: Arc<FsBlockStore>) -> DeviceA {
+fn setup_device_a(
+    root: PathBuf,
+    sync_state: Arc<ReplicaCoordinator>,
+    store: Arc<FsBlockStore>,
+) -> DeviceA {
     let processor = Arc::new(
         LocalChangeProcessor::new(sync_state, store, "device-a".to_string())
             .with_change_emitter(dst_dag_migrate_b2::emitter_for("device-a")),

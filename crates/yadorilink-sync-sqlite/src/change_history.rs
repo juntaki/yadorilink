@@ -40,11 +40,11 @@ use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension};
 
+use crate::dag_store::{self, ChangeEmitter, ChangeOrdering};
+use crate::error::SyncSqliteError;
 use yadorilink_replica_domain::change::{Change, ChangeAuth, Op};
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::ids::ChangeHash;
-use crate::dag_store::{self, ChangeEmitter, ChangeOrdering};
-use crate::error::SyncSqliteError;
 use yadorilink_sqlite_runtime::SyncDatabase;
 
 pub struct ChangeHistoryRepository {
@@ -155,7 +155,9 @@ impl ChangeHistoryRepository {
                     change.device_id.as_str() == device_id
                         && change.ops.iter().any(|op| match op {
                             yadorilink_replica_domain::change::Op::Put { path: p, .. }
-                            | yadorilink_replica_domain::change::Op::Delete { path: p } => p.as_str() == path,
+                            | yadorilink_replica_domain::change::Op::Delete { path: p } => {
+                                p.as_str() == path
+                            }
                             yadorilink_replica_domain::change::Op::Move { from, to, .. } => {
                                 from.as_str() == path || to.as_str() == path
                             }
@@ -166,8 +168,12 @@ impl ChangeHistoryRepository {
     }
 
     /// Paths represented anywhere in this group's retained change history.
-    pub fn dag_group_history_paths(&self, group_id: &str) -> Result<HashSet<String>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| Ok(dag_store::group_history_paths(conn, group_id)?))
+    pub fn dag_group_history_paths(
+        &self,
+        group_id: &str,
+    ) -> Result<HashSet<String>, SyncSqliteError> {
+        self.database
+            .read::<_, SyncSqliteError>(|conn| Ok(dag_store::group_history_paths(conn, group_id)?))
     }
 
     /// Appends repair operations to an already-initialized DAG without
@@ -217,8 +223,12 @@ impl ChangeHistoryRepository {
     /// — the reconciliation layer's re-projection worklist (see
     /// [`dag_store::list_unapplied`]). The `applied` flag is the durable retry
     /// state: a change stays here until its path projection actually succeeds.
-    pub fn dag_list_unapplied_changes(&self, group_id: &str) -> Result<Vec<Change>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| Ok(dag_store::list_unapplied(conn, group_id)?))
+    pub fn dag_list_unapplied_changes(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<Change>, SyncSqliteError> {
+        self.database
+            .read::<_, SyncSqliteError>(|conn| Ok(dag_store::list_unapplied(conn, group_id)?))
     }
 
     /// Whether a change is already present in the applied store.
@@ -231,7 +241,9 @@ impl ChangeHistoryRepository {
         group_id: &str,
         hash: &ChangeHash,
     ) -> Result<bool, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| Ok(dag_store::has_change_or_pruned(conn, group_id, hash)?))
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            Ok(dag_store::has_change_or_pruned(conn, group_id, hash)?)
+        })
     }
 
     /// Compares two authoring identities using one checked-out connection.
@@ -244,7 +256,9 @@ impl ChangeHistoryRepository {
         local: &ChangeHash,
         incoming: &ChangeHash,
     ) -> Result<Option<ChangeOrdering>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| compare_authoring_on_conn(conn, group_id, local, incoming))
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            compare_authoring_on_conn(conn, group_id, local, incoming)
+        })
     }
 
     /// Reads the current row's author (`files.authoring_change_hash`) and
@@ -284,8 +298,13 @@ impl ChangeHistoryRepository {
 
     /// Whether a change is already known locally at all — admitted or still
     /// buffered as an orphan. See `dag_store::has_change_or_buffered_orphan`.
-    pub fn dag_has_change_or_buffered_orphan(&self, hash: &ChangeHash) -> Result<bool, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| Ok(dag_store::has_change_or_buffered_orphan(conn, hash)?))
+    pub fn dag_has_change_or_buffered_orphan(
+        &self,
+        hash: &ChangeHash,
+    ) -> Result<bool, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            Ok(dag_store::has_change_or_buffered_orphan(conn, hash)?)
+        })
     }
 
     /// Read-only DAG-progress diagnostics for one group. See
@@ -295,7 +314,9 @@ impl ChangeHistoryRepository {
         &self,
         group_id: &str,
     ) -> Result<dag_store::GroupDagDiagnostics, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| Ok(dag_store::group_dag_diagnostics(conn, group_id)?))
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            Ok(dag_store::group_dag_diagnostics(conn, group_id)?)
+        })
     }
 
     /// Where one specific hash stands locally (admitted / orphaned /
@@ -310,7 +331,8 @@ impl ChangeHistoryRepository {
     /// Every admitted change for `group_id`, decoded. See
     /// [`dag_store::list_group_changes`]; diagnostic only.
     pub fn dag_list_group_changes(&self, group_id: &str) -> Result<Vec<Change>, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| Ok(dag_store::list_group_changes(conn, group_id)?))
+        self.database
+            .read::<_, SyncSqliteError>(|conn| Ok(dag_store::list_group_changes(conn, group_id)?))
     }
 
     /// Persists a content-addressed file version, transactionally. Idempotent;
@@ -332,11 +354,9 @@ impl ChangeHistoryRepository {
         group_id: &str,
         block_hash: &[u8],
     ) -> Result<bool, SyncSqliteError> {
-        Ok(self
-            .database
-            .read::<_, SyncSqliteError>(|conn| {
-                dag_store::group_file_version_references_block(conn, group_id, block_hash)
-            })?)
+        Ok(self.database.read::<_, SyncSqliteError>(|conn| {
+            dag_store::group_file_version_references_block(conn, group_id, block_hash)
+        })?)
     }
 
     /// Records blocks whose bytes this device actually obtained through the
@@ -346,11 +366,9 @@ impl ChangeHistoryRepository {
         group_id: &str,
         block_hashes: &[Vec<u8>],
     ) -> Result<(), SyncSqliteError> {
-        Ok(self
-            .database
-            .write::<_, SyncSqliteError>(|conn| {
-                dag_store::record_group_block_provenance(conn, group_id, block_hashes)
-            })?)
+        Ok(self.database.write::<_, SyncSqliteError>(|conn| {
+            dag_store::record_group_block_provenance(conn, group_id, block_hashes)
+        })?)
     }
 
     /// Whether `ancestor` is a strict ancestor of `descendant`.
@@ -359,7 +377,9 @@ impl ChangeHistoryRepository {
         ancestor: &ChangeHash,
         descendant: &ChangeHash,
     ) -> Result<bool, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| Ok(dag_store::is_ancestor(conn, ancestor, descendant)?))
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            Ok(dag_store::is_ancestor(conn, ancestor, descendant)?)
+        })
     }
 
     /// Admits a verified peer change transactionally: applies it (and
@@ -371,7 +391,9 @@ impl ChangeHistoryRepository {
         change: &Change,
         applied: bool,
     ) -> Result<dag_store::AdmitResult, SyncSqliteError> {
-        self.database.write_immediate::<_, SyncSqliteError>(|tx| Ok(dag_store::admit_change(tx, change, applied)?))
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            Ok(dag_store::admit_change(tx, change, applied)?)
+        })
     }
 
     /// Atomically persists a verified peer change's referenced versions and

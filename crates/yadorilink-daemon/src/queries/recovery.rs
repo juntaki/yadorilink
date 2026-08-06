@@ -54,12 +54,9 @@ impl RecoveryQueryService {
             return Ok(DiagnoseOutcome::CoordinationNotConfigured);
         };
         let source = WorkerEvidenceSource::new(&addr, &access_token);
-        let outcome = crate::recovery_diagnosis::diagnose_stable(
-            &self.replica_coordinator,
-            &source,
-            key,
-        )
-        .await?;
+        let outcome =
+            crate::recovery_diagnosis::diagnose_stable(&self.replica_coordinator, &source, key)
+                .await?;
         Ok(DiagnoseOutcome::Diagnosis(outcome))
     }
 }

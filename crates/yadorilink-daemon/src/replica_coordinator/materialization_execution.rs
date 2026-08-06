@@ -16,6 +16,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::sync_error::SyncError;
 use yadorilink_filesystem_sync::block_liveness::BlockPhysicalDeletionGuard;
 use yadorilink_filesystem_sync::materialization_execution::{
     EvictionEligibilitySnapshot as ExecEvictionEligibilitySnapshot,
@@ -30,17 +31,20 @@ use yadorilink_local_storage::{BlockReclamationStore, GcReport};
 use yadorilink_replica_domain::admission::ChangeEmitter;
 use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_replica_domain::ids::ChangeHash;
-use yadorilink_replica_engine::custody::VerifiedCustody;
 use yadorilink_replica_domain::session_state::MaterializationState;
+use yadorilink_replica_engine::custody::VerifiedCustody;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_root_authority::root_identity::VerifiedRoot;
 use yadorilink_sync_sqlite::materialization_state_port::MaterializationStatePort;
-use crate::sync_error::SyncError;
 
 use super::ReplicaCoordinator;
 
 impl MaterializationExecutionPort for ReplicaCoordinator {
-    fn get_exec_bit(&self, group_id: &str, path: &str) -> Result<bool, MaterializationExecutionError> {
+    fn get_exec_bit(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, MaterializationExecutionError> {
         Ok(self.file_index_repository().get_exec_bit(group_id, path).map_err(SyncError::from)?)
     }
 
@@ -56,11 +60,17 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         &self,
         group_id: &str,
     ) -> Result<Vec<EvictableFile>, MaterializationExecutionError> {
-        Ok(self.materialization_state_repository().list_evictable_files(group_id).map_err(SyncError::from)?)
+        Ok(self
+            .materialization_state_repository()
+            .list_evictable_files(group_id)
+            .map_err(SyncError::from)?)
     }
 
     fn hydrated_usage_bytes(&self, group_id: &str) -> Result<u64, MaterializationExecutionError> {
-        Ok(self.materialization_state_repository().hydrated_usage_bytes(group_id).map_err(SyncError::from)?)
+        Ok(self
+            .materialization_state_repository()
+            .hydrated_usage_bytes(group_id)
+            .map_err(SyncError::from)?)
     }
 
     fn touch_last_accessed(
@@ -69,15 +79,23 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         path: &str,
         unix_ts: i64,
     ) -> Result<(), MaterializationExecutionError> {
-        Ok(self.file_index_repository().touch_last_accessed(group_id, path, unix_ts).map_err(SyncError::from)?)
+        Ok(self
+            .file_index_repository()
+            .touch_last_accessed(group_id, path, unix_ts)
+            .map_err(SyncError::from)?)
     }
 
     fn list_materialization_states(
         &self,
         group_id: &str,
-    ) -> Result<std::collections::HashMap<String, MaterializationState>, MaterializationExecutionError>
-    {
-        Ok(self.materialization_state_repository().list_materialization_states(group_id).map_err(SyncError::from)?)
+    ) -> Result<
+        std::collections::HashMap<String, MaterializationState>,
+        MaterializationExecutionError,
+    > {
+        Ok(self
+            .materialization_state_repository()
+            .list_materialization_states(group_id)
+            .map_err(SyncError::from)?)
     }
 
     fn has_materialization_intent(
@@ -85,7 +103,8 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         group_id: &str,
         path: &str,
     ) -> Result<bool, MaterializationExecutionError> {
-        Ok(self.materialization_job_repository()
+        Ok(self
+            .materialization_job_repository()
             .has_materialization_intent(group_id, path)
             .map_err(SyncError::from)?)
     }
@@ -96,7 +115,8 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         path: &str,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), MaterializationExecutionError> {
-        Ok(self.materialization_job_repository()
+        Ok(self
+            .materialization_job_repository()
             .clear_materialization_intent(group_id, path, permit)
             .map_err(SyncError::from)?)
     }
@@ -108,7 +128,8 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         target_version_hash: &[u8],
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), MaterializationExecutionError> {
-        Ok(self.materialization_job_repository()
+        Ok(self
+            .materialization_job_repository()
             .begin_materialization_intent(group_id, path, target_version_hash, permit)
             .map_err(SyncError::from)?)
     }
@@ -141,7 +162,8 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         observed_at_unix_nanos: i64,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), MaterializationExecutionError> {
-        Ok(self.dirty_path_repository()
+        Ok(self
+            .dirty_path_repository()
             .record_dirty_path(group_id, path, change_kind, observed_at_unix_nanos, permit)
             .map_err(SyncError::from)?)
     }
@@ -153,7 +175,8 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         state: MaterializationState,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), MaterializationExecutionError> {
-        Ok(self.materialization_state_repository()
+        Ok(self
+            .materialization_state_repository()
             .set_materialization_state(group_id, path, state, permit)
             .map_err(SyncError::from)?)
     }
@@ -166,7 +189,8 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         next: MaterializationState,
         permit: &RootCommitPermit<'_>,
     ) -> Result<bool, MaterializationExecutionError> {
-        Ok(self.materialization_state_repository()
+        Ok(self
+            .materialization_state_repository()
             .transition_materialization_state(group_id, path, expected, next, permit)
             .map_err(SyncError::from)?)
     }
@@ -195,7 +219,10 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .map_err(SyncError::from)?)
     }
 
-    fn discard_restore_operation(&self, operation_id: &str) -> Result<(), MaterializationExecutionError> {
+    fn discard_restore_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<(), MaterializationExecutionError> {
         Ok(self
             .restore_operation_repository()
             .discard_restore_operation(operation_id)
@@ -210,7 +237,11 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         Ok(VerifiedRoot::verify(root, group_id, self)?)
     }
 
-    fn open_root(&self, root: &Path, group_id: &str) -> Result<VerifiedRoot, MaterializationExecutionError> {
+    fn open_root(
+        &self,
+        root: &Path,
+        group_id: &str,
+    ) -> Result<VerifiedRoot, MaterializationExecutionError> {
         Ok(VerifiedRoot::open(root, group_id, self)?)
     }
 

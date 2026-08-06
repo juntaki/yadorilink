@@ -42,7 +42,9 @@ use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_root_authority::root_identity::VerifiedRoot;
 
-use crate::materialization_execution::{MaterializationExecutionError, MaterializationExecutionPort};
+use crate::materialization_execution::{
+    MaterializationExecutionError, MaterializationExecutionPort,
+};
 use crate::materialization_types::RestoreCommitOutcome;
 
 // --- Startup recovery ------------------------------------------------------
@@ -461,7 +463,12 @@ fn repair_interrupted_materializations_inner(
                 }
             }
         } else {
-            state.set_materialization_state(group_id, &path, MaterializationState::Placeholder, permit)?;
+            state.set_materialization_state(
+                group_id,
+                &path,
+                MaterializationState::Placeholder,
+                permit,
+            )?;
             verify_write_target_within_root(&out_path, root)?;
             write_placeholder(&out_path, record.size, record.mtime_unix_nanos)?;
             // A placeholder is a fresh file too, so it needs the recorded exec
@@ -509,7 +516,8 @@ fn reconstruct_file_journaled(
     target_version_hash: &[u8],
     permit: &RootCommitPermit<'_>,
 ) -> Result<(), MaterializationExecutionError> {
-    let guard = state.open_materialization_intent_guard(group_id, path, target_version_hash, permit)?;
+    let guard =
+        state.open_materialization_intent_guard(group_id, path, target_version_hash, permit)?;
     // On `Err` the `?` returns while `guard` is still live, so it drops without
     // clearing — the intent stays, and the next repair pass treats a resulting
     // missing file as a crash to recover, never as an offline delete.

@@ -21,9 +21,9 @@ use std::collections::HashSet;
 
 use ed25519_dalek::SigningKey;
 
-use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId};
 use crate::compaction::{Checkpoint, CompactionStore};
 use crate::error::ReplicaEngineError;
+use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId};
 
 // `HistoryBase`/`RebootstrapTrust`/`SnapshotManifest`/`RebootstrapRequired`
 // moved to `yadorilink_replica_domain::rebootstrap` in Phase 7D-6 (pure
