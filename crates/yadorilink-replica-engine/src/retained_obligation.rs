@@ -69,7 +69,7 @@ impl ObligationState {
     /// reads a row through `get`/`create`/the `record_*` functions, all of
     /// which propagate this as a hard error rather than falling back to
     /// treating an undecodable state as safe to delete.
-    pub fn from_str(s: &str) -> Result<Self, ReplicaEngineError> {
+    pub fn parse(s: &str) -> Result<Self, ReplicaEngineError> {
         match s {
             "known_old" => Ok(ObligationState::KnownOld),
             "divergent" => Ok(ObligationState::Divergent),
@@ -269,13 +269,13 @@ mod tests {
             ObligationState::Divergent,
             ObligationState::LocalRecoveryOnly,
         ] {
-            assert_eq!(ObligationState::from_str(state.as_str()).unwrap(), state);
+            assert_eq!(ObligationState::parse(state.as_str()).unwrap(), state);
         }
     }
 
     #[test]
     fn obligation_state_from_str_rejects_an_unrecognized_value() {
-        assert!(ObligationState::from_str("not_a_real_state").is_err());
+        assert!(ObligationState::parse("not_a_real_state").is_err());
     }
 
     #[test]

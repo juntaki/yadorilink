@@ -7964,7 +7964,6 @@ impl PeerSyncSession {
             ),
             None => self.state.upsert_file_with_origin(group_id, record, origin_device_id, &permit),
         }
-        .map_err(PeerSessionError::from)
     }
 
     pub async fn materialize(

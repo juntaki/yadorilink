@@ -966,7 +966,7 @@ fn recover_orphaned_custody_obligation(
         now_unix_nanos(),
     )
     .map_err(|error| match error {
-        RetainedObligationError::Sync(e) => SyncSqliteError::from(e),
+        RetainedObligationError::Sync(e) => e,
         // The `get`-and-compare check above already handles a byte-for-byte
         // repeat, so this call only ever reaches `create` when no row
         // exists at all -- a genuine `ObligationIdentityConflict` here means

@@ -196,7 +196,7 @@ impl MaterializationStatePort for ReplicaCoordinator {
         permit: &RootCommitPermit<'_>,
     ) -> Result<ChangeHash, SyncSqliteError> {
         let auth = ReplicaCoordinator::local_emission_auth(self, group_id)?;
-        Ok(self.file_index_repository().mark_deleted_emitting_change(
+        self.file_index_repository().mark_deleted_emitting_change(
             group_id,
             path,
             device_id,
@@ -204,7 +204,7 @@ impl MaterializationStatePort for ReplicaCoordinator {
             emitter,
             permit,
             auth,
-        )?)
+        )
     }
 
     fn record_dirty_path(

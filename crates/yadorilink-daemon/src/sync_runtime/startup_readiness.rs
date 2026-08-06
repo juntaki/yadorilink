@@ -84,6 +84,12 @@ enum GroupStartupPhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartupGeneration(u64);
 
+impl Default for StartupReadinessRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StartupReadinessRegistry {
     pub fn new() -> Self {
         Self { gates: Mutex::new(HashMap::new()) }

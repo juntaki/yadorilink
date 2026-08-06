@@ -32,6 +32,9 @@ pub struct DurableVersionQuery {
     pub block_sizes: Vec<u32>,
 }
 
+/// Encoded changes and the encoded file versions they reference.
+pub type ChangeBatch = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
 /// Owns DAG-state operations that are peer-identity-parameterized rather
 /// than peer-CONNECTION-stateful -- i.e. they take a `group_id`/hash/etc.
 /// as a plain parameter and read only replica state, with no dependency on
@@ -118,7 +121,7 @@ impl PeerReplicaEngine {
         group_id: &FolderGroupId,
         want: &[ChangeHash],
         max_changes_per_batch: usize,
-    ) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>), ReplicaEngineError> {
+    ) -> Result<ChangeBatch, ReplicaEngineError> {
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
         let mut ordered: Vec<ChangeHash> = Vec::new();
         for hash in want {

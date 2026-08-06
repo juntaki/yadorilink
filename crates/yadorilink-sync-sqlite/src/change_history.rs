@@ -173,7 +173,7 @@ impl ChangeHistoryRepository {
         group_id: &str,
     ) -> Result<HashSet<String>, SyncSqliteError> {
         self.database
-            .read::<_, SyncSqliteError>(|conn| Ok(dag_store::group_history_paths(conn, group_id)?))
+            .read::<_, SyncSqliteError>(|conn| dag_store::group_history_paths(conn, group_id))
     }
 
     /// Appends repair operations to an already-initialized DAG without
@@ -227,13 +227,12 @@ impl ChangeHistoryRepository {
         &self,
         group_id: &str,
     ) -> Result<Vec<Change>, SyncSqliteError> {
-        self.database
-            .read::<_, SyncSqliteError>(|conn| Ok(dag_store::list_unapplied(conn, group_id)?))
+        self.database.read::<_, SyncSqliteError>(|conn| dag_store::list_unapplied(conn, group_id))
     }
 
     /// Whether a change is already present in the applied store.
     pub fn dag_has_change(&self, hash: &ChangeHash) -> Result<bool, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| Ok(dag_store::has_change(conn, hash)?))
+        self.database.read::<_, SyncSqliteError>(|conn| dag_store::has_change(conn, hash))
     }
 
     pub fn dag_has_change_or_pruned(
@@ -242,7 +241,7 @@ impl ChangeHistoryRepository {
         hash: &ChangeHash,
     ) -> Result<bool, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
-            Ok(dag_store::has_change_or_pruned(conn, group_id, hash)?)
+            dag_store::has_change_or_pruned(conn, group_id, hash)
         })
     }
 
@@ -302,9 +301,8 @@ impl ChangeHistoryRepository {
         &self,
         hash: &ChangeHash,
     ) -> Result<bool, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            Ok(dag_store::has_change_or_buffered_orphan(conn, hash)?)
-        })
+        self.database
+            .read::<_, SyncSqliteError>(|conn| dag_store::has_change_or_buffered_orphan(conn, hash))
     }
 
     /// Read-only DAG-progress diagnostics for one group. See
@@ -314,9 +312,8 @@ impl ChangeHistoryRepository {
         &self,
         group_id: &str,
     ) -> Result<dag_store::GroupDagDiagnostics, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            Ok(dag_store::group_dag_diagnostics(conn, group_id)?)
-        })
+        self.database
+            .read::<_, SyncSqliteError>(|conn| dag_store::group_dag_diagnostics(conn, group_id))
     }
 
     /// Where one specific hash stands locally (admitted / orphaned /
@@ -325,14 +322,14 @@ impl ChangeHistoryRepository {
         &self,
         hash: &ChangeHash,
     ) -> Result<dag_store::DagHashDisposition, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| Ok(dag_store::describe_hash(conn, hash)?))
+        self.database.read::<_, SyncSqliteError>(|conn| dag_store::describe_hash(conn, hash))
     }
 
     /// Every admitted change for `group_id`, decoded. See
     /// [`dag_store::list_group_changes`]; diagnostic only.
     pub fn dag_list_group_changes(&self, group_id: &str) -> Result<Vec<Change>, SyncSqliteError> {
         self.database
-            .read::<_, SyncSqliteError>(|conn| Ok(dag_store::list_group_changes(conn, group_id)?))
+            .read::<_, SyncSqliteError>(|conn| dag_store::list_group_changes(conn, group_id))
     }
 
     /// Persists a content-addressed file version, transactionally. Idempotent;
@@ -354,9 +351,9 @@ impl ChangeHistoryRepository {
         group_id: &str,
         block_hash: &[u8],
     ) -> Result<bool, SyncSqliteError> {
-        Ok(self.database.read::<_, SyncSqliteError>(|conn| {
+        self.database.read::<_, SyncSqliteError>(|conn| {
             dag_store::group_file_version_references_block(conn, group_id, block_hash)
-        })?)
+        })
     }
 
     /// Records blocks whose bytes this device actually obtained through the
@@ -366,9 +363,9 @@ impl ChangeHistoryRepository {
         group_id: &str,
         block_hashes: &[Vec<u8>],
     ) -> Result<(), SyncSqliteError> {
-        Ok(self.database.write::<_, SyncSqliteError>(|conn| {
+        self.database.write::<_, SyncSqliteError>(|conn| {
             dag_store::record_group_block_provenance(conn, group_id, block_hashes)
-        })?)
+        })
     }
 
     /// Whether `ancestor` is a strict ancestor of `descendant`.
@@ -377,9 +374,8 @@ impl ChangeHistoryRepository {
         ancestor: &ChangeHash,
         descendant: &ChangeHash,
     ) -> Result<bool, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| {
-            Ok(dag_store::is_ancestor(conn, ancestor, descendant)?)
-        })
+        self.database
+            .read::<_, SyncSqliteError>(|conn| dag_store::is_ancestor(conn, ancestor, descendant))
     }
 
     /// Admits a verified peer change transactionally: applies it (and
@@ -392,7 +388,7 @@ impl ChangeHistoryRepository {
         applied: bool,
     ) -> Result<dag_store::AdmitResult, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            Ok(dag_store::admit_change(tx, change, applied)?)
+            dag_store::admit_change(tx, change, applied)
         })
     }
 
@@ -408,13 +404,13 @@ impl ChangeHistoryRepository {
             for version in versions {
                 dag_store::put_file_version(tx, change.group_id.as_str(), version)?;
             }
-            Ok(dag_store::admit_change(tx, change, applied)?)
+            dag_store::admit_change(tx, change, applied)
         })
     }
 
     /// Marks a stored change as materialized into the index.
     pub fn dag_mark_applied(&self, hash: &ChangeHash) -> Result<(), SyncSqliteError> {
-        self.database.write::<_, SyncSqliteError>(|conn| Ok(dag_store::mark_applied(conn, hash)?))
+        self.database.write::<_, SyncSqliteError>(|conn| dag_store::mark_applied(conn, hash))
     }
 
     /// Records a device's acknowledged head for a group. This single-head
@@ -430,7 +426,7 @@ impl ChangeHistoryRepository {
         hash: &ChangeHash,
     ) -> Result<(), SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            Ok(dag_store::set_device_frontier(tx, group_id, device_id, std::slice::from_ref(hash))?)
+            dag_store::set_device_frontier(tx, group_id, device_id, std::slice::from_ref(hash))
         })
     }
 

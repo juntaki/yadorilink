@@ -940,8 +940,7 @@ pub fn prepare_captured_change<'gate>(
     gate: &'gate BlockLivenessGate,
     request: CapturedAuthoringRequest<'_>,
 ) -> Result<PrepareOutcome<'gate>, CapturedAuthoringError> {
-    filesystem_transaction::require_execution_enabled()
-        .map_err(|e| CapturedAuthoringError::Sync(SyncSqliteError::from(e)))?;
+    filesystem_transaction::require_execution_enabled().map_err(CapturedAuthoringError::Sync)?;
     prepare_captured_change_unchecked(conn, store, gate, request)
 }
 
@@ -1059,8 +1058,7 @@ pub fn admit_prepared_captured_change(
     authorization: CandidateAuthorizationCoordinate,
     prepared: PreparedCapturedChange<'_>,
 ) -> Result<CapturedAuthoringResult, CapturedAuthoringError> {
-    filesystem_transaction::require_execution_enabled()
-        .map_err(|e| CapturedAuthoringError::Sync(SyncSqliteError::from(e)))?;
+    filesystem_transaction::require_execution_enabled().map_err(CapturedAuthoringError::Sync)?;
     admit_prepared_captured_change_unchecked(conn, emitter, authorization, prepared)
 }
 
@@ -1247,8 +1245,7 @@ pub fn author_captured_change(
     authorization: CandidateAuthorizationCoordinate,
     request: CapturedAuthoringRequest<'_>,
 ) -> Result<CapturedAuthoringResult, CapturedAuthoringError> {
-    filesystem_transaction::require_execution_enabled()
-        .map_err(|e| CapturedAuthoringError::Sync(SyncSqliteError::from(e)))?;
+    filesystem_transaction::require_execution_enabled().map_err(CapturedAuthoringError::Sync)?;
     author_captured_change_unchecked(conn, store, gate, emitter, authorization, request)
 }
 

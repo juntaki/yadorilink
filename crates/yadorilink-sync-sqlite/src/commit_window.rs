@@ -204,8 +204,7 @@ pub fn execute_short_commit_window(
     request: &CommitWindowRequest,
     now_unix_nanos: i64,
 ) -> Result<CommitWindowOutcome, CommitWindowError> {
-    filesystem_transaction::require_execution_enabled()
-        .map_err(|e| CommitWindowError::Sync(SyncSqliteError::from(e)))?;
+    filesystem_transaction::require_execution_enabled().map_err(CommitWindowError::Sync)?;
     execute_short_commit_window_unchecked(conn, adapter, request, now_unix_nanos)
 }
 
@@ -233,8 +232,7 @@ pub fn execute_short_commit_window_keeping_reservations(
     request: &CommitWindowRequest,
     now_unix_nanos: i64,
 ) -> Result<CommitWindowOutcome, CommitWindowError> {
-    filesystem_transaction::require_execution_enabled()
-        .map_err(|e| CommitWindowError::Sync(SyncSqliteError::from(e)))?;
+    filesystem_transaction::require_execution_enabled().map_err(CommitWindowError::Sync)?;
     execute_short_commit_window_unchecked_keeping_reservations(
         conn,
         adapter,
@@ -309,7 +307,7 @@ fn execute_short_commit_window_core(
         // race-sensitive and gains nothing from running later.
         let prepared_epoch =
             filesystem_transaction::lookup_epoch(&tx, request.transaction_id, request.epoch)
-                .map_err(|e| CommitWindowError::Sync(SyncSqliteError::from(e)))?
+                .map_err(CommitWindowError::Sync)?
                 .ok_or_else(|| {
                     CommitWindowError::Sync(SyncSqliteError::NotFound(format!(
                         "epoch {}/{}",
@@ -327,7 +325,7 @@ fn execute_short_commit_window_core(
             &EpochUpdate::default(),
             now_unix_nanos,
         )
-        .map_err(|e| CommitWindowError::Sync(SyncSqliteError::from(e)))?;
+        .map_err(CommitWindowError::Sync)?;
         tx.commit().map_err(|e| CommitWindowError::Sync(SyncSqliteError::Sqlite(e)))?;
     }
 
@@ -372,7 +370,7 @@ fn execute_short_commit_window_core(
         request.expected_execution_generation,
     ) {
         block_fenced_epoch(conn, request, now_unix_nanos);
-        return Err(CommitWindowError::Sync(SyncSqliteError::from(fence_error)));
+        return Err(CommitWindowError::Sync(fence_error));
     }
 
     // The one mutating filesystem call this window makes.
@@ -401,7 +399,7 @@ fn execute_short_commit_window_core(
                     &EpochUpdate::default(),
                     now_unix_nanos,
                 )
-                .map_err(|e| CommitWindowError::Sync(SyncSqliteError::from(e)))?;
+                .map_err(CommitWindowError::Sync)?;
             } else {
                 // Retrying the identical plan would just fail again --
                 // take the pre-existing `(Committing, Blocked)` edge
@@ -417,7 +415,7 @@ fn execute_short_commit_window_core(
                     &EpochUpdate::default(),
                     now_unix_nanos,
                 )
-                .map_err(|e| CommitWindowError::Sync(SyncSqliteError::from(e)))?;
+                .map_err(CommitWindowError::Sync)?;
                 filesystem_transaction::set_transaction_phase_unchecked(
                     &tx,
                     request.transaction_id,
@@ -426,7 +424,7 @@ fn execute_short_commit_window_core(
                     Some(&format!("commit not started: {reason:?}")),
                     now_unix_nanos,
                 )
-                .map_err(|e| CommitWindowError::Sync(SyncSqliteError::from(e)))?;
+                .map_err(CommitWindowError::Sync)?;
             }
             tx.commit().map_err(|e| CommitWindowError::Sync(SyncSqliteError::Sqlite(e)))?;
             Err(CommitWindowError::NotStarted(reason))

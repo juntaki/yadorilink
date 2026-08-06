@@ -123,10 +123,6 @@ impl SyncDatabase {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    fn pool(&self) -> &ConnectionPool {
-        &self.pool
-    }
-
     /// Test-only raw pool access, for a fixture that needs multiple
     /// concurrently-held raw connections (a deliberate lock-contention
     /// test) or that corrupts the schema directly (`DROP TABLE ...`) --

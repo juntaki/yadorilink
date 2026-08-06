@@ -380,7 +380,7 @@ pub(crate) fn row_to_local_link_evidence(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+
     use crate::recovery::tests::{
         insert_valid_enrollment_op, insert_valid_membership_op, insert_valid_role_loss_op,
     };

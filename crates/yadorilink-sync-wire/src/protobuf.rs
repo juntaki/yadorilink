@@ -1273,7 +1273,7 @@ mod tests {
         let decoded = codec.decode(&message.encode_to_vec()).unwrap();
         match decoded {
             InboundFrame::ClusterConfig(config) => {
-                assert_eq!(config.acked_peer_cluster_config, true);
+                assert!(config.acked_peer_cluster_config);
                 assert_eq!(config.supported_compression, vec![proto::Compression::Zstd as i32]);
                 assert!(config.supports_reliable_delivery);
                 assert!(config.supports_change_dag);

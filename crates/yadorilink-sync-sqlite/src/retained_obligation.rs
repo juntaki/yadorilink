@@ -533,7 +533,7 @@ fn decode_row(row: RawRow) -> Result<RetainedObligation, SyncSqliteError> {
         updated_at_unix_nanos,
     ) = row;
 
-    let state = ObligationState::from_str(&state)?;
+    let state = ObligationState::parse(&state)?;
     let last_captured_change_hash = last_captured_change_hash
         .map(|bytes| hash_from_blob(&retained_id, "last_captured_change_hash", bytes))
         .transpose()?;

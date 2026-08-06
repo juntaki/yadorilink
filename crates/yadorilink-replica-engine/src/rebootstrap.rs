@@ -21,7 +21,9 @@ use std::collections::HashSet;
 
 use ed25519_dalek::SigningKey;
 
-use crate::compaction::{Checkpoint, CompactionStore};
+#[cfg(test)]
+use crate::compaction::Checkpoint;
+use crate::compaction::CompactionStore;
 use crate::error::ReplicaEngineError;
 use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId};
 

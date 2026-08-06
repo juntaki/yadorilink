@@ -1633,7 +1633,11 @@ async fn restore_to_version_inner(
                 }
                 #[cfg(windows)]
                 {
-                    if state.replica_coordinator.windows_symlink_opt_in_for_group(group_id)? {
+                    if state
+                        .replica_coordinator
+                        .link_repository()
+                        .windows_symlink_opt_in_for_group(group_id)?
+                    {
                         yadorilink_local_storage::materialize_symlink_windows(&out_path, target)?;
                     }
                 }

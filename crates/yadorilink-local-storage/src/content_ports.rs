@@ -193,7 +193,7 @@ mod tests {
         let content: Arc<dyn BlockContentStore> = Arc::new(FsBlockStore::new(dir.path()).unwrap());
         let hash = content.put(b"port coercion proof").unwrap();
         assert_eq!(content.get(&hash).unwrap(), b"port coercion proof");
-        assert_eq!(content.present_blocks(&[hash.clone()]).unwrap(), vec![true]);
+        assert_eq!(content.present_blocks(std::slice::from_ref(&hash)).unwrap(), vec![true]);
 
         let reclamation: Arc<dyn BlockReclamationStore> =
             Arc::new(FsBlockStore::new(dir.path()).unwrap());

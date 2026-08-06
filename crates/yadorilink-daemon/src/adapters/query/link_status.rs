@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 #[cfg(windows)]
 use yadorilink_replica_domain::file::RecordKind;
+#[cfg(windows)]
+use yadorilink_sync_sqlite::MaterializationStatePort;
 
 use crate::daemon_state::DaemonState;
 use crate::queries::link_status::{

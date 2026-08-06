@@ -242,7 +242,7 @@ async fn device_remove_while_peer_offline_is_reflected_on_its_next_subscribe() {
          session to the removed device"
     );
     assert!(
-        !daemon_a.state.peers.reachability(device_b_id).is_some(),
+        daemon_a.state.peers.reachability(device_b_id).is_none(),
         "a removed device must never even appear as connecting/connected in peer status"
     );
 }

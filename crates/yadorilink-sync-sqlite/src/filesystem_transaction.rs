@@ -649,11 +649,11 @@ pub fn begin_transaction_unchecked(
             transaction_id,
             new.group_id,
             new.source_path,
-            new.kind.as_db_str(),
-            new.cause.as_db_str(),
+            new.kind.db_str(),
+            new.cause.db_str(),
             new.trigger_change_hash.map(|h| &h.0[..]),
             &new.desired_frontier_hash[..],
-            TransactionPhase::Planning.as_db_str(),
+            TransactionPhase::Planning.db_str(),
             now_unix_nanos,
         ],
     )?;
@@ -814,7 +814,7 @@ pub fn list_incomplete_transactions(
          FROM filesystem_transactions WHERE phase != ?1 ORDER BY transaction_id",
     )?;
     let rows = stmt
-        .query_map([TransactionPhase::Completed.as_db_str()], |r| {
+        .query_map([TransactionPhase::Completed.db_str()], |r| {
             Ok((
                 r.get(0)?,
                 r.get(1)?,
@@ -1230,12 +1230,12 @@ pub fn set_transaction_phase_unchecked(
              updated_at_unix_nanos = ?3 WHERE transaction_id = ?4 AND execution_generation = ?5 \
              AND phase = ?6 AND epoch_watermark = ?7",
             rusqlite::params![
-                to.as_db_str(),
+                to.db_str(),
                 blocked_reason,
                 now_unix_nanos,
                 transaction_id,
                 expected_execution_generation,
-                record.phase.as_db_str(),
+                record.phase.db_str(),
                 record.epoch_watermark,
             ],
         )?
@@ -1245,12 +1245,12 @@ pub fn set_transaction_phase_unchecked(
              updated_at_unix_nanos = ?3 WHERE transaction_id = ?4 AND execution_generation = ?5 \
              AND phase = ?6",
             rusqlite::params![
-                to.as_db_str(),
+                to.db_str(),
                 blocked_reason,
                 now_unix_nanos,
                 transaction_id,
                 expected_execution_generation,
-                record.phase.as_db_str(),
+                record.phase.db_str(),
             ],
         )?
     };
@@ -1271,8 +1271,8 @@ pub fn set_transaction_phase_unchecked(
         if current.phase != record.phase {
             return Err(SyncSqliteError::TransitionRaced {
                 subject: format!("filesystem transaction {transaction_id}"),
-                expected_state: record.phase.as_db_str().to_string(),
-                current_state: current.phase.as_db_str().to_string(),
+                expected_state: record.phase.db_str().to_string(),
+                current_state: current.phase.db_str().to_string(),
             });
         }
         if to == TransactionPhase::Completed && current.epoch_watermark != record.epoch_watermark {
@@ -1305,12 +1305,12 @@ pub fn set_transaction_phase_unchecked(
 // crate to own the type, which it no longer does) so the exact
 // `Result<_, SyncSqliteError>` corrupt-row error path is unchanged.
 trait EpochStateDbCodec {
-    fn as_db_str(self) -> &'static str;
+    fn db_str(self) -> &'static str;
     fn from_db_str(value: &str) -> Result<EpochState, SyncSqliteError>;
 }
 
 impl EpochStateDbCodec for EpochState {
-    fn as_db_str(self) -> &'static str {
+    fn db_str(self) -> &'static str {
         match self {
             EpochState::Allocated => "allocated",
             EpochState::Preparing => "preparing",
@@ -1370,12 +1370,12 @@ impl EpochStateDbCodec for EpochState {
 // alongside `EpochState` (Phase 7D-9D) -- see that module's own doc. Same
 // local-trait codec pattern as `EpochStateDbCodec` above.
 trait PlacementRoleDbCodec {
-    fn as_db_str(self) -> &'static str;
+    fn db_str(self) -> &'static str;
     fn from_db_str(value: &str) -> Result<PlacementRole, SyncSqliteError>;
 }
 
 impl PlacementRoleDbCodec for PlacementRole {
-    fn as_db_str(self) -> &'static str {
+    fn db_str(self) -> &'static str {
         match self {
             PlacementRole::CanonicalPath => "canonical_path",
             PlacementRole::ConflictCopy => "conflict_copy",
@@ -1882,8 +1882,8 @@ pub fn insert_epoch_row_unchecked(
             new.epoch,
             new.plan_revision,
             new.target_path,
-            new.placement_role.as_db_str(),
-            EpochState::Allocated.as_db_str(),
+            new.placement_role.db_str(),
+            EpochState::Allocated.db_str(),
             new.target_generation,
             parent_directory_identity_blob,
             new.capability_snapshot,
@@ -2243,7 +2243,7 @@ pub fn transition_epoch_unchecked(
                       WHERE transaction_id = ?13) \
            AND phase = ?16",
         rusqlite::params![
-            to.as_db_str(),
+            to.db_str(),
             update.displaced_generation_id.map(|g| g.0.clone()),
             update.displaced_snapshot,
             update.stage_path,
@@ -2258,7 +2258,7 @@ pub fn transition_epoch_unchecked(
             transaction_id,
             epoch,
             expected_execution_generation,
-            current.phase.as_db_str(),
+            current.phase.db_str(),
         ],
     )?;
     if rows_changed == 0 {
@@ -2278,8 +2278,8 @@ pub fn transition_epoch_unchecked(
         if current_epoch.phase != current.phase {
             return Err(SyncSqliteError::TransitionRaced {
                 subject: format!("epoch {transaction_id}/{epoch}"),
-                expected_state: current.phase.as_db_str().to_string(),
-                current_state: current_epoch.phase.as_db_str().to_string(),
+                expected_state: current.phase.db_str().to_string(),
+                current_state: current_epoch.phase.db_str().to_string(),
             });
         }
         return Err(SyncSqliteError::ExecutionGenerationFenced {
@@ -2301,12 +2301,12 @@ pub fn transition_epoch_unchecked(
 // alongside `EpochState`/`PlacementRole` (Phase 7D-9D) -- see that module's
 // own doc. Same local-trait codec pattern as `EpochStateDbCodec` above.
 trait ReservationScopeDbCodec {
-    fn as_db_str(self) -> &'static str;
+    fn db_str(self) -> &'static str;
     fn from_db_str(value: &str) -> Result<ReservationScope, SyncSqliteError>;
 }
 
 impl ReservationScopeDbCodec for ReservationScope {
-    fn as_db_str(self) -> &'static str {
+    fn db_str(self) -> &'static str {
         match self {
             ReservationScope::Exact => "exact",
             ReservationScope::SubtreeIntent => "subtree_intent",
@@ -2327,12 +2327,12 @@ impl ReservationScopeDbCodec for ReservationScope {
 }
 
 trait ReservationRoleDbCodec {
-    fn as_db_str(self) -> &'static str;
+    fn db_str(self) -> &'static str;
     fn from_db_str(value: &str) -> Result<ReservationRole, SyncSqliteError>;
 }
 
 impl ReservationRoleDbCodec for ReservationRole {
-    fn as_db_str(self) -> &'static str {
+    fn db_str(self) -> &'static str {
         match self {
             ReservationRole::CanonicalPath => "canonical_path",
             ReservationRole::ConflictCopy => "conflict_copy",
@@ -2692,11 +2692,11 @@ pub fn acquire_reservations_in_open_transaction(
                 reservation_id,
                 request.group_id,
                 request.transaction_id,
-                request.scope.as_db_str(),
+                request.scope.db_str(),
                 request.path,
                 start,
                 end,
-                request.role.as_db_str(),
+                request.role.db_str(),
                 now_unix_nanos,
             ],
         )?;
@@ -3409,8 +3409,8 @@ mod tests {
                     1_i64,
                     0_i64,
                     "b.txt",
-                    PlacementRole::CanonicalPath.as_db_str(),
-                    EpochState::Allocated.as_db_str(),
+                    PlacementRole::CanonicalPath.db_str(),
+                    EpochState::Allocated.db_str(),
                     b"opaque".to_vec(),
                     encode_directory_identity(&sample_directory_identity()),
                     b"opaque".to_vec(),
@@ -4386,10 +4386,10 @@ mod tests {
                 "UPDATE filesystem_transaction_epochs SET phase = ?1, updated_at_unix_nanos = ?2 \
                  WHERE transaction_id = ?3 AND epoch = 0 AND phase = ?4",
                 rusqlite::params![
-                    EpochState::RequiresPhysicalRecovery.as_db_str(),
+                    EpochState::RequiresPhysicalRecovery.db_str(),
                     6i64,
                     &transaction_id,
-                    EpochState::Committing.as_db_str(),
+                    EpochState::Committing.db_str(),
                 ],
             )
             .unwrap();
@@ -4426,8 +4426,8 @@ mod tests {
         );
         if let Err(SyncSqliteError::TransitionRaced { expected_state, current_state, .. }) = &result
         {
-            assert_eq!(expected_state, EpochState::Committing.as_db_str());
-            assert_eq!(current_state, EpochState::RequiresPhysicalRecovery.as_db_str());
+            assert_eq!(expected_state, EpochState::Committing.db_str());
+            assert_eq!(current_state, EpochState::RequiresPhysicalRecovery.db_str());
         }
 
         let final_conn = open_file_backed(&db_path);
@@ -4473,10 +4473,10 @@ mod tests {
                 "UPDATE filesystem_transactions SET phase = ?1, updated_at_unix_nanos = ?2 \
                  WHERE transaction_id = ?3 AND phase = ?4",
                 rusqlite::params![
-                    TransactionPhase::Planning.as_db_str(),
+                    TransactionPhase::Planning.db_str(),
                     2i64,
                     &transaction_id,
-                    TransactionPhase::Committing.as_db_str(),
+                    TransactionPhase::Committing.db_str(),
                 ],
             )
             .unwrap();
