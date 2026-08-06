@@ -57,7 +57,7 @@ pub(crate) enum StableDiagnosisOutcome {
         /// never re-read from a later, separate `inventory()`/snapshot
         /// call, so this can never describe a different point in time
         /// than `diagnosis` itself does.
-        operation: RecoveryOperationSummary,
+        operation: Box<RecoveryOperationSummary>,
         diagnosis: RecoveryDiagnosis,
         local_revision: RecoverySnapshotRevision,
     },
@@ -195,7 +195,11 @@ where
         }
     };
 
-    Ok(StableDiagnosisOutcome::Diagnosed { operation, diagnosis, local_revision: before_revision })
+    Ok(StableDiagnosisOutcome::Diagnosed {
+        operation: Box::new(operation),
+        diagnosis,
+        local_revision: before_revision,
+    })
 }
 
 #[cfg(test)]

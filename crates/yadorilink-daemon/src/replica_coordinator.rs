@@ -100,7 +100,7 @@ use yadorilink_root_authority::root_identity::RootVerificationStatePort;
 use yadorilink_sqlite_runtime::SyncDatabase;
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
-type LocalChangeAuthProvider =
+pub(crate) type LocalChangeAuthProvider =
     dyn Fn(&str) -> Result<ChangeAuth, PolicyUnavailable> + Send + Sync + 'static;
 /// Local copy of what was `yadorilink_sync_core::index::RepairElectionProvider`
 /// -- a plain type alias with no logic of its own (see that module's

@@ -1013,7 +1013,7 @@ impl DaemonState {
         {
             let weak_state = Arc::downgrade(&state);
             let local_change_auth_provider: Arc<
-                dyn Fn(&str) -> Result<ChangeAuth, PolicyUnavailable> + Send + Sync + 'static,
+                crate::replica_coordinator::LocalChangeAuthProvider,
             > = Arc::new(move |group_id| {
                 let Some(state) = weak_state.upgrade() else {
                     // The daemon is being torn down. Report the policy as
@@ -1051,86 +1051,77 @@ impl DaemonState {
         }
         {
             let weak_state = Arc::downgrade(&state);
-            let repair_election_provider: Arc<
-                dyn Fn(
-                        &str,
-                        yadorilink_replica_engine::repair_election::RepairObligationId,
-                    ) -> Result<
-                        yadorilink_replica_engine::repair_election::RepairElectionContext,
-                        PolicyUnavailable,
-                    > + Send
-                    + Sync
-                    + 'static,
-            > = Arc::new(move |group_id, obligation| {
-                let Some(state) = weak_state.upgrade() else {
-                    return Err(PolicyUnavailable);
-                };
-                let Some(signing_key) = state.device_signing_key() else {
-                    return Err(PolicyUnavailable);
-                };
-                let local_fingerprint: [u8; 32] =
-                    sha2::Sha256::digest(signing_key.verifying_key().as_bytes()).into();
-                let netmap_writers = |state: &DaemonState| {
-                    let metadata =
-                        state.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
-                    let mut writers: Vec<AuthorizedWriter> = metadata
-                        .writers
-                        .iter()
-                        .filter(|(_, writer_group)| writer_group == group_id)
-                        .filter_map(|(device_id, _)| {
-                            metadata.signing_keys.get(device_id).map(|key| AuthorizedWriter {
-                                device_id: device_id.clone(),
-                                signing_key_fingerprint: sha2::Sha256::digest(key).into(),
+            let repair_election_provider: Arc<crate::replica_coordinator::RepairElectionProvider> =
+                Arc::new(move |group_id, obligation| {
+                    let Some(state) = weak_state.upgrade() else {
+                        return Err(PolicyUnavailable);
+                    };
+                    let Some(signing_key) = state.device_signing_key() else {
+                        return Err(PolicyUnavailable);
+                    };
+                    let local_fingerprint: [u8; 32] =
+                        sha2::Sha256::digest(signing_key.verifying_key().as_bytes()).into();
+                    let netmap_writers = |state: &DaemonState| {
+                        let metadata =
+                            state.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut writers: Vec<AuthorizedWriter> = metadata
+                            .writers
+                            .iter()
+                            .filter(|(_, writer_group)| writer_group == group_id)
+                            .filter_map(|(device_id, _)| {
+                                metadata.signing_keys.get(device_id).map(|key| AuthorizedWriter {
+                                    device_id: device_id.clone(),
+                                    signing_key_fingerprint: sha2::Sha256::digest(key).into(),
+                                })
                             })
-                        })
-                        .collect();
-                    writers.retain(|writer| writer.device_id != state.device_id);
-                    writers.push(AuthorizedWriter {
-                        device_id: state.device_id.clone(),
-                        signing_key_fingerprint: local_fingerprint,
-                    });
-                    writers.sort();
-                    writers
-                };
-                let (auth, writers) = match state.resolve_group_policy(group_id) {
-                    GroupPolicyResolution::Verified(policy) => {
-                        let writers = policy.current_writers();
-                        if writers.is_empty() {
-                            // A verified policy whose Grant chain names NO
-                            // writers is the bootstrap regime with a signed
-                            // (empty) log: the same regime in which ordinary
-                            // emission is still authorized. Taking it
-                            // literally here would rank NOBODY — every
-                            // replica computes `local_rank = None`, the
-                            // deterministic failover never unlocks for any
-                            // device, and the liveness guarantee this
-                            // election exists to provide (issue #24) silently
-                            // dies group-wide (measured: row14's six devices
-                            // each logging AwaitingFailover forever while a
-                            // six-head frontier never merges). Fall back to
-                            // the same netmap-derived writer set the
-                            // no-policy bootstrap arm uses; the strict
-                            // grant/fingerprint binding still applies
-                            // whenever the chain names any writer at all.
-                            (policy.change_auth(), netmap_writers(&state))
-                        } else {
-                            (policy.change_auth(), writers)
+                            .collect();
+                        writers.retain(|writer| writer.device_id != state.device_id);
+                        writers.push(AuthorizedWriter {
+                            device_id: state.device_id.clone(),
+                            signing_key_fingerprint: local_fingerprint,
+                        });
+                        writers.sort();
+                        writers
+                    };
+                    let (auth, writers) = match state.resolve_group_policy(group_id) {
+                        GroupPolicyResolution::Verified(policy) => {
+                            let writers = policy.current_writers();
+                            if writers.is_empty() {
+                                // A verified policy whose Grant chain names NO
+                                // writers is the bootstrap regime with a signed
+                                // (empty) log: the same regime in which ordinary
+                                // emission is still authorized. Taking it
+                                // literally here would rank NOBODY — every
+                                // replica computes `local_rank = None`, the
+                                // deterministic failover never unlocks for any
+                                // device, and the liveness guarantee this
+                                // election exists to provide (issue #24) silently
+                                // dies group-wide (measured: row14's six devices
+                                // each logging AwaitingFailover forever while a
+                                // six-head frontier never merges). Fall back to
+                                // the same netmap-derived writer set the
+                                // no-policy bootstrap arm uses; the strict
+                                // grant/fingerprint binding still applies
+                                // whenever the chain names any writer at all.
+                                (policy.change_auth(), netmap_writers(&state))
+                            } else {
+                                (policy.change_auth(), writers)
+                            }
                         }
-                    }
-                    GroupPolicyResolution::Bootstrap => {
-                        (ChangeAuth::PLACEHOLDER, netmap_writers(&state))
-                    }
-                    GroupPolicyResolution::Withhold => return Err(PolicyUnavailable),
-                };
-                RepairElectionContext::new(
-                    auth,
-                    obligation,
-                    writers,
-                    state.device_id.clone(),
-                    local_fingerprint,
-                )
-                .map_err(|_| PolicyUnavailable)
-            });
+                        GroupPolicyResolution::Bootstrap => {
+                            (ChangeAuth::PLACEHOLDER, netmap_writers(&state))
+                        }
+                        GroupPolicyResolution::Withhold => return Err(PolicyUnavailable),
+                    };
+                    RepairElectionContext::new(
+                        auth,
+                        obligation,
+                        writers,
+                        state.device_id.clone(),
+                        local_fingerprint,
+                    )
+                    .map_err(|_| PolicyUnavailable)
+                });
             // Same reasoning as `local_change_auth_provider` above: real
             // local edits (and the repair-election path that resolves
             // through it) run through `replica_coordinator` exclusively.

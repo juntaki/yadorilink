@@ -19,7 +19,8 @@
 //! The public entry points are [`diagnose_enrollment`]/
 //! [`diagnose_membership`]/[`diagnose_role_loss`] -- each takes only local
 //! + remote evidence and builds the B1 qualification internally, so a
-//! caller can never combine a qualification built from one evidence pair
+//!
+//! A caller can never combine a qualification built from one evidence pair
 //! with a diagnosis for a different one.
 //!
 //! - **C2-C1** (`service`): assembles a single STABLE diagnosis for one
