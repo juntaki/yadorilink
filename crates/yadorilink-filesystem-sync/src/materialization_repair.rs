@@ -426,17 +426,17 @@ fn repair_interrupted_materializations_inner(
             // a non-faulting read. Only a genuinely-missing block (the `else`
             // arm) is an unavoidable placeholder.
             let target_hash = intent_target_hash(&record.blocks);
-            match reconstruct_file_journaled(
+            match reconstruct_file_journaled(JournaledReconstruction {
                 state,
                 store,
                 group_id,
-                &path,
-                &out_path,
-                &record.blocks,
-                record.mtime_unix_nanos,
-                &target_hash,
+                path: &path,
+                out_path: &out_path,
+                blocks: &record.blocks,
+                mtime_unix_nanos: record.mtime_unix_nanos,
+                target_version_hash: &target_hash,
                 permit,
-            ) {
+            }) {
                 Ok(()) => report.reconstructed.push(path),
                 Err(e) => {
                     tracing::warn!(
@@ -505,23 +505,31 @@ fn repair_interrupted_materializations_inner(
 /// exactly that basis, so a file it lists is left the way the live peer
 /// materialize path would have left it, permissions included, rather than
 /// being a second, weaker materialization implementation.
-fn reconstruct_file_journaled(
-    state: &dyn MaterializationExecutionPort,
-    store: &dyn BlockContentStore,
-    group_id: &str,
-    path: &str,
-    out_path: &Path,
-    blocks: &[yadorilink_replica_domain::file::BlockInfo],
+struct JournaledReconstruction<'a, 'permit> {
+    state: &'a dyn MaterializationExecutionPort,
+    store: &'a dyn BlockContentStore,
+    group_id: &'a str,
+    path: &'a str,
+    out_path: &'a Path,
+    blocks: &'a [yadorilink_replica_domain::file::BlockInfo],
     mtime_unix_nanos: i64,
-    target_version_hash: &[u8],
-    permit: &RootCommitPermit<'_>,
+    target_version_hash: &'a [u8],
+    permit: &'a RootCommitPermit<'permit>,
+}
+
+fn reconstruct_file_journaled(
+    request: JournaledReconstruction<'_, '_>,
 ) -> Result<(), MaterializationExecutionError> {
-    let guard =
-        state.open_materialization_intent_guard(group_id, path, target_version_hash, permit)?;
+    let guard = request.state.open_materialization_intent_guard(
+        request.group_id,
+        request.path,
+        request.target_version_hash,
+        request.permit,
+    )?;
     // On `Err` the `?` returns while `guard` is still live, so it drops without
     // clearing — the intent stays, and the next repair pass treats a resulting
     // missing file as a crash to recover, never as an offline delete.
-    reconstruct_file(store, out_path, blocks, mtime_unix_nanos)?;
+    reconstruct_file(request.store, request.out_path, request.blocks, request.mtime_unix_nanos)?;
     // Clear as soon as the rename is durable — BEFORE the exec-bit touch below,
     // never after. `apply_exec_bit` is a real `chmod` on POSIX, so clearing only
     // after it would leak the intent whenever reading or applying the bit
@@ -543,7 +551,10 @@ fn reconstruct_file_journaled(
     // above) is that a path it reports `reconstructed` was left exactly as
     // the live peer materialize path would have left it, exec bit included,
     // not merely "eventually correct once some other pass notices."
-    Ok(apply_exec_bit(out_path, state.get_exec_bit(group_id, path)?)?)
+    Ok(apply_exec_bit(
+        request.out_path,
+        request.state.get_exec_bit(request.group_id, request.path)?,
+    )?)
 }
 
 /// Wall-clock now in unix nanoseconds, for stamping an offline-delete tombstone

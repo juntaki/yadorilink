@@ -303,7 +303,7 @@ pub enum FilesystemTransactionKind {
 }
 
 impl FilesystemTransactionKind {
-    fn as_db_str(self) -> &'static str {
+    fn db_str(self) -> &'static str {
         match self {
             FilesystemTransactionKind::ObjectResolution => "object_resolution",
             FilesystemTransactionKind::SubtreeReplacement => "subtree_replacement",
@@ -334,7 +334,7 @@ pub enum TransactionCause {
 }
 
 impl TransactionCause {
-    fn as_db_str(self) -> &'static str {
+    fn db_str(self) -> &'static str {
         match self {
             TransactionCause::PeerProjection => "peer_projection",
             TransactionCause::Hydration => "hydration",
@@ -386,7 +386,7 @@ pub enum TransactionPhase {
 }
 
 impl TransactionPhase {
-    fn as_db_str(self) -> &'static str {
+    fn db_str(self) -> &'static str {
         match self {
             TransactionPhase::Planning => "planning",
             TransactionPhase::Committing => "committing",
@@ -1763,7 +1763,7 @@ pub fn bump_epoch_watermark_if_not_completed(
     let legal_phases: Vec<&'static str> = TransactionPhase::ALL
         .into_iter()
         .filter(|phase| phase.may_receive_new_epochs())
-        .map(TransactionPhase::as_db_str)
+        .map(TransactionPhase::db_str)
         .collect();
     // `by` and `transaction_id` occupy ?1 and ?2; the legal-phase list fills
     // ?3 onward, however many there turn out to be.
