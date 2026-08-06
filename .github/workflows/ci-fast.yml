@@ -3,9 +3,7 @@ name: CI fast
 on:
   push:
     branches: [main, "ci/private-pr-*"]
-    paths-ignore: ["docs/**"]
   pull_request:
-    paths-ignore: ["docs/**"]
 
 permissions:
   contents: read
