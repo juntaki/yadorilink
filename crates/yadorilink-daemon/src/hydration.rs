@@ -2235,7 +2235,10 @@ mod tests {
                 &permit,
             )
             .unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink("target.txt", root_dir.path().join("link.txt")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file("target.txt", root_dir.path().join("link.txt")).unwrap();
 
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
@@ -2772,6 +2775,7 @@ mod tests {
         (meta.ctime(), meta.ctime_nsec())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn hydration_commit_rejects_a_same_size_same_mtime_edit_ctime_permitting() {
         let (state, _store_dir) = test_state();
@@ -2788,7 +2792,6 @@ mod tests {
             .unwrap();
         let initial_identity = disk_identity(&out_path).unwrap();
         let original_mtime = std::fs::symlink_metadata(&out_path).unwrap().modified().unwrap();
-        #[cfg(unix)]
         let ctime_before = raw_ctime(&out_path);
 
         std::fs::write(&out_path, b"BBBB").unwrap();
@@ -2810,7 +2813,6 @@ mod tests {
         // pair -- comparing two `disk_identity()` calls here for the skip
         // condition would make it tautological with the assertion below and
         // silently stop testing anything the moment the fix regressed.
-        #[cfg(unix)]
         if raw_ctime(&out_path) == ctime_before {
             eprintln!(
                 "skipping: this filesystem's ctime granularity could not distinguish a \
@@ -2818,12 +2820,6 @@ mod tests {
             );
             return;
         }
-        #[cfg(not(unix))]
-        {
-            eprintln!("skipping: ctime is unix-only, this fix has no residual coverage here");
-            return;
-        }
-
         assert_eq!(
             hydration_commit_decision(
                 &state,

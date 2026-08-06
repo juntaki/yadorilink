@@ -435,6 +435,7 @@ mod windows_pipe_tests {
     };
     use yadorilink_local_storage::FsBlockStore;
     use yadorilink_replica_domain::file::FileRecord;
+    use yadorilink_sync_sqlite::materialization_state_port::MaterializationStatePort;
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -449,6 +450,7 @@ mod windows_pipe_tests {
         let sync_state =
             Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
         sync_state
+            .link_repository()
             .add_link(dir.path().join("photos").to_string_lossy().as_ref(), "group-1")
             .unwrap();
         std::fs::create_dir_all(dir.path().join("photos")).unwrap();
