@@ -1697,7 +1697,7 @@ mod migration_safety_tests {
     /// other device known to store everything, unlinking would leave the group
     /// with no complete copy, so the guard refuses fail-closed.
     #[tokio::test]
-    async fn last_full_replica_cannot_unlink() {
+    async fn control_socket_last_full_replica_cannot_unlink() {
         let state = test_state();
         state
             .replica_coordinator
