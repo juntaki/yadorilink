@@ -385,7 +385,7 @@ fn spawn_session_with_authenticator(
         Some(TEST_RESYNC_INTERVAL),
         true,
         change_authenticator,
-        None,
+        Some(AlwaysValidRootCommitAuthorityProvider::shared()),
     )
 }
 
@@ -557,7 +557,7 @@ fn spawn_session_configured(
         resync_interval,
         true,
         change_authenticator,
-        None,
+        Some(AlwaysValidRootCommitAuthorityProvider::shared()),
     )
 }
 
