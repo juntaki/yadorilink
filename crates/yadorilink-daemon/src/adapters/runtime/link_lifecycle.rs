@@ -129,6 +129,10 @@ impl DaemonLinkWatcherAdapter {
 }
 
 impl LinkWatcherPort for DaemonLinkWatcherAdapter {
+    fn is_ready(&self, local_path: &str) -> bool {
+        self.controller.is_ready(local_path)
+    }
+
     fn start<'a>(
         &'a self,
         local_path: &'a str,

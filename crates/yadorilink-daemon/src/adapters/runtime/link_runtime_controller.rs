@@ -65,6 +65,10 @@ impl LinkRuntimeController {
         Self { state }
     }
 
+    pub(crate) fn is_ready(&self, local_path: &str) -> bool {
+        self.state.links.runtime(local_path).is_some()
+    }
+
     pub fn start(&self, local_path: String, group_id: String) -> Result<(), DaemonError> {
         self.start_inner(local_path, group_id, Arc::new(RealFolderWatchSource), true)
     }
