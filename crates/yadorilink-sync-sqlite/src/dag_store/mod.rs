@@ -2736,8 +2736,10 @@ mod tests {
                 "device-A",
                 ChangeContent { ops: vec![create_op("a.txt")], versions: &[] },
                 None,
-                &em,
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+                yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
+                    emitter: &em,
+                    permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+                },
             )
             .unwrap();
 

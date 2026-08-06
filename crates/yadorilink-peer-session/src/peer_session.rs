@@ -9480,6 +9480,7 @@ mod eager_admission_tests {
 mod symlink_and_metadata_only_update_tests {
     use super::{
         materialize_symlink_at, try_apply_metadata_only_update, BlockInfo, FileRecord, RecordKind,
+        SymlinkMaterialization,
     };
     use crate::ports::PeerReplicaStatePort;
     use crate::test_support::FakeReplicaState;
@@ -10541,7 +10542,7 @@ mod dag_resolution_tests {
 /// arrival of its parent — in the SAME batch — both applies the parent and
 /// promotes the child, so both changes' paths must materialize in that one
 /// call rather than waiting for the periodic reprojection audit.
-
+///
 /// Deterministic regression coverage for the flush-before-reconcile guard on
 /// the DAG `ChangeBatch` admission/projection path — the counterpart to the
 /// wire-driven `tests/dst_peer_reconcile_race.rs`, but exercising
@@ -10564,7 +10565,7 @@ mod dag_resolution_tests {
 ///   ahead of the Absent (tombstone) resolution in `reconcile_group_paths`
 ///   can capture P's pending edit before the delete — without it, P is
 ///   silently deleted.
-
+///
 /// `ClusterConfig.supports_version_hash_exact` negotiation and the
 /// `holds_version_durably` responder behavior it exists to let a querier
 /// reason about — a peer's advertised capability must default to
@@ -10574,7 +10575,7 @@ mod dag_resolution_tests {
 /// stay exactly as strict as before: this capability bit only changes which
 /// peers a whole-group durability-handoff QUERIER trusts, never how the
 /// RESPONDER itself verifies a query.
-
+///
 /// The `HandoffLeaseRequest`/`HandoffLeaseGrant` peer-to-peer wire exchange:
 /// a real requester session talking to a real responder session over a live
 /// (loopback) `PeerChannel` pair, mirroring `yadorilink-daemon`'s own
@@ -11433,7 +11434,7 @@ mod rebootstrap_wire_tests {
 /// and requesting exactly those — so an announce carrying only already-known
 /// heads is observable proof the peer was never told about the edit,
 /// without depending on any live send/receive timing.
-
+///
 /// Convergence coverage for the single-authority property the DAG engine now
 /// holds outright: a concurrent edit resolves to the same winner regardless of
 /// arrival order, and the materialization-audit backstop keeps repairing
@@ -11441,7 +11442,7 @@ mod rebootstrap_wire_tests {
 /// and deterministic: the sessions run over a live-but-unreachable loopback
 /// channel and are driven by direct `handle_message` / `handle_change_batch`
 /// calls, never real datagram delivery, so nothing depends on network timing.
-
+///
 /// Admission-time enforcement that a change's pinned authorization coordinate
 /// is non-decreasing along causal order. Without it, a device revoked at
 /// policy seq N (still holding its signing key) could craft a new change,
@@ -11452,7 +11453,7 @@ mod rebootstrap_wire_tests {
 /// auth_seq)` at admission closes that: to be causally newer than its own
 /// revoke the attacker must build on post-revoke heads (which pin seq >= N),
 /// and the older stamp then loses to the parent floor.
-
+///
 #[cfg(all(test, unix))]
 mod disk_race_fingerprint_tests {
     use super::disk_race_fingerprint;

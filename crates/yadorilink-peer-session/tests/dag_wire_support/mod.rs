@@ -75,7 +75,7 @@ pub struct AlwaysValidRootCommitAuthorityProvider {
 }
 
 impl AlwaysValidRootCommitAuthorityProvider {
-    pub fn new() -> Arc<dyn RootCommitAuthorityProvider> {
+    pub fn shared() -> Arc<dyn RootCommitAuthorityProvider> {
         Arc::new(Self { lease: Arc::new(RootLease::for_tests()) })
     }
 }
@@ -203,8 +203,10 @@ impl DagProducer {
                     versions: std::slice::from_ref(&version),
                 },
                 None,
-                &self.emitter,
-                &RootCommitPermit::for_tests(),
+                yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
+                    emitter: &self.emitter,
+                    permit: &RootCommitPermit::for_tests(),
+                },
             )
             .expect("emit signed change and upsert index row");
         record
@@ -253,8 +255,10 @@ impl DagProducer {
                     versions: std::slice::from_ref(&version),
                 },
                 None,
-                &self.emitter,
-                &RootCommitPermit::for_tests(),
+                yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
+                    emitter: &self.emitter,
+                    permit: &RootCommitPermit::for_tests(),
+                },
             )
             .expect("emit signed change and upsert index row");
         (record, version)

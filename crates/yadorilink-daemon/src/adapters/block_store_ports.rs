@@ -98,7 +98,7 @@ mod tests {
             Arc::new(BlockStorePortsAdapter::new(store.clone()));
         let hash = content.put(b"adapter proof").unwrap();
         assert_eq!(content.get(&hash).unwrap(), b"adapter proof");
-        assert_eq!(content.present_blocks(&[hash.clone()]).unwrap(), vec![true]);
+        assert_eq!(content.present_blocks(std::slice::from_ref(&hash)).unwrap(), vec![true]);
 
         let reclamation: Arc<dyn BlockReclamationStore> =
             Arc::new(BlockStorePortsAdapter::new(store));

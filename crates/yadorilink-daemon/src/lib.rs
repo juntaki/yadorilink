@@ -6,7 +6,7 @@ pub mod app;
 pub mod application;
 pub mod change_auth;
 pub mod change_policy;
-pub(crate) mod commit_orchestration;
+pub mod commit_orchestration;
 pub mod connection_trace;
 pub mod control_context;
 pub mod control_socket;
@@ -74,4 +74,4 @@ pub mod update;
 pub mod update_ipc;
 #[cfg(windows)]
 pub mod windows_pipe_security;
-pub(crate) mod work_class_queue;
+pub mod work_class_queue;

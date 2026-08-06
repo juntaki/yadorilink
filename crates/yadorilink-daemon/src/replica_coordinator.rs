@@ -82,7 +82,6 @@ use crate::sync_runtime::path_locks::PathLockRegistry;
 use crate::sync_runtime::schema::{post_dag_schema, pre_dag_schema};
 use crate::sync_runtime::startup_readiness::StartupReadinessRegistry;
 use yadorilink_filesystem_sync::materialization_types::RestoreOperation;
-use yadorilink_local_capture::ports::LocalChangeEmission;
 use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PolicyUnavailable};
 use yadorilink_replica_domain::file::{FileRecord, FileVersion};
 use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId};
@@ -103,6 +102,12 @@ use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
 pub(crate) type LocalChangeAuthProvider =
     dyn Fn(&str) -> Result<ChangeAuth, PolicyUnavailable> + Send + Sync + 'static;
+
+#[derive(Clone, Copy)]
+pub struct ReplicaChangeEmission<'a, 'permit> {
+    pub emitter: &'a ChangeEmitter,
+    pub permit: &'a RootCommitPermit<'permit>,
+}
 /// Local copy of what was `yadorilink_sync_core::index::RepairElectionProvider`
 /// -- a plain type alias with no logic of its own (see that module's
 /// definition), so Phase 7D-10's final deletion pass redefines it here
@@ -523,7 +528,7 @@ impl ReplicaCoordinator {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         meta: Option<&LocalFileMetaColumns>,
-        emission: LocalChangeEmission<'_, '_>,
+        emission: ReplicaChangeEmission<'_, '_>,
     ) -> Result<ChangeHash, SyncError> {
         let auth = self.local_emission_auth(group_id)?;
         Ok(self.file_index_repository.upsert_file_emitting_change(
@@ -549,7 +554,7 @@ impl ReplicaCoordinator {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         metas: &[Option<LocalFileMetaColumns>],
-        emission: LocalChangeEmission<'_, '_>,
+        emission: ReplicaChangeEmission<'_, '_>,
     ) -> Result<Option<ChangeHash>, SyncError> {
         let auth = self.local_emission_auth(group_id)?;
         Ok(self.file_index_repository.upsert_files_batch_emitting_change(

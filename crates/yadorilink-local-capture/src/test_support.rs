@@ -79,15 +79,6 @@ impl TestReplica {
         })
     }
 
-    pub(crate) fn open(
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<Self, yadorilink_sqlite_runtime::DatabaseError> {
-        Ok(Self {
-            inner: Arc::new(ReplicaCoordinator::open(path)?),
-            local_change_auth_provider: Mutex::new(None),
-        })
-    }
-
     /// The wrapped `ReplicaCoordinator` directly -- for callers (e.g.
     /// `dag_import::ensure_initial_import`) that need a concrete
     /// `&ReplicaCoordinator` to satisfy a `yadorilink-daemon`-defined trait

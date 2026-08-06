@@ -148,7 +148,7 @@ async fn connect_sessions(
         None,
         PeerSyncSessionDeps {
             change_authenticator: authenticator.clone(),
-            root_commit_authority_provider: AlwaysValidRootCommitAuthorityProvider::new(),
+            root_commit_authority_provider: AlwaysValidRootCommitAuthorityProvider::shared(),
             ..PeerSyncSessionDeps::standalone()
         },
     );
@@ -163,7 +163,7 @@ async fn connect_sessions(
         None,
         PeerSyncSessionDeps {
             change_authenticator: authenticator.clone(),
-            root_commit_authority_provider: AlwaysValidRootCommitAuthorityProvider::new(),
+            root_commit_authority_provider: AlwaysValidRootCommitAuthorityProvider::shared(),
             ..PeerSyncSessionDeps::standalone()
         },
     );

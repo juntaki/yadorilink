@@ -1288,9 +1288,11 @@ mod tests {
         dispatch: Mutex<VecDeque<MembershipCommitOutcome>>,
         dispatch_calls: Mutex<u32>,
         query: Mutex<VecDeque<Result<MembershipOperationLookup, String>>>,
-        resolve_edge_result: Mutex<VecDeque<Result<Option<(String, String)>, String>>>,
+        resolve_edge_result: Mutex<ResolveEdgeResults>,
         audit_calls: Mutex<u32>,
     }
+
+    type ResolveEdgeResults = VecDeque<Result<Option<(String, String)>, String>>;
 
     impl FakeCoordination {
         fn configured() -> Self {

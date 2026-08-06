@@ -709,9 +709,9 @@ fn membership_op(
     target_device_ids: Vec<&str>,
     lease_ids: Vec<Option<&str>>,
     state: MembershipOperationState,
-    durability_scope: MembershipDurabilityScope,
-    latch_group_ids: Vec<&str>,
+    durability: (MembershipDurabilityScope, Vec<&str>),
 ) -> MembershipOperation {
+    let (durability_scope, latch_group_ids) = durability;
     MembershipOperation {
         operation_id: "op-1".to_string(),
         action,
@@ -785,8 +785,7 @@ fn membership_recovery_blocked_wins() {
             vec![],
             vec![],
             MembershipOperationState::RecoveryBlocked,
-            MembershipDurabilityScope::Known,
-            vec![],
+            (MembershipDurabilityScope::Known, vec![]),
         ),
         vec![],
     );
@@ -805,8 +804,7 @@ fn membership_prepared_record_not_found_retries() {
             vec![],
             vec![],
             MembershipOperationState::Prepared,
-            MembershipDurabilityScope::Known,
-            vec![],
+            (MembershipDurabilityScope::Known, vec![]),
         ),
         vec![],
     );
@@ -823,8 +821,7 @@ fn membership_local_settlement_pending_known_scope_completes_even_when_remote_un
         vec![],
         vec![],
         MembershipOperationState::LocalSettlementPending,
-        MembershipDurabilityScope::Known,
-        vec![],
+        (MembershipDurabilityScope::Known, vec![]),
     );
     let local = membership_evidence(operation, vec![]);
     let remote = RemoteEvidence::Unavailable { category: RemoteEvidenceErrorCategory::Network };
@@ -842,8 +839,7 @@ fn membership_local_settlement_pending_unknown_scope_waits_when_remote_unavailab
         vec![],
         vec![],
         MembershipOperationState::LocalSettlementPending,
-        MembershipDurabilityScope::Unknown,
-        vec![],
+        (MembershipDurabilityScope::Unknown, vec![]),
     );
     let local = membership_evidence(operation, vec![]);
     let remote = RemoteEvidence::Unavailable { category: RemoteEvidenceErrorCategory::Network };
@@ -861,8 +857,7 @@ fn membership_committed_remove_device_missing_affected_groups_is_manual() {
         vec![],
         vec![],
         MembershipOperationState::Prepared,
-        MembershipDurabilityScope::Unknown,
-        vec![],
+        (MembershipDurabilityScope::Unknown, vec![]),
     );
     let local = membership_evidence(operation.clone(), vec![]);
     let remote = membership_record_for(&operation, MembershipRemoteStatus::Committed, None);
@@ -880,8 +875,7 @@ fn membership_committed_revoke_with_empty_result_is_allowed() {
         vec![],
         vec![],
         MembershipOperationState::Prepared,
-        MembershipDurabilityScope::Known,
-        vec![],
+        (MembershipDurabilityScope::Known, vec![]),
     );
     let local = membership_evidence(operation.clone(), vec![]);
     let remote = membership_record_for(
@@ -902,8 +896,7 @@ fn membership_definitely_rejected_with_result_payload_is_manual() {
         vec![],
         vec![],
         MembershipOperationState::Prepared,
-        MembershipDurabilityScope::Known,
-        vec![],
+        (MembershipDurabilityScope::Known, vec![]),
     );
     let local = membership_evidence(operation.clone(), vec![]);
     let remote = membership_record_for(
@@ -925,8 +918,7 @@ fn membership_missing_latch_still_completes_local_settlement() {
         vec![],
         vec![],
         MembershipOperationState::LocalSettlementPending,
-        MembershipDurabilityScope::Known,
-        vec!["group-2"],
+        (MembershipDurabilityScope::Known, vec!["group-2"]),
     );
     let local = membership_evidence(operation, vec![]);
     let diagnosis = diagnose_membership(&local, &RemoteEvidence::RecordNotFound);
@@ -944,8 +936,7 @@ fn membership_completed_with_remote_committed_settles() {
         vec![],
         vec![],
         MembershipOperationState::Completed,
-        MembershipDurabilityScope::Known,
-        vec![],
+        (MembershipDurabilityScope::Known, vec![]),
     );
     let local = membership_evidence(operation.clone(), vec![]);
     let remote = membership_record_for(
@@ -966,8 +957,7 @@ fn membership_completed_with_remote_rejected_is_conflict() {
         vec![],
         vec![],
         MembershipOperationState::Completed,
-        MembershipDurabilityScope::Known,
-        vec![],
+        (MembershipDurabilityScope::Known, vec![]),
     );
     let local = membership_evidence(operation.clone(), vec![]);
     let remote =

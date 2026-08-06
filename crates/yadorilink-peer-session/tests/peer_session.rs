@@ -424,7 +424,7 @@ struct AlwaysValidRootCommitAuthorityProvider {
 }
 
 impl AlwaysValidRootCommitAuthorityProvider {
-    fn new() -> Arc<dyn RootCommitAuthorityProvider> {
+    fn shared() -> Arc<dyn RootCommitAuthorityProvider> {
         Arc::new(Self {
             lease: Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
         })
@@ -607,7 +607,7 @@ fn spawn_session_without_convergence_driver_with_root_authority(
         Some(TEST_RESYNC_INTERVAL),
         false,
         Arc::new(DerivedKeyAuthenticator),
-        Some(AlwaysValidRootCommitAuthorityProvider::new()),
+        Some(AlwaysValidRootCommitAuthorityProvider::shared()),
     )
 }
 
@@ -4081,8 +4081,10 @@ async fn eager_materialize_leaves_placeholder_when_peer_cannot_supply_a_block() 
                 versions: std::slice::from_ref(&absent_version),
             },
             None,
-            &device_a.emitter(),
-            &RootCommitPermit::for_tests(),
+            yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
+                emitter: &device_a.emitter(),
+                permit: &RootCommitPermit::for_tests(),
+            },
         )
         .unwrap();
     // Intentionally NOT `device_a.store.put(&content)` — the block is absent,
@@ -8040,7 +8042,6 @@ mod reconcile_group_paths_flush_tests {
         session: Arc<PeerSyncSession>,
         state: Arc<ReplicaCoordinator>,
         sync_root: PathBuf,
-        local_processor: Arc<LocalChangeProcessor>,
         /// Always wired in (see `setup`'s own doc comment): a test that never
         /// calls `flush.mark_pending` sees the exact same no-op behavior an
         /// absent handle used to produce, since `RecordingFlush` only ever
@@ -8124,15 +8125,7 @@ mod reconcile_group_paths_flush_tests {
             },
         );
 
-        Harness {
-            session,
-            state,
-            sync_root,
-            local_processor,
-            flush,
-            _root_dir: root_dir,
-            _store_dir: store_dir,
-        }
+        Harness { session, state, sync_root, flush, _root_dir: root_dir, _store_dir: store_dir }
     }
 
     fn conflict_copy_files(root: &Path) -> Vec<PathBuf> {

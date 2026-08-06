@@ -4021,7 +4021,7 @@ mod tests {
                 versions: &[version],
             },
             None,
-            yadorilink_local_capture::ports::LocalChangeEmission {
+            crate::replica_coordinator::ReplicaChangeEmission {
                 emitter: &emitter,
                 permit: &permit,
             },

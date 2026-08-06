@@ -1102,9 +1102,11 @@ mod tests {
     #[derive(Default)]
     struct FakeReadiness {
         full_replica: AtomicBool,
-        digest_and_peer: Mutex<VecDeque<Option<([u8; 32], Option<String>)>>>,
+        digest_and_peer: Mutex<DigestAndPeerResults>,
         lease: Mutex<VecDeque<Option<String>>>,
     }
+
+    type DigestAndPeerResults = VecDeque<Option<([u8; 32], Option<String>)>>;
 
     impl HandoffReadinessPort for FakeReadiness {
         fn is_local_full_replica(&self, _group_id: &str) -> bool {
