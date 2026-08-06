@@ -10401,7 +10401,7 @@ mod dag_resolution_tests {
 #[cfg(test)]
 mod handoff_lease_wire_tests {
     use super::{HandoffLeaseResponder, PeerHandoffLeaseGrant, PeerSyncSession, PeerSyncSessionOneTimeDeps};
-    
+
     use crate::test_support::FakeReplicaState;
     use std::collections::HashMap;
     use std::future::Future;
@@ -10691,7 +10691,7 @@ mod handoff_lease_wire_tests {
 #[cfg(test)]
 mod handoff_ticket_wire_tests {
     use super::{HandoffTicketResponder, PeerHandoffTicketGrant, PeerSyncSession, PeerSyncSessionOneTimeDeps};
-    
+
     use crate::test_support::FakeReplicaState;
     use std::collections::HashMap;
     use std::future::Future;
@@ -10983,7 +10983,7 @@ mod rebootstrap_wire_tests {
     use super::{PeerSyncSession, PeerSyncSessionOneTimeDeps, PreparedRebootstrap, RebootstrapHandler};
     use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId};
     use yadorilink_replica_domain::rebootstrap::Checkpoint;
-    
+
     use crate::test_support::FakeReplicaState;
     use yadorilink_replica_domain::rebootstrap::{RebootstrapRequired, SnapshotManifest};
 

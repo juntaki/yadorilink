@@ -13,7 +13,7 @@ digraph {
         splines="line",
         rankdir=LR,
 
-        fontname="Helvetica", 
+        fontname="Helvetica",
         fontsize="36",
     ];
 
