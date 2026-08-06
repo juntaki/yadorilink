@@ -105,762 +105,6 @@ production_callers = 4
 status = "migrated"
 
 [[method]]
-name = "scan_all_enrollment_operations"
-line = 2268
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "delete_role_loss_operation"
-line = 2992
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "increment_role_loss_operation_attempts"
-line = 3004
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "get_role_loss_operation"
-line = 3014
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "list_role_loss_operations_in_states"
-line = 3026
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "scan_all_role_loss_operations"
-line = 3047
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 0
-status = "migrated"
-
-[[method]]
-name = "try_insert_membership_operation"
-line = 3065
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "mark_membership_operation_state"
-line = 3098
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "delete_membership_operation"
-line = 3115
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "get_membership_operation"
-line = 3120
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "scan_membership_operations_in_states"
-line = 3131
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 0
-status = "migrated"
-
-[[method]]
-name = "scan_all_membership_operations"
-line = 3147
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 0
-status = "migrated"
-
-[[method]]
-name = "recovery_local_snapshot"
-line = 3175
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "scan_open_membership_operations"
-line = 3192
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "has_open_unknown_durability_scope_operation"
-line = 3202
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "has_recovery_blocked_membership_operation"
-line = 3214
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-# --- Second pass addendum: the two `impl SyncState` blocks OUTSIDE index.rs
-# the first pass flagged as a known scope gap (exit report S2/S5 item 1) ---
-# `crates/yadorilink-sync-core/src/index/rebootstrap_store/base.rs` (7
-# methods) and
-# `crates/yadorilink-sync-core/src/index/rebootstrap_store/retroactive_conflict_store.rs`
-# (1 method). Folded into this same ledger, same schema, so the gate's
-# `syncstate_production_methods` metric can eventually cover every
-# `SyncState` inherent method workspace-wide, not just `index.rs`'s own --
-# the gate script's `index_rs_production_lines` metric itself stays scoped to
-# `index.rs` alone (these two files are not `index.rs`), but the per-method
-# ledger below is now complete. None of the 8 were migrated this pass.
-#
-# The `base.rs` six-method group is a thin `self.database.read/write_immediate(
-# |conn| yadorilink_sync_sqlite::rebootstrap_store::<free fn>(conn, ...))`
-# wrapper layer (see that file's own module doc comment: the SQL/traversal
-# logic already moved to `yadorilink-sync-sqlite` in 7D-9D). Migrating any of
-# these six would mean exposing an accessor for the private `self.database:
-# Arc<SyncDatabase>` field (or a narrower `rebootstrap_store`-scoped
-# accessor) -- deferred to a future pass since `self.database` also backs
-# dozens of OTHER still-pending `index.rs` delegation methods not touched
-# this pass, and a single-purpose accessor for only these six would be a
-# narrower cut than the field's real shared usage.
-#
-# `install_rebootstrap_snapshot` is `composition`, not pure `delegation`: it
-# resolves `self.local_emission_auth(...)` (itself an in-crate composition
-# call) BEFORE opening the transaction, then passes the already-snapshotted
-# auth value into the moved module -- real per-call sequencing logic, not a
-# single forward.
-#
-# `repair_retroactive_conflict_copy_obligations` (the
-# `retroactive_conflict_store.rs` file's only method) is `business logic`:
-# election-context resolution, a live-auth re-check race guard taken twice
-# inside the same transaction, and multi-way outcome branching -- exactly the
-# kind of real per-call orchestration the ledger's existing single
-# `business logic` entry (`absent_gate_verdict`) also has, not a thin
-# forward.
-
-[[method]]
-name = "history_base"
-path = "index/rebootstrap_store/base.rs"
-line = 48
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 0
-status = "migrated"
-
-[[method]]
-name = "history_base_previous_checkpoint_hash"
-path = "index/rebootstrap_store/base.rs"
-line = 64
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "checkpoint_snapshot"
-path = "index/rebootstrap_store/base.rs"
-line = 77
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "compacted_parent_auth"
-path = "index/rebootstrap_store/base.rs"
-line = 103
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "build_compaction_snapshot"
-path = "index/rebootstrap_store/base.rs"
-line = 125
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 0
-status = "migrated"
-
-[[method]]
-name = "commit_compaction_snapshot"
-path = "index/rebootstrap_store/base.rs"
-line = 138
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 0
-status = "migrated"
-
-[[method]]
-name = "install_rebootstrap_snapshot"
-path = "index/rebootstrap_store/base.rs"
-line = 166
-visibility = "pub"
-category = "composition"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "pending"
-
-[[method]]
-name = "repair_retroactive_conflict_copy_obligations"
-path = "index/rebootstrap_store/retroactive_conflict_store.rs"
-line = 47
-visibility = "pub"
-category = "business logic"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 0
-status = "migrated"
-
-[[method]]
-name = "policy_watermark"
-line = 2497
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "upsert_policy_watermark"
-line = 2506
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "record_dirty_path"
-line = 2528
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 3
-status = "migrated"
-
-[[method]]
-name = "mark_dirty_path_attempt"
-line = 2545
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "clear_dirty_path"
-line = 2560
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "is_path_dirty"
-line = 2574
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 3
-status = "migrated"
-
-[[method]]
-name = "list_dirty_paths"
-line = 2581
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 2
-status = "migrated"
-
-[[method]]
-name = "record_restore_operation"
-line = 2587
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 0
-status = "migrated"
-
-[[method]]
-name = "record_restore_operation_emitting_change"
-line = 2595
-visibility = "pub"
-category = "composition"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "pending"
-
-[[method]]
-name = "mark_restore_disk_committed"
-line = 2607
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "list_restore_operations"
-line = 2613
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "commit_restore_operation"
-line = 2623
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 2
-status = "migrated"
-
-[[method]]
-name = "discard_restore_operation"
-line = 2630
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "expire_superseded_and_trashed_versions"
-line = 2653
-visibility = "pub"
-category = "composition"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "pending"
-
-[[method]]
-name = "enumerate_group_durability_roots"
-line = 2740
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "enumerate_group_durability_root_versions"
-line = 2766
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 0
-status = "migrated"
-
-[[method]]
-name = "record_handoff_lease"
-line = 2781
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "record_handoff_lease_atomic"
-line = 2862
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "set_handoff_lease_state"
-line = 2883
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "list_handoff_leases_for_group"
-line = 2896
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "recheck_digest_then_set_materialization_policy"
-line = 2903
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "recheck_digest_then_remove_link"
-line = 2920
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "insert_role_loss_operation"
-line = 2936
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "mark_role_loss_worker_committed"
-line = 2945
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "latch_group_durability_unknown"
-line = 2958
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "clear_group_durability_unknown"
-line = 2962
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "list_durability_unknown_latches"
-line = 2966
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "advance_role_loss_operation"
-line = 2974
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "mark_enrollment_operation_prepared"
-line = 2274
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "mark_enrollment_operation_state"
-line = 2287
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "increment_enrollment_operation_attempts"
-line = 2302
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "delete_enrollment_operation"
-line = 2310
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "settle_activated_enrollment"
-line = 2314
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "add_link_with_pending_enrollment_and_begin_setup"
-line = 2318
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "mark_enrollment_activation_pending"
-line = 2330
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "rollback_local_setup_to_cancel_pending"
-line = 2338
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "move_pending_enrollment_to_cancel_operation"
-line = 2353
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "list_versions"
-line = 2366
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 5
-status = "migrated"
-
-[[method]]
-name = "get_version"
-line = 2383
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "list_trashed"
-line = 2403
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "set_materialization_policy"
-line = 2407
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "windows_symlink_opt_in_for_group"
-line = 2415
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 2
-status = "migrated"
-
-[[method]]
-name = "set_windows_symlink_opt_in"
-line = 2419
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "set_max_local_size_bytes"
-line = 2427
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "set_paused"
-line = 2435
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "suppress_tombstones_for_group"
-line = 2439
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 2
-status = "migrated"
-
-[[method]]
-name = "set_suppress_tombstones"
-line = 2443
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 2
-status = "migrated"
-
-[[method]]
-name = "arm_duplicate_recovery_paths"
-line = 2451
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "resolve_duplicate_recovery_path"
-line = 2455
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "duplicate_recovery_pending"
-line = 2463
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "ensure_unambiguous_group"
-line = 2467
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 2
-status = "migrated"
-
-[[method]]
-name = "live_link_paths_for_group"
-line = 2471
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "live_link_local_path_for_group"
-line = 2475
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "link_gate_for_group"
-line = 2482
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 3
-status = "migrated"
-
-[[method]]
-name = "is_paused_for_group"
-line = 2486
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 0
-status = "migrated"
-
-[[method]]
 name = "begin_group_startup"
 line = 428
 visibility = "pub"
@@ -998,6 +242,258 @@ status = "migrated"
 [[method]]
 name = "has_materialization_intent"
 line = 781
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 3
+status = "migrated"
+
+[[method]]
+name = "append_initial_import"
+line = 805
+visibility = "pub"
+category = "composition"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 0
+status = "pending"
+
+[[method]]
+name = "dag_group_heads"
+line = 832
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 4
+status = "migrated"
+
+[[method]]
+name = "dag_last_authored_change_for_path"
+line = 846
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 0
+status = "migrated"
+
+[[method]]
+name = "dag_group_history_paths"
+line = 856
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "append_history_backfill"
+line = 866
+visibility = "pub"
+category = "composition"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "pending"
+
+[[method]]
+name = "dag_list_unapplied_changes"
+line = 882
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "dag_has_change"
+line = 887
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 2
+status = "migrated"
+
+[[method]]
+name = "dag_has_change_or_pruned"
+line = 891
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 2
+status = "migrated"
+
+[[method]]
+name = "dag_compare_authoring"
+line = 903
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "current_authoring_relation"
+line = 914
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "dag_has_change_or_buffered_orphan"
+line = 925
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "dag_missing_ancestor_frontier"
+line = 934
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 2
+status = "migrated"
+
+[[method]]
+name = "dag_group_diagnostics"
+line = 945
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "dag_describe_hash"
+line = 954
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "dag_list_group_changes"
+line = 963
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "dag_get_change"
+line = 968
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 4
+status = "migrated"
+
+[[method]]
+name = "dag_get_encoded"
+line = 974
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "dag_put_file_version"
+line = 981
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 0
+status = "migrated"
+
+[[method]]
+name = "dag_has_file_version"
+line = 990
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 2
+status = "migrated"
+
+[[method]]
+name = "dag_get_file_version"
+line = 1000
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 2
+status = "migrated"
+
+[[method]]
+name = "dag_group_file_version_references_block"
+line = 1008
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 2
+status = "migrated"
+
+[[method]]
+name = "record_group_block_provenance"
+line = 1018
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 4
+status = "migrated"
+
+[[method]]
+name = "group_has_block_provenance"
+line = 1026
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 2
+status = "migrated"
+
+[[method]]
+name = "group_retained_version_references_block"
+line = 1039
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "dag_parents_of"
+line = 1049
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "dag_is_ancestor"
+line = 1054
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 2
+status = "migrated"
+
+[[method]]
+name = "dag_admit_change"
+line = 1066
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 0
+status = "migrated"
+
+[[method]]
+name = "dag_admit_change_with_versions"
+line = 1076
 visibility = "pub"
 category = "delegation"
 destination = ["yadorilink-sync-sqlite"]
@@ -1752,26 +1248,8 @@ production_callers = 1
 status = "migrated"
 
 [[method]]
-name = "append_initial_import"
-line = 805
-visibility = "pub"
-category = "composition"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 0
-status = "pending"
-
-[[method]]
-name = "dag_group_heads"
-line = 832
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 4
-status = "migrated"
-
-[[method]]
-name = "dag_last_authored_change_for_path"
-line = 846
+name = "scan_all_enrollment_operations"
+line = 2268
 visibility = "pub"
 category = "delegation"
 destination = ["yadorilink-sync-sqlite"]
@@ -1779,8 +1257,8 @@ production_callers = 0
 status = "migrated"
 
 [[method]]
-name = "dag_group_history_paths"
-line = 856
+name = "mark_enrollment_operation_prepared"
+line = 2274
 visibility = "pub"
 category = "delegation"
 destination = ["yadorilink-sync-sqlite"]
@@ -1788,17 +1266,8 @@ production_callers = 1
 status = "migrated"
 
 [[method]]
-name = "append_history_backfill"
-line = 866
-visibility = "pub"
-category = "composition"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "pending"
-
-[[method]]
-name = "dag_list_unapplied_changes"
-line = 882
+name = "mark_enrollment_operation_state"
+line = 2287
 visibility = "pub"
 category = "delegation"
 destination = ["yadorilink-sync-sqlite"]
@@ -1806,8 +1275,107 @@ production_callers = 1
 status = "migrated"
 
 [[method]]
-name = "dag_has_change"
-line = 887
+name = "increment_enrollment_operation_attempts"
+line = 2302
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "delete_enrollment_operation"
+line = 2310
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "settle_activated_enrollment"
+line = 2314
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "add_link_with_pending_enrollment_and_begin_setup"
+line = 2318
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "mark_enrollment_activation_pending"
+line = 2330
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "rollback_local_setup_to_cancel_pending"
+line = 2338
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "move_pending_enrollment_to_cancel_operation"
+line = 2353
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "list_versions"
+line = 2366
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 5
+status = "migrated"
+
+[[method]]
+name = "get_version"
+line = 2383
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "list_trashed"
+line = 2403
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "set_materialization_policy"
+line = 2407
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "windows_symlink_opt_in_for_group"
+line = 2415
 visibility = "pub"
 category = "delegation"
 destination = ["yadorilink-sync-sqlite"]
@@ -1815,8 +1383,35 @@ production_callers = 2
 status = "migrated"
 
 [[method]]
-name = "dag_has_change_or_pruned"
-line = 891
+name = "set_windows_symlink_opt_in"
+line = 2419
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "set_max_local_size_bytes"
+line = 2427
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "set_paused"
+line = 2435
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "suppress_tombstones_for_group"
+line = 2439
 visibility = "pub"
 category = "delegation"
 destination = ["yadorilink-sync-sqlite"]
@@ -1824,35 +1419,8 @@ production_callers = 2
 status = "migrated"
 
 [[method]]
-name = "dag_compare_authoring"
-line = 903
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "current_authoring_relation"
-line = 914
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "dag_has_change_or_buffered_orphan"
-line = 925
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "dag_missing_ancestor_frontier"
-line = 934
+name = "set_suppress_tombstones"
+line = 2443
 visibility = "pub"
 category = "delegation"
 destination = ["yadorilink-sync-sqlite"]
@@ -1860,8 +1428,8 @@ production_callers = 2
 status = "migrated"
 
 [[method]]
-name = "dag_group_diagnostics"
-line = 945
+name = "arm_duplicate_recovery_paths"
+line = 2451
 visibility = "pub"
 category = "delegation"
 destination = ["yadorilink-sync-sqlite"]
@@ -1869,8 +1437,8 @@ production_callers = 1
 status = "migrated"
 
 [[method]]
-name = "dag_describe_hash"
-line = 954
+name = "resolve_duplicate_recovery_path"
+line = 2455
 visibility = "pub"
 category = "delegation"
 destination = ["yadorilink-sync-sqlite"]
@@ -1878,8 +1446,8 @@ production_callers = 1
 status = "migrated"
 
 [[method]]
-name = "dag_list_group_changes"
-line = 963
+name = "duplicate_recovery_pending"
+line = 2463
 visibility = "pub"
 category = "delegation"
 destination = ["yadorilink-sync-sqlite"]
@@ -1887,35 +1455,8 @@ production_callers = 1
 status = "migrated"
 
 [[method]]
-name = "dag_get_change"
-line = 968
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 4
-status = "migrated"
-
-[[method]]
-name = "dag_get_encoded"
-line = 974
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 1
-status = "migrated"
-
-[[method]]
-name = "dag_put_file_version"
-line = 981
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 0
-status = "migrated"
-
-[[method]]
-name = "dag_has_file_version"
-line = 990
+name = "ensure_unambiguous_group"
+line = 2467
 visibility = "pub"
 category = "delegation"
 destination = ["yadorilink-sync-sqlite"]
@@ -1923,44 +1464,8 @@ production_callers = 2
 status = "migrated"
 
 [[method]]
-name = "dag_get_file_version"
-line = 1000
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 2
-status = "migrated"
-
-[[method]]
-name = "dag_group_file_version_references_block"
-line = 1008
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 2
-status = "migrated"
-
-[[method]]
-name = "record_group_block_provenance"
-line = 1018
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 4
-status = "migrated"
-
-[[method]]
-name = "group_has_block_provenance"
-line = 1026
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 2
-status = "migrated"
-
-[[method]]
-name = "group_retained_version_references_block"
-line = 1039
+name = "live_link_paths_for_group"
+line = 2471
 visibility = "pub"
 category = "delegation"
 destination = ["yadorilink-sync-sqlite"]
@@ -1968,8 +1473,8 @@ production_callers = 1
 status = "migrated"
 
 [[method]]
-name = "dag_parents_of"
-line = 1049
+name = "live_link_local_path_for_group"
+line = 2475
 visibility = "pub"
 category = "delegation"
 destination = ["yadorilink-sync-sqlite"]
@@ -1977,28 +1482,523 @@ production_callers = 1
 status = "migrated"
 
 [[method]]
-name = "dag_is_ancestor"
-line = 1054
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 2
-status = "migrated"
-
-[[method]]
-name = "dag_admit_change"
-line = 1066
-visibility = "pub"
-category = "delegation"
-destination = ["yadorilink-sync-sqlite"]
-production_callers = 0
-status = "migrated"
-
-[[method]]
-name = "dag_admit_change_with_versions"
-line = 1076
+name = "link_gate_for_group"
+line = 2482
 visibility = "pub"
 category = "delegation"
 destination = ["yadorilink-sync-sqlite"]
 production_callers = 3
 status = "migrated"
+
+[[method]]
+name = "is_paused_for_group"
+line = 2486
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 0
+status = "migrated"
+
+[[method]]
+name = "policy_watermark"
+line = 2497
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "upsert_policy_watermark"
+line = 2506
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "record_dirty_path"
+line = 2528
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 3
+status = "migrated"
+
+[[method]]
+name = "mark_dirty_path_attempt"
+line = 2545
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "clear_dirty_path"
+line = 2560
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "is_path_dirty"
+line = 2574
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 3
+status = "migrated"
+
+[[method]]
+name = "list_dirty_paths"
+line = 2581
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 2
+status = "migrated"
+
+[[method]]
+name = "record_restore_operation"
+line = 2587
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 0
+status = "migrated"
+
+[[method]]
+name = "record_restore_operation_emitting_change"
+line = 2595
+visibility = "pub"
+category = "composition"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "pending"
+
+[[method]]
+name = "mark_restore_disk_committed"
+line = 2607
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "list_restore_operations"
+line = 2613
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "commit_restore_operation"
+line = 2623
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 2
+status = "migrated"
+
+[[method]]
+name = "discard_restore_operation"
+line = 2630
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "expire_superseded_and_trashed_versions"
+line = 2653
+visibility = "pub"
+category = "composition"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "pending"
+
+[[method]]
+name = "enumerate_group_durability_roots"
+line = 2740
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "enumerate_group_durability_root_versions"
+line = 2766
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 0
+status = "migrated"
+
+[[method]]
+name = "record_handoff_lease"
+line = 2781
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "record_handoff_lease_atomic"
+line = 2862
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "set_handoff_lease_state"
+line = 2883
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "list_handoff_leases_for_group"
+line = 2896
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "recheck_digest_then_set_materialization_policy"
+line = 2903
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "recheck_digest_then_remove_link"
+line = 2920
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "insert_role_loss_operation"
+line = 2936
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "mark_role_loss_worker_committed"
+line = 2945
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "latch_group_durability_unknown"
+line = 2958
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "clear_group_durability_unknown"
+line = 2962
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "list_durability_unknown_latches"
+line = 2966
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "advance_role_loss_operation"
+line = 2974
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "delete_role_loss_operation"
+line = 2992
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "increment_role_loss_operation_attempts"
+line = 3004
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "get_role_loss_operation"
+line = 3014
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "list_role_loss_operations_in_states"
+line = 3026
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "scan_all_role_loss_operations"
+line = 3047
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 0
+status = "migrated"
+
+[[method]]
+name = "try_insert_membership_operation"
+line = 3065
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "mark_membership_operation_state"
+line = 3098
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "delete_membership_operation"
+line = 3115
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "get_membership_operation"
+line = 3120
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "scan_membership_operations_in_states"
+line = 3131
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 0
+status = "migrated"
+
+[[method]]
+name = "scan_all_membership_operations"
+line = 3147
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 0
+status = "migrated"
+
+[[method]]
+name = "recovery_local_snapshot"
+line = 3175
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "scan_open_membership_operations"
+line = 3192
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "has_open_unknown_durability_scope_operation"
+line = 3202
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "has_recovery_blocked_membership_operation"
+line = 3214
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+# --- Second pass addendum: the two `impl SyncState` blocks OUTSIDE index.rs
+# the first pass flagged as a known scope gap (exit report S2/S5 item 1) ---
+# `crates/yadorilink-sync-core/src/index/rebootstrap_store/base.rs` (7
+# methods) and
+# `crates/yadorilink-sync-core/src/index/rebootstrap_store/retroactive_conflict_store.rs`
+# (1 method). Folded into this same ledger, same schema, so the gate's
+# `syncstate_production_methods` metric can eventually cover every
+# `SyncState` inherent method workspace-wide, not just `index.rs`'s own --
+# the gate script's `index_rs_production_lines` metric itself stays scoped to
+# `index.rs` alone (these two files are not `index.rs`), but the per-method
+# ledger below is now complete. None of the 8 were migrated this pass.
+#
+# The `base.rs` six-method group is a thin `self.database.read/write_immediate(
+# |conn| yadorilink_sync_sqlite::rebootstrap_store::<free fn>(conn, ...))`
+# wrapper layer (see that file's own module doc comment: the SQL/traversal
+# logic already moved to `yadorilink-sync-sqlite` in 7D-9D). Migrating any of
+# these six would mean exposing an accessor for the private `self.database:
+# Arc<SyncDatabase>` field (or a narrower `rebootstrap_store`-scoped
+# accessor) -- deferred to a future pass since `self.database` also backs
+# dozens of OTHER still-pending `index.rs` delegation methods not touched
+# this pass, and a single-purpose accessor for only these six would be a
+# narrower cut than the field's real shared usage.
+#
+# `install_rebootstrap_snapshot` is `composition`, not pure `delegation`: it
+# resolves `self.local_emission_auth(...)` (itself an in-crate composition
+# call) BEFORE opening the transaction, then passes the already-snapshotted
+# auth value into the moved module -- real per-call sequencing logic, not a
+# single forward.
+#
+# `repair_retroactive_conflict_copy_obligations` (the
+# `retroactive_conflict_store.rs` file's only method) is `business logic`:
+# election-context resolution, a live-auth re-check race guard taken twice
+# inside the same transaction, and multi-way outcome branching -- exactly the
+# kind of real per-call orchestration the ledger's existing single
+# `business logic` entry (`absent_gate_verdict`) also has, not a thin
+# forward.
+
+[[method]]
+name = "history_base"
+path = "index/rebootstrap_store/base.rs"
+line = 48
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 0
+status = "migrated"
+
+[[method]]
+name = "history_base_previous_checkpoint_hash"
+path = "index/rebootstrap_store/base.rs"
+line = 64
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "checkpoint_snapshot"
+path = "index/rebootstrap_store/base.rs"
+line = 77
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "compacted_parent_auth"
+path = "index/rebootstrap_store/base.rs"
+line = 103
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
+
+[[method]]
+name = "build_compaction_snapshot"
+path = "index/rebootstrap_store/base.rs"
+line = 125
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 0
+status = "migrated"
+
+[[method]]
+name = "commit_compaction_snapshot"
+path = "index/rebootstrap_store/base.rs"
+line = 138
+visibility = "pub"
+category = "delegation"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 0
+status = "migrated"
+
+[[method]]
+name = "install_rebootstrap_snapshot"
+path = "index/rebootstrap_store/base.rs"
+line = 166
+visibility = "pub"
+category = "composition"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "pending"
+
+[[method]]
+name = "repair_retroactive_conflict_copy_obligations"
+path = "index/rebootstrap_store/retroactive_conflict_store.rs"
+line = 47
+visibility = "pub"
+category = "business logic"
+destination = ["yadorilink-sync-sqlite"]
+production_callers = 2
+status = "pending"
