@@ -14,6 +14,20 @@ use crate::error::StorageError;
 use crate::free_space::{self, VolumeFreeSpace};
 use crate::traits::{BlockStore, ContentHash, GcReport, StorageUsage};
 
+/// Single crate-wide boundary for removing a filesystem object. Block-store
+/// deletion and materialization cleanup both pass through here so audits see
+/// every physical removal at one capability seam.
+pub(crate) fn remove_path(path: &Path) -> std::io::Result<()> {
+    fs::remove_file(path)
+}
+
+/// Single crate-wide boundary for atomically replacing a filesystem path.
+/// Callers remain responsible for their operation-specific durability and
+/// containment checks.
+pub(crate) fn rename_path(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
 const GC_SWEEP_BATCH_SIZE: usize = 256;
 const GC_SWEEP_BATCH_DELAY: Duration = Duration::from_millis(1);
 
@@ -159,7 +173,7 @@ impl BlockCommitIo for StdBlockCommitIo {
     }
 
     fn remove_file(&self, path: &Path) -> Result<(), StorageError> {
-        fs::remove_file(path)?;
+        remove_path(path)?;
         Ok(())
     }
 
@@ -173,7 +187,7 @@ impl BlockCommitIo for StdBlockCommitIo {
         // A rename preserves the exact on-disk bytes and atomically clears the
         // live shard path, so the corrupt inode survives for analysis while
         // never masquerading as valid content on its content-addressed name.
-        fs::rename(source, dest)?;
+        rename_path(source, dest)?;
         Ok(())
     }
 }
