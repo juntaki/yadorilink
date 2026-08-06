@@ -39,12 +39,14 @@ impl RoleLossCoordination for HttpRoleLossCoordination {
             crate::coordination_client::commit_handoff_role_loss(
                 &config.addr,
                 &config.access_token,
-                group_id,
-                source_device_id,
-                target_device_id,
-                lease_id,
-                action,
-                operation_id,
+                crate::coordination_client::RoleLossCommitRequest {
+                    group_id,
+                    source_device_id,
+                    target_device_id,
+                    lease_id,
+                    action,
+                    operation_id,
+                },
             )
             .await
         })

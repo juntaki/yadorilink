@@ -213,12 +213,14 @@ impl MembershipCoordination for HttpMembershipCoordination {
                     match crate::coordination_client::commit_handoff_role_loss(
                         &config.addr,
                         &config.access_token,
-                        &command.group_ids[0],
-                        &command.removed_device_id,
-                        command.target_device_ids[0].as_str(),
-                        command.lease_ids[0].as_deref(),
-                        "revoke",
-                        operation_id,
+                        crate::coordination_client::RoleLossCommitRequest {
+                            group_id: &command.group_ids[0],
+                            source_device_id: &command.removed_device_id,
+                            target_device_id: command.target_device_ids[0].as_str(),
+                            lease_id: command.lease_ids[0].as_deref(),
+                            action: "revoke",
+                            operation_id,
+                        },
                     )
                     .await
                     {

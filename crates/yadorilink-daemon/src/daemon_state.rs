@@ -4021,8 +4021,10 @@ mod tests {
                 versions: &[version],
             },
             None,
-            &emitter,
-            &permit,
+            yadorilink_local_capture::ports::LocalChangeEmission {
+                emitter: &emitter,
+                permit: &permit,
+            },
         );
 
         // The fix: an already-linked group's policy merely being unresolved

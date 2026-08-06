@@ -1337,8 +1337,10 @@ mod tests {
                     versions: &[version],
                 },
                 None,
-                &emitter,
-                &permit,
+                yadorilink_local_capture::ports::LocalChangeEmission {
+                    emitter: &emitter,
+                    permit: &permit,
+                },
             )
             .expect(
                 "a local edit for a policy-verified group this device is a granted writer for \

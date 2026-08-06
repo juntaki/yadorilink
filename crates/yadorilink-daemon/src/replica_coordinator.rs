@@ -82,6 +82,7 @@ use crate::sync_runtime::path_locks::PathLockRegistry;
 use crate::sync_runtime::schema::{post_dag_schema, pre_dag_schema};
 use crate::sync_runtime::startup_readiness::StartupReadinessRegistry;
 use yadorilink_filesystem_sync::materialization_types::RestoreOperation;
+use yadorilink_local_capture::ports::LocalChangeEmission;
 use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PolicyUnavailable};
 use yadorilink_replica_domain::file::{FileRecord, FileVersion};
 use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId};
@@ -522,8 +523,7 @@ impl ReplicaCoordinator {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         meta: Option<&LocalFileMetaColumns>,
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
+        emission: LocalChangeEmission<'_, '_>,
     ) -> Result<ChangeHash, SyncError> {
         let auth = self.local_emission_auth(group_id)?;
         Ok(self.file_index_repository.upsert_file_emitting_change(
@@ -532,7 +532,11 @@ impl ReplicaCoordinator {
             origin_device_id,
             content,
             meta,
-            yadorilink_sync_sqlite::file_index::ChangeEmissionContext { emitter, permit, auth },
+            yadorilink_sync_sqlite::file_index::ChangeEmissionContext {
+                emitter: emission.emitter,
+                permit: emission.permit,
+                auth,
+            },
         )?)
     }
 
@@ -545,8 +549,7 @@ impl ReplicaCoordinator {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         metas: &[Option<LocalFileMetaColumns>],
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
+        emission: LocalChangeEmission<'_, '_>,
     ) -> Result<Option<ChangeHash>, SyncError> {
         let auth = self.local_emission_auth(group_id)?;
         Ok(self.file_index_repository.upsert_files_batch_emitting_change(
@@ -555,7 +558,11 @@ impl ReplicaCoordinator {
             origin_device_id,
             content,
             metas,
-            yadorilink_sync_sqlite::file_index::ChangeEmissionContext { emitter, permit, auth },
+            yadorilink_sync_sqlite::file_index::ChangeEmissionContext {
+                emitter: emission.emitter,
+                permit: emission.permit,
+                auth,
+            },
         )?)
     }
 
