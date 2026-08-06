@@ -8863,7 +8863,10 @@ mod version_hash_exact_capability_tests {
 
         // "evil_link" inside the sync root points OUTSIDE it -- this
         // device's own local state, not anything peer-controlled.
+        #[cfg(unix)]
         std::os::unix::fs::symlink(outside_dir.path(), sync_root.join("evil_link")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside_dir.path(), sync_root.join("evil_link")).unwrap();
 
         let content = b"attacker-controlled content";
         let hash = hex::decode(store.put(content).unwrap()).unwrap();
