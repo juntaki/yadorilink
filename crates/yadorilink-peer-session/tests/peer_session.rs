@@ -611,6 +611,34 @@ fn spawn_session_without_convergence_driver_with_root_authority(
     )
 }
 
+fn spawn_session_with_block_serve_engine(
+    channel: Arc<PeerChannel>,
+    device: &Device,
+    peer_device_id: &str,
+    block_serve_engine: Arc<yadorilink_peer_session::block_serve::BlockServeEngine>,
+) -> Arc<PeerSyncSession> {
+    let session = PeerSyncSession::new_with_dependencies(
+        channel,
+        device.device_id.clone(),
+        peer_device_id.to_owned(),
+        device.state.clone(),
+        device.store.clone(),
+        vec![GROUP.to_owned()],
+        device.sync_roots(),
+        None,
+        PeerSyncSessionDeps {
+            change_authenticator: Arc::new(DerivedKeyAuthenticator),
+            root_commit_authority_provider: AlwaysValidRootCommitAuthorityProvider::shared(),
+            block_serve_engine,
+            full_index_resync_interval: TEST_RESYNC_INTERVAL,
+            ..PeerSyncSessionDeps::standalone()
+        },
+    );
+    spawn_test_convergence_driver(&session, device.state.clone(), vec![GROUP.to_owned()]);
+    tokio::spawn(session.clone().run());
+    session
+}
+
 /// Shared spawn seam. `change_authenticator` defaults to
 /// `DerivedKeyAuthenticator` at every call site above except
 /// `spawn_session_with_authenticator`, which lets a test wire in a
@@ -894,6 +922,7 @@ async fn eager_peer_adoption_waits_for_block_deletion_gate_before_index_commit()
         None,
         PeerSyncSessionDeps {
             change_authenticator: auth.clone(),
+            root_commit_authority_provider: AlwaysValidRootCommitAuthorityProvider::shared(),
             block_write_activity_provider: Arc::new(BlockingActivityProvider {
                 attempted: attempted_tx,
                 release: release.clone(),
@@ -977,6 +1006,7 @@ async fn ondemand_peer_adoption_waits_for_block_deletion_gate_before_index_commi
         None,
         PeerSyncSessionDeps {
             change_authenticator: auth.clone(),
+            root_commit_authority_provider: AlwaysValidRootCommitAuthorityProvider::shared(),
             block_write_activity_provider: Arc::new(BlockingActivityProvider {
                 attempted: attempted_tx,
                 release: release.clone(),
@@ -3920,20 +3950,29 @@ async fn handle_block_reply_acquires_no_examination_dispatch_or_credit_permit() 
     let hash = seed_referenced_block(&device_a, "starved-requester.bin", &content);
 
     let (channel_a, channel_b) = connect_pair(addr).await;
-    let session_a = spawn_session(channel_a, &device_a, "device-b");
-    session_a.set_block_serve_engine(yadorilink_peer_session::block_serve::BlockServeEngine::new(
-        u64::MAX,
-        u64::MAX,
-        u64::MAX,
-        4,
-    ));
-    let session_b = spawn_session(channel_b, &device_b, "device-a");
+    let session_a = spawn_session_with_block_serve_engine(
+        channel_a,
+        &device_a,
+        "device-b",
+        yadorilink_peer_session::block_serve::BlockServeEngine::new(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            4,
+        ),
+    );
 
     // Device-b's OWN serve-side engine (used only if IT were answering
     // inbound requests from someone else), deliberately starved of every
     // permit kind for the whole test.
     let starved_engine = yadorilink_peer_session::block_serve::BlockServeEngine::new(1, 1, 1, 1);
-    session_b.set_block_serve_engine(starved_engine.clone());
+    let session_b = spawn_session_with_block_serve_engine(
+        channel_b,
+        &device_b,
+        "device-a",
+        starved_engine.clone(),
+    );
+    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
     let mut held_examination_permits = Vec::new();
     while let Ok(permit) = starved_engine.try_begin_examination() {
         held_examination_permits.push(permit);
@@ -6681,7 +6720,8 @@ async fn recv_loop_survives_a_catchup_batch_larger_than_the_permit_budget() {
     const N: usize = 80;
 
     let (channel_a, channel_b) = connect_pair(addr).await;
-    let _session_a = spawn_session(channel_a, &device_a, "device-b");
+    let session_a = spawn_session(channel_a, &device_a, "device-b");
+    complete_raw_peer_handshake(&channel_b, &session_a).await;
 
     struct StressFile {
         path: String,
