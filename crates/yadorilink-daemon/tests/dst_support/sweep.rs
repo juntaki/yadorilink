@@ -3,7 +3,7 @@
 //!
 //! A bare-`PeerSyncSession` DST scenario never runs the periodic sweeps a
 //! real daemon runs (`repair_interrupted_materializations` +
-//! `cleanup_stale_temp_files`, driven by `link_manager.rs`), so a state the
+//! `cleanup_stale_temp_files`, driven by `link_runtime`), so a state the
 //! production daemon would have repaired on its next sweep -- an interrupted
 //! eager materialize's live-but-fileless index row plus an orphaned
 //! `.yadorilink-tmp.*` file -- surfaced as `StructuralIndexDiskMismatch` /

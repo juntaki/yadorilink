@@ -51,7 +51,7 @@ const PARALLEL_VARIATIONS: usize = 500;
 /// One seeded, fully deterministic simulated run: performs
 /// `OPS_PER_RUN` randomized local writes through the real watcher-event
 /// boundary -> debounce -> `LocalChangeProcessor` indexing pipeline
-/// (`link_manager::start_link_watch_with_source`'s production wiring,
+/// (`link_runtime::factory::LinkRuntimeFactory`'s production wiring,
 /// reproduced directly against `yadorilink-sync-core` here since that
 /// production entry point lives in `yadorilink-daemon`, whose coordination-
 /// plane dependency isn't part of this crate's madsim scope), then

@@ -203,7 +203,7 @@ struct ChaosDevice {
 
 impl ChaosDevice {
     /// Harness twin of
-    /// `link_manager::LinkFlushHandle::capture_undiscovered_local_change`.
+    /// `link_runtime::LinkFlushHandle::capture_undiscovered_local_change`.
     ///
     /// Production does *not* read a `None` reply from the debounce
     /// accumulator as "nothing local to protect" — it falls back to a
@@ -370,7 +370,8 @@ impl PendingLocalChangeFlush for ChaosDevice {
 /// Sets up one device's real watcher-boundary/debounce/`LocalChangeProcessor`
 /// pipeline, with the executor forwarding every non-empty flush result to
 /// this device's (not-yet-connected) session the same way
-/// `link_manager::announce_local_change` -> `DaemonState::broadcast_change`
+/// `link_runtime::operations::capture_local_change::announce_local_change`
+/// -> `DaemonState::broadcast_change`
 /// does in production for a send-receive link.
 fn setup_device(
     device_id: &str,
@@ -1242,7 +1243,7 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
     // PF (fidelity/artifact-reduction) F.2, agmsg investigation 2026-07-09:
     // a real daemon runs `repair_interrupted_materializations` +
     // `cleanup_stale_temp_files` at startup and periodically
-    // (`link_manager.rs`) -- this bare-`PeerSyncSession` harness never
+    // (`link_runtime`) -- this bare-`PeerSyncSession` harness never
     // called either, so an interrupted eager materialize's window
     // (`materialize`'s own `upsert_file_with_origin`-before-`reconstruct_
     // file` ordering, see its doc comment) left a live-but-fileless index

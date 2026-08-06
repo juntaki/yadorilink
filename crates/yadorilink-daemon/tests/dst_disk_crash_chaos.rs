@@ -268,7 +268,7 @@ struct ChaosDevice {
 
 impl ChaosDevice {
     /// Harness twin of
-    /// `link_manager::LinkFlushHandle::capture_undiscovered_local_change`.
+    /// `link_runtime::LinkFlushHandle::capture_undiscovered_local_change`.
     ///
     /// Production does *not* read a `None` reply from the debounce
     /// accumulator as "nothing local to protect" — it falls back to a

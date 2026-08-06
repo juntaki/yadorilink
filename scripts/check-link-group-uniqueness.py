@@ -40,7 +40,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-INDEX_RS = ROOT / "crates/yadorilink-sync-core/src/index.rs"
+LINK_REPOSITORY_RS = ROOT / "crates/yadorilink-sync-sqlite/src/link.rs"
+SCHEMA_RS = ROOT / "crates/yadorilink-sqlite-runtime/src/schema.rs"
 
 # Production sources only. Tests deliberately forge the state this outlaws (see
 # `SyncState::force_second_live_link_for_test`) in order to pin what the read
@@ -49,7 +50,8 @@ INDEX_RS = ROOT / "crates/yadorilink-sync-core/src/index.rs"
 SCAN_DIRS = [
     ROOT / "crates/yadorilink-daemon/src",
     ROOT / "crates/yadorilink-cli/src",
-    ROOT / "crates/yadorilink-sync-core/src",
+    ROOT / "crates/yadorilink-sync-sqlite/src",
+    ROOT / "crates/yadorilink-sqlite-runtime/src",
 ]
 
 INSERT_OR_REPLACE = re.compile(r"INSERT\s+OR\s+REPLACE\s+INTO\s+links\b", re.IGNORECASE)
@@ -163,28 +165,32 @@ def main() -> int:
                     f"{path.relative_to(ROOT)}:{lineno}: INSERT OR REPLACE INTO links: {line}"
                 )
 
-    if not INDEX_RS.exists():
-        print(f"guard target not found: {INDEX_RS}", file=sys.stderr)
+    if not LINK_REPOSITORY_RS.exists():
+        print(f"guard target not found: {LINK_REPOSITORY_RS}", file=sys.stderr)
         return 1
-    index_text = INDEX_RS.read_text(encoding="utf-8")
+    repository_text = LINK_REPOSITORY_RS.read_text(encoding="utf-8")
 
-    inserts = plain_insert_sites(index_text)
+    inserts = plain_insert_sites(repository_text)
     if len(inserts) != 1:
         for lineno, line in inserts:
             findings.append(
-                f"{INDEX_RS.relative_to(ROOT)}:{lineno}: INSERT INTO links outside the "
+                f"{LINK_REPOSITORY_RS.relative_to(ROOT)}:{lineno}: INSERT INTO links outside the "
                 f"chokepoint: {line}"
             )
         if not inserts:
             findings.append(
-                f"{INDEX_RS.relative_to(ROOT)}: no `INSERT INTO links` found at all -- the "
+                f"{LINK_REPOSITORY_RS.relative_to(ROOT)}: no `INSERT INTO links` found at all -- the "
                 f"write chokepoint `insert_link_row` appears to be gone"
             )
 
+    if not SCHEMA_RS.exists():
+        print(f"guard target not found: {SCHEMA_RS}", file=sys.stderr)
+        return 1
+    schema_text = SCHEMA_RS.read_text(encoding="utf-8")
     for trigger in REQUIRED_TRIGGERS:
-        if trigger not in index_text:
+        if trigger not in schema_text:
             findings.append(
-                f"{INDEX_RS.relative_to(ROOT)}: schema trigger `{trigger}` is missing -- the "
+                f"{SCHEMA_RS.relative_to(ROOT)}: schema trigger `{trigger}` is missing -- the "
                 f"database-level backstop is gone"
             )
 

@@ -172,8 +172,9 @@ struct MeshDevice {
     flush_request_tx: tokio::sync::mpsc::Sender<FlushPathRequest>,
     /// This device's session to each of its two neighbors. Broadcasting a
     /// locally-produced (or directly-injected) record to *every* entry
-    /// here is this harness's mirror of `link_manager::announce_local_
-    /// change` -> `DaemonState::broadcast_change`'s real fan-out shape
+    /// here is this harness's mirror of `link_runtime::operations::
+    /// capture_local_change::announce_local_change` ->
+    /// `DaemonState::broadcast_change`'s real fan-out shape
     /// (`daemon_state.rs` ~927: every session sharing the group, no
     /// exclusion).
     sessions: OnceLock<Vec<Arc<PeerSyncSession>>>,
@@ -207,7 +208,7 @@ impl MeshDevice {
 
 impl MeshDevice {
     /// Harness twin of
-    /// `link_manager::LinkFlushHandle::capture_undiscovered_local_change`.
+    /// `link_runtime::LinkFlushHandle::capture_undiscovered_local_change`.
     ///
     /// Production does *not* read a `None` reply from the debounce
     /// accumulator as "nothing local to protect" — it falls back to a

@@ -158,7 +158,7 @@ struct ChaosDevice {
 
 impl ChaosDevice {
     /// Harness twin of
-    /// `link_manager::LinkFlushHandle::capture_undiscovered_local_change`.
+    /// `link_runtime::LinkFlushHandle::capture_undiscovered_local_change`.
     ///
     /// Production does *not* read a `None` reply from the debounce
     /// accumulator as "nothing local to protect" — it falls back to a
@@ -1840,7 +1840,7 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
     // PF (fidelity/artifact-reduction) F.2, agmsg investigation 2026-07-09:
     // a real daemon runs `repair_interrupted_materializations` +
     // `cleanup_stale_temp_files` at startup and periodically
-    // (`link_manager.rs`) -- this bare-`PeerSyncSession` harness never
+    // (`link_runtime`) -- this bare-`PeerSyncSession` harness never
     // called either, so an interrupted eager materialize's window left a
     // live-but-fileless index row + an orphaned `.yadorilink-tmp.*` file
     // permanently, surfacing as `StructuralIndexDiskMismatch`/`Corruption`

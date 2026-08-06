@@ -120,7 +120,7 @@ enum Ordering {
 }
 
 /// A's `PendingLocalChangeFlush`, mirroring the production
-/// `yadorilink-daemon::link_manager::LinkFlushHandle` +
+/// `yadorilink-daemon::link_runtime::LinkFlushHandle` +
 /// `impl PendingLocalChangeFlush for DaemonState`: on a reconcile-time
 /// flush request it does the exact-path debounce round trip and, if an
 /// entry was pending, dispatches it through the real `process_flush`.
