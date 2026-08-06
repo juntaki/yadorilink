@@ -362,8 +362,6 @@ line = 47
 visibility = "pub"
 category = "business logic"
 destination = ["yadorilink-sync-sqlite"]
-production_callers = 2
-status = "pending"
 production_callers = 0
 status = "migrated"
 
@@ -616,6 +614,8 @@ line = 2974
 visibility = "pub"
 category = "delegation"
 destination = ["yadorilink-sync-sqlite"]
+production_callers = 1
+status = "migrated"
 
 [[method]]
 name = "mark_enrollment_operation_prepared"
@@ -859,6 +859,8 @@ category = "delegation"
 destination = ["yadorilink-sync-sqlite"]
 production_callers = 0
 status = "migrated"
+
+[[method]]
 name = "begin_group_startup"
 line = 428
 visibility = "pub"
@@ -1750,9 +1752,6 @@ production_callers = 1
 status = "migrated"
 
 [[method]]
-status = "migrated"
-
-[[method]]
 name = "append_initial_import"
 line = 805
 visibility = "pub"
@@ -2002,3 +2001,4 @@ visibility = "pub"
 category = "delegation"
 destination = ["yadorilink-sync-sqlite"]
 production_callers = 3
+status = "migrated"
