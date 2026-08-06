@@ -615,16 +615,29 @@ impl Drop for PendingBlockGuard<'_> {
 /// tested, and ready, but a symlink genuinely cannot cross the wire from
 /// a peer that classified it during section 2's scan/watch path on a
 /// *different* device.
-fn materialize_symlink_at(
-    state: &dyn crate::ports::PeerReplicaStatePort,
-    root: &Path,
-    group_id: &str,
-    record: &FileRecord,
+struct SymlinkMaterialization<'a, 'permit> {
+    state: &'a dyn crate::ports::PeerReplicaStatePort,
+    root: &'a Path,
+    group_id: &'a str,
     windows_opt_in: bool,
-    origin_device_id: &str,
-    authoring_change_hash: Option<&ChangeHash>,
-    permit: &RootCommitPermit<'_>,
+    origin_device_id: &'a str,
+    authoring_change_hash: Option<&'a ChangeHash>,
+    permit: &'a RootCommitPermit<'permit>,
+}
+
+fn materialize_symlink_at(
+    context: SymlinkMaterialization<'_, '_>,
+    record: &FileRecord,
 ) -> Result<(), PeerSessionError> {
+    let SymlinkMaterialization {
+        state,
+        root,
+        group_id,
+        windows_opt_in,
+        origin_device_id,
+        authoring_change_hash,
+        permit,
+    } = context;
     match authoring_change_hash {
         Some(hash) => state.upsert_file_with_origin_and_author(
             group_id,
@@ -7512,14 +7525,16 @@ impl PeerSyncSession {
                                 let windows_opt_in =
                                     self.state.windows_symlink_opt_in_for_group(group_id)?;
                                 materialize_symlink_at(
-                                    self.state.as_ref(),
-                                    &self.sync_root(group_id)?,
-                                    group_id,
+                                    SymlinkMaterialization {
+                                        state: self.state.as_ref(),
+                                        root: &self.sync_root(group_id)?,
+                                        group_id,
+                                        windows_opt_in,
+                                        origin_device_id: &incoming_origin,
+                                        authoring_change_hash: Some(incoming_author),
+                                        permit: &root_commit_permit,
+                                    },
                                     &local,
-                                    windows_opt_in,
-                                    &incoming_origin,
-                                    Some(incoming_author),
-                                    &root_commit_permit,
                                 )?;
                             }
                             // Nothing physical to reapply for a
@@ -8296,14 +8311,16 @@ impl PeerSyncSession {
             self.state.clear_held(group_id, &record.path)?;
             let windows_opt_in = self.state.windows_symlink_opt_in_for_group(group_id)?;
             materialize_symlink_at(
-                self.state.as_ref(),
-                &self.sync_root(group_id)?,
-                group_id,
+                SymlinkMaterialization {
+                    state: self.state.as_ref(),
+                    root: &self.sync_root(group_id)?,
+                    group_id,
+                    windows_opt_in,
+                    origin_device_id,
+                    authoring_change_hash,
+                    permit: &root_commit_permit,
+                },
                 record,
-                windows_opt_in,
-                origin_device_id,
-                authoring_change_hash,
-                &root_commit_permit,
             )?;
             return Ok(MaterializeResult::Settled);
         }
@@ -9509,14 +9526,16 @@ mod symlink_and_metadata_only_update_tests {
         state.set_symlink_target("group-1", "link.txt", Some(b"target.txt")).unwrap();
 
         materialize_symlink_at(
-            &state,
-            root.path(),
-            "group-1",
+            SymlinkMaterialization {
+                state: &state,
+                root: root.path(),
+                group_id: "group-1",
+                windows_opt_in: false,
+                origin_device_id: "device-a",
+                authoring_change_hash: None,
+                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            },
             &record,
-            false,
-            "device-a",
-            None,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
 
@@ -9558,14 +9577,16 @@ mod symlink_and_metadata_only_update_tests {
         .unwrap();
 
         let result = materialize_symlink_at(
-            &state,
-            root.path(),
-            "group-1",
+            SymlinkMaterialization {
+                state: &state,
+                root: root.path(),
+                group_id: "group-1",
+                windows_opt_in: false,
+                origin_device_id: "device-a",
+                authoring_change_hash: None,
+                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            },
             &record,
-            false,
-            "device-a",
-            None,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         );
         assert!(
             result.is_err(),
@@ -9609,14 +9630,16 @@ mod symlink_and_metadata_only_update_tests {
         .unwrap();
 
         let result = materialize_symlink_at(
-            &state,
-            root.path(),
-            "group-1",
+            SymlinkMaterialization {
+                state: &state,
+                root: root.path(),
+                group_id: "group-1",
+                windows_opt_in: false,
+                origin_device_id: "device-a",
+                authoring_change_hash: None,
+                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            },
             &record,
-            false,
-            "device-a",
-            None,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         );
         assert!(
             result.is_err(),
@@ -9651,14 +9674,16 @@ mod symlink_and_metadata_only_update_tests {
         // symlink_target deliberately left unset.
 
         materialize_symlink_at(
-            &state,
-            root.path(),
-            "group-1",
+            SymlinkMaterialization {
+                state: &state,
+                root: root.path(),
+                group_id: "group-1",
+                windows_opt_in: false,
+                origin_device_id: "device-a",
+                authoring_change_hash: None,
+                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            },
             &record,
-            false,
-            "device-a",
-            None,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
 
