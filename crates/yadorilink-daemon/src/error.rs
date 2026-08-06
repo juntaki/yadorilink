@@ -3,8 +3,11 @@ pub enum DaemonError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("sync-core error: {0}")]
-    Sync(#[from] yadorilink_sync_core::SyncError),
+    #[error("sync error: {0}")]
+    Sync(#[from] crate::sync_error::SyncError),
+
+    #[error("root authority error: {0}")]
+    RootAuthority(#[from] yadorilink_root_authority::RootAuthorityError),
 
     /// `peer_orchestrator`'s transport-level failures (e.g. a `PeerChannel`
     /// that could not be constructed for a peer).

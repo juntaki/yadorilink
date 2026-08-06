@@ -49,11 +49,6 @@ class FinderSync: FIFinderSync {
         case pending = "com.yadorilink.badge.pending"
         case error = "com.yadorilink.badge.error"
         case onlineOnly = "com.yadorilink.badge.onlineOnly"
-        // on-demand-sync's advisory "open elsewhere" signal (an
-        // Office-style `~$*` lock file seen on a
-        // peer, relayed over PeerChannel) — a sixth badge identifier
-        // following the exact pattern of the five above.
-        case openElsewhere = "com.yadorilink.badge.openElsewhere"
 
         var symbolName: String {
             switch self {
@@ -62,7 +57,6 @@ class FinderSync: FIFinderSync {
             case .pending: return "clock"
             case .error: return "exclamationmark.triangle.fill"
             case .onlineOnly: return "icloud.and.arrow.down"
-            case .openElsewhere: return "person.crop.circle.badge.exclamationmark"
             }
         }
 
@@ -73,7 +67,6 @@ class FinderSync: FIFinderSync {
             case .pending: return "YadoriLink: Pending"
             case .error: return "YadoriLink: Sync Error"
             case .onlineOnly: return "YadoriLink: Online Only"
-            case .openElsewhere: return "YadoriLink: Open on Another Device"
             }
         }
 
@@ -193,7 +186,6 @@ class FinderSync: FIFinderSync {
         case Int32(YadoriLinkBadgeStatusPending.rawValue): identifier = Badge.pending.rawValue
         case Int32(YadoriLinkBadgeStatusError.rawValue): identifier = Badge.error.rawValue
         case Int32(YadoriLinkBadgeStatusOnlineOnly.rawValue): identifier = Badge.onlineOnly.rawValue
-        case Int32(YadoriLinkBadgeStatusOpenElsewhere.rawValue): identifier = Badge.openElsewhere.rawValue
         default: identifier = "" // YadoriLinkBadgeStatusUnspecified, or the daemon isn't
                                   // reachable — fail soft to "no badge" per spec.
         }

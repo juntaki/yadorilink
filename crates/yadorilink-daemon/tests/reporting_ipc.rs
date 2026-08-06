@@ -25,7 +25,7 @@ use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_local_storage::FsBlockStore;
 use yadorilink_reporting::builder::{build_usage_envelope, ReportEnvironment};
 use yadorilink_reporting::schema::{OsFamily, ReportEnvelope, UsagePayload};
-use yadorilink_sync_core::index::SyncState;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 
 /// `YADORILINK_CONFIG_DIR` is a process-global env var (same pattern used
 /// by `yadorilink-cli`'s `tests/materialization.rs`), so every test here
@@ -36,15 +36,20 @@ async fn start_daemon() -> (std::path::PathBuf, tempfile::TempDir, Arc<DaemonSta
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
     let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
-    let sync_state = Arc::new(SyncState::open(dir.path().join("sync.sqlite3")).unwrap());
+    let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
     let socket_path = dir.path().join("daemon.sock");
 
     let serve_path = socket_path.clone();
     let serve_state = state.clone();
     tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(&serve_path, serve_state)
-            .await;
+        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
+            &serve_path,
+            std::sync::Arc::new(yadorilink_daemon::control_context::ControlContext::from_state(
+                serve_state,
+            )),
+        )
+        .await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     (socket_path, dir, state)

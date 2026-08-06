@@ -1,0 +1,359 @@
+digraph {
+
+    graph [
+        label="yadorilink_daemon @ 40e3456e",
+        labelloc=t,
+
+        pad=0.4,
+
+        // Consider rendering the graph using a different layout algorithm, such as:
+        // [dot, neato, twopi, circo, fdp, sfdp]
+        layout=dot,
+        overlap=false,
+        splines="line",
+        rankdir=LR,
+
+        fontname="Helvetica", 
+        fontsize="36",
+    ];
+
+    node [
+        fontname="monospace",
+        fontsize="10",
+        shape="box",
+        style="filled",
+    ];
+
+    edge [
+        fontname="monospace",
+        fontsize="10",
+    ];
+
+    "yadorilink_daemon" [label="yadorilink_daemon @ 40e3456e", fillcolor="#5397c8"]; // "crate" node
+    "yadorilink_daemon::adapters" [label="adapters @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::adapters::coordination::enrollment" [label="adapters::coordination::enrollment @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::adapters::coordination::membership" [label="adapters::coordination::membership @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::adapters::coordination::role_loss" [label="adapters::coordination::role_loss @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::adapters::persistence::enrollment" [label="adapters::persistence::enrollment @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::adapters::persistence::membership" [label="adapters::persistence::membership @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::adapters::persistence::replica_role" [label="adapters::persistence::replica_role @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::adapters::runtime::enrollment_attempts" [label="adapters::runtime::enrollment_attempts @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::adapters::runtime::enrollment_link" [label="adapters::runtime::enrollment_link @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::adapters::runtime::handoff_readiness" [label="adapters::runtime::handoff_readiness @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::adapters::runtime::handoff_ticket" [label="adapters::runtime::handoff_ticket @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::adapters::runtime::link_watch" [label="adapters::runtime::link_watch @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::adapters::runtime::materialization" [label="adapters::runtime::materialization @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::adapters::runtime::replica_readiness" [label="adapters::runtime::replica_readiness @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::adapters::runtime::role_loss_journal" [label="adapters::runtime::role_loss_journal @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::app" [label="app @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::application" [label="application @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::application::enrollment_recovery_service" [label="application::enrollment_recovery_service @ 40e3456e", fillcolor="#db5367"]; // "mod" node
+    "yadorilink_daemon::application::enrollment_service" [label="application::enrollment_service @ 40e3456e", fillcolor="#db5367"]; // "mod" node
+    "yadorilink_daemon::application::materialization_service" [label="application::materialization_service @ 40e3456e", fillcolor="#db5367"]; // "mod" node
+    "yadorilink_daemon::application::membership_operation_identity" [label="application::membership_operation_identity @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::application::model" [label="application::model @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::application::model::enrollment" [label="application::model::enrollment @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::application::model::membership" [label="application::model::membership @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::application::ports" [label="application::ports @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::application::ports::common" [label="application::ports::common @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::application::ports::enrollment" [label="application::ports::enrollment @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::application::ports::materialization" [label="application::ports::materialization @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::application::ports::membership" [label="application::ports::membership @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::application::ports::replica_role" [label="application::ports::replica_role @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::application::replica_membership_service" [label="application::replica_membership_service @ 40e3456e", fillcolor="#db5367"]; // "mod" node
+    "yadorilink_daemon::application::replica_role_service" [label="application::replica_role_service @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::application::services" [label="application::services @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::change_auth" [label="change_auth @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::change_policy" [label="change_policy @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::connection_trace" [label="connection_trace @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::control_socket" [label="control_socket @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::control_socket::unix_transport" [label="control_socket::unix_transport @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::convergence::backoff" [label="convergence::backoff @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::convergence::engine" [label="convergence::engine @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::convergence::engine_impl" [label="convergence::engine_impl @ 40e3456e", fillcolor="#db5367"]; // "mod" node
+    "yadorilink_daemon::coordination_client" [label="coordination_client @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::coordination_client::imp" [label="coordination_client::imp @ 40e3456e", fillcolor="#db5367"]; // "mod" node
+    "yadorilink_daemon::daemon_context" [label="daemon_context @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::daemon_state" [label="daemon_state @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::device_config" [label="device_config @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::diagnostics_ipc" [label="diagnostics_ipc @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::durability_service" [label="durability_service @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::error" [label="error @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::gc" [label="gc @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::governance_config" [label="governance_config @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::hydration" [label="hydration @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::link_manager" [label="link_manager @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::link_registry" [label="link_registry @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::link_runtime" [label="link_runtime @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::link_runtime::operations::apply_peer_change" [label="link_runtime::operations::apply_peer_change @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::link_runtime::operations::capture_local_change" [label="link_runtime::operations::capture_local_change @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::maintenance_coordinator" [label="maintenance_coordinator @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::metrics" [label="metrics @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::peer_orchestrator" [label="peer_orchestrator @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::peer_orchestrator::ws_netmap" [label="peer_orchestrator::ws_netmap @ 40e3456e", fillcolor="#db5367"]; // "mod" node
+    "yadorilink_daemon::peer_registry" [label="peer_registry @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::rebootstrap_handler" [label="rebootstrap_handler @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::recent_errors" [label="recent_errors @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::recovery_diagnosis" [label="recovery_diagnosis @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::recovery_diagnosis::classifier" [label="recovery_diagnosis::classifier @ 40e3456e", fillcolor="#db5367"]; // "mod" node
+    "yadorilink_daemon::recovery_diagnosis::identity" [label="recovery_diagnosis::identity @ 40e3456e", fillcolor="#db5367"]; // "mod" node
+    "yadorilink_daemon::recovery_diagnosis::ipc" [label="recovery_diagnosis::ipc @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_daemon::recovery_diagnosis::model" [label="recovery_diagnosis::model @ 40e3456e", fillcolor="#db5367"]; // "mod" node
+    "yadorilink_daemon::recovery_diagnosis::reason" [label="recovery_diagnosis::reason @ 40e3456e", fillcolor="#db5367"]; // "mod" node
+    "yadorilink_daemon::recovery_diagnosis::service" [label="recovery_diagnosis::service @ 40e3456e", fillcolor="#db5367"]; // "mod" node
+    "yadorilink_daemon::recovery_evidence" [label="recovery_evidence @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::reporting" [label="reporting @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::reporting::consent_store" [label="reporting::consent_store @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::reporting::counters" [label="reporting::counters @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::reporting::entry_store" [label="reporting::entry_store @ 40e3456e", fillcolor="#db5367"]; // "mod" node
+    "yadorilink_daemon::reporting::environment" [label="reporting::environment @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::reporting::error" [label="reporting::error @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::reporting::error_candidates" [label="reporting::error_candidates @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::reporting::hooks" [label="reporting::hooks @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::reporting::queue" [label="reporting::queue @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::reporting::retry" [label="reporting::retry @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::reporting::time" [label="reporting::time @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::reporting_ipc" [label="reporting_ipc @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::runtime_telemetry" [label="runtime_telemetry @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::shell_ipc" [label="shell_ipc @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::shell_ipc::unix_transport" [label="shell_ipc::unix_transport @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::shell_status" [label="shell_status @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::supervise" [label="supervise @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::token_store" [label="token_store @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::transfer_progress" [label="transfer_progress @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::update::install_macos" [label="update::install_macos @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::update::install_windows" [label="update::install_windows @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::update::manager" [label="update::manager @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::update::manifest" [label="update::manifest @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::update::policy" [label="update::policy @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::update::verify" [label="update::verify @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_daemon::update_ipc" [label="update_ipc @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+
+    "yadorilink_daemon" -> "yadorilink_daemon::coordination_client" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon" -> "yadorilink_daemon::device_config" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters" -> "yadorilink_daemon::application::enrollment_recovery_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters" -> "yadorilink_daemon::application::enrollment_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters" -> "yadorilink_daemon::application::materialization_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters" -> "yadorilink_daemon::application::replica_membership_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters" -> "yadorilink_daemon::application::replica_role_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters" -> "yadorilink_daemon::application::services" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::coordination::enrollment" -> "yadorilink_daemon::application::model::enrollment" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::coordination::enrollment" -> "yadorilink_daemon::application::ports::common" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::coordination::enrollment" -> "yadorilink_daemon::application::ports::enrollment" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::coordination::enrollment" -> "yadorilink_daemon::coordination_client" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::coordination::enrollment" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::coordination::membership" -> "yadorilink_daemon::application::model::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::coordination::membership" -> "yadorilink_daemon::application::ports::common" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::coordination::membership" -> "yadorilink_daemon::application::ports::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::coordination::membership" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::coordination::role_loss" -> "yadorilink_daemon::application::model::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::coordination::role_loss" -> "yadorilink_daemon::application::ports::common" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::coordination::role_loss" -> "yadorilink_daemon::application::ports::replica_role" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::coordination::role_loss" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::persistence::enrollment" -> "yadorilink_daemon::application::ports::enrollment" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::persistence::membership" -> "yadorilink_daemon::application::ports::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::persistence::membership" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::persistence::replica_role" -> "yadorilink_daemon::application::ports::replica_role" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::persistence::replica_role" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::enrollment_attempts" -> "yadorilink_daemon::application::ports::enrollment" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::enrollment_attempts" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::enrollment_link" -> "yadorilink_daemon::application::enrollment_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::enrollment_link" -> "yadorilink_daemon::application::ports::common" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::enrollment_link" -> "yadorilink_daemon::application::ports::enrollment" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::enrollment_link" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::handoff_readiness" -> "yadorilink_daemon::application::ports::common" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::handoff_readiness" -> "yadorilink_daemon::application::ports::replica_role" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::handoff_readiness" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::handoff_ticket" -> "yadorilink_daemon::application::ports::common" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::handoff_ticket" -> "yadorilink_daemon::application::ports::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::handoff_ticket" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::link_watch" -> "yadorilink_daemon::application::ports::common" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::link_watch" -> "yadorilink_daemon::application::ports::replica_role" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::link_watch" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::materialization" -> "yadorilink_daemon::application::ports::common" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::materialization" -> "yadorilink_daemon::application::ports::materialization" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::materialization" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::materialization" -> "yadorilink_daemon::hydration" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::replica_readiness" -> "yadorilink_daemon::application::ports::common" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::replica_readiness" -> "yadorilink_daemon::application::ports::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::replica_readiness" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::role_loss_journal" -> "yadorilink_daemon::application::ports::common" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::role_loss_journal" -> "yadorilink_daemon::application::ports::replica_role" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::adapters::runtime::role_loss_journal" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::app" -> "yadorilink_daemon::control_socket" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::app" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::app" -> "yadorilink_daemon::device_config" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::app" -> "yadorilink_daemon::link_manager" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::app" -> "yadorilink_daemon::metrics" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::app" -> "yadorilink_daemon::peer_orchestrator" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::app" -> "yadorilink_daemon::shell_ipc" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::app" -> "yadorilink_daemon::supervise" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::app" -> "yadorilink_daemon::token_store" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application" -> "yadorilink_daemon::application::enrollment_recovery_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application" -> "yadorilink_daemon::application::enrollment_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application" -> "yadorilink_daemon::application::materialization_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application" -> "yadorilink_daemon::application::replica_membership_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application" -> "yadorilink_daemon::application::replica_role_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application" -> "yadorilink_daemon::application::services" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::enrollment_recovery_service" -> "yadorilink_daemon::application::model::enrollment" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::enrollment_recovery_service" -> "yadorilink_daemon::application::ports::enrollment" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::enrollment_service" -> "yadorilink_daemon::application::model::enrollment" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::enrollment_service" -> "yadorilink_daemon::application::ports::enrollment" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::materialization_service" -> "yadorilink_daemon::application::ports::materialization" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::membership_operation_identity" -> "yadorilink_daemon::application::model::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::model" -> "yadorilink_daemon::application::model::enrollment" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::model" -> "yadorilink_daemon::application::model::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::ports" -> "yadorilink_daemon::application::ports::common" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::ports" -> "yadorilink_daemon::application::ports::enrollment" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::ports" -> "yadorilink_daemon::application::ports::materialization" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::ports" -> "yadorilink_daemon::application::ports::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::ports" -> "yadorilink_daemon::application::ports::replica_role" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::ports::enrollment" -> "yadorilink_daemon::application::enrollment_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::ports::enrollment" -> "yadorilink_daemon::application::model::enrollment" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::ports::enrollment" -> "yadorilink_daemon::application::ports::common" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::ports::materialization" -> "yadorilink_daemon::application::ports::common" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::ports::membership" -> "yadorilink_daemon::application::model::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::ports::membership" -> "yadorilink_daemon::application::ports::common" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::ports::replica_role" -> "yadorilink_daemon::application::model::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::ports::replica_role" -> "yadorilink_daemon::application::ports::common" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::replica_membership_service" -> "yadorilink_daemon::application::model::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::replica_membership_service" -> "yadorilink_daemon::application::ports::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::replica_role_service" -> "yadorilink_daemon::application::model::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::replica_role_service" -> "yadorilink_daemon::application::ports::replica_role" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::services" -> "yadorilink_daemon::application::enrollment_recovery_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::services" -> "yadorilink_daemon::application::enrollment_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::services" -> "yadorilink_daemon::application::materialization_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::services" -> "yadorilink_daemon::application::replica_membership_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::application::services" -> "yadorilink_daemon::application::replica_role_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::change_auth" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::connection_trace" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::control_socket" -> "yadorilink_daemon::application::enrollment_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::control_socket" -> "yadorilink_daemon::application::replica_membership_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::control_socket" -> "yadorilink_daemon::daemon_context" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::control_socket" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::control_socket" -> "yadorilink_daemon::hydration" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::control_socket" -> "yadorilink_daemon::link_manager" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::control_socket" -> "yadorilink_daemon::reporting_ipc" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::control_socket" -> "yadorilink_daemon::shell_status" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::control_socket::unix_transport" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::convergence::engine" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::convergence::engine_impl" -> "yadorilink_daemon::convergence::backoff" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::convergence::engine_impl" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::coordination_client" -> "yadorilink_daemon::application::model::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::coordination_client" -> "yadorilink_daemon::coordination_client::imp" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::coordination_client::imp" -> "yadorilink_daemon::application::model::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::coordination_client::imp" -> "yadorilink_daemon::coordination_client" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::daemon_context" -> "yadorilink_daemon::application::services" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::daemon_context" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::daemon_state" -> "yadorilink_daemon::change_policy" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::daemon_state" -> "yadorilink_daemon::durability_service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::daemon_state" -> "yadorilink_daemon::gc" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::daemon_state" -> "yadorilink_daemon::governance_config" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::daemon_state" -> "yadorilink_daemon::link_registry" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::daemon_state" -> "yadorilink_daemon::peer_registry" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::daemon_state" -> "yadorilink_daemon::reporting" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::daemon_state" -> "yadorilink_daemon::runtime_telemetry" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::daemon_state" -> "yadorilink_daemon::supervise" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::diagnostics_ipc" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::durability_service" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::gc" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::hydration" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::hydration" -> "yadorilink_daemon::recent_errors" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::hydration" -> "yadorilink_daemon::transfer_progress" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::link_manager" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::link_manager" -> "yadorilink_daemon::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::link_manager" -> "yadorilink_daemon::link_runtime" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::link_manager" -> "yadorilink_daemon::link_runtime::operations::capture_local_change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::link_registry" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::link_registry" -> "yadorilink_daemon::link_runtime" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::link_runtime" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::link_runtime" -> "yadorilink_daemon::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::link_runtime" -> "yadorilink_daemon::link_runtime::operations::capture_local_change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::link_runtime::operations::apply_peer_change" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::link_runtime::operations::apply_peer_change" -> "yadorilink_daemon::link_runtime" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::link_runtime::operations::capture_local_change" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::link_runtime::operations::capture_local_change" -> "yadorilink_daemon::link_runtime" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::maintenance_coordinator" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::maintenance_coordinator" -> "yadorilink_daemon::link_manager" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::maintenance_coordinator" -> "yadorilink_daemon::supervise" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::metrics" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::peer_orchestrator" -> "yadorilink_daemon::change_policy" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::peer_orchestrator" -> "yadorilink_daemon::connection_trace" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::peer_orchestrator" -> "yadorilink_daemon::coordination_client" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::peer_orchestrator" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::peer_orchestrator" -> "yadorilink_daemon::device_config" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::peer_orchestrator" -> "yadorilink_daemon::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::peer_orchestrator" -> "yadorilink_daemon::peer_orchestrator::ws_netmap" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::peer_orchestrator" -> "yadorilink_daemon::supervise" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::peer_orchestrator::ws_netmap" -> "yadorilink_daemon::connection_trace" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::peer_orchestrator::ws_netmap" -> "yadorilink_daemon::coordination_client" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::peer_orchestrator::ws_netmap" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::peer_orchestrator::ws_netmap" -> "yadorilink_daemon::device_config" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::peer_orchestrator::ws_netmap" -> "yadorilink_daemon::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::peer_orchestrator::ws_netmap" -> "yadorilink_daemon::peer_orchestrator" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::peer_orchestrator::ws_netmap" -> "yadorilink_daemon::supervise" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::peer_registry" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::rebootstrap_handler" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis" -> "yadorilink_daemon::recovery_diagnosis::classifier" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis" -> "yadorilink_daemon::recovery_diagnosis::identity" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis" -> "yadorilink_daemon::recovery_diagnosis::model" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis" -> "yadorilink_daemon::recovery_diagnosis::reason" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis" -> "yadorilink_daemon::recovery_diagnosis::service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::classifier" -> "yadorilink_daemon::application::model::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::classifier" -> "yadorilink_daemon::coordination_client" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::classifier" -> "yadorilink_daemon::recovery_diagnosis::identity" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::classifier" -> "yadorilink_daemon::recovery_diagnosis::model" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::classifier" -> "yadorilink_daemon::recovery_diagnosis::reason" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::classifier" -> "yadorilink_daemon::recovery_evidence" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::identity" -> "yadorilink_daemon::application::model::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::identity" -> "yadorilink_daemon::coordination_client" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::identity" -> "yadorilink_daemon::recovery_diagnosis::model" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::identity" -> "yadorilink_daemon::recovery_evidence" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::ipc" -> "yadorilink_daemon::coordination_client" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::ipc" -> "yadorilink_daemon::recovery_diagnosis::classifier" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::ipc" -> "yadorilink_daemon::recovery_diagnosis::model" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::ipc" -> "yadorilink_daemon::recovery_diagnosis::service" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::service" -> "yadorilink_daemon::application::model::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::service" -> "yadorilink_daemon::coordination_client" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::service" -> "yadorilink_daemon::recovery_diagnosis::classifier" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_diagnosis::service" -> "yadorilink_daemon::recovery_evidence" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_evidence" -> "yadorilink_daemon::application::model::membership" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::recovery_evidence" -> "yadorilink_daemon::coordination_client" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::reporting" -> "yadorilink_daemon::reporting::consent_store" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::reporting" -> "yadorilink_daemon::reporting::counters" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::reporting" -> "yadorilink_daemon::reporting::error_candidates" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::reporting" -> "yadorilink_daemon::reporting::queue" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::reporting::consent_store" -> "yadorilink_daemon::reporting::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::reporting::counters" -> "yadorilink_daemon::reporting::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::reporting::entry_store" -> "yadorilink_daemon::reporting::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::reporting::entry_store" -> "yadorilink_daemon::reporting::time" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::reporting::error_candidates" -> "yadorilink_daemon::reporting::entry_store" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::reporting::error_candidates" -> "yadorilink_daemon::reporting::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::reporting::hooks" -> "yadorilink_daemon::reporting" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::reporting::queue" -> "yadorilink_daemon::reporting::entry_store" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::reporting::queue" -> "yadorilink_daemon::reporting::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::reporting::retry" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::reporting_ipc" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::reporting_ipc" -> "yadorilink_daemon::reporting::environment" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::runtime_telemetry" -> "yadorilink_daemon::connection_trace" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::runtime_telemetry" -> "yadorilink_daemon::recent_errors" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::runtime_telemetry" -> "yadorilink_daemon::transfer_progress" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::shell_ipc" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::shell_ipc" -> "yadorilink_daemon::hydration" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::shell_ipc" -> "yadorilink_daemon::shell_status" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::shell_ipc::unix_transport" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::shell_status" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::update::install_macos" -> "yadorilink_daemon::update::verify" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::update::install_windows" -> "yadorilink_daemon::update::verify" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::update::manager" -> "yadorilink_daemon::update::install_macos" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::update::manager" -> "yadorilink_daemon::update::install_windows" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::update::manager" -> "yadorilink_daemon::update::manifest" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::update::manager" -> "yadorilink_daemon::update::policy" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::update::manager" -> "yadorilink_daemon::update::verify" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::update_ipc" -> "yadorilink_daemon::daemon_state" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::update_ipc" -> "yadorilink_daemon::update::manager" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_daemon::update_ipc" -> "yadorilink_daemon::update::policy" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+
+}

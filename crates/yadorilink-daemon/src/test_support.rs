@@ -25,7 +25,7 @@
 //! entire set-to-restore window, regardless of which module it lives in.
 //! `tokio::sync::Mutex` (rather than `std::sync::Mutex`) so it can be held
 //! across `.await` points in the async tests that need that (e.g.
-//! `reporting::retry::tests`'s `test_state.await`); synchronous tests
+//! `reporting_retry::tests`'s `test_state.await`); synchronous tests
 //! (`device_config.rs`) use `blocking_lock` instead.
 #[cfg(test)]
 pub(crate) static CONFIG_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

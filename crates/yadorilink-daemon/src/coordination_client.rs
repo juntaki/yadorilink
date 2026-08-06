@@ -1,7 +1,7 @@
 //! Unary coordination-plane calls the daemon makes outside the netmap
 //! subscription: the one-time signing-key backfill, endpoint-candidate
 //! reporting, rendezvous requests for hole punching, and the
-//! activate/cancel calls `pending_enrollment::reconcile` issues for a
+//! activate/cancel calls `EnrollmentRecoveryService::reconcile_once` issues for a
 //! create/join left over from a previous run. Each speaks the coordination
 //! plane over its HTTP+JSON API, the same host the netmap WebSocket
 //! subscription connects to.
@@ -12,7 +12,7 @@
 //! identical re-upload is a no-op, a mismatch is refused), so it is safe to
 //! call unconditionally on every startup. The activate calls below return an
 //! [`ActivateOutcome`] (rather than swallowing the result entirely) so
-//! `pending_enrollment::reconcile` knows whether it is safe to drop its
+//! `EnrollmentRecoveryService::reconcile_once` knows whether it is safe to drop its
 //! local marker, must mark the link orphaned, or should leave the marker for
 //! the next sweep to retry. The cancel calls stay a bare success/failure
 //! bool: `reconcile` treats a cancel as best-effort regardless of why it
@@ -30,7 +30,7 @@ pub struct EndpointCandidate {
 
 /// The result of an `activate_create`/`activate_join` call, distinguished by
 /// what the coordination plane's response actually communicates --
-/// `pending_enrollment::reconcile` branches on this instead of a bare bool
+/// `EnrollmentRecoveryService::reconcile_once` branches on this instead of a bare bool
 /// since "already active" and "permanently gone" call for different local
 /// follow-up (see its own doc comment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,11 +52,132 @@ pub enum ActivateOutcome {
     TransientFailure,
 }
 
+/// The classified result of a coordination-plane enrollment PREPARE call
+/// (create or join) -- distinct from a plain success/failure `Result` so a
+/// caller can tell "definitely never committed" (safe to discard the local
+/// journal row) apart from "may have committed, response merely lost" (must
+/// never discard, must resend under the same operation_id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnrollmentPrepareOutcome {
+    Prepared {
+        group_id: String,
+    },
+    /// 4xx (other than 409). The remote prepare was NOT committed.
+    DefinitelyRejected(String),
+    /// 409 -- this operation_id already names a differently-shaped request.
+    Conflict(String),
+    /// Transport failure, 5xx, or an unparseable 2xx create response.
+    Ambiguous(String),
+}
+
+/// The classified result of a coordination-plane enrollment CANCEL call --
+/// mirrors [`EnrollmentPrepareOutcome`]. Unlike prepare, the Worker's own
+/// cancel routes treat "already gone"/"already active" as an ordinary 2xx
+/// no-op (see `coordination-worker`'s own idempotent-cancel contract), so a
+/// 404 here is NOT a routine "already cancelled" -- it means this
+/// operation_id's identity itself doesn't match what the Worker expects,
+/// same as a 409.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnrollmentCancelOutcome {
+    /// 2xx -- includes an already-deleted/already-swept/already-active
+    /// no-op.
+    Confirmed,
+    /// 409 or 404 -- a request-identity mismatch, not a routine absence.
+    Conflict(String),
+    /// Transport failure or 5xx.
+    Ambiguous(String),
+}
+
 pub use imp::{
-    activate_create, activate_join, cancel_create, cancel_join, commit_handoff_role_loss,
-    compensate_handoff_role_loss, find_handoff_lease, release_handoff_lease, report_endpoint,
-    request_handoff_lease, send_rendezvous, set_storage_mode, upload_signing_key,
+    activate_create, activate_join, cancel_create, cancel_create_classified, cancel_join,
+    cancel_join_classified, commit_handoff_role_loss, compensate_handoff_role_loss,
+    find_handoff_lease, prepare_create, prepare_join, query_enrollment_operation,
+    query_membership_operation, query_membership_operation_categorized, query_role_loss_operation,
+    release_handoff_lease, report_endpoint, request_handoff_lease, resolve_edge, send_rendezvous,
+    set_storage_mode, upload_signing_key,
 };
+
+/// Why a remote-evidence lookup could not be answered -- see
+/// `RemoteEvidence`'s own doc comment for the
+/// contract this backs: NONE of these categories may ever be treated as
+/// "the operation doesn't exist" (only a genuine HTTP 404 means that).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteEvidenceErrorCategory {
+    /// The request never reached the coordination plane at all (DNS,
+    /// connection refused, TLS failure, ...).
+    Network,
+    /// The request timed out waiting for a response.
+    Timeout,
+    /// The coordination plane responded, but with a server-side failure
+    /// (5xx) or an unexpected non-success status this lookup has no more
+    /// specific category for.
+    ServerError,
+    /// The coordination plane rejected the request's credentials (401/403)
+    /// -- distinct from every other category because it likely means this
+    /// device's own access token needs refreshing, not that the operation
+    /// itself is unreachable.
+    Unauthorized,
+    /// A 2xx response whose body could not be parsed as the expected
+    /// shape.
+    MalformedResponse,
+    /// The coordination plane responded successfully but the response
+    /// shape names something this build does not recognize (e.g. a
+    /// `status`/`kind` string added by a newer Worker deploy) -- distinct
+    /// from `MalformedResponse` (which means the JSON itself didn't even
+    /// parse) so a caller can tell "the plane is ahead of this build" apart
+    /// from "the plane sent garbage".
+    Unsupported,
+}
+
+/// A remote-evidence lookup's failure: the category above, plus a
+/// human-readable detail for logs. Never constructed for a 404 -- that is
+/// `RemoteEvidence::RecordNotFound`, not an
+/// error.
+#[derive(Debug, Clone)]
+pub struct RemoteQueryError {
+    pub category: RemoteEvidenceErrorCategory,
+    pub message: String,
+}
+
+impl std::fmt::Display for RemoteQueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+fn categorize_transport_error(error: &reqwest::Error) -> RemoteEvidenceErrorCategory {
+    if error.is_timeout() {
+        RemoteEvidenceErrorCategory::Timeout
+    } else {
+        RemoteEvidenceErrorCategory::Network
+    }
+}
+
+/// Bounded so a recovery-evidence lookup can genuinely produce
+/// [`RemoteEvidenceErrorCategory::Timeout`] rather than hang indefinitely
+/// (this file's other calls use a plain, timeout-less `reqwest::Client::new()`
+/// -- fine for a best-effort background call, wrong for an operator-facing
+/// diagnosis command that must return in bounded time either way).
+pub const EVIDENCE_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+pub fn evidence_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(EVIDENCE_LOOKUP_TIMEOUT)
+        .build()
+        .expect("building the recovery-evidence HTTP client")
+}
+
+fn categorize_error_status(status: reqwest::StatusCode) -> RemoteEvidenceErrorCategory {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        RemoteEvidenceErrorCategory::Unauthorized
+    } else {
+        // Every other non-success, non-404 status -- including a genuine
+        // 5xx, but also any other unexpected code this lookup has no more
+        // specific category for. Never `RecordNotFound`: only a literal
+        // 404 means that.
+        RemoteEvidenceErrorCategory::ServerError
+    }
+}
 
 /// A successfully-issued full-replica-handoff lease grant — the target-side
 /// half of the round trip described on `HandoffLease` (`yadorilink_sync_
@@ -91,24 +212,11 @@ pub struct HandoffLeaseGrant {
 /// Kept as a plain struct here (rather than constructing the proto type
 /// directly) so this module stays free of any dependency on
 /// `yadorilink-ipc-proto`, matching every other function in this file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HandoffCommitResult {
-    pub target_device_id: String,
-    pub membership_generation: i64,
-    pub lease_id: Option<String>,
-}
-
-/// Outcome of a role-loss commit, preserving whether it is safe to discard
-/// the source-side Prepared journal row. Only an explicit 4xx response is a
-/// protocol-level guarantee that the Worker rejected the transaction before
-/// committing it. Transport failures, 5xx responses, and malformed 2xx
-/// responses are ambiguous because the Worker may already have committed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RoleLossCommitOutcome {
-    Committed(HandoffCommitResult),
-    DefinitelyRejected(String),
-    Ambiguous(String),
-}
+pub(crate) use crate::application::model::membership::{
+    HandoffCommitResult, MembershipOperationLookup, MembershipOperationRecord,
+    MembershipRemoteRequest, MembershipRemoteRequestGroup, MembershipRemoteResult,
+    MembershipRemoteStatus, RoleLossCommitOutcome,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoleLossCompensationOutcome {
@@ -116,13 +224,87 @@ pub enum RoleLossCompensationOutcome {
     Superseded,
 }
 
+/// Which stage of the create/join enrollment saga a Worker-side ledger row
+/// (`enrollment_operations`) reports -- mirrors
+/// `yadorilink_sync_core::recovery`'s own domain-specific state strings,
+/// but as a typed enum here since this is the coordination plane's OWN
+/// state machine, not a local journal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrollmentRemoteStatus {
+    Preparing,
+    Prepared,
+    Active,
+    Cancelled,
+}
+
+/// The exact canonical request the coordination plane fingerprinted
+/// `operation_id` against, mirroring `MembershipRemoteRequest`'s own
+/// identity-comparison role. `Create`'s `storage_mode` is not actually a
+/// wire field (a CREATE's creator edge is always `"eager"` by construction
+/// -- see `prepareCreateFolderGroupRow`'s own doc comment on the Worker
+/// side) -- it is filled in as that fixed constant here so both variants
+/// present the same shape for identity comparison against a local
+/// enrollment journal row, which always has a `storage_mode` regardless of
+/// `kind`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnrollmentRemoteRequest {
+    Create { group_name: String, device_id: String, storage_mode: String },
+    Join { group_id: String, device_id: String, storage_mode: String },
+}
+
+/// An enrollment operation record read back from the coordination plane,
+/// scoped by this device's own account (the Worker's
+/// `/devices/enrollment-operations/:operationId` route is itself
+/// `userId`-scoped).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrollmentOperationRecord {
+    pub status: EnrollmentRemoteStatus,
+    pub request_fingerprint: String,
+    pub request: EnrollmentRemoteRequest,
+    /// The `groupId` from the ledger row's own `result` payload, when
+    /// present (set once `prepared`/`active`). `None` while still
+    /// `preparing`, or if the Worker response omitted it.
+    pub result_group_id: Option<String>,
+}
+
+/// A role-loss-commit receipt read back from the coordination plane's
+/// `role_loss_operation_receipts` table (Phase 2.1-C1) -- its mere
+/// existence IS the evidence: a receipt means the underlying acl mutation
+/// committed, full stop, there is no separate `status` field the way
+/// enrollment/membership have one. See
+/// `coordination-worker/src/db/queries.ts`'s `commitRoleLossGuarded` for
+/// why this receipt is reliable (a `changes()`-chained, replay-idempotent
+/// UPSERT) rather than a best-effort side record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleLossOperationRecord {
+    pub group_id: String,
+    pub source_device_id: String,
+    pub target_device_id: String,
+    pub lease_id: Option<String>,
+    /// `"demote"` or `"revoke"` -- the Worker's own wire action string (see
+    /// `commitHandoffRoleLoss`'s own doc comment for why the daemon's own
+    /// `Unlink` role-loss action is sent to the Worker as `"demote"` too).
+    pub action: String,
+    /// Never `None` once decode succeeds -- `query_role_loss_operation`
+    /// itself rejects a NULL generation as `Unsupported` before this type is
+    /// ever constructed (generation 8's column is `NOT NULL`), so this field
+    /// is non-optional rather than a redundant always-`Some` wrapper.
+    pub membership_generation: i64,
+    pub committed_at_unix: i64,
+}
+
 mod imp {
     use base64::Engine;
     use serde::{Deserialize, Serialize};
 
     use super::{
-        ActivateOutcome, EndpointCandidate, HandoffCommitResult, HandoffLeaseGrant,
-        RoleLossCommitOutcome, RoleLossCompensationOutcome,
+        categorize_error_status, categorize_transport_error, evidence_http_client, ActivateOutcome,
+        EndpointCandidate, EnrollmentOperationRecord, EnrollmentRemoteRequest,
+        EnrollmentRemoteStatus, HandoffCommitResult, HandoffLeaseGrant, MembershipOperationLookup,
+        MembershipOperationRecord, MembershipRemoteRequest, MembershipRemoteRequestGroup,
+        MembershipRemoteResult, MembershipRemoteStatus, RemoteEvidenceErrorCategory,
+        RemoteQueryError, RoleLossCommitOutcome, RoleLossCompensationOutcome,
+        RoleLossOperationRecord,
     };
 
     #[derive(Serialize)]
@@ -151,7 +333,7 @@ mod imp {
     }
 
     /// Same shape as `post_no_content`, but reports success/failure back to
-    /// the caller instead of only logging it -- `pending_enrollment::reconcile`
+    /// the caller instead of only logging it -- `EnrollmentRecoveryService::reconcile_once`
     /// needs to know whether it may drop its local marker.
     async fn post_no_content_ok<B: Serialize>(
         url: String,
@@ -237,7 +419,7 @@ mod imp {
     /// `POST /shares/groups/:groupId/activate`), turning a Pending group +
     /// its creator's Pending eager membership into the real thing. Called
     /// both by the CLI's own create flow (immediately, via its own HTTP
-    /// client) and by `pending_enrollment::reconcile` on daemon startup, for
+    /// client) and by `EnrollmentRecoveryService::reconcile_once` on daemon startup, for
     /// a marker left over from a killed CLI process.
     pub async fn activate_create(
         addr: &str,
@@ -307,6 +489,184 @@ mod imp {
             access_token,
             &JoinOperationBody { operation_id, device_id },
             "join cancel",
+        )
+        .await
+    }
+
+    /// Sends the create-prepare request and classifies the response -- see
+    /// [`super::EnrollmentPrepareOutcome`].
+    pub async fn prepare_create(
+        addr: &str,
+        access_token: &str,
+        operation_id: &str,
+        name: &str,
+        device_id: &str,
+    ) -> super::EnrollmentPrepareOutcome {
+        use super::EnrollmentPrepareOutcome;
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            operation_id: &'a str,
+            name: &'a str,
+            creating_device_id: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Response {
+            group_id: String,
+        }
+
+        let response = match reqwest::Client::new()
+            .post(format!("{addr}/shares/groups/prepare"))
+            .bearer_auth(access_token)
+            .json(&Body { operation_id, name, creating_device_id: device_id })
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return EnrollmentPrepareOutcome::Ambiguous(error.to_string()),
+        };
+        let status = response.status();
+        if status == reqwest::StatusCode::CONFLICT {
+            return EnrollmentPrepareOutcome::Conflict(response.text().await.unwrap_or_default());
+        }
+        if status.is_client_error() {
+            return EnrollmentPrepareOutcome::DefinitelyRejected(format!(
+                "create prepare returned HTTP {status}: {}",
+                response.text().await.unwrap_or_default()
+            ));
+        }
+        if !status.is_success() {
+            return EnrollmentPrepareOutcome::Ambiguous(format!(
+                "create prepare returned HTTP {status}: {}",
+                response.text().await.unwrap_or_default()
+            ));
+        }
+        match response.json::<Response>().await {
+            Ok(body) if !body.group_id.is_empty() => {
+                EnrollmentPrepareOutcome::Prepared { group_id: body.group_id }
+            }
+            Ok(_) => EnrollmentPrepareOutcome::Ambiguous(
+                "create prepare returned an empty group_id".to_string(),
+            ),
+            Err(error) => EnrollmentPrepareOutcome::Ambiguous(format!(
+                "create prepare may have committed but its response was unparseable: {error}"
+            )),
+        }
+    }
+
+    /// Sends the join-prepare request and classifies the response. Unlike
+    /// create, the group id is already known (it names the group being
+    /// joined), so a bare 2xx is enough to confirm `Prepared`.
+    pub async fn prepare_join(
+        addr: &str,
+        access_token: &str,
+        operation_id: &str,
+        group_id: &str,
+        device_id: &str,
+        storage_mode: &str,
+    ) -> super::EnrollmentPrepareOutcome {
+        use super::EnrollmentPrepareOutcome;
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            operation_id: &'a str,
+            device_id: &'a str,
+            storage_mode: &'a str,
+        }
+
+        let response = match reqwest::Client::new()
+            .post(format!("{addr}/shares/groups/{group_id}/join/prepare"))
+            .bearer_auth(access_token)
+            .json(&Body { operation_id, device_id, storage_mode })
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return EnrollmentPrepareOutcome::Ambiguous(error.to_string()),
+        };
+        let status = response.status();
+        if status.is_success() {
+            return EnrollmentPrepareOutcome::Prepared { group_id: group_id.to_string() };
+        }
+        let detail = format!(
+            "join prepare returned HTTP {status}: {}",
+            response.text().await.unwrap_or_default()
+        );
+        if status == reqwest::StatusCode::CONFLICT {
+            EnrollmentPrepareOutcome::Conflict(detail)
+        } else if status.is_client_error() {
+            EnrollmentPrepareOutcome::DefinitelyRejected(detail)
+        } else {
+            EnrollmentPrepareOutcome::Ambiguous(detail)
+        }
+    }
+
+    async fn classify_cancel_response(
+        response: Result<reqwest::Response, reqwest::Error>,
+    ) -> super::EnrollmentCancelOutcome {
+        use super::EnrollmentCancelOutcome;
+
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => return EnrollmentCancelOutcome::Ambiguous(error.to_string()),
+        };
+        let status = response.status();
+        if status.is_success() {
+            return EnrollmentCancelOutcome::Confirmed;
+        }
+        let detail =
+            format!("cancel returned HTTP {status}: {}", response.text().await.unwrap_or_default());
+        // A 404 here is NOT a routine "already gone" -- the Worker's own
+        // cancel routes already fold that into an ordinary 2xx no-op, so a
+        // 404 or 409 means this operation_id's identity itself doesn't
+        // match.
+        if status == reqwest::StatusCode::CONFLICT || status == reqwest::StatusCode::NOT_FOUND {
+            EnrollmentCancelOutcome::Conflict(detail)
+        } else {
+            EnrollmentCancelOutcome::Ambiguous(detail)
+        }
+    }
+
+    /// Sends the create-cancel request and classifies the response -- see
+    /// [`super::EnrollmentCancelOutcome`]. Distinct from the plain bool
+    /// [`cancel_create`] above: `EnrollmentService`'s own compensation
+    /// sequence needs to tell a confirmed identity mismatch apart from a
+    /// merely-ambiguous transport failure, which a bare bool cannot.
+    pub async fn cancel_create_classified(
+        addr: &str,
+        access_token: &str,
+        group_id: &str,
+        operation_id: &str,
+    ) -> super::EnrollmentCancelOutcome {
+        classify_cancel_response(
+            reqwest::Client::new()
+                .post(format!("{addr}/shares/groups/{group_id}/cancel"))
+                .bearer_auth(access_token)
+                .json(&OperationIdBody { operation_id })
+                .send()
+                .await,
+        )
+        .await
+    }
+
+    /// Sends the join-cancel request and classifies the response -- see
+    /// [`cancel_create_classified`]'s own doc comment.
+    pub async fn cancel_join_classified(
+        addr: &str,
+        access_token: &str,
+        group_id: &str,
+        operation_id: &str,
+        device_id: &str,
+    ) -> super::EnrollmentCancelOutcome {
+        classify_cancel_response(
+            reqwest::Client::new()
+                .post(format!("{addr}/shares/groups/{group_id}/join/cancel"))
+                .bearer_auth(access_token)
+                .json(&JoinOperationBody { operation_id, device_id })
+                .send()
+                .await,
         )
         .await
     }
@@ -542,6 +902,7 @@ mod imp {
         target_device_id: &str,
         lease_id: Option<&str>,
         action: &str,
+        operation_id: &str,
     ) -> RoleLossCommitOutcome {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
@@ -551,6 +912,7 @@ mod imp {
             #[serde(skip_serializing_if = "Option::is_none")]
             lease_id: Option<&'a str>,
             action: &'a str,
+            operation_id: &'a str,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -560,7 +922,7 @@ mod imp {
             lease_id: Option<String>,
         }
         let url = format!("{addr}/shares/groups/{group_id}/handoff/commit");
-        let body = Body { source_device_id, target_device_id, lease_id, action };
+        let body = Body { source_device_id, target_device_id, lease_id, action, operation_id };
         let resp = match reqwest::Client::new()
             .post(&url)
             .bearer_auth(access_token)
@@ -580,7 +942,9 @@ mod imp {
             let text = resp.text().await.unwrap_or_default();
             let detail =
                 format!("coordination plane refused the handoff commit ({status}): {text}");
-            return if status.is_client_error() {
+            return if status == reqwest::StatusCode::CONFLICT {
+                RoleLossCommitOutcome::Conflict(detail)
+            } else if status.is_client_error() {
                 RoleLossCommitOutcome::DefinitelyRejected(detail)
             } else {
                 RoleLossCommitOutcome::Ambiguous(detail)
@@ -599,6 +963,518 @@ mod imp {
             membership_generation: parsed.membership_generation,
             lease_id: parsed.lease_id,
         })
+    }
+
+    /// Resolves a share edge id to its `(group_id, device_id)` by listing
+    /// the account's own share edges, the same `/shares` route the CLI used
+    /// to call directly. Kept here so `revoke_edge` is fully daemon-owned:
+    /// the CLI never sees the edge listing or issues a raw HTTP delete
+    /// against the coordination plane for it (see
+    /// `ReplicaMembershipService::revoke_edge`'s doc comment).
+    pub async fn resolve_edge(
+        addr: &str,
+        access_token: &str,
+        edge_id: &str,
+    ) -> Result<Option<(String, String)>, String> {
+        #[derive(Deserialize)]
+        struct EdgeInfo {
+            edge_id: String,
+            group_id: String,
+            device_id: String,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            edges: Vec<EdgeInfo>,
+        }
+        let resp = reqwest::Client::new()
+            .get(format!("{addr}/shares"))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("listing shares returned HTTP {}", resp.status()));
+        }
+        let parsed: Resp = resp.json().await.map_err(|e| e.to_string())?;
+        Ok(parsed
+            .edges
+            .into_iter()
+            .find(|edge| edge.edge_id == edge_id)
+            .map(|edge| (edge.group_id, edge.device_id)))
+    }
+
+    /// Confirms whether a daemon-driven membership mutation actually landed,
+    /// by `operation_id` -- see `MembershipOperationLookup`'s doc comment.
+    /// Scoped by this device's own account, never by device ownership, so it
+    /// keeps answering correctly after the removed device's own row is gone
+    /// (unlike `resolve_edge`/eager-groups above). `Ok(NotFound)` means a
+    /// genuine HTTP 404 -- no durable operation record was returned for
+    /// this operation id at lookup time. It does NOT prove that the
+    /// request was definitely rejected, that no historical mutation
+    /// occurred, or that treating this operation as resolved is safe --
+    /// see `RemoteEvidence`'s own doc comment
+    /// for the same contract stated once, generally. Distinct from `Err`,
+    /// which means the query itself couldn't be answered (network error,
+    /// 5xx) and the caller must treat the operation's outcome as still
+    /// unknown, not as rejected.
+    pub async fn query_membership_operation(
+        addr: &str,
+        access_token: &str,
+        operation_id: &str,
+    ) -> Result<MembershipOperationLookup, String> {
+        query_membership_operation_categorized(
+            &evidence_http_client(),
+            addr,
+            access_token,
+            operation_id,
+        )
+        .await
+        .map_err(|e| e.message)
+    }
+
+    /// Same lookup as [`query_membership_operation`], sharing its entire
+    /// request-building/parsing implementation, but with the failure
+    /// categorized -- see [`RemoteEvidenceErrorCategory`]'s own doc
+    /// comment. Used by the recovery-evidence module's
+    /// `RecoveryEvidenceSource` implementation, which must distinguish a
+    /// timeout/network/server error (still `Unavailable`, might resolve on
+    /// retry) from a 404 (`RecordNotFound`, a real answer) -- a
+    /// distinction the plain `String` error above deliberately does not
+    /// expose to its own (pre-existing) callers, which never needed it.
+    /// Takes `client` explicitly (rather than building one internally, the
+    /// way every other function in this file does) so a test can inject a
+    /// short-timeout client and exercise a genuine, real `Timeout`
+    /// classification end to end, through `WorkerEvidenceSource` itself,
+    /// instead of only unit-testing `categorize_transport_error` in
+    /// isolation against a raw `reqwest::Error`.
+    pub async fn query_membership_operation_categorized(
+        client: &reqwest::Client,
+        addr: &str,
+        access_token: &str,
+        operation_id: &str,
+    ) -> Result<MembershipOperationLookup, RemoteQueryError> {
+        // Decoded as a plain `String` below, not a serde enum -- see
+        // `query_enrollment_operation`'s identical reasoning for why an
+        // unrecognized-but-well-formed status must be `Unsupported`, not
+        // `MalformedResponse`.
+        #[derive(Deserialize, Default)]
+        #[serde(rename_all = "camelCase")]
+        struct ResultBody {
+            #[serde(default)]
+            affected_group_ids: Option<Vec<String>>,
+            target_device_id: Option<String>,
+            membership_generation: Option<i64>,
+            lease_id: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RequestGroupBody {
+            group_id: String,
+            target_device_id: Option<String>,
+            lease_id: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RequestBody {
+            // Present on the wire (the Worker's own fingerprint input
+            // includes it) but unused here: this lookup is already scoped
+            // to the caller's own account server-side, so there's nothing
+            // left to compare it against locally.
+            #[allow(dead_code)]
+            user_id: String,
+            action: String,
+            removed_device_id: String,
+            mode: String,
+            groups: Vec<RequestGroupBody>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Resp {
+            operation_id: String,
+            status: String,
+            action: String,
+            removed_device_id: String,
+            request_fingerprint: String,
+            request: RequestBody,
+            result: Option<ResultBody>,
+            rejection_code: Option<String>,
+            rejection_detail: Option<String>,
+        }
+        let resp = client
+            .get(format!("{addr}/devices/membership-operations/{operation_id}"))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|e| RemoteQueryError {
+                category: categorize_transport_error(&e),
+                message: e.to_string(),
+            })?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(MembershipOperationLookup::NotFound);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            return Err(RemoteQueryError {
+                category: categorize_error_status(status),
+                message: format!("membership operation lookup returned HTTP {status}"),
+            });
+        }
+        let parsed: Resp = resp.json().await.map_err(|e| RemoteQueryError {
+            category: RemoteEvidenceErrorCategory::MalformedResponse,
+            message: e.to_string(),
+        })?;
+        // Same endpoint-contract check as `query_enrollment_operation`'s own
+        // -- see that function's identical comment.
+        if parsed.operation_id != operation_id {
+            return Err(RemoteQueryError {
+                category: RemoteEvidenceErrorCategory::MalformedResponse,
+                message: format!(
+                    "operation id mismatch: requested {operation_id}, received {}",
+                    parsed.operation_id
+                ),
+            });
+        }
+        let status = match parsed.status.as_str() {
+            "committed" => MembershipRemoteStatus::Committed,
+            "definitely-rejected" => MembershipRemoteStatus::DefinitelyRejected,
+            other => {
+                return Err(RemoteQueryError {
+                    category: RemoteEvidenceErrorCategory::Unsupported,
+                    message: format!("unsupported membership operation status: {other}"),
+                });
+            }
+        };
+        // The Worker's own `MembershipOperationAction`/`MembershipOperationMode`
+        // wire types (`coordination-worker/src/db/types.ts`) are each a
+        // closed two-value set -- an unrecognized value here means a newer
+        // Worker deploy this build predates, `Unsupported`, not a shape
+        // violation. Checked on both the top-level `action` and the nested
+        // `request.action` since they are independently-decoded fields.
+        for candidate in [parsed.action.as_str(), parsed.request.action.as_str()] {
+            if candidate != "revoke" && candidate != "remove-device" {
+                return Err(RemoteQueryError {
+                    category: RemoteEvidenceErrorCategory::Unsupported,
+                    message: format!("unsupported membership operation action: {candidate}"),
+                });
+            }
+        }
+        if parsed.request.mode != "guarded" && parsed.request.mode != "plain" {
+            return Err(RemoteQueryError {
+                category: RemoteEvidenceErrorCategory::Unsupported,
+                message: format!("unsupported membership operation mode: {}", parsed.request.mode),
+            });
+        }
+        // Two independently-decoded fields naming the same request
+        // (top-level vs. `request.*`) disagreeing is not an unrecognized
+        // value -- it is the response contradicting itself, which is
+        // `MalformedResponse`, not `Unsupported`.
+        if parsed.action != parsed.request.action {
+            return Err(RemoteQueryError {
+                category: RemoteEvidenceErrorCategory::MalformedResponse,
+                message: format!(
+                    "membership operation action mismatch: top-level {}, request {}",
+                    parsed.action, parsed.request.action
+                ),
+            });
+        }
+        if parsed.removed_device_id != parsed.request.removed_device_id {
+            return Err(RemoteQueryError {
+                category: RemoteEvidenceErrorCategory::MalformedResponse,
+                message: format!(
+                    "membership operation removed device mismatch: top-level {}, request {}",
+                    parsed.removed_device_id, parsed.request.removed_device_id
+                ),
+            });
+        }
+        let result = parsed.result.map(|r| MembershipRemoteResult {
+            affected_group_ids: r.affected_group_ids,
+            target_device_id: r.target_device_id,
+            membership_generation: r.membership_generation,
+            lease_id: r.lease_id,
+        });
+        let request = MembershipRemoteRequest {
+            action: parsed.request.action,
+            removed_device_id: parsed.request.removed_device_id,
+            mode: parsed.request.mode,
+            groups: parsed
+                .request
+                .groups
+                .into_iter()
+                .map(|group| MembershipRemoteRequestGroup {
+                    group_id: group.group_id,
+                    target_device_id: group.target_device_id,
+                    lease_id: group.lease_id,
+                })
+                .collect(),
+        };
+        Ok(MembershipOperationLookup::Found(Box::new(MembershipOperationRecord {
+            status,
+            action: parsed.action,
+            removed_device_id: parsed.removed_device_id,
+            request_fingerprint: parsed.request_fingerprint,
+            request,
+            result,
+            rejection_code: parsed.rejection_code,
+            rejection_detail: parsed.rejection_detail,
+        })))
+    }
+
+    /// Reads the coordination plane's own `enrollment_operations` ledger
+    /// row by `operation_id`, scoped to this device's own account (the
+    /// Worker route itself is `userId`-scoped). `Ok(None)` means a genuine
+    /// HTTP 404 -- no durable operation record was returned for this
+    /// operation id at lookup time. It does NOT prove that the request was
+    /// definitely rejected, that no historical mutation occurred, or that
+    /// treating this operation as resolved is safe -- see
+    /// `RemoteEvidence`'s own doc comment for
+    /// the same contract stated once, generally. Distinct from `Err`, which
+    /// means the query itself could not be answered -- see
+    /// [`RemoteEvidenceErrorCategory`]'s own doc comment for why these must
+    /// never be conflated.
+    pub async fn query_enrollment_operation(
+        client: &reqwest::Client,
+        addr: &str,
+        access_token: &str,
+        operation_id: &str,
+    ) -> Result<Option<EnrollmentOperationRecord>, RemoteQueryError> {
+        // `kind`/`status` are decoded as plain `String`, not a serde enum:
+        // a serde enum fails the ENTIRE response parse on an unrecognized
+        // variant, which this lookup would then report as
+        // `MalformedResponse` -- indistinguishable from genuinely broken
+        // JSON. Matched explicitly below instead, so an unrecognized-but
+        // well-formed value (a newer Worker deploy adding a status this
+        // build predates) is reported as `Unsupported`.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RequestBody {
+            // Present on the wire (the fingerprint input includes it) but
+            // unused here: this lookup is already scoped to the caller's
+            // own account server-side.
+            #[allow(dead_code)]
+            user_id: String,
+            #[serde(default)]
+            group_name: Option<String>,
+            #[serde(default)]
+            group_id: Option<String>,
+            device_id: String,
+            #[serde(default)]
+            storage_mode: Option<String>,
+        }
+        #[derive(Deserialize, Default)]
+        struct ResultBody {
+            #[serde(rename = "groupId")]
+            group_id: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Resp {
+            operation_id: String,
+            kind: String,
+            status: String,
+            request_fingerprint: String,
+            request: RequestBody,
+            result: Option<ResultBody>,
+        }
+        let resp = client
+            .get(format!("{addr}/devices/enrollment-operations/{operation_id}"))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|e| RemoteQueryError {
+                category: categorize_transport_error(&e),
+                message: e.to_string(),
+            })?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            return Err(RemoteQueryError {
+                category: categorize_error_status(status),
+                message: format!("enrollment operation lookup returned HTTP {status}"),
+            });
+        }
+        let parsed: Resp = resp.json().await.map_err(|e| RemoteQueryError {
+            category: RemoteEvidenceErrorCategory::MalformedResponse,
+            message: e.to_string(),
+        })?;
+        // The endpoint's own contract is to answer for exactly the
+        // requested operation_id -- a mismatch means the Worker response
+        // itself broke that contract (not a local-vs-remote identity
+        // question C2's diagnosis engine handles), so this is
+        // `MalformedResponse`, not `Conflict` (which does not even exist
+        // at this layer).
+        if parsed.operation_id != operation_id {
+            return Err(RemoteQueryError {
+                category: RemoteEvidenceErrorCategory::MalformedResponse,
+                message: format!(
+                    "operation id mismatch: requested {operation_id}, received {}",
+                    parsed.operation_id
+                ),
+            });
+        }
+        let status = match parsed.status.as_str() {
+            "preparing" => EnrollmentRemoteStatus::Preparing,
+            "prepared" => EnrollmentRemoteStatus::Prepared,
+            "active" => EnrollmentRemoteStatus::Active,
+            "cancelled" => EnrollmentRemoteStatus::Cancelled,
+            other => {
+                return Err(RemoteQueryError {
+                    category: RemoteEvidenceErrorCategory::Unsupported,
+                    message: format!("unsupported enrollment status: {other}"),
+                });
+            }
+        };
+        // `storage_mode` is a real wire field for `join`; for `create` it
+        // is always `"eager"` by construction (see
+        // `EnrollmentRemoteRequest`'s own doc comment) -- an absent field
+        // there is expected, not a shape violation. A `join` response
+        // missing it, or either kind missing its own required id field, IS
+        // a shape this build doesn't recognize.
+        let request = match parsed.kind.as_str() {
+            "create" => {
+                let Some(group_name) = parsed.request.group_name else {
+                    return Err(RemoteQueryError {
+                        category: RemoteEvidenceErrorCategory::Unsupported,
+                        message: "create enrollment response missing groupName".to_string(),
+                    });
+                };
+                EnrollmentRemoteRequest::Create {
+                    group_name,
+                    device_id: parsed.request.device_id,
+                    storage_mode: "eager".to_string(),
+                }
+            }
+            "join" => {
+                let (Some(group_id), Some(storage_mode)) =
+                    (parsed.request.group_id, parsed.request.storage_mode)
+                else {
+                    return Err(RemoteQueryError {
+                        category: RemoteEvidenceErrorCategory::Unsupported,
+                        message: "join enrollment response missing groupId/storageMode".to_string(),
+                    });
+                };
+                if storage_mode != "eager" && storage_mode != "on-demand" {
+                    return Err(RemoteQueryError {
+                        category: RemoteEvidenceErrorCategory::Unsupported,
+                        message: format!("unsupported join storage mode: {storage_mode}"),
+                    });
+                }
+                EnrollmentRemoteRequest::Join {
+                    group_id,
+                    device_id: parsed.request.device_id,
+                    storage_mode,
+                }
+            }
+            other => {
+                return Err(RemoteQueryError {
+                    category: RemoteEvidenceErrorCategory::Unsupported,
+                    message: format!("unsupported enrollment kind: {other}"),
+                });
+            }
+        };
+        Ok(Some(EnrollmentOperationRecord {
+            status,
+            request_fingerprint: parsed.request_fingerprint,
+            request,
+            result_group_id: parsed.result.and_then(|r| r.group_id),
+        }))
+    }
+
+    /// Reads the coordination plane's `role_loss_operation_receipts` row by
+    /// `operation_id` (Phase 2.1-C1) -- the receipt's mere existence IS the
+    /// evidence that a role-loss commit landed; there is no separate
+    /// status field the way enrollment/membership have one. `Ok(None)`
+    /// means a genuine HTTP 404 -- no durable receipt was returned for this
+    /// operation id at lookup time. It does NOT prove that the request was
+    /// definitely rejected, that no historical mutation occurred (a commit
+    /// made before generation 7, when this table did not exist, leaves no
+    /// receipt either), or that treating this operation as resolved is
+    /// safe -- see `RemoteEvidence`'s own doc
+    /// comment for the same contract stated once, generally.
+    pub async fn query_role_loss_operation(
+        client: &reqwest::Client,
+        addr: &str,
+        access_token: &str,
+        operation_id: &str,
+    ) -> Result<Option<RoleLossOperationRecord>, RemoteQueryError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Resp {
+            operation_id: String,
+            group_id: String,
+            source_device_id: String,
+            target_device_id: String,
+            lease_id: Option<String>,
+            action: String,
+            membership_generation: Option<i64>,
+            committed_at: i64,
+        }
+        let resp = client
+            .get(format!("{addr}/devices/role-loss-operations/{operation_id}"))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|e| RemoteQueryError {
+                category: categorize_transport_error(&e),
+                message: e.to_string(),
+            })?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            return Err(RemoteQueryError {
+                category: categorize_error_status(status),
+                message: format!("role-loss operation lookup returned HTTP {status}"),
+            });
+        }
+        let parsed: Resp = resp.json().await.map_err(|e| RemoteQueryError {
+            category: RemoteEvidenceErrorCategory::MalformedResponse,
+            message: e.to_string(),
+        })?;
+        // Same endpoint-contract check as `query_enrollment_operation`'s own
+        // -- see that function's identical comment.
+        if parsed.operation_id != operation_id {
+            return Err(RemoteQueryError {
+                category: RemoteEvidenceErrorCategory::MalformedResponse,
+                message: format!(
+                    "operation id mismatch: requested {operation_id}, received {}",
+                    parsed.operation_id
+                ),
+            });
+        }
+        // `action` is well-formed JSON but has a closed, known set of legal
+        // values on the Worker side (`"demote"`/`"revoke"` -- see
+        // `commitHandoffRoleLoss`'s own doc comment) -- anything else is
+        // `Unsupported`, not a shape violation.
+        if parsed.action != "demote" && parsed.action != "revoke" {
+            return Err(RemoteQueryError {
+                category: RemoteEvidenceErrorCategory::Unsupported,
+                message: format!("unsupported role-loss action: {}", parsed.action),
+            });
+        }
+        // Generation 8's `role_loss_operation_receipts.membership_generation`
+        // column is `NOT NULL` (see that table's own migration comment) --
+        // a receipt with no generation at all is a shape this build does
+        // not recognize, not a legitimately absent value; treating it as
+        // generation 0 (an earlier version of this code did) would silently
+        // fabricate a successful outcome from a malformed row.
+        let Some(membership_generation) = parsed.membership_generation else {
+            return Err(RemoteQueryError {
+                category: RemoteEvidenceErrorCategory::Unsupported,
+                message: "role-loss receipt missing membershipGeneration".to_string(),
+            });
+        };
+        Ok(Some(RoleLossOperationRecord {
+            group_id: parsed.group_id,
+            source_device_id: parsed.source_device_id,
+            target_device_id: parsed.target_device_id,
+            lease_id: parsed.lease_id,
+            action: parsed.action,
+            membership_generation,
+            committed_at_unix: parsed.committed_at,
+        }))
     }
 
     pub async fn compensate_handoff_role_loss(

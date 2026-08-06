@@ -35,11 +35,11 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
+use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::app::{self, DaemonConfig};
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_daemon::link_manager;
-use yadorilink_sync_core::debounce::DebounceConfig;
-use yadorilink_sync_core::watcher::{FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource};
+use yadorilink_filesystem_sync::debounce::DebounceConfig;
+use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource};
 
 const GROUP_ID: &str = "dst-daemon-smoke-group";
 
@@ -88,7 +88,7 @@ type IndexSnapshot = Vec<(String, i64, Vec<String>)>;
 /// Reads the linked group's live records out of `DaemonState` and folds
 /// them into a deterministic, order-independent [`IndexSnapshot`].
 fn capture_index(state: &DaemonState) -> Result<IndexSnapshot, String> {
-    let files = state.sync_state.list_files(GROUP_ID).map_err(|e| format!("list_files: {e}"))?;
+    let files = state.replica_coordinator.list_files(GROUP_ID).map_err(|e| format!("list_files: {e}"))?;
     let mut snapshot: IndexSnapshot = files
         .iter()
         .filter(|r| !r.deleted)
@@ -168,13 +168,13 @@ async fn scenario_body(seed: u64) -> Result<IndexSnapshot, String> {
     // downstream stage (debounce, indexing, materialization) is the real
     // daemon code.
     let (watch_source, events_tx) = SimulatedFolderWatchSource::new(64);
-    link_manager::start_link_watch_with_source(
-        state.clone(),
-        root.to_string_lossy().to_string(),
-        GROUP_ID.to_string(),
-        Arc::new(watch_source),
-    )
-    .map_err(|e| format!("start_link_watch_with_source: {e}"))?;
+    LinkRuntimeController::new(state.clone())
+        .start_with_source(
+            root.to_string_lossy().to_string(),
+            GROUP_ID.to_string(),
+            Arc::new(watch_source),
+        )
+        .map_err(|e| format!("start_link_watch_with_source: {e}"))?;
 
     // 3) INDEXES: write a file, then deliver the synthetic watcher event for
     // it. The scenario controls the timing relative to the write, exactly
@@ -188,7 +188,7 @@ async fn scenario_body(seed: u64) -> Result<IndexSnapshot, String> {
     // real wall-clock stamp. See `deterministic_mtime_nanos`.
     let mtime_nanos = deterministic_mtime_nanos(seed);
     stamp_deterministic_mtime(&file_path, mtime_nanos)?;
-    yadorilink_sync_core::peer_session::set_test_clock_override(mtime_nanos);
+    yadorilink_peer_session::peer_session::set_test_clock_override(mtime_nanos);
     tokio::time::sleep(Duration::from_millis(5)).await;
     events_tx
         .send(FsChangeEvent { path: file_path.clone(), kind: FsChangeKind::CreatedOrModified })

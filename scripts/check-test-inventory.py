@@ -9,13 +9,24 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CI = ROOT / ".github/workflows/ci.yml"
+CI_FILES = [
+    path
+    for path in (
+        ROOT / ".github/workflows/ci.yml",
+        ROOT / ".github/workflows/ci-fast.yml",
+        ROOT / ".github/workflows/ci-full.yml",
+    )
+    if path.exists()
+]
 BETA_HEAT = ROOT / ".github/workflows/beta-heat.yml"
 IGNORED_RUNNER = ROOT / "scripts/run-all-ignored-tests.sh"
 CRATES = ROOT / "crates"
 DST_CORPUS = (
+    # `dst_support/` and the daemon workflow/E2E scenarios moved to
+    # `yadorilink-daemon` in Phase 7D-10.4, taking the shared `dst_corpus/`
+    # jsonl files (including this one) with them.
     ROOT
-    / "crates/yadorilink-sync-core/tests/dst_corpus/network_fault_chaos_cases.jsonl"
+    / "crates/yadorilink-daemon/tests/dst_corpus/network_fault_chaos_cases.jsonl"
 )
 
 # Integration test files (`crates/*/tests/*.rs`) for which running only in the
@@ -27,6 +38,15 @@ DST_CORPUS = (
 # guard, so a flake-prone test can never silently live only in the
 # multi-threaded workspace run.
 WORKSPACE_MULTITHREAD_ALLOWLIST: dict[str, str] = {
+    # Pure in-memory SQLite fuzz: every seed builds its own private
+    # ReplicaCoordinators, no network, no shared filesystem, no globals —
+    # fully deterministic and safe alongside any other test. (Moved from
+    # `yadorilink-sync-core` in Phase 7D-10.4; repointed off `SyncState` onto
+    # `yadorilink-daemon`'s `ReplicaCoordinator` in Phase 7D-10's final
+    # sync-core deletion pass, still constructed via a dev-dependency
+    # back-edge, same shape as `dag_store`'s own pre-existing test fixtures
+    # in this crate.)
+    "yadorilink-sync-sqlite/tests/dag_admission_order_fuzz.rs": "self-contained in-memory SQLite states per seed; no network/disk/global contention",
     # CLI end-to-end tests each drive at most one in-process daemon over a
     # per-test unix control socket in its own tempdir (or exercise pure CLI
     # parsing); deterministic, with no cross-test loopback/disk contention.
@@ -54,17 +74,47 @@ WORKSPACE_MULTITHREAD_ALLOWLIST: dict[str, str] = {
     # DAG store RED regression tests: each opens its own rusqlite
     # `Connection::open_in_memory()` and never touches the filesystem, a port,
     # or any other cross-test resource, so concurrent execution cannot flake.
-    "yadorilink-sync-core/tests/dag_checkpoint_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
-    "yadorilink-sync-core/tests/dag_checkpoint_sequence_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
-    "yadorilink-sync-core/tests/dag_compaction_boundary_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
-    "yadorilink-sync-core/tests/dag_compaction_restart_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
-    "yadorilink-sync-core/tests/dag_frontier_ghost_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
-    "yadorilink-sync-core/tests/dag_frontier_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
-    "yadorilink-sync-core/tests/dag_orphan_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
-    "yadorilink-sync-core/tests/dag_prune_proof_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
-    "yadorilink-sync-core/tests/dag_retained_history_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
-    "yadorilink-sync-core/tests/dag_serving_authorization_red.rs": "isolated in-memory SQLite connection per test; no shared state",
-    "yadorilink-sync-core/tests/dag_store_repair.rs": "isolated in-memory SQLite connection per test; no shared state",
+    # (Moved from `yadorilink-sync-core` in Phase 7D-10.4 — `dag_store` itself
+    # already lives in this crate, moved in 7D-7.3; these tests were only
+    # reachable through sync-core's re-export shim before this move.)
+    "yadorilink-sync-sqlite/tests/dag_checkpoint_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
+    "yadorilink-sync-sqlite/tests/dag_checkpoint_sequence_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
+    "yadorilink-sync-sqlite/tests/dag_compaction_boundary_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
+    "yadorilink-sync-sqlite/tests/dag_compaction_restart_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
+    "yadorilink-sync-sqlite/tests/dag_frontier_ghost_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
+    "yadorilink-sync-sqlite/tests/dag_frontier_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
+    "yadorilink-sync-sqlite/tests/dag_orphan_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
+    "yadorilink-sync-sqlite/tests/dag_prune_proof_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
+    "yadorilink-sync-sqlite/tests/dag_retained_history_integrity_red.rs": "isolated in-memory SQLite connection per test; no shared state",
+    "yadorilink-sync-sqlite/tests/dag_serving_authorization_red.rs": "isolated in-memory SQLite connection per test; no shared state",
+    "yadorilink-sync-sqlite/tests/dag_store_repair.rs": "isolated in-memory SQLite connection per test; no shared state",
+    # `VerifiedRoot`/`RootCommitPermit` exercised against a real
+    # `ReplicaCoordinator` (moved from `yadorilink-sync-core` in Phase
+    # 7D-10.4, repointed off `SyncState` in Phase 7D-10's final sync-core
+    # deletion pass): every test opens its own `tempfile::tempdir()` root
+    # and its own `ReplicaCoordinator::open`/`open_in_memory` instance, so
+    # there is no shared filesystem path, port, or global state across
+    # tests — including the deliberately concurrent
+    # `concurrent_adoption_of_the_same_unmarked_root_never_
+    # disagrees_with_itself`, whose 8-way race is internal to that one
+    # test's own threads/barrier, not against any other test.
+    "yadorilink-root-authority/tests/root_identity_verification.rs": "isolated per-test tempdir + own ReplicaCoordinator instance; no shared state across tests",
+    # `LocalChangeProcessor` scan-after-repair seam test (moved from
+    # `yadorilink-sync-core` in Phase 7D-10.4, repointed off `SyncState` in
+    # Phase 7D-10's final sync-core deletion pass): its own tempdir for the
+    # materialized root, own `tempfile::tempdir()` block store, own
+    # `ReplicaCoordinator::open_in_memory()` instance; no shared state
+    # across tests (single test in this file today).
+    "yadorilink-local-capture/tests/materialization_local_capture.rs": "isolated per-test tempdir + own ReplicaCoordinator instance; no shared state across tests",
+    # Crash-injection scenario for `repair_interrupted_materializations` +
+    # `cleanup_stale_temp_files` (moved from `yadorilink-sync-core` in Phase
+    # 7D-10.4, repointed off `SyncState` in Phase 7D-10's final sync-core
+    # deletion pass, independent of the `dst_support` harness -- not
+    # madsim-gated, just seeded and run across many variations in-process):
+    # every variation builds its own tempdir root, own `FsBlockStore`, own
+    # in-memory `ReplicaCoordinator`; no shared filesystem path, port, or
+    # global state.
+    "yadorilink-filesystem-sync/tests/dst_materialization_crash_recovery.rs": "isolated per-variation tempdir + own ReplicaCoordinator/FsBlockStore instances; no shared state across tests",
 }
 
 
@@ -117,11 +167,26 @@ def reliable_lane_failures(ci: str) -> list[str]:
         # (a) daemon whole-crate single-threaded lane
         if crate == "yadorilink-daemon" and daemon_lane:
             continue
-        # (b) DST xtask lanes / scheduled sweep (all sync-core dst_*.rs)
-        if crate == "yadorilink-sync-core" and stem.startswith("dst_") and dst_lane:
-            continue
-        # (a) sync-core wire single-threaded lane (named `--test <stem>`)
-        if crate == "yadorilink-sync-core" and named_test(stem):
+        # (b) DST xtask lanes / scheduled sweep: dropped as a rule of its own
+        # in Phase 7D-10's final sync-core deletion pass. It used to cover
+        # `yadorilink-sync-core`'s own dst_*.rs scenarios; every one of those
+        # moved to `yadorilink-daemon` in Phase 7D-10.4 and is covered by
+        # rule (a) above instead (which exempts the whole crate), and no
+        # other crate's dst_*.rs file relies on the DST xtask lanes rather
+        # than an explicit single-threaded lane or allowlist entry (e.g.
+        # `yadorilink-filesystem-sync/tests/dst_materialization_crash_
+        # recovery.rs` is deliberately not madsim/xtask-discovered -- see
+        # its own module doc -- and is covered by rule (c) below instead).
+        # `dst_lane` is still required and checked above (`ci.yml must run
+        # both per-PR DST lanes`); it just no longer gates a per-file rule
+        # here.
+        # (a) peer-session wire single-threaded lane (named `--test <stem>`).
+        # `peer_session.rs`/`crash_recovery.rs`/`dag_two_device_wire_
+        # convergence.rs` moved from `yadorilink-sync-core` to
+        # `yadorilink-peer-session` in Phase 7D-10's dedicated
+        # `peer_session.rs` pass; the same `--test <stem>` invocation now
+        # targets that crate in ci.yml.
+        if crate == "yadorilink-peer-session" and named_test(stem):
             continue
         # (c) explicit workspace-multithread allowlist
         if key in WORKSPACE_MULTITHREAD_ALLOWLIST:
@@ -173,9 +238,41 @@ def ignored_tests() -> list[tuple[Path, int, str]]:
     return found
 
 
+# An `#[ignore]`d test that `run-all-ignored-tests.sh` must NOT run, with the
+# reason. The runner exists so no ignored test is quietly forgotten; a test
+# that cannot run unattended does not become forgettable just because the
+# runner would fail on it, so it is listed here explicitly rather than left
+# to trip the registration check. Same shape and same honesty rule as
+# WORKSPACE_MULTITHREAD_ALLOWLIST below: a stale entry naming a test that no
+# longer exists is itself a failure.
+IGNORED_RUNNER_EXEMPT: dict[str, str] = {
+    "batch_position_probe": (
+        "ad hoc diagnostic: requires DST_TARGET_SEED and panics without it, "
+        "so an unattended sweep can only fail on it"
+    ),
+    # Phase 7D-10's final sync-core deletion pass: all four read
+    # `crates/yadorilink-sync-core/src`/`tests`, deleted outright, so an
+    # unattended sweep would only panic on `std::fs::read_dir`/`read_dir`
+    # of a directory that no longer exists. See
+    # `dst_impact_map_lint.rs`'s own `#[ignore]` reasons and its module doc.
+    "every_source_module_is_in_the_impact_map": (
+        "reads deleted yadorilink-sync-core/src; Phase 7E's impact-map lint gap item"
+    ),
+    "impact_map_names_no_phantom_module": (
+        "reads deleted yadorilink-sync-core/src; Phase 7E's impact-map lint gap item"
+    ),
+    "every_dst_scenario_is_in_the_impact_map": (
+        "reads deleted yadorilink-sync-core/tests; Phase 7E's impact-map lint gap item"
+    ),
+    "impact_map_names_no_phantom_scenario": (
+        "reads deleted yadorilink-sync-core/tests; Phase 7E's impact-map lint gap item"
+    ),
+}
+
+
 def main() -> int:
     failures: list[str] = []
-    ci = CI.read_text(encoding="utf-8")
+    ci = "\n".join(path.read_text(encoding="utf-8") for path in CI_FILES)
     beta_heat = BETA_HEAT.read_text(encoding="utf-8")
     ignored_runner = IGNORED_RUNNER.read_text(encoding="utf-8")
 
@@ -189,10 +286,22 @@ def main() -> int:
     failures.extend(reliable_lane_failures(ci))
     failures.extend(guard_script_failures(ci))
 
+    seen_ignored: set[str] = set()
     for path, line, test_name in ignored_tests():
+        seen_ignored.add(test_name)
+        if test_name in IGNORED_RUNNER_EXEMPT:
+            continue
         if test_name not in ignored_runner:
             failures.append(
                 f"{path.relative_to(ROOT)}:{line}: ignored test is not registered: {test_name}"
+            )
+    # Keep the exemption list honest, the same way the multithread allowlist
+    # is kept honest: an entry naming a test that no longer exists silently
+    # widens the exemption for whatever is added under that name next.
+    for test_name in IGNORED_RUNNER_EXEMPT:
+        if test_name not in seen_ignored:
+            failures.append(
+                f"IGNORED_RUNNER_EXEMPT names no #[ignore]d test: {test_name}"
             )
 
     corpus_cases = [
@@ -203,7 +312,7 @@ def main() -> int:
     if not corpus_cases:
         failures.append("DST regression corpus must contain at least one replay case")
     dst_scenario = (
-        ROOT / "crates/yadorilink-sync-core/tests/dst_network_fault_chaos.rs"
+        ROOT / "crates/yadorilink-daemon/tests/dst_network_fault_chaos.rs"
     ).read_text(encoding="utf-8")
     if "for case in load_corpus_cases()" not in dst_scenario:
         failures.append("DST network chaos scenario must replay the checked-in corpus")

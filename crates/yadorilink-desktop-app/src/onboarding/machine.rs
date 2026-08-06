@@ -97,7 +97,7 @@ pub struct GroupOption {
 }
 
 /// The machine's view of a link preflight result — deliberately independent of
-/// `yadorilink_sync_core::link_preflight::LinkPreflightReport` so the machine
+/// `yadorilink_local_storage::link_preflight::LinkPreflightReport` so the machine
 /// stays free of sync-core types. The executor converts the report into this
 /// (its `warnings` is exactly `LinkPreflightReport::warnings`), and the
 /// window renders one acknowledgement card per warning.

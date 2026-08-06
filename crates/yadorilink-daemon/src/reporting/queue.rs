@@ -15,11 +15,10 @@
 
 use std::path::PathBuf;
 
+use yadorilink_reporting::local_store::entry_store::EntryStore;
+use yadorilink_reporting::local_store::error::ReportingResult;
 use yadorilink_reporting::queue::{QueuedReportMetadata, RetentionPolicy};
 use yadorilink_reporting::schema::ReportEnvelope;
-
-use super::entry_store::EntryStore;
-use super::error::ReportingResult;
 
 pub struct QueueStore {
     inner: EntryStore,

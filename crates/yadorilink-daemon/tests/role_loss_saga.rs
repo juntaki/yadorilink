@@ -26,13 +26,14 @@
 //!   - INV-4: the compensating Worker call carries only
 //!     `(group_id, device_id, storage_mode)` -- never a digest, path, or
 //!     version.
+#![cfg(unix)]
 
 mod support;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use support::{connect_two_daemons, ensure_device_signing_key, open_file_backed_sync_state};
+use support::{connect_two_daemons, ensure_device_signing_key, open_file_backed_replica_coordinator};
 use tokio::net::UnixStream;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -44,9 +45,9 @@ use yadorilink_ipc_proto::daemonctl::{
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_sync_core::index::{RoleLossAction, RoleLossOperationState};
-use yadorilink_sync_core::types::{BlockInfo, FileRecord, MaterializationPolicy};
-use yadorilink_sync_core::version_vector::VersionVector;
+use yadorilink_replica_domain::session_state::{RoleLossAction, RoleLossOperationParams, RoleLossOperationState};
+use yadorilink_replica_domain::session_state::MaterializationPolicy;
+use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 
 const GROUP: &str = "role-loss-saga-group";
 
@@ -59,7 +60,7 @@ struct Daemon {
 
 impl Daemon {
     /// The on-disk path of this daemon's file-backed sync index -- matches
-    /// `support::open_file_backed_sync_state`'s own `dir.join("index.db")`.
+    /// `support::open_file_backed_replica_coordinator`'s own `dir.join("index.db")`.
     /// Used only by the fail-closed test, which opens an independent
     /// connection here to drop a table out from under an in-flight operation.
     fn index_db_path(&self) -> std::path::PathBuf {
@@ -70,22 +71,19 @@ impl Daemon {
 fn new_daemon(device_id: &str) -> Daemon {
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-    let (sync_state, index_dir) = open_file_backed_sync_state();
+    let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
     let root = tempfile::tempdir().unwrap();
-    state.sync_state.add_link(&root.path().to_string_lossy(), GROUP).unwrap();
+    state.replica_coordinator.link_repository().add_link(&root.path().to_string_lossy(), GROUP).unwrap();
     Daemon { state, _store_dir: store_dir, index_dir, root }
 }
 
-fn record_referencing(path_str: &str, device: &str, hash_bytes: Vec<u8>, size: u64) -> FileRecord {
-    let mut version = VersionVector::new();
-    version.increment(device);
+fn record_referencing(path_str: &str, _device: &str, hash_bytes: Vec<u8>, size: u64) -> FileRecord {
     FileRecord {
         path: path_str.to_string(),
         size,
         mtime_unix_nanos: 0,
-        version,
         blocks: vec![BlockInfo { hash: hash_bytes, offset: 0, size: size as u32 }],
         deleted: false,
     }
@@ -112,14 +110,20 @@ async fn serve(state: Arc<DaemonState>, root: &std::path::Path) -> std::path::Pa
     let socket_path = root.join("daemon.sock");
     let serve_path = socket_path.clone();
     tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(&serve_path, state).await;
+        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
+            &serve_path,
+            std::sync::Arc::new(yadorilink_daemon::control_context::ControlContext::from_state(
+                state,
+            )),
+        )
+        .await;
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
     socket_path
 }
 
 fn policy_of(state: &DaemonState, group_id: &str) -> MaterializationPolicy {
-    state.sync_state.materialization_policy_for_group(group_id).unwrap().unwrap()
+    state.replica_coordinator.link_repository().materialization_policy_for_group(group_id).unwrap().unwrap()
 }
 
 async fn request_count(server: &MockServer, method_name: &str, suffix: &str) -> usize {
@@ -162,14 +166,35 @@ async fn demoting_setup(server: &MockServer) -> (Daemon, Daemon, std::path::Path
     support::ensure_isolated_config_dir();
     let a = new_daemon("device-a");
     let b = new_daemon("device-b");
+    // Every test in this file exercises the demotion saga itself (journal
+    // write/settle/compensate ordering) -- none of them are about the
+    // on-demand pipeline's own real-vs-fake state, so unconditionally
+    // connect the fake here rather than per test. See `DaemonState::
+    // set_test_placeholder_pipeline_connected`'s own doc comment for why a
+    // daemon integration test needs this instead of the production probe
+    // (unconditionally `false`) or the free function's thread-local
+    // `OverrideForTest` (unreliable across this multi-threaded runtime).
+    b.state.set_test_placeholder_pipeline_connected(true);
 
     let content = b"the file device-a confirms holding";
     let hash = a.state.block_store.put(content).unwrap();
+    a.state
+        .replica_coordinator
+        .change_history_repository().record_group_block_provenance(GROUP, &[hex::decode(hash.as_str()).unwrap()])
+        .unwrap();
     b.state.block_store.put(content).unwrap();
     let bytes = hex::decode(hash.as_str()).unwrap();
+    // Device-b is the confirmed-ready target's OWN peer: device-a's mandatory
+    // lease issuance (`DaemonState::request_handoff_lease`) re-verifies ITS
+    // OWN readiness by querying device-b to confirm device-b durably holds
+    // this file (`peer_holds_entire_group` -> `holds_version_durably`, which
+    // requires group block provenance on the ANSWERING side, not just the
+    // asker's) -- without this, device-a's own readiness check fails and no
+    // lease is ever issued, regardless of the mocked Worker endpoint below.
+    b.state.replica_coordinator.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&bytes)).unwrap();
     let record = record_referencing("only.bin", "device-b", bytes, content.len() as u64);
-    a.state.sync_state.upsert_file(GROUP, &record).unwrap();
-    b.state.sync_state.upsert_file(GROUP, &record).unwrap();
+    a.state.replica_coordinator.file_index_repository().upsert_file(GROUP, &record, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+    b.state.replica_coordinator.file_index_repository().upsert_file(GROUP, &record, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
     b.state.set_peer_group_full_replica("device-a", GROUP, true);
@@ -187,10 +212,10 @@ async fn demoting_setup(server: &MockServer) -> (Daemon, Daemon, std::path::Path
 /// state -- the full journal-table dump this file's assertions read.
 fn all_role_loss_operations(
     state: &DaemonState,
-) -> Vec<yadorilink_sync_core::index::RoleLossOperation> {
+) -> Vec<yadorilink_replica_domain::session_state::RoleLossOperation> {
     state
-        .sync_state
-        .list_role_loss_operations_in_states(&[
+        .replica_coordinator
+        .role_loss_operation_repository().list_role_loss_operations_in_states(&[
             RoleLossOperationState::Prepared,
             RoleLossOperationState::WorkerCommitted,
             RoleLossOperationState::LocalCommitted,
@@ -355,14 +380,19 @@ async fn ambiguous_demote_keeps_prepared_journal() {
 
 /// An explicit 4xx is the only protocol outcome that guarantees the Worker
 /// rejected before committing. That terminal rejection may discard Prepared
-/// without issuing a compensating eager write.
+/// without issuing a compensating eager write. 400, not 409: 409 CONFLICT is
+/// its own distinct `RoleLossCommitOutcome::Conflict` outcome
+/// (`coordination_client::commit_handoff_role_loss`'s own status-code
+/// classification) -- an operation-id collision the daemon deliberately
+/// leaves untouched for operator attention, not the definite-rejection path
+/// this test means to exercise.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn definite_4xx_discards_prepared_journal() {
     let server = MockServer::start().await;
     mount_target_lease_issuance(&server, "lease-from-device-a").await;
     Mock::given(method("POST"))
         .and(path(format!("/shares/groups/{GROUP}/handoff/commit")))
-        .respond_with(ResponseTemplate::new(409).set_body_string("lease no longer valid"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("lease no longer valid"))
         .mount(&server)
         .await;
 
@@ -427,7 +457,7 @@ async fn demote_local_failure_after_worker_commit_is_compensated_and_rolled_back
     let racer = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let record = record_referencing("concurrent-edit.bin", "device-b", vec![0xAB; 32], 4);
-        racer_state.sync_state.upsert_file(GROUP, &record).unwrap();
+        racer_state.replica_coordinator.file_index_repository().upsert_file(GROUP, &record, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
     });
 
     let resp = send_over_socket(
@@ -511,16 +541,18 @@ async fn prepared_reconcile_restores_worker_eager_after_response_loss() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
         as i64;
     b.state
-        .sync_state
-        .insert_role_loss_operation(
+        .replica_coordinator
+        .role_loss_operation_repository().insert_role_loss_operation(
             "op-ambiguous-prepared",
             GROUP,
-            "device-b",
-            "device-a",
-            Some("lease-prepared"),
-            RoleLossAction::Demote,
-            Some(&b.root.path().to_string_lossy()),
-            now,
+            RoleLossOperationParams {
+                source_device_id: "device-b",
+                target_device_id: "device-a",
+                lease_id: Some("lease-prepared"),
+                action: RoleLossAction::Demote,
+                local_path: Some(&b.root.path().to_string_lossy()),
+                now_unix: now,
+            },
         )
         .unwrap();
 
@@ -557,21 +589,23 @@ async fn worker_committed_row_found_at_startup_is_compensated_by_the_sweep() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
         as i64;
     b.state
-        .sync_state
-        .insert_role_loss_operation(
+        .replica_coordinator
+        .role_loss_operation_repository().insert_role_loss_operation(
             "op-crash-1",
             GROUP,
-            "device-b",
-            "device-a",
-            Some("lease-crash-1"),
-            RoleLossAction::Demote,
-            Some(&b.root.path().to_string_lossy()),
-            now,
+            RoleLossOperationParams {
+                source_device_id: "device-b",
+                target_device_id: "device-a",
+                lease_id: Some("lease-crash-1"),
+                action: RoleLossAction::Demote,
+                local_path: Some(&b.root.path().to_string_lossy()),
+                now_unix: now,
+            },
         )
         .unwrap();
     b.state
-        .sync_state
-        .advance_role_loss_operation("op-crash-1", RoleLossOperationState::WorkerCommitted, now)
+        .replica_coordinator
+        .role_loss_operation_repository().advance_role_loss_operation("op-crash-1", RoleLossOperationState::WorkerCommitted, now)
         .unwrap();
 
     run_role_loss_reconciliation_sweep(&b.state).await;
@@ -612,25 +646,27 @@ async fn compensation_unreachable_leaves_the_row_compensating_and_retries() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
         as i64;
     b.state
-        .sync_state
-        .insert_role_loss_operation(
+        .replica_coordinator
+        .role_loss_operation_repository().insert_role_loss_operation(
             "op-crash-2",
             GROUP,
-            "device-b",
-            "device-a",
-            Some("lease-crash-2"),
-            RoleLossAction::Demote,
-            Some(&b.root.path().to_string_lossy()),
-            now,
+            RoleLossOperationParams {
+                source_device_id: "device-b",
+                target_device_id: "device-a",
+                lease_id: Some("lease-crash-2"),
+                action: RoleLossAction::Demote,
+                local_path: Some(&b.root.path().to_string_lossy()),
+                now_unix: now,
+            },
         )
         .unwrap();
     b.state
-        .sync_state
-        .advance_role_loss_operation("op-crash-2", RoleLossOperationState::WorkerCommitted, now)
+        .replica_coordinator
+        .role_loss_operation_repository().advance_role_loss_operation("op-crash-2", RoleLossOperationState::WorkerCommitted, now)
         .unwrap();
 
     run_role_loss_reconciliation_sweep(&b.state).await;
-    let after_first = b.state.sync_state.get_role_loss_operation("op-crash-2").unwrap();
+    let after_first = b.state.replica_coordinator.role_loss_operation_repository().get_role_loss_operation("op-crash-2").unwrap();
     let after_first = after_first.expect("an unreachable-compensation row must NOT be lost");
     assert_eq!(after_first.state, RoleLossOperationState::Compensating);
     // `>= 1`, not `== 1`: the auto-sweep spawned by `DaemonState::new` may also
@@ -647,8 +683,8 @@ async fn compensation_unreachable_leaves_the_row_compensating_and_retries() {
     run_role_loss_reconciliation_sweep(&b.state).await;
     let after_second = b
         .state
-        .sync_state
-        .get_role_loss_operation("op-crash-2")
+        .replica_coordinator
+        .role_loss_operation_repository().get_role_loss_operation("op-crash-2")
         .unwrap()
         .expect("the row must still survive a second failed compensation attempt");
     assert_eq!(after_second.state, RoleLossOperationState::Compensating);

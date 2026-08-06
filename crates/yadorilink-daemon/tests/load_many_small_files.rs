@@ -9,10 +9,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use support::{real_entry_names, wait_until_with_context};
+use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_daemon::link_manager;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_sync_core::index::SyncState;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_transport::DeviceKeyPair;
 
 const FILE_COUNT: usize = 200;
@@ -52,7 +52,7 @@ async fn many_small_files_survive_initial_sync_and_incremental_update() {
 
     let store_dir_a = tempfile::tempdir().unwrap();
     let store_a = Arc::new(FsBlockStore::new(store_dir_a.path()).unwrap());
-    let sync_state_a = Arc::new(SyncState::open_in_memory().unwrap());
+    let sync_state_a = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state_a = DaemonState::new(device_a_id.clone(), sync_state_a, store_a);
     // Give the device a change-signing key before its link watch starts, so
     // the change-DAG emitter is wired and local edits actually propagate.
@@ -61,14 +61,14 @@ async fn many_small_files_survive_initial_sync_and_incremental_update() {
 
     let store_dir_b = tempfile::tempdir().unwrap();
     let store_b = Arc::new(FsBlockStore::new(store_dir_b.path()).unwrap());
-    let sync_state_b = Arc::new(SyncState::open_in_memory().unwrap());
+    let sync_state_b = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state_b = DaemonState::new(device_b_id.clone(), sync_state_b, store_b);
     support::ensure_device_signing_key(&state_b);
     let root_b = tempfile::tempdir().unwrap();
 
     // Populate device A's folder with many small files *before* B ever
     // connects, so the initial full index carries all of them at once —
-    // exercised via `link_manager`'s pre-existing-file scan (the
+    // exercised via the daemon's own link-runtime pre-existing-file scan (the
     // `sync-engine` spec's "Initial Full Sync" requirement), not just the
     // live watcher.
     for i in 0..FILE_COUNT {
@@ -80,11 +80,12 @@ async fn many_small_files_survive_initial_sync_and_incremental_update() {
     }
 
     let local_path_a = root_a.path().to_string_lossy().to_string();
-    state_a.sync_state.add_link(&local_path_a, &group_id).unwrap();
-    link_manager::start_link_watch(state_a.clone(), local_path_a, group_id.clone()).unwrap();
+    state_a.replica_coordinator.link_repository().add_link(&local_path_a, &group_id).unwrap();
+    LinkRuntimeController::new(state_a.clone()).start(local_path_a, group_id.clone()).unwrap();
     let local_path_b = root_b.path().to_string_lossy().to_string();
-    state_b.sync_state.add_link(&local_path_b, &group_id).unwrap();
-    link_manager::start_link_watch(state_b.clone(), local_path_b.clone(), group_id.clone())
+    state_b.replica_coordinator.link_repository().add_link(&local_path_b, &group_id).unwrap();
+    LinkRuntimeController::new(state_b.clone())
+        .start(local_path_b.clone(), group_id.clone())
         .unwrap();
 
     support::connect_two_daemons(
@@ -102,8 +103,8 @@ async fn many_small_files_survive_initial_sync_and_incremental_update() {
         CONVERGENCE_TIMEOUT,
         || {
             let actual = real_entry_names(root_b.path()).len();
-            let indexed_a = state_a.sync_state.list_files(&group_id).map(|files| files.len());
-            let indexed_b = state_b.sync_state.list_files(&group_id).map(|files| files.len());
+            let indexed_a = state_a.replica_coordinator.file_index_repository().list_files(&group_id).map(|files| files.len());
+            let indexed_b = state_b.replica_coordinator.file_index_repository().list_files(&group_id).map(|files| files.len());
             format!(
                 "expected >= {FILE_COUNT} files in root_b={:?}, found {actual}; indexed_a={indexed_a:?}, indexed_b={indexed_b:?}; device_a: {}; device_b: {}",
                 root_b.path(),

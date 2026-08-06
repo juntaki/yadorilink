@@ -1,0 +1,33 @@
+[package]
+name = "yadorilink-replica-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Exposes test-only helpers (see `custody::verify_reclaim_custody_for_test`)
+# to OTHER crates' test builds -- mirrors yadorilink-sync-core's own
+# identical `test-support` feature and the reasoning documented there.
+test-support = []
+
+[dependencies]
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+# `optimistic_placement::select_fast_path`'s `PlacementInputs.capabilities:
+# &FilesystemSafetyCapabilities` (7D-9D move from `yadorilink-sync-core`) --
+# this crate does not depend back on `yadorilink-root-authority`'s own
+# dependents (`yadorilink-sync-sqlite`/`yadorilink-sync-core`), so no cycle
+# risk: `yadorilink-root-authority` itself only depends on
+# `yadorilink-replica-domain`.
+yadorilink-root-authority = { path = "../yadorilink-root-authority" }
+thiserror.workspace = true
+sha2.workspace = true
+# conflict_authoring.rs's error messages hex-encode change hashes, mirroring
+# the identical usage in yadorilink-sync-sqlite's own conflict_authoring.rs.
+hex = "0.4"
+# `rebootstrap.rs`'s `prepare_rebootstrap_required`/`verify_and_install_
+# rebootstrap` take a `&SigningKey`/verify against one directly in
+# production code (7D-9D move from yadorilink-sync-core, where this was
+# already a real, non-dev dependency for the identical reason) -- promoted
+# out of `[dev-dependencies]` below, which previously carried it only for
+# `authenticated_history`'s own test fixture signing.
+ed25519-dalek = "2"

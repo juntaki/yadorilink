@@ -152,7 +152,6 @@ Notes:
 | `crates/yadorilink-cli` | User-facing CLI (`yadorilink`) |
 | `crates/yadorilink-daemon` | Background sync daemon (`yadorilink-daemon`) |
 | `crates/yadorilink-transport` | Peer transport, NAT traversal, and connection management |
-| `crates/yadorilink-sync-core` | Sync engine and reconciliation logic |
 | `crates/yadorilink-local-storage` | Local block store |
 | `crates/yadorilink-ipc-proto` | Shared protobuf and wire-format definitions |
 | `crates/yadorilink-desktop-app` | Desktop status app (`yadorilink-status-app`) |

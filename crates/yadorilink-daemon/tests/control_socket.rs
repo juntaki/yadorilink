@@ -9,6 +9,7 @@ mod unix_socket_tests {
     use std::sync::Arc;
 
     use tokio::net::UnixStream;
+    use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
     use yadorilink_daemon::daemon_state::DaemonState;
     use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
     use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
@@ -20,7 +21,7 @@ mod unix_socket_tests {
     };
     use yadorilink_ipc_proto::framing::{read_message, write_message};
     use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_sync_core::index::SyncState;
+    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 
     async fn start_daemon() -> (std::path::PathBuf, tempfile::TempDir) {
         let (socket_path, dir, _state) = start_daemon_with_state().await;
@@ -29,26 +30,41 @@ mod unix_socket_tests {
 
     /// Like `start_daemon`, but also returns the `DaemonState` handle for
     /// tests that need to index files directly (bypassing the watcher
-    /// pipeline, which is covered by `local_change`/`link_manager`'s own tests).
+    /// pipeline, which is covered by `local_change`/the daemon's own link-runtime tests).
     async fn start_daemon_with_state() -> (std::path::PathBuf, tempfile::TempDir, Arc<DaemonState>)
     {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
-        let state_db = Arc::new(SyncState::open(dir.path().join("sync.sqlite3")).unwrap());
+        let state_db = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
         let state = DaemonState::new("device-under-test".into(), state_db, store);
         // A registered (non-empty device_id) device with no change-signing
-        // key is fail-closed (`link_manager::ensure_initial_change_history`):
+        // key is fail-closed (`ensure_initial_change_history`):
         // linking a folder refuses index-only sync rather than leave
         // emission silently off. Wire one before any test here links.
-        state.set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
+        state
+            .set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
+        state.replica_coordinator.set_local_change_auth_provider(Arc::new(|_| {
+            Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER)
+        }));
+        // Local edits now route through `replica_coordinator`, not
+        // `sync_state` (7D-10.7) -- mirror the override there too, or
+        // `DaemonState::new`'s real provider fires instead and withholds
+        // for lack of a verified group policy.
+        state.replica_coordinator.set_local_change_auth_provider(Arc::new(|_| {
+            Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER)
+        }));
         let socket_path = dir.path().join("daemon.sock");
 
         let serve_path = socket_path.clone();
         let serve_state = state.clone();
         tokio::spawn(async move {
-            let _ =
-                yadorilink_daemon::control_socket::unix_transport::serve(&serve_path, serve_state)
-                    .await;
+            let _ = yadorilink_daemon::control_socket::unix_transport::serve(
+                &serve_path,
+                std::sync::Arc::new(
+                    yadorilink_daemon::control_context::ControlContext::from_state(serve_state),
+                ),
+            )
+            .await;
         });
 
         // Give the listener a moment to bind.
@@ -307,10 +323,10 @@ mod unix_socket_tests {
         std::fs::create_dir_all(&folder_a).unwrap();
         std::fs::create_dir_all(&folder_b).unwrap();
 
-        state.sync_state.add_link(&folder_a.to_string_lossy(), "group-amb").unwrap();
+        state.replica_coordinator.link_repository().add_link(&folder_a.to_string_lossy(), "group-amb").unwrap();
         state
-            .sync_state
-            .force_second_live_link_for_test(&folder_b.to_string_lossy(), "group-amb")
+            .replica_coordinator
+            .link_repository().force_second_live_link_for_test(&folder_b.to_string_lossy(), "group-amb")
             .unwrap();
 
         let resp = send(&socket_path, ReqPayload::ListLinks(ListLinksRequest {})).await;
@@ -346,7 +362,7 @@ mod unix_socket_tests {
         let (socket_path, dir, state) = start_daemon_with_state().await;
         let folder = dir.path().join("photos");
         std::fs::create_dir_all(&folder).unwrap();
-        state.sync_state.add_link(&folder.to_string_lossy(), "group-ok").unwrap();
+        state.replica_coordinator.link_repository().add_link(&folder.to_string_lossy(), "group-ok").unwrap();
 
         let resp = send(&socket_path, ReqPayload::ListLinks(ListLinksRequest {})).await;
         let Some(RespPayload::ListLinks(list)) = resp.payload else {
@@ -377,10 +393,10 @@ mod unix_socket_tests {
         std::fs::create_dir_all(&folder_a).unwrap();
         std::fs::create_dir_all(&folder_b).unwrap();
 
-        state.sync_state.add_link(&folder_a.to_string_lossy(), "group-amb").unwrap();
+        state.replica_coordinator.link_repository().add_link(&folder_a.to_string_lossy(), "group-amb").unwrap();
         state
-            .sync_state
-            .force_second_live_link_for_test(&folder_b.to_string_lossy(), "group-amb")
+            .replica_coordinator
+            .link_repository().force_second_live_link_for_test(&folder_b.to_string_lossy(), "group-amb")
             .unwrap();
         state.set_peer_group_full_replica("device-b", "group-amb", true);
 
@@ -401,7 +417,7 @@ mod unix_socket_tests {
         assert!(matches!(resp.payload, Some(RespPayload::Unlink(_))), "got {:?}", resp.payload);
 
         assert!(
-            state.sync_state.suppress_tombstones_for_group("group-amb").unwrap(),
+            state.replica_coordinator.link_repository().suppress_tombstones_for_group("group-amb").unwrap(),
             "unlinking one of two roots must make the survivor's next scan additive -- otherwise \
              the recovery this error message instructs deletes every file that only existed in \
              the folder the user unlinked, on every device"
@@ -421,8 +437,8 @@ mod unix_socket_tests {
         std::fs::create_dir_all(&folder_b).unwrap();
 
         // Two links, but on DIFFERENT groups: nothing ambiguous here.
-        state.sync_state.add_link(&folder_a.to_string_lossy(), "group-x").unwrap();
-        state.sync_state.add_link(&folder_b.to_string_lossy(), "group-y").unwrap();
+        state.replica_coordinator.link_repository().add_link(&folder_a.to_string_lossy(), "group-x").unwrap();
+        state.replica_coordinator.link_repository().add_link(&folder_b.to_string_lossy(), "group-y").unwrap();
         state.set_peer_group_full_replica("device-b", "group-y", true);
 
         send(
@@ -435,7 +451,7 @@ mod unix_socket_tests {
         .await;
 
         assert!(
-            !state.sync_state.suppress_tombstones_for_group("group-x").unwrap(),
+            !state.replica_coordinator.link_repository().suppress_tombstones_for_group("group-x").unwrap(),
             "an unrelated group's link must keep propagating deletions normally"
         );
     }
@@ -478,8 +494,7 @@ mod unix_socket_tests {
     /// `SyncState::set_held`/`get_held_state`.
     #[tokio::test]
     async fn status_reports_held_file_count_and_reason() {
-        use yadorilink_sync_core::types::FileRecord;
-        use yadorilink_sync_core::version_vector::VersionVector;
+        use yadorilink_replica_domain::file::FileRecord;
 
         let (socket_path, dir, state) = start_daemon_with_state().await;
         let folder = dir.path().join("shared");
@@ -504,14 +519,20 @@ mod unix_socket_tests {
             path: "a.txt".into(),
             size: 3,
             mtime_unix_nanos: 0,
-            version: VersionVector::new(),
             blocks: vec![],
             deleted: false,
         };
-        state.sync_state.upsert_file("group-held", &record).unwrap();
         state
-            .sync_state
-            .set_held(
+            .replica_coordinator
+            .file_index_repository().upsert_file(
+                "group-held",
+                &record,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        state
+            .replica_coordinator
+            .materialization_state_repository().set_held(
                 "group-held",
                 "a.txt",
                 "case-fold collision with existing sibling 'A.txt'",
@@ -582,8 +603,7 @@ mod unix_socket_tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn status_reports_skipped_windows_symlink_count() {
-        use yadorilink_sync_core::types::{FileRecord, RecordKind};
-        use yadorilink_sync_core::version_vector::VersionVector;
+        use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 
         let (socket_path, dir, state) = start_daemon_with_state().await;
         let folder = dir.path().join("shared");
@@ -608,17 +628,28 @@ mod unix_socket_tests {
             path: "link-to-elsewhere".into(),
             size: 0,
             mtime_unix_nanos: 0,
-            version: VersionVector::new(),
             blocks: vec![],
             deleted: false,
         };
-        state.sync_state.upsert_file("group-symlink", &record).unwrap();
         state
-            .sync_state
-            .set_record_kind("group-symlink", "link-to-elsewhere", RecordKind::Symlink)
+            .replica_coordinator
+            .upsert_file(
+                "group-symlink",
+                &record,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
             .unwrap();
         state
-            .sync_state
+            .replica_coordinator
+            .set_record_kind(
+                "group-symlink",
+                "link-to-elsewhere",
+                RecordKind::Symlink,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        state
+            .replica_coordinator
             .set_symlink_target("group-symlink", "link-to-elsewhere", Some("target.txt"))
             .unwrap();
         // `windows_symlink_opt_in` is left at its default `false` — the
@@ -640,8 +671,7 @@ mod unix_socket_tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn status_does_not_count_an_opted_in_windows_symlink_as_skipped() {
-        use yadorilink_sync_core::types::{FileRecord, RecordKind};
-        use yadorilink_sync_core::version_vector::VersionVector;
+        use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 
         let (socket_path, dir, state) = start_daemon_with_state().await;
         let folder = dir.path().join("shared");
@@ -661,23 +691,34 @@ mod unix_socket_tests {
             }),
         )
         .await;
-        state.sync_state.set_windows_symlink_opt_in(&local_path, true).unwrap();
+        state.replica_coordinator.set_windows_symlink_opt_in(&local_path, true).unwrap();
 
         let record = FileRecord {
             path: "link-to-elsewhere".into(),
             size: 0,
             mtime_unix_nanos: 0,
-            version: VersionVector::new(),
             blocks: vec![],
             deleted: false,
         };
-        state.sync_state.upsert_file("group-symlink-optin", &record).unwrap();
         state
-            .sync_state
-            .set_record_kind("group-symlink-optin", "link-to-elsewhere", RecordKind::Symlink)
+            .replica_coordinator
+            .upsert_file(
+                "group-symlink-optin",
+                &record,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
             .unwrap();
         state
-            .sync_state
+            .replica_coordinator
+            .set_record_kind(
+                "group-symlink-optin",
+                "link-to-elsewhere",
+                RecordKind::Symlink,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        state
+            .replica_coordinator
             .set_symlink_target("group-symlink-optin", "link-to-elsewhere", Some("target.txt"))
             .unwrap();
 
@@ -698,8 +739,7 @@ mod unix_socket_tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn status_reports_zero_skipped_symlinks_on_non_windows_even_for_a_symlink_record() {
-        use yadorilink_sync_core::types::{FileRecord, RecordKind};
-        use yadorilink_sync_core::version_vector::VersionVector;
+        use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 
         let (socket_path, dir, state) = start_daemon_with_state().await;
         let folder = dir.path().join("shared");
@@ -724,18 +764,29 @@ mod unix_socket_tests {
             path: "link-to-elsewhere".into(),
             size: 0,
             mtime_unix_nanos: 0,
-            version: VersionVector::new(),
             blocks: vec![],
             deleted: false,
         };
-        state.sync_state.upsert_file("group-symlink-posix", &record).unwrap();
         state
-            .sync_state
-            .set_record_kind("group-symlink-posix", "link-to-elsewhere", RecordKind::Symlink)
+            .replica_coordinator
+            .file_index_repository().upsert_file(
+                "group-symlink-posix",
+                &record,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
             .unwrap();
         state
-            .sync_state
-            .set_symlink_target("group-symlink-posix", "link-to-elsewhere", Some("target.txt"))
+            .replica_coordinator
+            .file_index_repository().set_record_kind(
+                "group-symlink-posix",
+                "link-to-elsewhere",
+                RecordKind::Symlink,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository().set_symlink_target("group-symlink-posix", "link-to-elsewhere", Some(b"target.txt"))
             .unwrap();
 
         let resp = send(&socket_path, ReqPayload::Status(StatusRequest {})).await;
@@ -771,7 +822,7 @@ mod unix_socket_tests {
 
         // No index entry exists for this path (the watcher pipeline that
         // would create one is exercised elsewhere, e.g. `local_change`'s and
-        // `link_manager`'s own tests) — eviction over the control socket must
+        // the daemon's own link-runtime tests) — eviction over the control socket must
         // report a clear error rather than silently no-op'ing on an unknown path.
         let resp = send(
             &socket_path,
@@ -789,13 +840,22 @@ mod unix_socket_tests {
     #[tokio::test]
     async fn evict_via_control_socket_succeeds_for_an_indexed_hydrated_file() {
         let (socket_path, dir, state) = start_daemon_with_state().await;
+        // This test is about the eviction gate's own success path, not the
+        // on-demand pipeline's real-vs-fake state, so unconditionally
+        // connect the fake here. See `DaemonState::
+        // set_test_placeholder_pipeline_connected`'s own doc comment for why
+        // a daemon integration test needs this instead of the production
+        // probe (unconditionally `false`) or the free function's
+        // thread-local `OverrideForTest` (unreliable across this
+        // multi-threaded runtime).
+        state.set_test_placeholder_pipeline_connected(true);
         let folder = dir.path().join("shared");
         std::fs::create_dir_all(&folder).unwrap();
         let local_path = folder.to_string_lossy().to_string();
         send(
             &socket_path,
             ReqPayload::Link(LinkRequest {
-                local_path,
+                local_path: local_path.clone(),
                 group_id: "group-7".into(),
                 on_demand: false,
                 max_local_size_bytes: None,
@@ -806,27 +866,59 @@ mod unix_socket_tests {
             }),
         )
         .await;
+        // `Link` starts a real, live filesystem watcher for `folder`
+        // (`LinkRuntimeController::start`, called from the daemon's own
+        // Link handler) -- the write-then-index-directly setup below is
+        // meant to bypass that watcher pipeline entirely (see
+        // `start_daemon_with_state`'s own doc comment), but the watcher
+        // itself does not know that: it can independently notice
+        // `report.pdf` appearing on disk and start processing it
+        // concurrently with this test's own direct `upsert_file` +
+        // immediate `Evict`, racing for the same per-path lock
+        // `evict_file`'s non-blocking `try_lock` refuses to wait for.
+        // Confirmed as the actual cause of a real CI failure: the eviction
+        // was rejected with "it is pinned", but that error variant is also
+        // used for a busy path lock (`{path} is busy`), which is what the
+        // rejection message actually said -- the watcher, not a real pin,
+        // held the lock. Stopping the watch makes the bypass genuine
+        // instead of merely likely on a fast host.
+        LinkRuntimeController::new(state.clone()).stop(&local_path).await;
+        // Stopping the watch above also tears down this link's runtime
+        // registration, which is what `hydration::evict`'s own
+        // `root_lease_for` lookup resolves through -- without this, eviction
+        // fails closed with "no live root-commit authority" instead of
+        // reaching the actual behavior under test. See
+        // `install_test_root_commit_authority`'s own doc comment (same
+        // pattern used by `multi_peer_hydration.rs` for the same reason).
+        state.install_test_root_commit_authority("group-7");
 
         let content = vec![7u8; 1000];
         std::fs::write(folder.join("report.pdf"), &content).unwrap();
-        let mut version = yadorilink_sync_core::version_vector::VersionVector::new();
-        version.increment("device-a");
+        // The block hash must be real, not a placeholder: `evict_file`
+        // verifies on-disk bytes against indexed blocks before reclaiming
+        // anything, so a hash that cannot possibly match this file's real
+        // content makes eviction silently bail out as "changed" (`Ok`, but
+        // nothing evicted) rather than actually evicting it.
+        let hash = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&content).to_vec()
+        };
         state
-            .sync_state
-            .upsert_file(
+            .replica_coordinator
+            .file_index_repository().upsert_file(
                 "group-7",
-                &yadorilink_sync_core::types::FileRecord {
+                &yadorilink_replica_domain::file::FileRecord {
                     path: "report.pdf".into(),
                     size: 1000,
                     mtime_unix_nanos: 0,
-                    version,
-                    blocks: vec![yadorilink_sync_core::types::BlockInfo {
-                        hash: vec![0xEFu8; 32],
+                    blocks: vec![yadorilink_replica_domain::file::BlockInfo {
+                        hash,
                         offset: 0,
                         size: 1000,
                     }],
                     deleted: false,
                 },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
 
@@ -844,8 +936,8 @@ mod unix_socket_tests {
         );
 
         assert_eq!(
-            state.sync_state.get_materialization_state("group-7", "report.pdf").unwrap(),
-            Some(yadorilink_sync_core::types::MaterializationState::Placeholder)
+            state.replica_coordinator.materialization_state_repository().get_materialization_state("group-7", "report.pdf").unwrap(),
+            Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
         );
         let metadata = std::fs::metadata(folder.join("report.pdf")).unwrap();
         assert_eq!(metadata.len(), 1000);
@@ -922,7 +1014,7 @@ mod unix_socket_tests {
         .await;
 
         let v1_hash = state.block_store.put(b"version one").unwrap();
-        let v1_block = yadorilink_sync_core::types::BlockInfo {
+        let v1_block = yadorilink_replica_domain::file::BlockInfo {
             hash: hex::decode(&v1_hash).unwrap(),
             offset: 0,
             size: 11,
@@ -931,48 +1023,49 @@ mod unix_socket_tests {
         // (`record_group_block_provenance`'s doc comment): without this, a
         // restore treats a block this test poked directly into the store as
         // never having been obtained through the group, and refuses it.
-        state.sync_state.record_group_block_provenance("group-versions", &[v1_block.hash.clone()]).unwrap();
-        let mut v1_version = yadorilink_sync_core::version_vector::VersionVector::new();
-        v1_version.increment("device-a");
         state
-            .sync_state
-            .upsert_file_with_origin(
+            .replica_coordinator
+            .change_history_repository().record_group_block_provenance("group-versions", std::slice::from_ref(&v1_block.hash))
+            .unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository().upsert_file_with_origin(
                 "group-versions",
-                &yadorilink_sync_core::types::FileRecord {
+                &yadorilink_replica_domain::file::FileRecord {
                     path: "notes.txt".into(),
                     size: 11,
                     mtime_unix_nanos: 1,
-                    version: v1_version,
                     blocks: vec![v1_block.clone()],
                     deleted: false,
                 },
                 "device-a",
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
 
         let v2_hash = state.block_store.put(b"version two!").unwrap();
-        let v2_block = yadorilink_sync_core::types::BlockInfo {
+        let v2_block = yadorilink_replica_domain::file::BlockInfo {
             hash: hex::decode(&v2_hash).unwrap(),
             offset: 0,
             size: 12,
         };
-        state.sync_state.record_group_block_provenance("group-versions", &[v2_block.hash.clone()]).unwrap();
-        let mut v2_version = yadorilink_sync_core::version_vector::VersionVector::new();
-        v2_version.increment("device-a");
-        v2_version.increment("device-a");
         state
-            .sync_state
-            .upsert_file_with_origin(
+            .replica_coordinator
+            .change_history_repository().record_group_block_provenance("group-versions", std::slice::from_ref(&v2_block.hash))
+            .unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository().upsert_file_with_origin(
                 "group-versions",
-                &yadorilink_sync_core::types::FileRecord {
+                &yadorilink_replica_domain::file::FileRecord {
                     path: "notes.txt".into(),
                     size: 12,
                     mtime_unix_nanos: 2,
-                    version: v2_version,
                     blocks: vec![v2_block],
                     deleted: false,
                 },
                 "device-a",
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
 
@@ -1003,7 +1096,7 @@ mod unix_socket_tests {
         assert!(matches!(resp.payload, Some(RespPayload::RestoreVersion(_))), "{resp:?}");
 
         assert_eq!(std::fs::read(folder.join("notes.txt")).unwrap(), b"version one");
-        let versions = state.sync_state.list_versions("group-versions", "notes.txt").unwrap();
+        let versions = state.replica_coordinator.sqlite().dag_list_versions("group-versions", "notes.txt").unwrap();
         assert_eq!(versions.len(), 3, "restore must add a new version, not rewrite history");
         assert_eq!(versions[0].version_seq, 3);
         assert_eq!(versions[0].blocks, vec![v1_block]);
@@ -1034,7 +1127,7 @@ mod unix_socket_tests {
         .await;
 
         let v1_hash = state.block_store.put(b"first").unwrap();
-        let v1_block = yadorilink_sync_core::types::BlockInfo {
+        let v1_block = yadorilink_replica_domain::file::BlockInfo {
             hash: hex::decode(&v1_hash).unwrap(),
             offset: 0,
             size: 5,
@@ -1042,42 +1135,42 @@ mod unix_socket_tests {
         // See the identical comment in `list_versions_then_restore_version_
         // round_trips_through_control_socket` above.
         state
-            .sync_state
-            .record_group_block_provenance("group-default-restore", &[v1_block.hash.clone()])
-            .unwrap();
-        let mut v1_version = yadorilink_sync_core::version_vector::VersionVector::new();
-        v1_version.increment("device-a");
-        state
-            .sync_state
-            .upsert_file_with_origin(
+            .replica_coordinator
+            .change_history_repository().record_group_block_provenance(
                 "group-default-restore",
-                &yadorilink_sync_core::types::FileRecord {
+                std::slice::from_ref(&v1_block.hash),
+            )
+            .unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository().upsert_file_with_origin(
+                "group-default-restore",
+                &yadorilink_replica_domain::file::FileRecord {
                     path: "todo.txt".into(),
                     size: 5,
                     mtime_unix_nanos: 1,
-                    version: v1_version,
                     blocks: vec![v1_block.clone()],
                     deleted: false,
                 },
                 "device-a",
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
 
         let v2_hash = hex::decode(state.block_store.put(b"second content").unwrap()).unwrap();
-        state.sync_state.record_group_block_provenance("group-default-restore", &[v2_hash.clone()]).unwrap();
-        let mut v2_version = yadorilink_sync_core::version_vector::VersionVector::new();
-        v2_version.increment("device-a");
-        v2_version.increment("device-a");
         state
-            .sync_state
-            .upsert_file_with_origin(
+            .replica_coordinator
+            .change_history_repository().record_group_block_provenance("group-default-restore", std::slice::from_ref(&v2_hash))
+            .unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository().upsert_file_with_origin(
                 "group-default-restore",
-                &yadorilink_sync_core::types::FileRecord {
+                &yadorilink_replica_domain::file::FileRecord {
                     path: "todo.txt".into(),
                     size: 14,
                     mtime_unix_nanos: 2,
-                    version: v2_version,
-                    blocks: vec![yadorilink_sync_core::types::BlockInfo {
+                    blocks: vec![yadorilink_replica_domain::file::BlockInfo {
                         hash: v2_hash,
                         offset: 0,
                         size: 14,
@@ -1085,6 +1178,7 @@ mod unix_socket_tests {
                     deleted: false,
                 },
                 "device-a",
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
 
@@ -1117,21 +1211,19 @@ mod unix_socket_tests {
             }),
         )
         .await;
-        let mut only_version = yadorilink_sync_core::version_vector::VersionVector::new();
-        only_version.increment("device-a");
         state
-            .sync_state
-            .upsert_file_with_origin(
+            .replica_coordinator
+            .file_index_repository().upsert_file_with_origin(
                 "group-no-superseded",
-                &yadorilink_sync_core::types::FileRecord {
+                &yadorilink_replica_domain::file::FileRecord {
                     path: "solo.txt".into(),
                     size: 0,
                     mtime_unix_nanos: 1,
-                    version: only_version,
                     blocks: vec![],
                     deleted: false,
                 },
                 "device-a",
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
         let resp = send(
@@ -1174,7 +1266,7 @@ mod unix_socket_tests {
 
         // A version referencing a block never actually written to this
         // device's block store (as if evicted, or never fetched).
-        let phantom_block = yadorilink_sync_core::types::BlockInfo {
+        let phantom_block = yadorilink_replica_domain::file::BlockInfo {
             hash: {
                 use sha2::{Digest, Sha256};
                 Sha256::digest(b"never fetched").to_vec()
@@ -1182,21 +1274,19 @@ mod unix_socket_tests {
             offset: 0,
             size: 13,
         };
-        let mut version = yadorilink_sync_core::version_vector::VersionVector::new();
-        version.increment("device-a");
         state
-            .sync_state
-            .upsert_file_with_origin(
+            .replica_coordinator
+            .file_index_repository().upsert_file_with_origin(
                 "group-missing-blocks",
-                &yadorilink_sync_core::types::FileRecord {
+                &yadorilink_replica_domain::file::FileRecord {
                     path: "phantom.bin".into(),
                     size: 13,
                     mtime_unix_nanos: 1,
-                    version,
                     blocks: vec![phantom_block],
                     deleted: false,
                 },
                 "device-a",
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
 
@@ -1243,32 +1333,41 @@ mod unix_socket_tests {
         .await;
 
         let hash = state.block_store.put(b"soon deleted").unwrap();
-        let block = yadorilink_sync_core::types::BlockInfo {
+        let block = yadorilink_replica_domain::file::BlockInfo {
             hash: hex::decode(&hash).unwrap(),
             offset: 0,
             size: 12,
         };
         // See the identical comment in `list_versions_then_restore_version_
         // round_trips_through_control_socket` above.
-        state.sync_state.record_group_block_provenance("group-trash", &[block.hash.clone()]).unwrap();
-        let mut version = yadorilink_sync_core::version_vector::VersionVector::new();
-        version.increment("device-a");
         state
-            .sync_state
-            .upsert_file_with_origin(
+            .replica_coordinator
+            .change_history_repository().record_group_block_provenance("group-trash", std::slice::from_ref(&block.hash))
+            .unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository().upsert_file_with_origin(
                 "group-trash",
-                &yadorilink_sync_core::types::FileRecord {
+                &yadorilink_replica_domain::file::FileRecord {
                     path: "gone.txt".into(),
                     size: 12,
                     mtime_unix_nanos: 1,
-                    version,
                     blocks: vec![block],
                     deleted: false,
                 },
                 "device-a",
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
-        state.sync_state.mark_deleted("group-trash", "gone.txt", "device-a").unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository().mark_deleted(
+                "group-trash",
+                "gone.txt",
+                "device-a",
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
 
         let resp = send(&socket_path, ReqPayload::ListTrash(ListTrashRequest {})).await;
         let Some(RespPayload::ListTrash(list)) = resp.payload else {
@@ -1290,7 +1389,7 @@ mod unix_socket_tests {
         assert!(matches!(resp.payload, Some(RespPayload::RestoreTrash(_))), "{resp:?}");
 
         assert_eq!(std::fs::read(folder.join("gone.txt")).unwrap(), b"soon deleted");
-        let current = state.sync_state.get_file("group-trash", "gone.txt").unwrap().unwrap();
+        let current = state.replica_coordinator.file_index_repository().get_file("group-trash", "gone.txt").unwrap().unwrap();
         assert!(!current.deleted, "the file must be live again after a trash restore");
     }
 } // mod unix_socket_tests
@@ -1312,11 +1411,11 @@ mod windows_pipe_tests {
     use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
     use yadorilink_ipc_proto::daemonctl::{
         DaemonControlRequest, DaemonControlResponse, LinkRequest, ListLinksRequest, PauseRequest,
-        ResumeRequest, StatusRequest,
+        PendingEnrollmentKind, ResumeRequest, StatusRequest,
     };
     use yadorilink_ipc_proto::framing::{read_message, write_message};
     use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_sync_core::index::SyncState;
+    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -1328,16 +1427,32 @@ mod windows_pipe_tests {
     async fn start_daemon() -> (String, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
-        let state_db = Arc::new(SyncState::open(dir.path().join("sync.sqlite3")).unwrap());
+        let state_db = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
         let state = DaemonState::new("device-under-test".into(), state_db, store);
         // See the identical comment in the Unix `start_daemon_with_state` above.
-        state.set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
+        state
+            .set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
+        state.replica_coordinator.set_local_change_auth_provider(Arc::new(|_| {
+            Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER)
+        }));
+        // Local edits now route through `replica_coordinator`, not
+        // `sync_state` (7D-10.7) -- mirror the override there too, or
+        // `DaemonState::new`'s real provider fires instead and withholds
+        // for lack of a verified group policy.
+        state.replica_coordinator.set_local_change_auth_provider(Arc::new(|_| {
+            Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER)
+        }));
         let pipe_name = unique_pipe_name();
 
         let serve_name = pipe_name.clone();
         tokio::spawn(async move {
-            let _ = yadorilink_daemon::control_socket::windows_transport::serve(&serve_name, state)
-                .await;
+            let _ = yadorilink_daemon::control_socket::windows_transport::serve(
+                &serve_name,
+                std::sync::Arc::new(
+                    yadorilink_daemon::control_context::ControlContext::from_state(state),
+                ),
+            )
+            .await;
         });
 
         // Give the listener a moment to create the first pipe instance.

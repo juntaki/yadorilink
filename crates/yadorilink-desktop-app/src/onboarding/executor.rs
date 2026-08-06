@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use yadorilink_cli::commands::{device, link, share};
 use yadorilink_cli::error::CliError;
-use yadorilink_sync_core::link_preflight::LinkPreflightReport;
+use yadorilink_local_storage::link_preflight::LinkPreflightReport;
 
 use super::machine::{Effect, Event, GroupOption, PreflightView};
 
@@ -276,7 +276,7 @@ mod tests {
         // Some(0) disables the free-space headroom check so this test's verdict
         // is driven purely by the non-empty-folder condition, not the host's
         // disk state.
-        let report = yadorilink_sync_core::link_preflight::run_preflight(dir.path(), &[], Some(0));
+        let report = yadorilink_local_storage::link_preflight::run_preflight(dir.path(), &[], Some(0));
         let view = preflight_to_view(dir.path().to_path_buf(), &report);
 
         assert!(view.is_risky);
@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn preflight_view_of_an_empty_folder_has_no_non_empty_warning() {
         let dir = tempfile::tempdir().unwrap();
-        let report = yadorilink_sync_core::link_preflight::run_preflight(dir.path(), &[], Some(0));
+        let report = yadorilink_local_storage::link_preflight::run_preflight(dir.path(), &[], Some(0));
         let view = preflight_to_view(dir.path().to_path_buf(), &report);
         assert!(!view.warnings.iter().any(|w| w.contains("not empty")));
         assert!(view.summary.iter().any(|s| s.contains("empty folder")));

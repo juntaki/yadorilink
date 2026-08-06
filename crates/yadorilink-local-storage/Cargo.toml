@@ -12,16 +12,27 @@ license.workspace = true
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
 
 [dependencies]
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+# `fs_identity::bytes_to_target` for symlink-target byte<->OS-path
+# conversion in `materialize_write::materialize_symlink*` (Phase 7D-6). A
+# pure leaf crate over `yadorilink-replica-domain` only -- no cycle risk.
+yadorilink-root-authority = { path = "../yadorilink-root-authority" }
 thiserror.workspace = true
 sha2.workspace = true
 tracing.workspace = true
 hex = "0.4"
+# Content-defined chunking for `chunker::chunk_file_content_defined`
+# (Phase 7D-8.1, moved from `yadorilink-sync-core`).
+fastcdc = "4.0.1"
 # Portable free-space queries
 # (`available_space`/`total_space`) for the disk-headroom preflight check —
 # no existing dependency in this crate (or anywhere else in the workspace,
 # confirmed via search) exposed this; `std` has no stable cross-platform
 # API for it.
 fs2 = "0.4"
+# `link_preflight.rs`'s directory-scan preflight (moved here from
+# yadorilink-sync-core in Phase 7D-9B).
+walkdir = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -32,6 +43,9 @@ windows-sys = { version = "0.59", features = [
 
 [dev-dependencies]
 tempfile = "3"
+# `chunker`'s CDC tests need pseudo-random content (real byte entropy
+# matters for boundary-finding behavior, unlike the fixed-size tests).
+rand = "0.10.2"
 
 # See yadorilink-sync-core/Cargo.toml's identical section for why.
 [target.'cfg(not(madsim))'.dependencies]

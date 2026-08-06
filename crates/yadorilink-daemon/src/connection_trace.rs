@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::daemon_state::DaemonState;
+use crate::runtime_telemetry::RuntimeTelemetry;
 
 /// Bounded, matching this module's own doc comment and every sibling
 /// bounded store in this crate (e.g. `reporting::error_candidates`'s cap).
@@ -205,7 +205,11 @@ fn category(
     }
 }
 
-pub fn run_connectivity_doctor(state: &DaemonState) -> Vec<DoctorCategory> {
+pub fn run_connectivity_doctor(
+    telemetry: &RuntimeTelemetry,
+    sync_state: &crate::replica_coordinator::ReplicaCoordinator,
+    nat_observations: &yadorilink_transport::ObservationLog,
+) -> Vec<DoctorCategory> {
     let mut out = Vec::new();
 
     // "daemon": trivially true — this function is running inside it.
@@ -215,10 +219,8 @@ pub fn run_connectivity_doctor(state: &DaemonState) -> Vec<DoctorCategory> {
         detail: "daemon process is running".to_string(),
     });
 
-    let tasks = state.task_liveness.lock().unwrap_or_else(|p| p.into_inner());
-    let control_socket_alive = tasks.get("control-socket").copied().unwrap_or(true);
-    let peer_orchestrator_alive = tasks.get("peer-orchestrator").copied().unwrap_or(true);
-    drop(tasks);
+    let control_socket_alive = telemetry.task_alive("control-socket", true);
+    let peer_orchestrator_alive = telemetry.task_alive("peer-orchestrator", true);
 
     out.push(category(
         "listener",
@@ -236,7 +238,7 @@ pub fn run_connectivity_doctor(state: &DaemonState) -> Vec<DoctorCategory> {
     // that further). Direct-path failures are surfaced per-attempt (with
     // their candidate class and failure category) through the connection
     // trace log itself, not as a single coarse doctor category.
-    let recent = state.connection_traces.recent(None);
+    let recent = telemetry.recent_connection_attempts(None);
     let recent_window = recent.iter().take(50);
     let mut discovery_seen_ok = false;
     let mut coordination_seen_ok = false;
@@ -295,7 +297,7 @@ pub fn run_connectivity_doctor(state: &DaemonState) -> Vec<DoctorCategory> {
     // reports "not all paused" -- the non-alarming direction -- so surface the
     // read failure rather than collapsing it silently into a clean bill of
     // health for a daemon that cannot read its own state.
-    let links = state.sync_state.list_links().unwrap_or_else(|e| {
+    let links = sync_state.link_repository().list_links().unwrap_or_else(|e| {
         tracing::warn!(error = %e, "cannot read link table; doctor policy check is not meaningful");
         Vec::new()
     });
@@ -319,7 +321,7 @@ pub fn run_connectivity_doctor(state: &DaemonState) -> Vec<DoctorCategory> {
     // punchable or open NAT — or one not yet determined — is fine; a
     // UDP-blocked or symmetric/CGNAT one warns, since direct connectivity to
     // some peers may not be establishable.
-    let nat_class = yadorilink_transport::classify(&state.nat_observations.snapshot());
+    let nat_class = yadorilink_transport::classify(&nat_observations.snapshot());
     let nat_ok =
         nat_class.is_punchable() || matches!(nat_class, yadorilink_transport::NatClass::Unknown);
     out.push(DoctorCategory {

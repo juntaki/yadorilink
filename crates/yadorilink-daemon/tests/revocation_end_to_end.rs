@@ -5,8 +5,8 @@
 //! also guard the "coordination plane availability independence" invariant for
 //! already-authorized, already-connected peers.
 //!
-//! Uses the full daemon stack (real `DaemonState` + `link_manager::
-//! start_link_watch` + `peer_orchestrator::run`, discovering peers from the
+//! Uses the full daemon stack (real `DaemonState` + `LinkRuntimeController::
+//! start` + `peer_orchestrator::run`, discovering peers from the
 //! fake's netmap) rather than the lighter-weight `connect_two_daemons` pairing,
 //! since what's under test here is the daemon-level coordination wiring itself.
 
@@ -17,10 +17,11 @@ use std::time::Duration;
 
 use support::fake_coordination::FakeCoordination;
 use support::{register_with_fake, wait_until};
+use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_daemon::{link_manager, peer_orchestrator};
+use yadorilink_daemon::peer_orchestrator;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_sync_core::index::SyncState;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_transport::DeviceKeyPair;
 
 static TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -34,15 +35,15 @@ fn new_test_daemon(device_id: &str) -> TestDaemon {
     // Leaked deliberately: the block store must outlive the test; the process
     // tears the temp dir down on exit.
     let store = Arc::new(FsBlockStore::new(Box::leak(Box::new(store_dir)).path()).unwrap());
-    let sync_state = Arc::new(SyncState::open_in_memory().unwrap());
+    let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state = DaemonState::new(device_id.to_string(), sync_state, store);
     TestDaemon { state }
 }
 
 fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
     let local_path = root.to_string_lossy().to_string();
-    state.sync_state.add_link(&local_path, group_id).unwrap();
-    link_manager::start_link_watch(state.clone(), local_path, group_id.to_string()).unwrap();
+    state.replica_coordinator.link_repository().add_link(&local_path, group_id).unwrap();
+    LinkRuntimeController::new(state.clone()).start(local_path, group_id.to_string()).unwrap();
 }
 
 fn spawn_orchestrator(
@@ -120,10 +121,8 @@ async fn share_revoke_mid_session_stops_serving_the_revoked_group_but_not_others
         || {
             daemon_a
                 .state
-                .sessions
-                .lock()
-                .unwrap()
-                .get(device_b_id)
+                .peers
+                .session(device_b_id)
                 .is_some_and(|session| session.change_dag_negotiated())
         },
         Duration::from_secs(40),
@@ -145,10 +144,8 @@ async fn share_revoke_mid_session_stops_serving_the_revoked_group_but_not_others
     .await;
 
     // B's live session-to-A serves A's requests; its `shares_group` must flip.
-    let session_b_to_a = {
-        let sessions = daemon_b.state.sessions.lock().unwrap();
-        sessions.get(device_a_id).expect("B must have a live session to A by now").clone()
-    };
+    let session_b_to_a =
+        daemon_b.state.peers.session(device_a_id).expect("B must have a live session to A by now");
     assert!(session_b_to_a.shares_group(group_revoked));
     assert!(session_b_to_a.shares_group(group_control));
 
@@ -179,25 +176,11 @@ async fn share_revoke_mid_session_stops_serving_the_revoked_group_but_not_others
     wait_until(|| root_a_control.path().join("after-revoke.txt").exists(), Duration::from_secs(40))
         .await;
     assert!(
-        daemon_a
-            .state
-            .peer_statuses
-            .lock()
-            .unwrap()
-            .get(device_b_id)
-            .map(|s| s.reachability.is_connected())
-            .unwrap_or(false),
+        daemon_a.state.peers.reachability(device_b_id).map(|r| r.is_connected()).unwrap_or(false),
         "the tunnel must stay up for a group-edge-only revocation"
     );
     assert!(
-        daemon_b
-            .state
-            .peer_statuses
-            .lock()
-            .unwrap()
-            .get(device_a_id)
-            .map(|s| s.reachability.is_connected())
-            .unwrap_or(false),
+        daemon_b.state.peers.reachability(device_a_id).map(|r| r.is_connected()).unwrap_or(false),
         "the tunnel must stay up for a group-edge-only revocation"
     );
 }
@@ -249,21 +232,17 @@ async fn device_remove_while_peer_offline_is_reflected_on_its_next_subscribe() {
     spawn_orchestrator(fake.addr(), device_c_id.to_string(), keypair_c, daemon_c.state.clone());
 
     // Positive control: A connects normally to the still-authorized peer C.
-    wait_until(
-        || daemon_a.state.sessions.lock().unwrap().contains_key(device_c_id),
-        Duration::from_secs(40),
-    )
-    .await;
+    wait_until(|| daemon_a.state.peers.has_session(device_c_id), Duration::from_secs(40)).await;
 
     // A must never establish a session to the removed device.
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(
-        !daemon_a.state.sessions.lock().unwrap().contains_key(device_b_id),
+        !daemon_a.state.peers.has_session(device_b_id),
         "an offline device reconnecting after its peer was removed must never establish a \
          session to the removed device"
     );
     assert!(
-        !daemon_a.state.peer_statuses.lock().unwrap().contains_key(device_b_id),
+        !daemon_a.state.peers.reachability(device_b_id).is_some(),
         "a removed device must never even appear as connecting/connected in peer status"
     );
 }
@@ -307,10 +286,8 @@ async fn already_authorized_devices_keep_syncing_while_coordination_plane_is_unr
         || {
             daemon_a
                 .state
-                .sessions
-                .lock()
-                .unwrap()
-                .get(device_b_id)
+                .peers
+                .session(device_b_id)
                 .is_some_and(|session| session.change_dag_negotiated())
         },
         Duration::from_secs(40),

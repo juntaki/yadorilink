@@ -21,20 +21,25 @@ use yadorilink_ipc_proto::daemonctl::{
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_sync_core::index::SyncState;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 
 async fn start_daemon_with_state() -> (std::path::PathBuf, tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
-    let state_db = Arc::new(SyncState::open(dir.path().join("sync.sqlite3")).unwrap());
+    let state_db = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), state_db, store);
     let socket_path = dir.path().join("daemon.sock");
 
     let serve_path = socket_path.clone();
     let serve_state = state.clone();
     tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(&serve_path, serve_state)
-            .await;
+        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
+            &serve_path,
+            std::sync::Arc::new(yadorilink_daemon::control_context::ControlContext::from_state(
+                serve_state,
+            )),
+        )
+        .await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     (socket_path, dir, state)

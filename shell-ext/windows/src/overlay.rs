@@ -23,17 +23,9 @@ pub const CLSID_SYNCED: GUID = GUID::from_u128(0x8f3a1c00_1e6b_4b7a_9d2e_1a2b3c4
 pub const CLSID_SYNCING: GUID = GUID::from_u128(0x8f3a1c00_1e6b_4b7a_9d2e_1a2b3c4d5e02);
 pub const CLSID_ERROR: GUID = GUID::from_u128(0x8f3a1c00_1e6b_4b7a_9d2e_1a2b3c4d5e03);
 pub const CLSID_ONLINE_ONLY: GUID = GUID::from_u128(0x8f3a1c00_1e6b_4b7a_9d2e_1a2b3c4d5e04);
-// edit-presence awareness's "open
-// elsewhere" (lock file) overlay, shown when another user/device is accessing a file;
-// this uses the same pattern as the four above, querying `StatusResponse.open_elsewhere_device_id`
-// instead of `SyncState`/`MaterializationState`.
-pub const CLSID_OPEN_ELSEWHERE: GUID = GUID::from_u128(0x8f3a1c00_1e6b_4b7a_9d2e_1a2b3c4d5e05);
 
 pub fn is_known_clsid(clsid: GUID) -> bool {
-    matches!(
-        clsid,
-        CLSID_SYNCED | CLSID_SYNCING | CLSID_ERROR | CLSID_ONLINE_ONLY | CLSID_OPEN_ELSEWHERE
-    )
+    matches!(clsid, CLSID_SYNCED | CLSID_SYNCING | CLSID_ERROR | CLSID_ONLINE_ONLY)
 }
 
 /// Converts a Windows path (as Explorer hands it to `IsMemberOf`, UTF-16
@@ -225,57 +217,5 @@ impl IShellIconOverlayIdentifier_Impl for OnlineOnlyOverlay_Impl {
     }
     fn GetPriority(&self) -> Result<i32> {
         Ok(3)
-    }
-}
-
-/// Renders `open_elsewhere_device_id`
-/// (set daemon-side by the edit-presence-awareness capability)
-/// as its own overlay badge, same pattern as `OnlineOnlyOverlay`
-/// but with higher precedence in `yadorilink_desktop_app`. This
-/// signal is independent from `SyncState` and `MaterializationState`,
-/// so this is its own CLSID rather than folded into one of the other four.
-#[implement(IShellIconOverlayIdentifier)]
-pub struct OpenElsewhereOverlay;
-
-impl OpenElsewhereOverlay {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for OpenElsewhereOverlay {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl IShellIconOverlayIdentifier_Impl for OpenElsewhereOverlay_Impl {
-    fn IsMemberOf(&self, pwszpath: &PCWSTR, _dwattrib: u32) -> Result<()> {
-        let Some(path) = path_from_pcwstr(*pwszpath) else {
-            return Err(windows::core::Error::from(S_FALSE));
-        };
-        if ipc_client::is_open_elsewhere(&path) {
-            Ok(())
-        } else {
-            Err(windows::core::Error::from(S_FALSE))
-        }
-    }
-    fn GetOverlayInfo(
-        &self,
-        pwsziconfile: PWSTR,
-        cchmax: i32,
-        pindex: *mut i32,
-        pdwflags: *mut u32,
-    ) -> Result<()> {
-        get_overlay_info(pwsziconfile, cchmax, pindex, pdwflags, 79)
-    }
-    fn GetPriority(&self) -> Result<i32> {
-        // Lower value = higher priority. `-1` so this outranks all four
-        // routine states above (including `SyncedOverlay`'s `0`) in the
-        // case where both conditions are simultaneously true (e.g. a
-        // fully-synced, hydrated file a peer also currently has open) —
-        // an active "someone else has this open" warning is more
-        // actionable than "this file is synced".
-        Ok(-1)
     }
 }

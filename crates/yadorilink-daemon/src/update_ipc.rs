@@ -1,102 +1,76 @@
-//! Daemon-side handlers for the update IPC surface added to
-//! `daemon_control.proto`. Kept in
-//! its own module (mirroring `reporting_ipc.rs`'s precedent) rather than
-//! inlined into `control_socket.rs`'s match arms, since each handler
-//! needs a little translation between wire messages and
-//! `update::{manager, policy}` types.
+//! IPC encode/decode for the update surface added to
+//! `daemon_control.proto` -- protobuf request -> application command, and
+//! application outcome -> protobuf response. All actual update-manager/
+//! policy mutation lives in `UpdateCommandService`
+//! (`crate::application::update_command_service`); status reads go
+//! through `UpdateStatusQueryService` (`context.queries.update_status`).
 
 use yadorilink_ipc_proto::daemonctl::{
     UpdateCheckResponse, UpdateConfigRequest, UpdateConfigResponse, UpdateInstallResponse,
     UpdateStatusResponse,
 };
 
-use crate::daemon_state::DaemonState;
-use crate::update::manager::InstallDispatchOutcome;
-use crate::update::policy::{AutoInstallMode, UpdatePolicy, UpdateState};
+use crate::application::{InstallOutcome, UpdateConfigCommand};
 
-/// Shared by `StatusResponse`'s embedded update fields
-/// (`control_socket::list_link_statuses`'s caller) and
-/// `UpdateStatusResponse` itself — both carry the exact same information,
-/// see `daemon_control.proto`'s doc comment on why they're two separate
-/// flat messages rather than one nested inside the other.
-pub fn status_response(state: &DaemonState) -> UpdateStatusResponse {
-    let policy = state.update_manager.policy.load_or_default();
-    let manager = &state.update_manager;
+/// `UpdateStatusView` (`crate::queries::update_status`, `DaemonState`-
+/// independent) -> the IPC wire type. Shared by `StatusResponse`'s
+/// embedded update fields (`control_socket::encode_runtime_status`) and
+/// `UpdateStatusResponse` itself -- both carry the exact same
+/// information, see `daemon_control.proto`'s doc comment on why they're
+/// two separate flat messages rather than one nested inside the other.
+pub(crate) fn encode_update_status(
+    view: crate::queries::update_status::UpdateStatusView,
+) -> UpdateStatusResponse {
     UpdateStatusResponse {
-        current_version: manager.current_version().to_string(),
-        channel: policy.channel.clone(),
-        install_source: manager.platform_info().install_source.clone(),
-        last_check_unix: policy.last_check_unix.unwrap_or(0),
-        state: policy.state.as_str().to_string(),
-        available_version: policy.available_version.clone().unwrap_or_default(),
-        release_notes_url: policy.available_release_notes_url.clone().unwrap_or_default(),
-        mandatory: policy.mandatory,
-        holdback_reason: policy.holdback_reason.clone().unwrap_or_default(),
-        waiting_for_safe_point: policy.state == UpdateState::Deferred,
-        last_error_category: policy.last_error_category.clone().unwrap_or_default(),
-        last_error_message: policy.last_error_message.clone().unwrap_or_default(),
-        automatic_checks_enabled: policy.automatic_checks_enabled,
-        automatic_install_mode: policy.automatic_install_mode.as_str().to_string(),
+        current_version: view.current_version,
+        channel: view.channel,
+        install_source: view.install_source,
+        last_check_unix: view.last_check_unix,
+        state: view.state,
+        available_version: view.available_version,
+        release_notes_url: view.release_notes_url,
+        mandatory: view.mandatory,
+        holdback_reason: view.holdback_reason,
+        waiting_for_safe_point: view.waiting_for_safe_point,
+        last_error_category: view.last_error_category,
+        last_error_message: view.last_error_message,
+        automatic_checks_enabled: view.automatic_checks_enabled,
+        automatic_install_mode: view.automatic_install_mode,
     }
 }
 
-/// `yadorilink update check`: runs an immediate manifest
-/// check regardless of `automatic_checks_enabled` (spec "Automatic
-/// checks disabled... still allows a user-initiated manual check") and
-/// returns the resulting status. A check failure is still reported via
-/// the returned status (its `state`/`last_error_*` fields) rather than as
-/// an IPC-level error, since "the manifest was unreachable" is itself
-/// meaningful status, not a protocol failure.
-pub async fn check(state: &DaemonState) -> UpdateCheckResponse {
-    let _ = state.update_manager.check_now().await;
-    UpdateCheckResponse { status: Some(status_response(state)) }
+pub(crate) fn encode_check_response(
+    status: crate::queries::update_status::UpdateStatusView,
+) -> UpdateCheckResponse {
+    UpdateCheckResponse { status: Some(encode_update_status(status)) }
 }
 
-/// `yadorilink update install`: requests installation of a
-/// verified update. Consults `DaemonState::is_write_safe_point`
-/// so a caller never has to know about safe-point mechanics
-/// directly — this is the one and only place that check happens before
-/// installation is attempted.
-pub async fn install(state: &DaemonState) -> Result<UpdateInstallResponse, String> {
-    let safe_point = state.is_write_safe_point();
-    match state.update_manager.install_now(safe_point).await {
-        Ok(InstallDispatchOutcome::Deferred) => {
-            Ok(UpdateInstallResponse { outcome: "deferred".into(), guidance: String::new() })
+pub(crate) fn encode_install_response(outcome: InstallOutcome) -> UpdateInstallResponse {
+    match outcome {
+        InstallOutcome::Deferred => {
+            UpdateInstallResponse { outcome: "deferred".into(), guidance: String::new() }
         }
-        Ok(InstallDispatchOutcome::StoreManaged { guidance }) => {
-            Ok(UpdateInstallResponse { outcome: "store_managed".into(), guidance })
+        InstallOutcome::StoreManaged { guidance } => {
+            UpdateInstallResponse { outcome: "store_managed".into(), guidance }
         }
-        Ok(InstallDispatchOutcome::HandoffLaunched) => {
-            Ok(UpdateInstallResponse { outcome: "installing".into(), guidance: String::new() })
+        InstallOutcome::HandoffLaunched | InstallOutcome::Installed => {
+            UpdateInstallResponse { outcome: "installing".into(), guidance: String::new() }
         }
-        Ok(InstallDispatchOutcome::Installed) => {
-            Ok(UpdateInstallResponse { outcome: "installing".into(), guidance: String::new() })
-        }
-        Err(e) => Err(e.to_string()),
     }
 }
 
-/// `yadorilink update config`: each optional field left unset
-/// leaves that setting unchanged.
-pub fn config(
-    state: &DaemonState,
-    req: UpdateConfigRequest,
-) -> Result<UpdateConfigResponse, String> {
-    let install_mode = match req.automatic_install_mode {
-        Some(raw) => Some(
-            AutoInstallMode::parse(&raw)
-                .ok_or_else(|| format!("invalid automatic_install_mode: {raw:?}"))?,
-        ),
-        None => None,
-    };
-    let policy: UpdatePolicy = crate::update::manager::apply_config(
-        &state.update_manager.policy,
-        req.automatic_checks_enabled,
-        install_mode,
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(UpdateConfigResponse {
+pub(crate) fn decode_config_request(req: UpdateConfigRequest) -> UpdateConfigCommand {
+    UpdateConfigCommand {
+        automatic_checks_enabled: req.automatic_checks_enabled,
+        automatic_install_mode: req.automatic_install_mode,
+    }
+}
+
+pub(crate) fn encode_config_response(
+    policy: crate::application::UpdatePolicyView,
+) -> UpdateConfigResponse {
+    UpdateConfigResponse {
         automatic_checks_enabled: policy.automatic_checks_enabled,
-        automatic_install_mode: policy.automatic_install_mode.as_str().to_string(),
-    })
+        automatic_install_mode: policy.automatic_install_mode,
+    }
 }

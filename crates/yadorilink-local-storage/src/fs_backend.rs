@@ -227,10 +227,8 @@ impl FsBlockStore {
         // shard leniently and fall back to shard 0 on any malformed prefix. A
         // wrong shard only costs some lock contention; it never corrupts data,
         // whereas a panic here would take down the whole block store.
-        let shard = hash
-            .get(0..2)
-            .and_then(|prefix| u8::from_str_radix(prefix, 16).ok())
-            .unwrap_or(0);
+        let shard =
+            hash.get(0..2).and_then(|prefix| u8::from_str_radix(prefix, 16).ok()).unwrap_or(0);
         &self.hash_locks[shard as usize]
     }
 

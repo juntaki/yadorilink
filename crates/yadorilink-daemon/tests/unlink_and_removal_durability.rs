@@ -6,17 +6,19 @@
 //! exercised the same way `full_replica_handoff_ready.rs` exercises its
 //! non-excluding sibling — real peer-to-peer `VersionPresentQuery`s, not an
 //! injected confirmer).
+#![cfg(unix)]
 
 mod support;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use support::{connect_two_daemons, ensure_device_signing_key, open_file_backed_sync_state};
+use support::{connect_two_daemons, ensure_device_signing_key, open_file_backed_replica_coordinator};
 use tokio::net::UnixStream;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use yadorilink_daemon::daemon_state::{DaemonState, GroupDurabilityStatus};
+use yadorilink_daemon::daemon_state::DaemonState;
+use yadorilink_daemon::durability_service::GroupDurabilityStatus;
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
@@ -24,9 +26,8 @@ use yadorilink_ipc_proto::daemonctl::{
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_sync_core::index::RoleLossOperationState;
-use yadorilink_sync_core::types::{BlockInfo, FileRecord};
-use yadorilink_sync_core::version_vector::VersionVector;
+use yadorilink_replica_domain::session_state::RoleLossOperationState;
+use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 
 const GROUP: &str = "durability-group";
 
@@ -40,22 +41,19 @@ struct Daemon {
 fn new_daemon(device_id: &str) -> Daemon {
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-    let (sync_state, index_dir) = open_file_backed_sync_state();
+    let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
     let root = tempfile::tempdir().unwrap();
-    state.sync_state.add_link(&root.path().to_string_lossy(), GROUP).unwrap();
+    state.replica_coordinator.link_repository().add_link(&root.path().to_string_lossy(), GROUP).unwrap();
     Daemon { state, _store_dir: store_dir, _index_dir: index_dir, root }
 }
 
 fn record_referencing(path: &str, hash_bytes: Vec<u8>, size: u64) -> FileRecord {
-    let mut version = VersionVector::new();
-    version.increment("device-a");
     FileRecord {
         path: path.to_string(),
         size,
         mtime_unix_nanos: 0,
-        version,
         blocks: vec![BlockInfo { hash: hash_bytes, offset: 0, size: size as u32 }],
         deleted: false,
     }
@@ -88,14 +86,26 @@ async fn unlink_refused_when_no_other_replica_is_ready() {
     support::ensure_isolated_config_dir();
     let b = new_daemon("device-b");
     let record = record_referencing("solo.bin", vec![1u8; 32], 4);
-    b.state.sync_state.upsert_file(GROUP, &record).unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     let socket_path = b.root.path().join("daemon.sock");
     let serve_path = socket_path.clone();
     let serve_state = b.state.clone();
     tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(&serve_path, serve_state)
-            .await;
+        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
+            &serve_path,
+            std::sync::Arc::new(yadorilink_daemon::control_context::ControlContext::from_state(
+                serve_state,
+            )),
+        )
+        .await;
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -178,9 +188,28 @@ async fn exclude_target_readiness_false_when_only_ready_replica_is_the_excluded_
     let content = b"file only device-a holds";
     let hash = a.state.block_store.put(content).unwrap();
     let bytes = hex::decode(hash.as_str()).unwrap();
+    // Mirrors what `LocalChangeProcessor` does for a real local edit
+    // (`record_group_block_provenance`'s doc comment): without this, the
+    // real peer-to-peer readiness confirmation this file exercises refuses
+    // the block as never having been obtained through the group.
+    a.state.replica_coordinator.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&bytes)).unwrap();
     let record = record_referencing("held.bin", bytes, content.len() as u64);
-    a.state.sync_state.upsert_file(GROUP, &record).unwrap();
-    b.state.sync_state.upsert_file(GROUP, &record).unwrap();
+    a.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
     b.state.set_peer_group_full_replica("device-a", GROUP, true);
@@ -211,12 +240,25 @@ async fn exclude_target_readiness_true_when_a_different_replica_is_ready() {
     let bytes = hex::decode(hash.as_str()).unwrap();
     let record = record_referencing("shared.bin", bytes, content.len() as u64);
     for d in [&a, &b, &c] {
-        d.state.sync_state.upsert_file(GROUP, &record).unwrap();
+        d.state
+            .replica_coordinator
+            .file_index_repository().upsert_file(
+                GROUP,
+                &record,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
     }
     // Give device-a and device-c the actual block too, since each must
     // independently confirm holding it when queried.
+    let block_hash = record.blocks[0].hash.clone();
     a.state.block_store.put(content).unwrap();
+    a.state
+        .replica_coordinator
+        .change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&block_hash))
+        .unwrap();
     c.state.block_store.put(content).unwrap();
+    c.state.replica_coordinator.change_history_repository().record_group_block_provenance(GROUP, &[block_hash]).unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
     connect_two_daemons(&c.state, "device-c", &b.state, "device-b", &[GROUP.to_string()]).await;
@@ -260,9 +302,33 @@ async fn unlink_setup(
     let hash = a.state.block_store.put(content).unwrap();
     b.state.block_store.put(content).unwrap();
     let bytes = hex::decode(hash.as_str()).unwrap();
+    // Mirrors what `LocalChangeProcessor` does for a real local edit
+    // (`record_group_block_provenance`'s doc comment): without this, the
+    // real peer-to-peer readiness confirmation this file exercises refuses
+    // the block as never having been obtained through the group.
+    a.state.replica_coordinator.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&bytes)).unwrap();
+    // Device-b needs the same provenance record as device-a: device-a's own
+    // mandatory lease issuance re-verifies ITS OWN readiness by querying
+    // device-b to confirm device-b durably holds this file, which requires
+    // group block provenance on the ANSWERING side too.
+    b.state.replica_coordinator.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&bytes)).unwrap();
     let record = record_referencing("only.bin", bytes, content.len() as u64);
-    a.state.sync_state.upsert_file(GROUP, &record).unwrap();
-    b.state.sync_state.upsert_file(GROUP, &record).unwrap();
+    a.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
     b.state.set_peer_group_full_replica("device-a", GROUP, true);
@@ -280,8 +346,13 @@ async fn unlink_setup(
     let serve_path = socket_path.clone();
     let serve_state = b.state.clone();
     tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(&serve_path, serve_state)
-            .await;
+        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
+            &serve_path,
+            std::sync::Arc::new(yadorilink_daemon::control_context::ControlContext::from_state(
+                serve_state,
+            )),
+        )
+        .await;
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
     (a, b, socket_path)
@@ -380,8 +451,8 @@ async fn ambiguous_unlink_keeps_prepared_journal() {
     assert!(matches!(resp.payload, Some(RespPayload::Error(_))));
     let rows = b
         .state
-        .sync_state
-        .list_role_loss_operations_in_states(&[
+        .replica_coordinator
+        .role_loss_operation_repository().list_role_loss_operations_in_states(&[
             RoleLossOperationState::Prepared,
             RoleLossOperationState::Compensating,
         ])

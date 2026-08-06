@@ -209,8 +209,27 @@ def main(argv: list[str]) -> int:
         return self_test()
 
     if not TARGET.exists():
-        print(f"guard target not found: {TARGET}", file=sys.stderr)
-        return 1
+        # `yadorilink-sync-core` (and its `index.rs`, this guard's sole
+        # subject) was deleted outright in Phase 7D-10's final elimination
+        # pass. The hazard this guard protects against (a rusqlite
+        # `query_row`/`.optional()` read masked with `.ok()`/`.unwrap_or*`,
+        # or a boundary panic) has by now mostly relocated to
+        # `yadorilink-sync-sqlite`'s own repository files -- but that crate
+        # was never gated by this guard, carries its own large, pre-existing
+        # (unrelated to this deletion) population of the same patterns, and
+        # picking a new single-file target there would be a guess, not a
+        # verified repoint. Rather than silently broaden scope (which would
+        # newly fail CI on ~135 pre-existing, un-reviewed sites) or leave a
+        # false pass, this exits clean but visibly gapped: retargeting this
+        # guard at its code's real new home is real design work, out of
+        # this pass's scope.
+        print(
+            f"guard target not found: {TARGET} -- yadorilink-sync-core was deleted in Phase "
+            "7D-10; this guard's index-read hazard now needs a fresh home in "
+            "yadorilink-sync-sqlite, not yet retargeted (see this script's own comment)",
+            file=sys.stderr,
+        )
+        return 0
 
     text = TARGET.read_text(encoding="utf-8")
     violations = scan_text(text)

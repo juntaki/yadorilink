@@ -3,7 +3,15 @@ resolver = "2"
 members = [
     "crates/yadorilink-transport",
     "crates/yadorilink-local-storage",
-    "crates/yadorilink-sync-core",
+    "crates/yadorilink-replica-domain",
+    "crates/yadorilink-peer-session",
+    "crates/yadorilink-replica-engine",
+    "crates/yadorilink-root-authority",
+    "crates/yadorilink-sqlite-runtime",
+    "crates/yadorilink-sync-sqlite",
+    "crates/yadorilink-sync-wire",
+    "crates/yadorilink-local-capture",
+    "crates/yadorilink-filesystem-sync",
     "crates/yadorilink-daemon",
     "crates/yadorilink-cli",
     "crates/yadorilink-ipc-proto",
@@ -23,7 +31,15 @@ repository = "https://github.com/juntaki/yadorilink"
 yadorilink-ipc-proto = { path = "crates/yadorilink-ipc-proto" }
 yadorilink-local-storage = { path = "crates/yadorilink-local-storage" }
 yadorilink-transport = { path = "crates/yadorilink-transport" }
-yadorilink-sync-core = { path = "crates/yadorilink-sync-core" }
+yadorilink-replica-domain = { path = "crates/yadorilink-replica-domain" }
+yadorilink-replica-engine = { path = "crates/yadorilink-replica-engine" }
+yadorilink-root-authority = { path = "crates/yadorilink-root-authority" }
+yadorilink-peer-session = { path = "crates/yadorilink-peer-session" }
+yadorilink-sqlite-runtime = { path = "crates/yadorilink-sqlite-runtime" }
+yadorilink-sync-sqlite = { path = "crates/yadorilink-sync-sqlite" }
+yadorilink-sync-wire = { path = "crates/yadorilink-sync-wire" }
+yadorilink-local-capture = { path = "crates/yadorilink-local-capture" }
+yadorilink-filesystem-sync = { path = "crates/yadorilink-filesystem-sync" }
 yadorilink-reporting = { path = "crates/yadorilink-reporting" }
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
@@ -34,6 +50,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
 # Negotiated zstd compression for sync-protocol block/index payloads —
-# scoped to `yadorilink-sync-core` only, not a dependency of any other
+# scoped to `yadorilink-peer-session` only, not a dependency of any other
 # crate.
 zstd = "0.13"

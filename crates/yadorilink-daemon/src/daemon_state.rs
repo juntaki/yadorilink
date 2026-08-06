@@ -12,37 +12,77 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use sha2::Digest;
 use tokio::sync::{broadcast, mpsc};
-use tokio::task::JoinHandle;
-use yadorilink_ipc_proto::shellipc::StatusPush;
 use yadorilink_local_storage::BlockStore;
-use yadorilink_sync_core::block_liveness::{
+use yadorilink_filesystem_sync::block_liveness::{
     BlockLivenessGate, BlockPhysicalDeletionGuard, BlockReferenceWriteGuard,
 };
-use yadorilink_sync_core::change::{ChangeAuth, PolicyUnavailable, VersionBlock, VersionHash};
-use yadorilink_sync_core::custody::{CustodyStamp, FullReplicaCustody};
-use yadorilink_sync_core::index::{
-    DurabilityRoot, DurabilityRoots, HandoffLeaseState, RoleLossAction, RoleLossOperationState,
-    SyncState,
+use yadorilink_replica_domain::change::{ChangeAuth, PolicyUnavailable};
+use yadorilink_replica_domain::file::VersionBlock;
+use yadorilink_replica_domain::ids::VersionHash;
+use yadorilink_replica_engine::custody::{CustodyStamp, FullReplicaCustody};
+
+use crate::daemon_runtime::{DaemonBuild, RuntimeComponents};
+#[cfg(test)]
+use crate::durability_service::CustodyConfirmer;
+use crate::durability_service::GroupDurabilityStatus;
+use yadorilink_replica_domain::session_state::{
+    DurabilityRoot, DurabilityRoots, MembershipCommitMode, MembershipDurabilityScope,
+    MembershipOperationAction, MembershipOperationState, RoleLossAction, RoleLossOperationParams,
+    RoleLossOperationState,
 };
-use yadorilink_sync_core::peer_session::{
+use yadorilink_sync_sqlite::handoff_lease::HandoffLeaseState;
+use yadorilink_peer_session::peer_session::{
     BlockWriteActivityProvider, HandoffLeaseResponder, HandoffTicketResponder,
     PeerHandoffLeaseGrant, PeerHandoffTicketGrant, PeerSyncSession,
 };
-use yadorilink_sync_core::rate_limiter::RateLimiters;
-use yadorilink_sync_core::types::FileRecord;
+use yadorilink_peer_session::rate_limiter::RateLimiters;
+use yadorilink_replica_engine::repair_election::{AuthorizedWriter, RepairElectionContext};
+use yadorilink_replica_domain::file::FileRecord;
 
 use crate::change_policy::GroupPolicyState;
 use crate::governance_config::GovernanceConfigStore;
-use crate::link_manager::{run_disk_reconcile_backstop_sweep, run_retention_expiry_sweep};
 use crate::reporting::ReportingStorage;
 use crate::supervise;
 
 /// How often the retention-expiry sweep
 /// runs — see its spawn site in `DaemonState::new` for why this is a much
 /// longer interval than the other periodic sweeps in this file.
-const RETENTION_EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
+pub(crate) const RETENTION_EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 const MATERIALIZATION_REPAIR_SWEEP_INTERVAL: Duration = Duration::from_secs(90);
+
+/// Test-only hook overriding the value every subsequently-constructed
+/// `DaemonState`'s materialization-repair scheduler starts with, closing a
+/// race `set_materialization_repair_sweep_interval` alone cannot: that
+/// setter only takes effect on the scheduler's *next* sleep, so a caller
+/// racing against `DaemonState::new` (which has already spawned the
+/// scheduler by the time it returns) cannot guarantee its override lands
+/// before that task's first read — especially on a multi-threaded runtime,
+/// where the newly-spawned task can start executing on a different worker
+/// thread immediately, with no `.await` needed to hand it control. A test
+/// that needs to prove convergence with NO help from this periodic sweep
+/// (see `fix/conflict-copy-convergence-obligation-20260723`'s acceptance
+/// criteria) needs the FIRST sleep, not just subsequent ones, to already
+/// reflect the override. Set this before constructing any `DaemonState`
+/// whose scheduler should start with it.
+static MATERIALIZATION_REPAIR_SWEEP_INTERVAL_OVERRIDE_FOR_TESTS: std::sync::OnceLock<
+    Mutex<Option<Duration>>,
+> = std::sync::OnceLock::new();
+
+pub fn set_default_materialization_repair_sweep_interval_for_tests(interval: Duration) {
+    *MATERIALIZATION_REPAIR_SWEEP_INTERVAL_OVERRIDE_FOR_TESTS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(interval);
+}
+
+fn default_materialization_repair_sweep_interval() -> Duration {
+    MATERIALIZATION_REPAIR_SWEEP_INTERVAL_OVERRIDE_FOR_TESTS
+        .get()
+        .and_then(|m| *m.lock().unwrap_or_else(|p| p.into_inner()))
+        .unwrap_or(MATERIALIZATION_REPAIR_SWEEP_INTERVAL)
+}
 /// How often the role-loss-operation reconciliation sweep
 /// (`run_role_loss_reconciliation_sweep`) retries any journal row left
 /// mid-flight by a crash or a compensation attempt that couldn't reach the
@@ -50,7 +90,7 @@ const MATERIALIZATION_REPAIR_SWEEP_INTERVAL: Duration = Duration::from_secs(90);
 /// cadence rather than the much longer retention-expiry one: a role-loss
 /// split state is a user-visible correctness gap the same way a broken
 /// materialization is, not a slow-moving housekeeping concern.
-const ROLE_LOSS_RECONCILIATION_SWEEP_INTERVAL: Duration = Duration::from_secs(90);
+pub(crate) const ROLE_LOSS_RECONCILIATION_SWEEP_INTERVAL: Duration = Duration::from_secs(90);
 /// Past this many compensation attempts for the same role-loss operation,
 /// the sweep escalates its log level from `warn` to `error` — a visibility
 /// aid only. The row itself is never abandoned or deleted regardless of how
@@ -68,134 +108,6 @@ const ROLE_LOSS_COMPENSATION_ESCALATION_ATTEMPTS: i64 = 5;
 /// solely on each query's own internal bound.
 const VERSION_PRESENT_QUERY_OVERALL_TIMEOUT: Duration = Duration::from_secs(12);
 
-/// Why a peer could not be connected. Rendered by the CLI and desktop app
-/// as the reason a peer "cannot connect", and mapped verbatim onto the
-/// control socket's peer-status wire fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnreachableCategory {
-    /// No candidate address to try at all (no endpoints learned).
-    NoCandidates,
-    /// Candidates were probed but stayed silent — most often a symmetric
-    /// NAT or CGNAT pair that cannot be traversed.
-    NoResponse,
-    /// No datagram could get out at all (even local/STUN probes failed).
-    UdpBlocked,
-    /// The peer answered but refused the handshake — a key or
-    /// authorization mismatch, distinct from being unreachable on the
-    /// network.
-    HandshakeRefused,
-}
-
-impl UnreachableCategory {
-    /// Stable wire/status slug.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            UnreachableCategory::NoCandidates => "no_candidates",
-            UnreachableCategory::NoResponse => "no_response",
-            UnreachableCategory::UdpBlocked => "udp_blocked",
-            UnreachableCategory::HandshakeRefused => "handshake_refused",
-        }
-    }
-}
-
-/// A peer's live connectivity as tracked by the daemon and reported to the
-/// CLI and desktop app. There is no operator-run relay: a peer is either
-/// being connected, connected over a confirmed direct path, or cannot be
-/// connected at all (with the reason it can't).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeerReachability {
-    /// Candidate paths are still being raced; not yet connected, but not
-    /// yet given up on either.
-    Connecting,
-    /// A direct path to the peer is confirmed and in use.
-    Connected,
-    /// Transport is up, but sync protocol negotiation completed without the
-    /// mandatory change-DAG capability.
-    ProtocolIncompatible,
-    /// The peer cannot currently be reached; carries why.
-    Unreachable(UnreachableCategory),
-}
-
-impl PeerReachability {
-    pub fn is_connected(self) -> bool {
-        matches!(self, PeerReachability::Connected)
-    }
-
-    /// Stable wire/status slug: "connecting" | "connected" | "unreachable".
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PeerReachability::Connecting => "connecting",
-            PeerReachability::Connected => "connected",
-            PeerReachability::ProtocolIncompatible => "protocol_incompatible",
-            PeerReachability::Unreachable(_) => "unreachable",
-        }
-    }
-
-    /// The failure-category slug when unreachable, otherwise empty.
-    pub fn unreachable_category_str(self) -> &'static str {
-        match self {
-            PeerReachability::Unreachable(category) => category.as_str(),
-            PeerReachability::ProtocolIncompatible => "",
-            _ => "",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PeerStatusInfo {
-    pub reachability: PeerReachability,
-}
-
-/// This device's local, UI-facing view of one group's durability — distinct
-/// from the coordination-plane member/share count (which only tracks who is
-/// *configured* to sync a group, not who durably holds its data right now)
-/// and distinct from `DegradedLinkInfo` below (that's disk pressure, an
-/// orthogonal axis). Answers "how safe is my data right now, from what this
-/// daemon can currently confirm" — and must never overstate safety: a group
-/// this daemon has no current basis to back up with a real confirmation
-/// reports `DurabilityUnknown`, never `Healthy`.
-///
-/// See [`DaemonState::group_durability_status`] for how the unlatched
-/// default is derived, and [`DaemonState::latch_group_durability_unknown`]
-/// for the one place that pins a group to `DurabilityUnknown` regardless of
-/// what it would otherwise derive to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GroupDurabilityStatus {
-    /// This device or a confirmed peer is a whole-group full replica for
-    /// the group's current head.
-    Healthy,
-    /// Configured for this group but still catching up to head (not every
-    /// file materialized yet).
-    Syncing,
-    /// Coverage cannot currently be confirmed — most notably, right after a
-    /// `--force` override bypassed the durability handoff gate for this
-    /// group, until a later handoff check positively reconfirms whole-group
-    /// coverage. The fail-safe default whenever this daemon has no other
-    /// basis to report from either.
-    DurabilityUnknown,
-    /// A current file is confirmed to have no durable holder reachable
-    /// anywhere — a positive negative, not merely "unconfirmed."
-    KnownMissing,
-}
-
-/// A linked folder's Degraded
-/// (disk-pressure) state — in-memory only, deliberately not persisted
-/// (mirrors `paused_paths`'s "transient" rationale): it's re-derived from
-/// live disk state on the very next preflight/re-check either way, so
-/// persisting it across a restart would only risk it going stale.
-#[derive(Debug, Clone)]
-pub struct DegradedLinkInfo {
-    /// Human-readable cause (the triggering `SyncError::DiskPressure`'s
-    /// `Display`), shown by `yadorilink status`.
-    pub reason: String,
-    pub since_unix: i64,
-    /// how many consecutive re-checks have found the link still
-    /// under pressure — drives `BackoffConfig::DEGRADED_LINK_RECHECK`'s
-    /// increasing interval. `0` for a link that just became degraded.
-    pub backoff_attempt: u32,
-    pub next_recheck_unix: i64,
-}
-
 /// This crate's own build version, parsed as semver — the "current
 /// running version" `update::manifest::LocalContext` compares manifest
 /// entries against. `CARGO_PKG_VERSION` is always the exact
@@ -210,89 +122,11 @@ fn current_crate_version() -> semver::Version {
         .unwrap_or_else(|_| semver::Version::new(0, 0, 0))
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-fn spawn_materialization_repair_scheduler(state: Arc<DaemonState>) {
-    supervise::spawn_logged("daemon-state-materialization-repair", async move {
-        let mut interval = tokio::time::interval(MATERIALIZATION_REPAIR_SWEEP_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            let groups: HashSet<String> = match state.sync_state.list_links() {
-                // An orphaned link's coordination-side authorization is
-                // confirmed gone, so there is no valid peer edge left to
-                // request a repair from -- skip it the same way a paused
-                // link's watcher already keeps it out of this set in
-                // practice (no `LinkFlushHandle` to drive repair against).
-                Ok(links) => links
-                    .into_iter()
-                    .filter(|link| !link.orphaned)
-                    .map(|link| link.group_id)
-                    .collect(),
-                Err(e) => {
-                    tracing::warn!(error = %e, "materialization repair failed to list links");
-                    continue;
-                }
-            };
-            for group_id in groups {
-                state.backfill_missing_change_history(&group_id).await;
-                let candidates = {
-                    let sessions = state.sessions.lock().unwrap_or_else(|p| p.into_inner());
-                    let mut candidates: Vec<_> = sessions
-                        .iter()
-                        .filter(|(_, session)| session.shares_group(&group_id))
-                        .map(|(peer_id, session)| (peer_id.clone(), session.clone()))
-                        .collect();
-                    candidates.sort_by(|a, b| a.0.cmp(&b.0));
-                    candidates
-                };
-                if candidates.is_empty() {
-                    continue;
-                }
-                let start = {
-                    let mut cursors = state
-                        .materialization_repair_cursors
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    let cursor = cursors.entry(group_id.clone()).or_insert(0);
-                    let start = *cursor % candidates.len();
-                    *cursor = (start + 1) % candidates.len();
-                    start
-                };
-                let mut last_error = None;
-                for offset in 0..candidates.len() {
-                    let (peer_id, session) = &candidates[(start + offset) % candidates.len()];
-                    match session.clone().reconcile_local_materialization_audit(&group_id).await {
-                        Ok(()) => {
-                            last_error = None;
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                group_id,
-                                peer = %peer_id,
-                                error = %e,
-                                "materialization repair peer failed; trying another peer"
-                            );
-                            last_error = Some(e);
-                        }
-                    }
-                }
-                if let Some(e) = last_error {
-                    tracing::warn!(
-                        group_id,
-                        error = %e,
-                        "materialization repair failed for every available peer"
-                    );
-                }
-            }
-        }
-    });
 }
 
 /// Fix-saga: the startup + periodic reconciliation sweep for the role-loss
@@ -325,8 +159,21 @@ fn spawn_materialization_repair_scheduler(state: Arc<DaemonState>) {
 /// directly and deterministically, instead of racing or waiting out
 /// `ROLE_LOSS_RECONCILIATION_SWEEP_INTERVAL`'s real-time periodic spawn in
 /// `DaemonState::new` — the same production entry point either way.
+/// One scheduling owner for every membership-related recovery journal this
+/// daemon currently sweeps: this device's own role loss (demote/unlink),
+/// unknown-scope device removals, and ambiguous ticket-bound revoke/remove
+/// commits. `pub` for the same reason `run_role_loss_reconciliation_sweep`
+/// is — so a test can invoke exactly this deterministically instead of
+/// racing `DaemonState::new`'s real-time periodic spawn.
+pub async fn run_membership_recovery_sweep(state: &Arc<DaemonState>) {
+    run_role_loss_reconciliation_sweep(state).await;
+    let application = crate::adapters::build_application_services(state.clone());
+    application.membership.reconcile_unknown_scope().await;
+    application.membership.reconcile_ambiguous().await;
+}
+
 pub async fn run_role_loss_reconciliation_sweep(state: &Arc<DaemonState>) {
-    let rows = match state.sync_state.list_role_loss_operations_in_states(&[
+    let rows = match state.replica_coordinator.role_loss_operation_repository().list_role_loss_operations_in_states(&[
         RoleLossOperationState::Prepared,
         RoleLossOperationState::WorkerCommitted,
         RoleLossOperationState::LocalCommitted,
@@ -342,7 +189,7 @@ pub async fn run_role_loss_reconciliation_sweep(state: &Arc<DaemonState>) {
     for op in rows {
         match op.state {
             RoleLossOperationState::LocalCommitted | RoleLossOperationState::Completed => {
-                if let Err(e) = state.sync_state.delete_role_loss_operation(&op.operation_id) {
+                if let Err(e) = state.replica_coordinator.role_loss_operation_repository().delete_role_loss_operation(&op.operation_id) {
                     tracing::warn!(
                         error = %e,
                         operation_id = %op.operation_id,
@@ -368,92 +215,6 @@ pub async fn run_role_loss_reconciliation_sweep(state: &Arc<DaemonState>) {
                 }
             }
         }
-    }
-}
-
-/// Confirms whether a full replica durably holds an exact file version — bound
-/// by its `change::VersionHash`, with the ordered block list carried alongside
-/// for the responder's explicit block/size check and `get()` verification —
-/// so an on-demand device may reclaim its own cached copy. Injected onto
-/// [`DaemonState`] so production performs the peer-to-peer version-present query
-/// while unit tests supply a deterministic answer without a live peer.
-pub trait CustodyConfirmer: Send + Sync {
-    fn confirms_present(
-        &self,
-        group_id: &str,
-        path: &str,
-        version_hash: &VersionHash,
-        blocks: &[VersionBlock],
-    ) -> Option<CustodyStamp>;
-
-    fn confirmation_still_valid(&self, group_id: &str, stamp: &CustodyStamp) -> bool;
-}
-
-#[cfg(test)]
-impl<F: Fn(&str, &str, &VersionHash, &[VersionBlock]) -> bool + Send + Sync> CustodyConfirmer
-    for F
-{
-    fn confirms_present(
-        &self,
-        group_id: &str,
-        path: &str,
-        version_hash: &VersionHash,
-        blocks: &[VersionBlock],
-    ) -> Option<CustodyStamp> {
-        self(group_id, path, version_hash, blocks).then(|| CustodyStamp::new("test-peer".into(), 0))
-    }
-
-    fn confirmation_still_valid(&self, _group_id: &str, _stamp: &CustodyStamp) -> bool {
-        true
-    }
-}
-
-/// Production custody confirmer: performs the peer-to-peer version-present query
-/// via [`DaemonState::confirm_version_present_via_peer`]. The eviction sweep is
-/// synchronous, so this bridges to the async query with `block_in_place` —
-/// valid because the daemon runs on a multi-threaded runtime and the sweep is
-/// driven from an async task. Holds a weak reference so it never keeps the
-/// daemon alive.
-struct P2pCustodyConfirmer {
-    state: std::sync::Weak<DaemonState>,
-}
-
-impl CustodyConfirmer for P2pCustodyConfirmer {
-    fn confirms_present(
-        &self,
-        group_id: &str,
-        path: &str,
-        version_hash: &VersionHash,
-        blocks: &[VersionBlock],
-    ) -> Option<CustodyStamp> {
-        let Some(state) = self.state.upgrade() else {
-            return None;
-        };
-        let group_id = group_id.to_string();
-        let path = path.to_string();
-        let version_hash = *version_hash;
-        let blocks = blocks.to_vec();
-        tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move {
-                state
-                    .confirm_version_present_witness_via_peer(
-                        &group_id,
-                        &path,
-                        version_hash,
-                        &blocks,
-                    )
-                    .await
-            })
-        })
-    }
-
-    fn confirmation_still_valid(&self, group_id: &str, stamp: &CustodyStamp) -> bool {
-        let Some(state) = self.state.upgrade() else {
-            return false;
-        };
-        state.membership_generation() == stamp.membership_generation()
-            && state.peer_group_is_full_replica(stamp.peer_id(), group_id)
-            && state.peer_is_writer(stamp.peer_id(), group_id)
     }
 }
 
@@ -501,10 +262,29 @@ pub enum GroupPolicyResolution {
 
 pub struct DaemonState {
     pub device_id: String,
-    pub sync_state: Arc<SyncState>,
+    /// Phase 7D-10.9: this is now the ONLY replica/DAG/materialization
+    /// composition-root handle `DaemonState` holds -- `sync_state: Arc<
+    /// yadorilink_sync_core::index::SyncState>` (additive since 7D-10.2)
+    /// has been removed. Every production call site that used to read
+    /// `sync_state` was already repointed to this field by earlier passes,
+    /// or (the two provider-setter calls, `app::run`'s own `SyncState::open`)
+    /// removed/repointed in the same pass that deleted the field -- see
+    /// `docs/design/phase7d10-exit-report.md`'s 7D-10.9 addendum.
+    pub replica_coordinator: Arc<crate::replica_coordinator::ReplicaCoordinator>,
     pub block_store: Arc<dyn BlockStore + Send + Sync>,
-    /// device_id -> live connectivity, updated as `PeerChannel`s connect/upgrade.
-    pub peer_statuses: Mutex<HashMap<String, PeerStatusInfo>>,
+    /// Shared, device-wide block-serve credit/coalescing engine (stage 2)
+    /// -- one instance for the whole daemon, handed to every
+    /// `PeerSyncSession` this device constructs via
+    /// `PeerSyncSession::set_block_serve_engine` (`peer_orchestrator.rs`),
+    /// exactly like `block_store` above. See
+    /// `yadorilink_peer_session::block_serve`'s own doc comment for why the
+    /// engine type itself lives in that crate rather than this one.
+    pub block_serve_engine: Arc<yadorilink_peer_session::block_serve::BlockServeEngine>,
+    /// Live peer sessions and per-peer connectivity, updated as
+    /// `PeerChannel`s connect/upgrade -- see
+    /// `crate::peer_registry::PeerRegistry`'s own doc comment. Reached only
+    /// through its own methods; the maps themselves are private.
+    pub peers: Arc<crate::peer_registry::PeerRegistry>,
     /// The merged set of this device's local endpoint candidates (LAN, IPv6
     /// host, port-mapped, server-reflexive), maintained by the NAT-traversal
     /// tasks. Held here so those tasks publish into it and the peer
@@ -544,10 +324,6 @@ pub struct DaemonState {
     /// a revoke/demote — or any membership churn — arriving during the wait
     /// fails the confirmation closed rather than trusting a now-stale ACK.
     membership_generation: std::sync::atomic::AtomicU64,
-    /// Confirms whether a full replica durably holds a version's blocks before
-    /// an on-demand device reclaims its cached copy. Injected so production does
-    /// the peer-to-peer query while tests supply a deterministic answer.
-    custody_confirmer: Mutex<Option<Arc<dyn CustodyConfirmer>>>,
     /// group_id -> current signed policy-log head coordinates from the latest
     /// coordination netmap full update. Used to verify a change's signed
     /// auth_seq/auth_epoch/policy_head_hash stamp after its signature verifies.
@@ -561,35 +337,104 @@ pub struct DaemonState {
     stale_policy_groups: Mutex<HashMap<String, i64>>,
     /// group_id -> next candidate offset for daemon-level materialization
     /// repair, so a slow or incomplete peer is not selected forever.
-    materialization_repair_cursors: Mutex<HashMap<String, usize>>,
-    /// device_id -> the running sync session, so local changes can be
-    /// broadcast and (in principle) sessions torn down on ACL revocation.
-    pub sessions: Mutex<HashMap<String, Arc<PeerSyncSession>>>,
-    /// local_path -> the folder-watcher's tasks (the debounce accumulator
-    /// and the executor that consumes its flushes — batch-processing changes
-    /// splits these into two independently-scheduled tasks),
-    /// kept alive for as long as the link exists; all aborted together on
-    /// unlink.
-    pub link_tasks: Mutex<HashMap<String, Vec<JoinHandle<()>>>>,
-    /// local_path -> that
-    /// link's targeted-flush handle — same
-    /// key and lifetime as `link_tasks` (registered by `link_manager::
-    /// start_link_watch`, removed by `stop_link_watch`). Consulted by
-    /// `PendingLocalChangeFlush for DaemonState`
-    /// (`link_manager::pending_local_change_flush_impl`) to find which
-    /// link's debounce accumulator to ask, given a `group_id` (resolved to
-    /// a `local_path` via `sync_state.list_links`, the same lookup
-    /// `peer_orchestrator::sync_roots_for_groups` already uses).
-    pub link_flush_handles: Mutex<HashMap<String, Arc<crate::link_manager::LinkFlushHandle>>>,
+    /// `pub(crate)`: read by `maintenance::materialization_repair::
+    /// MaterializationRepairJob`'s own `run_once`, a relocation of what
+    /// used to be this file's own `spawn_materialization_repair_scheduler`
+    /// loop body.
+    pub(crate) materialization_repair_cursors: Mutex<HashMap<String, usize>>,
+    /// group_id -> next candidate offset for the Convergence Engine's own
+    /// per-group peer selection (`convergence::engine`) — a separate cursor
+    /// from `materialization_repair_cursors` above since the two run on
+    /// independent schedules (event-driven/~1s vs the 90s backstop) and
+    /// rotating them together would couple cadences that have no reason to
+    /// be coupled.
+    pub(crate) convergence_engine_cursors: Mutex<HashMap<String, usize>>,
+    /// group_id -> next path-budget offset for the Convergence Engine's own
+    /// per-tick path cap (`MAX_PATHS_PER_RECONCILE_ATTEMPT` in
+    /// `convergence::engine`) — a confirmed, reproduced regression (see
+    /// `fix/conflict-copy-convergence-obligation-20260723`): a single
+    /// candidate attempt handed the ENTIRE claimed batch for a group
+    /// (up to `MAX_JOBS_PER_TICK_PER_GROUP`, 128) processes every path's
+    /// blocks fully serially, and a large backlog of not-yet-referenced/
+    /// genuinely-missing blocks was measured accumulating into a 40+
+    /// second single call with no visible progress. Rotating which bounded
+    /// subset of `remaining` gets attempted each tick (this cursor) is what
+    /// lets every path eventually get its turn without needing an
+    /// unboundedly large single attempt.
+    pub(crate) convergence_engine_path_budget_cursors: Mutex<HashMap<String, usize>>,
+    /// Overridable copy of `MATERIALIZATION_REPAIR_SWEEP_INTERVAL` — same
+    /// mutable-after-construction shape as `PeerSyncSession::
+    /// full_index_resync_interval` (`StdMutex`, opt-in override via
+    /// `set_materialization_repair_sweep_interval`), for the identical
+    /// reason: every existing call site keeps compiling and behaving
+    /// identically at the 90s default, and a test that needs the backstop
+    /// to fire faster than production's cadence can opt in without a
+    /// constructor parameter.
+    materialization_repair_sweep_interval: Mutex<Duration>,
+    /// local_path -> that link's single runtime record: its
+    /// folder-watcher tasks (the debounce accumulator and the executor
+    /// that consumes its flushes, plus the periodic repair and
+    /// dirty-journal tasks), its targeted-flush handle, and its sync-root
+    /// single-instance OS lock. All three used to be three independently-
+    /// updated maps (`link_tasks`, `link_flush_handles`, `link_root_locks`)
+    /// keyed the same way but published and torn down at different points
+    /// in `start_link_watch_inner`/`stop_link_watch` — which is exactly
+    /// what let a peer session's targeted flush
+    /// (`LinkFlushHandle::flush_pending_local_change` and friends) and the
+    /// disk-reconcile backstop sweep (`run_disk_reconcile_backstop_sweep`),
+    /// both of which take their own `Arc<LinkFlushHandle>` clone
+    /// independent of any map, keep committing index/DAG writes after
+    /// `stop_link_watch` had already removed the entry and dropped the
+    /// root lock. `LinkRuntime` closes that gap with `LinkFlushHandle`'s
+    /// own operation fence (`LinkOpFence`): `stop_link_watch` aborts and
+    /// awaits every task exactly as before, then additionally waits for
+    /// that fence to drain (every in-flight targeted flush or backstop
+    /// call to actually finish, and every new one to be refused) before
+    /// dropping `root_lock`. See `LinkRuntime`'s own doc.
+    ///
+    /// A `LinkSlot::Starting` placeholder is reserved via `links` as the
+    /// very first step of `start_link_watch_inner` (via
+    /// `LinkSlotStartingGuard` -- see its own doc for the start-vs-stop
+    /// zombie-runtime race this closes), replaced by `LinkSlot::Ready` once
+    /// every fallible step has succeeded, and removed as a single entry by
+    /// `stop_link_watch`. See `crate::link_registry::LinkRegistry`'s own
+    /// doc comment for its exact coordination; fields are private, reached
+    /// only through its own methods.
+    pub links: Arc<crate::link_registry::LinkRegistry>,
+    /// Test-only override consulted by `root_lease_for` before its normal
+    /// `link_runtimes` lookup -- lets a unit test that only calls
+    /// `sync_state.add_link(...)` (never a real `start_link_watch`, which
+    /// spins up a watcher, debounce/executor/repair tasks, and an OS-level
+    /// root lock the test has no interest in) still exercise a production
+    /// mutation path that requires a live `RootCommitPermit`
+    /// (`hydration::hydrate_inner`, `hydration::evict`, ...). Not reachable
+    /// outside test builds -- see this field's own `cfg` -- so it is not a
+    /// production bypass, the same seam `root_commit::RootLease::
+    /// for_tests()` is for tests that hold a `SyncState` handle directly
+    /// rather than a `DaemonState`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub test_root_commit_authorities:
+        Mutex<HashMap<String, Arc<yadorilink_root_authority::root_commit::RootLease>>>,
+    /// Test-only override consulted by `adapters::build_application_services`
+    /// in place of the real `on_demand_pipeline_is_connected()` probe --
+    /// `None` (the default) leaves the real, unconditionally-`false`
+    /// production adapter wired in. A `Mutex<Option<bool>>` rather than the
+    /// free function's own thread-local `OverrideForTest`, because a
+    /// multi-threaded Tokio integration test's async task (this daemon's
+    /// actual caller) is not guaranteed to run on the same OS thread the
+    /// test itself set an override from -- see `application::ports::
+    /// PlaceholderPipelineCapabilityPort`'s own doc comment. Not reachable
+    /// outside test builds -- see this field's own `cfg`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub test_placeholder_pipeline_connected: Mutex<Option<bool>>,
     /// Absolute paths a shell-extension client has asked to pause
     /// individually via `ContextAction::PauseItem` — finer-grained than
     /// the whole-link pause in `SyncState`, and deliberately in-memory
     /// only: it's a transient UI action, not durable state.
     pub paused_paths: Mutex<HashSet<String>>,
-    /// Fan-out for the shell-integration IPC: every connected
-    /// shell-extension client subscribes and receives status pushes as
-    /// local changes are indexed, instead of only ever answering queries.
-    pub status_push_tx: broadcast::Sender<StatusPush>,
+    /// This device's observability-facing runtime state -- see
+    /// `crate::runtime_telemetry::RuntimeTelemetry`'s own doc comment.
+    pub telemetry: Arc<crate::runtime_telemetry::RuntimeTelemetry>,
     /// Handed to every `PeerSyncSession` as its forwarding channel (see
     /// `PeerSyncSession::forward_tx`'s doc comment): a record one peer
     /// session adopts or resolves is sent here, and a background task
@@ -602,12 +447,6 @@ pub struct DaemonState {
     /// drain (bounded by a timeout) before tearing the process down,
     /// instead of possibly cutting one off mid-send.
     in_flight_broadcasts: AtomicI64,
-    /// name -> still running, for every essential task `main.rs`
-    /// supervises together. Populated from the outside (`main.rs`
-    /// sets this as it spawns/observes the exit of each task) since
-    /// `DaemonState` doesn't own those tasks itself; read by the control
-    /// socket's health handler.
-    pub task_liveness: Mutex<HashMap<String, bool>>,
     /// The control socket's `Shutdown` handler used to call
     /// `std::process::exit(0)` directly, a second shutdown path entirely
     /// separate from SIGTERM/SIGINT handling — neither aborted watcher
@@ -622,12 +461,12 @@ pub struct DaemonState {
     /// to disk by itself (see `reporting::mod`'s doc comment), so adding
     /// this field is safe for every existing `DaemonState::new` call site,
     /// test or production.
-    pub reporting: ReportingStorage,
+    pub reporting: Arc<ReportingStorage>,
     /// On-disk persistence for the
     /// global rate limits / headroom override (`governance_config`'s doc
     /// comment). Opening this never writes anything to disk by itself,
     /// mirroring `reporting`'s "safe for every existing call site" property.
-    pub governance_config: GovernanceConfigStore,
+    pub governance_config: Arc<GovernanceConfigStore>,
     /// The single, shared upload/
     /// download token-bucket pair every `PeerSyncSession` this daemon
     /// constructs is wired to (`peer_orchestrator::spawn_peer_session`,
@@ -635,11 +474,11 @@ pub struct DaemonState {
     /// "concurrent per-peer fetches share one global ceiling"
     /// true: they all draw from these exact two `Arc<TokenBucket>`
     /// instances, not independent per-session copies. Initialized from
-    /// `governance_config` at construction; `apply_governance_config`
-    /// re-reads config and updates these same buckets' rates in place
-    /// (live reload) rather than replacing the `Arc`, so every
-    /// already-connected session picks up a change on its very next token
-    /// consumption.
+    /// `governance_config` at construction; `GovernanceCommandService::
+    /// set_limits` (`adapters::runtime::governance`) re-reads config and
+    /// updates these same buckets' rates in place (live reload) rather
+    /// than replacing the `Arc`, so every already-connected session picks
+    /// up a change on its very next token consumption.
     pub rate_limiters: Arc<RateLimiters>,
     /// Mirrors `enable_disk_headroom_enforcement`'s effect for the block
     /// store, but for `PeerSyncSession`s constructed *after* it's set:
@@ -650,14 +489,10 @@ pub struct DaemonState {
     /// exact same `spawn_peer_session`, so this needs the same "off unless
     /// `main.rs` opts in" default the block store gets).
     disk_headroom_enforcement_enabled: std::sync::atomic::AtomicBool,
-    /// local_path -> Degraded
-    /// (disk-pressure) state for that link, entered by `mark_link_degraded`
-    /// (called from wherever a `DiskPressure` error surfaces for a
-    /// specific link — currently `hydration::hydrate_inner`) and cleared by
-    /// the periodic re-check task spawned in `new` once a subsequent
-    /// headroom check for that link's volume succeeds.
-    pub degraded_links: Mutex<HashMap<String, DegradedLinkInfo>>,
-    /// group_id -> latched `DurabilityUnknown` override, set by
+    /// This device's durability confirmation/latch state -- see
+    /// `crate::durability_service::DurabilityService`'s own doc comment.
+    /// `durability.group_durability_latch`: group_id -> latched
+    /// `DurabilityUnknown` override, set by
     /// [`Self::latch_group_durability_unknown`] whenever a force override
     /// bypasses this daemon's own durability handoff gate for that group.
     /// A group with NO entry here is not thereby "Healthy" — its status is
@@ -665,12 +500,22 @@ pub struct DaemonState {
     /// here only ever pins a group to `DurabilityUnknown` until a later
     /// whole-group handoff re-check clears it. The set is loaded from and
     /// written through `SyncState` so force history survives restart.
-    group_durability_latch: Mutex<HashMap<String, GroupDurabilityStatus>>,
+    durability: Arc<crate::durability_service::DurabilityService>,
     durability_latch_load_failed: AtomicBool,
+    /// Set while at least one `membership_operations` journal row is in
+    /// `UnknownScope` state (a `--force` device removal proceeded without a
+    /// verified list of groups at risk). Since the AT-RISK GROUPS are
+    /// themselves unknown, this cannot be expressed as a per-group latch —
+    /// it forces every group's `group_durability_status` to
+    /// `DurabilityUnknown` until a reconciliation pass narrows the scope
+    /// down to real per-group latches and clears this flag. Loaded from
+    /// `SyncState` at startup so it survives a restart, matching
+    /// `durability_latch_load_failed`'s own persistence.
+    unknown_scope_membership_marker: AtomicBool,
     /// operation_id -> consecutive `TransientFailure` count from
-    /// `pending_enrollment::reconcile`'s activate retries, so a
+    /// `EnrollmentRecoveryService::reconcile_once`'s activate retries, so a
     /// coordination-plane outage (or any other unconfirmable activate) that
-    /// outlasts `pending_enrollment::TRANSIENT_ESCALATION_THRESHOLD` sweeps
+    /// outlasts `enrollment_recovery_service::TRANSIENT_ESCALATION_THRESHOLD` sweeps
     /// is escalated -- a loud, stable log line, not just the ordinary
     /// per-sweep debug/info trace -- instead of retrying invisibly forever.
     /// The retry itself is never abandoned and the local link/marker are
@@ -682,24 +527,6 @@ pub struct DaemonState {
     /// TTL sweep is the ultimate backstop regardless of how long this has
     /// been climbing.
     pending_enrollment_transient_attempts: Mutex<HashMap<String, u32>>,
-    /// Bounded history of recent
-    /// connection attempts (`crate::connection_trace`), feeding both the
-    /// raw trace listing and the connectivity-doctor summary. Transient,
-    /// in-memory, never persisted, like `degraded_links` above.
-    pub connection_traces: crate::connection_trace::ConnectionTraceLog,
-    /// Bounded, in-memory
-    /// per-active-transfer progress state (`crate::transfer_progress`),
-    /// updated as blocks land during hydration and torn down automatically
-    /// once a transfer completes, fails, or times out (its RAII guard's
-    /// `Drop`). Same "transient, in-memory, never persisted" treatment as
-    /// `connection_traces`.
-    pub transfer_progress: crate::transfer_progress::TransferProgressTracker,
-    /// Bounded, in-memory recent
-    /// sync-error ring buffer (`crate::recent_errors`), surfaced in
-    /// `yadorilink status` so a stuck or failing sync is diagnosable
-    /// without reading logs. Same "transient, in-memory, never persisted"
-    /// treatment as `connection_traces`.
-    pub recent_errors: crate::recent_errors::RecentErrorLog,
     /// Check/download/verify/install
     /// orchestration, persisted update policy, and the pinned trust root
     /// for manifest signature verification.
@@ -707,7 +534,7 @@ pub struct DaemonState {
     /// Incremented for the duration of
     /// every sync-critical write this daemon performs — the initial
     /// folder scan and every debounced flush's chunk/index/broadcast pass
-    /// (`link_manager::start_link_watch`), and on-demand-sync's
+    /// (the daemon's own `LinkRuntimeController::start`), and on-demand-sync's
     /// hydrate/evict/restore materialization writes (`hydration.rs`).
     /// Mirrors `in_flight_broadcasts` and `BroadcastGuard`'s exact
     /// counter-plus-RAII-guard shape, so a write path that returns early
@@ -741,8 +568,8 @@ pub struct DaemonState {
     /// startup's own link-resume/repair work.
     last_activity_unix: AtomicI64,
     /// GC scheduling coordination and
-    /// last-run bookkeeping — see `gc::GcState`'s doc comment.
-    pub gc: crate::gc::GcState,
+    /// last-run bookkeeping — see `gc_state::GcState`'s doc comment.
+    pub gc: Arc<crate::gc_state::GcState>,
     /// This device's coordination-plane address + access token, set once at
     /// startup (`app.rs`, alongside the other production-only coordination
     /// wiring: signing-key backfill, NAT traversal, pending-enrollment
@@ -760,6 +587,14 @@ pub struct DaemonState {
     /// `coordination_client` caller in this daemon already has — see
     /// `pending_enrollment`'s module doc for the same accepted limitation).
     coordination_client_config: std::sync::OnceLock<CoordinationClientConfig>,
+    /// Test-only escape hatch from the unconditional, real-time periodic
+    /// `daemon-state-membership-recovery-sweep` spawned by [`Self::new`] --
+    /// see [`Self::disable_membership_recovery_sweep_for_test`]'s own doc
+    /// comment for why a recovery-diagnosis crash-qualification test needs
+    /// this. Always `false` (sweep enabled, unchanged from today) unless a
+    /// test explicitly opts out; compiled out of non-test builds entirely.
+    #[cfg(test)]
+    pub(crate) membership_recovery_sweep_disabled_for_test: std::sync::atomic::AtomicBool,
 }
 
 /// This device's coordination-plane address + access token — see
@@ -802,6 +637,99 @@ impl BlockWriteActivityProvider for DaemonState {
     }
 }
 
+/// Backs [`DaemonState::link_runtime_dependencies`]'s narrow bundle: the
+/// three operations the per-link runtime module tree (`link_runtime.rs`
+/// and `link_runtime/operations/*.rs`) needs but cannot perform itself
+/// without reaching into daemon-wide coordination state that dependency
+/// bundle deliberately does not carry -- see
+/// `link_runtime::dependencies::LinkRuntimeHostPort`'s own doc for why
+/// each of these three specifically can't just be a plain field there.
+impl crate::link_runtime::dependencies::LinkRuntimeHostPort for DaemonState {
+    fn broadcast_change<'a>(
+        &'a self,
+        group_id: &'a str,
+        records: Vec<FileRecord>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        // Resolves to the inherent method below (Rust prefers an inherent
+        // method over a trait method of the same name on the same
+        // receiver type), not a recursive call into this trait method --
+        // the same resolution `HandoffLeaseResponder for DaemonState`
+        // already relies on just above.
+        Box::pin(self.broadcast_change(group_id, records))
+    }
+
+    fn begin_write_activity(&self) -> Box<dyn Send + '_> {
+        Box::new(self.begin_write_activity())
+    }
+
+    fn device_signing_key(&self) -> Option<ed25519_dalek::SigningKey> {
+        self.device_signing_key()
+    }
+}
+
+impl DaemonState {
+    /// Narrows this daemon-wide state down to exactly what the per-link
+    /// runtime module tree needs -- see
+    /// `link_runtime::dependencies::LinkRuntimeDependencies`'s own doc.
+    /// Called at the top of every `LinkRuntimeController` entry point that
+    /// touches that module tree (`start_inner`, the disk-
+    /// reconcile backstop sweep, ...), each of which threads the returned
+    /// bundle down instead of `self` from that point on.
+    pub(crate) fn link_runtime_dependencies(
+        self: &Arc<Self>,
+    ) -> Arc<crate::link_runtime::dependencies::LinkRuntimeDependencies> {
+        Arc::new(crate::link_runtime::dependencies::LinkRuntimeDependencies {
+            replica_coordinator: self.replica_coordinator.clone(),
+            block_store: self.block_store.clone(),
+            telemetry: self.telemetry.clone(),
+            device_id: self.device_id.clone(),
+            host: self.clone() as Arc<dyn crate::link_runtime::dependencies::LinkRuntimeHostPort>,
+        })
+    }
+
+    /// Shared by both `PendingLocalChangeFlush` methods below: resolves
+    /// `group_id` to its live `LinkRuntime`, if this device is actively
+    /// linked (and watching) that group at all.
+    fn link_runtime_for(&self, group_id: &str) -> Option<Arc<crate::link_runtime::LinkRuntime>> {
+        let local_path = match self.replica_coordinator.link_repository().list_links() {
+            Ok(links) => links.into_iter().find(|l| l.group_id == group_id).map(|l| l.local_path),
+            Err(e) => {
+                tracing::warn!(error = %e, group_id, "failed to look up this group's local link");
+                None
+            }
+        };
+        let local_path = local_path?;
+        // `Starting` or absent: nothing to flush against yet either way.
+        self.links.runtime(&local_path)
+    }
+}
+
+impl yadorilink_peer_session::peer_session::PendingLocalChangeFlush for DaemonState {
+    fn flush_pending_local_change<'a>(
+        &'a self,
+        group_id: &'a str,
+        rel_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(runtime) = self.link_runtime_for(group_id) {
+                runtime.flush_pending_local_change(group_id, rel_path).await;
+            }
+        })
+    }
+
+    fn flush_case_fold_sibling<'a>(
+        &'a self,
+        group_id: &'a str,
+        rel_path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(runtime) = self.link_runtime_for(group_id) {
+                runtime.flush_case_fold_sibling(group_id, rel_path).await;
+            }
+        })
+    }
+}
+
 /// The decision logic behind [`DaemonState::obtain_handoff_lease_from_peer`]:
 /// whether a target's `HandoffLeaseGrant` actually covers this device's own
 /// current durability-root set. Split out as a pure function -- no session,
@@ -839,7 +767,7 @@ fn handoff_lease_grant_matches_digest(
 /// When there is no multi-thread worker to offload onto (a current-thread
 /// runtime, or called outside any runtime — e.g. tests), the plain synchronous
 /// path is correct and cannot starve a worker pool.
-fn run_blocking_sweep_offloaded(sweep: impl FnOnce()) {
+pub(crate) fn run_blocking_sweep_offloaded(sweep: impl FnOnce()) {
     #[cfg(not(madsim))]
     {
         match tokio::runtime::Handle::try_current() {
@@ -859,29 +787,50 @@ fn run_blocking_sweep_offloaded(sweep: impl FnOnce()) {
 }
 
 impl DaemonState {
+    /// Whether this device's on-demand (placeholder) materialization pipeline
+    /// is connected end-to-end -- the single place every call site in this
+    /// crate (`ReplicaRoleService::set_storage_mode` via
+    /// `PlaceholderPipelineCapabilityPort`, `hydration::evict`) should read
+    /// this from, so `set_test_placeholder_pipeline_connected`'s override
+    /// reaches all of them uniformly instead of each site needing its own
+    /// test seam. Falls through to `yadorilink_filesystem_sync::placeholder_backend::
+    /// on_demand_pipeline_is_connected` (unconditionally `false` in every
+    /// real build) when no test override is set.
+    pub(crate) fn on_demand_pipeline_is_connected(&self) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(connected) = *self
+            .test_placeholder_pipeline_connected
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            return connected;
+        }
+        yadorilink_filesystem_sync::placeholder_backend::on_demand_pipeline_is_connected()
+    }
+
     /// Repairs index rows omitted from the DAG by a policy-withheld initial
     /// import. Called both immediately after a verified policy snapshot lands
     /// and by the periodic materialization audit as a long-horizon retry.
     pub(crate) async fn backfill_missing_change_history(&self, group_id: &str) {
         let Some(signing_key) = self.device_signing_key() else { return };
-        let emitter = yadorilink_sync_core::dag_store::ChangeEmitter::new(
+        let emitter = yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
             self.device_id.clone(),
             signing_key,
         );
-        match yadorilink_sync_core::dag_import::backfill_missing_history(
-            &self.sync_state,
+        match crate::dag_import::backfill_missing_history(
+            self.replica_coordinator.as_ref(),
             group_id,
             &emitter,
         )
         .await
         {
-            Ok(yadorilink_sync_core::dag_import::BackfillOutcome::Backfilled { paths }) => {
+            Ok(crate::dag_import::BackfillOutcome::Backfilled { paths }) => {
                 tracing::info!(
                     group_id,
                     paths,
                     "repaired indexed paths missing from change history"
                 );
-                match self.sync_state.list_files(group_id) {
+                match self.replica_coordinator.file_index_repository().list_files(group_id) {
                     Ok(records) => self.broadcast_change(group_id, records).await,
                     Err(e) => tracing::warn!(
                         group_id,
@@ -890,7 +839,7 @@ impl DaemonState {
                     ),
                 }
             }
-            Ok(yadorilink_sync_core::dag_import::BackfillOutcome::NothingMissing) => {}
+            Ok(crate::dag_import::BackfillOutcome::NothingMissing) => {}
             Err(e) => tracing::warn!(
                 group_id,
                 error = %e,
@@ -899,13 +848,39 @@ impl DaemonState {
         }
     }
 
+    /// Convenience wrapper around [`Self::build`] for every caller that
+    /// wants the old all-in-one behavior: construct `self`, then start
+    /// `MaintenanceCoordinator` on it immediately. Production
+    /// (`app::run`) uses `build` directly instead, so it controls exactly
+    /// when maintenance starts relative to the rest of composition-root
+    /// wiring; this wrapper exists so the very large number of existing
+    /// test call sites (which only ever wanted a fully-functional
+    /// `DaemonState`, never cared about controlling that ordering
+    /// themselves) don't all need to change.
     pub fn new(
         device_id: String,
-        sync_state: Arc<SyncState>,
+        replica_coordinator: Arc<crate::replica_coordinator::ReplicaCoordinator>,
         block_store: Arc<dyn BlockStore + Send + Sync>,
     ) -> Arc<Self> {
+        let build = Self::build(device_id, replica_coordinator, block_store);
+        crate::maintenance_coordinator::start(&build.state, build.forward_rx);
+        build.state
+    }
+
+    /// Construction only -- builds `self` and wires its internal
+    /// closures (local-change-auth/repair-election providers), but starts
+    /// no background task and performs no other side effect beyond that
+    /// wiring and `update_manager.recover_on_startup()`'s own startup
+    /// recovery I/O. The caller owns starting `MaintenanceCoordinator` on
+    /// the returned state (see [`Self::new`] for the common case, or
+    /// `app::run` for production's own explicit sequencing).
+    pub(crate) fn build(
+        device_id: String,
+        replica_coordinator: Arc<crate::replica_coordinator::ReplicaCoordinator>,
+        block_store: Arc<dyn BlockStore + Send + Sync>,
+    ) -> DaemonBuild {
         let (status_push_tx, _) = broadcast::channel(256);
-        let (forward_tx, mut forward_rx) = mpsc::unbounded_channel::<(String, FileRecord)>();
+        let (forward_tx, forward_rx) = mpsc::unbounded_channel::<(String, FileRecord)>();
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let governance_config = GovernanceConfigStore::new(crate::device_config::config_dir());
         // Apply whatever's on disk
@@ -913,7 +888,7 @@ impl DaemonState {
         // been written) right away, so a freshly-started daemon's very
         // first session/block write already reflects a previous `limits
         // set`/headroom override rather than starting unlimited/unenforced
-        // for a beat until something else calls `apply_governance_config`.
+        // for a beat.
         let initial_governance = governance_config.load_or_default();
         let rate_limiters = Arc::new(RateLimiters::new(
             initial_governance.upload_limit_bytes_per_sec,
@@ -928,8 +903,8 @@ impl DaemonState {
         // explicitly, mirroring `FsBlockStore`/`PeerSyncSession`'s own
         // "off by default" behavior at every other layer of this change.
         block_store.set_headroom_override_bytes(initial_governance.headroom_override_bytes);
-        let (persisted_durability_latches, durability_latch_load_failed) = match sync_state
-            .list_durability_unknown_latches()
+        let (persisted_durability_latches, durability_latch_load_failed) = match replica_coordinator
+            .role_loss_operation_repository().list_durability_unknown_latches()
         {
             Ok(groups) => (groups, false),
             Err(error) => {
@@ -937,12 +912,36 @@ impl DaemonState {
                 (Vec::new(), true)
             }
         };
+        let unknown_scope_membership_marker =
+            replica_coordinator.membership_operation_repository().has_open_unknown_durability_scope_operation().unwrap_or(true);
         let (nat_sink, nat_candidates) = yadorilink_transport::CandidateSink::new();
         let state = Arc::new(Self {
             device_id,
-            sync_state,
+            replica_coordinator,
             block_store,
-            peer_statuses: Mutex::new(HashMap::new()),
+            // 512 MiB global / 128 MiB per-peer / 256 MiB per-group,
+            // sized against `MAX_BLOCK_SIZE` (16 MiB, `chunker.rs`) --
+            // each of a request's credit is reserved pessimistically at
+            // that pre-read worst case (see `handle_block_request_with_
+            // credit`'s doc comment), so these bound roughly how many
+            // full-size blocks this device serves concurrently overall/to
+            // one peer/for one group, not raw request count. 16 is
+            // `BlockServeEngine::new`'s own tuned value -- it is now BOTH
+            // what this device advertises AND the real concurrent-dispatch
+            // cap (previously two independently-set, silently-diverging
+            // numbers: this passed 64 while the dispatch queue itself was
+            // separately hardcoded to 16, so a peer favoring this device
+            // based on its advertised worker-slot count was reading a
+            // number this device could never actually back up). See that
+            // constructor's own doc comment for the throughput/fairness
+            // measurements 16 was tuned against before changing it.
+            block_serve_engine: yadorilink_peer_session::block_serve::BlockServeEngine::new(
+                512 * 1024 * 1024,
+                128 * 1024 * 1024,
+                256 * 1024 * 1024,
+                16,
+            ),
+            peers: Arc::new(crate::peer_registry::PeerRegistry::new()),
             nat_sink,
             nat_candidates,
             nat_observations: yadorilink_transport::ObservationLog::new(),
@@ -951,35 +950,37 @@ impl DaemonState {
             device_signing_key: Mutex::new(None),
             peer_netmap_metadata: Mutex::new(PeerNetmapMetadata::default()),
             membership_generation: std::sync::atomic::AtomicU64::new(0),
-            custody_confirmer: Mutex::new(None),
             group_policy_states: Mutex::new(HashMap::new()),
             stale_policy_groups: Mutex::new(HashMap::new()),
             materialization_repair_cursors: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashMap::new()),
-            link_tasks: Mutex::new(HashMap::new()),
-            link_flush_handles: Mutex::new(HashMap::new()),
+            convergence_engine_cursors: Mutex::new(HashMap::new()),
+            convergence_engine_path_budget_cursors: Mutex::new(HashMap::new()),
+            materialization_repair_sweep_interval: Mutex::new(
+                default_materialization_repair_sweep_interval(),
+            ),
+            links: Arc::new(crate::link_registry::LinkRegistry::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            test_root_commit_authorities: Mutex::new(HashMap::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            test_placeholder_pipeline_connected: Mutex::new(None),
             paused_paths: Mutex::new(HashSet::new()),
-            status_push_tx,
+            telemetry: Arc::new(crate::runtime_telemetry::RuntimeTelemetry::new(status_push_tx)),
             forward_tx,
             in_flight_broadcasts: AtomicI64::new(0),
-            task_liveness: Mutex::new(HashMap::new()),
             shutdown_tx,
-            reporting: ReportingStorage::open_default(),
-            governance_config,
+            reporting: Arc::new(ReportingStorage::open_default()),
+            governance_config: Arc::new(governance_config),
             rate_limiters,
             disk_headroom_enforcement_enabled: std::sync::atomic::AtomicBool::new(false),
-            degraded_links: Mutex::new(HashMap::new()),
-            group_durability_latch: Mutex::new(
+            durability: Arc::new(crate::durability_service::DurabilityService::new(
                 persisted_durability_latches
                     .into_iter()
                     .map(|group_id| (group_id, GroupDurabilityStatus::DurabilityUnknown))
                     .collect(),
-            ),
+            )),
             durability_latch_load_failed: AtomicBool::new(durability_latch_load_failed),
+            unknown_scope_membership_marker: AtomicBool::new(unknown_scope_membership_marker),
             pending_enrollment_transient_attempts: Mutex::new(HashMap::new()),
-            connection_traces: crate::connection_trace::ConnectionTraceLog::new(),
-            transfer_progress: crate::transfer_progress::TransferProgressTracker::new(),
-            recent_errors: crate::recent_errors::RecentErrorLog::new(),
             update_manager: Arc::new(crate::update::manager::UpdateManager::new(
                 crate::device_config::config_dir(),
                 current_crate_version(),
@@ -988,8 +989,10 @@ impl DaemonState {
             block_liveness_gate: BlockLivenessGate::default(),
             started_at: std::time::Instant::now(),
             last_activity_unix: AtomicI64::new(now_unix()),
-            gc: crate::gc::GcState::new(),
+            gc: Arc::new(crate::gc_state::GcState::new()),
             coordination_client_config: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            membership_recovery_sweep_disabled_for_test: std::sync::atomic::AtomicBool::new(false),
         });
         // Recover from any update artifact
         // left unverified, or an install left mid-handoff, by a previous
@@ -999,7 +1002,9 @@ impl DaemonState {
         state.update_manager.recover_on_startup();
         {
             let weak_state = Arc::downgrade(&state);
-            state.sync_state.set_local_change_auth_provider(Arc::new(move |group_id| {
+            let local_change_auth_provider: Arc<
+                dyn Fn(&str) -> Result<ChangeAuth, PolicyUnavailable> + Send + Sync + 'static,
+            > = Arc::new(move |group_id| {
                 let Some(state) = weak_state.upgrade() else {
                     // The daemon is being torn down. Report the policy as
                     // unavailable rather than stamping a placeholder-auth
@@ -1022,205 +1027,119 @@ impl DaemonState {
                     GroupPolicyResolution::Bootstrap => Ok(ChangeAuth::PLACEHOLDER),
                     GroupPolicyResolution::Withhold => Err(PolicyUnavailable),
                 }
-            }));
+            });
+            // Since 7D-10.7 repointed `build_change_processor` to construct
+            // `LocalChangeProcessor` from `replica_coordinator` (it now
+            // implements `LocalMutationStore`), real local edits resolve
+            // their authorization stamp through
+            // `ReplicaCoordinator::local_emission_auth` exclusively -- the
+            // `SyncState`-side copy this provider used to also be wired onto
+            // (removed in 7D-10.9 along with the `sync_state` field itself)
+            // had no remaining production reader. See
+            // phase7d10-exit-report.md's 7D-10.8/7D-10.9 addenda.
+            state.replica_coordinator.set_local_change_auth_provider(local_change_auth_provider);
         }
-        // Periodic background update
-        // checks with jitter, honoring `automatic_checks_enabled` (a
-        // disabled policy just means this loop's iteration is a no-op,
-        // not that the loop stops running — `yadorilink update check`
-        // must still work regardless, per the spec's "Automatic checks
-        // disabled" scenario). A failed check retries sooner
-        // (`UPDATE_CHECK_RETRY`'s shorter, doubling backoff) than the
-        // steady-state success interval (`UPDATE_CHECK_INTERVAL`).
-        // The periodic update-check scheduler is the daemon's only startup
-        // path that performs a real outbound HTTP request (`reqwest`, via
-        // `UpdateManager::check_now`). The deterministic simulator does not
-        // virtualize `reqwest`, and there is no update endpoint to reach
-        // in-sim, so this loop is not spawned there — its absence is inert
-        // (an operator-facing background maintenance task, not part of the
-        // sync data path). Production (`not(madsim)`) is unchanged; the
-        // `UpdateManager` itself is still constructed above so
-        // `yadorilink update check` and control-socket requests work.
-        // Unit tests construct many short-lived states in one process. Starting
-        // a real, immediate HTTP check for each one both leaks work past the
-        // test body and can overwrite the update-policy fixture another test
-        // is asserting. Integration tests still compile this crate normally,
-        // so production-like scheduler coverage remains available there.
-        #[cfg(not(any(madsim, test)))]
         {
-            let update_state = state.clone();
-            supervise::spawn_logged("daemon-state-update-check-scheduler", async move {
-                let mut consecutive_failures: u32 = 0;
-                loop {
-                    // Periodic update checks at daemon startup
-                    // and on an interval — the startup check runs first
-                    // (immediately, no delay), and every subsequent iteration
-                    // waits out the jittered steady-state interval, or a
-                    // shorter jittered backoff after a failure.
-                    let checks_enabled = update_state
-                        .update_manager
-                        .policy
-                        .load_or_default()
-                        .automatic_checks_enabled;
-                    if checks_enabled {
-                        match update_state.update_manager.check_now().await {
-                            Ok(_) => consecutive_failures = 0,
-                            Err(e) => {
-                                consecutive_failures = consecutive_failures.saturating_add(1);
-                                tracing::warn!(error = %e, consecutive_failures, "update check failed");
-                            }
+            let weak_state = Arc::downgrade(&state);
+            let repair_election_provider: Arc<
+                dyn Fn(
+                        &str,
+                        yadorilink_replica_engine::repair_election::RepairObligationId,
+                    ) -> Result<
+                        yadorilink_replica_engine::repair_election::RepairElectionContext,
+                        PolicyUnavailable,
+                    > + Send
+                    + Sync
+                    + 'static,
+            > = Arc::new(move |group_id, obligation| {
+                let Some(state) = weak_state.upgrade() else {
+                    return Err(PolicyUnavailable);
+                };
+                let Some(signing_key) = state.device_signing_key() else {
+                    return Err(PolicyUnavailable);
+                };
+                let local_fingerprint: [u8; 32] =
+                    sha2::Sha256::digest(signing_key.verifying_key().as_bytes()).into();
+                let netmap_writers = |state: &DaemonState| {
+                    let metadata =
+                        state.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut writers: Vec<AuthorizedWriter> = metadata
+                        .writers
+                        .iter()
+                        .filter(|(_, writer_group)| writer_group == group_id)
+                        .filter_map(|(device_id, _)| {
+                            metadata.signing_keys.get(device_id).map(|key| AuthorizedWriter {
+                                device_id: device_id.clone(),
+                                signing_key_fingerprint: sha2::Sha256::digest(key).into(),
+                            })
+                        })
+                        .collect();
+                    writers.retain(|writer| writer.device_id != state.device_id);
+                    writers.push(AuthorizedWriter {
+                        device_id: state.device_id.clone(),
+                        signing_key_fingerprint: local_fingerprint,
+                    });
+                    writers.sort();
+                    writers
+                };
+                let (auth, writers) = match state.resolve_group_policy(group_id) {
+                    GroupPolicyResolution::Verified(policy) => {
+                        let writers = policy.current_writers();
+                        if writers.is_empty() {
+                            // A verified policy whose Grant chain names NO
+                            // writers is the bootstrap regime with a signed
+                            // (empty) log: the same regime in which ordinary
+                            // emission is still authorized. Taking it
+                            // literally here would rank NOBODY — every
+                            // replica computes `local_rank = None`, the
+                            // deterministic failover never unlocks for any
+                            // device, and the liveness guarantee this
+                            // election exists to provide (issue #24) silently
+                            // dies group-wide (measured: row14's six devices
+                            // each logging AwaitingFailover forever while a
+                            // six-head frontier never merges). Fall back to
+                            // the same netmap-derived writer set the
+                            // no-policy bootstrap arm uses; the strict
+                            // grant/fingerprint binding still applies
+                            // whenever the chain names any writer at all.
+                            (policy.change_auth(), netmap_writers(&state))
+                        } else {
+                            (policy.change_auth(), writers)
                         }
                     }
-                    let delay = if consecutive_failures == 0 {
-                        supervise::BackoffConfig::UPDATE_CHECK_INTERVAL.next(0)
-                    } else {
-                        supervise::BackoffConfig::UPDATE_CHECK_RETRY.next(consecutive_failures - 1)
-                    };
-                    tokio::time::sleep(delay).await;
-                }
-            });
-        }
-        // The background queue-retry
-        // sweep, spawned unconditionally like the other periodic tasks
-        // below — it is a no-op (no network call at all) until the user
-        // opts into `queue_retry_enabled` and configures an endpoint, so
-        // spawning it for every `DaemonState` (including test call sites)
-        // is inert, matching how the pending-broadcast-retry task below is
-        // already spawned unconditionally.
-        crate::reporting::retry::spawn_periodic(state.clone());
-        spawn_materialization_repair_scheduler(state.clone());
-        // Every one of `DaemonState`'s own background tasks
-        // used to be a bare `tokio::spawn` with its `JoinHandle` dropped —
-        // a panic partway through a single forwarded record
-        // would silently stop mesh propagation
-        // for the rest of the process's life with no log line at all.
-        // `supervise::spawn_logged` doesn't restart these (unlike the
-        // reconnect loops in `peer_orchestrator`/`yadorilink-transport`,
-        // these consume an owned `mpsc::Receiver` that can't be recreated
-        // per attempt the way `spawn_restarting`'s `make_task` expects),
-        // but it does guarantee a loud `error`-level log naming the task
-        // if it ever exits or panics, instead of a zombie behavior gap.
-        let task_state = state.clone();
-        supervise::spawn_logged("daemon-state-forward-rebroadcast", async move {
-            while let Some((group_id, record)) = forward_rx.recv().await {
-                // A record forwarded here is
-                // exactly a peer session having just adopted/resolved an
-                // incoming file — this is this crate's "peer-reconciliation
-                // activity" signal for the GC idle scheduler.
-                task_state.record_activity();
-                task_state.broadcast_change(&group_id, vec![record]).await;
-            }
-            Ok(())
-        });
-        // A dedicated, short-interval poll for every currently-Degraded
-        // link whose backoff window has elapsed. The whole point of
-        // `BackoffConfig::DEGRADED_LINK_RECHECK`'s 5s *initial* interval is
-        // a link that degrades and recovers quickly getting checked again
-        // promptly, so this must not be folded into a slower housekeeping
-        // cadence.
-        let degraded_state = state.clone();
-        supervise::spawn_logged("daemon-state-degraded-link-recheck", async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                degraded_state.recheck_degraded_links();
-            }
-        });
-        // The retention-expiry sweep —
-        // "scheduled periodically... and on daemon startup". Once
-        // immediately (a daemon that was down for a while, or one whose
-        // retention policy just changed, shouldn't wait a full interval
-        // before its first sweep), then on a bounded interval. A
-        // relatively long interval (unlike the 2s degraded-link recheck
-        // above, which reacts to a transient, user-visible condition) is
-        // appropriate here: retention expiry is a slow-moving housekeeping
-        // concern — a version that's `RETENTION_EXPIRY_SWEEP_INTERVAL`
-        // late to be swept is not a correctness problem, only a delayed
-        // storage reclamation, and the actual space reclamation is
-        // deferred to the block-store GC regardless (this sweep only
-        // ever drops the *index* row, per ).
-        run_blocking_sweep_offloaded(|| run_retention_expiry_sweep(&state));
-        let retention_state = state.clone();
-        supervise::spawn_logged("daemon-state-retention-expiry-sweep", async move {
-            loop {
-                tokio::time::sleep(RETENTION_EXPIRY_SWEEP_INTERVAL).await;
-                run_blocking_sweep_offloaded(|| run_retention_expiry_sweep(&retention_state));
-            }
-        });
-        // Fix-saga: startup + periodic reconciliation of any role-loss
-        // operation left mid-flight by a crash — see
-        // `run_role_loss_reconciliation_sweep`'s own doc comment. Unlike the
-        // retention sweep just above, this one is async (its compensation
-        // path makes a coordination-plane HTTP call), so "run once
-        // immediately, then on an interval" is expressed as a single
-        // spawned loop that sweeps at the top before its first sleep,
-        // rather than a separate blocking call ahead of the spawn.
-        let role_loss_state = state.clone();
-        supervise::spawn_logged("daemon-state-role-loss-reconciliation-sweep", async move {
-            loop {
-                run_role_loss_reconciliation_sweep(&role_loss_state).await;
-                tokio::time::sleep(ROLE_LOSS_RECONCILIATION_SWEEP_INTERVAL).await;
-            }
-        });
-        // Piggy-backs on the same cadence as
-        // `PeerSyncSession`'s own periodic full-index resync
-        // (`DEFAULT_FULL_INDEX_RESYNC_INTERVAL`) rather than a new,
-        // independent timer. Not run once immediately at startup the way the
-        // retention sweep above is: `start_link_watch`'s own initial
-        // `scan_existing_files` already indexes everything present on disk
-        // at daemon start, so an immediate add-only pass here would find
-        // nothing new; the first sweep only matters once a watcher has had
-        // a chance to miss something.
-        let disk_reconcile_state = state.clone();
-        supervise::spawn_logged("daemon-state-disk-reconcile-backstop-sweep", async move {
-            loop {
-                tokio::time::sleep(
-                    yadorilink_sync_core::peer_session::DEFAULT_FULL_INDEX_RESYNC_INTERVAL,
+                    GroupPolicyResolution::Bootstrap => {
+                        (ChangeAuth::PLACEHOLDER, netmap_writers(&state))
+                    }
+                    GroupPolicyResolution::Withhold => return Err(PolicyUnavailable),
+                };
+                RepairElectionContext::new(
+                    auth,
+                    obligation,
+                    writers,
+                    state.device_id.clone(),
+                    local_fingerprint,
                 )
-                .await;
-                run_disk_reconcile_backstop_sweep(&disk_reconcile_state).await;
-            }
-        });
-        // The idle-triggered GC scheduler,
-        // modeled on this same `spawn_logged` periodic-task shape as every
-        // other sweep in this file. Shares its poll tick with the
-        // Previously-uncalled `run_eviction_sweep` — see
-        // `gc::run_periodic_capacity_eviction_sweep`'s doc comment for why
-        // that one doesn't need the same idle/write-safe-point gating GC
-        // itself does.
-        let gc_state = state.clone();
-        supervise::spawn_logged("daemon-state-gc-idle-scheduler", async move {
-            loop {
-                tokio::time::sleep(crate::gc::GC_IDLE_POLL_INTERVAL).await;
-                match crate::gc::maybe_run_idle_sweep(&gc_state, crate::gc::GC_IDLE_THRESHOLD).await
-                {
-                    None => {}
-                    Some(Ok(report)) if report.blocks_deleted > 0 => {
-                        tracing::info!(
-                            blocks_deleted = report.blocks_deleted,
-                            bytes_reclaimed = report.bytes_reclaimed,
-                            "idle-triggered GC sweep reclaimed blocks"
-                        );
-                    }
-                    Some(Ok(_)) => {}
-                    // Benign: either another sweep (on-demand or this same
-                    // loop's previous still-running iteration — shouldn't
-                    // happen given the `.await` above, but the invariant
-                    // holds either way) is in flight, or activity resumed
-                    // between the idle check and the attempt.
-                    Some(Err(
-                        crate::gc::GcTriggerError::AlreadyRunning
-                        | crate::gc::GcTriggerError::SyncBurstInProgress,
-                    )) => {}
-                    Some(Err(e @ crate::gc::GcTriggerError::Failed(_))) => {
-                        tracing::warn!(error = %e, "idle-triggered GC sweep failed");
-                    }
-                }
-                run_blocking_sweep_offloaded(|| {
-                    crate::gc::run_periodic_capacity_eviction_sweep(&gc_state)
-                });
-            }
-        });
-        state
+                .map_err(|_| PolicyUnavailable)
+            });
+            // Same reasoning as `local_change_auth_provider` above: real
+            // local edits (and the repair-election path that resolves
+            // through it) run through `replica_coordinator` exclusively.
+            state.replica_coordinator.set_repair_election_provider(repair_election_provider);
+        }
+        DaemonBuild { state, forward_rx }
+    }
+
+    /// This state's runtime-owner components, as `Arc` clones -- for a
+    /// caller (the composition root, an adapter) that needs to hold them
+    /// directly rather than reach through `DaemonState`.
+    #[allow(dead_code)]
+    pub(crate) fn runtime_components(&self) -> RuntimeComponents {
+        RuntimeComponents {
+            peers: self.peers.clone(),
+            links: self.links.clone(),
+            telemetry: self.telemetry.clone(),
+            durability: self.durability.clone(),
+        }
     }
 
     /// Seeds this device's WireGuard static public key for the transport hub's
@@ -1271,33 +1190,26 @@ impl DaemonState {
     /// apart, "not a tight retry loop") rather than reset, and
     /// keeps its original `since_unix` onset time.
     pub fn mark_link_degraded(&self, local_path: &str, reason: String) {
-        let mut degraded = self.degraded_links.lock().unwrap_or_else(|p| p.into_inner());
-        let now = now_unix();
-        let (since_unix, backoff_attempt) = match degraded.get(local_path) {
-            Some(existing) => (existing.since_unix, existing.backoff_attempt + 1),
-            None => (now, 0),
-        };
-        let next_recheck_unix = now
-            + supervise::BackoffConfig::DEGRADED_LINK_RECHECK.next(backoff_attempt).as_secs()
-                as i64;
-        degraded.insert(
-            local_path.to_string(),
-            DegradedLinkInfo { reason, since_unix, backoff_attempt, next_recheck_unix },
-        );
+        self.links.mark_degraded(local_path, reason, now_unix(), |backoff_attempt| {
+            supervise::BackoffConfig::DEGRADED_LINK_RECHECK.next(backoff_attempt).as_secs() as i64
+        });
     }
 
     /// Clears `local_path`'s Degraded state, if any — a no-op if it wasn't
     /// degraded.
     pub fn clear_link_degraded(&self, local_path: &str) {
-        self.degraded_links.lock().unwrap_or_else(|p| p.into_inner()).remove(local_path);
+        self.links.clear_degraded(local_path);
     }
 
     pub fn is_link_degraded(&self, local_path: &str) -> bool {
-        self.degraded_links.lock().unwrap_or_else(|p| p.into_inner()).contains_key(local_path)
+        self.links.is_degraded(local_path)
     }
 
-    pub fn degraded_link_info(&self, local_path: &str) -> Option<DegradedLinkInfo> {
-        self.degraded_links.lock().unwrap_or_else(|p| p.into_inner()).get(local_path).cloned()
+    pub fn degraded_link_info(
+        &self,
+        local_path: &str,
+    ) -> Option<crate::link_registry::DegradedLinkInfo> {
+        self.links.degraded_info(local_path)
     }
 
     /// Pins `group_id` to [`GroupDurabilityStatus::DurabilityUnknown`],
@@ -1312,12 +1224,9 @@ impl DaemonState {
     pub fn latch_group_durability_unknown(
         &self,
         group_id: &str,
-    ) -> Result<(), yadorilink_sync_core::SyncError> {
-        self.sync_state.latch_group_durability_unknown(group_id)?;
-        self.group_durability_latch
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(group_id.to_string(), GroupDurabilityStatus::DurabilityUnknown);
+    ) -> Result<(), crate::sync_error::SyncError> {
+        self.replica_coordinator.role_loss_operation_repository().latch_group_durability_unknown(group_id)?;
+        self.durability.latch_unknown(group_id);
         Ok(())
     }
 
@@ -1333,9 +1242,9 @@ impl DaemonState {
     pub fn clear_group_durability_latch(
         &self,
         group_id: &str,
-    ) -> Result<(), yadorilink_sync_core::SyncError> {
-        self.sync_state.clear_group_durability_unknown(group_id)?;
-        self.group_durability_latch.lock().unwrap_or_else(|p| p.into_inner()).remove(group_id);
+    ) -> Result<(), crate::sync_error::SyncError> {
+        self.replica_coordinator.role_loss_operation_repository().clear_group_durability_unknown(group_id)?;
+        self.durability.clear_unknown(group_id);
         Ok(())
     }
 
@@ -1363,19 +1272,6 @@ impl DaemonState {
             .remove(operation_id);
     }
 
-    /// Read-only peek at `operation_id`'s current transient-attempt count,
-    /// for tests -- unlike `note_pending_enrollment_transient_attempt`, this
-    /// never increments it.
-    #[cfg(test)]
-    pub fn pending_enrollment_transient_attempts_for(&self, operation_id: &str) -> u32 {
-        self.pending_enrollment_transient_attempts
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(operation_id)
-            .copied()
-            .unwrap_or(0)
-    }
-
     /// This group's current local durability status: the latched override
     /// above if one is set, otherwise a value derived live from this
     /// group's own sync state. The derived default is deliberately
@@ -1390,21 +1286,35 @@ impl DaemonState {
     /// reconfirmed"; the latch above is what specifically tracks the
     /// stronger "coverage was actively bypassed" fact.
     pub fn group_durability_status(&self, group_id: &str) -> GroupDurabilityStatus {
-        if self.durability_latch_load_failed.load(Ordering::SeqCst) {
-            return GroupDurabilityStatus::DurabilityUnknown;
-        }
-        if let Some(latched) =
-            self.group_durability_latch.lock().unwrap_or_else(|p| p.into_inner()).get(group_id)
-        {
-            return *latched;
-        }
-        match self.sync_state.materialization_counts(group_id) {
-            Ok(counts) if counts.placeholder == 0 && counts.hydrating == 0 => {
-                GroupDurabilityStatus::Healthy
-            }
-            Ok(_) => GroupDurabilityStatus::Syncing,
-            Err(_) => GroupDurabilityStatus::DurabilityUnknown,
-        }
+        // The three account-wide/group-scoped "cannot currently confirm"
+        // facts (latch-table load failure, an unresolved unknown-scope
+        // removal, a recovery-blocked membership operation) are gathered
+        // here since they live on `DaemonState`'s own atomics/`SyncState`,
+        // not inside `DurabilityService` -- see
+        // `crate::durability_service::classify`'s own doc for why this
+        // exact precedence (each one short-circuits before the optimistic
+        // materialization check ever runs) is the actual fail-safe
+        // property, not an implementation detail. `latched_unknown` is
+        // left `false` here -- `DurabilityService::classify` fills it in
+        // from its own latch table, which this method never touches
+        // directly.
+        let facts = crate::durability_service::DurabilityFacts {
+            latch_load_failed: self.durability_latch_load_failed.load(Ordering::SeqCst),
+            scope_unknown: self.unknown_scope_membership_marker.load(Ordering::SeqCst),
+            recovery_blocked: self
+                .replica_coordinator
+                .membership_operation_repository().has_recovery_blocked_membership_operation()
+                .unwrap_or(true),
+            latched_unknown: false,
+            materialization: match self.replica_coordinator.materialization_state_repository().materialization_counts(group_id) {
+                Ok(counts) if counts.placeholder == 0 && counts.hydrating == 0 => {
+                    Ok(crate::durability_service::MaterializationHealth::FullyLocal)
+                }
+                Ok(_) => Ok(crate::durability_service::MaterializationHealth::Partial),
+                Err(_) => Err(()),
+            },
+        };
+        self.durability.classify(group_id, facts)
     }
 
     /// re-checks free space for every Degraded link whose backoff
@@ -1414,16 +1324,9 @@ impl DaemonState {
     /// backoff) if it's still under pressure. A link whose local folder no
     /// longer exists (unlinked while degraded) or whose free space can't
     /// currently be determined is left degraded rather than guessed clear.
-    fn recheck_degraded_links(&self) {
+    pub(crate) fn recheck_degraded_links(&self) {
         let now = now_unix();
-        let due: Vec<(String, String)> = self
-            .degraded_links
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .filter(|(_, info)| info.next_recheck_unix <= now)
-            .map(|(path, info)| (path.clone(), info.reason.clone()))
-            .collect();
+        let due = self.links.degraded_due_snapshot(now);
         if due.is_empty() {
             return;
         }
@@ -1454,20 +1357,6 @@ impl DaemonState {
 
     /// Re-reads the persisted
     /// governance config and applies it to the *same* shared
-    /// `rate_limiters`/`block_store` instances (never replacing them) —
-    /// this is what makes a `limits set`/headroom-override change take
-    /// effect on already-connected sessions and the running block store
-    /// without a daemon restart. Called once by `DaemonState::new` (via its
-    /// own initial-load path) and again by the control socket's
-    /// `limits set` / headroom-override handlers (section 5) after they
-    /// persist a change.
-    pub fn apply_governance_config(&self) {
-        let config = self.governance_config.load_or_default();
-        self.rate_limiters.upload.set_rate_bytes_per_sec(config.upload_limit_bytes_per_sec);
-        self.rate_limiters.download.set_rate_bytes_per_sec(config.download_limit_bytes_per_sec);
-        self.block_store.set_headroom_override_bytes(config.headroom_override_bytes);
-    }
-
     /// Turns on the block store's
     /// disk-headroom preflight (`FsBlockStore::headroom_enforced`'s "off by
     /// default" flag) for this daemon's actual production block store.
@@ -1495,15 +1384,19 @@ impl DaemonState {
 
     /// Records this device's Ed25519 change-history signing key. The real
     /// daemon binary calls this once at startup when the device is
-    /// registered; a `DaemonState` built without it (every test that goes
-    /// through `new` without wiring one) leaves change-history emission off,
-    /// so behavior is byte-identical to before change history existed.
+    /// registered. A registered (non-empty `device_id`) `DaemonState` built
+    /// without one is a fail-closed condition, not a legitimate no-emitter
+    /// path — see `ensure_initial_change_history`'s own doc
+    /// comment for why: local edits would be indexed but never recorded as
+    /// DAG changes, which is silent data loss from the group's perspective.
+    /// Only a genuinely unregistered device (empty `device_id`) tolerates
+    /// this being unset.
     pub fn set_device_signing_key(&self, signing_key: ed25519_dalek::SigningKey) {
         *self.device_signing_key.lock().unwrap_or_else(|p| p.into_inner()) = Some(signing_key);
     }
 
     /// This device's change-history signing key, if one has been wired.
-    /// Consulted by `link_manager` when deciding whether to emit signed
+    /// Consulted by the daemon's own `LinkRuntimeController`-owned module tree when deciding whether to emit signed
     /// changes for a folder.
     pub fn device_signing_key(&self) -> Option<ed25519_dalek::SigningKey> {
         self.device_signing_key.lock().unwrap_or_else(|p| p.into_inner()).clone()
@@ -1633,27 +1526,14 @@ impl DaemonState {
         drop(metadata);
     }
 
-    /// Whether at least one OTHER device (any peer) is known to sync
-    /// `group_id` as a full replica. This is the content-blind "a full replica
-    /// for this group exists elsewhere" signal used both by the
-    /// last-full-replica guard and by cache-reclamation custody.
-    pub fn group_has_other_full_replica(&self, group_id: &str) -> bool {
-        self.peer_netmap_metadata
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .full_replicas
-            .iter()
-            .any(|(_device, g)| g == group_id)
-    }
-
     /// Whether THIS device syncs `group_id` as a full replica (its link's
     /// storage mode is eager/"store everything"). A missing link or any lookup
     /// error is treated as "not a full replica" — the guard/custody callers
     /// only ever need the positive, and an absent link cannot be a replica.
     pub fn is_local_full_replica(&self, group_id: &str) -> bool {
         matches!(
-            self.sync_state.materialization_policy_for_group(group_id),
-            Ok(Some(yadorilink_sync_core::types::MaterializationPolicy::Eager))
+            self.replica_coordinator.link_repository().materialization_policy_for_group(group_id),
+            Ok(Some(yadorilink_replica_domain::session_state::MaterializationPolicy::Eager))
         )
     }
 
@@ -1673,7 +1553,7 @@ impl DaemonState {
     /// peer.
     #[cfg(test)]
     pub fn set_custody_confirmer(&self, confirmer: Arc<dyn CustodyConfirmer>) {
-        *self.custody_confirmer.lock().unwrap_or_else(|p| p.into_inner()) = Some(confirmer);
+        self.durability.install_custody_confirmer(confirmer);
     }
 
     /// Wires the peer-to-peer custody confirmer. Physical cache reclamation is
@@ -1681,8 +1561,9 @@ impl DaemonState {
     /// GC leases; this wiring preserves exact-version diagnostics and the
     /// generation-stamped implementation that the future lease flow will use.
     pub fn install_p2p_custody_confirmer(self: &Arc<Self>) {
-        *self.custody_confirmer.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some(Arc::new(P2pCustodyConfirmer { state: Arc::downgrade(self) }));
+        self.durability.install_custody_confirmer(Arc::new(
+            crate::adapters::runtime::custody::P2pCustodyConfirmer::new(self),
+        ));
     }
 
     /// Fail-closed custody gate for on-demand cache reclamation: whether a full
@@ -1699,11 +1580,7 @@ impl DaemonState {
         version_hash: &VersionHash,
         blocks: &[VersionBlock],
     ) -> Option<CustodyStamp> {
-        let confirmer = self.custody_confirmer.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        match confirmer {
-            Some(confirmer) => confirmer.confirms_present(group_id, path, version_hash, blocks),
-            None => None,
-        }
+        self.durability.confirm_version(group_id, path, version_hash, blocks)
     }
 
     pub fn full_replica_custody_confirmed(
@@ -1717,8 +1594,7 @@ impl DaemonState {
     }
 
     fn custody_confirmation_still_valid(&self, group_id: &str, stamp: &CustodyStamp) -> bool {
-        let confirmer = self.custody_confirmer.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        confirmer.is_some_and(|confirmer| confirmer.confirmation_still_valid(group_id, stamp))
+        self.durability.confirmation_still_valid(group_id, stamp)
     }
 
     /// Asks every currently-connected, currently-authorized full-replica peer
@@ -1768,7 +1644,7 @@ impl DaemonState {
             .is_some()
     }
 
-    async fn confirm_version_present_witness_via_peer(
+    pub(crate) async fn confirm_version_present_witness_via_peer(
         &self,
         group_id: &str,
         path: &str,
@@ -1778,11 +1654,9 @@ impl DaemonState {
         use futures_util::stream::{FuturesUnordered, StreamExt};
 
         let candidates: Vec<(String, Arc<PeerSyncSession>)> = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .map(|(id, session)| (id.clone(), session.clone()))
+            .peers
+            .all_sessions()
+            .into_iter()
             .filter(|(peer_id, session)| {
                 self.peer_group_is_full_replica(peer_id, group_id)
                     && self.peer_is_writer(peer_id, group_id)
@@ -1925,12 +1799,58 @@ impl DaemonState {
             self.coordination_client_config.set(CoordinationClientConfig { addr, access_token });
     }
 
+    /// Overrides how often the daemon-level materialization-repair sweep
+    /// (`spawn_materialization_repair_scheduler`) re-drives any change still
+    /// unapplied — see `materialization_repair_sweep_interval`'s doc
+    /// comment. A test whose scenario can leave a change legitimately
+    /// stalled for multiple production-cadence (90s) intervals with no
+    /// other retry trigger in flight (no new local writes, no incoming
+    /// traffic) can opt into a much shorter one instead of either widening
+    /// its own timeout budget to absorb 90s gaps or accepting a wall-clock
+    /// tax production doesn't need. Takes effect on this scheduler's next
+    /// `interval.tick()`; a change after `DaemonState::new` has already
+    /// spawned it has no effect on a tick already in flight.
+    pub fn set_materialization_repair_sweep_interval(&self, interval: Duration) {
+        *self.materialization_repair_sweep_interval.lock().unwrap_or_else(|p| p.into_inner()) =
+            interval;
+    }
+
+    /// `pub(crate)`: read by `maintenance::materialization_repair::
+    /// MaterializationRepairJob`, which owns this scheduler's sleep-loop
+    /// (moved out of this file's own former
+    /// `spawn_materialization_repair_scheduler`).
+    pub(crate) fn materialization_repair_sweep_interval(&self) -> Duration {
+        *self.materialization_repair_sweep_interval.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// This device's coordination-plane address + access token, if recorded
     /// — see [`Self::set_coordination_client_config`]'s doc comment for when
     /// it is (and, notably, isn't: most of this crate's own unit tests never
     /// call the setter) set.
     pub fn coordination_client_config(&self) -> Option<&CoordinationClientConfig> {
         self.coordination_client_config.get()
+    }
+
+    /// Stops the real-time periodic `daemon-state-membership-recovery-sweep`
+    /// (role-loss + membership reconciliation, unconditional and
+    /// real-time -- see that sweep's own doc comment) from acting on THIS
+    /// `DaemonState`'s journal rows. A recovery-diagnosis crash-
+    /// qualification test builds a real `DaemonState` (through the same
+    /// `new()` production callers use) specifically to plant a membership/
+    /// role-loss journal row and read it back through the real
+    /// `recovery show` path -- the SAME background sweep this daemon would
+    /// also run in production would otherwise race that read (some sweep
+    /// branches mutate or delete a matching row unconditionally, with no
+    /// age gate, regardless of whether a coordination-plane config is even
+    /// set), corrupting the very state under test. Must be called
+    /// synchronously, before this task's first `.await` after construction
+    /// -- the spawned sweep task cannot run even one line of its own code
+    /// until the caller yields, so calling this immediately after `new()`
+    /// is race-free by construction, not by timing luck.
+    #[cfg(test)]
+    pub fn disable_membership_recovery_sweep_for_test(&self) {
+        self.membership_recovery_sweep_disabled_for_test
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Fix-saga: opens a durable role-loss-operation journal row for a
@@ -1960,16 +1880,18 @@ impl DaemonState {
         local_path: &str,
     ) -> Result<String, String> {
         let operation_id = uuid::Uuid::new_v4().to_string();
-        self.sync_state
-            .insert_role_loss_operation(
+        self.replica_coordinator
+            .role_loss_operation_repository().insert_role_loss_operation(
                 &operation_id,
                 group_id,
-                &self.device_id,
-                target_device_id,
-                Some(lease_id),
-                action,
-                Some(local_path),
-                now_unix(),
+                RoleLossOperationParams {
+                    source_device_id: &self.device_id,
+                    target_device_id,
+                    lease_id: Some(lease_id),
+                    action,
+                    local_path: Some(local_path),
+                    now_unix: now_unix(),
+                },
             )
             .map(|()| operation_id)
             .map_err(|e| {
@@ -1991,13 +1913,13 @@ impl DaemonState {
     /// called immediately after the coordination-worker role-loss commit
     /// succeeds, so a crash from this point on is reconciled by the startup
     /// + periodic sweep (`run_role_loss_reconciliation_sweep`) instead of
-    /// left as a split state. Best-effort: even if this write itself fails
-    /// (row stays `Prepared`), the sweep treats a `Prepared` row the same as
-    /// `WorkerCommitted` at reconciliation time — see
-    /// [`yadorilink_sync_core::index::RoleLossOperationState::Prepared`]'s
-    /// doc comment for why that's safe.
+    ///   left as a split state. Best-effort: even if this write itself fails
+    ///   (row stays `Prepared`), the sweep treats a `Prepared` row the same as
+    ///   `WorkerCommitted` at reconciliation time — see
+    ///   [`yadorilink_sync_core::index::RoleLossOperationState::Prepared`]'s
+    ///   doc comment for why that's safe.
     pub fn mark_role_loss_worker_committed(&self, operation_id: &str, membership_generation: i64) {
-        if let Err(e) = self.sync_state.mark_role_loss_worker_committed(
+        if let Err(e) = self.replica_coordinator.role_loss_operation_repository().mark_role_loss_worker_committed(
             operation_id,
             membership_generation,
             now_unix(),
@@ -2015,7 +1937,7 @@ impl DaemonState {
     /// — nothing was committed on either side, so the row never protected
     /// anything real.
     pub fn discard_role_loss_operation(&self, operation_id: &str) {
-        if let Err(e) = self.sync_state.delete_role_loss_operation(operation_id) {
+        if let Err(e) = self.replica_coordinator.role_loss_operation_repository().delete_role_loss_operation(operation_id) {
             tracing::warn!(
                 error = %e,
                 operation_id,
@@ -2031,7 +1953,7 @@ impl DaemonState {
     /// just with a journal row written and cleaned up around it.
     pub fn settle_role_loss_operation_success(&self, operation_id: &str) {
         let now = now_unix();
-        if let Err(e) = self.sync_state.advance_role_loss_operation(
+        if let Err(e) = self.replica_coordinator.role_loss_operation_repository().advance_role_loss_operation(
             operation_id,
             RoleLossOperationState::LocalCommitted,
             now,
@@ -2042,7 +1964,7 @@ impl DaemonState {
                 "failed to advance a role-loss operation journal row to LocalCommitted"
             );
         }
-        if let Err(e) = self.sync_state.delete_role_loss_operation(operation_id) {
+        if let Err(e) = self.replica_coordinator.role_loss_operation_repository().delete_role_loss_operation(operation_id) {
             tracing::warn!(
                 error = %e,
                 operation_id,
@@ -2050,6 +1972,174 @@ impl DaemonState {
                  cleaned up by the next reconciliation sweep"
             );
         }
+    }
+
+    /// Persists a membership-operation journal row -- see
+    /// [`yadorilink_sync_core::index::MembershipOperation`]'s doc comment.
+    /// Called instead of releasing tickets / falling through to a plain
+    /// revoke-remove, so an outcome that MAY already have committed on the
+    /// coordination plane is never silently treated as "never happened".
+    /// Never overwrites an existing row under `operation_id` -- returns
+    /// `Ok(false)` on conflict so the caller can retry under a fresh id
+    /// (see `replica_membership_service.rs`'s `open_membership_operation`),
+    /// rather than silently clobbering whatever that row already recorded.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_persist_membership_operation(
+        &self,
+        operation_id: &str,
+        action: MembershipOperationAction,
+        commit_mode: MembershipCommitMode,
+        removed_device_id: &str,
+        group_ids: &[String],
+        target_device_ids: &[String],
+        lease_ids: &[Option<String>],
+        state: MembershipOperationState,
+        durability_scope: MembershipDurabilityScope,
+        latch_group_ids: &[String],
+        last_error: Option<&str>,
+    ) -> Result<bool, String> {
+        let inserted = self
+            .replica_coordinator
+            .membership_operation_repository().try_insert_membership_operation(
+                operation_id,
+                action,
+                commit_mode,
+                removed_device_id,
+                group_ids,
+                target_device_ids,
+                lease_ids,
+                state,
+                durability_scope,
+                latch_group_ids,
+                last_error,
+                now_unix(),
+            )
+            .map_err(|e| e.to_string())?;
+        if inserted && durability_scope == MembershipDurabilityScope::Unknown {
+            self.unknown_scope_membership_marker.store(true, Ordering::SeqCst);
+        }
+        Ok(inserted)
+    }
+
+    /// Advances an existing `Prepared` membership-operation row to
+    /// `Ambiguous` — the row is KEPT (not deleted), unlike
+    /// [`Self::settle_membership_operation`]: an ambiguous commit's real
+    /// outcome is still unknown, so its journal row must survive for
+    /// `reconcile_ambiguous_membership_operations` to resolve later.
+    /// Best-effort: even if this write fails, the row stays `Prepared`,
+    /// which the reconciler treats the same way (see
+    /// [`yadorilink_sync_core::index::MembershipOperationState::Ambiguous`]'s
+    /// doc comment for the analogous role-loss reasoning this mirrors).
+    pub fn mark_membership_operation_ambiguous(&self, operation_id: &str, detail: &str) {
+        if let Err(e) = self.replica_coordinator.membership_operation_repository().mark_membership_operation_state(
+            operation_id,
+            MembershipOperationState::Ambiguous,
+            Some(detail),
+            now_unix(),
+        ) {
+            tracing::warn!(
+                error = %e,
+                operation_id,
+                "failed to advance a membership operation journal row to Ambiguous"
+            );
+        }
+    }
+
+    /// Marks a membership-operation journal row's outcome as settled
+    /// (`Completed`/`DefinitelyRejected`) by deleting it directly --
+    /// best-effort, matching [`Self::settle_role_loss_operation_success`].
+    /// Deletes in ONE step rather than updating to `final_state` and then
+    /// deleting: a row is never re-read after reaching a terminal state
+    /// (`scan_open_membership_operations` excludes both terminal states),
+    /// so an update that succeeds but is followed by a failed delete would
+    /// leave an orphaned row invisible to every future sweep -- there is no
+    /// "cleaned up by the next reconciliation sweep" for a row a terminal
+    /// state itself hides from that sweep's own query.
+    pub fn settle_membership_operation(
+        &self,
+        operation_id: &str,
+        _final_state: MembershipOperationState,
+    ) {
+        if let Err(e) = self.replica_coordinator.membership_operation_repository().delete_membership_operation(operation_id) {
+            tracing::warn!(
+                error = %e,
+                operation_id,
+                "failed to delete a settled membership operation; its non-terminal journal row \
+                 remains available for idempotent recovery"
+            );
+        }
+        self.refresh_unknown_scope_membership_marker();
+    }
+
+    /// Deletes a membership-operation journal row whose scope became known
+    /// (an unknown-scope marker converted to per-group latches) — matching
+    /// [`Self::discard_role_loss_operation`].
+    pub fn discard_membership_operation(&self, operation_id: &str) {
+        if let Err(e) = self.replica_coordinator.membership_operation_repository().delete_membership_operation(operation_id) {
+            tracing::warn!(
+                error = %e,
+                operation_id,
+                "failed to delete a resolved membership operation journal row"
+            );
+        }
+        self.refresh_unknown_scope_membership_marker();
+    }
+
+    /// Advances a membership-operation row to `RecoveryBlocked` -- automatic
+    /// recovery refused (an operation_id conflict, a local/remote request
+    /// identity mismatch, or a malformed journal row). The row is KEPT (not
+    /// deleted): unlike a confirmed terminal outcome, there is nothing safe
+    /// to conclude here, so it stays for operator attention and is excluded
+    /// from periodic resend/settlement.
+    pub fn mark_membership_operation_recovery_blocked(&self, operation_id: &str, detail: &str) {
+        if let Err(e) = self.replica_coordinator.membership_operation_repository().mark_membership_operation_state(
+            operation_id,
+            MembershipOperationState::RecoveryBlocked,
+            Some(detail),
+            now_unix(),
+        ) {
+            tracing::warn!(
+                error = %e,
+                operation_id,
+                "failed to advance a membership operation journal row to RecoveryBlocked"
+            );
+        }
+    }
+
+    /// Advances a membership-operation row to `LocalSettlementPending` --
+    /// the remote mutation is confirmed committed, but a required local
+    /// follow-up (e.g. a post-commit durability latch) failed and must be
+    /// retried. The row is KEPT so the next reconciliation sweep retries the
+    /// local step; it must never be silently discarded until that step also
+    /// succeeds.
+    pub fn mark_membership_operation_local_settlement_pending(
+        &self,
+        operation_id: &str,
+        detail: &str,
+    ) {
+        if let Err(e) = self.replica_coordinator.membership_operation_repository().mark_membership_operation_state(
+            operation_id,
+            MembershipOperationState::LocalSettlementPending,
+            Some(detail),
+            now_unix(),
+        ) {
+            tracing::warn!(
+                error = %e,
+                operation_id,
+                "failed to advance a membership operation journal row to LocalSettlementPending"
+            );
+        }
+    }
+
+    /// Re-derives `unknown_scope_membership_marker` from the journal —
+    /// called after any delete/settle that might have resolved the last
+    /// outstanding `Unknown`-durability-scope row, so `group_durability_status`
+    /// stops forcing `DurabilityUnknown` account-wide once every such row is
+    /// resolved.
+    fn refresh_unknown_scope_membership_marker(&self) {
+        let still_present =
+            self.replica_coordinator.membership_operation_repository().has_open_unknown_durability_scope_operation().unwrap_or(true);
+        self.unknown_scope_membership_marker.store(still_present, Ordering::SeqCst);
     }
 
     /// Compensates a role-loss operation whose coordination-worker commit
@@ -2088,12 +2178,12 @@ impl DaemonState {
     /// same as every other call in `coordination_client`).
     pub async fn compensate_role_loss_operation(&self, operation_id: &str) -> Result<(), String> {
         let Some(op) =
-            self.sync_state.get_role_loss_operation(operation_id).map_err(|e| e.to_string())?
+            self.replica_coordinator.role_loss_operation_repository().get_role_loss_operation(operation_id).map_err(|e| e.to_string())?
         else {
             return Ok(());
         };
         if op.state != RoleLossOperationState::Compensating {
-            if let Err(e) = self.sync_state.advance_role_loss_operation(
+            if let Err(e) = self.replica_coordinator.role_loss_operation_repository().advance_role_loss_operation(
                 operation_id,
                 RoleLossOperationState::Compensating,
                 now_unix(),
@@ -2107,8 +2197,8 @@ impl DaemonState {
         }
         let Some(config) = self.coordination_client_config() else {
             let attempts = self
-                .sync_state
-                .increment_role_loss_operation_attempts(operation_id, now_unix())
+                .replica_coordinator
+                .role_loss_operation_repository().increment_role_loss_operation_attempts(operation_id, now_unix())
                 .unwrap_or(op.attempts + 1);
             tracing::warn!(
                 operation_id,
@@ -2128,7 +2218,7 @@ impl DaemonState {
                 operation_id,
                 "legacy role-loss journal has no lease; treating it as superseded"
             );
-            self.sync_state.delete_role_loss_operation(operation_id).map_err(|e| e.to_string())?;
+            self.replica_coordinator.role_loss_operation_repository().delete_role_loss_operation(operation_id).map_err(|e| e.to_string())?;
             return Ok(());
         };
         match crate::coordination_client::compensate_handoff_role_loss(
@@ -2148,7 +2238,7 @@ impl DaemonState {
                     ?outcome,
                     "role-loss compensation reached a terminal outcome"
                 );
-                if let Err(e) = self.sync_state.advance_role_loss_operation(
+                if let Err(e) = self.replica_coordinator.role_loss_operation_repository().advance_role_loss_operation(
                     operation_id,
                     RoleLossOperationState::Completed,
                     now_unix(),
@@ -2159,7 +2249,7 @@ impl DaemonState {
                         "failed to advance a role-loss operation journal row to Completed"
                     );
                 }
-                if let Err(e) = self.sync_state.delete_role_loss_operation(operation_id) {
+                if let Err(e) = self.replica_coordinator.role_loss_operation_repository().delete_role_loss_operation(operation_id) {
                     tracing::warn!(
                         error = %e,
                         operation_id,
@@ -2171,8 +2261,8 @@ impl DaemonState {
             }
             Err(e) => {
                 let attempts = self
-                    .sync_state
-                    .increment_role_loss_operation_attempts(operation_id, now_unix())
+                    .replica_coordinator
+                    .role_loss_operation_repository().increment_role_loss_operation_attempts(operation_id, now_unix())
                     .unwrap_or(op.attempts + 1);
                 if attempts >= ROLE_LOSS_COMPENSATION_ESCALATION_ATTEMPTS {
                     tracing::error!(
@@ -2214,10 +2304,11 @@ impl DaemonState {
     /// the lease (giving a real `lease_id`), then — ONLY THEN — atomically
     /// re-enumerates this device's exact `(path, version_seq)` root rows AND
     /// records the local pin for them in one transaction
-    /// ([`SyncState::record_handoff_lease_atomic`]), so no retention sweep
-    /// can evict a row between enumerating it and pinning it (the gap
-    /// [`SyncState::record_handoff_lease`] alone leaves — see its sibling's
-    /// own doc comment). Ordering the Worker call first is what makes this
+    /// (`sync_state.handoff_lease_repository().record_handoff_lease_atomic`),
+    /// so no retention sweep can evict a row between enumerating it and
+    /// pinning it (the gap a separate `record_handoff_lease` call alone
+    /// leaves — see its sibling's own doc comment). Ordering the Worker call
+    /// first is what makes this
     /// atomic pin possible without a local schema change: the real
     /// Worker-issued `lease_id` is already in hand, so the single atomic
     /// write only ever inserts/updates one row keyed on it, never
@@ -2228,7 +2319,8 @@ impl DaemonState {
     /// step one — the root set moved between the readiness attestation and
     /// the atomic pin landing (e.g. a retention sweep evicted a root, or a
     /// new local version landed) — this aborts: it ATTEMPTS to release both
-    /// the just-written local pin ([`SyncState::set_handoff_lease_state`],
+    /// the just-written local pin
+    /// (`sync_state.handoff_lease_repository().set_handoff_lease_state`,
     /// `Released`) and the just-granted Worker lease
     /// (`coordination_client::release_handoff_lease`), then returns `None`,
     /// exactly as if no lease had been obtained at all. Both releases are
@@ -2327,7 +2419,10 @@ impl DaemonState {
         // plus the TTL, so it can never be thrown off by skew between this
         // device's clock and the Worker's -- see that function's own doc
         // comment for the full rationale.
-        let (pinned_digest, _pinned_versions) = match self.sync_state.record_handoff_lease_atomic(
+        let (pinned_digest, _pinned_versions) = match self
+            .replica_coordinator
+            .handoff_lease_repository()
+            .record_handoff_lease_atomic(
             group_id,
             &grant.lease_id,
             now_unix(),
@@ -2353,7 +2448,8 @@ impl DaemonState {
             // pin expiry and the Worker TTL sweep as the backstop if either
             // fails.
             if let Err(e) = self
-                .sync_state
+                .replica_coordinator
+                .handoff_lease_repository()
                 .set_handoff_lease_state(&grant.lease_id, HandoffLeaseState::Released)
             {
                 tracing::debug!(error = %e, group_id, lease_id = %grant.lease_id,
@@ -2375,8 +2471,10 @@ impl DaemonState {
     /// The local pin is released even when coordination configuration is no
     /// longer available; Worker TTL remains the fallback for a failed POST.
     pub async fn release_owned_handoff_lease(&self, group_id: &str, lease_id: &str) {
-        if let Err(e) =
-            self.sync_state.set_handoff_lease_state(lease_id, HandoffLeaseState::Released)
+        if let Err(e) = self
+            .replica_coordinator
+            .handoff_lease_repository()
+            .set_handoff_lease_state(lease_id, HandoffLeaseState::Released)
         {
             tracing::debug!(
                 error = %e,
@@ -2424,12 +2522,7 @@ impl DaemonState {
         target_peer_device_id: &str,
         my_digest: [u8; 32],
     ) -> Option<String> {
-        let session = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(target_peer_device_id)
-            .cloned()?;
+        let session = self.peers.session(target_peer_device_id)?;
         let grant = session.request_handoff_lease_from_peer(group_id).await?;
         let lease_id = handoff_lease_grant_matches_digest(&grant, my_digest);
         if lease_id.is_none() {
@@ -2539,8 +2632,7 @@ impl DaemonState {
         group_id: &str,
         device_id: &str,
     ) -> Option<PeerHandoffTicketGrant> {
-        let session =
-            self.sessions.lock().unwrap_or_else(|p| p.into_inner()).get(device_id).cloned()?;
+        let session = self.peers.session(device_id)?;
         session.request_handoff_ticket_from_peer(group_id).await
     }
 
@@ -2552,9 +2644,8 @@ impl DaemonState {
         device_id: &str,
         target_device_id: &str,
         lease_id: &str,
-    ) {
-        let session =
-            self.sessions.lock().unwrap_or_else(|p| p.into_inner()).get(device_id).cloned();
+    ) -> Result<(), String> {
+        let session = self.peers.session(device_id);
         if let Some(session) = session {
             if let Err(e) =
                 session.release_handoff_ticket_to_peer(group_id, target_device_id, lease_id).await
@@ -2567,8 +2658,11 @@ impl DaemonState {
                     lease_id,
                     "could not send removed-device ticket release; TTL remains the backstop"
                 );
+                return Err(e.to_string());
             }
+            return Ok(());
         }
+        Err(format!("no active session for removed device {device_id}"))
     }
 
     /// Like [`Self::full_replica_handoff_ready_digest`], but also returns the
@@ -2617,14 +2711,7 @@ impl DaemonState {
         if roots.roots.is_empty() {
             return Some((roots.digest, None));
         }
-        let sessions: Vec<(String, Arc<PeerSyncSession>)> = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .map(|(id, session)| (id.clone(), session.clone()))
-            .collect();
-        for (peer_id, session) in sessions {
+        for (peer_id, session) in self.peers.all_sessions() {
             if excluded_device_id == Some(peer_id.as_str()) {
                 continue;
             }
@@ -2652,7 +2739,7 @@ impl DaemonState {
     /// roots`), plus its digest. `None` (fail closed) if the underlying
     /// enumeration errors.
     fn durability_roots_for_group(&self, group_id: &str) -> Option<DurabilityRoots> {
-        self.sync_state.enumerate_group_durability_roots(group_id).ok()
+        self.replica_coordinator.file_index_repository().enumerate_group_durability_roots(group_id).ok()
     }
 
     /// Whether one specific peer — `peer_id`, reached over its own `session`
@@ -2741,9 +2828,7 @@ impl DaemonState {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(group_id.to_string(), now_unix());
-        let sessions: Vec<_> =
-            self.sessions.lock().unwrap_or_else(|p| p.into_inner()).values().cloned().collect();
-        for session in sessions {
+        for (_, session) in self.peers.all_sessions() {
             session.revoke_group(group_id);
         }
     }
@@ -2781,8 +2866,8 @@ impl DaemonState {
         {
             return true;
         }
-        self.sync_state
-            .list_links()
+        self.replica_coordinator
+            .link_repository().list_links()
             .map(|links| links.iter().any(|link| link.group_id == group_id))
             .unwrap_or(false)
     }
@@ -2846,7 +2931,7 @@ impl DaemonState {
     }
 
     /// Call around any sync-critical
-    /// write (folder scan/flush processing in `link_manager.rs`,
+    /// write (folder scan/flush processing in the daemon's own `LinkRuntimeController`,
     /// materialization writes in `hydration.rs`) so
     /// `is_write_safe_point` reports `false` for its duration. Public (not
     /// just crate-visible) since both call sites are in sibling modules
@@ -2856,7 +2941,7 @@ impl DaemonState {
         let liveness = self.block_liveness_gate.begin_reference_write();
         self.active_write_ops.fetch_add(1, Ordering::SeqCst);
         // Every existing call site of this
-        // guard (the local-change flush executor in `link_manager.rs`,
+        // guard (the local-change flush executor started via the daemon's own `LinkRuntimeController`,
         // hydration's hydrate/evict/restore paths in `hydration.rs`) is
         // exactly the "local-change/hydration activity" the GC idle
         // scheduler needs to know about.
@@ -2921,10 +3006,7 @@ impl DaemonState {
     /// `JoinSet`/supervision itself; this is just where the result
     /// is published for `control_socket`'s health handler to read).
     pub fn set_task_alive(&self, name: &str, alive: bool) {
-        self.task_liveness
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(name.to_string(), alive);
+        self.telemetry.set_task_alive(name, alive);
     }
 
     /// Propagates a batch of just-committed file records to every peer
@@ -2948,20 +3030,29 @@ impl DaemonState {
     pub async fn broadcast_change(
         &self,
         group_id: &str,
-        records: Vec<yadorilink_sync_core::types::FileRecord>,
+        records: Vec<yadorilink_replica_domain::file::FileRecord>,
     ) {
         if records.is_empty() {
             return;
         }
+        self.announce_heads_to_group_peers(group_id).await;
+    }
+
+    /// The actual per-session announce loop `broadcast_change` gates on a
+    /// non-empty `records` batch -- factored out so a caller that already
+    /// knows independently there is something new to announce (the
+    /// retroactive conflict-copy repair loop, `engine_wrapper.rs`) can
+    /// trigger the same immediate heads announce without needing to first
+    /// produce a `FileRecord` for every affected path. That gate is wrong
+    /// for the repair loop specifically: it authors a change directly
+    /// against the DAG (already durable) and may not yet have the
+    /// resulting content materialized locally (`get_file` returns `None`
+    /// while blocks are still being fetched), which must not silently
+    /// suppress the announce and leave propagation dependent on the next
+    /// periodic audit.
+    pub(crate) async fn announce_heads_to_group_peers(&self, group_id: &str) {
         let _in_flight = self.begin_broadcast(); // let shutdown wait for this to finish
-        let sessions: Vec<(String, Arc<PeerSyncSession>)> = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .map(|(id, s)| (id.clone(), s.clone()))
-            .collect();
-        for (peer_id, session) in sessions {
+        for (peer_id, session) in self.peers.all_sessions() {
             if !session.shares_group(group_id) {
                 continue;
             }
@@ -2983,7 +3074,7 @@ impl DaemonState {
 /// constructed session via `PeerSyncSession::set_handoff_lease_responder`
 /// (`peer_orchestrator.rs`), the same "daemon injects real behavior into a
 /// session" shape `PendingLocalChangeFlush for DaemonState` uses
-/// (`link_manager.rs`). `self.request_handoff_lease(group_id)` below resolves
+/// (the daemon's own `LinkRuntimeController`). `self.request_handoff_lease(group_id)` below resolves
 /// to the inherent method of the same name (Rust always prefers an inherent
 /// method over a trait method of the same name on the same receiver type),
 /// not a recursive call into this trait method.
@@ -3035,12 +3126,7 @@ impl HandoffTicketResponder for DaemonState {
         lease_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            let session = self
-                .sessions
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(target_device_id)
-                .cloned();
+            let session = self.peers.session(target_device_id);
             if let Some(session) = session {
                 if let Err(e) = session.release_handoff_lease_to_peer(group_id, lease_id).await {
                     tracing::debug!(
@@ -3059,6 +3145,7 @@ impl HandoffTicketResponder for DaemonState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replica_coordinator::ReplicaCoordinator;
     use yadorilink_local_storage::FsBlockStore;
 
     /// `YADORILINK_CONFIG_DIR` is a process-global env var (same pattern
@@ -3075,7 +3162,7 @@ mod tests {
     fn test_state() -> Arc<DaemonState> {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-        let sync_state = Arc::new(SyncState::open_in_memory().unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         DaemonState::new("device-a".into(), sync_state, store)
     }
 
@@ -3084,7 +3171,7 @@ mod tests {
         let state = test_state();
         state.set_peer_group_writer("peer-b", "group-a", true);
         state.set_peer_group_full_replica("peer-b", "group-a", true);
-        let confirmer = P2pCustodyConfirmer { state: Arc::downgrade(&state) };
+        let confirmer = crate::adapters::runtime::custody::P2pCustodyConfirmer::new(&state);
         let stamp = CustodyStamp::new("peer-b".into(), state.membership_generation());
 
         assert!(confirmer.confirmation_still_valid("group-a", &stamp));
@@ -3230,13 +3317,7 @@ mod tests {
         state.governance_config.set_headroom_override_bytes(Some(0)).unwrap();
         // Force the entry's backoff window to be due right now (avoids
         // this test waiting out even the 5s initial backoff).
-        state
-            .degraded_links
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get_mut(&link_path)
-            .unwrap()
-            .next_recheck_unix = now_unix() - 1;
+        state.links.force_degraded_recheck_due_now(&link_path, now_unix());
 
         state.recheck_degraded_links();
 
@@ -3265,13 +3346,7 @@ mod tests {
         // A headroom override far larger than any real disk's free space
         // keeps this link `Critical` no matter what.
         state.governance_config.set_headroom_override_bytes(Some(u64::MAX / 2)).unwrap();
-        state
-            .degraded_links
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get_mut(&link_path)
-            .unwrap()
-            .next_recheck_unix = now_unix() - 1;
+        state.links.force_degraded_recheck_due_now(&link_path, now_unix());
         let before = state.degraded_link_info(&link_path).unwrap();
 
         state.recheck_degraded_links();
@@ -3380,7 +3455,8 @@ mod tests {
         let server = MockServer::start().await;
         state.set_coordination_client_config(server.uri(), "test-token".into());
         state
-            .sync_state
+            .replica_coordinator
+            .handoff_lease_repository()
             .record_handoff_lease(
                 "group-release",
                 "lease-release",
@@ -3399,7 +3475,7 @@ mod tests {
 
         state.release_owned_handoff_lease("group-release", "lease-release").await;
 
-        let leases = state.sync_state.list_handoff_leases_for_group("group-release").unwrap();
+        let leases = state.replica_coordinator.handoff_lease_repository().list_handoff_leases_for_group("group-release").unwrap();
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].state, HandoffLeaseState::Released);
     }
@@ -3421,30 +3497,28 @@ mod tests {
     async fn request_handoff_lease_aborts_and_releases_both_pins_on_a_digest_mismatch() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-        use yadorilink_sync_core::version_vector::VersionVector;
 
         let state = test_state();
         let server = MockServer::start().await;
         state.set_coordination_client_config(server.uri(), "test-token".into());
 
-        let sync_state_for_handler = state.sync_state.clone();
+        let sync_state_for_handler = state.replica_coordinator.clone();
         Mock::given(method("POST"))
             .and(path("/shares/groups/group-1/handoff/lease"))
             .respond_with(move |_req: &Request| {
-                let mut version = VersionVector::new();
-                version.increment("device-b");
+                let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
                 sync_state_for_handler
-                    .upsert_file_with_origin(
+                    .file_index_repository().upsert_file_with_origin(
                         "group-1",
                         &FileRecord {
                             path: "b.txt".to_string(),
                             size: 5,
                             mtime_unix_nanos: 0,
-                            version,
                             blocks: vec![],
                             deleted: false,
                         },
                         "device-b",
+                        &permit,
                     )
                     .unwrap();
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3475,7 +3549,7 @@ mod tests {
         // The local pin must have been written (provisionally) and then
         // explicitly released, not left dangling as a live-looking
         // 'provisional' row.
-        let local_leases = state.sync_state.list_handoff_leases_for_group("group-1").unwrap();
+        let local_leases = state.replica_coordinator.handoff_lease_repository().list_handoff_leases_for_group("group-1").unwrap();
         assert_eq!(local_leases.len(), 1);
         assert_eq!(local_leases[0].lease_id, "lease-xyz");
         assert_eq!(local_leases[0].state, HandoffLeaseState::Released);
@@ -3510,7 +3584,7 @@ mod tests {
 
         let db_dir = tempfile::tempdir().unwrap();
         let db_path = db_dir.path().join("sync.db");
-        let sync_state = Arc::new(SyncState::open(&db_path).unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
         let state = DaemonState::new("device-a".into(), sync_state, store);
@@ -3612,7 +3686,7 @@ mod tests {
         let local_now_after_request = now_unix();
         assert_eq!(grant.ttl_seconds, ttl_seconds);
 
-        let leases = state.sync_state.list_handoff_leases_for_group("group-1").unwrap();
+        let leases = state.replica_coordinator.handoff_lease_repository().list_handoff_leases_for_group("group-1").unwrap();
         assert_eq!(leases.len(), 1);
         let recorded = &leases[0];
         assert_eq!(recorded.lease_id, "lease-skewed");
@@ -3628,9 +3702,9 @@ mod tests {
              expiresAt was stale relative to this device's own clock"
         );
         let earliest_deadline =
-            earliest_local_now + ttl_seconds + SyncState::HANDOFF_LEASE_PIN_SAFETY_MARGIN_SECS;
+            earliest_local_now + ttl_seconds + yadorilink_sync_sqlite::handoff_lease::HANDOFF_LEASE_PIN_SAFETY_MARGIN_SECS;
         let latest_deadline =
-            latest_local_now + ttl_seconds + SyncState::HANDOFF_LEASE_PIN_SAFETY_MARGIN_SECS;
+            latest_local_now + ttl_seconds + yadorilink_sync_sqlite::handoff_lease::HANDOFF_LEASE_PIN_SAFETY_MARGIN_SECS;
         assert!(
             recorded.expires_at_unix >= earliest_deadline - 5
                 && recorded.expires_at_unix <= latest_deadline + 5,
@@ -3683,7 +3757,7 @@ mod tests {
             );
 
             // No local pin was written for the rejected grant.
-            let local_leases = state.sync_state.list_handoff_leases_for_group("group-1").unwrap();
+            let local_leases = state.replica_coordinator.handoff_lease_repository().list_handoff_leases_for_group("group-1").unwrap();
             assert!(
                 local_leases.is_empty(),
                 "a rejected non-positive-ttl grant must record no local pin"
@@ -3741,14 +3815,14 @@ mod tests {
     async fn forced_durability_unknown_latch_survives_daemon_restart() {
         let database_dir = tempfile::tempdir().unwrap();
         let database_path = database_dir.path().join("sync-state.sqlite");
-        let before_restart = SyncState::open(&database_path).unwrap();
-        before_restart.latch_group_durability_unknown("group-1").unwrap();
+        let before_restart = ReplicaCoordinator::open(&database_path).unwrap();
+        before_restart.role_loss_operation_repository().latch_group_durability_unknown("group-1").unwrap();
         drop(before_restart);
 
         let restarted_store_dir = tempfile::tempdir().unwrap();
         let restarted = DaemonState::new(
             "device-a".into(),
-            Arc::new(SyncState::open(&database_path).unwrap()),
+            Arc::new(ReplicaCoordinator::open(&database_path).unwrap()),
             Arc::new(FsBlockStore::new(restarted_store_dir.path()).unwrap()),
         );
 
@@ -3758,14 +3832,14 @@ mod tests {
             "force history must remain latched after reopening the durable index"
         );
         restarted.clear_group_durability_latch("group-1").unwrap();
-        let after_clear = SyncState::open(&database_path).unwrap();
-        assert!(after_clear.list_durability_unknown_latches().unwrap().is_empty());
+        let after_clear = ReplicaCoordinator::open(&database_path).unwrap();
+        assert!(after_clear.role_loss_operation_repository().list_durability_unknown_latches().unwrap().is_empty());
     }
 
     // --- Startup-window placeholder-auth race (watcher before policy load) ---
     //
     // `app::run` resumes every already-linked folder's filesystem watcher
-    // (`link_manager::start_link_watch`, driven by `sync_state.list_links()`)
+    // (the daemon's own `LinkRuntimeController::start`, driven by `sync_state.list_links()`)
     // before it spawns the peer/netmap orchestrator task that eventually
     // calls `replace_group_policy_states`. Until that first netmap fetch
     // completes, `group_policy_state(group_id)` is `None` for every group —
@@ -3797,10 +3871,11 @@ mod tests {
     #[tokio::test]
     async fn local_edit_before_policy_load_must_not_enter_the_dag_with_a_placeholder_stamp_for_an_already_linked_group(
     ) {
-        use yadorilink_sync_core::change::{FileMeta, Op, SyncPath};
-        use yadorilink_sync_core::dag_store::ChangeEmitter;
-        use yadorilink_sync_core::types::RecordKind;
-        use yadorilink_sync_core::version_vector::VersionVector;
+        use yadorilink_replica_domain::change::{Op, PutOrigin};
+        use yadorilink_replica_domain::file::FileMeta;
+        use yadorilink_replica_domain::ids::SyncPath;
+        use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
+        use yadorilink_replica_domain::file::RecordKind;
 
         let state = test_state();
         let group = "group-1";
@@ -3811,7 +3886,7 @@ mod tests {
         // for the first time never reaches this state before its own policy
         // is established, so this precondition is what separates "existing
         // group, not loaded yet" from "genuinely policy-free group".
-        state.sync_state.add_link("/links/photos", group).unwrap();
+        state.replica_coordinator.link_repository().add_link("/links/photos", group).unwrap();
 
         // The startup-gap precondition: the orchestrator has not completed
         // its first netmap fetch, so nothing has populated policy state for
@@ -3825,7 +3900,7 @@ mod tests {
         // on `sync_state`), exactly as a live watcher callback would drive it.
         let emitter =
             ChangeEmitter::new("device-a", ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]));
-        let version = yadorilink_sync_core::change::FileVersion::new(
+        let version = yadorilink_replica_domain::file::FileVersion::new(
             vec![],
             0,
             FileMeta {
@@ -3835,25 +3910,30 @@ mod tests {
                 record_kind: RecordKind::File,
             },
         );
-        let mut vv = VersionVector::new();
-        vv.increment("device-a");
         let record = FileRecord {
             path: "note.txt".into(),
             size: 0,
             mtime_unix_nanos: 0,
-            version: vv,
             blocks: vec![],
             deleted: false,
         };
 
-        let result = state.sync_state.upsert_file_emitting_change(
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        let result = state.replica_coordinator.upsert_file_emitting_change(
             group,
             &record,
             "device-a",
-            vec![Op::Create { path: SyncPath("note.txt".into()), version: version.version_hash }],
-            &[version],
+            yadorilink_replica_domain::session_state::ChangeContent {
+                ops: vec![Op::Put {
+                    path: SyncPath("note.txt".into()),
+                    version: version.version_hash,
+                    origin: PutOrigin::Direct,
+                }],
+                versions: &[version],
+            },
             None,
             &emitter,
+            &permit,
         );
 
         // The fix: an already-linked group's policy merely being unresolved
@@ -3866,12 +3946,12 @@ mod tests {
         // the group's real policy loads, rather than landing a placeholder
         // stamp every valid-policy peer rejects.
         assert!(
-            matches!(result, Err(yadorilink_sync_core::SyncError::PolicyUnavailable)),
+            matches!(result, Err(crate::sync_error::SyncError::PolicyUnavailable)),
             "local emission for an already-linked, policy-not-yet-loaded group must withhold \
              (PolicyUnavailable), not stamp a placeholder-auth change; got {result:?}"
         );
         assert!(
-            state.sync_state.dag_group_heads(group).unwrap().is_empty(),
+            state.replica_coordinator.sqlite().dag_group_heads(group).unwrap().is_empty(),
             "an already-linked group whose policy state has not loaded yet this run must not get \
              a placeholder-auth change committed to its DAG"
         );

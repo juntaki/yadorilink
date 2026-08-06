@@ -8,11 +8,6 @@ package yadorilink.sync.v1;
 // established per session). Every message exchanged between two
 // syncing devices is one prost-encoded `SyncMessage`.
 
-message VersionVector {
-  // device_id -> monotonically increasing counter for that device's edits.
-  map<string, uint64> counters = 1;
-}
-
 message BlockInfo {
   bytes hash = 1; // SHA-256 of block content
   uint64 offset = 2;
@@ -57,7 +52,11 @@ message FileInfo {
   string path = 1;
   uint64 size = 2;
   int64 mtime_unix_nanos = 3;
-  VersionVector version = 4;
+  // Field 4 was `VersionVector version`, removed together with the per-file
+  // counter model. Causality is carried by the signed change DAG and its
+  // ancestry, never by per-file counters.
+  reserved 4;
+  reserved "version";
   repeated BlockInfo blocks = 5;
   bool deleted = 6;
   // Symlink-record and exec-bit fidelity
@@ -101,6 +100,9 @@ message FileInfo {
   // `yadorilink_sync_core::peer_session::resolve_and_apply_conflict`'s
   // doc comment.
   string origin_device_id = 11;
+  // Hash of the retained DAG change that authored the projected row. Empty
+  // means a legacy/unknown identity and must never be trusted for causality.
+  bytes authoring_change_hash = 12;
 }
 
 message ClusterConfig {
@@ -194,6 +196,47 @@ message ClusterConfig {
   // exact-version proof; the per-file eviction custody path is unaffected
   // by this field.
   bool supports_version_hash_exact = 9;
+  // Was `bool supports_block_serve_credit` -- the credit-gated `BlockReply`
+  // serving path is no longer negotiated; every peer
+  // speaking `protocol_version >= MIN_SUPPORTED_PROTOCOL_VERSION` is
+  // required to use it (see `protocol_version`'s own doc comment below).
+  // The legacy `BlockResponse` message this flag used to gate falling back
+  // to is removed entirely, not merely unused.
+  reserved 10;
+  reserved "supports_block_serve_credit";
+  // The following four fields piggyback on `ClusterConfig`'s existing
+  // periodic re-announce (no separate advertisement message). Advisory
+  // hints for scheduling, not binding promises -- an advertised slot can
+  // still be contended by the time a request actually arrives, which
+  // `BlockReply.Busy`'s own `retry_after_ms`/`queue_depth` communicate
+  // authoritatively for that specific request.
+  //
+  // The most in-flight *request count* this peer's serve engine is willing
+  // to admit from all requesters combined right now.
+  uint32 max_inflight_requests = 11;
+  // The most in-flight *bytes* this peer's serve engine is willing to admit
+  // from all requesters combined right now (CONV-6's global bound,
+  // advertised so a requester can favor a less-loaded source before even
+  // asking).
+  uint64 max_inflight_bytes = 12;
+  // How many of this peer's serve-engine worker slots are currently free.
+  uint32 available_worker_slots = 13;
+  // This peer's own current estimate of how long a new request would wait
+  // in its serve queue before being served, in milliseconds.
+  uint32 estimated_queue_delay_ms = 14;
+  // This device's protocol generation, bumped whenever a wire-incompatible,
+  // breaking change lands (as opposed to the additive
+  // capability-negotiation fields elsewhere in this message, which stay
+  // wire-compatible with an old peer by design). Currently `2`: generation
+  // `1` (the proto3 default `0`, and anything below `2`) spoke the legacy
+  // `BlockResponse`/hash-only-correlated block-serving path this
+  // generation removed outright with no fallback -- unlike every
+  // `supports_*` flag above, there is nothing to negotiate down to, so a
+  // peer this device's own `MIN_SUPPORTED_PROTOCOL_VERSION` doesn't accept
+  // is refused (all of this peer's group authorization withdrawn) rather
+  // than served on a best-effort basis. See
+  // `PeerSyncSession::MIN_SUPPORTED_PROTOCOL_VERSION`'s own doc comment.
+  uint32 protocol_version = 15;
 }
 
 message BlockRequest {
@@ -201,23 +244,86 @@ message BlockRequest {
   string file_path = 2;
   // The plaintext content hash of the requested block.
   bytes block_hash = 3;
+  // A per-session-unique, requester-assigned identifier for this specific
+  // request, always set (starting from 1, so an unset/default value never
+  // collides with a real one) and always echoed back by the responder on
+  // `BlockReply.request_id` -- see that field's own doc comment.
+  uint64 request_id = 4;
 }
 
-message BlockResponse {
-  bytes block_hash = 1;
+// Was `message BlockResponse` -- the sole block-serving reply before
+// `protocol_version` 2 (see that field's own doc comment): only
+// `not_found`, no per-peer/per-group/global credit, no distinction between
+// a genuine miss and "temporarily can't serve it" or "someone else likely
+// holds it". Removed entirely rather than kept alongside `BlockReply`
+// (there is no fallback path for a peer this device refuses to talk to at
+// all -- see `PeerSyncSession::MIN_SUPPORTED_PROTOCOL_VERSION`'s own doc
+// comment). Field 5 in `SyncMessage.payload` (`block_response`) is
+// reserved rather than reused.
+//
+// Distinguishes a genuine "block not
+// found" from "temporarily can't serve it" and "someone else likely holds
+// it", which the old message's own `not_found` boolean alone collapsed
+// into one signal a requester could not act differently on.
+message BlockReplyFound {
   // The block's content bytes: plaintext, optionally zstd-compressed per
   // `compression` below.
-  bytes data = 2;
-  // Set (with `data` empty) when the responder no longer has this block,
-  // so the requester doesn't hang waiting for a response that never comes.
-  bool not_found = 3;
-  Compression compression = 4;
-  // Fields 5-6 were `bool is_ciphertext` and `bytes ciphertext_nonce`,
-  // removed together with the untrusted ciphertext-only peer kind. Block
-  // `data` is always plaintext (optionally compressed), never AEAD
-  // ciphertext.
-  reserved 5, 6;
-  reserved "is_ciphertext", "ciphertext_nonce";
+  bytes data = 1;
+  Compression compression = 2;
+}
+
+// This peer's serve queue for the requested block is at its in-flight
+// credit limit (per-peer, per-group, or global -- CONV-6) right now, not
+// permanently absent. The requester must retry no sooner than
+// `retry_after_ms` rather than treating this as `dont_have` or a timeout.
+message BlockReplyBusy {
+  uint32 retry_after_ms = 1;
+  // How many requests are currently ahead of a hypothetical new one in this
+  // peer's serve queue, for the requester's own source-selection judgment.
+  uint32 queue_depth = 2;
+}
+
+// This peer does not hold the block itself, but believes one of these
+// devices might (CONV-8: steering requesters toward a scarce block's known
+// holder instead of every requester piling onto the same sole source).
+// Advisory only -- the requester still has to ask, and any candidate may no
+// longer hold it.
+message BlockReplyRedirect {
+  repeated string candidate_device_ids = 1;
+}
+
+// The request itself could not be honored for a reason other than
+// not-having-it or being-busy (e.g. the requester is not authorized for the
+// group, or the request was structurally malformed) -- distinct from
+// `dont_have` so a requester does not mistake a hard rejection for "keep
+// retrying, it might show up."
+message BlockReplyRejected {
+  string reason = 1;
+}
+
+message BlockReply {
+  bytes block_hash = 1;
+  oneof outcome {
+    BlockReplyFound found = 2;
+    // Set `true` when the responder has looked and genuinely does not
+    // (and, unlike `BlockReplyBusy`, is not merely temporarily unable to)
+    // hold this block -- the requester should stop waiting on this peer for
+    // it, exactly like `BlockResponse.not_found` today.
+    bool dont_have = 3;
+    BlockReplyBusy busy = 4;
+    BlockReplyRedirect redirect = 5;
+    BlockReplyRejected rejected = 6;
+  }
+  // Echoes `BlockRequest.request_id` verbatim. A single session can have
+  // several outstanding requests for the identical `block_hash` at once --
+  // e.g. two different folder groups sharing a peer connection both happen
+  // to reference the same content -- and each can legitimately get a
+  // DIFFERENT outcome (one group has provenance and gets `found`, another
+  // doesn't and gets `rejected`). Correlating replies by `block_hash` alone
+  // cannot distinguish those; this codebase's responder always echoes the
+  // requester's `request_id`, and the requester correlates by it
+  // exclusively.
+  uint64 request_id = 7;
 }
 
 // Change-history DAG exchange. Sent only between two peers that have both
@@ -229,7 +335,7 @@ message BlockResponse {
 //
 // A change hash is the 32-byte SHA-256 of a change's canonical encoding; an
 // encoded change is its canonical encoding followed by its 64-byte Ed25519
-// signature (`yadorilink_sync_core::change::Change::to_wire_bytes`), so a
+// signature (`yadorilink_replica_domain::change::Change::to_wire_bytes`), so a
 // relayed change carries its original signature and cannot be forged or
 // altered by an intermediary without detection at the receiver.
 
@@ -270,7 +376,7 @@ message ChangeBatch {
   // The canonical encodings of every file version referenced by the ops in
   // this batch's `changes` (a create/update/move op carries only a version's
   // content hash, not its block list). Each entry is one version's
-  // `yadorilink_sync_core::change::FileVersion::canonical_encoding`, whose
+  // `yadorilink_replica_domain::file::FileVersion::canonical_encoding`, whose
   // SHA-256 is that version's hash — so a receiver re-derives and verifies the
   // hash on arrival and a tampered version simply fails to match the hash any
   // op references. Deduplicated within the batch and always sent uncompressed
@@ -520,10 +626,15 @@ message SyncMessage {
   // ciphertext-only peer kind.
   reserved 7, 8, 9;
   reserved "encrypted_full_index", "encrypted_index_update", "wrapped_group_key";
+  // Field 5 was `BlockResponse block_response` -- protocol_version 2's
+  // block-serving path (see `ClusterConfig.protocol_version`'s own doc
+  // comment) replaced it outright with `block_reply` (field 23) below,
+  // with no fallback for a peer that only ever spoke this one.
+  reserved 5;
+  reserved "block_response";
   oneof payload {
     ClusterConfig cluster_config = 1;
     BlockRequest block_request = 4;
-    BlockResponse block_response = 5;
     HeadsAnnounce heads_announce = 10;
     ChangeRequest change_request = 11;
     ChangeBatch change_batch = 12;
@@ -537,5 +648,6 @@ message SyncMessage {
     HandoffTicketRelease handoff_ticket_release = 20;
     RebootstrapSnapshotRequest rebootstrap_snapshot_request = 21;
     RebootstrapSnapshotResponse rebootstrap_snapshot_response = 22;
+    BlockReply block_reply = 23;
   }
 }

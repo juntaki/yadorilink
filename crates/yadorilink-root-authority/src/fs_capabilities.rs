@@ -1,0 +1,2159 @@
+//! Probed, per-volume filesystem safety capabilities.
+//!
+//! Every capability here is established by *attempting the real operation*
+//! against a caller-supplied directory and observing the actual syscall
+//! result — never by reading a filesystem-type string and looking up what
+//! that type is "supposed to" support. A network mount can present as
+//! `ext4` over NFS re-export, a container bind-mount can silently strip a
+//! primitive its host supports, and a removable drive can be reformatted
+//! between two probes of the "same" path. Only the syscall result is ground
+//! truth.
+//!
+//! # The cache is advisory, never authoritative
+//!
+//! [`CapabilityCache`] exists so that expensive repeated probing (creating
+//! and exchanging real files, issuing real `ioctl`s) is not required on
+//! every commit. It is keyed by [`CapabilityCacheKey`] — volume identity,
+//! operation kind, adapter version and a mount-options fingerprint — never
+//! by a single global "probed once at startup" flag, because that shape is
+//! wrong on every removable and network volume: the volume behind a given
+//! path can change without any code here observing it.
+//!
+//! Even so, **a cache hit must never be used to skip interpreting the real
+//! result of an actual filesystem operation at the moment it happens.** The
+//! cache may tell a caller which primitive is worth attempting first, or
+//! back a status report; it must never stand in for checking what a commit
+//! attempt's own return value says. Treating a cached `Supported` as a
+//! license to assume success is exactly the bug this module exists to
+//! prevent.
+
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::fs_identity::{
+    DirectoryIdentity, FileIdentity, IdentityComparison, TimestampGranularity, VolumeIdentity,
+};
+
+/// The current shape of the probes below. Bumped whenever a probe's method
+/// changes in a way that could change its answer for a volume that was
+/// already cached — a [`CapabilityCacheKey`] embeds this, so a version bump
+/// invalidates every existing cache entry rather than reusing a stale
+/// answer against new probe logic.
+pub const ADAPTER_VERSION: u32 = 1;
+
+/// Whether a capability is known to work, known not to work, or has not
+/// been probed. There is deliberately no way to read `Unknown` as
+/// `Supported`: [`Capability::is_supported`] is the only query method, and
+/// it returns `false` for both `Unsupported` and `Unknown`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Capability {
+    Supported,
+    Unsupported,
+    /// Not yet probed, or the probe itself could not run (for example the
+    /// caller-supplied directory was not writable). Distinct from
+    /// `Unsupported`, which means the probe ran and the operation failed.
+    Unknown,
+}
+
+impl Capability {
+    /// The only sanctioned way to ask "can I rely on this". `Unknown` is
+    /// not `Supported` — an unprobed capability must be treated the same as
+    /// a confirmed-absent one until it is actually probed.
+    pub fn is_supported(self) -> bool {
+        matches!(self, Capability::Supported)
+    }
+}
+
+/// Everything the transaction engine needs to know about what a volume can
+/// actually do, each field probed independently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FilesystemSafetyCapabilities {
+    /// Atomic two-object exchange (`renameat2(RENAME_EXCHANGE)` on Linux,
+    /// `renamex_np(RENAME_SWAP)` on macOS).
+    pub atomic_exchange: Capability,
+    /// A durable flush of file content using the platform's strongest
+    /// available primitive — `F_FULLFSYNC` on macOS, not plain `fsync`,
+    /// since plain `fsync` there does not flush the drive's write cache.
+    pub durable_file_flush: Capability,
+    /// A durable flush of a directory's own metadata (needed so a rename
+    /// or exchange within it survives a crash). Always `Unsupported` on
+    /// Windows by construction — see [`probe_durable_directory_flush`]'s
+    /// doc for why a successful Windows directory flush still doesn't
+    /// establish this.
+    pub durable_directory_flush: Capability,
+    /// Whether an EXTERNALLY supplied file's identity — a file the engine
+    /// did not itself create, e.g. a source file already present in a sync
+    /// root — can be relied on across rename, replacement and copy-up.
+    ///
+    /// This is deliberately **not measured**, only **inferred**: the engine
+    /// has no way to manufacture a lower-layer file of its own to probe
+    /// with; therefore the capability probe must be split.
+    /// The inference this field stands for is a conjunction of (a) a
+    /// layer-independent reuse discriminator existing — `generation_or_usn`
+    /// or a fine-grained `birth_or_creation_time`, the same evidence
+    /// [`FileIdentity::compare`] itself requires, read for free from the
+    /// probe [`probe_stable_identity`] already runs — and (b) this mount
+    /// being POSITIVELY identified as a stacking filesystem (overlayfs or
+    /// similar), which would otherwise make even a fine-grained
+    /// discriminator observed on an upper-only probe artefact meaningless
+    /// evidence about a lower-layer source file's identity.
+    ///
+    /// No mount-option or filesystem-type introspection exists anywhere in
+    /// this module in this phase (see [`CapabilityCacheKey::mount_options_
+    /// hint`]'s own doc), so condition (b) can never be shown true today —
+    /// this field's value is therefore driven entirely by (a), exactly the
+    /// same discriminator check the old, unsplit `stable_file_identity`
+    /// probe performed. That is what keeps this a **behaviour-preserving
+    /// split**: every value this field reports today is byte-identical to
+    /// what the old field reported, because the "positively stacking"
+    /// branch of the inference is dead code until mount detection exists.
+    ///
+    /// **Cost of being wrong in each direction**, since this is inferred
+    /// rather than measured: reporting `Supported` when a source file's
+    /// identity is not actually stable risks trusting a substituted or
+    /// reused object as the same one a caller expected (a `SameObject`
+    /// answer for what should have been `Ambiguous`) — the unsafe
+    /// direction. Reporting `Unsupported`/`Unknown` when it would actually
+    /// have been safe only costs a caller falling back to a more
+    /// conservative path (or D1a's fail-closed tier) on a volume that could
+    /// have supported more — safe, merely pessimistic. This field is built
+    /// to err toward the second cost, never the first: absent positive
+    /// proof of non-stacking, it never upgrades a missing discriminator
+    /// into `Supported`.
+    pub stable_source_identity: Capability,
+    /// For a marker file the ENGINE ITSELF created on this same mount, can
+    /// sameness be confirmed after a rename and a hardlink?
+    ///
+    /// **Provisional in this increment**: this reuses the exact probe
+    /// [`stable_source_identity`](Self::stable_source_identity) reuses —
+    /// create a fresh file, rename it in place, and require
+    /// [`FileIdentity::compare`] to report
+    /// [`crate::fs_identity::IdentityComparison::SameObject`] — because no
+    /// consumer of this field exists yet to require anything stronger (see
+    /// `decisions.md` D1). Per D1b, routing this question through `compare`
+    /// makes it answer `Unsupported` on overlayfs regardless, since
+    /// `compare` needs a reuse discriminator overlayfs never supplies — even
+    /// though V-D1b measured that a WEAKER predicate (same-boot `(st_dev,
+    /// st_ino)` sameness among simultaneously live objects: hardlink,
+    /// rename, `readdir` vs `stat`) is sound for exactly this question, for
+    /// an object the engine created directly in the upper layer and never
+    /// copied up. **This field is the one the weaker predicate will answer**
+    /// once it is implemented (a later increment, not this one) — this
+    /// increment only carves out the name and the doc boundary; it does not
+    /// yet change what computes the value. When that lands, this field's
+    /// probe stops sharing an implementation with
+    /// [`stable_source_identity`](Self::stable_source_identity) and starts
+    /// answering `Supported` on overlayfs where today both fields answer
+    /// `Unsupported`.
+    pub stable_owned_marker_identity: Capability,
+    /// Whether an already-open handle keeps working after its path is
+    /// unlinked (POSIX delete-on-close semantics; not universal on every
+    /// remote filesystem or on Windows without explicit share flags).
+    pub stale_handle_preservation: Capability,
+    /// Whether a written metadata change (the tracked POSIX mode subset)
+    /// round-trips exactly.
+    pub metadata_fidelity: Capability,
+    /// Whole-file reflink/clone (`FICLONE` on Linux, `clonefile` on
+    /// macOS).
+    pub reflink_or_clone: Capability,
+    /// Byte-range clone/copy (`copy_file_range` on Linux). No portable
+    /// primitive exists on macOS or Windows in this phase, so this is
+    /// `Unsupported` there by construction rather than by a failed probe.
+    pub range_clone: Capability,
+}
+
+/// The declared durability guarantee, derived from probed capabilities.
+/// Never upgraded beyond what was actually observed: `PowerLossSafe` is
+/// only reachable through [`FilesystemSafetyCapabilities::durable_file_flush`]
+/// having used the platform's strongest flush primitive, never from a
+/// plain `fsync` success alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DurabilityLevel {
+    /// Survives a process crash; not confirmed to survive a power loss.
+    ProcessCrashSafe,
+    /// Survives a power loss, to the extent the strongest available local
+    /// flush primitive can confirm it.
+    PowerLossSafe,
+    /// The volume responded to every probe, but is known or asserted to be
+    /// a network/remote filesystem, where a successful flush response does
+    /// not necessarily mean the server has persisted the data.
+    BestEffortRemoteFilesystem,
+    Unsupported,
+}
+
+/// Which probed operation a [`CapabilityCacheKey`] identifies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OperationKind {
+    AtomicExchange,
+    DurableFileFlush,
+    DurableDirectoryFlush,
+    StableSourceIdentity,
+    StableOwnedMarkerIdentity,
+    StaleHandlePreservation,
+    MetadataFidelity,
+    ReflinkOrClone,
+    RangeClone,
+}
+
+/// The cache key for one probed capability. Two probes only share a cache
+/// entry when they agree on all four fields — in particular, a volume
+/// change (a different [`VolumeIdentity`] observed at what is otherwise the
+/// same path) always misses the cache and re-probes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CapabilityCacheKey {
+    pub volume_identity: VolumeIdentity,
+    pub operation_kind: OperationKind,
+    pub adapter_version: u32,
+    /// Reserved for a fingerprint of relevant mount options (for example
+    /// whether a network mount was remounted with different flags). Not
+    /// populated by any probe in this module yet — no mount-option
+    /// introspection exists in this phase — so every key currently carries
+    /// `0`. Kept as a real field rather than added later so the key's
+    /// discrimination shape does not change out from under existing
+    /// entries once that introspection lands.
+    pub mount_options_hint: u64,
+}
+
+impl CapabilityCacheKey {
+    pub fn new(
+        volume_identity: VolumeIdentity,
+        operation_kind: OperationKind,
+        adapter_version: u32,
+    ) -> CapabilityCacheKey {
+        CapabilityCacheKey {
+            volume_identity,
+            operation_kind,
+            adapter_version,
+            mount_options_hint: 0,
+        }
+    }
+}
+
+/// How many consecutive `Unknown` results [`CapabilityCache::get_or_probe`]
+/// will re-probe for one key before giving up and returning `Unknown`
+/// without calling `probe` again. `Unknown` is "not yet established", not
+/// a settled answer, so it must never be cached as if it were one — but
+/// re-probing on every single call is its own problem if a directory is
+/// durably broken (permanently read-only, permanently out of space): an
+/// unbounded retry loop at the call site would spin forever paying real
+/// I/O cost for an answer that was never going to change. Below the cap,
+/// every call still re-probes, so a real answer as soon as one is
+/// available always gets through and is cached as settled — but once the
+/// cap is reached, `get_or_probe` alone stops calling `probe` again for
+/// that key for the rest of this `CapabilityCache` instance's lifetime; it
+/// does not retry later or self-heal automatically. A caller that wants a
+/// fresh look after conditions might have changed starts a new
+/// `CapabilityCache` or calls [`CapabilityCache::record`] directly, which
+/// always resets the streak (see its doc).
+const MAX_CONSECUTIVE_UNKNOWN_REPROBES: u32 = 3;
+
+#[derive(Clone, Copy, Debug)]
+struct CachedCapability {
+    value: Capability,
+    /// How many times in a row `get_or_probe` has re-probed this key and
+    /// gotten `Unknown` back. Reset to `0` the moment any probe (or an
+    /// explicit `record`) returns something other than `Unknown`.
+    consecutive_unknown_probes: u32,
+}
+
+/// An advisory cache of probe results. See the module doc: a hit here must
+/// never substitute for interpreting a real operation's actual result.
+#[derive(Default)]
+pub struct CapabilityCache {
+    entries: Mutex<HashMap<CapabilityCacheKey, CachedCapability>>,
+}
+
+impl CapabilityCache {
+    pub fn new() -> CapabilityCache {
+        CapabilityCache { entries: Mutex::new(HashMap::new()) }
+    }
+
+    /// Returns the cached value, or `Unknown` if this key has never been
+    /// recorded. Never blocks on probing, and never re-probes — unlike
+    /// [`Self::get_or_probe`], this is a pure read.
+    pub fn get(&self, key: &CapabilityCacheKey) -> Capability {
+        self.entries
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|entry| entry.value)
+            .unwrap_or(Capability::Unknown)
+    }
+
+    /// Records a freshly probed value, as an explicit assertion from the
+    /// caller rather than through [`Self::get_or_probe`]'s own re-probe
+    /// bookkeeping. Overwrites whatever was cached before for this exact
+    /// key and resets its re-probe count to `0`, so a `record`ed `Unknown`
+    /// still gets the full re-probe allowance on the next `get_or_probe`
+    /// call.
+    pub fn record(&self, key: CapabilityCacheKey, value: Capability) {
+        self.entries
+            .lock()
+            .unwrap()
+            .insert(key, CachedCapability { value, consecutive_unknown_probes: 0 });
+    }
+
+    /// Returns the cached value if it is a settled (non-`Unknown`) hit,
+    /// otherwise runs `probe`, records its result, and returns it —
+    /// bounded by [`MAX_CONSECUTIVE_UNKNOWN_REPROBES`] consecutive
+    /// `Unknown` results, past which this stops re-probing and returns
+    /// `Unknown` directly. `probe` is never called for a settled hit; this
+    /// method exists purely to avoid redundant probing, not to gate any
+    /// actual filesystem operation (see the module doc).
+    pub fn get_or_probe(
+        &self,
+        key: CapabilityCacheKey,
+        probe: impl FnOnce() -> Capability,
+    ) -> Capability {
+        {
+            let entries = self.entries.lock().unwrap();
+            if let Some(entry) = entries.get(&key) {
+                if entry.value != Capability::Unknown {
+                    return entry.value;
+                }
+                if entry.consecutive_unknown_probes >= MAX_CONSECUTIVE_UNKNOWN_REPROBES {
+                    return Capability::Unknown;
+                }
+            }
+        }
+        let value = probe();
+        let mut entries = self.entries.lock().unwrap();
+        let entry = entries.entry(key).or_insert(CachedCapability {
+            value: Capability::Unknown,
+            consecutive_unknown_probes: 0,
+        });
+        if value == Capability::Unknown {
+            entry.value = Capability::Unknown;
+            entry.consecutive_unknown_probes = entry.consecutive_unknown_probes.saturating_add(1);
+        } else {
+            entry.value = value;
+            entry.consecutive_unknown_probes = 0;
+        }
+        value
+    }
+}
+
+/// Observes the [`VolumeIdentity`] of the volume hosting `dir`, for building
+/// a [`CapabilityCacheKey`].
+pub fn observe_volume_identity(dir: &Path) -> io::Result<VolumeIdentity> {
+    Ok(DirectoryIdentity::observe_path(dir)?.volume_identity)
+}
+
+/// Runs every probe in this module against `dir`, which must already exist
+/// and be writable. Each probe creates and removes its own throwaway
+/// artefacts, always named under the engine's reserved on-disk namespace
+/// (`.yadorilink-v1-probe.<id>`, [`crate::reserved_namespace::ArtefactKind::Probe`])
+/// — see [`probe_artefact_name`]'s doc for why an unreserved name here was
+/// a defect, not merely a cosmetic gap.
+pub fn probe_all(dir: &Path) -> io::Result<FilesystemSafetyCapabilities> {
+    if !dir.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "probe directory does not exist"));
+    }
+    // Probed once, not twice, and the one result is used for both fields.
+    // See `stable_owned_marker_identity`'s doc: in this increment the two
+    // capabilities are answered by the literal same procedure (no mount-
+    // stacking detection exists to diverge `stable_source_identity`'s
+    // inference, and the weaker same-boot marker predicate `stable_owned_
+    // marker_identity` is meant to grow into does not exist yet either).
+    // Probing twice would double the real file-create/rename I/O this
+    // probe does for a value that is, today, provably identical either way.
+    let stable_identity = probe_stable_identity(dir);
+    Ok(FilesystemSafetyCapabilities {
+        atomic_exchange: probe_atomic_exchange(dir),
+        durable_file_flush: probe_durable_file_flush(dir),
+        durable_directory_flush: probe_durable_directory_flush(dir),
+        stable_source_identity: stable_identity,
+        stable_owned_marker_identity: stable_identity,
+        stale_handle_preservation: probe_stale_handle_preservation(dir),
+        metadata_fidelity: probe_metadata_fidelity(dir),
+        reflink_or_clone: probe_reflink_or_clone(dir),
+        range_clone: probe_range_clone(dir),
+    })
+}
+
+// `durable_claim_store` — deliberately not a field of
+// `FilesystemSafetyCapabilities`. D1a's design analysis introduces it as "do
+// claim records survive a restart", for the future nonce-and-claim marker
+// mechanism (see `stable_owned_marker_identity`'s doc above). That is not a
+// property this module's probing methodology can establish: every field in
+// this struct is answered by attempting a real syscall against a
+// caller-supplied directory and observing its result (see this module's own
+// top-level doc) — but "does this location survive a restart" is not
+// observable from inside one process's one run. A claim area sitting inside
+// a container's writable layer looks, to every syscall this module could
+// issue, identical to a genuinely durable one right up until the container
+// is recreated and it is gone; no probe run before that moment can
+// distinguish the two without fabricating an answer this module's own
+// discipline forbids (see the module doc's "only the syscall result is
+// ground truth"). It belongs instead to whatever decides deployment
+// topology for a sync root — e.g. daemon/container configuration that
+// already knows whether the reserved claim area lives on a bind-mounted,
+// host-durable path or inside an ephemeral writable layer — not to a
+// per-volume filesystem capability probe. No such caller exists yet in this
+// crate (the marker/claim mechanism itself is a later increment), so this
+// module deliberately adds no field, no probe and no placeholder for it
+// rather than inventing an observation it cannot make.
+
+/// Derives the declared durability guarantee from probed capabilities.
+///
+/// `assume_remote_filesystem` is supplied by the caller, not detected here:
+/// distinguishing a local from a network filesystem generally requires
+/// reading a filesystem-type string, which this module deliberately avoids
+/// for capability probing (see the module doc). A caller with independent
+/// evidence (an explicit mount table lookup, user configuration) may pass
+/// `true`; this function never infers it from syscall behavior alone.
+///
+/// **This has no caller anywhere in this crate today** (verified 2026-07-27,
+/// `grep -rln derive_durability_level` across the workspace matches only this
+/// file). That is not a bug by itself — no production caller of this whole
+/// engine exists yet, `fs_commit`/`optimistic_placement`/`early_physical_
+/// recovery` are all still test-only-driven — but it means this function is
+/// currently dead code, not a live gate, and the identity-comparison call
+/// sites it would gate (`fs_commit::check_stage_identity_matches_expected`,
+/// `custody_transfer::transfer_to_custody_unchecked`, `optimistic_placement`'s
+/// and `early_physical_recovery`'s parent-directory checks) do not consult
+/// either identity field below before trusting a `FileIdentity`/
+/// `DirectoryIdentity` comparison. They do not need to, *provided* the
+/// granularity those comparisons use is always freshly, correctly measured:
+/// every one of those call sites now probes `probe_birth_time_granularity`
+/// itself rather than accepting a caller-supplied value (see their own
+/// docs) — the actual defect this crate has repeatedly hit was a
+/// hardcoded/stale granularity, not a missing capability check, and
+/// `compare`'s own `Ambiguous`-on-no-discriminator logic already fails
+/// closed once given a true value. This function's remaining, distinct job
+/// is coarser: whether to attempt syncing a volume **at all** (it also
+/// folds in `atomic_exchange` and the flush capabilities, not just
+/// identity), which is a decision no code in this crate makes yet because
+/// nothing here decides "start syncing this root" — that lives in whatever
+/// future daemon/CLI wiring calls into this engine.
+///
+/// **Reads both `stable_source_identity` and `stable_owned_marker_identity`,
+/// requiring both `Supported`.** The nine `FileIdentity`/`DirectoryIdentity`
+/// `compare()` call sites this function's doc lists above are a mixed bag
+/// against the source/marker split (some compare an engine-written stage
+/// artefact within one process run, some compare a directory or an object
+/// whose creator cannot be shown from the call site alone, some span a
+/// restart) — seven of the nine do not classify unambiguously as depending
+/// on only one of the two fields. A single
+/// "attempt syncing at all" gate with no real caller yet has no way to
+/// pick a side of that ambiguity correctly, so it requires both rather than
+/// guessing one is sufficient — the conservative reading, and (today) also
+/// the behaviour-preserving one: [`probe_all`] currently derives both
+/// fields from the same probe, so they always agree, and this conjunction
+/// evaluates identically to the pre-split single-field check for every
+/// value either field can currently take.
+///
+/// **Obligation for that future caller, recorded here because there is no
+/// call site yet to attach a structural constraint to**: before beginning to
+/// sync a volume, call this (or an equivalent capability-derived check) and
+/// refuse `DurabilityLevel::Unsupported` outright, the same way `fs_commit`'s
+/// own module-level "fail-closed" convention already refuses an unconfirmed
+/// `atomic_exchange` rather than downgrading to a plain rename. Wiring it in
+/// now was considered and rejected: there is no real caller to wire it into,
+/// and inventing one purely to hold this check would be scope no one asked
+/// for and code with no real integration to validate it against.
+pub fn derive_durability_level(
+    caps: &FilesystemSafetyCapabilities,
+    assume_remote_filesystem: bool,
+) -> DurabilityLevel {
+    let stable_identity = caps.stable_source_identity.is_supported()
+        && caps.stable_owned_marker_identity.is_supported();
+    if assume_remote_filesystem {
+        return if caps.atomic_exchange.is_supported()
+            && caps.durable_file_flush.is_supported()
+            && stable_identity
+        {
+            DurabilityLevel::BestEffortRemoteFilesystem
+        } else {
+            DurabilityLevel::Unsupported
+        };
+    }
+    if !caps.atomic_exchange.is_supported() || !stable_identity {
+        return DurabilityLevel::Unsupported;
+    }
+    if caps.durable_file_flush.is_supported() && caps.durable_directory_flush.is_supported() {
+        DurabilityLevel::PowerLossSafe
+    } else if caps.durable_file_flush.is_supported() {
+        DurabilityLevel::ProcessCrashSafe
+    } else {
+        DurabilityLevel::Unsupported
+    }
+}
+
+static PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A filename inside the engine's reserved on-disk namespace
+/// ([`crate::reserved_namespace::ArtefactKind::Probe`]), unique enough for
+/// one-shot probe use within a process. Uniqueness here is only
+/// probabilistic — see [`create_probe_artefact`] and
+/// [`reserve_probe_artefact_path`], which are what actually establish
+/// ownership before anything is deleted.
+///
+/// **Must** be reserved-namespace-shaped, not merely collision-avoidant: a
+/// probe artefact is created directly inside the caller's sync directory,
+/// beside real user content, for the same reason a stage or preimage
+/// artefact is. An earlier version of this function generated an
+/// unreserved name (`.yl-fscap-probe-<pid>-<nanos>-<counter>-<label>`) on
+/// the theory that avoiding the exact `.yadorilink-v1-*` prefix was enough
+/// to keep it out of the way. It was not: `is_reserved_component` — the
+/// predicate the watcher, the initial scan and local change processing all
+/// consult *before* indexing anything — only ever recognized that prefix,
+/// so an unreserved probe name was ordinary content to every one of those
+/// entry points for the whole window between this function creating it and
+/// the probe's own cleanup removing it. Each `probe_all` call creates and
+/// removes 32 such artefacts (see [`GRANULARITY_SAMPLE_COUNT`]); on the
+/// commit path, that is 32 enqueued creates and 32 enqueued deletes per
+/// commit, racing this function's own unlink — worst case, a create wins
+/// that race and a probe artefact gets signed into the DAG and replicated
+/// to every peer. Building the name through
+/// [`crate::reserved_namespace::artefact_component_name`] instead makes
+/// that unreachable: every one of those entry points excludes a reserved
+/// component before it ever reaches an ignore rule or the index.
+///
+/// `pub(crate)`: `hazard`'s two volume-behaviour probes (case-insensitivity
+/// and normalization-insensitivity) mint their on-disk artefacts through
+/// this same function rather than growing a second name scheme, for exactly
+/// the reason the previous paragraph describes — they too create artefacts
+/// directly inside the caller's sync directory, from a production
+/// materialization path, and an unreserved name there is indexable content.
+pub fn probe_artefact_name(
+    label: &str,
+) -> Result<String, crate::reserved_namespace::ArtefactNameError> {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let counter = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let id = format!("{}-{}-{}-{}", std::process::id(), nanos, counter, label);
+    crate::reserved_namespace::artefact_component_name(
+        crate::reserved_namespace::ArtefactKind::Probe,
+        &id,
+    )
+}
+
+/// How many fresh names a probe will try before giving up on
+/// [`create_probe_artefact`] or [`reserve_probe_artefact_path`]. A single
+/// collision is plausible noise; this many in a row means something is
+/// actually wrong with the directory, not bad luck.
+pub const MAX_ARTEFACT_NAME_ATTEMPTS: u32 = 8;
+
+// Thread-local rather than a `static`: the test harness runs tests in
+// parallel, and several of them create probe artefacts, so a process-wide
+// flag is consumed by whichever test happens to call first -- measured, not
+// hypothesised. Scoping it to the setting thread makes the injection reach
+// exactly the call the test then makes itself.
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_PROBE_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The write half of [`create_probe_artefact`], behind a seam so a test can
+/// make it fail.
+///
+/// The failure being guarded against — `ENOSPC`, a quota, an I/O error part
+/// way through the write — cannot be provoked portably from a test without
+/// contriving a full or failing filesystem, and the property at stake is
+/// specifically what happens on the error path. A test-only injection point
+/// is narrower than the alternatives (a closure parameter threaded through
+/// every call site, or no test at all) and leaves the production path a
+/// plain `write_all`.
+fn write_probe_content(file: &mut File, content: &[u8]) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_PROBE_WRITE.with(|f| f.replace(false)) {
+        return Err(io::Error::new(io::ErrorKind::StorageFull, "injected probe write failure"));
+    }
+    std::io::Write::write_all(file, content)
+}
+
+/// Creates a brand-new probe artefact file containing `content`, retrying
+/// under a fresh name on any collision. [`probe_artefact_name`] is only
+/// probabilistically unique, so `create_new` — which fails rather than
+/// truncating or following an existing entry — is what actually proves this
+/// call, and not some unrelated writer, created the returned path. Only a
+/// path this function returned `Ok` for may later be removed by its caller;
+/// this is the same "never delete an artefact you don't own" rule the
+/// engine's reserved namespace enforces elsewhere.
+fn create_probe_artefact(dir: &Path, label: &str, content: &[u8]) -> io::Result<(PathBuf, File)> {
+    for _ in 0..MAX_ARTEFACT_NAME_ATTEMPTS {
+        let name = probe_artefact_name(label)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        let path = dir.join(name);
+        match OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                // The write is the only step between `create_new` proving
+                // this process owns `path` and the caller receiving it, and
+                // it is exactly the step that fails under disk pressure
+                // (`ENOSPC`, a quota, an I/O error). Returning the error
+                // bare would strand the artefact: the caller never sees the
+                // path, so it cannot remove what it does not know about,
+                // and no other owner exists. Removing it here is safe for
+                // the same reason the caller's own cleanup is -- `create_new`
+                // succeeded, so this call, and nothing else, put it there.
+                if let Err(err) = write_probe_content(&mut file, content) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(err);
+                }
+                return Ok((path, file));
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique probe artefact name",
+    ))
+}
+
+/// Reserves a path this process has just confirmed does not exist, for an
+/// operation (a clone target or a rename target) that must create the path
+/// itself rather than through [`create_probe_artefact`]'s `create_new`.
+/// Retries under a fresh name on collision.
+///
+/// This only narrows the ownership race to the gap between the check and
+/// the caller's own operation — exclusive reservation of an as-yet
+/// nonexistent path has no portable API — so callers must still only treat
+/// the returned path as theirs to remove once their own operation is what
+/// put something there (see call sites for the exact reasoning per probe).
+fn reserve_probe_artefact_path(dir: &Path, label: &str) -> io::Result<PathBuf> {
+    for _ in 0..MAX_ARTEFACT_NAME_ATTEMPTS {
+        let name = probe_artefact_name(label)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        let path = dir.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => continue,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(path),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique probe artefact name",
+    ))
+}
+
+/// Classifies a failed raw syscall as either definite feature absence
+/// (`Unsupported`) or a transient/unrelated failure (`Unknown`), given the
+/// operation-specific errno set that call documents as meaning "this
+/// feature does not exist here". Anything else — `EPERM`, `EIO`, `ENOSPC`,
+/// a path race, or any errno not in that set — stays `Unknown`: it says
+/// nothing about whether the feature exists, and reading it as
+/// `Unsupported` would let one transient failure permanently poison this
+/// volume's cached capability (see the module doc on `CapabilityCache`).
+///
+/// Must be called with the `errno` captured immediately after the failing
+/// return value, before any other libc call — `errno` is only valid until
+/// the next one.
+///
+/// `pub(crate)`: `fs_commit`'s commit adapter reuses this exact function
+/// (with its own, operation-specific `feature_absent` set — a *commit's*
+/// feature-absence errno is not necessarily the same set a capability
+/// *probe* uses) rather than inventing a second, looser classification.
+#[cfg(unix)]
+pub fn classify_errno(errno: Option<i32>, feature_absent: &[i32]) -> Capability {
+    match errno {
+        Some(code) if feature_absent.contains(&code) => Capability::Unsupported,
+        _ => Capability::Unknown,
+    }
+}
+
+/// Retries a raw libc call that follows the usual C convention (`-1` with
+/// `errno` set on failure) across `EINTR`. A signal interruption is not a
+/// meaningful result for any probe in this module — the underlying
+/// operation was never actually attempted — so it must never surface as
+/// either `Supported` or `Unsupported`.
+///
+/// `attempt` returns `(return_value, errno_if_failed)` rather than this
+/// function reading `errno` itself: the caller already has to capture it
+/// immediately after its own syscall (see [`classify_errno`]'s doc on
+/// staleness), so folding that capture into the same closure means there is
+/// only ever one read of `errno` per attempt, taken at the only point it is
+/// guaranteed valid.
+#[cfg(unix)]
+fn retry_eintr(mut attempt: impl FnMut() -> (i32, Option<i32>)) -> (i32, Option<i32>) {
+    loop {
+        let (ret, errno) = attempt();
+        if ret != -1 || errno != Some(libc::EINTR) {
+            return (ret, errno);
+        }
+    }
+}
+
+/// Same as [`retry_eintr`] for calls made through the raw `syscall(2)`
+/// wrapper, which returns `c_long` rather than `c_int`.
+#[cfg(target_os = "linux")]
+fn retry_eintr_syscall(mut attempt: impl FnMut() -> (i64, Option<i32>)) -> (i64, Option<i32>) {
+    loop {
+        let (ret, errno) = attempt();
+        if ret != -1 || errno != Some(libc::EINTR) {
+            return (ret, errno);
+        }
+    }
+}
+
+/// Runs a raw libc call and captures `errno` in the same expression when it
+/// fails, so the two are never separated by anything else that could
+/// change it. Intended to be used as the body of a [`retry_eintr`] /
+/// [`retry_eintr_syscall`] closure.
+#[cfg(unix)]
+macro_rules! call_and_capture_errno {
+    ($ret:expr) => {{
+        let ret = $ret;
+        let errno = if ret == -1 { io::Error::last_os_error().raw_os_error() } else { None };
+        (ret, errno)
+    }};
+}
+
+fn probe_atomic_exchange(dir: &Path) -> Capability {
+    let Ok((a, _)) = create_probe_artefact(dir, "exchange-a", b"a") else {
+        return Capability::Unknown;
+    };
+    let Ok((b, _)) = create_probe_artefact(dir, "exchange-b", b"b") else {
+        let _ = std::fs::remove_file(&a);
+        return Capability::Unknown;
+    };
+
+    let result = platform_atomic_exchange(&a, &b);
+
+    // The exchange only swaps the two paths' contents, never removes
+    // either path, so both are still owned artefacts to clean up
+    // regardless of whether the exchange itself succeeded.
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn platform_atomic_exchange(a: &Path, b: &Path) -> Capability {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (Some(a_c), Some(b_c)) =
+        (CString::new(a.as_os_str().as_bytes()).ok(), CString::new(b.as_os_str().as_bytes()).ok())
+    else {
+        return Capability::Unknown;
+    };
+    // Called through the raw syscall number rather than `libc::renameat2`:
+    // glibc only exports that symbol from 2.28, and uClibc does not export
+    // it at all, so calling the symbol directly would fail to link on
+    // either. The syscall itself has existed since Linux 3.15.
+    // SAFETY: `a_c`/`b_c` are valid NUL-terminated paths kept alive for
+    // the duration of the call; the two `AT_FDCWD` values and the flag are
+    // plain integers with no memory behind them.
+    let (ret, errno) = retry_eintr_syscall(|| {
+        // SAFETY: `a_c`/`b_c` remain valid for the duration of this call.
+        call_and_capture_errno!(unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                a_c.as_ptr(),
+                libc::AT_FDCWD,
+                b_c.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        })
+    });
+    if ret == 0 {
+        return Capability::Supported;
+    }
+    // `renameat2(2)` documents `EINVAL` as the filesystem not supporting
+    // one of the given flags; `ENOSYS` covers a kernel older than 3.15,
+    // where the syscall does not exist at all.
+    classify_errno(errno, &[libc::ENOSYS, libc::EINVAL])
+}
+
+#[cfg(target_os = "macos")]
+fn platform_atomic_exchange(a: &Path, b: &Path) -> Capability {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (Some(a_c), Some(b_c)) =
+        (CString::new(a.as_os_str().as_bytes()).ok(), CString::new(b.as_os_str().as_bytes()).ok())
+    else {
+        return Capability::Unknown;
+    };
+    // SAFETY: `a_c`/`b_c` are valid NUL-terminated paths owned for the
+    // duration of the call.
+    let (ret, errno) = retry_eintr(|| {
+        call_and_capture_errno!(unsafe {
+            libc::renamex_np(a_c.as_ptr(), b_c.as_ptr(), libc::RENAME_SWAP)
+        })
+    });
+    if ret == 0 {
+        return Capability::Supported;
+    }
+    // `renamex_np(2)` documents `ENOTSUP` as "the underlying filesystem
+    // does not support the `RENAME_SWAP` flag".
+    classify_errno(errno, &[libc::ENOSYS, libc::ENOTSUP])
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn platform_atomic_exchange(_a: &Path, _b: &Path) -> Capability {
+    // No portable atomic-exchange primitive is wired up on this platform
+    // in this phase (Windows uses `ReplaceFileW`, handled by the commit
+    // adapter, not this probe).
+    Capability::Unsupported
+}
+
+fn probe_reflink_or_clone(dir: &Path) -> Capability {
+    let Ok((src, _)) = create_probe_artefact(dir, "clone-src", b"reflink probe content") else {
+        return Capability::Unknown;
+    };
+    let Ok(dst) = reserve_probe_artefact_path(dir, "clone-dst") else {
+        let _ = std::fs::remove_file(&src);
+        return Capability::Unknown;
+    };
+
+    // `dst_created_by_us` is the platform function's own attestation, not
+    // an assumption from `dst` merely existing afterward: if a different
+    // actor won a race and created something at `dst` between the
+    // reservation check above and the platform call, that call reports it
+    // did NOT create `dst`, and this probe must not delete a path it never
+    // produced (the same "never remove an artefact you don't own" rule
+    // `create_probe_artefact` enforces via `create_new`).
+    let (result, dst_created_by_us) = platform_reflink_or_clone(&src, &dst);
+
+    let _ = std::fs::remove_file(&src);
+    if dst_created_by_us {
+        let _ = std::fs::remove_file(&dst);
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn platform_reflink_or_clone(src: &Path, dst: &Path) -> (Capability, bool) {
+    use std::os::unix::io::AsRawFd;
+
+    let Ok(src_file) = File::open(src) else {
+        return (Capability::Unknown, false);
+    };
+    let Ok(dst_file) = OpenOptions::new().write(true).create_new(true).open(dst) else {
+        // Either genuine I/O trouble, or something else claimed this name
+        // between the reservation check and here — either way this
+        // process did not create `dst`.
+        return (Capability::Unknown, false);
+    };
+    // SAFETY: both file descriptors are valid and kept alive for the
+    // duration of the call.
+    let (ret, errno) = retry_eintr(|| {
+        call_and_capture_errno!(unsafe {
+            libc::ioctl(dst_file.as_raw_fd(), libc::FICLONE, src_file.as_raw_fd())
+        })
+    });
+    // `create_new` above succeeded, so `dst` exists and is ours to remove
+    // regardless of whether the clone itself worked.
+    if ret == 0 {
+        return (Capability::Supported, true);
+    }
+    // `ioctl_ficlone(2)`: `ENOTTY` means the kernel/filesystem predates
+    // this ioctl entirely ("inappropriate ioctl for device" is the
+    // kernel's generic answer for an unrecognized request on this fd);
+    // `EOPNOTSUPP` means the filesystem recognizes the request but does
+    // not implement reflinking.
+    (classify_errno(errno, &[libc::ENOTTY, libc::EOPNOTSUPP]), true)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_reflink_or_clone(src: &Path, dst: &Path) -> (Capability, bool) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (Some(src_c), Some(dst_c)) = (
+        CString::new(src.as_os_str().as_bytes()).ok(),
+        CString::new(dst.as_os_str().as_bytes()).ok(),
+    ) else {
+        return (Capability::Unknown, false);
+    };
+    // SAFETY: both paths are valid NUL-terminated strings; `dst` was just
+    // confirmed absent by `reserve_probe_artefact_path`.
+    let (ret, errno) = retry_eintr(|| {
+        call_and_capture_errno!(unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) })
+    });
+    if ret == 0 {
+        // `clonefile(2)` only creates `dst` on success.
+        return (Capability::Supported, true);
+    }
+    // `clonefile(2)` documents `ENOTSUP` as "the underlying filesystem
+    // does not support this call".
+    (classify_errno(errno, &[libc::ENOTSUP, libc::ENOSYS]), false)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn platform_reflink_or_clone(_src: &Path, _dst: &Path) -> (Capability, bool) {
+    (Capability::Unsupported, false)
+}
+
+fn probe_range_clone(dir: &Path) -> Capability {
+    let Ok((src, _)) = create_probe_artefact(dir, "range-clone-src", b"0123456789abcdef") else {
+        return Capability::Unknown;
+    };
+    let Ok(dst) = reserve_probe_artefact_path(dir, "range-clone-dst") else {
+        let _ = std::fs::remove_file(&src);
+        return Capability::Unknown;
+    };
+
+    let (result, dst_created_by_us) = platform_range_clone(&src, &dst);
+
+    let _ = std::fs::remove_file(&src);
+    if dst_created_by_us {
+        let _ = std::fs::remove_file(&dst);
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn platform_range_clone(src: &Path, dst: &Path) -> (Capability, bool) {
+    use std::os::unix::io::AsRawFd;
+
+    const PROBE_CONTENT: &[u8] = b"0123456789abcdef";
+
+    let Ok(src_file) = File::open(src) else {
+        return (Capability::Unknown, false);
+    };
+    let Ok(dst_file) = OpenOptions::new().write(true).create_new(true).open(dst) else {
+        return (Capability::Unknown, false);
+    };
+    // `create_new` above succeeded: `dst` exists and is ours from here on,
+    // regardless of how the copy loop below turns out.
+
+    // `libc` does not expose a `copy_file_range` wrapper for every target,
+    // so this goes through the raw syscall number directly. Looped: a
+    // single call is not obligated to copy every requested byte, and a
+    // `0`-byte return with bytes still remaining means nothing was
+    // actually copied — that demonstrates nothing about support either
+    // way, so it must not be read as success (see below).
+    let mut copied = 0usize;
+    while copied < PROBE_CONTENT.len() {
+        let remaining = PROBE_CONTENT.len() - copied;
+        // SAFETY: null offsets mean "use and advance each fd's current
+        // file position", which both `src_file`/`dst_file` start at for
+        // this freshly opened probe pair; both fds are valid and kept
+        // alive for the duration of the call.
+        let (ret, errno) = retry_eintr_syscall(|| {
+            call_and_capture_errno!(unsafe {
+                libc::syscall(
+                    libc::SYS_copy_file_range,
+                    src_file.as_raw_fd(),
+                    std::ptr::null_mut::<libc::loff_t>(),
+                    dst_file.as_raw_fd(),
+                    std::ptr::null_mut::<libc::loff_t>(),
+                    remaining,
+                    0u32,
+                )
+            })
+        });
+        if ret < 0 {
+            // `copy_file_range(2)` documents `EOPNOTSUPP` as the
+            // filesystem not implementing the call at all. `EXDEV`
+            // ("different filesystems") is deliberately excluded: `src`
+            // and `dst` are both freshly created in the same
+            // caller-supplied directory, so it cannot legitimately mean
+            // that here — if it occurs anyway, that is a probe-environment
+            // surprise, not proof of feature absence.
+            return (classify_errno(errno, &[libc::ENOSYS, libc::EOPNOTSUPP]), true);
+        }
+        if ret == 0 {
+            return (Capability::Unknown, true);
+        }
+        copied += ret as usize;
+    }
+
+    let capability = match std::fs::read(dst) {
+        Ok(observed) if observed == PROBE_CONTENT => Capability::Supported,
+        Ok(_) => Capability::Unsupported,
+        Err(_) => Capability::Unknown,
+    };
+    (capability, true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn platform_range_clone(_src: &Path, _dst: &Path) -> (Capability, bool) {
+    // No portable byte-range clone primitive exists on macOS or Windows in
+    // this phase; there is nothing to attempt, so this is a deliberate
+    // classification, not an unattempted probe.
+    (Capability::Unsupported, false)
+}
+
+fn probe_durable_file_flush(dir: &Path) -> Capability {
+    match create_probe_artefact(dir, "durable-flush", b"durability probe") {
+        Ok((path, file)) => {
+            let capability = platform_durable_file_flush(&file);
+            let _ = std::fs::remove_file(&path);
+            capability
+        }
+        Err(_) => Capability::Unknown,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_durable_file_flush(file: &File) -> Capability {
+    use std::os::unix::io::AsRawFd;
+    platform_full_fsync(file.as_raw_fd())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_durable_file_flush(file: &File) -> Capability {
+    match file.sync_all() {
+        Ok(()) => Capability::Supported,
+        // `fsync(2)`'s only documented "this fd doesn't support
+        // synchronization" case is a non-regular-file special file, which
+        // cannot apply here since `file` is a plain regular file this
+        // function just created — so the sole feature-absence signal left
+        // is a kernel/libc lacking the call at all.
+        Err(err) => classify_errno(err.raw_os_error(), &[libc::ENOSYS]),
+    }
+}
+
+#[cfg(windows)]
+fn platform_durable_file_flush(file: &File) -> Capability {
+    match file.sync_all() {
+        Ok(()) => Capability::Supported,
+        // `sync_all` on Windows maps to `FlushFileBuffers`, which has no
+        // portable errno-style signal this module can use to distinguish
+        // "this filesystem/driver doesn't support flush" from any other
+        // failure — unlike the Unix `classify_errno` path above, there is
+        // no known feature-absence error code to check for. Reporting
+        // every failure as `Unknown` rather than guessing `Unsupported`
+        // keeps this fail-closed the same way `classify_errno` is: a
+        // transient failure must never poison this volume's cached
+        // capability with a wrong "definitely absent" answer.
+        Err(_) => Capability::Unknown,
+    }
+}
+
+/// Issues `F_FULLFSYNC` on `fd` and classifies the result. Shared by both
+/// [`platform_durable_file_flush`] and [`platform_durable_directory_flush`]
+/// on macOS so there is exactly one place that primitive is invoked: plain
+/// `fsync` does not flush the drive's write cache on this platform
+/// regardless of whether the fd names a file or a directory, and the file
+/// probe already exists specifically to avoid that unsound claim — routing
+/// the directory probe through a *different* implementation would silently
+/// reopen the same hole through `durable_directory_flush`, which is the
+/// other required input to `derive_durability_level`'s `PowerLossSafe`
+/// decision.
+#[cfg(target_os = "macos")]
+fn platform_full_fsync(fd: std::os::unix::io::RawFd) -> Capability {
+    // SAFETY: `fd` is a valid, open file descriptor for the duration of
+    // the call (both callers hold the owning `File` alive across it).
+    let (ret, errno) =
+        retry_eintr(|| call_and_capture_errno!(unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) }));
+    if ret == 0 {
+        return Capability::Supported;
+    }
+    // `fcntl(2)` documents `ENOTSUP` for `F_FULLFSYNC` when the underlying
+    // device does not support it (seen on some older/external drives).
+    classify_errno(errno, &[libc::ENOTSUP, libc::ENOSYS])
+}
+
+#[cfg(unix)]
+fn probe_durable_directory_flush(dir: &Path) -> Capability {
+    match File::open(dir) {
+        Ok(handle) => platform_durable_directory_flush(&handle),
+        Err(_) => Capability::Unknown,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_durable_directory_flush(handle: &File) -> Capability {
+    use std::os::unix::io::AsRawFd;
+    platform_full_fsync(handle.as_raw_fd())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_durable_directory_flush(handle: &File) -> Capability {
+    match handle.sync_all() {
+        Ok(()) => Capability::Supported,
+        Err(err) => classify_errno(err.raw_os_error(), &[libc::ENOSYS]),
+    }
+}
+
+#[cfg(windows)]
+fn probe_durable_directory_flush(_dir: &Path) -> Capability {
+    // A directory handle *can* be opened on Windows (with
+    // `FILE_FLAG_BACKUP_SEMANTICS`, via `custom_flags` —
+    // `optimistic_placement::durable_flush_directory` does this), and
+    // calling `FlushFileBuffers` on it can return success. But unlike the
+    // Unix `fsync(dirfd)` idiom this capability models — a documented,
+    // portable contract that a successful call makes a prior rename within
+    // that directory durable across a crash — Win32 documents no such
+    // contract for `FlushFileBuffers` on a directory handle specifically.
+    // Community reports from other durability-sensitive engines (SQLite,
+    // LevelDB/RocksDB, LMDB) consistently note there is no reliable way to
+    // fsync a directory on Windows; those engines instead rely on NTFS's
+    // own always-on metadata journal (`$LogFile`) to make directory-entry
+    // changes crash-durable, a filesystem-internal guarantee that holds
+    // unconditionally rather than one this probe's methodology can ever
+    // observe through a syscall's return value the way `F_FULLFSYNC`'s
+    // success is trusted on macOS.
+    //
+    // A successful `FlushFileBuffers` call on a directory handle therefore
+    // proves nothing this module can stand behind, and there is no
+    // stronger alternative primitive to reach for the way macOS reaches
+    // past plain `fsync` to `F_FULLFSYNC`. That makes this the same shape
+    // as [`probe_range_clone`]'s Windows/macOS stub: a permanent, known
+    // absence of a *provable* guarantee, not an unattempted probe — so
+    // this reports `Unsupported` by construction rather than attempting
+    // the call and classifying its result.
+    Capability::Unsupported
+}
+
+#[cfg(not(any(unix, windows)))]
+fn probe_durable_directory_flush(_dir: &Path) -> Capability {
+    // No platform-specific probe is wired up here yet. Genuinely
+    // unprobed, not a negative result.
+    Capability::Unknown
+}
+
+/// How many back-to-back artefact creates [`probe_birth_time_granularity`]
+/// samples. More samples raise the odds of ever catching two creates that
+/// land inside the same clock tick — the only signal this probe treats as
+/// proof of coarseness — at the cost of more real time and I/O per call.
+/// 32 was chosen so that even a clock coarse enough to matter (multiple
+/// milliseconds, per the measured overlayfs case this probe exists to
+/// catch) reliably collides at least once across the run, while staying
+/// cheap enough to run as part of one capability probe.
+const GRANULARITY_SAMPLE_COUNT: usize = 32;
+
+/// Measures whether `dir`'s volume assigns `birth_or_creation_time` finely
+/// enough to trust an equal value as proof of "same object" — see
+/// [`TimestampGranularity`]. Creates [`GRANULARITY_SAMPLE_COUNT`] probe
+/// artefacts back-to-back with as little work between them as this module
+/// can manage, and observes each one's birth time immediately after.
+///
+/// The only signal this trusts is a direct collision: two **consecutive**
+/// samples reporting the exact same birth time proves two genuinely
+/// distinct creation events were indistinguishable, which is exactly the
+/// failure mode `Coarse` exists to catch — that is deliberately the sole
+/// proof accepted, rather than also accepting "the smallest observed
+/// delta between two *different* values was small". Comparing an absolute
+/// delta against a fixed threshold would conflate the clock's real
+/// resolution with this loop's own per-iteration overhead (each iteration
+/// does a real file create and a `stat`, easily tens of microseconds on
+/// its own): a genuinely fine (even nanosecond-resolution) clock will
+/// still show inter-sample deltas dominated by that overhead and never
+/// approach nanosecond scale, so a delta-based threshold would misjudge a
+/// fine clock as coarse. Collision is the only observation a coarse clock
+/// can produce that a fine one cannot.
+///
+/// Fewer than two usable samples (artefact creation failed, or the
+/// platform reports no birth time here at all) leaves no data to trust
+/// either way, so it is treated the same as a proven-coarse result rather
+/// than left as an unresolved case that might later be read as `Fine` by
+/// accident — the unsafe direction to get wrong here is assuming `Fine`.
+pub fn probe_birth_time_granularity(dir: &Path) -> TimestampGranularity {
+    let mut created = Vec::with_capacity(GRANULARITY_SAMPLE_COUNT);
+    let mut timestamps = Vec::with_capacity(GRANULARITY_SAMPLE_COUNT);
+    for i in 0..GRANULARITY_SAMPLE_COUNT {
+        let label = format!("granularity-{i}");
+        match create_probe_artefact(dir, &label, b"g") {
+            Ok((path, _file)) => {
+                if let Ok(identity) = FileIdentity::observe_path(&path) {
+                    if let Some(birth) = identity.birth_or_creation_time {
+                        timestamps.push(birth);
+                    }
+                }
+                created.push(path);
+            }
+            Err(_) => break,
+        }
+    }
+    for path in &created {
+        let _ = std::fs::remove_file(path);
+    }
+
+    if timestamps.len() < 2 {
+        return TimestampGranularity::Coarse;
+    }
+
+    if timestamps.windows(2).any(|pair| pair[0] == pair[1]) {
+        return TimestampGranularity::Coarse;
+    }
+    TimestampGranularity::Fine
+}
+
+/// The outcome of [`rename_no_replace`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenameOutcome {
+    /// The move happened; the source path is gone and the destination now
+    /// holds what the source held.
+    Renamed,
+    /// The move did not happen, for any reason (the destination was
+    /// occupied, the no-replace primitive is unavailable on this volume,
+    /// or an unrelated I/O error). Both the source and destination are
+    /// exactly as they were before the call.
+    NotRenamed,
+}
+
+/// Moves `from` to `to` without ever touching a preexisting object at
+/// `to`, using the platform's own no-replace rename primitive where this
+/// module has one available.
+///
+/// On Linux and macOS this uses `renameat2(RENAME_NOREPLACE)` /
+/// `renamex_np(RENAME_EXCL)` — the same two syscalls
+/// [`platform_atomic_exchange`] already uses, with a different flag — and
+/// reports [`RenameOutcome::NotRenamed`] on *any* failure. A racing actor
+/// occupying `to` (`EEXIST`) and the primitive itself being unavailable on
+/// this volume (a feature-absence errno, per [`classify_errno`]'s usual
+/// set) are deliberately not distinguished: the caller's response to
+/// either is identical (do not touch `to`, treat the whole operation as
+/// `Unknown`), and unlike the other probes in this module there is no
+/// `Unsupported` for this primitive to report — a capability probe that
+/// cannot attempt an operation safely must not fall back to an unsafe one
+/// just to produce a more specific answer. It never falls back to a
+/// clobbering rename.
+///
+/// **Windows is a known, accepted residual — see the platform-specific
+/// implementation below.**
+#[cfg(target_os = "linux")]
+fn rename_no_replace(from: &Path, to: &Path) -> RenameOutcome {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (Some(from_c), Some(to_c)) = (
+        CString::new(from.as_os_str().as_bytes()).ok(),
+        CString::new(to.as_os_str().as_bytes()).ok(),
+    ) else {
+        return RenameOutcome::NotRenamed;
+    };
+    // Called through the raw syscall number for the same reason
+    // `platform_atomic_exchange` is: glibc only exports `renameat2` from
+    // 2.28, and uClibc does not export it at all.
+    // SAFETY: `from_c`/`to_c` are valid NUL-terminated paths kept alive
+    // for the duration of the call.
+    let (ret, _errno) = retry_eintr_syscall(|| {
+        call_and_capture_errno!(unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                from_c.as_ptr(),
+                libc::AT_FDCWD,
+                to_c.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        })
+    });
+    // The errno is deliberately discarded — see the doc comment on why
+    // `EEXIST` and feature-absence are not distinguished here.
+    if ret == 0 {
+        RenameOutcome::Renamed
+    } else {
+        RenameOutcome::NotRenamed
+    }
+}
+
+/// See [`rename_no_replace`]'s doc (the Linux implementation) for the
+/// shared reasoning. macOS side: `renamex_np(RENAME_EXCL)`.
+#[cfg(target_os = "macos")]
+fn rename_no_replace(from: &Path, to: &Path) -> RenameOutcome {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (Some(from_c), Some(to_c)) = (
+        CString::new(from.as_os_str().as_bytes()).ok(),
+        CString::new(to.as_os_str().as_bytes()).ok(),
+    ) else {
+        return RenameOutcome::NotRenamed;
+    };
+    // SAFETY: `from_c`/`to_c` are valid NUL-terminated paths owned for the
+    // duration of the call.
+    let (ret, _errno) = retry_eintr(|| {
+        call_and_capture_errno!(unsafe {
+            libc::renamex_np(from_c.as_ptr(), to_c.as_ptr(), libc::RENAME_EXCL)
+        })
+    });
+    if ret == 0 {
+        RenameOutcome::Renamed
+    } else {
+        RenameOutcome::NotRenamed
+    }
+}
+
+/// **Accepted residual on Windows and any other platform.** A true
+/// no-replace primitive here (`ReplaceFileW`/`SetFileInformationByHandle`
+/// with `FILE_RENAME_FLAG_POSIX_SEMANTICS`, depending on Windows version)
+/// would need a `windows-sys`/`winapi` dependency this phase does not add.
+/// This falls back to a plain `std::fs::rename`, which — unlike the
+/// Linux/macOS path above — CAN silently overwrite an unrelated file a
+/// racing actor placed at `to` between [`reserve_probe_artefact_path`]'s
+/// check and this call. That is a possible *clobber*, not merely a
+/// possible wrongful delete (the class of bug the rest of this module's
+/// ownership discipline otherwise avoids). It is accepted here only
+/// because eliminating it needs a dependency this phase does not add, and
+/// is called out here explicitly rather than left silent.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn rename_no_replace(from: &Path, to: &Path) -> RenameOutcome {
+    match std::fs::rename(from, to) {
+        Ok(()) => RenameOutcome::Renamed,
+        Err(_) => RenameOutcome::NotRenamed,
+    }
+}
+
+/// Shared probe body for [`FilesystemSafetyCapabilities::stable_source_
+/// identity`] and [`FilesystemSafetyCapabilities::stable_owned_marker_
+/// identity`] — see both fields' docs for why this increment answers them
+/// with the identical procedure and result. Creates a fresh file, renames
+/// it in place, and asks [`FileIdentity::compare`] whether the before/after
+/// observation is `SameObject`.
+fn probe_stable_identity(dir: &Path) -> Capability {
+    let Ok((before_path, before_file)) =
+        create_probe_artefact(dir, "identity-before", b"identity probe")
+    else {
+        return Capability::Unknown;
+    };
+    drop(before_file);
+    let Ok(after_path) = reserve_probe_artefact_path(dir, "identity-after") else {
+        let _ = std::fs::remove_file(&before_path);
+        return Capability::Unknown;
+    };
+
+    let before = match FileIdentity::observe_path(&before_path) {
+        Ok(identity) => identity,
+        Err(_) => {
+            let _ = std::fs::remove_file(&before_path);
+            return Capability::Unknown;
+        }
+    };
+
+    if rename_no_replace(&before_path, &after_path) == RenameOutcome::NotRenamed {
+        // Either a racing actor occupies `after_path`, or this volume has
+        // no safe way to attempt the move at all — either way `to` was
+        // never touched (see `rename_no_replace`'s doc) and must not be
+        // removed; `before_path` is still exactly what this probe created
+        // and is still its to clean up.
+        let _ = std::fs::remove_file(&before_path);
+        return Capability::Unknown;
+    }
+
+    let result = (|| -> io::Result<Capability> {
+        let after = FileIdentity::observe_path(&after_path)?;
+        // Measured against this same directory, not assumed `Fine`: a
+        // coarse clock is exactly the condition under which a rename-only
+        // check (no discriminator-availability awareness) would have
+        // wrongly reported `Supported` before this fix — see
+        // `TimestampGranularity`'s doc.
+        let granularity = probe_birth_time_granularity(dir);
+        // Ask the exact question the capability advertises: does
+        // `FileIdentity::compare` — the primitive callers will actually
+        // use — treat this as the same object. Checking the raw fields by
+        // hand here would let this probe and `compare`'s own rule drift
+        // apart silently.
+        Ok(match before.compare(&after, granularity) {
+            IdentityComparison::SameObject => Capability::Supported,
+            IdentityComparison::DefinitelyDifferent | IdentityComparison::Ambiguous(_) => {
+                Capability::Unsupported
+            }
+        })
+    })();
+
+    // The rename succeeded: `before_path` no longer exists (it *is*
+    // `after_path` now, which this call produced), so only `after_path`
+    // needs cleanup.
+    let _ = std::fs::remove_file(&after_path);
+    result.unwrap_or(Capability::Unknown)
+}
+
+/// Classifies a failed `remove_file` on a path this probe still holds an
+/// open handle to. Only Windows' documented "can't unlink an open file
+/// under the default sharing mode" errno counts as the definite negative
+/// answer this capability probes for; any other failure (a permission
+/// race, a transient I/O error) says nothing about whether stale-handle
+/// preservation is supported here and must stay `Unknown` — the same
+/// errno discipline `classify_errno` applies to the raw-syscall probes,
+/// applied to a `std`-returned `io::Error` instead.
+fn classify_unlink_while_open_failure(err: &io::Error) -> Capability {
+    #[cfg(windows)]
+    {
+        // ERROR_SHARING_VIOLATION: the file is open without
+        // FILE_SHARE_DELETE, which is Windows' default and exactly the
+        // condition this probe exists to detect.
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        if err.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+            return Capability::Unsupported;
+        }
+    }
+    let _ = err;
+    Capability::Unknown
+}
+
+fn probe_stale_handle_preservation(dir: &Path) -> Capability {
+    let Ok((path, mut file)) = create_probe_artefact(dir, "stale-handle", b"before") else {
+        return Capability::Unknown;
+    };
+
+    let result = (|| -> io::Result<Capability> {
+        // If the platform will not even let the path be removed while the
+        // handle is open, that is only the accurate negative answer for
+        // this capability when the failure is specifically the
+        // sharing-violation Windows uses to signal it — see
+        // `classify_unlink_while_open_failure`.
+        if let Err(err) = std::fs::remove_file(&path) {
+            return Ok(classify_unlink_while_open_failure(&err));
+        }
+
+        std::io::Write::write_all(&mut file, b"-after")?;
+        std::io::Write::flush(&mut file)?;
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0))?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        Ok(if buf == b"before-after" { Capability::Supported } else { Capability::Unsupported })
+    })();
+
+    // Reached only when the `remove_file` above failed (the success path
+    // already removed it), in which case the artefact is genuinely still
+    // there and still this probe's to clean up.
+    let _ = std::fs::remove_file(&path);
+    result.unwrap_or(Capability::Unknown)
+}
+
+#[cfg(unix)]
+fn probe_metadata_fidelity(dir: &Path) -> Capability {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok((path, _)) = create_probe_artefact(dir, "metadata-fidelity", b"metadata probe") else {
+        return Capability::Unknown;
+    };
+    let result = (|| -> io::Result<Capability> {
+        let probe_mode = 0o741;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(probe_mode))?;
+        let observed = std::fs::metadata(&path)?.mode() & 0o777;
+        Ok(if observed == probe_mode { Capability::Supported } else { Capability::Unsupported })
+    })();
+    let _ = std::fs::remove_file(&path);
+    result.unwrap_or(Capability::Unknown)
+}
+
+#[cfg(windows)]
+fn probe_metadata_fidelity(dir: &Path) -> Capability {
+    let Ok((path, _)) = create_probe_artefact(dir, "metadata-fidelity", b"metadata probe") else {
+        return Capability::Unknown;
+    };
+    let result = (|| -> io::Result<Capability> {
+        let mut permissions = std::fs::metadata(&path)?.permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions)?;
+        let observed_readonly = std::fs::metadata(&path)?.permissions().readonly();
+        Ok(if observed_readonly { Capability::Supported } else { Capability::Unsupported })
+    })();
+    // Clear the readonly bit unconditionally, regardless of which branch
+    // above returned or errored, so the artefact is never left behind in a
+    // state where an ordinary `remove_file` cannot delete it — every exit
+    // path above reaches this, not just the success path.
+    if let Ok(metadata) = std::fs::metadata(&path) {
+        let mut permissions = metadata.permissions();
+        if permissions.readonly() {
+            permissions.set_readonly(false);
+            let _ = std::fs::set_permissions(&path, permissions);
+        }
+    }
+    if std::fs::remove_file(&path).is_err() {
+        tracing::warn!(
+            path = %path.display(),
+            "failed to remove filesystem-capability probe artefact"
+        );
+    }
+    result.unwrap_or(Capability::Unknown)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A probe artefact whose write fails after `create_new` succeeded has
+    /// no owner: the caller never receives the path, so it cannot clean up
+    /// what it was never told about, and nothing else knows the name. Under
+    /// sustained disk pressure — the exact condition that makes the write
+    /// fail — every retry would leave another one behind.
+    ///
+    /// The artefact is reserved-namespace shaped, so it is excluded from
+    /// indexing and can never be signed into the DAG; this is disk litter,
+    /// not a sync-correctness defect. It is still the caller's directory,
+    /// and the rule this module enforces everywhere else is that a probe
+    /// leaves nothing behind.
+    #[test]
+    fn a_probe_artefact_whose_write_fails_is_not_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        FAIL_NEXT_PROBE_WRITE.with(|f| f.set(true));
+
+        let result = create_probe_artefact(dir.path(), "orphan", b"content");
+
+        assert!(result.is_err(), "the injected write failure must be reported, not swallowed");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a probe artefact whose write failed must be removed, found {leftovers:?}"
+        );
+    }
+
+    /// High-severity regression: every artefact a probe places directly in
+    /// the caller's directory must classify as reserved — see
+    /// `probe_artefact_name`'s doc for the concrete harm an unreserved name
+    /// caused (a probe artefact racing the watcher/scan/local-change
+    /// indexing path and, worst case, getting signed into the DAG). Checked
+    /// against `create_probe_artefact`, `reserve_probe_artefact_path` and a
+    /// full `probe_all` run (which exercises every probe in this module),
+    /// not only `probe_artefact_name` in isolation, so this fails if any
+    /// probe stops routing its artefact names through it.
+    #[test]
+    fn every_probe_artefact_name_is_reserved_namespace_shaped() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (created_path, file) =
+            create_probe_artefact(dir.path(), "regression-label", b"x").unwrap();
+        assert!(crate::reserved_namespace::is_artefact_component(
+            created_path.file_name().unwrap()
+        ));
+        drop(file);
+        std::fs::remove_file(&created_path).unwrap();
+
+        let reserved_path = reserve_probe_artefact_path(dir.path(), "regression-label").unwrap();
+        assert!(crate::reserved_namespace::is_artefact_component(
+            reserved_path.file_name().unwrap()
+        ));
+
+        // `probe_all` exercises every probe in the module (atomic exchange,
+        // reflink, range clone, flush, identity, stale-handle, metadata) —
+        // whatever transient artefacts land in `dir` mid-run, none may ever
+        // be visible outside the reserved namespace. Sampled by polling the
+        // directory from a second thread while probing runs, since every
+        // artefact this module creates is normally cleaned up before
+        // `probe_all` returns.
+        let poll_dir = dir.path().to_path_buf();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let observed_unreserved = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_clone = observed_unreserved.clone();
+        let poller = std::thread::spawn(move || {
+            while !stop_clone.load(Ordering::Relaxed) {
+                if let Ok(entries) = std::fs::read_dir(&poll_dir) {
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        if !crate::reserved_namespace::is_reserved_component(&entry.file_name()) {
+                            observed_clone.lock().unwrap().push(entry.file_name());
+                        }
+                    }
+                }
+            }
+        });
+        let _ = probe_all(dir.path());
+        stop.store(true, Ordering::Relaxed);
+        poller.join().unwrap();
+        assert!(
+            observed_unreserved.lock().unwrap().is_empty(),
+            "probe_all left an unreserved artefact visible in the sync directory: {:?}",
+            observed_unreserved.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn unknown_is_never_read_as_supported() {
+        assert!(!Capability::Unknown.is_supported());
+        assert!(!Capability::Unsupported.is_supported());
+        assert!(Capability::Supported.is_supported());
+    }
+
+    #[test]
+    fn cache_miss_returns_unknown_never_a_guess() {
+        let cache = CapabilityCache::new();
+        let key = CapabilityCacheKey::new(
+            VolumeIdentity::Unix { device_id: 1 },
+            OperationKind::AtomicExchange,
+            ADAPTER_VERSION,
+        );
+        assert_eq!(cache.get(&key), Capability::Unknown);
+    }
+
+    #[test]
+    fn cache_round_trips_a_recorded_value() {
+        let cache = CapabilityCache::new();
+        let key = CapabilityCacheKey::new(
+            VolumeIdentity::Unix { device_id: 1 },
+            OperationKind::AtomicExchange,
+            ADAPTER_VERSION,
+        );
+        cache.record(key, Capability::Supported);
+        assert_eq!(cache.get(&key), Capability::Supported);
+    }
+
+    #[test]
+    fn different_volume_identity_is_a_different_cache_entry() {
+        let cache = CapabilityCache::new();
+        let key_a = CapabilityCacheKey::new(
+            VolumeIdentity::Unix { device_id: 1 },
+            OperationKind::AtomicExchange,
+            ADAPTER_VERSION,
+        );
+        let key_b = CapabilityCacheKey::new(
+            VolumeIdentity::Unix { device_id: 2 },
+            OperationKind::AtomicExchange,
+            ADAPTER_VERSION,
+        );
+        cache.record(key_a, Capability::Supported);
+        // A removable drive remounted with a different device id must miss
+        // the cache entirely, never inherit the old volume's answer.
+        assert_eq!(cache.get(&key_b), Capability::Unknown);
+    }
+
+    #[test]
+    fn different_operation_kind_is_a_different_cache_entry() {
+        let cache = CapabilityCache::new();
+        let volume = VolumeIdentity::Unix { device_id: 1 };
+        cache.record(
+            CapabilityCacheKey::new(volume, OperationKind::AtomicExchange, ADAPTER_VERSION),
+            Capability::Supported,
+        );
+        assert_eq!(
+            cache.get(&CapabilityCacheKey::new(
+                volume,
+                OperationKind::ReflinkOrClone,
+                ADAPTER_VERSION
+            )),
+            Capability::Unknown
+        );
+    }
+
+    #[test]
+    fn different_adapter_version_is_a_different_cache_entry() {
+        let cache = CapabilityCache::new();
+        let volume = VolumeIdentity::Unix { device_id: 1 };
+        cache.record(
+            CapabilityCacheKey::new(volume, OperationKind::AtomicExchange, 1),
+            Capability::Supported,
+        );
+        // A probe-logic change (adapter version bump) must not inherit an
+        // answer computed under the old logic.
+        assert_eq!(
+            cache.get(&CapabilityCacheKey::new(volume, OperationKind::AtomicExchange, 2)),
+            Capability::Unknown
+        );
+    }
+
+    #[test]
+    fn get_or_probe_only_probes_once() {
+        let cache = CapabilityCache::new();
+        let key = CapabilityCacheKey::new(
+            VolumeIdentity::Unix { device_id: 1 },
+            OperationKind::AtomicExchange,
+            ADAPTER_VERSION,
+        );
+        let mut probe_calls = 0;
+        let first = cache.get_or_probe(key, || {
+            probe_calls += 1;
+            Capability::Supported
+        });
+        let second = cache.get_or_probe(key, || {
+            probe_calls += 1;
+            Capability::Supported
+        });
+        assert_eq!(first, Capability::Supported);
+        assert_eq!(second, Capability::Supported);
+        assert_eq!(probe_calls, 1);
+    }
+
+    #[test]
+    fn cached_unknown_is_re_probed_not_treated_as_a_settled_hit() {
+        // R8: `Unknown` means "not yet established", so a cache entry
+        // sitting at `Unknown` (however it got there) must not short-
+        // circuit `get_or_probe` the way a settled `Supported`/
+        // `Unsupported` value does.
+        let cache = CapabilityCache::new();
+        let key = CapabilityCacheKey::new(
+            VolumeIdentity::Unix { device_id: 1 },
+            OperationKind::AtomicExchange,
+            ADAPTER_VERSION,
+        );
+        cache.record(key, Capability::Unknown);
+        let mut probed = false;
+        let result = cache.get_or_probe(key, || {
+            probed = true;
+            Capability::Supported
+        });
+        assert!(probed, "a cached Unknown must not be treated as a settled cache hit");
+        assert_eq!(result, Capability::Supported);
+    }
+
+    #[test]
+    fn get_or_probe_stops_reprobing_after_the_consecutive_unknown_cap_but_never_upgrades() {
+        // R8: an `Unknown` streak (a durably broken directory: permanent
+        // EIO, a permanent read-only remount) must not turn into an
+        // unbounded re-probe loop, but it must also never be "resolved"
+        // into anything other than `Unknown` just because the cap was
+        // reached.
+        let cache = CapabilityCache::new();
+        let key = CapabilityCacheKey::new(
+            VolumeIdentity::Unix { device_id: 1 },
+            OperationKind::AtomicExchange,
+            ADAPTER_VERSION,
+        );
+        let mut probe_calls = 0;
+        for _ in 0..(MAX_CONSECUTIVE_UNKNOWN_REPROBES + 3) {
+            let result = cache.get_or_probe(key, || {
+                probe_calls += 1;
+                Capability::Unknown
+            });
+            assert_eq!(result, Capability::Unknown, "Unknown must never be upgraded");
+        }
+        assert_eq!(
+            probe_calls, MAX_CONSECUTIVE_UNKNOWN_REPROBES,
+            "re-probing must stop once the bound is reached, not spin forever"
+        );
+    }
+
+    #[test]
+    fn a_settled_result_before_the_reprobe_cap_is_reported_and_cached() {
+        let cache = CapabilityCache::new();
+        let key = CapabilityCacheKey::new(
+            VolumeIdentity::Unix { device_id: 1 },
+            OperationKind::AtomicExchange,
+            ADAPTER_VERSION,
+        );
+        // One short of the cap, so the next call still actually re-probes
+        // (see `get_or_probe_stops_reprobing_after_the_consecutive_
+        // unknown_cap...` above for what happens once the cap itself is
+        // reached).
+        for _ in 0..MAX_CONSECUTIVE_UNKNOWN_REPROBES.saturating_sub(1) {
+            cache.get_or_probe(key, || Capability::Unknown);
+        }
+        let resolved = cache.get_or_probe(key, || Capability::Supported);
+        assert_eq!(resolved, Capability::Supported);
+        assert_eq!(cache.get(&key), Capability::Supported);
+    }
+
+    #[test]
+    fn explicit_record_unsticks_a_key_that_hit_the_reprobe_cap() {
+        // Once the cap is reached, `get_or_probe` alone never calls
+        // `probe` again for that key (see the test above) — that is a
+        // deliberate permanent stop for this `CapabilityCache` instance's
+        // lifetime, not a temporary pause with automatic recovery. A
+        // caller that wants a fresh look after conditions might have
+        // changed (a fresh probe session, an explicit user-triggered
+        // re-check) does so by starting a new `CapabilityCache` or by
+        // calling `record` directly, which always resets the streak.
+        let cache = CapabilityCache::new();
+        let key = CapabilityCacheKey::new(
+            VolumeIdentity::Unix { device_id: 1 },
+            OperationKind::AtomicExchange,
+            ADAPTER_VERSION,
+        );
+        for _ in 0..MAX_CONSECUTIVE_UNKNOWN_REPROBES {
+            cache.get_or_probe(key, || Capability::Unknown);
+        }
+        cache.record(key, Capability::Unknown);
+        let mut probed = false;
+        let result = cache.get_or_probe(key, || {
+            probed = true;
+            Capability::Supported
+        });
+        assert!(probed, "record must reset the re-probe streak, not just the cached value");
+        assert_eq!(result, Capability::Supported);
+    }
+
+    #[test]
+    fn durability_level_never_exceeds_atomic_exchange_support() {
+        let caps = FilesystemSafetyCapabilities {
+            atomic_exchange: Capability::Unsupported,
+            durable_file_flush: Capability::Supported,
+            durable_directory_flush: Capability::Supported,
+            stable_source_identity: Capability::Supported,
+            stable_owned_marker_identity: Capability::Supported,
+            stale_handle_preservation: Capability::Supported,
+            metadata_fidelity: Capability::Supported,
+            reflink_or_clone: Capability::Supported,
+            range_clone: Capability::Supported,
+        };
+        assert_eq!(derive_durability_level(&caps, false), DurabilityLevel::Unsupported);
+    }
+
+    #[test]
+    fn durability_level_requires_directory_flush_for_power_loss_safe() {
+        let mut caps = FilesystemSafetyCapabilities {
+            atomic_exchange: Capability::Supported,
+            durable_file_flush: Capability::Supported,
+            durable_directory_flush: Capability::Unsupported,
+            stable_source_identity: Capability::Supported,
+            stable_owned_marker_identity: Capability::Supported,
+            stale_handle_preservation: Capability::Supported,
+            metadata_fidelity: Capability::Supported,
+            reflink_or_clone: Capability::Unsupported,
+            range_clone: Capability::Unsupported,
+        };
+        assert_eq!(derive_durability_level(&caps, false), DurabilityLevel::ProcessCrashSafe);
+
+        caps.durable_directory_flush = Capability::Supported;
+        assert_eq!(derive_durability_level(&caps, false), DurabilityLevel::PowerLossSafe);
+    }
+
+    #[test]
+    fn durability_level_never_claims_power_loss_safe_from_flush_alone_on_remote_filesystems() {
+        let caps = FilesystemSafetyCapabilities {
+            atomic_exchange: Capability::Supported,
+            durable_file_flush: Capability::Supported,
+            durable_directory_flush: Capability::Supported,
+            stable_source_identity: Capability::Supported,
+            stable_owned_marker_identity: Capability::Supported,
+            stale_handle_preservation: Capability::Unsupported,
+            metadata_fidelity: Capability::Supported,
+            reflink_or_clone: Capability::Unsupported,
+            range_clone: Capability::Unsupported,
+        };
+        assert_eq!(
+            derive_durability_level(&caps, true),
+            DurabilityLevel::BestEffortRemoteFilesystem
+        );
+    }
+
+    #[test]
+    fn remote_durability_level_also_requires_stable_identity() {
+        // R7: the local branch above already required stable identity; the
+        // remote branch must too. A remote mount with working
+        // atomic-exchange and flush syscalls but no reuse-safe identity
+        // would otherwise be reported usable even though recovery cannot
+        // tell the recorded object from a replacement.
+        let caps = FilesystemSafetyCapabilities {
+            atomic_exchange: Capability::Supported,
+            durable_file_flush: Capability::Supported,
+            durable_directory_flush: Capability::Supported,
+            stable_source_identity: Capability::Unsupported,
+            stable_owned_marker_identity: Capability::Supported,
+            stale_handle_preservation: Capability::Supported,
+            metadata_fidelity: Capability::Supported,
+            reflink_or_clone: Capability::Unsupported,
+            range_clone: Capability::Unsupported,
+        };
+        assert_eq!(derive_durability_level(&caps, true), DurabilityLevel::Unsupported);
+    }
+
+    #[test]
+    fn remote_durability_level_requires_the_marker_field_too() {
+        // Mirrors the test above with the fields swapped: `derive_
+        // durability_level` requires BOTH `stable_source_identity` and
+        // `stable_owned_marker_identity` (see its own doc for why a single
+        // "attempt syncing at all" gate cannot safely pick a side of the
+        // nine `compare()` call sites' source/marker ambiguity), so a
+        // volume reporting only one of the two as `Supported` must still
+        // come back `Unsupported`, not `BestEffortRemoteFilesystem`.
+        let caps = FilesystemSafetyCapabilities {
+            atomic_exchange: Capability::Supported,
+            durable_file_flush: Capability::Supported,
+            durable_directory_flush: Capability::Supported,
+            stable_source_identity: Capability::Supported,
+            stable_owned_marker_identity: Capability::Unsupported,
+            stale_handle_preservation: Capability::Supported,
+            metadata_fidelity: Capability::Supported,
+            reflink_or_clone: Capability::Unsupported,
+            range_clone: Capability::Unsupported,
+        };
+        assert_eq!(derive_durability_level(&caps, true), DurabilityLevel::Unsupported);
+    }
+
+    #[test]
+    fn probe_all_against_a_real_temp_directory_returns_no_unsupported_atomic_exchange_surprise() {
+        // This is a smoke test, not an assertion about specific results:
+        // real probe outcomes vary by host filesystem (macOS APFS vs. a
+        // CI runner's overlay/tmpfs). It only asserts the probe completes
+        // and produces some definite `Capability` for every field — never
+        // a panic, and (per `is_supported`) `Unknown` never silently reads
+        // as `Supported`.
+        let dir = tempfile::tempdir().unwrap();
+        let caps = probe_all(dir.path()).unwrap();
+        for capability in [
+            caps.atomic_exchange,
+            caps.durable_file_flush,
+            caps.durable_directory_flush,
+            caps.stable_source_identity,
+            caps.stable_owned_marker_identity,
+            caps.stale_handle_preservation,
+            caps.metadata_fidelity,
+            caps.reflink_or_clone,
+            caps.range_clone,
+        ] {
+            if capability == Capability::Unknown {
+                assert!(!capability.is_supported());
+            }
+        }
+    }
+
+    #[test]
+    fn probe_stable_identity_reports_supported_exactly_when_a_reuse_discriminator_exists() {
+        // Platform-dependent, deliberately not hard-coded to `Supported`:
+        // on some filesystems (observed on Linux under overlayfs — see the
+        // eprintln below) `std::fs::Metadata` supplies neither a
+        // `generation_or_usn` nor a fine-grained `birth_or_creation_time`,
+        // so `FileIdentity::compare` correctly reports `Ambiguous` and this
+        // probe correctly reports `Unsupported`. That is the R6 fix working
+        // as designed, not a probe failure — asserting `Supported`
+        // unconditionally here was itself the bug (the same class as the
+        // `disk_race_fingerprint` test's platform-dependent-property-
+        // asserted-as-universal mistake): meaningful on the author's
+        // macOS/APFS host, wrong on Linux/overlayfs CI.
+        //
+        // Empirically reproduces the exact check the probe itself performs
+        // (rename a fresh file, measure this volume's real granularity, ask
+        // `compare`) and requires the probe's answer to match it exactly in
+        // both directions — never weakened to "not `Unknown`", which would
+        // stop testing anything.
+        let dir = tempfile::tempdir().unwrap();
+        let before_path = dir.path().join("expected-outcome-before");
+        let after_path = dir.path().join("expected-outcome-after");
+        std::fs::write(&before_path, b"identity probe").unwrap();
+        let before = FileIdentity::observe_path(&before_path).unwrap();
+        std::fs::rename(&before_path, &after_path).unwrap();
+        let after = FileIdentity::observe_path(&after_path).unwrap();
+        let granularity = probe_birth_time_granularity(dir.path());
+        let expected = match before.compare(&after, granularity) {
+            IdentityComparison::SameObject => Capability::Supported,
+            IdentityComparison::DefinitelyDifferent | IdentityComparison::Ambiguous(_) => {
+                Capability::Unsupported
+            }
+        };
+        eprintln!(
+            "probe_stable_identity: generation_or_usn present={}, \
+             birth_or_creation_time present={}, granularity={granularity:?}, expected={expected:?}",
+            before.generation_or_usn.is_some(),
+            before.birth_or_creation_time.is_some(),
+        );
+
+        let result = probe_stable_identity(dir.path());
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn a_reuse_discriminator_is_what_distinguishes_supported_from_ambiguous() {
+        // Not a probe test: this documents *why* `probe_stable_identity`
+        // checks for a discriminator at all, by constructing the exact
+        // synthetic identities the probe's own check is meant to catch and
+        // confirming `FileIdentity::compare` really does treat them as
+        // `Ambiguous`. If this regressed to being `SameObject` (e.g. a
+        // future edit made `compare` fall back to a non-discriminating
+        // field), `probe_stable_identity` would start reporting `Supported`
+        // for a volume that cannot actually back a safe identity
+        // comparison.
+        use crate::fs_identity::{AmbiguityReason, ObjectKind, PlatformObjectId};
+        let identity_without_a_discriminator = |object_id| FileIdentity {
+            volume_identity: VolumeIdentity::Unix { device_id: 1 },
+            object_id,
+            object_kind: ObjectKind::RegularFile,
+            generation_or_usn: None,
+            birth_or_creation_time: None,
+            observed_size: 0,
+            metadata_fingerprint: [0; 32],
+            link_count: Some(1),
+            symlink_target_digest: None,
+        };
+        let before = identity_without_a_discriminator(PlatformObjectId::Unix { inode: 2 });
+        let after = identity_without_a_discriminator(PlatformObjectId::Unix { inode: 2 });
+        assert_eq!(
+            before.compare(&after, TimestampGranularity::Fine),
+            IdentityComparison::Ambiguous(AmbiguityReason::NoStableGenerationOrUsn)
+        );
+    }
+
+    #[test]
+    fn probe_all_rejects_a_directory_that_does_not_exist() {
+        let missing =
+            std::env::temp_dir().join("yadorilink-fscap-probe-missing-dir-does-not-exist");
+        assert!(probe_all(&missing).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_errno_only_reports_unsupported_for_the_feature_absent_set() {
+        // The transient/unrelated case: `EPERM` says nothing about
+        // whether the feature exists, so it must stay `Unknown` — never
+        // `Unsupported`, which would let one unlucky permission failure
+        // permanently poison a cached "this volume can't do this" answer.
+        assert_eq!(
+            classify_errno(Some(libc::EPERM), &[libc::ENOSYS, libc::EINVAL]),
+            Capability::Unknown
+        );
+        // No errno at all (shouldn't happen for a real failed syscall, but
+        // defensively) is the same: not proof of anything.
+        assert_eq!(classify_errno(None, &[libc::ENOSYS]), Capability::Unknown);
+        // The documented feature-absence case.
+        assert_eq!(classify_errno(Some(libc::ENOSYS), &[libc::ENOSYS]), Capability::Unsupported);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retry_eintr_retries_past_interruption_and_returns_the_real_result() {
+        let mut calls = 0;
+        let (ret, errno) = retry_eintr(|| {
+            calls += 1;
+            if calls < 3 {
+                (-1, Some(libc::EINTR))
+            } else {
+                (0, None)
+            }
+        });
+        assert_eq!((ret, errno), (0, None));
+        assert_eq!(calls, 3, "EINTR must be retried, not surfaced as a result");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retry_eintr_does_not_retry_a_different_failure() {
+        // A `-1` with anything other than `EINTR` is a real result, not
+        // interruption noise, and must be returned on the first attempt.
+        let mut calls = 0;
+        let (ret, errno) = retry_eintr(|| {
+            calls += 1;
+            (-1, Some(libc::EPERM))
+        });
+        assert_eq!((ret, errno), (-1, Some(libc::EPERM)));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn probe_range_clone_smoke_test_never_reports_supported_from_a_zero_byte_copy() {
+        // Not a fault-injection test (this module has no seam for forcing
+        // `copy_file_range` to return `0` from real probe code) — this
+        // instead directly checks the loop invariant `platform_range_clone`
+        // relies on: a positive-length request must observe the full
+        // expected content on the destination before claiming `Supported`,
+        // which a `0`-byte return could never have produced.
+        let dir = tempfile::tempdir().unwrap();
+        let result = probe_range_clone(dir.path());
+        if result == Capability::Supported {
+            // On Linux with a working `copy_file_range`, the destination
+            // must contain the exact probe content, not a truncated or
+            // empty file a lenient `ret >= 0` check could have let through.
+            let dst_entries: Vec<_> =
+                std::fs::read_dir(dir.path()).unwrap().filter_map(|entry| entry.ok()).collect();
+            assert!(
+                dst_entries.is_empty(),
+                "a successful probe must clean up its own artefacts: found {:?}",
+                dst_entries.iter().map(|e| e.path()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_directory_flush_reports_supported_only_via_full_fsync() {
+        // Both the file-flush and directory-flush probes route through
+        // the single `platform_full_fsync` function on macOS (see its doc
+        // comment), so there is exactly one place plain `fsync` could ever
+        // leak back into a `PowerLossSafe` claim — and it isn't used here.
+        // APFS (the filesystem backing a macOS temp directory) supports
+        // `F_FULLFSYNC`, so a correct implementation reports `Supported`;
+        // this is a smoke-level regression guard for that shared-primitive
+        // structure, not a fault-injection proof that bare `fsync` is
+        // unreachable.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(probe_durable_directory_flush(dir.path()), Capability::Supported);
+    }
+
+    #[test]
+    fn platform_reflink_or_clone_reports_it_did_not_create_a_preexisting_destination() {
+        // R9: `reserve_probe_artefact_path` only narrows the ownership
+        // race to the gap between its own check and this call — it cannot
+        // eliminate it. If something else already occupies `dst` by the
+        // time the platform call actually runs, that call must say it did
+        // NOT create `dst`, so the outer probe never deletes a file it
+        // does not own. Simulated directly here (rather than relying on
+        // timing a real race) by simply pre-creating `dst` before calling
+        // the platform function.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::write(&src, b"content").unwrap();
+        let dst = dir.path().join("dst");
+        std::fs::write(&dst, b"someone else's content").unwrap();
+
+        let (_, dst_created_by_us) = platform_reflink_or_clone(&src, &dst);
+
+        assert!(!dst_created_by_us);
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            b"someone else's content",
+            "a probe must never overwrite or delete a path it did not create"
+        );
+    }
+
+    #[test]
+    fn platform_range_clone_reports_it_did_not_create_a_preexisting_destination() {
+        // Same reasoning as the reflink test above. On non-Linux hosts
+        // `platform_range_clone` is the stub that always reports `false`
+        // regardless of `dst`'s state, so this is trivially true there;
+        // on Linux it exercises the real `create_new` guard.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::write(&src, b"0123456789abcdef").unwrap();
+        let dst = dir.path().join("dst");
+        std::fs::write(&dst, b"someone else's content").unwrap();
+
+        let (_, dst_created_by_us) = platform_range_clone(&src, &dst);
+
+        assert!(!dst_created_by_us);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"someone else's content");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn rename_no_replace_does_not_clobber_a_preexisting_target() {
+        // Mirrors the two clone-probe ownership tests above, for the
+        // rename-target race `probe_stable_identity` used to be
+        // exposed to. On Linux/macOS this exercises the real
+        // `RENAME_NOREPLACE`/`RENAME_EXCL` syscall path, not the
+        // documented Windows fallback residual (see `rename_no_replace`'s
+        // doc) — gated accordingly rather than asserted everywhere, since
+        // the Windows path's behavior here is deliberately different
+        // (and cannot be verified from this host).
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from");
+        std::fs::write(&from, b"mover content").unwrap();
+        let to = dir.path().join("to");
+        std::fs::write(&to, b"someone else's content").unwrap();
+
+        let outcome = rename_no_replace(&from, &to);
+
+        assert_eq!(outcome, RenameOutcome::NotRenamed);
+        assert_eq!(
+            std::fs::read(&to).unwrap(),
+            b"someone else's content",
+            "a probe must never overwrite a path it did not create"
+        );
+        assert_eq!(std::fs::read(&from).unwrap(), b"mover content", "source must be untouched too");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn rename_no_replace_succeeds_when_the_target_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from");
+        std::fs::write(&from, b"mover content").unwrap();
+        let to = dir.path().join("to");
+
+        let outcome = rename_no_replace(&from, &to);
+
+        assert_eq!(outcome, RenameOutcome::Renamed);
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(&to).unwrap(), b"mover content");
+    }
+
+    #[test]
+    fn probe_birth_time_granularity_returns_a_defined_outcome_on_this_host() {
+        // Not asserting a specific value here (that's host-dependent, and
+        // already pinned indirectly by `probe_stable_identity_reports_
+        // supported_exactly_when_a_reuse_discriminator_exists` above,
+        // which requires `Fine` on this host to pass) — only that the
+        // probe completes and returns one of the two defined outcomes.
+        let dir = tempfile::tempdir().unwrap();
+        let granularity = probe_birth_time_granularity(dir.path());
+        assert!(matches!(granularity, TimestampGranularity::Fine | TimestampGranularity::Coarse));
+    }
+
+    #[test]
+    fn granularity_probe_treats_zero_usable_samples_as_coarse_not_unresolved() {
+        // R6's explicit ask: what happens when the measurement itself is
+        // inconclusive. A directory that does not exist can't have any
+        // artefact created in it, so every sample fails to even start —
+        // this must resolve to `Coarse`, never `Fine`, so a caller relying
+        // on it still blocks on ambiguity rather than guessing.
+        let missing = std::env::temp_dir().join("yadorilink-fscap-granularity-missing-dir");
+        assert_eq!(probe_birth_time_granularity(&missing), TimestampGranularity::Coarse);
+    }
+}

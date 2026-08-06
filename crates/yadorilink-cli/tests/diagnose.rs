@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_sync_core::index::SyncState;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
@@ -21,16 +21,21 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     std::env::set_var("YADORILINK_UPDATE_MANIFEST_URL", "http://127.0.0.1:1/manifest.json");
 
     let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
-    let sync_state = Arc::new(SyncState::open(dir.path().join("sync.sqlite3")).unwrap());
+    let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
 
     let socket_path = dir.path().join("daemon.sock");
     std::env::set_var("YADORILINK_CONTROL_SOCKET", &socket_path);
 
     let serve_path = socket_path.clone();
-    let serve_state = state.clone();
+    let serve_context = std::sync::Arc::new(
+        yadorilink_daemon::control_context::ControlContext::from_state(state.clone()),
+    );
     tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(&serve_path, serve_state)
+        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
+            &serve_path,
+            serve_context,
+        )
             .await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -83,7 +88,7 @@ async fn diagnose_export_via_daemon_redacts_a_real_linked_folder() {
     let link_root = dir.path().join("Users").join("alice").join("secret-project");
     std::fs::create_dir_all(&link_root).unwrap();
     let link_path = link_root.to_string_lossy().to_string();
-    state.sync_state.add_link(&link_path, "11111111-2222-3333-4444-555555555555").unwrap();
+    state.replica_coordinator.link_repository().add_link(&link_path, "11111111-2222-3333-4444-555555555555").unwrap();
 
     let out_path = dir.path().join("bundle.json");
     yadorilink_cli::commands::diagnose::export(out_path.clone()).await.unwrap();

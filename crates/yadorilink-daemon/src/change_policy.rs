@@ -7,8 +7,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
-use yadorilink_sync_core::change::ChangeAuth;
-use yadorilink_sync_core::index::PolicyWatermark;
+use yadorilink_replica_domain::change::ChangeAuth;
+use yadorilink_sync_sqlite::policy_watermark::PolicyWatermark;
+use yadorilink_replica_engine::repair_election::AuthorizedWriter;
 
 /// A group's signed policy log as delivered by the coordination plane in a
 /// netmap update. Plain data the netmap client fills from the coordination
@@ -120,6 +121,36 @@ pub enum WatermarkVerdict {
     Reject(String),
 }
 
+/// Why [`GroupPolicyState::writers_at`] refused to answer for a given seq.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterSnapshotError {
+    /// `requested` is beyond `current`, this state's own verified position —
+    /// the caller asked for a writer set at a policy point this device
+    /// cannot yet vouch for.
+    FutureSequence { requested: u64, current: u64 },
+    /// `requested` falls within the verified range but has no record at
+    /// that exact seq, which the chain's own gap-free construction should
+    /// make impossible.
+    MissingSequence { requested: u64 },
+}
+
+impl std::fmt::Display for WriterSnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriterSnapshotError::FutureSequence { requested, current } => write!(
+                f,
+                "writer snapshot requested at seq {requested}, beyond this state's verified seq {current}"
+            ),
+            WriterSnapshotError::MissingSequence { requested } => write!(
+                f,
+                "writer snapshot requested at seq {requested} has no verified record at that seq"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriterSnapshotError {}
+
 impl GroupPolicyState {
     pub fn change_auth(&self) -> ChangeAuth {
         ChangeAuth {
@@ -166,6 +197,64 @@ impl GroupPolicyState {
                 fingerprint_admits(*bound_fingerprint, signing_key_fingerprint)
             })
             .unwrap_or(false)
+    }
+
+    /// The full set of currently-authorized writers, replaying every
+    /// Grant/Revoke in the verified chain up to `self.current_seq`. Cannot
+    /// fail: `self.current_seq` is this state's own verified position, never
+    /// a future or missing one. See [`Self::writers_at`] for reconstructing
+    /// a specific historical seq's set instead.
+    pub fn current_writers(&self) -> Vec<AuthorizedWriter> {
+        self.writers_up_to(self.current_seq)
+    }
+
+    /// The authorized writer set as of a specific `auth_seq`. Sorted by
+    /// `device_id` so any two devices that replay the same verified chain up
+    /// to the same seq compute the identical `Vec` — the shared input
+    /// `yadorilink_replica_engine::repair_election::rank_writers_for_obligation`
+    /// depends on to produce the same ranking on every replica.
+    ///
+    /// Fails closed rather than silently substituting a different set:
+    /// `auth_seq` beyond `self.current_seq` asks for a policy point this
+    /// device cannot yet vouch for (this is NOT "the current set", even
+    /// though replaying up to it would produce one), and `auth_seq` within
+    /// `[1, current_seq]` with no verified record at that exact seq
+    /// indicates the chain itself is broken (impossible for a chain that
+    /// passed `verify_group_policy_log`'s gap-free sequencing check, but
+    /// this does not re-trust that invariant here).
+    pub fn writers_at(&self, auth_seq: u64) -> Result<Vec<AuthorizedWriter>, WriterSnapshotError> {
+        if auth_seq > self.current_seq {
+            return Err(WriterSnapshotError::FutureSequence {
+                requested: auth_seq,
+                current: self.current_seq,
+            });
+        }
+        if auth_seq >= 1 && !self.records.contains_key(&auth_seq) {
+            return Err(WriterSnapshotError::MissingSequence { requested: auth_seq });
+        }
+        Ok(self.writers_up_to(auth_seq))
+    }
+
+    fn writers_up_to(&self, auth_seq: u64) -> Vec<AuthorizedWriter> {
+        let mut grants: BTreeMap<&str, [u8; HASH_LEN]> = BTreeMap::new();
+        for record in self.records.range(..=auth_seq).map(|(_, record)| record) {
+            match &record.action {
+                PolicyAction::Grant { device_id, signing_key_fingerprint } => {
+                    grants.insert(device_id.as_str(), *signing_key_fingerprint);
+                }
+                PolicyAction::Revoke { device_id } => {
+                    grants.remove(device_id.as_str());
+                }
+                PolicyAction::RotateAuthority { .. } => {}
+            }
+        }
+        grants
+            .into_iter()
+            .map(|(device_id, signing_key_fingerprint)| AuthorizedWriter {
+                device_id: device_id.to_string(),
+                signing_key_fingerprint,
+            })
+            .collect()
     }
 
     /// SHA-256 of the group's current authority public key. Pins WHICH trust
@@ -997,5 +1086,313 @@ mod tests {
         // non-empty -- the placeholder path only ever admits a peer whose
         // chain is genuinely empty, never "some device this chain granted".
         assert!(!policy.author_was_writer_at("device-a", a_fp, ChangeAuth::PLACEHOLDER));
+    }
+
+    #[test]
+    fn current_writers_reflects_grants_and_revokes() {
+        // grant a, grant b, revoke a -- device-a should not appear at the
+        // current (post-revoke) writer set, only device-b should.
+        let (_key, _a_hash, _b_hash, verified) = revoke_chain();
+        let writers = verified.current_writers();
+        assert_eq!(writers.len(), 1);
+        assert_eq!(writers[0].device_id, "device-b");
+        assert_eq!(writers[0].signing_key_fingerprint, [7u8; HASH_LEN]);
+    }
+
+    #[test]
+    fn writers_at_reconstructs_a_historical_seq() {
+        // At seq 2 (after both grants, before the seq-3 revoke), both
+        // device-a and device-b must appear -- writers_at must reconstruct
+        // that historical set exactly, not just the final one.
+        let (_key, _a_hash, _b_hash, verified) = revoke_chain();
+        let mut writers = verified.writers_at(2).unwrap();
+        writers.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        assert_eq!(writers.len(), 2);
+        assert_eq!(writers[0].device_id, "device-a");
+        assert_eq!(writers[1].device_id, "device-b");
+
+        // At seq 1 (only the first grant), only device-a is a writer.
+        let writers_at_1 = verified.writers_at(1).unwrap();
+        assert_eq!(writers_at_1.len(), 1);
+        assert_eq!(writers_at_1[0].device_id, "device-a");
+    }
+
+    #[test]
+    fn writers_at_rejects_a_sequence_beyond_what_was_verified() {
+        // revoke_chain's verified state tops out at seq 3 -- asking for a
+        // seq beyond that must fail closed, not silently replay everything
+        // it does have and call that "the writer set at seq 10".
+        let (_key, _a_hash, _b_hash, verified) = revoke_chain();
+        assert_eq!(
+            verified.writers_at(10),
+            Err(WriterSnapshotError::FutureSequence { requested: 10, current: 3 })
+        );
+    }
+
+    #[test]
+    fn writers_at_zero_is_the_empty_pre_genesis_set() {
+        // Seq 0 is a real, valid answer (no grants applied yet), not an
+        // error -- distinct from asking beyond the verified chain.
+        let (_key, _a_hash, _b_hash, verified) = revoke_chain();
+        assert_eq!(verified.writers_at(0), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn writers_at_is_sorted_by_device_id_regardless_of_grant_order() {
+        // Grant order is z, then a -- the returned set must still be sorted
+        // by device_id, not by grant/insertion order, so two devices that
+        // replay the same chain always compute byte-identical `Vec`s.
+        let key = service_key();
+        let group_id = "group";
+        let z = grant_record(&key, group_id, 1, ZERO_HASH, "device-z", [1u8; HASH_LEN]);
+        let z_hash = hash_of(&z);
+        let a = grant_record(&key, group_id, 2, z_hash, "device-a", [2u8; HASH_LEN]);
+        let a_hash = hash_of(&a);
+        let log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 2,
+            current_epoch: 0,
+            policy_head: a_hash.to_vec(),
+            records: vec![z, a],
+        };
+        let policy = verify_group_policy_log(&key.verifying_key().to_bytes(), &log).unwrap();
+        let writers = policy.current_writers();
+        assert_eq!(
+            writers.iter().map(|w| w.device_id.as_str()).collect::<Vec<_>>(),
+            vec!["device-a", "device-z"]
+        );
+    }
+
+    #[test]
+    fn current_writers_is_empty_for_an_empty_chain() {
+        let policy = GroupPolicyState {
+            current_seq: 0,
+            current_epoch: 0,
+            policy_head: ZERO_HASH,
+            final_authority_key: ZERO_HASH,
+            authority_generation: 0,
+            records: BTreeMap::new(),
+        };
+        assert!(policy.current_writers().is_empty());
+    }
+
+    #[test]
+    fn writers_at_rejects_a_gap_in_the_verified_chain() {
+        // A hand-built state whose current_seq claims 3 but is missing the
+        // record at seq 2 -- something `verify_group_policy_log`'s own
+        // gap-free sequencing check should make impossible, but writers_at
+        // must not silently replay past the hole and call the result "the
+        // writer set at seq 2".
+        let key = service_key();
+        let group_id = "group";
+        let a = grant_record(&key, group_id, 1, ZERO_HASH, "device-a", [9u8; HASH_LEN]);
+        let a_hash = hash_of(&a);
+        let c = grant_record(&key, group_id, 3, a_hash, "device-c", [3u8; HASH_LEN]);
+        let log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 1,
+            current_epoch: 0,
+            policy_head: a_hash.to_vec(),
+            records: vec![a],
+        };
+        let base = verify_group_policy_log(&key.verifying_key().to_bytes(), &log).unwrap();
+        let mut records = base.records;
+        // Insert seq 3 directly, bypassing verify_group_policy_log's
+        // gap-free sequencing check, to construct the otherwise-impossible
+        // gapped state this test exists to guard against.
+        let VerifiedPolicyRecord {
+            seq,
+            prev_record_hash,
+            record_hash,
+            epoch,
+            signer_key_id,
+            action,
+            signature,
+        } = verify_record(&c, &base.final_authority_key, a_hash).unwrap();
+        records.insert(
+            seq,
+            VerifiedPolicyRecord {
+                seq,
+                prev_record_hash,
+                record_hash,
+                epoch,
+                signer_key_id,
+                action,
+                signature,
+            },
+        );
+        let gapped = GroupPolicyState {
+            current_seq: 3,
+            current_epoch: base.current_epoch,
+            policy_head: record_hash,
+            final_authority_key: base.final_authority_key,
+            authority_generation: base.authority_generation,
+            records,
+        };
+
+        assert_eq!(
+            gapped.writers_at(2),
+            Err(WriterSnapshotError::MissingSequence { requested: 2 })
+        );
+    }
+
+    /// End-to-end regression test for the 7D-10.8/7D-10.9 authorization gap:
+    /// `DaemonState::build` used to wire the real local-change-auth provider
+    /// only onto `sync_state`, leaving `replica_coordinator`'s own copy
+    /// `None` forever (silently falling back to `ChangeAuth::PLACEHOLDER`).
+    /// Since 7D-10.7 repointed `LocalChangeProcessor` to run through
+    /// `replica_coordinator`, not `sync_state`, every real local edit for a
+    /// policy-verified group was silently degraded to a PLACEHOLDER stamp --
+    /// which `GroupPolicyState::author_was_writer_at` (and so
+    /// `NetmapChangeAuthenticator::accepts_change_auth`) only accepts from a
+    /// group whose policy chain is EMPTY, so a real peer holding this
+    /// group's actual (non-empty) policy would reject the change outright.
+    ///
+    /// Proves the fix end-to-end: a real local edit through
+    /// `ReplicaCoordinator::upsert_file_emitting_change` -- production's own
+    /// method, the exact one `LocalChangeProcessor` calls -- for a group
+    /// whose verified policy grants this device write access lands a REAL,
+    /// policy-derived `ChangeAuth` stamp (not `PLACEHOLDER`) in the DAG, and
+    /// that a `NetmapChangeAuthenticator` built against the identical policy
+    /// state (standing in for a real peer) accepts it.
+    #[tokio::test]
+    async fn a_real_local_edit_through_replica_coordinator_gets_a_real_auth_stamp_a_policy_verified_peer_accepts(
+    ) {
+        use yadorilink_local_storage::FsBlockStore;
+        use yadorilink_peer_session::peer_session::ChangeAuthenticator;
+        use yadorilink_replica_domain::change::{Op, PutOrigin};
+        use yadorilink_replica_domain::file::{FileMeta, FileRecord, FileVersion, RecordKind};
+        use yadorilink_replica_domain::ids::SyncPath;
+        use crate::replica_coordinator::ReplicaCoordinator;
+        use yadorilink_replica_domain::session_state::ChangeContent;
+        use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
+
+        let group_id = "policy-verified-group";
+        let authority = service_key();
+
+        let device_a_signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let device_a_fingerprint: [u8; HASH_LEN] =
+            Sha256::digest(device_a_signing_key.verifying_key().to_bytes()).into();
+        let grant =
+            grant_record(&authority, group_id, 1, ZERO_HASH, "device-a", device_a_fingerprint);
+        let head = hash_of(&grant);
+        let log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 1,
+            current_epoch: 0,
+            policy_head: head.to_vec(),
+            records: vec![grant],
+        };
+        let policy = verify_group_policy_log(&authority.verifying_key().to_bytes(), &log)
+            .expect("hand-built single-grant policy log must verify");
+        assert_ne!(
+            policy.change_auth(),
+            ChangeAuth::PLACEHOLDER,
+            "sanity: a real one-record policy chain's change_auth must not equal the placeholder \
+             stamp"
+        );
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let sync_state = std::sync::Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let state = crate::daemon_state::DaemonState::new("device-a".into(), sync_state, store);
+        state.set_device_signing_key(device_a_signing_key.clone());
+        state.replace_group_policy_states(HashMap::from([(group_id.to_string(), policy.clone())]));
+
+        let emitter = ChangeEmitter::new("device-a", device_a_signing_key.clone());
+        let version = FileVersion::new(
+            vec![],
+            0,
+            FileMeta {
+                mtime_unix_nanos: 0,
+                exec_bit: false,
+                symlink_target: None,
+                record_kind: RecordKind::File,
+            },
+        );
+        let record = FileRecord {
+            path: "note.txt".into(),
+            size: 0,
+            mtime_unix_nanos: 0,
+            blocks: vec![],
+            deleted: false,
+        };
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+
+        // The real production entry point: `LocalChangeProcessor` (built from
+        // `replica_coordinator`, not `sync_state`, since 7D-10.7) calls
+        // exactly this method -- not a test-only substitute.
+        let hash = state
+            .replica_coordinator
+            .upsert_file_emitting_change(
+                group_id,
+                &record,
+                "device-a",
+                ChangeContent {
+                    ops: vec![Op::Put {
+                        path: SyncPath("note.txt".into()),
+                        version: version.version_hash,
+                        origin: PutOrigin::Direct,
+                    }],
+                    versions: &[version],
+                },
+                None,
+                &emitter,
+                &permit,
+            )
+            .expect(
+                "a local edit for a policy-verified group this device is a granted writer for \
+                 must succeed with a real authorization stamp, not withhold",
+            );
+
+        let change = state
+            .replica_coordinator
+            .sqlite()
+            .dag_get_change(&hash)
+            .unwrap()
+            .expect("the just-emitted change must be readable back from the DAG store");
+        let stamped_auth = ChangeAuth {
+            auth_seq: change.auth_seq,
+            auth_epoch: change.auth_epoch,
+            policy_head_hash: change.policy_head_hash,
+        };
+        assert_ne!(
+            stamped_auth,
+            ChangeAuth::PLACEHOLDER,
+            "the emitted change's authorization stamp must be the real, policy-derived one -- a \
+             PLACEHOLDER stamp here is exactly the 7D-10.8/7D-10.9 regression this test guards \
+             against"
+        );
+        assert_eq!(
+            stamped_auth,
+            policy.change_auth(),
+            "the emitted change's authorization stamp must match the verified group policy's \
+             own change_auth()"
+        );
+
+        // Close the loop: a real peer that already holds this group's actual
+        // (non-empty) policy chain -- reached here through
+        // `NetmapChangeAuthenticator`, the daemon's own inbound-admission
+        // gate -- must accept this change, not reject it as an
+        // unrecognized/placeholder-authenticated author the way it would if
+        // `replica_coordinator`'s provider were still unwired.
+        let peer_store_dir = tempfile::tempdir().unwrap();
+        let peer_store = std::sync::Arc::new(FsBlockStore::new(peer_store_dir.path()).unwrap());
+        let peer_sync_state = std::sync::Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let peer_state =
+            crate::daemon_state::DaemonState::new("device-b".into(), peer_sync_state, peer_store);
+        peer_state.replace_group_policy_states(HashMap::from([(group_id.to_string(), policy)]));
+        peer_state.set_peer_group_writer("device-a", group_id, true);
+        let authenticator = crate::change_auth::NetmapChangeAuthenticator::new(peer_state);
+        assert!(
+            authenticator.accepts_change_auth(
+                "device-a",
+                group_id,
+                device_a_fingerprint,
+                stamped_auth,
+            ),
+            "a peer holding this group's real, verified policy must accept the locally-emitted \
+             change's authorization stamp"
+        );
     }
 }

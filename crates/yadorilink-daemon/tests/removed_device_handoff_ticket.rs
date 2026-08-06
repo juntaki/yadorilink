@@ -9,6 +9,7 @@
 //! `HandoffTicketRequest`/`HandoffTicketGrant` wire exchange and the real
 //! `HandoffLeaseRequest`/`HandoffLeaseGrant` exchange it reuses underneath
 //! (Stage B, unchanged), not an injected confirmer.
+#![cfg(unix)]
 
 mod support;
 
@@ -17,7 +18,7 @@ use std::time::Duration;
 
 use support::{
     connect_two_daemons, ensure_device_signing_key, ensure_isolated_config_dir,
-    open_file_backed_sync_state,
+    open_file_backed_replica_coordinator,
 };
 use tokio::net::UnixStream;
 use wiremock::matchers::{method, path};
@@ -30,8 +31,7 @@ use yadorilink_ipc_proto::daemonctl::{
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_sync_core::types::{BlockInfo, FileRecord};
-use yadorilink_sync_core::version_vector::VersionVector;
+use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 
 const GROUP: &str = "ticket-durability-group";
 
@@ -45,22 +45,19 @@ struct Daemon {
 fn new_daemon(device_id: &str) -> Daemon {
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-    let (sync_state, index_dir) = open_file_backed_sync_state();
+    let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
     let root = tempfile::tempdir().unwrap();
-    state.sync_state.add_link(&root.path().to_string_lossy(), GROUP).unwrap();
+    state.replica_coordinator.link_repository().add_link(&root.path().to_string_lossy(), GROUP).unwrap();
     Daemon { state, _store_dir: store_dir, _index_dir: index_dir, root }
 }
 
-fn record_referencing(path: &str, author: &str, hash_bytes: Vec<u8>, size: u64) -> FileRecord {
-    let mut version = VersionVector::new();
-    version.increment(author);
+fn record_referencing(path: &str, _author: &str, hash_bytes: Vec<u8>, size: u64) -> FileRecord {
     FileRecord {
         path: path.to_string(),
         size,
         mtime_unix_nanos: 0,
-        version,
         blocks: vec![BlockInfo { hash: hash_bytes, offset: 0, size: size as u32 }],
         deleted: false,
     }
@@ -100,8 +97,17 @@ async fn send_over_socket(
 fn give_file(daemon: &Daemon, file_name: &str, content: &[u8], author: &str) {
     let hash = daemon.state.block_store.put(content).unwrap();
     let bytes = hex::decode(hash.as_str()).unwrap();
+    // Mirrors what `LocalChangeProcessor` does for a real local edit
+    // (`record_group_block_provenance`'s doc comment): without this, the
+    // real peer-to-peer durability confirmation this file exercises
+    // refuses the block as never having been obtained through the group.
+    daemon
+        .state
+        .replica_coordinator
+        .change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&bytes))
+        .unwrap();
     let record = record_referencing(file_name, author, bytes, content.len() as u64);
-    daemon.state.sync_state.upsert_file(GROUP, &record).unwrap();
+    daemon.state.replica_coordinator.file_index_repository().upsert_file(GROUP, &record, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
 }
 
 // --- happy path: B online, produces a real ticket ------------------------
@@ -151,8 +157,13 @@ async fn ticket_granted_when_b_is_online_and_can_pin_its_own_roots_at_a_confirme
     let serve_path = socket_path.clone();
     let serve_state = x.state.clone();
     tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(&serve_path, serve_state)
-            .await;
+        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
+            &serve_path,
+            std::sync::Arc::new(yadorilink_daemon::control_context::ControlContext::from_state(
+                serve_state,
+            )),
+        )
+        .await;
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
 

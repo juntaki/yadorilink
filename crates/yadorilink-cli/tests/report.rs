@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_sync_core::index::SyncState;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 
 /// Tests in this file share two process-global env vars
 /// (`YADORILINK_CONFIG_DIR`, `YADORILINK_CONTROL_SOCKET`) and so must not
@@ -22,16 +22,21 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
     let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
-    let sync_state = Arc::new(SyncState::open(dir.path().join("sync.sqlite3")).unwrap());
+    let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
 
     let socket_path = dir.path().join("daemon.sock");
     std::env::set_var("YADORILINK_CONTROL_SOCKET", &socket_path);
 
     let serve_path = socket_path.clone();
-    let serve_state = state.clone();
+    let serve_context = std::sync::Arc::new(
+        yadorilink_daemon::control_context::ControlContext::from_state(state.clone()),
+    );
     tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(&serve_path, serve_state)
+        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
+            &serve_path,
+            serve_context,
+        )
             .await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;

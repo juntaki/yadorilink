@@ -64,11 +64,12 @@ use std::time::Duration;
 use sha2::Digest;
 use support::fake_coordination::FakeCoordination;
 use support::{
-    open_file_backed_sync_state, real_entry_names, register_with_fake, wait_until,
+    open_file_backed_replica_coordinator, real_entry_names, register_with_fake, wait_until,
     wait_until_with_context,
 };
+use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_daemon::{link_manager, peer_orchestrator};
+use yadorilink_daemon::peer_orchestrator;
 use yadorilink_local_storage::FsBlockStore;
 use yadorilink_transport::DeviceKeyPair;
 
@@ -79,7 +80,7 @@ struct TestDevice {
     _store_dir: tempfile::TempDir,
     // Uses file-backed WAL (production's concurrency model) instead of
     // open_in_memory's shared-cache backend — see
-    // open_file_backed_sync_state's doc comment. Held only to keep the
+    // open_file_backed_replica_coordinator's doc comment. Held only to keep the
     // backing temp file alive for the test's duration.
     _index_dir: tempfile::TempDir,
 }
@@ -111,7 +112,7 @@ async fn setup_device(fake: &FakeCoordination, device_id: &str, groups: &[&str])
     let keypair = Arc::new(DeviceKeyPair::generate());
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-    let (sync_state, index_dir) = open_file_backed_sync_state();
+    let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
     let state = DaemonState::new(device_id.to_string(), sync_state, store);
     let root = tempfile::tempdir().unwrap();
@@ -120,8 +121,9 @@ async fn setup_device(fake: &FakeCoordination, device_id: &str, groups: &[&str])
 
     let local_path = root.path().to_string_lossy().to_string();
     for group_id in groups {
-        state.sync_state.add_link(&local_path, group_id).unwrap();
-        link_manager::start_link_watch(state.clone(), local_path.clone(), group_id.to_string())
+        state.replica_coordinator.link_repository().add_link(&local_path, group_id).unwrap();
+        LinkRuntimeController::new(state.clone())
+            .start(local_path.clone(), group_id.to_string())
             .unwrap();
     }
 
@@ -146,10 +148,10 @@ async fn wait_for_mesh(devices: &[&TestDevice]) {
     wait_until(
         || {
             devices.iter().all(|d| {
-                let sessions = d.state.sessions.lock().unwrap();
                 devices.iter().filter(|o| o.device_id != d.device_id).all(|o| {
-                    sessions
-                        .get(&o.device_id)
+                    d.state
+                        .peers
+                        .session(&o.device_id)
                         .is_some_and(|session| session.change_dag_negotiated())
                 })
             })
@@ -199,9 +201,11 @@ fn recursive_snapshot(root: &Path) -> HashMap<String, String> {
         let Ok(entries) = std::fs::read_dir(current) else { return };
         for entry in entries.filter_map(|e| e.ok()) {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name == yadorilink_sync_core::root_identity::ROOT_MARKER_FILE_NAME
+            if name == yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME
                 || name.contains(".yadorilink-tmp.")
-                || name.starts_with(".yl-case-probe-")
+                || yadorilink_root_authority::reserved_namespace::is_reserved_component(
+                    entry.file_name().as_os_str(),
+                )
             {
                 continue;
             }
@@ -227,7 +231,7 @@ fn is_conflict_copy(name: &str) -> bool {
 }
 
 fn pause(device: &TestDevice) {
-    device.state.sync_state.set_paused(device.root.path().to_str().unwrap(), true).unwrap();
+    device.state.replica_coordinator.link_repository().set_paused(device.root.path().to_str().unwrap(), true).unwrap();
 }
 
 /// Resumes every device in `devices` -- per `partition_reconnect_matrix.
@@ -249,9 +253,12 @@ fn pause(device: &TestDevice) {
 /// simultaneously_resume_races_converges`, which already resumes its two
 /// devices via `tokio::join!` for the identical reason.
 async fn resume_all(devices: &[TestDevice]) {
-    let resumes = devices.iter().map(|device| {
-        link_manager::resume_link(&device.state, device.root.path().to_str().unwrap())
-    });
+    let controllers: Vec<_> =
+        devices.iter().map(|device| LinkRuntimeController::new(device.state.clone())).collect();
+    let resumes = devices
+        .iter()
+        .zip(controllers.iter())
+        .map(|(device, controller)| controller.resume(device.root.path().to_str().unwrap()));
     for result in futures_util::future::join_all(resumes).await {
         result.unwrap();
     }
@@ -499,7 +506,7 @@ async fn run_taguchi_v3_row(
     let devices = n_synced_devices(&fake, device_count, group_id, row_name).await;
 
     if path_level == 4
-        && !yadorilink_sync_core::hazard::is_case_insensitive_filesystem(devices[0].root.path())
+        && !yadorilink_peer_session::hazard::is_case_insensitive_filesystem(devices[0].root.path())
     {
         eprintln!(
             "{row_name}: skipping case-fold path level -- {} is case-sensitive here",

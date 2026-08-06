@@ -10,18 +10,21 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-use yadorilink_sync_core::change::{
-    self, Change, ChangeAuth, ChangeHash, DeviceId, FolderGroupId,
+use yadorilink_replica_domain::change;
+use yadorilink_replica_domain::change::{Change, ChangeAuth};
+use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId};
+use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
+use yadorilink_peer_session::peer_session::{
+    ChangeAuthenticator, PreparedRebootstrap, RebootstrapHandler,
 };
-use yadorilink_sync_core::dag_store::ChangeEmitter;
-use yadorilink_sync_core::index::SyncState;
-use yadorilink_sync_core::peer_session::{ChangeAuthenticator, PreparedRebootstrap, RebootstrapHandler};
-use yadorilink_sync_core::rebootstrap::{
+use yadorilink_peer_session::PeerSessionError;
+use yadorilink_replica_engine::error::ReplicaEngineError;
+use yadorilink_replica_engine::rebootstrap::{
     prepare_rebootstrap_required, verify_and_install_rebootstrap, AtomicRebootstrapInstaller,
     RebootstrapRequired, RebootstrapTrust,
 };
-use yadorilink_sync_core::rebootstrap_snapshot::RebootstrapSnapshot;
-use yadorilink_sync_core::SyncError;
+use yadorilink_replica_engine::rebootstrap_snapshot::RebootstrapSnapshot;
+use crate::sync_error::SyncError;
 
 use crate::daemon_state::{DaemonState, GroupPolicyResolution};
 
@@ -68,7 +71,10 @@ impl DaemonRebootstrapHandler {
     /// has no group context to check them itself, so this runs as a second,
     /// explicit gate after signature verification, before either
     /// `verify_rebootstrap` or `install_rebootstrap` accepts the message.
-    fn check_signer_authorized_for_group(&self, required: &RebootstrapRequired) -> Result<(), SyncError> {
+    fn check_signer_authorized_for_group(
+        &self,
+        required: &RebootstrapRequired,
+    ) -> Result<(), SyncError> {
         let group_id = required.manifest.group_id.as_str();
         let signer = required.manifest.signer_device_id.as_str();
         if signer == self.state.device_id {
@@ -137,14 +143,19 @@ impl DaemonRebootstrapHandler {
                 auth_epoch: frontier_change.auth_epoch,
                 policy_head_hash: frontier_change.policy_head_hash,
             };
-            change::verify_change(&frontier_change, &hash, &verifying_key, |device_id, group_id| {
-                authenticator.accepts_change_auth(
-                    device_id.as_str(),
-                    group_id.as_str(),
-                    signing_key_fingerprint,
-                    auth,
-                )
-            })
+            change::verify_change(
+                &frontier_change,
+                &hash,
+                &verifying_key,
+                |device_id, group_id| {
+                    authenticator.accepts_change_auth(
+                        device_id.as_str(),
+                        group_id.as_str(),
+                        signing_key_fingerprint,
+                        auth,
+                    )
+                },
+            )
             .map_err(|error| {
                 SyncError::CorruptState(format!(
                     "re-bootstrap frontier change {} by {} failed signature/authorization \
@@ -159,7 +170,7 @@ impl DaemonRebootstrapHandler {
 }
 
 struct SyncStateRebootstrapInstaller {
-    state: Arc<SyncState>,
+    state: Arc<crate::replica_coordinator::ReplicaCoordinator>,
     /// This device's own signing identity, used only if the incoming
     /// snapshot needs to squash and re-emit an offline-diverged local
     /// branch (see `SyncState::install_rebootstrap_snapshot`'s doc
@@ -172,10 +183,18 @@ struct SyncStateRebootstrapInstaller {
 impl AtomicRebootstrapInstaller for SyncStateRebootstrapInstaller {
     fn install_snapshot_and_switch_history_base(
         &self,
-        manifest: &yadorilink_sync_core::rebootstrap::SnapshotManifest,
+        manifest: &yadorilink_replica_engine::rebootstrap::SnapshotManifest,
         snapshot_bytes: &[u8],
-    ) -> Result<(), SyncError> {
-        self.state.install_rebootstrap_snapshot(manifest, snapshot_bytes, self.local_emitter.as_ref())
+    ) -> Result<(), ReplicaEngineError> {
+        // `SyncState::install_rebootstrap_snapshot` stays `SyncError`-returning
+        // (it is sync-core's own SQLite-backed installer, not part of the
+        // 7D-9D move) -- this trait's own error type is `ReplicaEngineError`
+        // since `AtomicRebootstrapInstaller` moved to yadorilink-replica-engine,
+        // so the boundary conversion happens here, same as every other
+        // `SyncState`-backed replica-engine port adapter.
+        self.state
+            .install_rebootstrap_snapshot(manifest, snapshot_bytes, self.local_emitter.as_ref())
+            .map_err(|e| ReplicaEngineError::Storage(e.to_string()))
     }
 }
 
@@ -184,13 +203,13 @@ impl RebootstrapHandler for DaemonRebootstrapHandler {
         &self,
         group_id: &str,
         requested_hash: ChangeHash,
-    ) -> Result<Option<PreparedRebootstrap>, SyncError> {
+    ) -> Result<Option<PreparedRebootstrap>, PeerSessionError> {
         let Some(signing_key) = self.state.device_signing_key() else {
             return Ok(None);
         };
         let group = FolderGroupId::from(group_id);
         let required = prepare_rebootstrap_required(
-            self.state.sync_state.as_ref(),
+            self.state.replica_coordinator.as_ref(),
             &group,
             &requested_hash,
             DeviceId::from(self.state.device_id.as_str()),
@@ -202,8 +221,10 @@ impl RebootstrapHandler for DaemonRebootstrapHandler {
         let checkpoint_hash = required.manifest.checkpoint.checkpoint_hash();
         let snapshot_bytes = self
             .state
-            .sync_state
-            .checkpoint_snapshot(&checkpoint_hash)?
+            .replica_coordinator
+            .rebootstrap_store_repository()
+            .checkpoint_snapshot(&checkpoint_hash)
+            .map_err(SyncError::from)?
             .ok_or_else(|| {
                 SyncError::CorruptState(format!(
                     "checkpoint {} can prove a prune but its re-bootstrap snapshot bytes are missing",
@@ -215,7 +236,7 @@ impl RebootstrapHandler for DaemonRebootstrapHandler {
         Ok(Some(PreparedRebootstrap { required, snapshot_bytes }))
     }
 
-    fn verify_rebootstrap(&self, required: &RebootstrapRequired) -> Result<(), SyncError> {
+    fn verify_rebootstrap(&self, required: &RebootstrapRequired) -> Result<(), PeerSessionError> {
         struct Trust<'a>(&'a DaemonRebootstrapHandler);
         impl RebootstrapTrust for Trust<'_> {
             fn signing_key(&self, device_id: &str) -> Option<[u8; 32]> {
@@ -223,14 +244,14 @@ impl RebootstrapHandler for DaemonRebootstrapHandler {
             }
         }
         required.verify(&Trust(self))?;
-        self.check_signer_authorized_for_group(required)
+        Ok(self.check_signer_authorized_for_group(required)?)
     }
 
     fn install_rebootstrap(
         &self,
         required: &RebootstrapRequired,
         snapshot_bytes: &[u8],
-    ) -> Result<(), SyncError> {
+    ) -> Result<(), PeerSessionError> {
         self.check_signer_authorized_for_group(required)?;
         struct Trust<'a>(&'a DaemonRebootstrapHandler);
         impl RebootstrapTrust for Trust<'_> {
@@ -243,8 +264,8 @@ impl RebootstrapHandler for DaemonRebootstrapHandler {
             .device_signing_key()
             .map(|key| ChangeEmitter::new(self.state.device_id.clone(), key));
         let installer =
-            SyncStateRebootstrapInstaller { state: self.state.sync_state.clone(), local_emitter };
-        verify_and_install_rebootstrap(
+            SyncStateRebootstrapInstaller { state: self.state.replica_coordinator.clone(), local_emitter };
+        Ok(verify_and_install_rebootstrap(
             &installer,
             required,
             &Trust(self),
@@ -252,9 +273,16 @@ impl RebootstrapHandler for DaemonRebootstrapHandler {
             |manifest, bytes| {
                 let snapshot = RebootstrapSnapshot::decode(bytes)?;
                 snapshot.validate_against_checkpoint(&manifest.checkpoint)?;
+                // `verify_each_frontier_change` stays `SyncError`-returning
+                // (daemon-local signature/authorization verification, not
+                // part of the 7D-9D move) -- the closure's own error type is
+                // fixed to `ReplicaEngineError` by `verify_and_install_
+                // rebootstrap`'s signature, so this boundary needs an
+                // explicit conversion rather than a bare `?`.
                 self.verify_each_frontier_change(&snapshot)
+                    .map_err(|e| ReplicaEngineError::CorruptState(e.to_string()))
             },
-        )
+        )?)
     }
 }
 
@@ -262,30 +290,30 @@ impl RebootstrapHandler for DaemonRebootstrapHandler {
 mod tests {
     use ed25519_dalek::SigningKey;
     use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_sync_core::compaction::Checkpoint;
-    use yadorilink_sync_core::rebootstrap::SnapshotManifest;
+    use yadorilink_replica_engine::compaction::Checkpoint;
+    use yadorilink_replica_engine::rebootstrap::SnapshotManifest;
+    use crate::replica_coordinator::ReplicaCoordinator;
 
     use super::*;
 
     fn test_state() -> Arc<DaemonState> {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-        let sync_state = Arc::new(SyncState::open_in_memory().unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         DaemonState::new("device-a".into(), sync_state, store)
     }
 
     fn required_signed_by(group_id: &str, signer: &str, key: &SigningKey) -> RebootstrapRequired {
         let frontier = ChangeHash([9u8; 32]);
         let checkpoint = Checkpoint::new(FolderGroupId(group_id.into()), vec![frontier], [1u8; 32]);
-        let manifest =
-            SnapshotManifest::new_signed(
-                checkpoint,
-                vec![frontier],
-                None,
-                DeviceId(signer.into()),
-                key,
-            )
-            .unwrap();
+        let manifest = SnapshotManifest::new_signed(
+            checkpoint,
+            vec![frontier],
+            None,
+            DeviceId(signer.into()),
+            key,
+        )
+        .unwrap();
         RebootstrapRequired::new_signed(ChangeHash([2u8; 32]), manifest, key)
     }
 
@@ -356,8 +384,9 @@ mod tests {
     /// even though nothing here claims the outer manifest itself is invalid.
     #[tokio::test]
     async fn verify_each_frontier_change_rejects_a_change_with_no_pinned_author_key() {
-        use yadorilink_sync_core::change::{Op, SyncPath};
-        use yadorilink_sync_core::rebootstrap_snapshot::RebootstrapSnapshot;
+        use yadorilink_replica_domain::change::Op;
+        use yadorilink_replica_domain::ids::SyncPath;
+        use yadorilink_replica_engine::rebootstrap_snapshot::RebootstrapSnapshot;
 
         let state = test_state();
         let handler = DaemonRebootstrapHandler { state };

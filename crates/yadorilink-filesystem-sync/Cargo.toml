@@ -1,0 +1,132 @@
+[package]
+name = "yadorilink-filesystem-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Exposes FakeCommitAdapter (normally `#[cfg(test)]`-only) and
+# `placeholder_backend::OverrideForTest` to OTHER crates' test builds --
+# `yadorilink-sync-core`'s own `optimistic_placement.rs` test module and
+# `yadorilink-daemon`/`yadorilink-cli`'s own tests link this crate as an
+# ordinary external dependency, so `cfg(test)` alone is not active for it
+# there. Same shape as every other test-support feature in this workspace
+# (e.g. yadorilink-sync-core's own).
+#
+# Deliberately does NOT forward to `yadorilink-replica-engine/test-support`
+# -- see `evict-custody-test-bypass` below. Bundling that forward into this
+# feature used to mean every consumer of `test-support` (including
+# `yadorilink-daemon`/`yadorilink-cli`, which need it only for the doubles
+# above) silently got the confirmed-custody deletion bypass too, defeating
+# their own tests' fails-closed-without-a-durable-lease assertions.
+test-support = []
+
+# Forwards to `yadorilink-replica-engine`'s own identically-named feature:
+# `materialization_eviction::evict_file`'s
+# `cfg(any(test, feature = "evict-custody-test-bypass"))` branch calls that
+# crate's `verify_reclaim_custody_for_test`, which is itself gated
+# `cfg(any(test, feature = "test-support"))` on that crate -- without this
+# forward, a consumer that enables only this feature would unify it into
+# `true` for the whole build graph while leaving
+# `yadorilink-replica-engine`'s own feature off, so the function this branch
+# calls would not exist in that build.
+#
+# Deliberately separate from `test-support`: only a caller whose own tests
+# construct a confirming custody double and expect the eviction sweep to
+# actually reach physical block deletion (`yadorilink-sync-core`'s
+# `evict_reclaims_cached_blocks_once_custody_is_confirmed`) should enable
+# this. A caller whose tests assert the opposite -- that an instantaneous
+# confirmation without a durable remote lease must NOT authorize deletion
+# (`yadorilink-daemon`'s `preflight_disk_pressure_runs_eviction_sweep_for_on_demand_link_first`/
+# `eviction_without_remote_lease_never_reaches_physical_reclaim`) -- must
+# NOT enable it, or its tests silently stop exercising the real,
+# fails-closed `verify_reclaim_custody` path.
+evict-custody-test-bypass = ["yadorilink-replica-engine/test-support"]
+
+[dependencies]
+yadorilink-root-authority = { path = "../yadorilink-root-authority" }
+# `BlockReclamationStore`/`ContentHash`/`GcReport`/`StorageError` for
+# `block_deletion::sweep_globally_unreferenced_blocks` (7D-9C) — a pure leaf
+# dependency, same as `yadorilink-root-authority`'s own (this crate does not
+# depend back on `yadorilink-filesystem-sync`, so no cycle risk).
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+# `materialization_types.rs`'s value types (`FileRecord`/`ChangeHash`/
+# `LocalFileMetaColumns`) and `materialization_execution.rs`'s
+# `MaterializationExecutionPort` surface (7D-9C) -- already a transitive
+# dependency via `yadorilink-local-storage`/`yadorilink-root-authority`, made
+# direct now that this crate's own code names these types.
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+# `MaterializationExecutionPort::reclaim_cached_blocks`'s `VerifiedCustody`
+# parameter (7D-9C) -- a pure leaf crate over `yadorilink-replica-domain`
+# only, so depending on it here carries no cycle risk (mirrors this crate's
+# existing `yadorilink-local-storage` dependency's own reasoning).
+yadorilink-replica-engine = { path = "../yadorilink-replica-engine" }
+# `materialization_eviction::disk_identity`'s `disk_race_fingerprint` reuse
+# (7D-9C) -- same cross-reach `yadorilink-sync-core` already made before this
+# move; `yadorilink-peer-session` depends on none of this crate's own
+# dependents, so no cycle risk.
+yadorilink-peer-session = { path = "../yadorilink-peer-session" }
+thiserror.workspace = true
+tracing.workspace = true
+# `quarantine_dirty_disk_file`'s cheap on-disk `(size, mtime)` disambiguator
+# (7D-9C, `materialization_repair.rs`) -- same version pin as every other
+# workspace crate's `sha2` dependency.
+sha2.workspace = true
+# `repair_interrupted_materializations_inner`'s block-hash hex encoding
+# (7D-9C, `materialization_repair.rs`) -- same version pin as
+# `yadorilink-local-storage`'s/`yadorilink-sync-core`'s own `hex` dependency.
+hex = "0.4"
+# `watcher.rs`'s real OS filesystem watch (7D-9C) -- same version pin as
+# `yadorilink-sync-core` carried before this move.
+notify = "8"
+# `watcher.rs`'s new-directory-registration reconciliation walk (7D-9C) --
+# same version pin as `yadorilink-sync-core` carried before this move.
+walkdir = "2"
+# `single_pass_capture.rs`'s content-defined-chunking branch (7D-9C) --
+# same version pin as `yadorilink-sync-core` carried before this move.
+fastcdc = "4.0.1"
+
+[dev-dependencies]
+tempfile = "3"
+# `single_pass_capture.rs`'s own test module's deterministic pseudo-random
+# content generation (7D-9C) -- same version pin as `yadorilink-sync-core`
+# carried before this move.
+rand = "0.10.2"
+# `materialization_eviction::evict_file`'s `#[cfg(test)]` branch calls
+# `verify_reclaim_custody_for_test` -- same override this workspace's other
+# consumers of it (yadorilink-sync-core) already carry, for the same reason.
+yadorilink-replica-engine = { path = "../yadorilink-replica-engine", features = ["test-support"] }
+# `debounce.rs`'s own moved `#[cfg(test)]` module (7D-9E) needs this for its
+# fallback-trigger log-content assertions -- same dependency sync-core's
+# tests carried before this move.
+tracing-subscriber.workspace = true
+# `tests/dst_materialization_crash_recovery.rs` (moved from
+# `yadorilink-sync-core` in Phase 7D-10.4, repointed off `SyncState` in
+# Phase 7D-10's final sync-core deletion pass) constructs a real
+# `yadorilink_daemon::replica_coordinator::ReplicaCoordinator` as its
+# fixture and calls `materialization::repair_interrupted_materializations`
+# through it -- a dev-only back-edge against this crate's own normal
+# (non-dev) dependency direction (`yadorilink-daemon` depends on
+# `yadorilink-filesystem-sync`, not the reverse), same shape as
+# `yadorilink-local-capture`'s existing back-edge and
+# `yadorilink-root-authority`'s identical one added earlier in this same
+# migration pass.
+yadorilink-daemon = { path = "../yadorilink-daemon", features = ["test-support"] }
+
+# `renameat2`/`renamex_np` and friends for `fs_commit.rs`'s real-syscall
+# commit adapter -- same version pin as `yadorilink-root-authority`'s and
+# (formerly) `yadorilink-sync-core`'s existing `libc` dependency.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# `MaterializationExecutionPort::path_lock`'s `Arc<tokio::sync::Mutex<()>>`
+# return type (7D-9C) -- same conditional madsim-shim swap as
+# `yadorilink-sync-core`'s own identical dependency block, for the same
+# reason (a deterministic-simulation test binary built with
+# `RUSTFLAGS="--cfg madsim"` needs the shim; a normal build/test run never
+# sets that flag).
+[target.'cfg(not(madsim))'.dependencies]
+tokio.workspace = true
+
+[target.'cfg(madsim)'.dependencies]
+tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }

@@ -1,0 +1,115 @@
+[package]
+name = "yadorilink-local-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# See yadorilink-local-storage/Cargo.toml's identical section for why.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
+
+[features]
+# Exposes test-only helpers to OTHER crates' test builds. Propagates to
+# yadorilink-root-authority's (`RootLease::for_tests`/
+# `RootCommitPermit::for_tests`, and -- since Phase 7D-9B moved
+# `root_identity.rs` there -- `write_root_marker_for_test`). Phase 7D-10
+# (sync-core deletion) dropped the `yadorilink-sync-core/test-support`
+# forward: this crate's own `#[cfg(test)]` tests build their `ReplicaCoordinator`
+# fixture via the `yadorilink-daemon` dev-dependency below instead of
+# `SyncState`, and `force_second_live_link_for_test` is reached through that
+# fixture's own `link_repository()` accessor, not sync-core.
+test-support = [
+    "yadorilink-root-authority/test-support",
+]
+
+[dependencies]
+# `dag_import` (`IMPORT_BATCH_OP_LIMIT` specifically) physically relocated
+# out of sync-core in Phase 7D-10.5 -- the constant now lives at
+# `yadorilink_replica_domain::change::IMPORT_BATCH_OP_LIMIT` (this crate's
+# own production `RECONCILE_CHUNK_OP_LIMIT` needed it and sits below
+# `yadorilink-daemon`, which now owns the rest of `dag_import`, in the
+# dependency graph), and this crate's own `#[cfg(test)]` suite reaches
+# `dag_import::ensure_initial_import` itself through the dev-only back-edge
+# below.
+# `debounce::DebounceFlush`/`watcher::{FsChangeEvent,FsChangeKind}` moved
+# to a direct `yadorilink-filesystem-sync` dependency (Phase 7D-10, the
+# sync-core-elimination tier-1 pass): both were already just a re-export
+# shim over `yadorilink_filesystem_sync::{debounce,watcher}` (7D-9E), and
+# `DebounceFlush` is a real production dependency of this crate's own
+# `local_change::process_flush` -- this crate sits below `yadorilink-daemon`
+# in the dependency graph, so daemon was never a reachable destination for
+# it. See `yadorilink_filesystem_sync::debounce`'s own doc comment.
+#
+# `yadorilink-sync-core` itself is no longer a dependency of this crate at
+# all (Phase 7D-10's final deletion pass): `LocalMutationStore`'s only
+# implementor is now `yadorilink-daemon`'s `ReplicaCoordinator`
+# (`impl LocalMutationStore for SyncState` here was test-only, zero
+# production callers, and deleted outright once `ReplicaCoordinator`'s own
+# equivalent impl existed), and this crate's own `#[cfg(test)]`/`tests/`
+# fixtures build a `ReplicaCoordinator` via the `yadorilink-daemon`
+# dev-dependency below instead.
+yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync" }
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+yadorilink-root-authority = { path = "../yadorilink-root-authority" }
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+yadorilink-sync-sqlite = { path = "../yadorilink-sync-sqlite" }
+thiserror.workspace = true
+tracing.workspace = true
+walkdir = "2"
+
+[target.'cfg(not(madsim))'.dependencies]
+tokio.workspace = true
+
+[target.'cfg(madsim)'.dependencies]
+tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3"
+# Signs test fixture changes (`ensure_initial_import`'s `ChangeEmitter`
+# construction in this crate's own tests).
+ed25519-dalek = "2"
+rand = "0.10.2"
+# `materialization_local_capture.rs` (moved here from
+# `yadorilink-sync-core/tests/` in Phase 7D-10.4) decodes a block hash from
+# `FsBlockStore::put`'s hex-string output.
+hex = "0.4"
+# This crate's own `#[cfg(test)]` tests need
+# `root_identity::write_root_marker_for_test`
+# (`#[cfg(any(test, feature = "test-support"))]` in yadorilink-root-authority),
+# but `cfg(test)` is crate-local -- building this crate's own tests does not
+# turn on that cfg inside the yadorilink-root-authority artifact this crate
+# links against. This self-referencing dev-dependency turns the feature on
+# instead. Mirrors yadorilink-peer-session's own identical dev-dependency
+# override for the same reason.
+yadorilink-local-capture = { path = ".", features = ["test-support"] }
+# Dev-only back-edge (Phase 7D-10.5, repointed off `SyncState` in Phase
+# 7D-10's final deletion pass): this crate's own `#[cfg(test)]`/`tests/`
+# suites build a real `yadorilink-daemon::replica_coordinator::
+# ReplicaCoordinator` fixture (`ReplicaCoordinator::open_in_memory`,
+# `force_second_live_link_for_test` via its `link_repository()` accessor)
+# and simulate the daemon's restart-reconcile sequence
+# (`offline_edit_after_existing_dag_history_must_append_new_head_on_restart`
+# and its siblings) against it, re-running the idempotent initial import
+# exactly as `yadorilink-daemon`'s own restart path does, via
+# `yadorilink_daemon::dag_import::ensure_initial_import`. This is a dev-only
+# back-edge against this crate's own normal (non-dev) dependency direction
+# (`yadorilink-daemon` depends on `yadorilink-local-capture`, not the
+# reverse) -- cargo permits this: building this crate's *library* never
+# needs `yadorilink-daemon`'s lib, only compiling this crate's *test*
+# binaries does. Same dev-only back-edge shape as `yadorilink-peer-session`'s
+# existing identical back-edge onto `yadorilink-daemon`. `test-support` IS
+# needed here (unlike the pre-deletion `SyncState` fixture): `ReplicaCoordinator::
+# open_in_memory` and friends are `#[cfg(any(test, feature = "test-support"))]`
+# in `yadorilink-daemon`, and `cfg(test)` is crate-local the same way it is
+# for `yadorilink-root-authority` above.
+yadorilink-daemon = { path = "../yadorilink-daemon", features = ["test-support"] }
+# `test_support::TestReplica` (this crate's own `#[cfg(test)]`-only
+# `LocalMutationStore` fixture wrapper, see that module's own doc comment)
+# names `yadorilink_sqlite_runtime::DatabaseError` in
+# `ReplicaCoordinator::open_in_memory`/`open`'s own `Result` type directly.
+yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
+
+# The simulator itself, used by this crate's own madsim-gated unit tests (if
+# any) -- mirrors yadorilink-sync-core's identical dev-dependency.
+[target.'cfg(madsim)'.dev-dependencies]
+madsim = "0.2"

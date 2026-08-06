@@ -12,13 +12,54 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use yadorilink_sync_core::authenticated_history::{
+use yadorilink_replica_engine::authenticated_history::{
     validate_retained_group, AuthenticatedHistoryError, AuthenticatedHistoryReport,
+    AuthenticatedHistoryTrust,
 };
-use yadorilink_sync_core::change::ChangeAuth;
-use yadorilink_sync_core::peer_session::ChangeAuthenticator;
+use yadorilink_replica_domain::change::ChangeAuth;
+use yadorilink_peer_session::peer_session::ChangeAuthenticator;
 
 use crate::daemon_state::{DaemonState, GroupPolicyResolution};
+
+/// Adapts any `ChangeAuthenticator` into `AuthenticatedHistoryTrust` --
+/// reuses the live peer-admission trust resolver verbatim, so startup/
+/// reconnect validation and live admission never grow subtly different
+/// authorization rules. A newtype, not a blanket `impl<T: ChangeAuthenticator>
+/// AuthenticatedHistoryTrust for T`: that blanket form would need to live in
+/// `yadorilink-replica-engine` (the trait's home crate, per the orphan rule),
+/// which would in turn need to name `ChangeAuthenticator`, a type
+/// `yadorilink-replica-engine` must never depend on.
+///
+/// Relocated here (Phase 7D-10) from `yadorilink-sync-core`'s
+/// `authenticated_history_bridge` module -- this type has no coupling to
+/// `SyncState`/`SyncError` at all (it wraps a bare `&T: ChangeAuthenticator`),
+/// and `NetmapChangeAuthenticator::validate_retained_group` below was its
+/// only real caller workspace-wide.
+struct ChangeAuthenticatorTrust<'a, T: ?Sized> {
+    inner: &'a T,
+}
+
+impl<'a, T: ChangeAuthenticator + ?Sized> ChangeAuthenticatorTrust<'a, T> {
+    fn new(inner: &'a T) -> Self {
+        Self { inner }
+    }
+}
+
+impl<T: ChangeAuthenticator + ?Sized> AuthenticatedHistoryTrust for ChangeAuthenticatorTrust<'_, T> {
+    fn signing_key(&self, device_id: &str) -> Option<[u8; 32]> {
+        self.inner.signing_key(device_id)
+    }
+
+    fn accepts_change_auth(
+        &self,
+        device_id: &str,
+        group_id: &str,
+        signing_key_fingerprint: [u8; 32],
+        auth: ChangeAuth,
+    ) -> bool {
+        self.inner.accepts_change_auth(device_id, group_id, signing_key_fingerprint, auth)
+    }
+}
 
 pub struct NetmapChangeAuthenticator {
     state: Arc<DaemonState>,
@@ -118,7 +159,11 @@ impl NetmapChangeAuthenticator {
         &self,
         group_id: &str,
     ) -> Result<AuthenticatedHistoryReport, AuthenticatedHistoryError> {
-        validate_retained_group(self.state.sync_state.as_ref(), group_id, self)
+        validate_retained_group(
+            self.state.replica_coordinator.as_ref(),
+            group_id,
+            &ChangeAuthenticatorTrust::new(self),
+        )
     }
 
     /// Withdraws one group's live authorization from every already-published
@@ -127,15 +172,7 @@ impl NetmapChangeAuthenticator {
     /// live authorization switch quarantines both inbound and outbound data
     /// flow without inventing a second session-state mechanism.
     fn quarantine_group_sessions(&self, group_id: &str) {
-        let sessions: Vec<_> = self
-            .state
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .cloned()
-            .collect();
-        for session in sessions {
+        for (_, session) in self.state.peers.all_sessions() {
             session.revoke_group(group_id);
         }
     }
@@ -148,15 +185,7 @@ impl NetmapChangeAuthenticator {
     fn restore_group_sessions_if_currently_authorized(&self, group_id: &str) {
         let policy_servable =
             !matches!(self.state.resolve_group_policy(group_id), GroupPolicyResolution::Withhold);
-        let sessions: Vec<_> = self
-            .state
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .map(|(peer_id, session)| (peer_id.clone(), session.clone()))
-            .collect();
-        for (peer_id, session) in sessions {
+        for (peer_id, session) in self.state.peers.all_sessions() {
             if policy_servable && self.state.peer_is_writer(&peer_id, group_id) {
                 session.grant_group(group_id);
             } else {
@@ -178,7 +207,7 @@ impl NetmapChangeAuthenticator {
     /// daemon session map before this gate runs, otherwise only pre-existing
     /// sessions can be quarantined by this pass.
     pub(crate) fn validate_linked_history_best_effort(&self) {
-        let links = match self.state.sync_state.list_links() {
+        let links = match self.state.replica_coordinator.link_repository().list_links() {
             Ok(links) => links,
             Err(error) => {
                 tracing::error!(%error, "could not enumerate linked groups for retained-history authentication");
@@ -297,14 +326,14 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_sync_core::index::SyncState;
+    use crate::replica_coordinator::ReplicaCoordinator;
 
     use super::*;
 
     fn test_state() -> Arc<DaemonState> {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-        let sync_state = Arc::new(SyncState::open_in_memory().unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         DaemonState::new("device-a".into(), sync_state, store)
     }
 
@@ -360,7 +389,8 @@ mod tests {
         let cache: Mutex<HashMap<String, bool>> = Mutex::new(HashMap::new());
         cache.lock().unwrap().insert("group-x".to_string(), false);
 
-        let result = NetmapChangeAuthenticator::effective_servable_groups(state, &raw_groups, &cache);
+        let result =
+            NetmapChangeAuthenticator::effective_servable_groups(state, &raw_groups, &cache);
         assert!(result.is_empty());
     }
 

@@ -13,10 +13,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use support::{real_entry_names, wait_until_with_context};
+use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_daemon::link_manager;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_sync_core::index::SyncState;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_transport::DeviceKeyPair;
 
 const BURST_FILE_COUNT: usize = 300;
@@ -57,7 +57,7 @@ async fn live_burst_of_many_small_files_converges_via_debounced_batching() {
 
     let store_dir_a = tempfile::tempdir().unwrap();
     let store_a = Arc::new(FsBlockStore::new(store_dir_a.path()).unwrap());
-    let sync_state_a = Arc::new(SyncState::open_in_memory().unwrap());
+    let sync_state_a = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state_a = DaemonState::new(device_a_id.clone(), sync_state_a, store_a);
     // Give the device a change-signing key before its link watch starts, so
     // the change-DAG emitter is wired and local edits actually propagate.
@@ -66,7 +66,7 @@ async fn live_burst_of_many_small_files_converges_via_debounced_batching() {
 
     let store_dir_b = tempfile::tempdir().unwrap();
     let store_b = Arc::new(FsBlockStore::new(store_dir_b.path()).unwrap());
-    let sync_state_b = Arc::new(SyncState::open_in_memory().unwrap());
+    let sync_state_b = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state_b = DaemonState::new(device_b_id.clone(), sync_state_b, store_b);
     support::ensure_device_signing_key(&state_b);
     let root_b = tempfile::tempdir().unwrap();
@@ -75,11 +75,12 @@ async fn live_burst_of_many_small_files_converges_via_debounced_batching() {
     // the live watcher -> debounce accumulator -> executor pipeline, not
     // the initial-scan path.
     let local_path_a = root_a.path().to_string_lossy().to_string();
-    state_a.sync_state.add_link(&local_path_a, &group_id).unwrap();
-    link_manager::start_link_watch(state_a.clone(), local_path_a, group_id.clone()).unwrap();
+    state_a.replica_coordinator.link_repository().add_link(&local_path_a, &group_id).unwrap();
+    LinkRuntimeController::new(state_a.clone()).start(local_path_a, group_id.clone()).unwrap();
     let local_path_b = root_b.path().to_string_lossy().to_string();
-    state_b.sync_state.add_link(&local_path_b, &group_id).unwrap();
-    link_manager::start_link_watch(state_b.clone(), local_path_b.clone(), group_id.clone())
+    state_b.replica_coordinator.link_repository().add_link(&local_path_b, &group_id).unwrap();
+    LinkRuntimeController::new(state_b.clone())
+        .start(local_path_b.clone(), group_id.clone())
         .unwrap();
 
     support::connect_two_daemons(
@@ -153,8 +154,8 @@ async fn live_burst_of_many_small_files_converges_via_debounced_batching() {
     // The device that made the burst also holds a fully-indexed, correct
     // local view — the debounced/batched local pipeline didn't lose or
     // duplicate anything on its own side either.
-    assert_eq!(state_a.sync_state.list_files(&group_id).unwrap().len(), BURST_FILE_COUNT);
-    assert_eq!(state_b.sync_state.list_files(&group_id).unwrap().len(), BURST_FILE_COUNT);
+    assert_eq!(state_a.replica_coordinator.file_index_repository().list_files(&group_id).unwrap().len(), BURST_FILE_COUNT);
+    assert_eq!(state_b.replica_coordinator.file_index_repository().list_files(&group_id).unwrap().len(), BURST_FILE_COUNT);
 
     // Settling: nothing keeps re-triggering after convergence (a runaway
     // self-echo loop would show up as an ever-growing file count).

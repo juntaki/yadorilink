@@ -27,6 +27,7 @@
 //! panic-time write can never corrupt or block sync state.
 
 use yadorilink_reporting::builder::ErrorPayloadBuilder;
+use yadorilink_reporting::local_store::environment;
 
 use super::ReportingStorage;
 
@@ -47,7 +48,7 @@ pub fn record_severe_error(
     log_lines: Vec<String>,
 ) -> Option<String> {
     let consent = storage.consent_or_default();
-    let env = super::environment::current(&consent);
+    let env = environment::current(&consent);
     let builder = ErrorPayloadBuilder::new(category, subsystem).log_lines(log_lines);
     let (envelope, summary) = yadorilink_reporting::builder::build_error_envelope(env, builder);
     storage.record_error_candidate_with_summary_best_effort(envelope, &summary)
@@ -71,7 +72,7 @@ pub fn record_panic(
     backtrace: &str,
 ) -> Option<String> {
     let consent = storage.consent_or_default();
-    let env = super::environment::current(&consent);
+    let env = environment::current(&consent);
     let mut log_lines = vec![format!("panic: {message}")];
     if let Some(loc) = location {
         log_lines.push(format!("location: {loc}"));

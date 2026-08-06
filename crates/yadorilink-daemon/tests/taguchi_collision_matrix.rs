@@ -20,13 +20,37 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use support::{
-    open_file_backed_sync_state, real_entry_names, wait_until_with_context, TestAccount,
-};
+use support::{open_file_backed_replica_coordinator, real_entry_names, wait_until_or_stalled, TestAccount};
+use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_daemon::link_manager;
 use yadorilink_local_storage::FsBlockStore;
 use yadorilink_transport::DeviceKeyPair;
+
+/// Hard overall ceiling shared by every row -- see `run_taguchi_row`'s doc
+/// comment for why this can be generous for all 16 rows (most converge in
+/// low single-digit seconds regardless) without slowing down CI: it is
+/// `STALL_TIMEOUT`, not this, that catches a genuinely stuck row quickly.
+const ABSOLUTE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// How long the tracked convergence progress (see `run_taguchi_row`'s
+/// `wait_until_or_stalled` call) may stay unchanged before a row is
+/// considered stuck rather than just slow. Genuinely tighter than this would
+/// false-fire under the Convergence Engine (`replace-inline-hydration-with-
+/// durable-convergence-engine`): a single legitimate materialization attempt
+/// is still bounded by `HYDRATION_TIMEOUT` (30s, deliberately preserved — see
+/// that constant's own doc comment for why shrinking it is rejected: it gives
+/// a real chance to a slow-but-present sole-source peer), and a job's own
+/// backoff between attempts is jittered up to ~37.5s (the documented 1s-30s
+/// schedule, +/-25% jitter) — so a single contended path can legitimately
+/// produce a ~67s window with no visible on-disk change while still
+/// converging normally, not stalled. This value was tuned (in an earlier
+/// session, before that engine existed) against a qualitatively different
+/// failure signature — continuous retries with NO backoff at all — which
+/// this architecture no longer produces; 90s comfortably clears the new
+/// legitimate envelope while still catching a genuine deadlock/livelock in
+/// well under two minutes instead of running out the full absolute budget
+/// uninformatively.
+const STALL_TIMEOUT: Duration = Duration::from_secs(90);
 
 struct TestDevice {
     device_id: String,
@@ -35,7 +59,7 @@ struct TestDevice {
     _store_dir: tempfile::TempDir,
     // Uses file-backed WAL (production's concurrency model) instead of
     // open_in_memory's shared-cache backend — see
-    // open_file_backed_sync_state's doc comment. Held only to keep the
+    // open_file_backed_replica_coordinator's doc comment. Held only to keep the
     // backing temp file alive for the test's duration.
     _index_dir: tempfile::TempDir,
 }
@@ -45,7 +69,7 @@ async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
     let device_id = support::register_device(account, name, keypair.public_bytes()).await;
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-    let (sync_state, index_dir) = open_file_backed_sync_state();
+    let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
     let state = DaemonState::new(device_id.clone(), sync_state, store);
     // Give the device a change-signing key before its link watch starts, so the
@@ -63,8 +87,10 @@ async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
 
 async fn start_watching(device: &TestDevice, group_id: &str) {
     let local_path = device.root.path().to_string_lossy().to_string();
-    device.state.sync_state.add_link(&local_path, group_id).unwrap();
-    link_manager::start_link_watch(device.state.clone(), local_path, group_id.to_string()).unwrap();
+    device.state.replica_coordinator.link_repository().add_link(&local_path, group_id).unwrap();
+    LinkRuntimeController::new(device.state.clone())
+        .start(local_path, group_id.to_string())
+        .unwrap();
 }
 
 /// Pairs every device directly with every other device over loopback,
@@ -247,6 +273,32 @@ fn snapshot(root: &std::path::Path) -> std::collections::HashMap<String, String>
 /// for hand-picked, deterministic scenarios). Divergence here means one
 /// of the fixed bugs (or a new one) resurfaced under this specific
 /// factor combination.
+///
+/// Row 14 (max device count, all-same path, max rounds -- the one
+/// combination where every heaviest factor lines up at once) needs far
+/// longer than the other 15 rows (which converge in low single-digit
+/// seconds) to converge, but genuinely does converge rather than stalling:
+/// confirmed by re-running it in isolation with a 600s budget after it hit
+/// a 120s one (passed at ~510s) -- and, under real concurrent CI-like
+/// load, needing over 700s. Root-caused via a traced run: dozens of
+/// `HydrationFailed` retries, a meaningful fraction of them the full 30s
+/// `HYDRATION_TIMEOUT` (not a fast rejection) -- six devices all
+/// concurrently demanding blocks from what is, for any one conflict
+/// version, usually a single originating device is exactly the case
+/// `HYDRATION_TIMEOUT`'s 30s exists to give a real chance to (see
+/// `yadorilink_daemon::hydration`'s doc comments), not a bug to route
+/// around by shrinking it -- a production deployment essentially never has
+/// six devices simultaneously hammering one source this hard. Rather than
+/// give every row the same inflated flat deadline (which would only delay
+/// how long a genuine regression in one of the 15 *lighter* rows takes to
+/// be reported), every row shares one generous absolute ceiling
+/// (`ABSOLUTE_CONVERGENCE_TIMEOUT`) plus a much tighter stall detector
+/// (`STALL_TIMEOUT`, see `wait_until_or_stalled`): a row that is still
+/// making real progress (row 14's normal case) keeps running however long
+/// it genuinely needs, while a row that stops making progress entirely (a
+/// deadlock/livelock, or a genuine regression in a normally-fast row)
+/// still fails within `STALL_TIMEOUT`, not after burning the whole
+/// absolute budget uninformatively.
 async fn run_taguchi_row(
     row_name: &str,
     device_count_level: u8,
@@ -255,6 +307,13 @@ async fn run_taguchi_row(
     path_level: u8,
     rounds_level: u8,
 ) {
+    static TRACING_INIT: std::sync::Once = std::sync::Once::new();
+    TRACING_INIT.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
+    });
     let device_count = match device_count_level {
         1 => 3,
         2 => 4,
@@ -263,7 +322,6 @@ async fn run_taguchi_row(
         _ => unreachable!(),
     };
     let (devices, group_id) = n_synced_devices(device_count, row_name).await;
-    let _ = group_id;
     let pattern = op_pattern(op_pattern_level);
     let stagger = Duration::from_millis(stagger_ms(stagger_level));
     let round_count = rounds(rounds_level);
@@ -291,19 +349,72 @@ async fn run_taguchi_row(
     // below. Comparing content hashes here makes the wait actually block
     // until every device holds byte-identical files.
     let devices_ref = &devices;
-    wait_until_with_context(
+    wait_until_or_stalled(
         || {
             let reference = snapshot(devices_ref[0].root.path());
             devices_ref[1..].iter().all(|d| snapshot(d.root.path()) == reference)
         },
-        Duration::from_secs(120),
+        // Progress fingerprint: every device's own snapshot, concatenated.
+        // Changes whenever *any* device's on-disk state moves at all (a
+        // block lands, a conflict copy appears, a rename/delete
+        // propagates) -- not just when the devices happen to agree, which
+        // is the thing `cond` above already checks and would make a poor
+        // progress signal (it's `false` for the entire, often-long
+        // interior of a real convergence, not just when genuinely stuck).
+        || devices_ref.iter().map(|d| snapshot(d.root.path())).collect::<Vec<_>>(),
+        ABSOLUTE_CONVERGENCE_TIMEOUT,
+        STALL_TIMEOUT,
         || {
-            devices_ref
+            let entries = devices_ref
                 .iter()
                 .enumerate()
                 .map(|(i, d)| format!("device-{i}={:?}", real_entry_names(d.root.path())))
                 .collect::<Vec<_>>()
-                .join("; ")
+                .join("; ");
+            // Diagnostic-only, for the `taguchi_row_14` intermittent-stall
+            // investigation (see
+            // `fix/conflict-copy-convergence-obligation-20260723`): dump the
+            // actual `materialization_jobs` row (state/attempt/next_retry_at/
+            // updated_at/waiting_reason) every device holds for every path
+            // that appears on ANY device's disk right now. Log-based tracing
+            // alone could not explain why a job re-armed to `Pending` was
+            // never reclaimed by a later tick despite low per-tick
+            // contention -- this reads the actual persisted row directly,
+            // instead of inferring it from log lines.
+            let mut all_paths: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            for d in devices_ref {
+                all_paths.extend(real_entry_names(d.root.path()));
+            }
+            let job_dump = all_paths
+                .iter()
+                .map(|path| {
+                    let per_device = devices_ref
+                        .iter()
+                        .enumerate()
+                        .map(|(i, d)| {
+                            match d.state.replica_coordinator.materialization_job_repository().materialization_get_job(&group_id, path) {
+                                Ok(Some(job)) => format!(
+                                    "device-{i}=(state={:?}, attempt={}, next_retry_at={:?}, \
+                                     updated_at={}, waiting_reason={:?}, version_hash={})",
+                                    job.state,
+                                    job.attempt,
+                                    job.next_retry_at,
+                                    job.updated_at,
+                                    job.waiting_reason,
+                                    hex::encode(&job.version_hash)
+                                ),
+                                Ok(None) => format!("device-{i}=(no job row)"),
+                                Err(e) => format!("device-{i}=(job read error: {e})"),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("  path={path:?}: {per_device}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{entries}\njob table dump:\n{job_dump}")
         },
     )
     .await;

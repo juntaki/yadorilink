@@ -40,18 +40,18 @@ use crate::shell_status::{
 const MAX_SHELL_IPC_CONNECTIONS: usize = 64;
 
 fn to_shell_materialization_state(
-    state: Option<yadorilink_sync_core::types::MaterializationState>,
+    state: Option<yadorilink_replica_domain::session_state::MaterializationState>,
 ) -> ShellMaterializationState {
     match state {
-        Some(yadorilink_sync_core::types::MaterializationState::Hydrated) => {
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Hydrated) => {
             ShellMaterializationState::Hydrated
         }
-        Some(yadorilink_sync_core::types::MaterializationState::Placeholder) => {
+        Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder) => {
             ShellMaterializationState::Placeholder
         }
         Some(
-            yadorilink_sync_core::types::MaterializationState::Hydrating
-            | yadorilink_sync_core::types::MaterializationState::Evicting,
+            yadorilink_replica_domain::session_state::MaterializationState::Hydrating
+            | yadorilink_replica_domain::session_state::MaterializationState::Evicting,
         ) => ShellMaterializationState::Hydrating,
         None => ShellMaterializationState::Unspecified,
     }
@@ -66,7 +66,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut push_rx = state.status_push_tx.subscribe();
+    let mut push_rx = state.telemetry.subscribe_status();
     loop {
         tokio::select! {
             biased;
@@ -94,8 +94,8 @@ where
 async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Option<ShellIpcMessage> {
     match msg.payload {
         Some(Payload::StatusQuery(q)) => {
-            let sync_state = resolve_status(state, &q.path);
-            let materialization_state = resolve_materialization_state(state, &q.path);
+            let sync_state = resolve_status(&state.replica_coordinator, &q.path);
+            let materialization_state = resolve_materialization_state(&state.replica_coordinator, &q.path);
             Some(ShellIpcMessage {
                 payload: Some(Payload::StatusResponse(StatusResponse {
                     path: q.path,
@@ -106,7 +106,7 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
             })
         }
         Some(Payload::HydrateRequest(req)) => {
-            let response = match resolve_group_and_rel_path(state, &req.path) {
+            let response = match resolve_group_and_rel_path(&state.replica_coordinator, &req.path) {
                 Some((group_id, rel_path)) => {
                     match hydration::hydrate(state, &group_id, &rel_path).await {
                         Ok(()) => HydrateResponse { ok: true, error: String::new() },
@@ -145,20 +145,22 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
                 // Evict": the same daemon operations `yadorilink pin`/`yadorilink
                 // evict` (control_socket) drive, exposed via the shell
                 // extension's context menu instead of the CLI.
-                Ok(ContextAction::PinItem) => match resolve_group_and_rel_path(state, &req.path) {
-                    Some((group_id, rel_path)) => {
-                        match hydration::pin(state, &group_id, &rel_path).await {
-                            Ok(()) => ContextActionResponse { ok: true, error: String::new() },
-                            Err(e) => ContextActionResponse { ok: false, error: e.to_string() },
+                Ok(ContextAction::PinItem) => {
+                    match resolve_group_and_rel_path(&state.replica_coordinator, &req.path) {
+                        Some((group_id, rel_path)) => {
+                            match hydration::pin(state, &group_id, &rel_path).await {
+                                Ok(()) => ContextActionResponse { ok: true, error: String::new() },
+                                Err(e) => ContextActionResponse { ok: false, error: e.to_string() },
+                            }
                         }
+                        None => ContextActionResponse {
+                            ok: false,
+                            error: "path is not under any linked folder".into(),
+                        },
                     }
-                    None => ContextActionResponse {
-                        ok: false,
-                        error: "path is not under any linked folder".into(),
-                    },
-                },
+                }
                 Ok(ContextAction::EvictItem) => {
-                    match resolve_group_and_rel_path(state, &req.path) {
+                    match resolve_group_and_rel_path(&state.replica_coordinator, &req.path) {
                         Some((group_id, rel_path)) => {
                             match hydration::evict(state, &group_id, &rel_path) {
                                 Ok(()) => ContextActionResponse { ok: true, error: String::new() },
@@ -182,13 +184,13 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
         // create placeholders.
         Some(Payload::ListOnDemandFoldersRequest(_)) => {
             let folders = state
-                .sync_state
-                .list_links()
+                .replica_coordinator
+                .link_repository().list_links()
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|l| {
                     l.materialization_policy
-                        == yadorilink_sync_core::types::MaterializationPolicy::OnDemand
+                        == yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand
                         // An orphaned link's coordination-side authorization
                         // is gone -- it must never be handed to the
                         // platform virtual-filesystem provider as a sync
@@ -205,8 +207,8 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
         }
         Some(Payload::ListFolderFilesRequest(req)) => {
             let entries = state
-                .sync_state
-                .list_links()
+                .replica_coordinator
+                .link_repository().list_links()
                 .unwrap_or_default()
                 .into_iter()
                 // An orphaned link is no longer a live sync target -- treat
@@ -215,16 +217,16 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
                 .find(|l| l.local_path == req.local_path && !l.orphaned)
                 .map(|l| {
                     state
-                        .sync_state
-                        .list_files(&l.group_id)
+                        .replica_coordinator
+                        .file_index_repository().list_files(&l.group_id)
                         .unwrap_or_default()
                         .into_iter()
                         .filter(|f| !f.deleted)
                         .map(|f| {
                             let materialization_state = to_shell_materialization_state(
                                 state
-                                    .sync_state
-                                    .get_materialization_state(&l.group_id, &f.path)
+                                    .replica_coordinator
+                                    .materialization_state_repository().get_materialization_state(&l.group_id, &f.path)
                                     .ok()
                                     .flatten(),
                             );

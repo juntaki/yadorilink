@@ -135,19 +135,12 @@ async fn connect() -> std::io::Result<UnixStream> {
 pub struct StatusInfo {
     pub sync_state: SyncState,
     pub materialization_state: MaterializationState,
-    /// The advisory "open elsewhere" signal: the device id currently
-    /// reported editing this file (Office `~$*` lock-file convention),
-    /// empty if not open elsewhere or the signal has expired. Threaded
-    /// through here so `combine_status` in lib.rs can render the sixth
-    /// badge state without a second round trip.
-    pub open_elsewhere_device_id: String,
 }
 
 impl StatusInfo {
     const UNSPECIFIED: StatusInfo = StatusInfo {
         sync_state: SyncState::Unspecified,
         materialization_state: MaterializationState::Unspecified,
-        open_elsewhere_device_id: String::new(),
     };
 }
 
@@ -177,7 +170,6 @@ async fn query_status_inner(path: &str) -> StatusInfo {
             sync_state: SyncState::try_from(r.state).unwrap_or(SyncState::Unspecified),
             materialization_state: MaterializationState::try_from(r.materialization_state)
                 .unwrap_or(MaterializationState::Unspecified),
-            open_elsewhere_device_id: r.open_elsewhere_device_id,
         },
         _ => StatusInfo::UNSPECIFIED,
     }

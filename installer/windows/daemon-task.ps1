@@ -2,7 +2,7 @@
 # per-user Scheduled Task that starts at logon, the same way
 # shell-ext/windows/install.ps1 registers the YadoriLinkCfapiHost task for
 # yadorilink-cfapi-host.exe (see that script's comments for the full
-# rationale) — a process launched directly by an installer/SSH-invoked
+# rationale) -- a process launched directly by an installer/SSH-invoked
 # shell can be torn down along with that shell's session (Windows Job
 # Object semantics); -LogonType Interactive runs it in the interactive
 # user's session, which yadorilink-daemon needs for the same reason

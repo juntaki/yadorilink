@@ -1,0 +1,127 @@
+name: CI fast
+
+on:
+  push:
+    branches: [main, "ci/private-pr-*"]
+    paths-ignore: ["docs/**"]
+  pull_request:
+    paths-ignore: ["docs/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: linux-fast
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --exclude yadorilink-desktop-app --all-targets -- -D warnings
+      - name: Workspace unit tests
+        run: cargo test --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
+      - name: Daemon library tests
+        run: cargo test -p yadorilink-daemon --lib -- --test-threads=1
+      - name: Public boundary checks
+        run: |
+          python3 scripts/check-block-commit-boundary.py
+          python3 scripts/check-block-deletion-boundary.py
+          python3 scripts/check-daemon-application-dependencies.py
+          python3 scripts/check-daemon-composition-root.py
+          python3 scripts/check-data-durability-model.py
+          python3 scripts/check-index-read-fail-closed.py
+          python3 scripts/check-link-enumeration-fail-closed.py
+          python3 scripts/check-link-group-uniqueness.py
+          python3 scripts/check-link-runtime-ownership.py
+          python3 scripts/check-maintenance-ownership.py
+          python3 scripts/check-materialization-journal.py
+          python3 scripts/check-mutation-boundary.py
+          python3 scripts/check-phase1b-application-boundary.py
+          python3 scripts/check-phase7b-engine-boundary.py
+          python3 scripts/check-phase7c-complete-wire-boundary.py
+          python3 scripts/check-phase7c-inbound-boundary.py
+          python3 scripts/check-phase7d1-domain-boundary.py
+          python3 scripts/check-phase7d2-sync-wire-boundary.py
+          python3 scripts/check-phase7d3-replica-engine-boundary.py
+          python3 scripts/check-phase7d4-sqlite-runtime-boundary.py
+          python3 scripts/check-phase7d5-sync-sqlite-boundary.py
+          python3 scripts/check-phase7d6-peer-session-boundary.py
+          python3 scripts/check-phase7d8-local-capture-boundary.py
+          python3 scripts/check-phase7d9-residual-ledger.py
+          python3 scripts/check-phase7d9f-syncstate-strangler.py
+          python3 scripts/check-sync-core-port-activation.py
+          python3 scripts/check-sync-repository-boundary.py
+          python3 scripts/check-syncstate-facade.py
+          python3 scripts/check-stored-blocklist-fail-closed.py
+          python3 scripts/check-pre-release-compatibility-debt.py
+          python3 scripts/check-test-inventory.py
+          python3 scripts/check-removed-features.py
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: windows-fast
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --workspace --all-targets
+      - name: Windows tests
+        run: cargo test --workspace --exclude yadorilink-daemon -- --test-threads=4
+      - name: Windows shell extension
+        working-directory: shell-ext/windows
+        run: cargo build --release
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: macos-fast
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --workspace --all-targets
+      - name: macOS tests
+        run: cargo test --workspace --exclude yadorilink-daemon
+      - name: macOS shell extensions
+        run: |
+          cargo build --release --manifest-path shell-ext/macos/core/Cargo.toml
+          cargo build --release --manifest-path shell-ext/macos/fileprovider-core/Cargo.toml

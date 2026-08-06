@@ -24,7 +24,7 @@ regexes = ['''00e033f866c263139ff4afd165e75bae3cfca67eb32399dddd6e33a3251af1e3''
 [[allowlists]]
 description = """
 Synthetic root-identity token used in local_change.rs unit tests exercising
-VerifiedRoot / root_token adoption semantics (crates/yadorilink-sync-core). A
+VerifiedRoot / root_token adoption semantics (crates/yadorilink-local-capture). A
 fixed placeholder hex string, not a real credential.
 """
 regexes = ['''0123456789abcdef''']

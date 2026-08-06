@@ -15,9 +15,15 @@ mod http {
 
     use base64::Engine;
     use serde::{Deserialize, Serialize};
+    use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
+    use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
+    use yadorilink_ipc_proto::daemonctl::{
+        remove_device_command_response, RemoveDeviceCommandRequest,
+    };
 
+    use crate::control_client;
     use crate::error::CliError;
-    use crate::http_client::{get_json, post_json, post_json_no_content, require_access_token};
+    use crate::http_client::{get_json, post_json, require_access_token};
 
     #[derive(Serialize)]
     struct RegisterDeviceRequest<'a> {
@@ -41,10 +47,9 @@ mod http {
         devices: Vec<DeviceInfo>,
     }
 
-    /// The library form the onboarding
-    /// wizard drives — registers the device and persists `device.json`,
-    /// returning the assigned `device_id` as a typed result instead of
-    /// printing it. `register` below is the thin CLI caller.
+    /// The library form the onboarding wizard drives — registers the device and
+    /// persists the one canonical pre-release `device.json` shape, returning the
+    /// assigned `device_id` as a typed result instead of printing it.
     pub async fn register_device(device_name: String) -> Result<String, CliError> {
         let access_token = require_access_token()?;
         let keypair = yadorilink_transport::DeviceKeyPair::load_or_generate(super::keypair_path())
@@ -54,14 +59,17 @@ mod http {
         )
         .map_err(|e| CliError::Other(e.to_string()))?;
 
+        let wireguard_public_key_base64 =
+            base64::engine::general_purpose::STANDARD.encode(keypair.public_bytes());
+        let signing_public_key_base64 =
+            base64::engine::general_purpose::STANDARD.encode(signing_keypair.public_bytes());
+
         let resp: RegisterDeviceResponse = post_json(
             "/devices/register",
             &RegisterDeviceRequest {
                 device_name: &device_name,
-                wireguard_public_key_base64: base64::engine::general_purpose::STANDARD
-                    .encode(keypair.public_bytes()),
-                signing_public_key_base64: base64::engine::general_purpose::STANDARD
-                    .encode(signing_keypair.public_bytes()),
+                wireguard_public_key_base64: wireguard_public_key_base64.clone(),
+                signing_public_key_base64: signing_public_key_base64.clone(),
             },
             Some(&access_token),
         )
@@ -71,7 +79,9 @@ mod http {
             device_id: resp.device_id.clone(),
             coordination_addr: crate::http_client::coordination_addr(),
             nat: crate::device_config::NatConfig::default(),
-            config_version: 0,
+            wireguard_public_key: wireguard_public_key_base64,
+            signing_public_key: signing_public_key_base64,
+            config_version: crate::device_config::CONFIG_VERSION,
         })?;
         Ok(resp.device_id)
     }
@@ -102,30 +112,32 @@ mod http {
     /// a confirmed-ready full replica, AND asks the coordination Worker to
     /// enumerate every folder group the removed device is an eager full
     /// replica of (so a group the acting daemon doesn't itself link is still
-    /// covered -- see `commands::durability_force`'s doc comment for the full
-    /// contract and why this is layered on top of the Worker's own count
-    /// guard). `--force` bypasses a refusal with a data-loss warning and an
-    /// audit log line.
+    /// covered. The daemon owns that fail-closed decision while the Worker's
+    /// count guard remains an independent final check. `--force` bypasses a
+    /// refusal with a data-loss warning and an audit log line.
     pub async fn remove(device_id: String, force: bool) -> Result<(), CliError> {
-        let access_token = require_access_token()?;
-        let outcome = crate::commands::durability_force::guard_against_forced_replica_loss(
-            "remove this device",
-            None, // every group at risk: locally-linked groups plus the removed
-            // device's full Worker-reported eager-group set
-            &device_id,
-            force,
-        )
-        .await?;
-        // A multi-group removal that went through the removed-device-ticket
-        // path already removed the device -- ACL edges in every at-risk
-        // group AND the device row itself -- in one all-or-nothing
-        // coordination-plane transaction (see `RemovalOutcome`'s doc
-        // comment). The plain delete below must be skipped in that case:
-        // issuing it anyway would be an unconditional removal with no lease
-        // bound to it at all, exactly the gap this fix closes.
-        if outcome == crate::commands::durability_force::RemovalOutcome::ProceedWithPlainCall {
-            post_json_no_content::<()>(&format!("/devices/{device_id}"), &(), Some(&access_token))
-                .await?;
+        let response =
+            control_client::send(ReqPayload::RemoveDeviceCommand(RemoveDeviceCommandRequest {
+                device_id: device_id.clone(),
+                force,
+            }))
+            .await?;
+        match response.payload {
+            Some(RespPayload::RemoveDeviceCommand(response)) => match response.result {
+                Some(remove_device_command_response::Result::Outcome(outcome)) => {
+                    crate::commands::membership_render::render_membership_outcome("remove", &outcome);
+                }
+                Some(remove_device_command_response::Result::Error(error)) => {
+                    return Err(CliError::Other(error.message));
+                }
+                None => {
+                    return Err(CliError::Other("daemon returned an empty remove result".into()))
+                }
+            },
+            Some(RespPayload::Error(error)) => return Err(CliError::Other(error)),
+            _ => {
+                return Err(CliError::Other("unexpected daemon response to device removal".into()))
+            }
         }
         println!("Removed device: {device_id}");
         Ok(())

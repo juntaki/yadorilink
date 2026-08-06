@@ -12,10 +12,10 @@
 
 use std::sync::Arc;
 
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_sync_core::index::SyncState;
-use yadorilink_sync_core::types::{FileRecord, MaterializationPolicy, MaterializationState};
-use yadorilink_sync_core::version_vector::VersionVector;
+use yadorilink_replica_domain::file::FileRecord;
+use yadorilink_replica_domain::session_state::{MaterializationPolicy, MaterializationState};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -29,32 +29,41 @@ fn main() {
     std::fs::create_dir_all(&config_dir).unwrap();
 
     let store = Arc::new(FsBlockStore::new(config_dir.join("blocks")).unwrap());
-    let sync_state = Arc::new(SyncState::open(config_dir.join("sync-state.sqlite3")).unwrap());
+    let sync_state =
+        Arc::new(ReplicaCoordinator::open(config_dir.join("sync-state.sqlite3")).unwrap());
 
-    sync_state.add_link(folder, group_id).unwrap();
-    sync_state.set_materialization_policy(folder, MaterializationPolicy::OnDemand).unwrap();
+    sync_state.link_repository().add_link(folder, group_id).unwrap();
+    sync_state
+        .link_repository()
+        .set_materialization_policy(folder, MaterializationPolicy::OnDemand)
+        .unwrap();
 
     let path = std::path::Path::new(folder).join(relative_file);
     let content = std::fs::read(&path).unwrap();
-    let blocks = yadorilink_sync_core::chunker::chunk_file(store.as_ref(), &path).unwrap();
-    let mut version = VersionVector::new();
-    version.increment("device-under-test");
+    let blocks = yadorilink_local_storage::chunk_file(store.as_ref(), &path).unwrap();
 
     sync_state
+        .file_index_repository()
         .upsert_file(
             group_id,
             &FileRecord {
                 path: relative_file.clone(),
                 size: content.len() as u64,
                 mtime_unix_nanos: 0,
-                version,
                 blocks,
                 deleted: false,
             },
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
     sync_state
-        .set_materialization_state(group_id, relative_file, MaterializationState::Placeholder)
+        .materialization_state_repository()
+        .set_materialization_state(
+            group_id,
+            relative_file,
+            MaterializationState::Placeholder,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
         .unwrap();
 
     println!(

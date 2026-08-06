@@ -1,22 +1,22 @@
 //! OSS usage/error reporting local storage. This module owns
-//! everything under `<config_dir>/reporting/` — consent/config state,
-//! aggregate usage counters, bounded error-candidate persistence, and the
-//! bounded unsent-report queue. It deliberately depends only on
-//! `yadorilink-reporting`'s pure types (`ConsentState`, `ReportEnvelope`,
-//! `QueuedReportMetadata`, `RetentionPolicy`,...) plus `std`/`serde_json`
-//! — never `yadorilink-sync-core::index::SyncState` or anything else that
-//! touches the sync-critical SQLite database, so a reporting-storage bug
-//! can never corrupt or block sync.
+//! everything under `<config_dir>/reporting/` — aggregate usage counters
+//! and the bounded unsent-report queue directly, plus consent/config
+//! state and bounded error-candidate persistence by re-using
+//! `yadorilink_reporting::local_store` (those two have no daemon-specific
+//! coupling, so `yadorilink-cli` uses the same storage directly instead
+//! of reaching into this crate). This module deliberately depends only
+//! on `yadorilink-reporting`'s pure types (`ConsentState`,
+//! `ReportEnvelope`, `QueuedReportMetadata`, `RetentionPolicy`,...) plus
+//! `std`/`serde_json` — never `yadorilink-sync-core::index::SyncState` or
+//! anything else that touches the sync-critical SQLite database, so a
+//! reporting-storage bug can never corrupt or block sync.
 //!
 //! Submodules:
-//! - `error`: `ReportingStorageError`/`ReportingResult`, used only within
-//!   this module tree — never converted into `crate::error::DaemonError`.
-//! - `time`: dependency-free RFC 3339 formatting.
-//! - `consent_store`: `<config_dir>/reporting/consent.json`.
 //! - `counters`: `<config_dir>/reporting/counters.json`.
-//! - `entry_store`: shared engine behind the next two.
-//! - `error_candidates`: `<config_dir>/reporting/error-candidates/`.
-//! - `queue`: `<config_dir>/reporting/queue/`.
+//! - `queue`: `<config_dir>/reporting/queue/`, built on
+//!   `yadorilink_reporting::local_store::entry_store`.
+//! - `hooks`: severe-error/panic capture, writing into
+//!   `yadorilink_reporting::local_store::error_candidates`.
 //!
 //! `ReportingStorage` below is the facade that bundles all four stores
 //! together and is the type `DaemonState`'s IPC dispatch will
@@ -29,27 +29,28 @@
 //! accessors) for reporting-specific code (future CLI/IPC handlers in
 //! sections 3/4) that legitimately needs to see and report a failure.
 
-pub mod consent_store;
 pub mod counters;
-mod entry_store;
-pub mod environment;
-pub mod error;
-pub mod error_candidates;
 pub mod hooks;
 pub mod queue;
-pub mod retry;
-pub mod time;
+
+// Re-exported so existing `crate::reporting::time::...` call sites
+// elsewhere in this crate (e.g. `diagnostics_ipc.rs`) keep working
+// unchanged now that the dependency-free RFC 3339 helpers live in
+// `yadorilink-reporting::local_store` alongside the other storage that
+// moved there.
+pub(crate) use yadorilink_reporting::local_store::time;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use yadorilink_reporting::consent::ConsentState;
+use yadorilink_reporting::local_store::{
+    consent_store::ConsentStore, error_candidates::ErrorCandidateStore,
+};
 use yadorilink_reporting::redact::RedactionSummary;
 use yadorilink_reporting::schema::ReportEnvelope;
 
-use consent_store::ConsentStore;
 use counters::ReportingCounters;
-use error_candidates::ErrorCandidateStore;
 use queue::QueueStore;
 
 /// `<config_dir>/reporting` — a sibling of `device.json`/the block store,
@@ -259,8 +260,7 @@ mod tests {
             // daemon operation" this simulates being called from.
             storage.note_command_category("link");
             storage.note_error_category("daemon_startup");
-            let candidate =
-                super::error_candidates::ErrorCandidateStore::new(&blocked_reporting_dir);
+            let candidate = ErrorCandidateStore::new(&blocked_reporting_dir);
             let _ = candidate; // constructing doesn't touch disk either
 
             let consent = storage.consent_or_default();

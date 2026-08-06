@@ -1,7 +1,8 @@
 //! Free-space classification shared by every disk-pressure decision in the
 //! system — the local-storage block-store preflight (`FsBlockStore::put`),
 //! the sync-core hydration/materialization preflight
-//! (`yadorilink_sync_core::materialization::check_disk_headroom`), the
+//! (`yadorilink_local_storage::check_disk_headroom`, called directly by
+//! `yadorilink-sync-core::materialization`), the
 //! disk-pressure eviction trigger, and `yadorilink status`'s per-volume
 //! reporting all call through this one module, so a single computed
 //! classification always backs both the preflight decision and what's

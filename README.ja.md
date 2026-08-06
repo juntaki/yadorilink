@@ -108,7 +108,6 @@ CI workflow は引き続き、実行ごとの artifacts も公開します。
 | `crates/yadorilink-cli` | ユーザー向け CLI (`yadorilink`) |
 | `crates/yadorilink-daemon` | バックグラウンド同期デーモン (`yadorilink-daemon`) |
 | `crates/yadorilink-transport` | ピアトランスポート、NAT 越え、接続管理 |
-| `crates/yadorilink-sync-core` | 同期エンジンと調停ロジック |
 | `crates/yadorilink-local-storage` | ローカルブロックストア |
 | `crates/yadorilink-ipc-proto` | 共有 protobuf とワイヤーフォーマット定義 |
 | `crates/yadorilink-desktop-app` | デスクトップ状態表示アプリ (`yadorilink-status-app`) |

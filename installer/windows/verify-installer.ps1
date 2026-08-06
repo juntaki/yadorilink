@@ -3,18 +3,18 @@
 # Standalone verification for a built (or downloaded) yadorilink-setup.exe.
 # Unlike the signature check already inline in build-installer.ps1 (which only runs
 # right after that same script produces the artifact, and only for
-# -SignToolName builds), this can be pointed at any yadorilink-setup.exe —
-# e.g. one downloaded from a release page — to independently confirm its
+# -SignToolName builds), this can be pointed at any yadorilink-setup.exe --
+# e.g. one downloaded from a release page -- to independently confirm its
 # checksum and Authenticode signature before anyone runs it.
 #
 # Checks performed:
 #  1. SHA-256 checksum against the artifact's <name>.sha256 sidecar
 #  (release-blocking: every artifact must have a published checksum).
-#  2. Get-AuthenticodeSignature — reports signed/unsigned status.
+#  2. Get-AuthenticodeSignature -- reports signed/unsigned status.
 #
 # By default this only *reports* signature status without failing on
 # unsigned (matching this project's documented allowance for local/interim
-# unsigned builds — see installer/windows/README.md's "Signing and
+# unsigned builds -- see installer/windows/README.md's "Signing and
 # checksums" section). Pass
 # -Release to additionally require a valid Authenticode signature, per
 # the release rule that shipped installers must be signed and checksummed.
@@ -72,7 +72,7 @@ if ($signature.Status -eq "Valid") {
 } elseif ($Release) {
     Write-Fail "Authenticode signature is not valid: $($signature.Status) (-Release requires a valid signature)"
 } else {
-    Write-Note "unsigned/invalid signature ($($signature.Status)) — expected for local/interim builds; use -Release to enforce signing"
+    Write-Note "unsigned/invalid signature ($($signature.Status)) -- expected for local/interim builds; use -Release to enforce signing"
 }
 
 Write-Output "== Microsoft Store metadata =="

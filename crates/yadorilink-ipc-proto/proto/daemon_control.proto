@@ -1096,6 +1096,275 @@ message DiagnosticsBundleResponse {
   string collection_mode = 3;
 }
 
+// Phase 1b high-level application commands. The daemon owns each complete
+// workflow; the CLI sends one request and only renders the structured result.
+message RemoveDeviceCommandRequest {
+  string device_id = 1;
+  bool force = 2;
+}
+
+message RevokeDeviceCommandRequest {
+  string group_id = 1;
+  string device_id = 2;
+  bool force = 3;
+}
+
+// Resolves `edge_id` to its `(group_id, device_id)` on the daemon side (via
+// the coordination plane's own edge listing) before running the same
+// durability-readiness gate `RevokeDeviceCommand` runs, so the CLI never
+// issues a raw HTTP DELETE against the coordination plane and can never skip
+// the gate by racing the edge listing against the delete.
+message RevokeEdgeCommandRequest {
+  string edge_id = 1;
+  bool force = 2;
+}
+
+message MembershipHandoffResult {
+  string group_id = 1;
+  string target_device_id = 2;
+  string lease_id = 3;
+  uint64 membership_generation = 4;
+}
+
+message ReplicaMembershipCommandOutcome {
+  repeated MembershipHandoffResult handoffs = 1;
+  repeated string forced_group_ids = 2;
+  // Set only when a `--force` removal committed (or may have committed)
+  // WITHOUT ever learning which folder groups it put at risk. Empty means
+  // no such operation -- absence, not a sentinel value, since an operation
+  // id is never itself empty.
+  string unknown_scope_operation_id = 3;
+}
+
+enum ApplicationErrorCode {
+  APPLICATION_ERROR_CODE_UNSPECIFIED = 0;
+  APPLICATION_ERROR_CODE_LOCAL_IDENTITY_UNAVAILABLE = 1;
+  APPLICATION_ERROR_CODE_TARGET_NOT_FOUND = 2;
+  APPLICATION_ERROR_CODE_REPLICA_NOT_READY = 3;
+  APPLICATION_ERROR_CODE_TICKET_UNAVAILABLE = 4;
+  APPLICATION_ERROR_CODE_COORDINATION_REJECTED = 5;
+  APPLICATION_ERROR_CODE_COORDINATION_AMBIGUOUS = 6;
+  APPLICATION_ERROR_CODE_DURABILITY_LATCH_FAILED = 7;
+  APPLICATION_ERROR_CODE_RECOVERY_PENDING = 8;
+  APPLICATION_ERROR_CODE_COORDINATION_TRANSPORT = 9;
+  APPLICATION_ERROR_CODE_PERSISTENCE = 10;
+  APPLICATION_ERROR_CODE_PREPARATION_REJECTED = 11;
+  APPLICATION_ERROR_CODE_LOCAL_LINK_FAILED = 12;
+  APPLICATION_ERROR_CODE_ACTIVATION_REJECTED = 13;
+  APPLICATION_ERROR_CODE_ACTIVATION_AMBIGUOUS = 14;
+  APPLICATION_ERROR_CODE_COMPENSATION_PENDING = 15;
+  APPLICATION_ERROR_CODE_OPERATION_CONFLICT = 16;
+  APPLICATION_ERROR_CODE_RECOVERY_JOURNAL_UNAVAILABLE = 17;
+}
+
+message ApplicationCommandError {
+  ApplicationErrorCode code = 1;
+  string message = 2;
+  repeated string group_ids = 3;
+  string operation_id = 4;
+}
+
+message RemoveDeviceCommandResponse {
+  oneof result {
+    ReplicaMembershipCommandOutcome outcome = 1;
+    ApplicationCommandError error = 2;
+  }
+}
+
+message RevokeDeviceCommandResponse {
+  oneof result {
+    ReplicaMembershipCommandOutcome outcome = 1;
+    ApplicationCommandError error = 2;
+  }
+}
+
+message RevokeEdgeCommandResponse {
+  oneof result {
+    ReplicaMembershipCommandOutcome outcome = 1;
+    ApplicationCommandError error = 2;
+  }
+}
+
+message CreateAndLinkCommandRequest {
+  string group_name = 1;
+  string local_path = 2;
+  bool on_demand = 3;
+  bool acknowledge_risks = 4;
+}
+
+message JoinAndLinkCommandRequest {
+  string group_id = 1;
+  string group_name = 2;
+  string local_path = 3;
+  bool on_demand = 4;
+  bool acknowledge_risks = 5;
+}
+
+message EnrollmentCommandOutcome {
+  string operation_id = 1;
+  string group_id = 2;
+  string local_path = 3;
+}
+
+message CreateAndLinkCommandResponse {
+  oneof result {
+    EnrollmentCommandOutcome outcome = 1;
+    ApplicationCommandError error = 2;
+  }
+}
+
+message JoinAndLinkCommandResponse {
+  oneof result {
+    EnrollmentCommandOutcome outcome = 1;
+    ApplicationCommandError error = 2;
+  }
+}
+
+// Phase 2.1: `yadorilink recovery list`/`show`. `list` (Commit 2.1-B) is a
+// read-only view over the local recovery-journal inventory
+// (yadorilink_sync_core::recovery) alone -- its response has no dedicated
+// `error` variant, same as e.g. `ListLinksResponse`; a failure surfaces
+// through DaemonControlResponse's own top-level `error` fallback. `show`
+// (Commit 2.1-C2-C2) is a stable diagnosis instead: local journal state
+// combined with exactly one coordination-plane lookup and a recommendation
+// (yadorilink_daemon::recovery_diagnosis) -- its response's `invalid`/
+// `not_found`/`local_evidence_changed` variants are typed, successfully-
+// retrieved outcomes, never collapsed into that top-level `error` fallback;
+// only a genuine operational failure (e.g. no coordination-plane address
+// configured) still surfaces there. Both requests are strictly read-only.
+
+// One normalized recovery-journal row -- mirrors
+// yadorilink_sync_core::recovery::RecoveryOperationSummary field-for-field.
+// `domain`/`action`/`state`/`severity` are the same `as_str()`/`as_db_str()`
+// strings that struct itself uses, not a new proto enum -- a CLI displaying
+// them verbatim has no need to re-derive a mapping, and it keeps this
+// message stable across a future domain/state addition on the Rust side.
+message RecoveryOperation {
+  string operation_id = 1;
+  string domain = 2;
+  string action = 3;
+  string state = 4;
+  string severity = 5;
+  repeated string group_ids = 6;
+  optional string device_id = 7;
+  optional string local_path = 8;
+  uint64 attempts = 9;
+  optional string last_error = 10;
+  int64 created_at_unix = 11;
+  int64 updated_at_unix = 12;
+}
+
+// Mirrors yadorilink_sync_core::recovery::InvalidRecoveryOperation.
+message InvalidRecoveryOperation {
+  optional string operation_id = 1;
+  string domain = 2;
+  optional string raw_state = 3;
+  string detail = 4;
+}
+
+message ListRecoveryOperationsRequest {}
+
+message ListRecoveryOperationsResponse {
+  repeated RecoveryOperation operations = 1;
+  repeated InvalidRecoveryOperation invalid = 2;
+}
+
+// Phase 2.1-C2-C2: `show` now returns a stable diagnosis (local evidence +
+// exactly one remote lookup + a pure recommendation), not just the local
+// journal row. `domain` is required and unambiguous -- the three recovery
+// journals are separate tables with no cross-table uniqueness on
+// operation_id, so the SAME id can legitimately name a row in more than one
+// domain. Must be one of `RecoveryDomain::as_str()`'s own values
+// ("enrollment", "membership", "role-loss").
+message ShowRecoveryOperationRequest {
+  string domain = 1;
+  string operation_id = 2;
+}
+
+// One field two identity-bearing values (a local journal row and its
+// related local/remote evidence, or a remote record) can be compared on --
+// mirrors yadorilink_daemon::recovery_diagnosis::{ObservationQualification,
+// RemoteIdentityQualification}.
+message RecoveryObservationQualification {
+  string status = 1; // confirmed_absent | exact | mismatch | invalid | ambiguous
+  repeated string mismatch_fields = 2;
+  optional string detail = 3;
+}
+
+message RecoveryRemoteIdentityQualification {
+  string status = 1; // exact | mismatch | not_comparable | not_evaluated
+  repeated string mismatch_fields = 2;
+  repeated string not_comparable_reasons = 3;
+  optional string not_evaluated_reason = 4;
+}
+
+// `link`/`pending_marker` are absent for domains that have no such related
+// local evidence (membership has neither; role-loss has no pending marker).
+message RecoveryEvidenceQualification {
+  optional RecoveryObservationQualification link = 1;
+  optional RecoveryObservationQualification pending_marker = 2;
+  RecoveryRemoteIdentityQualification remote_identity = 3;
+}
+
+message RecoveryRemoteState {
+  string status = 1; // preparing|prepared|active|cancelled | committed|definitely_rejected | role_loss_committed | record_not_found|unavailable
+  optional string unavailable_category = 2;
+}
+
+message RecoveryOperationKey {
+  string domain = 1;
+  string operation_id = 2;
+}
+
+// `diagnostic_fingerprint` is display/troubleshooting only -- it is NEVER a
+// future apply/CAS token; see
+// yadorilink_sync_core::recovery::RecoverySnapshotRevision's own doc comment.
+message RecoverySnapshotRevision {
+  string state = 1;
+  int64 updated_at_unix = 2;
+  uint64 diagnostic_fingerprint = 3;
+}
+
+message RecoveryDiagnosis {
+  RecoveryOperation operation = 1;
+  RecoveryRemoteState remote = 2;
+  string recommendation = 3;
+  repeated string reason_codes = 4;
+  bool automatic_recovery_safe = 5;
+  RecoveryEvidenceQualification qualification = 6;
+  RecoverySnapshotRevision local_revision = 7;
+}
+
+message RecoverySnapshotAfterLookup {
+  string outcome = 1; // found | operation_not_found | invalid_operation
+  optional RecoverySnapshotRevision revision = 2;
+  optional string raw_state = 3;
+  optional string detail = 4;
+}
+
+message RecoveryLocalEvidenceChanged {
+  RecoveryOperationKey key = 1;
+  RecoverySnapshotRevision before = 2;
+  RecoverySnapshotAfterLookup after = 3;
+}
+
+message RecoveryOperationNotFound {
+  RecoveryOperationKey key = 1;
+}
+
+// Exactly one of these four is set on every success response -- `invalid`/
+// `not_found`/`local_evidence_changed` are typed, successfully-retrieved
+// outcomes, never collapsed into DaemonControlResponse's top-level `error`
+// fallback.
+message ShowRecoveryOperationResponse {
+  oneof result {
+    RecoveryDiagnosis diagnosed = 1;
+    InvalidRecoveryOperation invalid = 2;
+    RecoveryOperationNotFound not_found = 3;
+    RecoveryLocalEvidenceChanged local_evidence_changed = 4;
+  }
+}
+
 message DaemonControlRequest {
   oneof payload {
     LinkRequest link = 1;
@@ -1159,6 +1428,15 @@ message DaemonControlRequest {
     // Removed-device handoff-ticket request (operating-device-side).
     ObtainHandoffTicketRequest obtain_handoff_ticket = 55;
     ReleaseHandoffTicketRequest release_handoff_ticket = 56;
+    RemoveDeviceCommandRequest remove_device_command = 57;
+    RevokeDeviceCommandRequest revoke_device_command = 58;
+    CreateAndLinkCommandRequest create_and_link_command = 59;
+    JoinAndLinkCommandRequest join_and_link_command = 60;
+    RevokeEdgeCommandRequest revoke_edge_command = 61;
+    // Phase 2.1: local recovery-journal inventory (`list`) and stable
+    // recovery diagnosis (`show`) -- see the message definitions above.
+    ListRecoveryOperationsRequest list_recovery_operations = 62;
+    ShowRecoveryOperationRequest show_recovery_operation = 63;
   }
   // Field numbers 24-26 were the directional-mode requests (set_mode,
   // override, revert); 40-43 were the directional folder-operation requests
@@ -1244,6 +1522,15 @@ message DaemonControlResponse {
     // Removed-device handoff-ticket request (operating-device-side).
     ObtainHandoffTicketResponse obtain_handoff_ticket = 55;
     ReleaseHandoffTicketResponse release_handoff_ticket = 56;
+    RemoveDeviceCommandResponse remove_device_command = 57;
+    RevokeDeviceCommandResponse revoke_device_command = 58;
+    CreateAndLinkCommandResponse create_and_link_command = 59;
+    JoinAndLinkCommandResponse join_and_link_command = 60;
+    RevokeEdgeCommandResponse revoke_edge_command = 61;
+    // Phase 2.1: local recovery-journal inventory (`list`) and stable
+    // recovery diagnosis (`show`) -- see the message definitions above.
+    ListRecoveryOperationsResponse list_recovery_operations = 62;
+    ShowRecoveryOperationResponse show_recovery_operation = 63;
   }
   // Field numbers 25-27 were the directional-mode responses (set_mode,
   // override, revert); 40-43 were the directional folder-operation responses

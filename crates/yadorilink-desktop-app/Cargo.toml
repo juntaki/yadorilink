@@ -53,11 +53,13 @@ opener = { version = "0.8", features = ["reveal"] }
 url = "2"
 # The onboarding executor converts the shared
 # link preflight report (`link_preflight::LinkPreflightReport`) into the
-# window's warning cards, so this is now a normal dependency (it was already a
-# dev-dependency for the daemon-backed integration tests). It is pulled in
-# transitively via `yadorilink-cli` regardless, so this adds nothing to the
-# shipped binary's dependency closure.
-yadorilink-sync-core = { path = "../yadorilink-sync-core" }
+# window's warning cards. Moved from `yadorilink-sync-core` to
+# `yadorilink-local-storage` in Phase 7D-9B along with `link_preflight`
+# itself (see that crate's `Cargo.toml` for why it landed there and not
+# `yadorilink-root-authority`) -- already a dependency below for other
+# reasons, so this adds nothing new to the shipped binary's dependency
+# closure.
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
 # The onboarding wizard window. egui/eframe is
 # pure Rust with its own winit event loop (run as a separate process from the
 # tao tray) — no webview/JS asset pipeline, consistent with the workspace's
@@ -96,3 +98,8 @@ tempfile = "3"
 # `yadorilink-status-app` binary itself.
 yadorilink-daemon = { path = "../yadorilink-daemon" }
 yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+# For DeviceSigningKeyPair::generate() only, wiring a registered test
+# device's change-signing key -- already transitively present via
+# yadorilink-cli's own dependency on this crate, so this adds no new
+# crate to the build graph, only a direct name the test file can use.
+yadorilink-transport = { path = "../yadorilink-transport" }

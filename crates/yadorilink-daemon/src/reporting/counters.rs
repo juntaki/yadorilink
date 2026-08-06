@@ -1,7 +1,7 @@
 //! Daemon-owned aggregate usage counters, persisted to
 //! `<config_dir>/reporting/counters.json`. This module owns the
 //! storage/aggregation layer only — actually incrementing these from real
-//! call sites in `link_manager.rs`/`peer_orchestrator.rs`/etc. happens
+//! call sites in the daemon's own `LinkRuntimeController`/`peer_orchestrator.rs`/etc. happens
 //! elsewhere, as part of wiring reporting IPC dispatch into
 //! yadorilink-daemon. Every mutation method here is deliberately
 //! infallible (`-> `), not `-> ReportingResult<>`: this is the API a
@@ -32,9 +32,8 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use yadorilink_reporting::builder::UsagePayloadBuilder;
+use yadorilink_reporting::local_store::error::ReportingResult;
 use yadorilink_reporting::schema::UsagePayload;
-
-use super::error::ReportingResult;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct CountersState {

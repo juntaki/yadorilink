@@ -21,6 +21,10 @@ pub enum IpcError {
     DaemonNotRunning,
     #[error("daemon returned an error: {0}")]
     DaemonError(String),
+    #[error(
+        "desktop app/daemon protocol version mismatch (app {client_version}, daemon {daemon_version}); run matching YadoriLink app and daemon binaries"
+    )]
+    ProtocolMismatch { client_version: u32, daemon_version: u32 },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -73,17 +77,22 @@ pub fn control_pipe_name() -> String {
 
 pub async fn send(payload: ReqPayload) -> Result<DaemonControlResponse, IpcError> {
     let mut stream = connect().await.map_err(|_| IpcError::DaemonNotRunning)?;
-    write_message(
-        &mut stream,
-        &DaemonControlRequest {
-            payload: Some(payload),
-            protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
-        },
-    )
-    .await?;
+    let protocol_version = yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION;
+    write_message(&mut stream, &DaemonControlRequest { payload: Some(payload), protocol_version })
+        .await?;
     let resp = read_message::<DaemonControlResponse>(&mut stream)
         .await?
         .ok_or(IpcError::DaemonNotRunning)?;
+
+    // The pre-release desktop app and daemon are one release unit. Reject
+    // different development protocol generations instead of relying on
+    // protobuf's missing-field defaults as an implicit compatibility layer.
+    if resp.daemon_protocol_version != protocol_version {
+        return Err(IpcError::ProtocolMismatch {
+            client_version: protocol_version,
+            daemon_version: resp.daemon_protocol_version,
+        });
+    }
     if let Some(RespPayload::Error(msg)) = &resp.payload {
         return Err(IpcError::DaemonError(msg.clone()));
     }

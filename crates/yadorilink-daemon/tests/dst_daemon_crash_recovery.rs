@@ -56,12 +56,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
+use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::app::{self, DaemonConfig};
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_daemon::link_manager;
-use yadorilink_sync_core::debounce::DebounceConfig;
-use yadorilink_sync_core::types::MaterializationState;
-use yadorilink_sync_core::watcher::{FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource};
+use yadorilink_filesystem_sync::debounce::DebounceConfig;
+use yadorilink_replica_domain::session_state::MaterializationState;
+use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource};
 
 const GROUP_ID: &str = "dst-daemon-crash-group";
 
@@ -96,7 +96,7 @@ type IndexSnapshot = Vec<(String, Vec<String>)>;
 /// Reads the linked group's live records out of `DaemonState` and folds
 /// them into a deterministic, order-independent [`IndexSnapshot`].
 fn capture_index(state: &DaemonState) -> Result<IndexSnapshot, String> {
-    let files = state.sync_state.list_files(GROUP_ID).map_err(|e| format!("list_files: {e}"))?;
+    let files = state.replica_coordinator.list_files(GROUP_ID).map_err(|e| format!("list_files: {e}"))?;
     let mut snapshot: IndexSnapshot = files
         .iter()
         .filter(|r| !r.deleted)
@@ -189,7 +189,7 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
     // stamped mtimes sit on. It is process-global, so it also governs the
     // restarted daemon's indexing — set once, up front.
     let mtime_nanos = deterministic_mtime_nanos(seed);
-    yadorilink_sync_core::peer_session::set_test_clock_override(mtime_nanos);
+    yadorilink_peer_session::peer_session::set_test_clock_override(mtime_nanos);
 
     // ---- Boot 1: index one file through the real daemon pipeline. --------
     let daemon1 = boot_daemon(config_dir.path(), block_store_dir.path(), &sync_db_path).await?;
@@ -200,13 +200,13 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
     // madsim). The indexed `FileRecord`s persist independently of the links
     // table, so the crash/restart of the index is still fully exercised.
     let (watch_source, events_tx) = SimulatedFolderWatchSource::new(64);
-    link_manager::start_link_watch_with_source(
-        daemon1.state.clone(),
-        root.to_string_lossy().to_string(),
-        GROUP_ID.to_string(),
-        Arc::new(watch_source),
-    )
-    .map_err(|e| format!("start_link_watch_with_source: {e}"))?;
+    LinkRuntimeController::new(daemon1.state.clone())
+        .start_with_source(
+            root.to_string_lossy().to_string(),
+            GROUP_ID.to_string(),
+            Arc::new(watch_source),
+        )
+        .map_err(|e| format!("start_link_watch_with_source: {e}"))?;
 
     let file_path = root.join("hello.txt");
     let content = b"hello daemon, survive the crash and come back consistent";
@@ -240,7 +240,7 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
     //     startup `reset_stale_hydrating_to_placeholder` must clear it.
     daemon1
         .state
-        .sync_state
+        .replica_coordinator
         .set_materialization_state(GROUP_ID, &indexed_path, MaterializationState::Hydrating)
         .map_err(|e| format!("set Hydrating: {e}"))?;
     // (b) An orphaned temp file in the block-store root — as if the crash
@@ -313,7 +313,7 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
     //        now be a no-op (startup already cleared the staged one).
     let still_stale = daemon2
         .state
-        .sync_state
+        .replica_coordinator
         .reset_stale_hydrating_to_placeholder()
         .map_err(|e| format!("reset_stale_hydrating (post-check): {e}"))?;
     if still_stale != 0 {

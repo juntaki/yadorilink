@@ -3,17 +3,16 @@
 //! `reporting_ipc.rs`/`update_ipc.rs`'s precedent, rather than inlined
 //! into `control_socket.rs`'s match arms.
 //!
-//! Bundle assembly deliberately reuses existing daemon state readers
-//! (`control_socket::list_link_statuses`/`volumes_free_space`/
-//! `health_snapshot`, `update_ipc::status_response`, the reporting error-
-//! candidate store) rather than re-deriving them a second way: the goal
-//! is to export through the daemon so daemon-owned state files do not
-//! need to be read directly by the CLI. Redaction is likewise never
-//! reimplemented here: every assembled bundle, including the bounded-
-//! timeout fallback, is passed through `yadorilink_reporting::
-//! redact_diagnostics_value` (the same daemon-independent helper
-//! `yadorilink-cli`'s CLI-only fallback bundle already uses) before it
-//! ever leaves this module.
+//! This module is now IPC encode/package only: bundle *assembly* lives in
+//! `crate::queries::diagnostics_bundle::DiagnosticsBundleQueryService`
+//! (composing narrow ports, none of which know about protobuf or JSON);
+//! this module's own job is turning that plain snapshot into the exact
+//! JSON shape the diagnostics bundle schema expects, then redacting and
+//! wrapping it into the wire response. Redaction is never reimplemented
+//! here: every assembled bundle, including the bounded-timeout fallback,
+//! is passed through `yadorilink_reporting::redact_diagnostics_value`
+//! (the same daemon-independent helper `yadorilink-cli`'s CLI-only
+//! fallback bundle already uses) before it ever leaves this module.
 //!
 //! Bounded generation time and failure handling: bundle assembly runs on
 //! a `spawn_blocking` worker thread (mirroring `hydration.rs`'s "move
@@ -25,14 +24,14 @@
 //! `DIAGNOSTICS_BUNDLE_TIMEOUT`, either the real bundle or a minimal,
 //! still schema-valid `"daemon-partial"` fallback.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
 use yadorilink_ipc_proto::daemonctl::{DiagnosticsBundleResponse, RedactionCategoryCount};
-use yadorilink_reporting::schema::ReportPayload;
 
-use crate::daemon_state::DaemonState;
+use crate::queries::diagnostics_bundle::{
+    DiagnosticsBundleQueryService, DiagnosticsBundleSnapshot,
+};
 
 /// The overall time budget for one bundle-assembly call.
 /// Chosen to match `PER_BLOCK_FETCH_TIMEOUT` (`hydration.rs`) -- long
@@ -43,19 +42,20 @@ use crate::daemon_state::DaemonState;
 /// so 5 seconds is generous, not tight.
 const DIAGNOSTICS_BUNDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How many recent error candidates to summarize in the bundle -- a
-/// bounded sample, not the full set; a diagnostics bundle is a support
-/// artifact, not a full audit log.
-const RECENT_ERRORS_SAMPLE_LIMIT: usize = 5;
-
 /// `yadorilink diagnose preview`/`export` (daemon-backed path): both
 /// request the exact same assembled-and-redacted bundle -- see this
 /// module's doc comment and `daemon_control.proto`'s
 /// `DiagnosticsBundleResponse` doc comment for why preview/export share
 /// one response shape.
-pub async fn build_bundle(state: &Arc<DaemonState>) -> DiagnosticsBundleResponse {
-    let assemble_state = state.clone();
-    run_bounded(DIAGNOSTICS_BUNDLE_TIMEOUT, move || assemble_bundle_sync(&assemble_state)).await
+pub(crate) async fn build_bundle(
+    bundle_query: &std::sync::Arc<DiagnosticsBundleQueryService>,
+) -> DiagnosticsBundleResponse {
+    let bundle_query = bundle_query.clone();
+    let generated_at_unix = crate::reporting::time::now_unix_seconds() as i64;
+    run_bounded(DIAGNOSTICS_BUNDLE_TIMEOUT, move || {
+        assemble_bundle_json(&bundle_query, generated_at_unix)
+    })
+    .await
 }
 
 /// The actual bound: runs `work` on a `spawn_blocking` thread and gives
@@ -119,29 +119,26 @@ fn finish_response(bundle: serde_json::Value, collection_mode: &str) -> Diagnost
 }
 
 /// The real, happy-path bundle -- synchronous by construction (every
-/// reader it calls into is itself synchronous), run inside `run_bounded`'s
-/// `spawn_blocking` worker. Shape matches the diagnostics bundle schema.
-fn assemble_bundle_sync(state: &DaemonState) -> serde_json::Value {
-    let links = crate::control_socket::list_link_statuses(state).unwrap_or_default();
-    let health = crate::control_socket::health_snapshot(state);
-    let volumes = crate::control_socket::volumes_free_space(state, &links);
-    let governance = state.governance_config.load_or_default();
-    let update_status = crate::update_ipc::status_response(state);
-    let install_channel = state.update_manager.platform_info().install_source.clone();
+/// port `DiagnosticsBundleQueryService` composes is itself synchronous),
+/// run inside `run_bounded`'s `spawn_blocking` worker. Shape matches the
+/// diagnostics bundle schema; this function's only job is turning the
+/// plain `DiagnosticsBundleSnapshot` into that exact JSON shape -- no
+/// state reads of its own.
+fn assemble_bundle_json(
+    bundle_query: &DiagnosticsBundleQueryService,
+    generated_at_unix: i64,
+) -> serde_json::Value {
+    encode_bundle_json(bundle_query.build(generated_at_unix))
+}
 
-    let bundle_links: Vec<serde_json::Value> = links
+/// `DiagnosticsBundleSnapshot` -> the diagnostics bundle JSON schema.
+fn encode_bundle_json(snapshot: DiagnosticsBundleSnapshot) -> serde_json::Value {
+    let bundle_links: Vec<serde_json::Value> = snapshot
+        .runtime
+        .links
         .iter()
         .enumerate()
         .map(|(i, link)| {
-            let state_label = if link.degraded {
-                "degraded"
-            } else if link.paused {
-                "paused"
-            } else if link.conflict_count > 0 {
-                "conflict"
-            } else {
-                "synced"
-            };
             let (path, _) = yadorilink_reporting::redact_diagnostics_text(&link.local_path);
             json!({
                 // Sequential, per-bundle pseudonyms -- not a hash of the
@@ -153,30 +150,31 @@ fn assemble_bundle_sync(state: &DaemonState) -> serde_json::Value {
                 // real identifier.
                 "link_id": format!("link:{:03}", i + 1),
                 "group_id": format!("group:{:03}", i + 1),
-                "state": state_label,
+                "state": link.state_label,
                 "path": path,
             })
         })
         .collect();
 
-    let task_health: Vec<serde_json::Value> = health
+    let task_health: Vec<serde_json::Value> = snapshot
+        .health
         .tasks
         .iter()
         .map(|t| json!({ "name": t.name, "state": if t.alive { "running" } else { "stopped" } }))
         .collect();
 
-    let disk_state = worst_volume_state(volumes.iter().map(|v| v.state.as_str()));
-    let limits_state = if governance.upload_limit_bytes_per_sec == 0
-        && governance.download_limit_bytes_per_sec == 0
-    {
-        "unlimited"
-    } else {
-        "limited"
-    };
+    let recent_errors: Vec<serde_json::Value> = snapshot
+        .logs
+        .recent_errors
+        .iter()
+        .map(|e| json!({ "category": e.category, "timestamp": e.timestamp, "context": e.context }))
+        .collect();
 
     json!({
         "schema_version": 1,
-        "generated_at": crate::reporting::time::now_rfc3339(),
+        "generated_at": crate::reporting::time::unix_seconds_to_rfc3339(
+            snapshot.generated_at_unix.max(0) as u64
+        ),
         "yadorilink_version": env!("CARGO_PKG_VERSION"),
         "platform": {
             "os_family": std::env::consts::OS,
@@ -185,24 +183,24 @@ fn assemble_bundle_sync(state: &DaemonState) -> serde_json::Value {
         },
         "daemon": {
             "reachable": true,
-            "uptime_bucket": uptime_bucket(state.uptime()),
+            "uptime_bucket": uptime_bucket(snapshot.runtime.uptime),
             "task_health": task_health,
         },
         "links": bundle_links,
-        "recent_errors": recent_error_entries(state),
+        "recent_errors": recent_errors,
         "updates": {
-            "state": update_status.state,
-            "channel": update_status.channel,
-            "available_version": update_status.available_version,
-            "mandatory": update_status.mandatory,
-            "holdback_reason": update_status.holdback_reason,
+            "state": snapshot.update.state,
+            "channel": snapshot.update.channel,
+            "available_version": snapshot.update.available_version,
+            "mandatory": snapshot.update.mandatory,
+            "holdback_reason": snapshot.update.holdback_reason,
         },
         "resources": {
-            "disk_state": disk_state,
-            "limits": limits_state,
+            "disk_state": snapshot.runtime.disk_state,
+            "limits": snapshot.runtime.limits_state,
         },
         "environment": {
-            "install_channel": install_channel,
+            "install_channel": snapshot.configuration.install_channel,
         },
         "redaction": {
             "version": 1,
@@ -264,68 +262,26 @@ fn uptime_bucket(uptime: Duration) -> &'static str {
     }
 }
 
-/// Worst-case classification across every volume `StatusResponse.volumes`
-/// reports (using the same `"ok" | "low" | "critical"` convention) --
-/// "unknown" when there's nothing to classify (no links, no block-store
-/// volume resolvable).
-fn worst_volume_state<'a>(states: impl Iterator<Item = &'a str>) -> &'static str {
-    let mut saw_any = false;
-    let mut worst = "ok";
-    for state in states {
-        saw_any = true;
-        if state == "critical" {
-            return "critical";
-        }
-        if state == "low" {
-            worst = "low";
-        }
-    }
-    if !saw_any {
-        return "unknown";
-    }
-    worst
-}
-
-/// Recent error categories/timestamps/context (the "recent errors"
-/// bundle section), sourced from the same error-candidate store
-/// `reporting_ipc::generate_last_error_report` already reads. A
-/// dedicated recent-error ring buffer hadn't landed yet at the time this
-/// was written, so this reuses the existing error-candidate store as the
-/// best available "recent errors" source rather than blocking on that.
-fn recent_error_entries(state: &DaemonState) -> Vec<serde_json::Value> {
-    let candidates = state.reporting.error_candidates();
-    let Ok(metas) = candidates.list() else { return Vec::new() };
-    metas
-        .into_iter()
-        .rev() // newest first -- `list()` returns oldest-first (entry_store's on-disk scan order)
-        .take(RECENT_ERRORS_SAMPLE_LIMIT)
-        .filter_map(|meta| {
-            let envelope = candidates.show(&meta.report_id).ok().flatten()?;
-            let ReportPayload::Error(err) = envelope.payload else { return None };
-            Some(json!({
-                "category": err.error_category,
-                "timestamp": envelope.generated_at,
-                "context": err.subsystem,
-            }))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_sync_core::index::SyncState;
+    use crate::replica_coordinator::ReplicaCoordinator;
 
     use super::*;
+    use crate::daemon_state::DaemonState;
 
     fn test_state() -> Arc<DaemonState> {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-        let sync_state = Arc::new(SyncState::open_in_memory().unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         DaemonState::new("device-a".into(), sync_state, store)
+    }
+
+    fn test_bundle_service(state: &Arc<DaemonState>) -> Arc<DiagnosticsBundleQueryService> {
+        crate::adapters::build_query_services(state.clone()).diagnostics_bundle.clone()
     }
 
     /// Diagnostics-specific redaction: a link whose local path carries a
@@ -338,14 +294,14 @@ mod tests {
     async fn daemon_bundle_redacts_a_real_linked_folder_path() {
         let state = test_state();
         state
-            .sync_state
-            .add_link(
+            .replica_coordinator
+            .link_repository().add_link(
                 "/Users/alice/Documents/secret-project",
                 "11111111-2222-3333-4444-555555555555",
             )
             .unwrap();
 
-        let resp = build_bundle(&state).await;
+        let resp = build_bundle(&test_bundle_service(&state)).await;
 
         assert_eq!(resp.collection_mode, "daemon");
         assert!(!resp.bundle_json.contains("/Users/alice"));
@@ -395,8 +351,8 @@ mod tests {
     #[tokio::test]
     async fn bundle_generation_is_bounded_even_if_a_sub_collection_hangs() {
         let state = test_state();
+        let bundle_service = test_bundle_service(&state);
         let short_timeout = Duration::from_millis(150);
-        let assemble_state = state.clone();
 
         let started = Instant::now();
         let resp = run_bounded(short_timeout, move || {
@@ -405,7 +361,7 @@ mod tests {
             // `short_timeout`, so this proves the *caller* doesn't wait
             // for it, not merely that the closure itself is slow.
             std::thread::sleep(Duration::from_secs(2));
-            assemble_bundle_sync(&assemble_state)
+            assemble_bundle_json(&bundle_service, 0)
         })
         .await;
         let elapsed = started.elapsed();
@@ -428,7 +384,7 @@ mod tests {
     #[tokio::test]
     async fn bundle_generation_reports_full_daemon_mode_when_not_bounded() {
         let state = test_state();
-        let resp = build_bundle(&state).await;
+        let resp = build_bundle(&test_bundle_service(&state)).await;
         assert_eq!(resp.collection_mode, "daemon");
     }
 }

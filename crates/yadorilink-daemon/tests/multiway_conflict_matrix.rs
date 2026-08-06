@@ -37,10 +37,10 @@ use std::time::Duration;
 
 use sha2::Digest;
 use support::{
-    open_file_backed_sync_state, real_entry_names, wait_until_with_context, TestAccount,
+    open_file_backed_replica_coordinator, real_entry_names, wait_until_with_context, TestAccount,
 };
+use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_daemon::link_manager;
 use yadorilink_local_storage::FsBlockStore;
 use yadorilink_transport::DeviceKeyPair;
 
@@ -55,7 +55,7 @@ struct TestDevice {
     root: tempfile::TempDir,
     _store_dir: tempfile::TempDir,
     // File-backed WAL (production's concurrency model) instead of
-    // open_in_memory's shared-cache backend — see open_file_backed_sync_state's
+    // open_in_memory's shared-cache backend — see open_file_backed_replica_coordinator's
     // doc comment. Held only to keep the backing temp file alive for the test's
     // duration.
     _index_dir: tempfile::TempDir,
@@ -66,7 +66,7 @@ async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
     let device_id = support::register_device(account, name, keypair.public_bytes()).await;
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-    let (sync_state, index_dir) = open_file_backed_sync_state();
+    let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
     let state = DaemonState::new(device_id.clone(), sync_state, store);
     // Give the device a change-signing key before its link watch starts, so the
@@ -84,8 +84,10 @@ async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
 
 async fn start_watching(device: &TestDevice, group_id: &str) {
     let local_path = device.root.path().to_string_lossy().to_string();
-    device.state.sync_state.add_link(&local_path, group_id).unwrap();
-    link_manager::start_link_watch(device.state.clone(), local_path, group_id.to_string()).unwrap();
+    device.state.replica_coordinator.link_repository().add_link(&local_path, group_id).unwrap();
+    LinkRuntimeController::new(device.state.clone())
+        .start(local_path, group_id.to_string())
+        .unwrap();
 }
 
 /// Pairs every device with every other over loopback (a full mesh), the

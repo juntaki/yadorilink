@@ -33,6 +33,7 @@ stun = { version = "0.17", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber.workspace = true
 
 # Windows-only: tighten a freshly written private-key file's DACL to the
 # current user with inheritance disabled (the practical equivalent of unix

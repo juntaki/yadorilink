@@ -1,0 +1,258 @@
+digraph "yadorilink-daemon_production" {
+    label="yadorilink-daemon PRODUCTION module coupling (crate:: reference counts, #[cfg(test)] blocks excluded)";
+    labelloc="t";
+    rankdir="LR";
+    node [shape=box, fontname="Helvetica"];
+    edge [fontname="Helvetica", fontsize=10];
+    // Excluded #[cfg(test)] blocks, by file (block count):
+    // adapters/runtime/enrollment_link.rs: 1
+    // adapters/runtime/link_runtime_controller.rs: 2
+    // application/enrollment_recovery_service.rs: 1
+    // application/enrollment_service.rs: 1
+    // application/materialization_service.rs: 1
+    // application/mod.rs: 1
+    // application/replica_membership_service.rs: 1
+    // application/replica_role_service.rs: 1
+    // change_auth.rs: 1
+    // change_policy.rs: 1
+    // connection_trace.rs: 1
+    // control_context.rs: 1
+    // control_socket.rs: 2
+    // convergence/backoff.rs: 1
+    // convergence/engine.rs: 1
+    // convergence/engine_wrapper.rs: 1
+    // daemon_state.rs: 7
+    // device_config.rs: 1
+    // diagnostics_ipc.rs: 1
+    // durability_service.rs: 2
+    // gc.rs: 1
+    // gc_state.rs: 1
+    // governance_config.rs: 1
+    // hydration.rs: 2
+    // link_registry.rs: 1
+    // link_runtime/operations/capture_local_change.rs: 1
+    // link_runtime/startup.rs: 1
+    // maintenance/membership_recovery.rs: 2
+    // metrics.rs: 1
+    // metrics_config.rs: 1
+    // peer_orchestrator.rs: 2
+    // rebootstrap_handler.rs: 1
+    // recent_errors.rs: 1
+    // recovery_diagnosis/identity.rs: 1
+    // recovery_diagnosis/mod.rs: 1
+    // recovery_diagnosis/service.rs: 1
+    // recovery_evidence.rs: 1
+    // reporting/consent_store.rs: 1
+    // reporting/counters.rs: 1
+    // reporting/entry_store.rs: 1
+    // reporting/environment.rs: 1
+    // reporting/error_candidates.rs: 1
+    // reporting/hooks.rs: 1
+    // reporting/mod.rs: 1
+    // reporting/queue.rs: 1
+    // reporting/time.rs: 1
+    // reporting_retry.rs: 1
+    // resource_lock.rs: 1
+    // root_commit_authority.rs: 2
+    // shell_status.rs: 1
+    // supervise.rs: 1
+    // transfer_progress.rs: 1
+    // update/install_macos.rs: 1
+    // update/install_windows.rs: 1
+    // update/manager.rs: 1
+    // update/manifest.rs: 2
+    // update/policy.rs: 1
+    // update/verify.rs: 1
+    "adapters";
+    "app";
+    "application";
+    "change_auth";
+    "change_policy";
+    "connection_trace";
+    "control_context";
+    "control_socket";
+    "convergence";
+    "coordination_client";
+    "daemon_runtime";
+    "daemon_state";
+    "device_config";
+    "diagnostics_ipc";
+    "durability_service";
+    "error";
+    "gc";
+    "gc_state";
+    "governance_config";
+    "hydration";
+    "link_registry";
+    "link_runtime";
+    "maintenance";
+    "maintenance_coordinator";
+    "metrics";
+    "metrics_config";
+    "nat_traversal";
+    "peer_orchestrator";
+    "peer_registry";
+    "placeholder_backend_windows";
+    "queries";
+    "rebootstrap_handler";
+    "recent_errors";
+    "recovery_diagnosis";
+    "recovery_evidence";
+    "reporting";
+    "reporting_ipc";
+    "reporting_retry";
+    "resource_lock";
+    "root_commit_authority";
+    "runtime_telemetry";
+    "shell_ipc";
+    "shell_status";
+    "supervise";
+    "token_store";
+    "transfer_progress";
+    "update";
+    "update_ipc";
+    "windows_pipe_security";
+    "adapters" -> "application" [label="27", penwidth=4.50];
+    "adapters" -> "coordination_client" [label="9", penwidth=2.85];
+    "adapters" -> "daemon_state" [label="27", penwidth=4.50];
+    "adapters" -> "durability_service" [label="1", penwidth=1.65];
+    "adapters" -> "error" [label="2", penwidth=1.80];
+    "adapters" -> "gc" [label="1", penwidth=1.65];
+    "adapters" -> "governance_config" [label="2", penwidth=1.80];
+    "adapters" -> "hydration" [label="2", penwidth=1.80];
+    "adapters" -> "link_registry" [label="1", penwidth=1.65];
+    "adapters" -> "link_runtime" [label="5", penwidth=2.25];
+    "adapters" -> "queries" [label="25", penwidth=4.50];
+    "adapters" -> "reporting" [label="2", penwidth=1.80];
+    "adapters" -> "update" [label="3", penwidth=1.95];
+    "app" -> "adapters" [label="3", penwidth=1.95];
+    "app" -> "control_context" [label="1", penwidth=1.65];
+    "app" -> "coordination_client" [label="1", penwidth=1.65];
+    "app" -> "daemon_state" [label="3", penwidth=1.95];
+    "app" -> "device_config" [label="1", penwidth=1.65];
+    "app" -> "link_registry" [label="2", penwidth=1.80];
+    "app" -> "maintenance_coordinator" [label="1", penwidth=1.65];
+    "app" -> "metrics" [label="2", penwidth=1.80];
+    "app" -> "metrics_config" [label="1", penwidth=1.65];
+    "app" -> "nat_traversal" [label="1", penwidth=1.65];
+    "app" -> "reporting" [label="3", penwidth=1.95];
+    "app" -> "resource_lock" [label="1", penwidth=1.65];
+    "app" -> "supervise" [label="5", penwidth=2.25];
+    "app" -> "update" [label="2", penwidth=1.80];
+    "application" -> "error" [label="2", penwidth=1.80];
+    "application" -> "governance_config" [label="1", penwidth=1.65];
+    "application" -> "update" [label="1", penwidth=1.65];
+    "change_auth" -> "daemon_state" [label="1", penwidth=1.65];
+    "change_auth" -> "device_config" [label="1", penwidth=1.65];
+    "connection_trace" -> "reporting" [label="1", penwidth=1.65];
+    "connection_trace" -> "runtime_telemetry" [label="1", penwidth=1.65];
+    "control_context" -> "adapters" [label="3", penwidth=1.95];
+    "control_context" -> "daemon_state" [label="1", penwidth=1.65];
+    "control_socket" -> "adapters" [label="1", penwidth=1.65];
+    "control_socket" -> "application" [label="15", penwidth=3.75];
+    "control_socket" -> "control_context" [label="4", penwidth=2.10];
+    "control_socket" -> "diagnostics_ipc" [label="2", penwidth=1.80];
+    "control_socket" -> "durability_service" [label="2", penwidth=1.80];
+    "control_socket" -> "peer_registry" [label="2", penwidth=1.80];
+    "control_socket" -> "queries" [label="11", penwidth=3.15];
+    "control_socket" -> "recovery_diagnosis" [label="4", penwidth=2.10];
+    "control_socket" -> "reporting" [label="1", penwidth=1.65];
+    "control_socket" -> "reporting_ipc" [label="1", penwidth=1.65];
+    "control_socket" -> "update_ipc" [label="6", penwidth=2.40];
+    "control_socket" -> "windows_pipe_security" [label="1", penwidth=1.65];
+    "convergence" -> "daemon_state" [label="2", penwidth=1.80];
+    "convergence" -> "hydration" [label="2", penwidth=1.80];
+    "coordination_client" -> "application" [label="1", penwidth=1.65];
+    "daemon_runtime" -> "daemon_state" [label="1", penwidth=1.65];
+    "daemon_runtime" -> "durability_service" [label="1", penwidth=1.65];
+    "daemon_runtime" -> "link_registry" [label="1", penwidth=1.65];
+    "daemon_runtime" -> "maintenance_coordinator" [label="1", penwidth=1.65];
+    "daemon_runtime" -> "peer_registry" [label="1", penwidth=1.65];
+    "daemon_runtime" -> "runtime_telemetry" [label="1", penwidth=1.65];
+    "daemon_state" -> "adapters" [label="2", penwidth=1.80];
+    "daemon_state" -> "change_policy" [label="1", penwidth=1.65];
+    "daemon_state" -> "coordination_client" [label="6", penwidth=2.40];
+    "daemon_state" -> "daemon_runtime" [label="1", penwidth=1.65];
+    "daemon_state" -> "device_config" [label="1", penwidth=1.65];
+    "daemon_state" -> "durability_service" [label="4", penwidth=2.10];
+    "daemon_state" -> "governance_config" [label="1", penwidth=1.65];
+    "daemon_state" -> "link_registry" [label="4", penwidth=2.10];
+    "daemon_state" -> "link_runtime" [label="5", penwidth=2.25];
+    "daemon_state" -> "maintenance_coordinator" [label="1", penwidth=1.65];
+    "daemon_state" -> "peer_registry" [label="3", penwidth=1.95];
+    "daemon_state" -> "reporting" [label="1", penwidth=1.65];
+    "daemon_state" -> "supervise" [label="1", penwidth=1.65];
+    "diagnostics_ipc" -> "queries" [label="2", penwidth=1.80];
+    "diagnostics_ipc" -> "reporting" [label="3", penwidth=1.95];
+    "gc" -> "daemon_state" [label="1", penwidth=1.65];
+    "hydration" -> "daemon_state" [label="1", penwidth=1.65];
+    "hydration" -> "recent_errors" [label="2", penwidth=1.80];
+    "hydration" -> "transfer_progress" [label="2", penwidth=1.80];
+    "link_registry" -> "error" [label="1", penwidth=1.65];
+    "link_registry" -> "link_runtime" [label="1", penwidth=1.65];
+    "link_runtime" -> "error" [label="1", penwidth=1.65];
+    "link_runtime" -> "link_registry" [label="2", penwidth=1.80];
+    "link_runtime" -> "runtime_telemetry" [label="1", penwidth=1.65];
+    "maintenance" -> "adapters" [label="2", penwidth=1.80];
+    "maintenance" -> "daemon_state" [label="4", penwidth=2.10];
+    "maintenance" -> "gc" [label="6", penwidth=2.40];
+    "maintenance" -> "update" [label="2", penwidth=1.80];
+    "maintenance_coordinator" -> "adapters" [label="1", penwidth=1.65];
+    "maintenance_coordinator" -> "convergence" [label="1", penwidth=1.65];
+    "maintenance_coordinator" -> "daemon_state" [label="1", penwidth=1.65];
+    "maintenance_coordinator" -> "gc" [label="1", penwidth=1.65];
+    "maintenance_coordinator" -> "maintenance" [label="10", penwidth=3.00];
+    "maintenance_coordinator" -> "reporting_retry" [label="1", penwidth=1.65];
+    "maintenance_coordinator" -> "supervise" [label="3", penwidth=1.95];
+    "metrics" -> "daemon_state" [label="1", penwidth=1.65];
+    "nat_traversal" -> "coordination_client" [label="1", penwidth=1.65];
+    "nat_traversal" -> "daemon_state" [label="2", penwidth=1.80];
+    "nat_traversal" -> "device_config" [label="1", penwidth=1.65];
+    "peer_orchestrator" -> "change_auth" [label="3", penwidth=1.95];
+    "peer_orchestrator" -> "change_policy" [label="8", penwidth=2.70];
+    "peer_orchestrator" -> "connection_trace" [label="1", penwidth=1.65];
+    "peer_orchestrator" -> "coordination_client" [label="2", penwidth=1.80];
+    "peer_orchestrator" -> "daemon_state" [label="1", penwidth=1.65];
+    "peer_orchestrator" -> "device_config" [label="1", penwidth=1.65];
+    "peer_orchestrator" -> "error" [label="1", penwidth=1.65];
+    "peer_orchestrator" -> "peer_registry" [label="1", penwidth=1.65];
+    "peer_orchestrator" -> "rebootstrap_handler" [label="2", penwidth=1.80];
+    "peer_orchestrator" -> "supervise" [label="2", penwidth=1.80];
+    "queries" -> "connection_trace" [label="3", penwidth=1.95];
+    "queries" -> "coordination_client" [label="1", penwidth=1.65];
+    "queries" -> "durability_service" [label="1", penwidth=1.65];
+    "queries" -> "gc_state" [label="1", penwidth=1.65];
+    "queries" -> "governance_config" [label="2", penwidth=1.80];
+    "queries" -> "peer_registry" [label="2", penwidth=1.80];
+    "queries" -> "recovery_diagnosis" [label="2", penwidth=1.80];
+    "queries" -> "recovery_evidence" [label="1", penwidth=1.65];
+    "queries" -> "reporting" [label="1", penwidth=1.65];
+    "queries" -> "runtime_telemetry" [label="3", penwidth=1.95];
+    "queries" -> "shell_status" [label="1", penwidth=1.65];
+    "queries" -> "transfer_progress" [label="1", penwidth=1.65];
+    "queries" -> "update" [label="2", penwidth=1.80];
+    "rebootstrap_handler" -> "change_auth" [label="1", penwidth=1.65];
+    "rebootstrap_handler" -> "daemon_state" [label="1", penwidth=1.65];
+    "recent_errors" -> "transfer_progress" [label="1", penwidth=1.65];
+    "recovery_diagnosis" -> "application" [label="2", penwidth=1.80];
+    "recovery_diagnosis" -> "coordination_client" [label="6", penwidth=2.40];
+    "recovery_diagnosis" -> "recovery_evidence" [label="7", penwidth=2.55];
+    "recovery_evidence" -> "coordination_client" [label="2", penwidth=1.80];
+    "reporting" -> "device_config" [label="1", penwidth=1.65];
+    "reporting" -> "error" [label="2", penwidth=1.80];
+    "reporting_ipc" -> "application" [label="2", penwidth=1.80];
+    "reporting_retry" -> "daemon_state" [label="1", penwidth=1.65];
+    "reporting_retry" -> "maintenance" [label="1", penwidth=1.65];
+    "reporting_retry" -> "supervise" [label="1", penwidth=1.65];
+    "resource_lock" -> "app" [label="1", penwidth=1.65];
+    "root_commit_authority" -> "daemon_state" [label="1", penwidth=1.65];
+    "runtime_telemetry" -> "connection_trace" [label="3", penwidth=1.95];
+    "runtime_telemetry" -> "recent_errors" [label="3", penwidth=1.95];
+    "runtime_telemetry" -> "transfer_progress" [label="3", penwidth=1.95];
+    "shell_ipc" -> "daemon_state" [label="3", penwidth=1.95];
+    "shell_ipc" -> "hydration" [label="1", penwidth=1.65];
+    "shell_ipc" -> "shell_status" [label="1", penwidth=1.65];
+    "shell_ipc" -> "windows_pipe_security" [label="1", penwidth=1.65];
+    "update_ipc" -> "application" [label="3", penwidth=1.95];
+    "update_ipc" -> "queries" [label="3", penwidth=1.95];
+}

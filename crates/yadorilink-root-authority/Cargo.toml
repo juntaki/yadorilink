@@ -1,0 +1,80 @@
+[package]
+name = "yadorilink-root-authority"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# See yadorilink-local-storage/Cargo.toml's identical section for why.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
+
+[features]
+# Exposes RootCommitPermit::for_tests()/RootLease::for_tests() to OTHER
+# crates' test builds -- same shape as yadorilink-sync-core's own
+# test-support feature.
+test-support = []
+
+[dependencies]
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+thiserror.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+serde.workspace = true
+# `root_identity.rs`'s on-disk marker (plain, human-legible JSON).
+serde_json = "1"
+# `root_identity.rs`'s opaque root-token minting.
+rand = "0.10.2"
+hex = "0.4"
+# `sync_root_lock`'s OS advisory exclusive lock (`flock`/`LockFileEx`) --
+# same dependency yadorilink-sync-core/yadorilink-daemon/
+# yadorilink-desktop-app/yadorilink-local-storage already use for the
+# equivalent daemon-instance and block-store locks.
+fs2 = "0.4"
+# `canonical_fold`'s NFC/case-fold combined equivalence key.
+unicode-normalization = "0.1"
+caseless = "0.2.2"
+
+[dev-dependencies]
+tempfile = "3"
+# This crate's own `tests/*.rs` integration binaries link against
+# `yadorilink-root-authority` as an ordinary external library, so
+# `cfg(test)` is never active for it there -- `RootCommitPermit::for_tests`/
+# `read_root_marker_for_test`/`write_root_marker_for_test` (all
+# `#[cfg(any(test, feature = "test-support"))]`) need this self-referencing
+# dev-dependency to enable the feature half of that gate. Mirrors
+# `yadorilink-sync-core`'s own identical self-dependency override.
+yadorilink-root-authority = { path = ".", features = ["test-support"] }
+# `tests/root_identity_verification.rs` (moved from `yadorilink-sync-core`
+# in Phase 7D-10.4, repointed off `SyncState` in Phase 7D-10's final
+# sync-core deletion pass) exercises `VerifiedRoot`/`RootCommitPermit`
+# against a real `ReplicaCoordinator`, which is the only concrete
+# `RootVerificationStatePort`/`FileIndexRepository` implementer available --
+# `yadorilink-daemon` owns that construction (`ReplicaCoordinator::open`/
+# `open_in_memory`) and the test-only fixture helpers this test needs
+# (`add_link_with_pending_enrollment_for_test`,
+# `force_second_live_link_for_test`,
+# `link_root_tokens_for_group_unchecked_for_test`, all
+# `#[cfg(any(test, feature = "test-support"))]` there). This is a
+# dev-only back-edge against `yadorilink-daemon`'s own normal (non-dev)
+# dependency on this crate -- the same shape `yadorilink-local-capture`'s own
+# dev-dependency on `yadorilink-daemon` already uses for its own fixtures.
+yadorilink-daemon = { path = "../yadorilink-daemon", features = ["test-support"] }
+# `yadorilink-replica-domain` (`FileRecord`/`BlockInfo` fixtures) and `sha2`
+# (`the_live_root_does_not_inherit_the_orphaned_roots_token`'s content hash)
+# are already ordinary [dependencies] above, so no dev-dependency override
+# is needed for either.
+
+# `RootLease`'s stop/drain gate uses `tokio::sync::Notify`; swapped for
+# madsim's shim only under the deterministic-simulation test binary, same
+# as every other crate that needs this split.
+[target.'cfg(not(madsim))'.dependencies]
+tokio.workspace = true
+
+[target.'cfg(madsim)'.dependencies]
+tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }
+
+# `sync_root_lock`'s `openat`/`O_NOFOLLOW`/`mkfifo` real-syscall probes for
+# a symlink-safe, race-free lock-file open -- same version pin as
+# yadorilink-sync-core's existing libc dependency.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

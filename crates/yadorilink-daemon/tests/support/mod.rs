@@ -21,9 +21,9 @@ use std::sync::Arc;
 use boringtun::x25519::{PublicKey, StaticSecret};
 use yadorilink_daemon::change_policy::{verify_group_policy_log, GroupPolicyLog, GroupPolicyState};
 use yadorilink_daemon::daemon_state::DaemonState;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::{BlockStore, ContentHash, FsBlockStore, GcReport, StorageError};
-use yadorilink_sync_core::index::SyncState;
-use yadorilink_sync_core::peer_session::PeerSyncSession;
+use yadorilink_peer_session::peer_session::{PeerSyncSession, PeerSyncSessionDeps};
 use yadorilink_transport::{public_key_from_bytes, PeerChannel, TransportHub};
 
 pub mod fake_coordination;
@@ -39,7 +39,7 @@ use fake_coordination::FakeCoordination;
 /// `peer_orchestrator::run` as its `DeviceKeyPair`'s public bytes — so a peer
 /// dialing the endpoint completes the handshake against a matching key.
 ///
-/// Call this before `spawn_orchestrator` and before `link_manager::
+/// Call this before `spawn_orchestrator` and before `LinkRuntimeController::
 /// start_link_watch` for the daemon.
 #[allow(dead_code)]
 pub async fn register_with_fake(
@@ -192,6 +192,69 @@ where
     }
 }
 
+/// Like `wait_until_with_context`, but distinguishes a scenario that is
+/// genuinely still making forward progress (just slowly, e.g. a heavy
+/// multi-device conflict-collision scenario legitimately needing minutes to
+/// converge under real disk/CPU contention) from one that has stopped
+/// making progress entirely (a deadlock, a livelock, or a retry-amplification
+/// loop) -- the two look identical to a single flat deadline, which forces a
+/// choice between "generous enough for the slow-but-healthy case" and "tight
+/// enough to catch a genuine stall quickly," when what's actually wanted is
+/// both at once.
+///
+/// `progress` is polled alongside `cond` on the same cadence and must return
+/// a value that changes whenever the scenario has moved forward at all (a
+/// hash/snapshot of accumulated state works well; a monotonic counter is
+/// fine too) -- it is *not* required to reach any particular value, only to
+/// change while real progress is happening. `stall_timeout` bounds how long
+/// `progress`'s value may stay identical before this panics as stalled, reset
+/// every time it changes; `absolute_timeout` is the hard overall ceiling
+/// regardless of how recently progress last moved, so a scenario that keeps
+/// making just-barely-enough progress to dodge the stall check indefinitely
+/// still cannot run forever.
+#[allow(dead_code)]
+pub async fn wait_until_or_stalled<F, Prog, P, C>(
+    cond: F,
+    mut progress: Prog,
+    absolute_timeout: std::time::Duration,
+    stall_timeout: std::time::Duration,
+    context: C,
+) where
+    F: Fn() -> bool,
+    Prog: FnMut() -> P,
+    P: PartialEq,
+    C: Fn() -> String,
+{
+    let started = tokio::time::Instant::now();
+    let absolute_deadline = started + absolute_timeout;
+    let mut last_progress_value = progress();
+    let mut last_progress_at = started;
+    while !cond() {
+        let now = tokio::time::Instant::now();
+        if now > absolute_deadline {
+            panic!(
+                "condition never became true within the absolute {absolute_timeout:?} deadline \
+                 (elapsed {:?}):\n{}",
+                started.elapsed(),
+                context()
+            );
+        }
+        let current = progress();
+        if current != last_progress_value {
+            last_progress_value = current;
+            last_progress_at = now;
+        } else if now.duration_since(last_progress_at) > stall_timeout {
+            panic!(
+                "convergence stalled: no progress for over {stall_timeout:?} ({:?} elapsed of the \
+                 {absolute_timeout:?} absolute budget):\n{}",
+                started.elapsed(),
+                context()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// A compact daemon-state status summary for E2E timeout diagnostics —
 /// the connected peer session ids. Deliberately limited to ids: no file
 /// contents, no secret keys/tokens, no raw paths beyond the caller's own
@@ -199,7 +262,7 @@ where
 #[allow(dead_code)]
 pub fn daemon_status_summary(state: &DaemonState) -> String {
     let session_ids: Vec<String> =
-        state.sessions.lock().unwrap_or_else(|p| p.into_inner()).keys().cloned().collect();
+        state.peers.all_sessions().into_iter().map(|(id, _)| id).collect();
     format!("connected_sessions={session_ids:?}")
 }
 
@@ -208,7 +271,9 @@ pub fn daemon_status_summary(state: &DaemonState) -> String {
 /// otherwise inflate a raw directory-entry count:
 /// - the `<name>.yadorilink-tmp.<pid>.<n>` write-then-rename temp used while
 ///   materializing every received file, and
-/// - the `.yl-case-probe-<pid>-<n>` case-fold-collision probe file.
+/// - any reserved-namespace artefact (`.yadorilink-v1-<kind>.<id>`),
+///   including the scratch directories the case-fold and normalization
+///   filesystem-behaviour probes create and remove.
 ///
 /// Multi-device tests syncing into a shared root can race either window with
 /// their own directory listing — use this instead of a raw `read_dir` count
@@ -219,11 +284,16 @@ pub fn real_entry_names(dir: &std::path::Path) -> Vec<String> {
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
+                .filter(|e| {
+                    !yadorilink_root_authority::reserved_namespace::is_reserved_component(
+                        e.file_name().as_os_str(),
+                    )
+                })
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .filter(|n| {
-                    n != yadorilink_sync_core::root_identity::ROOT_MARKER_FILE_NAME
+                    n != yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME
+                        && n != yadorilink_root_authority::sync_root_lock::SYNC_ROOT_LOCK_FILE_NAME
                         && !n.contains(".yadorilink-tmp.")
-                        && !n.starts_with(".yl-case-probe-")
                 })
                 .collect()
         })
@@ -244,9 +314,9 @@ pub fn real_entry_names(dir: &std::path::Path) -> Vec<String> {
 /// file; the caller must keep the guard alive for as long as the `SyncState`
 /// is in use.
 #[allow(dead_code)]
-pub fn open_file_backed_sync_state() -> (SyncState, tempfile::TempDir) {
+pub fn open_file_backed_replica_coordinator() -> (ReplicaCoordinator, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let state = SyncState::open(dir.path().join("index.db")).unwrap();
+    let state = ReplicaCoordinator::open(dir.path().join("index.db")).unwrap();
     (state, dir)
 }
 
@@ -269,6 +339,94 @@ pub async fn connect_two_daemons(
     device_b_id: &str,
     shared_group_ids: &[String],
 ) {
+    // Discards the session tasks' `JoinHandle`s: every existing caller pairs a
+    // fixed, small set of devices once per test process and lets the process
+    // exit, so an unbounded `PeerSyncSession::run()` task per pairing is not a
+    // leak in practice. A caller that runs many short-lived pairings in a
+    // loop -- and so needs to actually bound how much accumulates -- wants
+    // `connect_two_daemons_with_handles` instead; see its doc comment.
+    let _handles = connect_two_daemons_with_handles(
+        state_a,
+        device_a_id,
+        state_b,
+        device_b_id,
+        shared_group_ids,
+    )
+    .await;
+}
+
+/// Like [`connect_two_daemons`], but also returns the two spawned
+/// `PeerSyncSession::run()` tasks' `JoinHandle`s.
+///
+/// `spawn_paired_session`'s spawned task holds a *strong* `Arc<PeerSyncSession>`
+/// (deliberately -- see its own `resync_handle`'s doc comment on why that
+/// inner task holds only a `Weak` one), and through the session, strong
+/// references to `DaemonState` (via `set_pending_local_change_flush`/
+/// `set_change_authenticator`/etc.), its `SyncState` connection pool, and
+/// everything reachable from those. Nothing about `connect_two_daemons`
+/// closes the channel or aborts that task, so it runs for the rest of the
+/// process. Fine for a test that pairs its (small, fixed) device set once;
+/// a test that calls this inside a loop -- pairing a fresh device set per
+/// iteration, as `monkey_chaos.rs`'s `replay_known_failing_seeds` does per
+/// corpus seed -- leaks a full daemon mesh's worth of tasks, SQLite pools,
+/// and periodic timers *per iteration*, with nothing ever torn down between
+/// them. Confirmed as the actual cause of a real CI failure: the second of
+/// two corpus seeds failed DAG handshake negotiation within its 10s budget,
+/// with the first seed's entire 4-device mesh (12 session tasks, their
+/// watcher/debounce/executor/repair tasks, and four SQLite pools) still
+/// running underneath it and competing for the same process's CPU/disk.
+/// A caller in that shape should abort the returned handles (and call
+/// `LinkRuntimeController::stop` for each device's link) once each
+/// iteration is done -- ideally from an RAII guard, since a panic mid-
+/// iteration must still tear the mesh down before the next one starts.
+#[allow(dead_code)]
+pub async fn connect_two_daemons_with_handles(
+    state_a: &Arc<DaemonState>,
+    device_a_id: &str,
+    state_b: &Arc<DaemonState>,
+    device_b_id: &str,
+    shared_group_ids: &[String],
+) -> [tokio::task::JoinHandle<()>; 2] {
+    let (handles, _channels) = connect_two_daemons_with_channels(
+        state_a,
+        device_a_id,
+        state_b,
+        device_b_id,
+        shared_group_ids,
+    )
+    .await;
+    handles
+}
+
+/// Like [`connect_two_daemons_with_handles`], but also returns the two
+/// underlying `Arc<PeerChannel>`s so a caller can later call
+/// [`PeerChannel::revoke`] on each to cleanly sever the pairing.
+///
+/// `revoke()` is the real disconnect primitive, unlike `JoinHandle::abort()`
+/// on the returned session tasks: `PeerSyncSession::run` spawns its own
+/// internal child tasks (`resync_handle`/`handshake_retry_handle`/
+/// `credit_hint_refresh_handle`), which only get torn down by `run`'s own
+/// exit cleanup -- itself only reached once its `recv()` loop observes the
+/// channel close. Aborting the outer task skips that cleanup and orphans
+/// those child tasks, which keep running and keep re-announcing this
+/// device's DAG state to the (still-live) peer channel -- confirmed,
+/// reproduced (see `exec_bit_metadata_conflict.rs`'s PR #31 review
+/// addendum). `revoke()` makes `recv()` return `None`, which `run()`
+/// already treats as "the session ended," so its real exit path (and the
+/// child-task cleanup it performs) runs normally. A caller that needs a
+/// clean disconnect -- e.g. to construct a genuine, isolated concurrent-
+/// history divergence on a file both devices already share -- should call
+/// this instead of [`connect_two_daemons_with_handles`], hold onto the
+/// returned channels, and `revoke()` both before making any edit meant to
+/// be isolated from the peer.
+#[allow(dead_code)]
+pub async fn connect_two_daemons_with_channels(
+    state_a: &Arc<DaemonState>,
+    device_a_id: &str,
+    state_b: &Arc<DaemonState>,
+    device_b_id: &str,
+    shared_group_ids: &[String],
+) -> ([tokio::task::JoinHandle<()>; 2], [Arc<PeerChannel>; 2]) {
     // Direct-pairing tests stand in for the coordination plane, so install the
     // verified empty policy snapshot that plane supplies during a group's
     // bootstrap phase. A linked group is intentionally fail-closed when its
@@ -290,8 +448,8 @@ pub async fn connect_two_daemons(
     // `session_index` must be unique per live channel on a device; the number
     // of sessions already established on each side is a monotonic, collision-
     // free choice for the sequential pairing these tests do.
-    let index_a = state_a.sessions.lock().unwrap_or_else(|p| p.into_inner()).len() as u32;
-    let index_b = state_b.sessions.lock().unwrap_or_else(|p| p.into_inner()).len() as u32;
+    let index_a = state_a.peers.session_count() as u32;
+    let index_b = state_b.peers.session_count() as u32;
 
     // Each side must pin the other's change-signing verifying key so incoming
     // DAG changes verify (the receiver checks every change's signature against
@@ -309,19 +467,19 @@ pub async fn connect_two_daemons(
     let channel_b = Arc::new(
         PeerChannel::connect(secret_b, public_a, index_b, vec![addr_a], shared_b).await.unwrap(),
     );
-    let session_a = spawn_paired_session(
+    let (session_a, handle_a) = spawn_paired_session(
         state_a,
         device_a_id,
         device_b_id,
-        channel_a,
+        channel_a.clone(),
         shared_group_ids,
         verifying_b,
     );
-    let session_b = spawn_paired_session(
+    let (session_b, handle_b) = spawn_paired_session(
         state_b,
         device_b_id,
         device_a_id,
-        channel_b,
+        channel_b.clone(),
         shared_group_ids,
         verifying_a,
     );
@@ -338,32 +496,73 @@ pub async fn connect_two_daemons(
         std::time::Duration::from_secs(10),
     )
     .await;
+
+    ([handle_a, handle_b], [channel_a, channel_b])
+}
+
+/// Installs the empty, verified bootstrap policy snapshot `connect_two_
+/// daemons`/`connect_two_daemons_with_handles` normally install as part of
+/// pairing two devices. Exposed as its own `pub` entry point (not just a
+/// side effect of connecting) so a test that deliberately wants local DAG
+/// emission live on a device BEFORE that device is ever connected to a
+/// peer -- e.g. to prove two devices produce genuinely independent local
+/// `Change`s with no possibility of racing a live wire connection -- can
+/// get there without connecting first. Without this, local DAG emission is
+/// withheld entirely (a linked group is intentionally fail-closed when its
+/// policy is absent — see this function's own body), so an unconnected
+/// device's local edits would never be captured at all, not merely slower.
+#[allow(dead_code)]
+pub fn install_bootstrap_policy(state: &DaemonState, group_ids: &[String]) {
+    install_bootstrap_policies(state, group_ids);
 }
 
 fn install_bootstrap_policies(state: &DaemonState, group_ids: &[String]) {
     let service_key = [1u8; 32];
-    let policies: HashMap<String, GroupPolicyState> = group_ids
-        .iter()
-        .map(|group_id| {
-            let log = GroupPolicyLog {
-                group_id: group_id.clone(),
-                current_seq: 0,
-                current_epoch: 0,
-                policy_head: vec![0; 32],
-                records: Vec::new(),
-            };
-            let policy = verify_group_policy_log(&service_key, &log)
-                .expect("empty bootstrap policy must verify");
-            (group_id.clone(), policy)
+    // `replace_group_policy_states` is a wholesale replace (production
+    // semantics: a full netmap resync legitimately wants to discard
+    // whatever was there before). A test device that connects to more than
+    // one peer -- each `connect_two_daemons` call reaching this helper with
+    // only THAT pairing's `shared_group_ids` -- must not have an EARLIER
+    // pairing's groups silently wiped out by a LATER, narrower call:
+    // confirmed, reproduced (`stage2_block_serve_contract.rs`'s
+    // `late_small_requests_from_another_peer_and_group_cut_ahead_of_a_
+    // large_backlog`): a source connecting to peer-a for [A, B] then to
+    // peer-b for [A] lost B's policy the instant the second call ran,
+    // withholding group B from every session (including peer-a's) from
+    // that point on. Preserve every already-linked group's existing policy
+    // (if any) by re-installing it alongside the new ones, rather than
+    // starting from an empty map.
+    let mut policies: HashMap<String, GroupPolicyState> = state
+        .replica_coordinator
+        .link_repository().list_links()
+        .map(|links| {
+            links
+                .into_iter()
+                .filter_map(|link| {
+                    state.group_policy_state(&link.group_id).map(|p| (link.group_id, p))
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
+    for group_id in group_ids {
+        let log = GroupPolicyLog {
+            group_id: group_id.clone(),
+            current_seq: 0,
+            current_epoch: 0,
+            policy_head: vec![0; 32],
+            records: Vec::new(),
+        };
+        let policy = verify_group_policy_log(&service_key, &log)
+            .expect("empty bootstrap policy must verify");
+        policies.insert(group_id.clone(), policy);
+    }
     state.replace_group_policy_states(policies);
 }
 
 /// Ensures `state` has a change-signing key (generating one if absent) and
 /// returns its verifying (public) key bytes — the value a peer pins so this
 /// device's DAG changes verify. Call this at device setup, before
-/// `link_manager::start_link_watch`: the change-DAG emitter is wired from the
+/// `LinkRuntimeController::start`: the change-DAG emitter is wired from the
 /// signing key when the link watch starts, so a key set afterward would leave
 /// emission off and nothing would propagate.
 #[allow(dead_code)]
@@ -530,7 +729,7 @@ fn spawn_paired_session(
     channel: Arc<PeerChannel>,
     shared_group_ids: &[String],
     peer_verifying_key: [u8; 32],
-) -> Arc<PeerSyncSession> {
+) -> (Arc<PeerSyncSession>, tokio::task::JoinHandle<()>) {
     // Mirror the netmap-derived authorization the real orchestrator installs
     // (`record_peer_change_authz`): pin the peer's actual change-signing key so
     // its changes' signatures verify, and mark it a writer for every shared
@@ -544,52 +743,93 @@ fn spawn_paired_session(
     }
 
     let sync_roots = sync_roots_for_groups(state, shared_group_ids);
-    let session = PeerSyncSession::new_with_forwarding(
+    let session = PeerSyncSession::new_with_dependencies(
         channel,
         local_device_id.to_string(),
         peer_device_id.to_string(),
-        state.sync_state.clone(),
-        state.block_store.clone(),
+        state.replica_coordinator.clone(),
+        std::sync::Arc::new(yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            state.block_store.clone(),
+        )),
         shared_group_ids.to_vec(),
         sync_roots,
         Some(state.forward_tx.clone()),
+        // Mirrors production's `peer_orchestrator.rs` wiring for these 4
+        // one-time capabilities so a test pairing built with this helper
+        // answers exactly like a real daemon would: `handoff_lease_
+        // responder`/`handoff_ticket_responder` are subject to `state`
+        // itself having coordination-plane config recorded (see
+        // `DaemonState::request_handoff_lease`'s doc comment for when they
+        // still decline).
+        PeerSyncSessionDeps {
+            pending_local_change_flush: state.clone(),
+            change_authenticator: yadorilink_daemon::change_auth::NetmapChangeAuthenticator::new(
+                state.clone(),
+            ),
+            handoff_lease_responder: state.clone(),
+            handoff_ticket_responder: state.clone(),
+            // Mirrors production's `peer_orchestrator.rs` wiring for this
+            // one-time capability too -- `DaemonState` implements
+            // `RootCommitAuthorityProvider` directly. Missing this left every
+            // caller of this helper on `PeerSyncSessionDeps::standalone()`'s
+            // deny-by-default provider, so every unapplied-change projection
+            // attempt failed closed with "no live root-commit authority ...
+            // no provider injected" forever, no matter how long the test
+            // waited -- not a convergence bug, a construction gap in this
+            // helper alone.
+            root_commit_authority_provider: state.clone(),
+            ..PeerSyncSessionDeps::standalone()
+        },
     );
     session.set_rate_limiters(state.rate_limiters.clone());
+    // Mirrors production's `peer_orchestrator.rs` wiring: without this, a
+    // test pairing built with this helper never advertises
+    // `supports_block_serve_credit` and always falls back to the legacy
+    // `BlockResponse` path, silently never exercising stage 2's
+    // credit-gated/coalesced serving at all.
+    session.set_block_serve_engine(state.block_serve_engine.clone());
     // Integration tests deliberately generate dense concurrent bursts over
     // lossy loopback UDP. Re-announce the DAG frontier at a test cadence so a
     // dropped one-shot HeadsAnnounce is retried within the assertion budget;
     // this is the same anti-entropy mechanism production runs every 90s.
     session.set_full_index_resync_interval(std::time::Duration::from_secs(1));
+    // Same rationale, for the daemon-level (not per-session) materialization-
+    // repair backstop (`DaemonState::set_materialization_repair_sweep_
+    // interval`): a heavy multi-device test can legitimately run out of
+    // organic retry triggers (no new local write, no incoming traffic) for
+    // a stretch and have only this periodic sweep left to re-drive a change
+    // still unapplied. At production's 90s cadence that shows up as tens of
+    // seconds with zero forward progress -- confirmed as a genuine,
+    // pre-existing gap (not a deadlock) via `taguchi_collision_matrix.rs`'s
+    // stall-detecting convergence wait. Idempotent across every pairing
+    // this same device appears in, so setting it again per-pairing is
+    // harmless.
+    state.set_materialization_repair_sweep_interval(std::time::Duration::from_secs(1));
     if state.disk_headroom_enforcement_enabled() {
         session.set_headroom_enforced(true);
     }
-    session.set_pending_local_change_flush(state.clone());
-    session.set_change_authenticator(
-        yadorilink_daemon::change_auth::NetmapChangeAuthenticator::new(state.clone()),
-    );
-    // Mirrors production's `peer_orchestrator.rs` wiring so a test pairing
-    // built with this helper can answer a peer's `HandoffLeaseRequest`
-    // exactly like a real daemon would (subject to `state` itself having
-    // coordination-plane config recorded -- see `DaemonState::request_
-    // handoff_lease`'s doc comment for when it still declines).
-    session.set_handoff_lease_responder(state.clone());
-    // Mirrors production's `peer_orchestrator.rs` wiring for the removed-
-    // device handoff-ticket flow, the same way as the `HandoffLeaseRequest`
-    // wiring just above.
-    session.set_handoff_ticket_responder(state.clone());
-    state
-        .sessions
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(peer_device_id.to_string(), session.clone());
+    state.peers.register_session(peer_device_id.to_string(), session.clone());
     let peer_id = peer_device_id.to_string();
     let running_session = session.clone();
-    tokio::spawn(async move {
-        if let Err(error) = running_session.run().await {
+    // Kept alive (not moved into `run()`) purely so the exit handler below
+    // can `Arc::ptr_eq`-identify this exact session instance afterward.
+    let identity_session = session.clone();
+    let state_for_task = state.clone();
+    let handle = tokio::spawn(async move {
+        let result = running_session.run().await;
+        // Without this, a session that exits (error or otherwise) leaves a
+        // stale entry in `state.peers.sessions` -- anything that later consults
+        // that map (e.g. a fresh re-pairing keyed on the same peer id) would
+        // see a dead session as if it were live. Guard on `Arc::ptr_eq`
+        // rather than unconditionally removing by key: a newer pairing for
+        // the same peer may already have replaced this entry by the time
+        // this exit handler runs, and removing *that* one would be wrong.
+        state_for_task.peers.remove_if_current(&peer_id, &identity_session);
+        if let Err(error) = result {
             tracing::error!(%error, peer = %peer_id, "paired peer session exited");
         }
     });
-    session
+    (session, handle)
 }
 
 /// The local materialization root for each of `group_ids`, read from this
@@ -600,7 +840,7 @@ fn sync_roots_for_groups(
     group_ids: &[String],
 ) -> HashMap<String, PathBuf> {
     let mut roots = HashMap::new();
-    if let Ok(links) = state.sync_state.list_links() {
+    if let Ok(links) = state.replica_coordinator.link_repository().list_links() {
         for link in links {
             if group_ids.contains(&link.group_id) {
                 roots.insert(link.group_id, PathBuf::from(link.local_path));

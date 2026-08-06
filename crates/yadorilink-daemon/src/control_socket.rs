@@ -15,53 +15,43 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
-    ActiveTransferProgress, CheckFullReplicaHandoffReadyExcludingResponse,
-    CheckFullReplicaHandoffReadyResponse, ConnectionAttemptTrace, ConnectivityDoctorCategory,
-    ConnectivityDoctorResponse, DaemonControlRequest, DaemonControlResponse, EvictResponse,
-    FileVersionInfo, GcResponse, GroupDurabilityStatus, HandoffResult, HealthResponse, HeldFile,
-    HydrateResponse, LatchGroupDurabilityUnknownResponse, LimitsSetResponse, LimitsShowResponse,
-    LinkRequest, LinkResponse, LinkStatus, ListConnectionTracesResponse, ListLinksResponse,
-    ListTrashResponse, ListVersionsResponse, ObtainHandoffTicketResponse, PauseResponse,
-    PeerStatus, PendingEnrollmentKind, PinResponse, RecentSyncError, ReleaseHandoffTicketResponse,
-    RemovePendingEnrollmentResponse, RequestHandoffLeaseResponse, RestoreTrashResponse,
-    RestoreVersionResponse, ResumeResponse, SetStorageModeResponse, ShutdownResponse,
-    StatusResponse, TaskLiveness, TrashedFileInfo, UnlinkResponse, UnpinResponse, VolumeFreeSpace,
+    create_and_link_command_response, join_and_link_command_response,
+    remove_device_command_response, revoke_device_command_response, revoke_edge_command_response,
+    ActiveTransferProgress, ApplicationCommandError, ApplicationErrorCode,
+    CheckFullReplicaHandoffReadyExcludingResponse, CheckFullReplicaHandoffReadyResponse,
+    ConnectionAttemptTrace, ConnectivityDoctorCategory, ConnectivityDoctorResponse,
+    CreateAndLinkCommandResponse, DaemonControlRequest, DaemonControlResponse,
+    EnrollmentCommandOutcome, EvictResponse, FileVersionInfo, GcResponse, GroupDurabilityStatus,
+    HandoffResult, HealthResponse, HeldFile, HydrateResponse, JoinAndLinkCommandResponse,
+    LatchGroupDurabilityUnknownResponse, LimitsSetResponse, LimitsShowResponse, LinkRequest,
+    LinkResponse, LinkStatus, ListConnectionTracesResponse, ListLinksResponse,
+    ListQueueItemsResponse, ListRecoveryOperationsResponse, ListTrashResponse,
+    ListVersionsResponse, MembershipHandoffResult, ObtainHandoffTicketResponse, PauseResponse,
+    PeerStatus, PendingEnrollmentKind, PinResponse, QueueItem, RecentSyncError,
+    ReleaseHandoffTicketResponse, RemoveDeviceCommandResponse, RemovePendingEnrollmentResponse,
+    ReplicaMembershipCommandOutcome, ReportingConsentState, ReportingStatusResponse,
+    RequestHandoffLeaseResponse, RestoreTrashResponse, RestoreVersionResponse, ResumeResponse,
+    RevokeDeviceCommandResponse, RevokeEdgeCommandResponse, SetStorageModeResponse,
+    ShowQueueItemResponse, ShutdownResponse, StatusResponse, TaskLiveness, TrashedFileInfo,
+    UnlinkResponse, UnpinResponse, VolumeFreeSpace,
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
-use yadorilink_sync_core::index::SyncState;
 #[cfg(windows)]
-use yadorilink_sync_core::types::RecordKind;
-use yadorilink_sync_core::types::{EnrollmentKind, MaterializationPolicy};
+use yadorilink_replica_domain::file::RecordKind;
 
-use crate::daemon_state::DaemonState;
-use crate::hydration;
-use crate::link_manager::{resume_link, start_link_watch, stop_link_watch};
 use crate::reporting_ipc;
-use crate::shell_status::resolve_group_and_rel_path;
 
 const MAX_CONTROL_CONNECTIONS: usize = 64;
 
-fn demotion_handoff_lease_failure_message() -> String {
-    "refusing to drop full-replica status: confirmed a ready replica but could not obtain the \
-     required handoff lease (peer unreachable, not caught up, or coordination unavailable); \
-     re-run set-storage-mode to retry"
-        .to_string()
-}
-
-fn unlink_handoff_lease_failure_message(local_path: &str) -> String {
-    format!(
-        "refusing to unlink {local_path}: confirmed a ready replica but could not obtain the \
-         required handoff lease (peer unreachable, not caught up, or coordination unavailable). \
-         Re-run unlink to retry, or use --force to unlink anyway (data-loss risk)."
-    )
-}
-
-async fn handle_connection<S>(mut stream: S, state: Arc<DaemonState>) -> std::io::Result<()>
+async fn handle_connection<S>(
+    mut stream: S,
+    context: Arc<crate::control_context::ControlContext>,
+) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let Some(req) = read_message::<DaemonControlRequest>(&mut stream).await? else { return Ok(()) };
-    let resp = handle_request(&state, req).await;
+    let resp = handle_request(&context, req).await;
     write_message(&mut stream, &resp).await
 }
 
@@ -73,9 +63,13 @@ pub mod unix_transport {
     use tokio::net::UnixListener;
     use tokio::sync::Semaphore;
 
-    use crate::daemon_state::DaemonState;
+    use crate::control_context::ControlContext;
 
-    pub async fn serve(socket_path: &Path, state: Arc<DaemonState>) -> std::io::Result<()> {
+    /// `context` is built exactly once by the caller (in production,
+    /// `app.rs` -- the sole composition root; see `ControlContext`'s own
+    /// doc comment) and handed down through every connection, never
+    /// rebuilt here.
+    pub async fn serve(socket_path: &Path, context: Arc<ControlContext>) -> std::io::Result<()> {
         let _ = std::fs::remove_file(socket_path); // clean up a stale socket from a crashed prior run
         prepare_private_socket_parent(socket_path)?;
         let listener = UnixListener::bind(socket_path)?;
@@ -97,10 +91,10 @@ pub mod unix_transport {
                 .await
                 .map_err(|_| std::io::Error::other("control socket semaphore closed"))?;
             let (stream, _) = listener.accept().await?;
-            let state = state.clone();
+            let context = context.clone();
             tokio::spawn(async move {
                 let _connection_slot = connection_slot;
-                if let Err(e) = super::handle_connection(stream, state).await {
+                if let Err(e) = super::handle_connection(stream, context).await {
                     tracing::debug!(error = %e, "control connection ended");
                 }
             });
@@ -127,7 +121,7 @@ pub mod windows_transport {
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
     use tokio::sync::Semaphore;
 
-    use crate::daemon_state::DaemonState;
+    use crate::control_context::ControlContext;
     use crate::windows_pipe_security::PipeSecurityAttributes;
 
     // `PipeSecurityAttributes` holds a raw `*mut c_void` and is therefore
@@ -171,7 +165,7 @@ pub mod windows_transport {
     /// Creating the next instance *before* awaiting the current one's
     /// `connect` closes that window — there are always at least two
     /// listening instances in existence except right at startup.
-    pub async fn serve(pipe_name: &str, state: Arc<DaemonState>) -> std::io::Result<()> {
+    pub async fn serve(pipe_name: &str, context: Arc<ControlContext>) -> std::io::Result<()> {
         tracing::info!(pipe_name, "control socket listening (named pipe)");
         let mut server = create_first_pipe_server(pipe_name)?;
         let connection_slots = Arc::new(Semaphore::new(super::MAX_CONTROL_CONNECTIONS));
@@ -187,10 +181,10 @@ pub mod windows_transport {
             let connected = server;
             server = next_server;
 
-            let state = state.clone();
+            let context = context.clone();
             tokio::spawn(async move {
                 let _connection_slot = connection_slot;
-                if let Err(e) = super::handle_connection(connected, state).await {
+                if let Err(e) = super::handle_connection(connected, context).await {
                     tracing::debug!(error = %e, "control connection ended");
                 }
             });
@@ -199,96 +193,81 @@ pub mod windows_transport {
 }
 
 async fn handle_request(
-    state: &Arc<DaemonState>,
+    context: &crate::control_context::ControlContext,
     req: DaemonControlRequest,
 ) -> DaemonControlResponse {
-    // Read before `req.payload` is matched (and partially moved) below —
-    // a `u32` copy, not a borrow, so this doesn't fight the match on
-    // `req.payload` for ownership. Absent on a request from a CLI build
-    // that predates this field, decodes as 0, which is
-    // `< CONTROL_PROTOCOL_VERSION` and thus handled by the same
-    // "older/unversioned client" branch below as a real old version would
-    // be.
-    let client_protocol_version = req.protocol_version;
+    // This repository has not shipped a public release yet, so the CLI,
+    // desktop app, and daemon are always built and deployed as one unit —
+    // a genuine version skew has no supported recovery path and must fail
+    // clearly before touching any daemon state, not be executed anyway and
+    // only surface as a mismatch once the CLI inspects the response. Absent
+    // on a request from a build that predates this field, `protocol_version`
+    // decodes as 0, which is `!= CONTROL_PROTOCOL_VERSION` and thus rejected
+    // the same as any other mismatch.
+    if req.protocol_version != yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION {
+        let message =
+            if req.protocol_version > yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION {
+                format!(
+                    "this daemon (protocol version {}) does not support this request (client is \
+                 protocol version {}); upgrade the daemon and try again",
+                    yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+                    req.protocol_version,
+                )
+            } else {
+                format!(
+                    "this daemon requires exactly protocol version {} (client is protocol version \
+                 {}); this is a pre-release build with no client/daemon compatibility path — run \
+                 matching CLI and daemon binaries",
+                    yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+                    req.protocol_version,
+                )
+            };
+        return DaemonControlResponse {
+            payload: Some(RespPayload::Error(message)),
+            daemon_protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+        };
+    }
     let payload = match req.payload {
-        Some(ReqPayload::Link(r)) => match link(state, r) {
-            Ok(()) => RespPayload::Link(LinkResponse {}),
-            Err(e) => RespPayload::Error(e.to_string()),
-        },
+        Some(ReqPayload::Link(r)) => {
+            match context.application.link_lifecycle.link(decode_link_command(r)).await {
+                Ok(()) => RespPayload::Link(LinkResponse {}),
+                Err(e) => RespPayload::Error(e.to_string()),
+            }
+        }
 
         Some(ReqPayload::Unlink(r)) => {
-            // If this is recovery from a legacy two-live-roots state, persist the
-            // survivor's additive-scan protection BEFORE anything can remove the
-            // departing link. A crash after the unlink commit must therefore
-            // never leave a seemingly healthy one-link group whose first scan
-            // tombstones files that only existed under the departed root.
-            let ambiguity_recovery = match prepare_ambiguity_recovery(state, &r.local_path) {
-                Ok(recovery) => recovery,
-                Err(e) => return DaemonControlResponse {
-                    payload: Some(RespPayload::Error(e.to_string())),
-                    daemon_protocol_version:
-                        yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
-                },
-            };
-            match ensure_unlink_keeps_a_full_replica(state, &r.local_path, r.force).await {
-                Ok(commit) => {
-                    stop_link_watch(state, &r.local_path);
-                    let (removed, handoff_result) = match commit {
-                        UnlinkCommit::AlreadyRemoved(handoff_result) => (Ok(()), handoff_result),
-                        UnlinkCommit::RemoveNormally => {
-                            (state.sync_state.remove_link(&r.local_path), None)
-                        }
-                    };
-                    if removed.is_ok() {
-                        if let Some(recovery) = ambiguity_recovery {
-                            if recovery.survivors.len() == 1 {
-                                let survivor = recovery.survivors[0].clone();
-                                stop_link_watch(state, &survivor);
-                                if let Err(e) = start_link_watch(
-                                    state.clone(),
-                                    survivor.clone(),
-                                    recovery.group_id.clone(),
-                                ) {
-                                    tracing::error!(
-                                        group_id = %recovery.group_id,
-                                        local_path = %survivor,
-                                        error = %e,
-                                        "duplicate-root recovery removed the extra link but could not restart the survivor; the group remains fail-closed until a relink or daemon restart"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    match removed {
-                        Ok(()) => RespPayload::Unlink(UnlinkResponse {
-                            handoff_result: handoff_result.map(|(hr, root_digest)| HandoffResult {
-                                target_device_id: hr.target_device_id,
-                                root_digest: root_digest.to_vec(),
-                                membership_generation: hr.membership_generation,
-                                lease_id: hr.lease_id.unwrap_or_default(),
-                            }),
-                        }),
-                        Err(e) => RespPayload::Error(e.to_string()),
-                    }
-                }
+            let application = context.application.clone();
+            match application.replica_role.unlink(&r.local_path, r.force).await {
+                Ok(outcome) => RespPayload::Unlink(UnlinkResponse {
+                    handoff_result: outcome.handoff.map(|h| HandoffResult {
+                        target_device_id: h.target_device_id,
+                        root_digest: h.root_digest.to_vec(),
+                        membership_generation: h.membership_generation,
+                        lease_id: h.lease_id.unwrap_or_default(),
+                    }),
+                }),
                 Err(e) => RespPayload::Error(e),
             }
         }
 
-        Some(ReqPayload::ListLinks(_)) => match list_link_statuses(state) {
-            Ok(links) => RespPayload::ListLinks(ListLinksResponse { links }),
+        Some(ReqPayload::ListLinks(_)) => match context.queries.link_status.list_links() {
+            Ok(links) => RespPayload::ListLinks(ListLinksResponse {
+                links: links.into_iter().map(encode_link_status).collect(),
+            }),
             Err(e) => RespPayload::Error(e.to_string()),
         },
 
-        Some(ReqPayload::Pause(r)) => match state.sync_state.set_paused(&r.local_path, true) {
+        Some(ReqPayload::Pause(r)) => match context.application.pause_resume.pause(&r.local_path) {
             Ok(()) => RespPayload::Pause(PauseResponse {}),
             Err(e) => RespPayload::Error(e.to_string()),
         },
 
-        Some(ReqPayload::Resume(r)) => match resume_link(state, &r.local_path).await {
-            Ok(()) => RespPayload::Resume(ResumeResponse {}),
-            Err(e) => RespPayload::Error(e.to_string()),
-        },
+        Some(ReqPayload::Resume(r)) => {
+            match context.application.pause_resume.resume(&r.local_path).await {
+                Ok(()) => RespPayload::Resume(ResumeResponse {}),
+                Err(e) => RespPayload::Error(e.to_string()),
+            }
+        }
 
         // Drops a pending-enrollment marker once `share create`/`share
         // join` has confirmed its own activate call directly -- an
@@ -298,58 +277,40 @@ async fn handle_request(
         // caller to it) is a no-op, matching `remove_pending_enrollment`'s
         // own idempotent delete.
         Some(ReqPayload::RemovePendingEnrollment(r)) => {
-            match state.sync_state.remove_pending_enrollment(&r.operation_id) {
+            match context.application.enrollment_recovery.acknowledge_activation(&r.operation_id) {
                 Ok(()) => RespPayload::RemovePendingEnrollment(RemovePendingEnrollmentResponse {}),
                 Err(e) => RespPayload::Error(e.to_string()),
             }
         }
 
-        // `yadorilink versions <path>`. Resolves the absolute path to
-        // `(group_id, relative path)` via the same
-        // `resolve_group_and_rel_path` helper `Hydrate`/`Pin`/`Unpin`/
-        // `Evict` above already use.
+        // `yadorilink versions <path>`.
         Some(ReqPayload::ListVersions(r)) => {
-            match resolve_group_and_rel_path(state, &r.absolute_path) {
-                Some((group_id, path)) => match state.sync_state.list_versions(&group_id, &path) {
-                    Ok(versions) => RespPayload::ListVersions(ListVersionsResponse {
-                        versions: versions.into_iter().map(version_to_proto).collect(),
-                    }),
-                    Err(e) => RespPayload::Error(e.to_string()),
-                },
-                None => RespPayload::Error("path is not under any linked folder".into()),
+            match context.queries.file_history.list_versions(&r.absolute_path) {
+                Ok(Some(versions)) => RespPayload::ListVersions(ListVersionsResponse {
+                    versions: versions.into_iter().map(version_to_proto).collect(),
+                }),
+                Ok(None) => RespPayload::Error("path is not under any linked folder".into()),
+                Err(e) => RespPayload::Error(e.to_string()),
             }
         }
 
         // `yadorilink restore <path> [--version <id>]`. An
         // absent `version_seq` resolves to the most recent superseded
         // version (spec "Restore without a version defaults to the most
-        // recent superseded version") via `hydration::most_recent_superseded_
-        // version_seq`; there being none to restore to is reported as a
-        // clear error rather than silently no-op'ing.
+        // recent superseded version") via `VersionRestoreService`; there
+        // being none to restore to is reported as a clear error rather
+        // than silently no-op'ing.
         Some(ReqPayload::RestoreVersion(r)) => {
-            match resolve_group_and_rel_path(state, &r.absolute_path) {
+            match context.queries.linked_path.resolve(&r.absolute_path) {
                 Some((group_id, path)) => {
-                    let version_seq = match r.version_seq {
-                        Some(v) => Ok(Some(v)),
-                        None => {
-                            hydration::most_recent_superseded_version_seq(state, &group_id, &path)
-                        }
-                    };
-                    match version_seq {
-                        Ok(Some(version_seq)) => {
-                            match hydration::restore_to_version(
-                                state,
-                                &group_id,
-                                &path,
-                                version_seq,
-                            )
-                            .await
-                            {
-                                Ok(()) => RespPayload::RestoreVersion(RestoreVersionResponse {}),
-                                Err(e) => RespPayload::Error(e.to_string()),
-                            }
-                        }
-                        Ok(None) => {
+                    match context
+                        .application
+                        .version_restore
+                        .restore_version(&group_id, &path, r.version_seq)
+                        .await
+                    {
+                        Ok(true) => RespPayload::RestoreVersion(RestoreVersionResponse {}),
+                        Ok(false) => {
                             RespPayload::Error("no superseded version to restore to".into())
                         }
                         Err(e) => RespPayload::Error(e.to_string()),
@@ -363,16 +324,23 @@ async fn handle_request(
         // above, this spans every linked folder at once (no `absolute_path`
         // to resolve) — mirrors `list_link_statuses`'s own per-link
         // iteration below.
-        Some(ReqPayload::ListTrash(_)) => match list_trashed_files(state) {
-            Ok(files) => RespPayload::ListTrash(ListTrashResponse { files }),
+        Some(ReqPayload::ListTrash(_)) => match context.queries.file_history.list_trash() {
+            Ok(files) => RespPayload::ListTrash(ListTrashResponse {
+                files: files.into_iter().map(trashed_file_view_to_proto).collect(),
+            }),
             Err(e) => RespPayload::Error(e.to_string()),
         },
 
         // `yadorilink trash restore <path>`.
         Some(ReqPayload::RestoreTrash(r)) => {
-            match resolve_group_and_rel_path(state, &r.absolute_path) {
+            match context.queries.linked_path.resolve(&r.absolute_path) {
                 Some((group_id, path)) => {
-                    match hydration::restore_trashed(state, &group_id, &path).await {
+                    match context
+                        .application
+                        .version_restore
+                        .restore_trashed(&group_id, &path)
+                        .await
+                    {
                         Ok(()) => RespPayload::RestoreTrash(RestoreTrashResponse {}),
                         Err(e) => RespPayload::Error(e.to_string()),
                     }
@@ -381,116 +349,9 @@ async fn handle_request(
             }
         }
 
-        Some(ReqPayload::Status(_)) => match list_link_statuses(state) {
-            Ok(links) => {
-                let peer_snapshots: Vec<_> = state
-                    .peer_statuses
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .iter()
-                    .map(|(device_id, info)| (device_id.clone(), info.reachability))
-                    .collect();
-                let sessions =
-                    state.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                let peers = peer_snapshots
-                    .into_iter()
-                    .map(|(device_id, mut reachability)| {
-                        if reachability == crate::daemon_state::PeerReachability::Connected
-                            && sessions.get(&device_id).is_some_and(|session| {
-                                session.peer_handshake_received()
-                                    && !session.change_dag_negotiated()
-                            })
-                        {
-                            reachability =
-                                crate::daemon_state::PeerReachability::ProtocolIncompatible;
-                        }
-                        // A peer is reachable or honestly cannot be connected
-                        // (with the reason), reported solely via `reachability`.
-                        let (reachability, category) = reachability_to_proto(reachability);
-                        PeerStatus {
-                            device_id,
-                            reachability: reachability as i32,
-                            unreachable_category: category as i32,
-                        }
-                    })
-                    .collect();
-                // Configured limits + current measured rates (from the
-                // shared `rate_limiters` every session/hydration fetch
-                // draws down) and per-volume free-space state, alongside
-                // the existing per-folder/per-peer status above.
-                let governance = state.governance_config.load_or_default();
-                let volumes = volumes_free_space(state, &links);
-                // Concise update state embedded directly in
-                // `StatusResponse` — reuses `update_ipc::status_response`'s
-                // exact field values rather than re-deriving them a
-                // second way.
-                let update_status = crate::update_ipc::status_response(state);
-                // O(1) usage counters — never a directory walk on a
-                // `status` call.
-                let block_store_usage = state.block_store.usage().unwrap_or_default();
-                let mut response = StatusResponse {
-                    links,
-                    peers,
-                    upload_limit_bytes_per_sec: governance.upload_limit_bytes_per_sec,
-                    download_limit_bytes_per_sec: governance.download_limit_bytes_per_sec,
-                    update_state: update_status.state,
-                    update_available_version: update_status.available_version,
-                    update_mandatory: update_status.mandatory,
-                    update_waiting_for_safe_point: update_status.waiting_for_safe_point,
-                    update_last_error_category: update_status.last_error_category,
-                    update_channel: update_status.channel,
-                    update_install_source: update_status.install_source,
-                    update_holdback_reason: update_status.holdback_reason,
-                    current_upload_bytes_per_sec: state
-                        .rate_limiters
-                        .upload
-                        .current_rate_bytes_per_sec(),
-                    current_download_bytes_per_sec: state
-                        .rate_limiters
-                        .download
-                        .current_rate_bytes_per_sec(),
-                    volumes,
-                    // Block-store usage (O(1) counters) and GC health,
-                    // alongside every other status surface above.
-                    block_store_total_bytes: block_store_usage.total_bytes,
-                    block_store_block_count: block_store_usage.block_count,
-                    last_gc_unix: state.gc.last_run_unix(),
-                    gc_reclaimable_estimate_bytes: state.gc.reclaimable_estimate_bytes(),
-                    // Every currently-active transfer and the bounded
-                    // recent-error feed, alongside every other status
-                    // surface above.
-                    active_transfers: state
-                        .transfer_progress
-                        .snapshot()
-                        .into_iter()
-                        .map(|t| ActiveTransferProgress {
-                            group_id: t.group_id,
-                            path: t.path,
-                            bytes_done: t.bytes_done,
-                            bytes_total: t.bytes_total,
-                            blocks_done: t.blocks_done,
-                            blocks_total: t.blocks_total,
-                            source_peer: t.source_peer,
-                            started_at_unix: t.started_at_unix,
-                        })
-                        .collect(),
-                    recent_errors: state
-                        .recent_errors
-                        .recent()
-                        .into_iter()
-                        .map(|e| RecentSyncError {
-                            category: e.category.to_string(),
-                            timestamp_unix: e.timestamp_unix,
-                            coarse_context: e.coarse_context,
-                        })
-                        .collect(),
-                    // Filled in below, from `response`'s own
-                    // already-populated fields, so this rollup can never
-                    // disagree with the rest of the message it's
-                    // summarizing.
-                    overall_state: String::new(),
-                    attention_reasons: Vec::new(),
-                };
+        Some(ReqPayload::Status(_)) => match context.queries.runtime_status.snapshot() {
+            Ok(view) => {
+                let mut response = encode_runtime_status(view);
                 let (overall_state, attention_reasons) = overall_status(&response);
                 response.overall_state = overall_state.as_str().to_string();
                 response.attention_reasons = attention_reasons;
@@ -500,61 +361,69 @@ async fn handle_request(
         },
 
         Some(ReqPayload::LimitsSet(r)) => {
-            match state
-                .governance_config
+            match context
+                .application
+                .governance
                 .set_limits(r.upload_bytes_per_sec, r.download_bytes_per_sec)
             {
-                Ok(config) => {
-                    // apply immediately to the running daemon's
-                    // shared buckets, not just persist to disk — a
-                    // `limits set` takes effect without a restart.
-                    state.apply_governance_config();
-                    RespPayload::LimitsSet(LimitsSetResponse {
-                        upload_bytes_per_sec: config.upload_limit_bytes_per_sec,
-                        download_bytes_per_sec: config.download_limit_bytes_per_sec,
-                    })
-                }
+                Ok(limits) => RespPayload::LimitsSet(LimitsSetResponse {
+                    upload_bytes_per_sec: limits.upload_bytes_per_sec,
+                    download_bytes_per_sec: limits.download_bytes_per_sec,
+                }),
                 Err(e) => RespPayload::Error(e.to_string()),
             }
         }
 
         Some(ReqPayload::LimitsShow(_)) => {
-            let config = state.governance_config.load_or_default();
+            let config = context.queries.governance.limits();
             RespPayload::LimitsShow(LimitsShowResponse {
                 upload_bytes_per_sec: config.upload_limit_bytes_per_sec,
                 download_bytes_per_sec: config.download_limit_bytes_per_sec,
             })
         }
 
-        Some(ReqPayload::Hydrate(r)) => match resolve_group_and_rel_path(state, &r.absolute_path) {
-            Some((group_id, path)) => match hydration::hydrate(state, &group_id, &path).await {
-                Ok(()) => RespPayload::Hydrate(HydrateResponse {}),
-                Err(e) => RespPayload::Error(e.to_string()),
-            },
+        Some(ReqPayload::Hydrate(r)) => match context.queries.linked_path.resolve(&r.absolute_path)
+        {
+            Some((group_id, path)) => {
+                let application = context.application.clone();
+                match application.materialization.hydrate(&group_id, &path).await {
+                    Ok(()) => RespPayload::Hydrate(HydrateResponse {}),
+                    Err(e) => RespPayload::Error(e.to_string()),
+                }
+            }
             None => RespPayload::Error("path is not under any linked folder".into()),
         },
 
-        Some(ReqPayload::Pin(r)) => match resolve_group_and_rel_path(state, &r.absolute_path) {
-            Some((group_id, path)) => match hydration::pin(state, &group_id, &path).await {
-                Ok(()) => RespPayload::Pin(PinResponse {}),
-                Err(e) => RespPayload::Error(e.to_string()),
-            },
+        Some(ReqPayload::Pin(r)) => match context.queries.linked_path.resolve(&r.absolute_path) {
+            Some((group_id, path)) => {
+                let application = context.application.clone();
+                match application.materialization.pin(&group_id, &path).await {
+                    Ok(()) => RespPayload::Pin(PinResponse {}),
+                    Err(e) => RespPayload::Error(e.to_string()),
+                }
+            }
             None => RespPayload::Error("path is not under any linked folder".into()),
         },
 
-        Some(ReqPayload::Unpin(r)) => match resolve_group_and_rel_path(state, &r.absolute_path) {
-            Some((group_id, path)) => match hydration::unpin(state, &group_id, &path).await {
-                Ok(()) => RespPayload::Unpin(UnpinResponse {}),
-                Err(e) => RespPayload::Error(e.to_string()),
-            },
+        Some(ReqPayload::Unpin(r)) => match context.queries.linked_path.resolve(&r.absolute_path) {
+            Some((group_id, path)) => {
+                let application = context.application.clone();
+                match application.materialization.unpin(&group_id, &path).await {
+                    Ok(()) => RespPayload::Unpin(UnpinResponse {}),
+                    Err(e) => RespPayload::Error(e.to_string()),
+                }
+            }
             None => RespPayload::Error("path is not under any linked folder".into()),
         },
 
-        Some(ReqPayload::Evict(r)) => match resolve_group_and_rel_path(state, &r.absolute_path) {
-            Some((group_id, path)) => match hydration::evict(state, &group_id, &path) {
-                Ok(()) => RespPayload::Evict(EvictResponse {}),
-                Err(e) => RespPayload::Error(e.to_string()),
-            },
+        Some(ReqPayload::Evict(r)) => match context.queries.linked_path.resolve(&r.absolute_path) {
+            Some((group_id, path)) => {
+                let application = context.application.clone();
+                match application.materialization.evict(&group_id, &path) {
+                    Ok(()) => RespPayload::Evict(EvictResponse {}),
+                    Err(e) => RespPayload::Error(e.to_string()),
+                }
+            }
             None => RespPayload::Error("path is not under any linked folder".into()),
         },
 
@@ -569,83 +438,110 @@ async fn handle_request(
             // once it observes this; a `send` error just means every
             // receiver (i.e. `main.rs` itself) is already gone, which
             // only happens if the process is already on its way out.
-            let _ = state.shutdown_tx.send(true);
+            context.application.lifecycle.request_shutdown();
             RespPayload::Shutdown(ShutdownResponse {})
         }
 
-        Some(ReqPayload::Health(_)) => RespPayload::Health(health_snapshot(state)),
+        Some(ReqPayload::Health(_)) => {
+            RespPayload::Health(encode_health(context.queries.health.snapshot()))
+        }
 
         // Dispatch into `reporting_ipc`, which owns the actual
         // translation to/from `yadorilink_reporting`/`crate::reporting`
         // types.
-        Some(ReqPayload::ReportingStatus(_)) => {
-            RespPayload::ReportingStatus(reporting_ipc::reporting_status(state))
-        }
-        Some(ReqPayload::GenerateUsageReport(_)) => {
-            RespPayload::GenerateUsageReport(reporting_ipc::generate_usage_report(state))
-        }
+        Some(ReqPayload::ReportingStatus(_)) => RespPayload::ReportingStatus(
+            encode_reporting_status(context.queries.reporting.status()),
+        ),
+        Some(ReqPayload::GenerateUsageReport(_)) => RespPayload::GenerateUsageReport(
+            reporting_ipc::generate_usage_report(&context.application.reporting),
+        ),
         Some(ReqPayload::GenerateLastErrorReport(r)) => {
-            match reporting_ipc::generate_last_error_report(state, r.report_id) {
+            match reporting_ipc::generate_last_error_report(
+                &context.application.reporting,
+                r.report_id,
+            ) {
                 Ok(resp) => RespPayload::GenerateLastErrorReport(resp),
                 Err(e) => RespPayload::Error(e),
             }
         }
-        Some(ReqPayload::ListQueueItems(_)) => match reporting_ipc::list_queue_items(state) {
-            Ok(resp) => RespPayload::ListQueueItems(resp),
+        Some(ReqPayload::ListQueueItems(_)) => match context.queries.reporting.list_queue_items() {
+            Ok(items) => RespPayload::ListQueueItems(ListQueueItemsResponse {
+                items: items.into_iter().map(encode_queue_item).collect(),
+            }),
             Err(e) => RespPayload::Error(e),
         },
         Some(ReqPayload::ShowQueueItem(r)) => {
-            match reporting_ipc::show_queue_item(state, &r.report_id) {
-                Ok(resp) => RespPayload::ShowQueueItem(resp),
+            match context.queries.reporting.show_queue_item(&r.report_id) {
+                Ok(Some(report_json)) => {
+                    RespPayload::ShowQueueItem(ShowQueueItemResponse { report_json })
+                }
+                Ok(None) => {
+                    RespPayload::Error(format!("no queued report found with id `{}`", r.report_id))
+                }
                 Err(e) => RespPayload::Error(e),
             }
         }
         Some(ReqPayload::DeleteQueueItem(r)) => {
-            match reporting_ipc::delete_queue_item(state, &r.report_id) {
+            match reporting_ipc::delete_queue_item(&context.application.reporting, &r.report_id) {
                 Ok(resp) => RespPayload::DeleteQueueItem(resp),
                 Err(e) => RespPayload::Error(e),
             }
         }
-        Some(ReqPayload::FlushQueue(_)) => match reporting_ipc::flush_queue(state) {
-            Ok(resp) => RespPayload::FlushQueue(resp),
-            Err(e) => RespPayload::Error(e),
-        },
+        Some(ReqPayload::FlushQueue(_)) => {
+            match reporting_ipc::flush_queue(&context.application.reporting) {
+                Ok(resp) => RespPayload::FlushQueue(resp),
+                Err(e) => RespPayload::Error(e),
+            }
+        }
         Some(ReqPayload::SubmitReport(r)) => {
-            match reporting_ipc::submit_report(state, &r.report_json).await {
+            match reporting_ipc::submit_report(&context.application.reporting, &r.report_json).await
+            {
                 Ok(resp) => RespPayload::SubmitReport(resp),
                 Err(e) => RespPayload::Error(e),
             }
         }
-        Some(ReqPayload::UpdateConsent(r)) => match reporting_ipc::update_consent(state, r) {
-            Ok(resp) => RespPayload::UpdateConsent(resp),
-            Err(e) => RespPayload::Error(e),
-        },
+        Some(ReqPayload::UpdateConsent(r)) => {
+            match reporting_ipc::update_consent(&context.application.reporting, r) {
+                Ok(resp) => RespPayload::UpdateConsent(resp),
+                Err(e) => RespPayload::Error(e),
+            }
+        }
 
-        // Dispatch into `update_ipc`, which owns the actual translation
-        // to/from `crate::update::{manager, policy}` types — mirrors
-        // `reporting_ipc`'s own dispatch pattern immediately above.
-        Some(ReqPayload::UpdateStatus(_)) => {
-            RespPayload::UpdateStatus(crate::update_ipc::status_response(state))
-        }
+        // Dispatch into `context.application.update`/`context.queries.
+        // update_status`; `update_ipc` only translates to/from the wire
+        // types — mirrors `reporting_ipc`'s own dispatch pattern above.
+        Some(ReqPayload::UpdateStatus(_)) => RespPayload::UpdateStatus(
+            crate::update_ipc::encode_update_status(context.queries.update_status.snapshot()),
+        ),
         Some(ReqPayload::UpdateCheck(_)) => {
-            RespPayload::UpdateCheck(crate::update_ipc::check(state).await)
+            context.application.update.check().await;
+            RespPayload::UpdateCheck(crate::update_ipc::encode_check_response(
+                context.queries.update_status.snapshot(),
+            ))
         }
-        Some(ReqPayload::UpdateInstall(_)) => match crate::update_ipc::install(state).await {
-            Ok(resp) => RespPayload::UpdateInstall(resp),
+        Some(ReqPayload::UpdateInstall(_)) => match context.application.update.install().await {
+            Ok(outcome) => {
+                RespPayload::UpdateInstall(crate::update_ipc::encode_install_response(outcome))
+            }
             Err(e) => RespPayload::Error(e),
         },
-        Some(ReqPayload::UpdateConfig(r)) => match crate::update_ipc::config(state, r) {
-            Ok(resp) => RespPayload::UpdateConfig(resp),
-            Err(e) => RespPayload::Error(e),
-        },
+        Some(ReqPayload::UpdateConfig(r)) => {
+            match context.application.update.config(crate::update_ipc::decode_config_request(r)) {
+                Ok(policy) => {
+                    RespPayload::UpdateConfig(crate::update_ipc::encode_config_response(policy))
+                }
+                Err(e) => RespPayload::Error(e),
+            }
+        }
 
         // Dispatch into `connection_trace`.
         Some(ReqPayload::ListConnectionTraces(r)) => {
             let peer_device_id =
                 (!r.peer_device_id.is_empty()).then_some(r.peer_device_id.as_str());
-            let traces = state
-                .connection_traces
-                .recent(peer_device_id)
+            let traces = context
+                .queries
+                .diagnostics
+                .recent_connection_traces(peer_device_id)
                 .into_iter()
                 .map(|trace| ConnectionAttemptTrace {
                     peer_device_id: trace.peer_device_id,
@@ -663,7 +559,10 @@ async fn handle_request(
         }
 
         Some(ReqPayload::ConnectivityDoctor(_)) => {
-            let categories = crate::connection_trace::run_connectivity_doctor(state)
+            let categories = context
+                .queries
+                .diagnostics
+                .connectivity_doctor()
                 .into_iter()
                 .map(|c| ConnectivityDoctorCategory {
                     name: c.name.to_string(),
@@ -680,12 +579,12 @@ async fn handle_request(
         // `reporting_ipc`/`update_ipc`'s own dispatch pattern above.
         // Preview and Export both request the exact same daemon-side
         // bundle; only the CLI-side disposition of the result differs.
-        Some(ReqPayload::DiagnosticsPreview(_)) => {
-            RespPayload::DiagnosticsPreview(crate::diagnostics_ipc::build_bundle(state).await)
-        }
-        Some(ReqPayload::DiagnosticsExport(_)) => {
-            RespPayload::DiagnosticsExport(crate::diagnostics_ipc::build_bundle(state).await)
-        }
+        Some(ReqPayload::DiagnosticsPreview(_)) => RespPayload::DiagnosticsPreview(
+            crate::diagnostics_ipc::build_bundle(&context.queries.diagnostics_bundle).await,
+        ),
+        Some(ReqPayload::DiagnosticsExport(_)) => RespPayload::DiagnosticsExport(
+            crate::diagnostics_ipc::build_bundle(&context.queries.diagnostics_bundle).await,
+        ),
 
         // Dispatch into `gc::run_sweep`, which owns the actual
         // mark-and-sweep, daemon-wide mutual-exclusion, and
@@ -696,7 +595,7 @@ async fn handle_request(
         // actionable message for `AlreadyRunning`/`SyncBurstInProgress`)
         // is surfaced directly as `DaemonControlResponse.error`, same as
         // every other fallible request in this match.
-        Some(ReqPayload::Gc(r)) => match crate::gc::run_sweep(state.clone(), r.dry_run).await {
+        Some(ReqPayload::Gc(r)) => match context.application.gc.run(r.dry_run).await {
             Ok(report) => RespPayload::Gc(GcResponse {
                 blocks_deleted: report.blocks_deleted,
                 bytes_reclaimed: report.bytes_reclaimed,
@@ -711,12 +610,13 @@ async fn handle_request(
         // `SetStorageMode` below, right before the local flip commits.
         Some(ReqPayload::CheckFullReplicaHandoffReady(r)) => {
             RespPayload::CheckFullReplicaHandoffReady(CheckFullReplicaHandoffReadyResponse {
-                ready: state.another_full_replica_is_ready(&r.group_id).await,
+                ready: context.queries.handoff_readiness.ready(&r.group_id).await,
             })
         }
 
         Some(ReqPayload::SetStorageMode(r)) => {
-            match set_storage_mode(state, &r.group_id, r.on_demand).await {
+            let application = context.application.clone();
+            match application.replica_role.set_storage_mode(&r.group_id, r.on_demand).await {
                 // `root_digest` is this device's own locally-computed
                 // durability-root digest at commit time -- never sent to or
                 // read back from coordination-worker (see
@@ -741,12 +641,11 @@ async fn handle_request(
         // empty-`group_id` "every affected group this daemon can see"
         // semantics and the "partial view, not a distributed proof" caveat.
         Some(ReqPayload::CheckFullReplicaHandoffReadyExcluding(r)) => {
-            match full_replica_handoff_not_ready_excluding(
-                state,
-                &r.group_id,
-                &r.excluded_device_id,
-            )
-            .await
+            match context
+                .queries
+                .handoff_readiness
+                .not_ready_excluding(&r.group_id, &r.excluded_device_id)
+                .await
             {
                 Ok(not_ready_group_ids) => RespPayload::CheckFullReplicaHandoffReadyExcluding(
                     CheckFullReplicaHandoffReadyExcludingResponse {
@@ -766,7 +665,7 @@ async fn handle_request(
         // failure is returned rather than acknowledging a latch that would
         // disappear on restart.
         Some(ReqPayload::LatchGroupDurabilityUnknown(r)) => {
-            match state.latch_group_durability_unknown(&r.group_id) {
+            match context.application.durability.latch_group_durability_unknown(&r.group_id) {
                 Ok(()) => {
                     RespPayload::LatchGroupDurabilityUnknown(LatchGroupDurabilityUnknownResponse {})
                 }
@@ -779,14 +678,12 @@ async fn handle_request(
         // lease` for the local-check-then-coordination-plane-request-then-
         // local-record round trip this drives.
         Some(ReqPayload::RequestHandoffLease(r)) => {
-            match state.request_handoff_lease(&r.group_id).await {
-                Some((grant, _root_digest)) => {
-                    RespPayload::RequestHandoffLease(RequestHandoffLeaseResponse {
-                        requested: true,
-                        lease_id: grant.lease_id,
-                        expires_at_unix: grant.expires_at_unix,
-                    })
-                }
+            match context.application.handoff.request_lease(&r.group_id).await {
+                Some(grant) => RespPayload::RequestHandoffLease(RequestHandoffLeaseResponse {
+                    requested: true,
+                    lease_id: grant.lease_id,
+                    expires_at_unix: grant.expires_at_unix,
+                }),
                 None => RespPayload::RequestHandoffLease(RequestHandoffLeaseResponse {
                     requested: false,
                     lease_id: String::new(),
@@ -802,12 +699,12 @@ async fn handle_request(
         // roots" all collapse to `granted = false` here, matching that
         // method's own doc comment).
         Some(ReqPayload::ObtainHandoffTicket(r)) => {
-            match state.obtain_handoff_ticket_from_device(&r.group_id, &r.device_id).await {
+            match context.application.handoff.obtain_ticket(&r.group_id, &r.device_id).await {
                 Some(grant) => RespPayload::ObtainHandoffTicket(ObtainHandoffTicketResponse {
                     granted: true,
-                    lease_id: grant.lease_id.unwrap_or_default(),
+                    lease_id: grant.lease_id,
                     expires_at_unix: grant.expires_at_unix,
-                    target_device_id: grant.target_device_id.unwrap_or_default(),
+                    target_device_id: grant.target_device_id,
                 }),
                 None => RespPayload::ObtainHandoffTicket(ObtainHandoffTicketResponse {
                     granted: false,
@@ -819,36 +716,179 @@ async fn handle_request(
         }
 
         Some(ReqPayload::ReleaseHandoffTicket(r)) => {
-            state
-                .release_handoff_ticket_from_device(
-                    &r.group_id,
-                    &r.device_id,
-                    &r.target_device_id,
-                    &r.lease_id,
-                )
+            context
+                .application
+                .handoff
+                .release_ticket(&r.group_id, &r.device_id, &r.target_device_id, &r.lease_id)
                 .await;
             RespPayload::ReleaseHandoffTicket(ReleaseHandoffTicketResponse {})
         }
 
-        // Per spec "New CLI talks to older supported daemon": an unset
-        // `oneof payload` is what a
-        // *this* daemon build's proto decodes an unrecognized request
-        // variant number as — the shape a newer CLI's request takes once
-        // it reaches an older daemon that predates that variant entirely
-        // (protobuf drops fields it has no definition for). Distinguish
-        // that case, using the version each side already stamped on every
-        // request/response, from a genuinely malformed/empty request, so
-        // the CLI gets "upgrade the daemon" rather than an ambiguous
-        // "empty request" for what's really a version mismatch.
-        None if client_protocol_version
-            > yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION =>
-        {
-            RespPayload::Error(format!(
-                "this daemon (protocol version {}) does not support this request (client is \
-                 protocol version {client_protocol_version}); upgrade the daemon and try again",
-                yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
-            ))
+        Some(ReqPayload::RemoveDeviceCommand(r)) => {
+            let application = context.application.clone();
+            let result = application
+                .membership
+                .remove_device(crate::application::RemoveDeviceCommand {
+                    device_id: r.device_id,
+                    force: r.force,
+                })
+                .await;
+            RespPayload::RemoveDeviceCommand(RemoveDeviceCommandResponse {
+                result: Some(match result {
+                    Ok(outcome) => remove_device_command_response::Result::Outcome(
+                        membership_outcome_to_proto(outcome),
+                    ),
+                    Err(error) => remove_device_command_response::Result::Error(
+                        membership_error_to_proto(error),
+                    ),
+                }),
+            })
         }
+
+        Some(ReqPayload::RevokeDeviceCommand(r)) => {
+            let application = context.application.clone();
+            let result = application
+                .membership
+                .revoke_device(crate::application::RevokeDeviceCommand {
+                    group_id: r.group_id,
+                    device_id: r.device_id,
+                    force: r.force,
+                })
+                .await;
+            RespPayload::RevokeDeviceCommand(RevokeDeviceCommandResponse {
+                result: Some(match result {
+                    Ok(outcome) => revoke_device_command_response::Result::Outcome(
+                        membership_outcome_to_proto(outcome),
+                    ),
+                    Err(error) => revoke_device_command_response::Result::Error(
+                        membership_error_to_proto(error),
+                    ),
+                }),
+            })
+        }
+
+        Some(ReqPayload::RevokeEdgeCommand(r)) => {
+            let application = context.application.clone();
+            let result = application.membership.revoke_edge(r.edge_id, r.force).await;
+            RespPayload::RevokeEdgeCommand(RevokeEdgeCommandResponse {
+                result: Some(match result {
+                    Ok(outcome) => revoke_edge_command_response::Result::Outcome(
+                        membership_outcome_to_proto(outcome),
+                    ),
+                    Err(error) => revoke_edge_command_response::Result::Error(
+                        membership_error_to_proto(error),
+                    ),
+                }),
+            })
+        }
+
+        Some(ReqPayload::CreateAndLinkCommand(r)) => {
+            let application = context.application.clone();
+            let result = application
+                .enrollment
+                .create_and_link(crate::application::CreateAndLinkCommand {
+                    group_name: r.group_name,
+                    absolute_path: r.local_path.into(),
+                    on_demand: r.on_demand,
+                    acknowledge_risks: r.acknowledge_risks,
+                })
+                .await;
+            RespPayload::CreateAndLinkCommand(CreateAndLinkCommandResponse {
+                result: Some(match result {
+                    Ok(outcome) => create_and_link_command_response::Result::Outcome(
+                        enrollment_outcome_to_proto(outcome),
+                    ),
+                    Err(error) => create_and_link_command_response::Result::Error(
+                        enrollment_error_to_proto(error),
+                    ),
+                }),
+            })
+        }
+
+        Some(ReqPayload::JoinAndLinkCommand(r)) => {
+            let application = context.application.clone();
+            let result = application
+                .enrollment
+                .join_and_link(crate::application::JoinAndLinkCommand {
+                    group_id: r.group_id,
+                    group_name: r.group_name,
+                    absolute_path: r.local_path.into(),
+                    on_demand: r.on_demand,
+                    acknowledge_risks: r.acknowledge_risks,
+                })
+                .await;
+            RespPayload::JoinAndLinkCommand(JoinAndLinkCommandResponse {
+                result: Some(match result {
+                    Ok(outcome) => join_and_link_command_response::Result::Outcome(
+                        enrollment_outcome_to_proto(outcome),
+                    ),
+                    Err(error) => join_and_link_command_response::Result::Error(
+                        enrollment_error_to_proto(error),
+                    ),
+                }),
+            })
+        }
+
+        // Phase 2.1: `yadorilink recovery list`/`show`. Strictly read-only --
+        // see yadorilink_sync_core::recovery's own doc comment -- so there is
+        // no dedicated error variant on these responses; a genuine read
+        // failure surfaces through the top-level `RespPayload::Error`
+        // fallback, same as `ListLinks` above.
+        Some(ReqPayload::ListRecoveryOperations(_)) => match context.queries.recovery.list() {
+            Ok(inv) => RespPayload::ListRecoveryOperations(ListRecoveryOperationsResponse {
+                operations: inv
+                    .valid
+                    .iter()
+                    .map(crate::recovery_diagnosis::ipc::recovery_summary_to_proto)
+                    .collect(),
+                invalid: inv
+                    .invalid
+                    .iter()
+                    .map(crate::recovery_diagnosis::ipc::invalid_recovery_operation_to_proto)
+                    .collect(),
+            }),
+            Err(e) => RespPayload::Error(e.to_string()),
+        },
+
+        // Phase 2.1-C2-C2: `show` returns a stable diagnosis (local
+        // evidence + exactly one remote lookup + a pure recommendation),
+        // not just the local journal row. `domain` is required and
+        // unambiguous -- see `ShowRecoveryOperationRequest`'s own doc
+        // comment in the proto file.
+        Some(ReqPayload::ShowRecoveryOperation(r)) => {
+            let Some(domain) =
+                yadorilink_replica_domain::recovery::RecoveryDomain::try_from_str(&r.domain)
+            else {
+                return DaemonControlResponse {
+                    payload: Some(RespPayload::Error(format!(
+                        "unknown recovery domain {:?}; expected one of \"enrollment\", \
+                         \"membership\", \"role-loss\"",
+                        r.domain
+                    ))),
+                    daemon_protocol_version:
+                        yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+                };
+            };
+            let key = crate::recovery::RecoveryOperationKey {
+                domain,
+                operation_id: r.operation_id.clone(),
+            };
+            match context.queries.recovery.diagnose(&key).await {
+                Ok(crate::queries::recovery::DiagnoseOutcome::Diagnosis(outcome)) => {
+                    RespPayload::ShowRecoveryOperation(
+                        crate::recovery_diagnosis::ipc::stable_diagnosis_outcome_to_proto(&outcome),
+                    )
+                }
+                Ok(crate::queries::recovery::DiagnoseOutcome::CoordinationNotConfigured) => {
+                    RespPayload::Error(
+                        "coordination-plane address/access token not configured on this device"
+                            .to_string(),
+                    )
+                }
+                Err(e) => RespPayload::Error(e.to_string()),
+            }
+        }
+
         None => RespPayload::Error("empty request".to_string()),
     };
 
@@ -858,202 +898,172 @@ async fn handle_request(
     }
 }
 
-/// Registers a new link, plus on-demand-sync's materialization
-/// policy/cap — set *after* `add_link` so the row those setters
-/// update-by-`local_path` already exists; `start_link_watch` itself
-/// doesn't depend on the ordering (it never queries the links table for
-/// the path it's given directly).
-///
-/// Defense-in-depth re-check, independent of whatever the CLI already
-/// showed/gated. Scoped to
-/// nested-link conflicts specifically (an already-linked folder that is an
-/// ancestor, descendant, or exact match of `r.local_path`) rather than the
-/// full preflight (non-empty folder, low disk space, risky location) --
-/// those are deliberately CLI-layer UX guardrails the user already sees
-/// and confirms/`--yes`es *before* a `LinkRequest` is ever sent (see
-/// `commands::link::link`), whereas an overlapping link is a genuine
-/// correctness hazard (two watchers racing over the same files) that this
-/// daemon is the sole authority on, since it alone knows every existing
-/// link's `local_path` -- worth rejecting here even if some future/'raw'
-/// caller bypassed the CLI's own gate entirely.
-///
-/// That authority is over PATHS. It is not the authority on which GROUP a
-/// folder belongs to: the one-live-link-per-group invariant is enforced in
-/// `SyncState::insert_link_row`, atomically with the insert, because a check
-/// out here cannot share the insert's transaction and so is a TOCTOU window
-/// between two concurrent `link` calls. The check below is an early, clearer
-/// refusal, not the guarantee.
-fn link(state: &Arc<DaemonState>, r: LinkRequest) -> Result<(), crate::error::DaemonError> {
-    // Deliberately NOT routed through `run_preflight`/`nested_conflicts`: that
-    // branch is gated on `!r.acknowledge_risks`, i.e. `--yes` waves it through.
-    // Path overlaps are warnings a user may knowingly accept; a second live root
-    // on one group is not acceptable at any confirmation level, because each
-    // root's scan tombstones the other's files on every device.
-    //
-    // `any(|p| p != &r.local_path)` rather than `!is_empty()`: re-linking the
-    // SAME folder to the same group is idempotent and must stay allowed -- it is
-    // exactly what a `share join` retry does after a failed link's rollback.
-    let live_for_group = state.sync_state.live_link_paths_for_group(&r.group_id)?;
-    if live_for_group.iter().any(|p| p != &r.local_path) {
-        return Err(crate::error::DaemonError::Config(format!(
-            "folder group {} is already linked at {}; a folder group can only be linked to one \
-             folder on a device -- two would make each folder's scan delete the other's files on \
-             every device. Unlink the other folder first, or link this folder to a different group",
-            r.group_id,
-            live_for_group.join(", ")
-        )));
-    }
-    let existing_paths: Vec<String> =
-        state.sync_state.list_links()?.into_iter().map(|l| l.local_path).collect();
-    let preflight = yadorilink_sync_core::link_preflight::run_preflight(
-        std::path::Path::new(&r.local_path),
-        &existing_paths,
-        None,
-    );
-    if !preflight.nested_conflicts.is_empty() && !r.acknowledge_risks {
-        let conflict_summary = preflight
-            .nested_conflicts
-            .iter()
-            .map(|c| match c.relation {
-                yadorilink_sync_core::link_preflight::NestedLinkRelation::Ancestor => {
-                    format!("{} is already linked and is an ancestor of this folder", c.other_path)
-                }
-                yadorilink_sync_core::link_preflight::NestedLinkRelation::Descendant => {
-                    format!("{} is already linked and is nested inside this folder", c.other_path)
-                }
-                yadorilink_sync_core::link_preflight::NestedLinkRelation::Same => {
-                    format!("{} is already linked", c.other_path)
-                }
+// `classify_link_failure`/`enrollment_link_to_request` moved to
+// `crate::adapters::runtime::enrollment_link::DaemonEnrollmentLinkAdapter`
+// (Phase 2 Commit 2) -- `application::EnrollmentService` now calls `link()`
+// through that port instead of a callback into this module.
+
+fn membership_outcome_to_proto(
+    outcome: crate::application::ReplicaMembershipOutcome,
+) -> ReplicaMembershipCommandOutcome {
+    ReplicaMembershipCommandOutcome {
+        handoffs: outcome
+            .handoffs
+            .into_iter()
+            .map(|handoff| MembershipHandoffResult {
+                group_id: handoff.group_id,
+                target_device_id: handoff.target_device_id,
+                lease_id: handoff.lease_id,
+                membership_generation: handoff.membership_generation,
             })
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(crate::error::DaemonError::Config(format!(
-            "link preflight rejected (nested-link conflict): {conflict_summary} -- re-run with acknowledge_risks/--yes to proceed"
-        )));
+            .collect(),
+        forced_group_ids: outcome.forced_group_ids,
+        unknown_scope_operation_id: outcome.unknown_scope_operation_id.unwrap_or_default(),
     }
-    // An empty operation id means "plain `link`, nothing to track" -- the
-    // common case and the only one a pre-existing caller (a CLI build that
-    // predates this field) ever sends. `share create`/`share join` set it,
-    // so the daemon can write the pending-enrollment marker in the same
-    // SQLite transaction as the link itself: if that write fails, the link
-    // is never created either, and the caller's own enroll operation can
-    // abort cleanly with no local trace at all (see
-    // `SyncState::add_link_with_pending_enrollment`'s doc comment for why
-    // the ordering matters).
-    if r.pending_enrollment_operation_id.is_empty() {
-        state.sync_state.add_link(&r.local_path, &r.group_id)?;
+}
+
+fn membership_error_to_proto(
+    error: crate::application::ReplicaMembershipError,
+) -> ApplicationCommandError {
+    use crate::application::ReplicaMembershipError as Error;
+    let (code, group_ids, operation_id) = match &error {
+        Error::LocalIdentityUnavailable => {
+            (ApplicationErrorCode::LocalIdentityUnavailable, Vec::new(), String::new())
+        }
+        Error::TargetNotFound => (ApplicationErrorCode::TargetNotFound, Vec::new(), String::new()),
+        Error::ReplicaNotReady { group_ids } => {
+            (ApplicationErrorCode::ReplicaNotReady, group_ids.clone(), String::new())
+        }
+        Error::TicketUnavailable { group_id } => {
+            (ApplicationErrorCode::TicketUnavailable, vec![group_id.clone()], String::new())
+        }
+        Error::CoordinationRejected { .. } => {
+            (ApplicationErrorCode::CoordinationRejected, Vec::new(), String::new())
+        }
+        Error::CoordinationAmbiguous { .. } => {
+            (ApplicationErrorCode::CoordinationAmbiguous, Vec::new(), String::new())
+        }
+        Error::DurabilityLatchFailed { group_ids, .. } => {
+            (ApplicationErrorCode::DurabilityLatchFailed, group_ids.clone(), String::new())
+        }
+        Error::RecoveryPending { operation_id, .. } => {
+            (ApplicationErrorCode::RecoveryPending, Vec::new(), operation_id.clone())
+        }
+        Error::CoordinationTransport { .. } => {
+            (ApplicationErrorCode::CoordinationTransport, Vec::new(), String::new())
+        }
+        Error::Persistence(_) => (ApplicationErrorCode::Persistence, Vec::new(), String::new()),
+        Error::OperationConflict { operation_id, .. } => {
+            (ApplicationErrorCode::OperationConflict, Vec::new(), operation_id.clone())
+        }
+        Error::RecoveryJournalUnavailable { operation_id, .. } => {
+            (ApplicationErrorCode::RecoveryJournalUnavailable, Vec::new(), operation_id.clone())
+        }
+    };
+    ApplicationCommandError {
+        code: code as i32,
+        message: error.to_string(),
+        group_ids,
+        operation_id,
+    }
+}
+
+fn enrollment_outcome_to_proto(
+    outcome: crate::application::EnrollmentOutcome,
+) -> EnrollmentCommandOutcome {
+    EnrollmentCommandOutcome {
+        operation_id: outcome.operation_id,
+        group_id: outcome.group_id,
+        local_path: outcome.local_path.to_string_lossy().to_string(),
+    }
+}
+
+fn enrollment_error_to_proto(
+    error: crate::application::EnrollmentError,
+) -> ApplicationCommandError {
+    use crate::application::EnrollmentError as Error;
+    let (code, operation_id) = match &error {
+        Error::LocalIdentityUnavailable => {
+            (ApplicationErrorCode::LocalIdentityUnavailable, String::new())
+        }
+        Error::RecoveryJournalUnavailable { operation_id, .. } => {
+            (ApplicationErrorCode::RecoveryJournalUnavailable, operation_id.clone())
+        }
+        Error::PreparationRejected { .. } => {
+            (ApplicationErrorCode::PreparationRejected, String::new())
+        }
+        Error::PreparationAmbiguous { operation_id, .. } => {
+            (ApplicationErrorCode::CoordinationAmbiguous, operation_id.clone())
+        }
+        Error::LocalLinkFailed { .. } => (ApplicationErrorCode::LocalLinkFailed, String::new()),
+        Error::LocalLinkAmbiguous { operation_id, .. } => {
+            (ApplicationErrorCode::RecoveryPending, operation_id.clone())
+        }
+        Error::ActivationRejected { .. } => {
+            (ApplicationErrorCode::ActivationRejected, String::new())
+        }
+        Error::ActivationAmbiguous { operation_id, .. } => {
+            (ApplicationErrorCode::ActivationAmbiguous, operation_id.clone())
+        }
+        Error::CompensationPending { operation_id, .. } => {
+            (ApplicationErrorCode::CompensationPending, operation_id.clone())
+        }
+        Error::OperationConflict { operation_id, .. } => {
+            (ApplicationErrorCode::OperationConflict, operation_id.clone())
+        }
+        Error::CoordinationTransport { .. } => {
+            (ApplicationErrorCode::CoordinationTransport, String::new())
+        }
+        Error::Persistence(_) => (ApplicationErrorCode::Persistence, String::new()),
+    };
+    ApplicationCommandError {
+        code: code as i32,
+        message: error.to_string(),
+        group_ids: Vec::new(),
+        operation_id,
+    }
+}
+
+/// `LinkRequest` (proto) -> `LinkCommand` (application-owned). All the
+/// real orchestration -- duplicate-group prevention, nested-path
+/// preflight, the pending-enrollment marker's same-transaction coupling,
+/// watcher setup, and rollback-on-setup-failure -- lives in
+/// `LinkLifecycleService::link`; this is decode only.
+fn decode_link_command(r: LinkRequest) -> crate::application::LinkCommand {
+    let pending_enrollment = if r.pending_enrollment_operation_id.is_empty() {
+        None
     } else {
         let kind = match PendingEnrollmentKind::try_from(r.pending_enrollment_kind)
             .unwrap_or(PendingEnrollmentKind::Unspecified)
         {
-            PendingEnrollmentKind::Join => EnrollmentKind::Join,
+            PendingEnrollmentKind::Join => crate::application::EnrollmentKind::Join,
             // `Create` and the (never expected, given a non-empty operation
             // id) `Unspecified` case both default to `Create` -- matching
             // `EnrollmentKind::from_db_str`'s own lenient fallback.
             PendingEnrollmentKind::Create | PendingEnrollmentKind::Unspecified => {
-                EnrollmentKind::Create
+                crate::application::EnrollmentKind::Create
             }
         };
-        state.sync_state.add_link_with_pending_enrollment(
-            &r.local_path,
-            &r.group_id,
-            &yadorilink_sync_core::index::PendingEnrollment {
-                operation_id: r.pending_enrollment_operation_id.clone(),
-                kind,
-                group_id: r.group_id.clone(),
-                device_id: r.pending_enrollment_device_id.clone(),
-                local_path: r.local_path.clone(),
-            },
-        )?;
+        Some(crate::application::PendingEnrollmentLinkCommand {
+            operation_id: r.pending_enrollment_operation_id,
+            kind,
+            device_id: r.pending_enrollment_device_id,
+        })
+    };
+    crate::application::LinkCommand {
+        local_path: r.local_path,
+        group_id: r.group_id,
+        on_demand: r.on_demand,
+        max_local_size_bytes: r.max_local_size_bytes,
+        acknowledge_risks: r.acknowledge_risks,
+        pending_enrollment,
     }
-    // From here on the link (and, if `pending_enrollment_operation_id` was
-    // set, its pending-enrollment marker) is durably committed. Every
-    // caller of this whole function treats any `Err` it returns as "nothing
-    // was created" (the CLI's `share create`/`share join` compensate only
-    // the coordination-plane side on failure -- see
-    // `commands::share::create_and_link`'s doc comment), so a failure past
-    // this point must roll the just-committed row(s) back rather than
-    // return `Err` with local state left behind. `start_link_watch`'s own
-    // fallible steps (loading the ignore set, binding the OS watcher) run
-    // before it registers anything in `DaemonState`'s in-memory maps, so
-    // there is no in-memory watcher state to unwind here, only the two
-    // SQLite rows above.
-    if let Err(e) = finish_link_setup(state, &r) {
-        // The rollback itself is best-effort against the same SQLite
-        // database the commit above just used, so it is expected to
-        // succeed in practice -- but it is not guaranteed to (e.g. a
-        // concurrent `SQLITE_BUSY`/`SQLITE_LOCKED` that outlasts the pool's
-        // own retry budget). A rollback failure must never be silently
-        // swallowed: the caller is about to be told the whole link setup
-        // failed and to treat nothing as created, so a link/marker that is
-        // actually still committed underneath that would be a live,
-        // reconcile-eligible link this device's own logs are the only
-        // record of.
-        // The link and (if set) its marker were committed together; roll them
-        // back together in one transaction so a mid-rollback failure can never
-        // leave the DB with a marker naming a path whose link is already gone
-        // (a half-state a later reconciliation would have to untangle). When
-        // there is no marker, the plain single-row `remove_link` is enough.
-        let mut rollback_ok = true;
-        let rollback_result = if r.pending_enrollment_operation_id.is_empty() {
-            state.sync_state.remove_link(&r.local_path)
-        } else {
-            state
-                .sync_state
-                .remove_link_and_pending_marker(&r.local_path, &r.pending_enrollment_operation_id)
-        };
-        if let Err(rollback_err) = rollback_result {
-            rollback_ok = false;
-            tracing::error!(
-                error = %rollback_err,
-                local_path = %r.local_path,
-                operation_id = %r.pending_enrollment_operation_id,
-                "failed to roll back a link (and its pending-enrollment marker, if any) after \
-                 its post-commit setup failed -- this local link may still be committed even \
-                 though link setup is being reported as failed"
-            );
-        }
-        return Err(if rollback_ok {
-            e
-        } else {
-            crate::error::DaemonError::Config(format!(
-                "link setup failed ({e}), and rolling back the partially-committed local state \
-                 also failed -- this device's local link state may now be inconsistent with \
-                 what was reported; check the daemon log and run `yadorilink link list` to \
-                 verify before retrying"
-            ))
-        });
-    }
-    Ok(())
-}
-
-/// The fallible steps of registering a link that run after the link (and
-/// pending-enrollment marker) row(s) are already committed -- split out so
-/// `link` above can roll both back together on any failure here, instead of
-/// leaving a phantom local link (and, worse, an orphaned-looking
-/// pending-enrollment row nothing will ever resolve) behind.
-fn finish_link_setup(
-    state: &Arc<DaemonState>,
-    r: &LinkRequest,
-) -> Result<(), crate::error::DaemonError> {
-    if r.on_demand {
-        state
-            .sync_state
-            .set_materialization_policy(&r.local_path, MaterializationPolicy::OnDemand)?;
-        if let Some(max_bytes) = r.max_local_size_bytes {
-            state.sync_state.set_max_local_size_bytes(&r.local_path, Some(max_bytes))?;
-        }
-    }
-    // Retention is a fixed built-in policy (10 versions / 30 days) applied to
-    // every link, so there is nothing per-link to configure here.
-    start_link_watch(state.clone(), r.local_path.clone(), r.group_id.clone())?;
-    Ok(())
 }
 
 /// `VersionRecord` (sync-core) -> `FileVersionInfo` (proto) — mirrors
 /// `LinkStatus`'s own by-field mapping pattern from `yadorilink_sync_core`
 /// types elsewhere in this file.
-fn version_to_proto(v: yadorilink_sync_core::index::VersionRecord) -> FileVersionInfo {
+fn version_to_proto(v: yadorilink_replica_domain::session_state::VersionRecord) -> FileVersionInfo {
     FileVersionInfo {
         version_seq: v.version_seq,
         size: v.size as i64,
@@ -1063,865 +1073,63 @@ fn version_to_proto(v: yadorilink_sync_core::index::VersionRecord) -> FileVersio
     }
 }
 
-#[derive(Debug)]
-struct AmbiguityRecovery {
-    group_id: String,
-    survivors: Vec<String>,
+/// `queries::reporting::ReportingStatusView` -> `ReportingStatusResponse`
+/// (proto).
+fn encode_reporting_status(
+    view: crate::queries::reporting::ReportingStatusView,
+) -> ReportingStatusResponse {
+    ReportingStatusResponse {
+        consent: Some(ReportingConsentState {
+            usage_submission_enabled: view.consent.usage_submission_enabled,
+            error_submission_enabled: view.consent.error_submission_enabled,
+            prompt_to_report_enabled: view.consent.prompt_to_report_enabled,
+            queue_retry_enabled: view.consent.queue_retry_enabled,
+            anonymous_reporter_id: view.consent.anonymous_reporter_id,
+            endpoint_override: view.consent.endpoint_override,
+        }),
+        queue_count: view.queue_count,
+        error_candidate_count: view.error_candidate_count,
+    }
 }
 
-fn prepare_ambiguity_recovery(
-    state: &DaemonState,
-    local_path: &str,
-) -> Result<Option<AmbiguityRecovery>, yadorilink_sync_core::SyncError> {
-    let links = state.sync_state.list_links()?;
-    let Some(target) = links.iter().find(|l| l.local_path == local_path) else {
-        return Ok(None);
-    };
-    let group_id = target.group_id.clone();
-    let live_paths: Vec<String> = links
-        .iter()
-        .filter(|l| l.group_id == group_id && !l.orphaned)
-        .map(|l| l.local_path.clone())
-        .collect();
-    if live_paths.len() < 2 {
-        return Ok(None);
+/// `queries::reporting::QueueItemView` -> `QueueItem` (proto).
+fn encode_queue_item(view: crate::queries::reporting::QueueItemView) -> QueueItem {
+    QueueItem {
+        report_id: view.report_id,
+        report_type: match view.report_type {
+            yadorilink_reporting::schema::ReportType::Usage => "usage".to_string(),
+            yadorilink_reporting::schema::ReportType::Error => "error".to_string(),
+        },
+        queued_at: view.queued_at,
+        size_bytes: view.size_bytes,
+        submit_attempts: view.submit_attempts,
     }
-
-    let survivors: Vec<String> =
-        live_paths.into_iter().filter(|path| path != local_path).collect();
-
-    state.sync_state.arm_duplicate_recovery_paths(&group_id)?;
-    for survivor in &survivors {
-        state.sync_state.set_suppress_tombstones(survivor, true)?;
-    }
-
-    Ok(Some(AmbiguityRecovery { group_id, survivors }))
 }
 
-/// The local link's path for `group_id`, if this device has one — the
-/// reverse of every other lookup in this file (which resolve a `local_path`
-/// forward to a `group_id`), needed here because [`SetStorageModeRequest`]
-/// carries only the group id (like the Worker's own storage-mode route),
-/// while `SyncState::set_materialization_policy` is keyed by `local_path`.
-///
-/// Returns `Result` rather than `Option`: the old `.ok()?` collapsed a failed
-/// link-table read into "this device has no link for that group", so a database
-/// error read as a routine absence. A group with two live links is likewise an
-/// error here, not a coin flip between two folders.
-fn local_path_for_group(
-    state: &DaemonState,
-    group_id: &str,
-) -> Result<Option<String>, yadorilink_sync_core::SyncError> {
-    state.sync_state.live_link_local_path_for_group(group_id)
-}
-
-/// Orchestrates `yadorilink share set-storage-mode`: the SOLE place that
-/// commits BOTH the coordination-plane record of this device's storage mode
-/// for `group_id` AND the local materialization-policy flip between eager
-/// (full replica) and on-demand (cache) — the CLI (`commands::share::
-/// set_storage_mode`) only asks for the change and prints this function's
-/// result; it makes no coordination-plane call of its own and has nothing to
-/// compensate.
-///
-/// Demoting FROM eager (`on_demand = true`) is refused, fail-closed, unless
-/// [`DaemonState::another_full_replica_is_ready`] confirms some other full
-/// replica durably holds the current version of every file in the group —
-/// without central storage, a full replica is the only durable copy, so
-/// giving one up before a confirmed handoff risks permanent data loss. This
-/// re-checks readiness itself rather than trusting any earlier check the
-/// caller may have already done (e.g. `CheckFullReplicaHandoffReady`), since
-/// that is the only check in this whole path that is actually authoritative
-/// at the moment local policy commits.
-///
-/// Promoting TO eager (`on_demand = false`) has no such hazard — gaining a
-/// durable copy is always safe — and is applied unconditionally; this
-/// direction is intentionally minimal (no readiness preflight, no backfill
-/// orchestration) since the corrected custody/hydration paths already bring
-/// an eager link's placeholders down over time.
-///
-/// Ordering, and why it is crash-safe either way. For a DEMOTION, when a real
-/// confirming peer is named and this device has coordination-plane config
-/// recorded (production, a logged-in registered device — see
-/// [`DaemonState::coordination_client_config`]), a live lease is now
-/// MANDATORY: this device asks the confirmed peer directly, over the
-/// authenticated peer channel, to verify and pin its own durability-root set
-/// and hand back a lease naming it
-/// ([`DaemonState::obtain_handoff_lease_from_peer`]), refusing outright if no
-/// live lease can be obtained (peer unreachable, refused, or its attested
-/// root digest doesn't match this device's own). Only once a lease is in
-/// hand does the coordination-plane role-loss commit happen, BEFORE the
-/// local policy flip, mirroring `ensure_unlink_keeps_a_full_replica`'s
-/// identical wiring. Unlike unlink, there is no `--force` here, so a refused
-/// or unreachable coordination-plane commit -- or a lease that could not be
-/// obtained at all -- fails the demotion closed with no local-only fallback
-/// and this device stays locally eager -- a crash between the two commits
-/// still leaves both sides agreeing this device is eager, which a re-run of
-/// the
-/// command reconciles. Committing local-only first would be the unsafe
-/// order: it would let this device release its only durable copy (and, on a
-/// crash before the coordination-plane commit, start reclaiming blocks)
-/// before the handoff is ever recorded coordination-side. For a PROMOTION,
-/// the coordination-plane storage-mode write
-/// (`coordination_client::set_storage_mode`) also happens BEFORE the local
-/// flip, and its failure aborts before the flip runs — but a promotion only
-/// ever ADDS a durable copy, so the reverse failure direction (Worker
-/// updated, local flip not yet run) is always safe and self-heals on a
-/// re-run; there is no data-loss hazard symmetric to the demotion case.
-///
-/// Behavior when no coordination-plane config is recorded differs by
-/// direction. A DEMOTION with no config falls through to a local-only flip
-/// (it can only get there when there was no confirming peer to name, i.e. a
-/// plane-disconnected daemon, which the readiness gate above already handles
-/// fail-closed for a real full replica). A PROMOTION in production instead
-/// FAILS CLOSED: it has no peer gate, so a silently-skipped Worker write
-/// would leave the plane on-demand while local goes eager, and — because a
-/// re-run no-ops once local already matches the target
-/// (`commands::share::set_storage_mode`) — that split would not self-heal.
-/// Under the deterministic simulator, where config is always absent by design
-/// (`set_coordination_client_config` is `#[cfg(not(madsim))]`), a promotion
-/// still proceeds local-only, just like a madsim demotion.
-///
-
-/// The readiness confirmation above is itself a network round trip, so there
-/// is a real window between it returning and the local policy flip below
-/// actually committing during which this device's own durability-root set
-/// (`SyncState::enumerate_group_durability_roots`) could change (a local
-/// edit lands). To close that TOCTOU, the digest the peer was confirmed
-/// against ([`DaemonState::full_replica_handoff_ready_digest`]) is re-checked
-/// and the policy flip is committed together, in one write transaction
-/// ([`SyncState::recheck_digest_then_set_materialization_policy`]), so a
-/// concurrent watcher index write cannot interleave between the re-check and
-/// the commit; a mismatch fails closed exactly like an unconfirmed peer would
-/// — there is no `--force` for demote (see this function's own doc comment on
-/// that), so the caller simply has to retry.
-///
-/// Note this atomic re-check guards the coordination-plane ROLE flip (eager
-/// -> on-demand), not block deletion. Actually reclaiming any specific
-/// version's blocks stays separately gated, per file, by the on-demand
-/// eviction custody check (`confirm_version_present_via_peer`), which is the
-/// real backstop against dropping the last copy of a version.
-async fn set_storage_mode(
-    state: &Arc<DaemonState>,
-    group_id: &str,
-    on_demand: bool,
-) -> Result<Option<(crate::coordination_client::HandoffCommitResult, [u8; 32])>, String> {
-    let Some(local_path) = local_path_for_group(state, group_id).map_err(|e| e.to_string())? else {
-        return Err(format!("no link registered for folder group {group_id}"));
-    };
-    if on_demand && state.is_local_full_replica(group_id) {
-        let Some((digest_at_check, ready_peer_device_id)) =
-            state.full_replica_handoff_ready_digest_and_peer(group_id).await
-        else {
-            return Err(
-                "refusing to drop full-replica status: no other full replica is confirmed to \
-                 hold every file in this group yet"
-                    .to_string(),
-            );
-        };
-        // Same role-loss shape as `ensure_unlink_keeps_a_full_replica`'s
-        // unlink path (this device giving up its own eager status) — reuse
-        // its exact wiring: a real confirmed peer means a non-empty root
-        // set, so a live, peer-attested lease is now MANDATORY (asked of the
-        // confirmed target directly, not merely looked up best-effort), and
-        // its absence refuses the whole commit -- see that function's own
-        // doc comment for the full rationale; only duplicated here because
-        // the two call sites commit two different local side effects (link
-        // removal vs. materialization-policy flip) on top of the same
-        // coordination-plane commit.
-        // Fix-saga: filled in inside the `Some(lease_id)` arm below, right
-        // before the coordination-worker commit, and consulted after the
-        // local recheck below to close out (success) or compensate
-        // (failure) the journal row it names -- see
-        // `DaemonState::open_role_loss_operation`'s doc comment.
-        let mut role_loss_operation_id: Option<String> = None;
-        let mut lease_acquisition_failed = false;
-        let coordination_result = match (&ready_peer_device_id, state.coordination_client_config())
-        {
-            (Some(target_device_id), Some(config)) => {
-                match state
-                    .obtain_handoff_lease_from_peer(group_id, target_device_id, digest_at_check)
-                    .await
-                {
-                    Some(lease_id) => {
-                        // Fix-saga: persist the durable Prepared journal row
-                        // FIRST, and fail closed if that write itself fails --
-                        // committing the role loss on the Worker without a
-                        // durable recovery record would reopen the exact
-                        // split-state hole the journal exists to close.
-                        // Nothing has been committed on either side yet, so
-                        // aborting here leaves no split (routed through the
-                        // same `Err(())` fail-closed tail as an unconfirmed
-                        // peer -- for demote there is no `--force`, so it just
-                        // refuses).
-                        match state.open_role_loss_operation(
-                            group_id,
-                            target_device_id,
-                            &lease_id,
-                            yadorilink_sync_core::index::RoleLossAction::Demote,
-                            &local_path,
-                        ) {
-                            Err(e) => {
-                                tracing::error!(
-                                    error = %e,
-                                    group_id,
-                                    target_device_id = %target_device_id,
-                                    "refusing the demotion: could not persist the durable \
-                                     role-loss rollback journal, so the role loss must not be \
-                                     committed on the coordination plane"
-                                );
-                                Err(())
-                            }
-                            Ok(operation_id) => {
-                                match crate::coordination_client::commit_handoff_role_loss(
-                                    &config.addr,
-                                    &config.access_token,
-                                    group_id,
-                                    &state.device_id,
-                                    target_device_id,
-                                    Some(lease_id.as_str()),
-                                    "demote",
-                                )
-                                .await
-                                {
-                                    crate::coordination_client::RoleLossCommitOutcome::Committed(result) => {
-                                        state.mark_role_loss_worker_committed(
-                                            &operation_id,
-                                            result.membership_generation,
-                                        );
-                                        role_loss_operation_id = Some(operation_id);
-                                        Ok(Some((result, digest_at_check)))
-                                    }
-                                    crate::coordination_client::RoleLossCommitOutcome::DefinitelyRejected(e) => {
-                                        state.discard_role_loss_operation(&operation_id);
-                                        tracing::warn!(
-                                            error = %e,
-                                            group_id,
-                                            target_device_id = %target_device_id,
-                                            "coordination-plane handoff role-loss commit failed; \
-                                             set-storage-mode readiness gate treats this the same \
-                                             as an unconfirmed peer"
-                                        );
-                                        Err(())
-                                    }
-                                    crate::coordination_client::RoleLossCommitOutcome::Ambiguous(e) => {
-                                        tracing::error!(
-                                            error = %e,
-                                            group_id,
-                                            target_device_id = %target_device_id,
-                                            operation_id,
-                                            "handoff role-loss commit outcome is ambiguous; retaining the \
-                                             Prepared journal and compensating Worker state back to eager"
-                                        );
-                                        if let Err(compensation_error) =
-                                            state.compensate_role_loss_operation(&operation_id).await
-                                        {
-                                            tracing::error!(
-                                                error = %compensation_error,
-                                                operation_id,
-                                                "immediate ambiguous role-loss compensation failed; the \
-                                                 periodic reconciler will retry"
-                                            );
-                                        }
-                                        Err(())
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        lease_acquisition_failed = true;
-                        tracing::warn!(
-                            group_id,
-                            target_device_id = %target_device_id,
-                            "could not obtain a live handoff lease from the confirmed target \
-                             peer (unreachable, refused, or its attested durability-root digest \
-                             did not match this device's own); a lease is mandatory for a \
-                             non-empty root set, so refusing to relinquish full-replica status"
-                        );
-                        Err(())
-                    }
-                }
-            }
-            // A confirmed handoff target with no coordination-plane config
-            // recorded. A named target means a NON-EMPTY root set, which now
-            // mandates a live lease -- and with no config there is no way to
-            // obtain or commit one. Fail closed rather than relinquish the
-            // role lease-less: the mandatory-lease guarantee is encoded here,
-            // not left resting on the (implicit, unencoded) assumption that a
-            // confirmed peer cannot exist without config. Under the
-            // deterministic simulator config is always absent by design
-            // (`set_coordination_client_config` is `#[cfg(not(madsim))]`) and
-            // there is no real coordination plane, so a demotion there keeps
-            // its pre-existing local-only fallthrough (see the `_` arm).
-            #[cfg(not(madsim))]
-            (Some(target_device_id), None) => {
-                lease_acquisition_failed = true;
-                tracing::warn!(
-                    group_id,
-                    target_device_id = %target_device_id,
-                    "confirmed a ready replica but cannot obtain the mandatory handoff lease: \
-                     coordination-plane configuration is unavailable"
-                );
-                Err(())
-            }
-            // Empty root set (vacuously ready -- no confirmed peer to name, no
-            // lease required), and, under the simulator, the (Some, None) case
-            // above (which is not compiled there) as its local-only path.
-            _ => Ok(None),
-        };
-        let Ok(handoff_result) = coordination_result else {
-            if lease_acquisition_failed {
-                return Err(demotion_handoff_lease_failure_message());
-            }
-            return Err("refusing to drop full-replica status: the coordination plane could not \
-                 confirm the target device is still an active eager full replica for this \
-                 group; re-run set-storage-mode to re-confirm"
-                .to_string());
-        };
-        // Atomic: re-enumerate the root set and, only if its digest still
-        // equals the one the peer confirmed against, flip the policy — both
-        // in one transaction, so no watcher write can slip in between.
-        //
-        // Fix-saga: when `role_loss_operation_id` is `Some`, the
-        // coordination-worker role-loss commit above already succeeded, so a
-        // failure here (digest mismatch OR a storage error -- both handled
-        // identically, per `RoleLossOperation`'s state machine) must not
-        // just return an error and leave the Worker and this device
-        // disagreeing about full-replica status. Compensate by reverting
-        // the Worker back to `eager` instead of erroring bare -- see
-        // `DaemonState::compensate_role_loss_operation`'s doc comment for
-        // why reverting, not force-completing the demotion, is the safe
-        // direction. When `role_loss_operation_id` is `None`, no Worker
-        // commit happened (an empty root set, or no coordination-plane
-        // config), so this is exactly the pre-existing local-only failure
-        // path, unchanged.
-        let recheck_result = state.sync_state.recheck_digest_then_set_materialization_policy(
-            group_id,
-            &local_path,
-            MaterializationPolicy::OnDemand,
-            digest_at_check,
-        );
-        let local_failure_reason = match &recheck_result {
-            Ok(true) => None,
-            Ok(false) => Some(
-                "this group's durable file/version set changed between the readiness check and \
-                 the commit, so the earlier confirmation no longer covers it"
-                    .to_string(),
-            ),
-            Err(e) => Some(e.to_string()),
-        };
-        let Some(local_failure_reason) = local_failure_reason else {
-            if let Some(operation_id) = &role_loss_operation_id {
-                state.settle_role_loss_operation_success(operation_id);
-            }
-            return Ok(handoff_result);
-        };
-        let Some(operation_id) = role_loss_operation_id else {
-            return Err(format!(
-                "refusing to drop full-replica status: {local_failure_reason}; re-run \
-                 set-storage-mode to re-confirm"
-            ));
-        };
-        return Err(match state.compensate_role_loss_operation(&operation_id).await {
-            Ok(()) => format!(
-                "demotion was committed on the coordination plane but the matching local change \
-                 failed ({local_failure_reason}); the operation was SAFELY ROLLED BACK -- this \
-                 device's full-replica status was restored on the coordination plane. Re-run \
-                 set-storage-mode to try again."
-            ),
-            Err(compensation_err) => format!(
-                "demotion was committed on the coordination plane but the matching local change \
-                 failed ({local_failure_reason}); the automatic rollback could not complete \
-                 ({compensation_err}) and will be retried automatically until it succeeds -- \
-                 this device may briefly appear demoted on the coordination plane even though \
-                 it is still storing this group eagerly locally."
-            ),
-        });
+/// `queries::file_history::TrashedFileView` -> `TrashedFileInfo` (proto).
+fn trashed_file_view_to_proto(
+    view: crate::queries::file_history::TrashedFileView,
+) -> TrashedFileInfo {
+    TrashedFileInfo {
+        local_path: view.local_path,
+        path: view.trashed.path,
+        version_seq: view.trashed.version_seq,
+        last_known_size: view.trashed.last_known_size as i64,
+        origin_device_id: view.trashed.origin_device_id.unwrap_or_default(),
+        deleted_at_unix_nanos: view.trashed.deleted_at_unix_nanos,
     }
-    // Reached for a PROMOTION (`on_demand = false`), and for a redundant
-    // on-demand request from a device that is not currently an eager full
-    // replica (nothing to hand off, so the demotion branch above never
-    // applies). Only the promotion direction needs a coordination-plane
-    // write here: a demotion's write is the role-loss commit above, already
-    // done by the time execution reaches this point. Written BEFORE the
-    // local flip below, and its failure aborts before the flip runs (via
-    // `?`), mirroring the demotion branch's own ordering -- see this
-    // function's doc comment for why that direction is always the safe one
-    // for a promotion.
-    //
-    // Unlike a demotion, a promotion has no ready-peer gate that would
-    // independently fail closed when this daemon is disconnected from the
-    // coordination plane. So if the mode write is silently skipped when no
-    // config is recorded, a promotion would flip local policy to eager while
-    // the coordination plane stays on-demand -- and it would NOT self-heal,
-    // since re-running the command sees the local mode already at the target
-    // and no-ops (`commands::share::set_storage_mode`). Fail closed instead:
-    // in production a missing config means the daemon is not connected to the
-    // coordination plane (started before login, or a token was lost and it
-    // was not restarted), so refuse rather than diverge. The local flip below
-    // is never reached in that case.
-    #[cfg(not(madsim))]
-    if !on_demand {
-        let Some(config) = state.coordination_client_config() else {
-            return Err(
-                "not connected to the coordination plane; cannot change storage mode (ensure the \
-                 daemon is logged in; restart it if you logged in after it started)"
-                    .to_string(),
-            );
-        };
-        crate::coordination_client::set_storage_mode(
-            &config.addr,
-            &config.access_token,
-            group_id,
-            &state.device_id,
-            "eager",
-        )
-        .await?;
-    }
-    // Under the deterministic simulator `set_coordination_client_config` is
-    // never called (it is `#[cfg(not(madsim))]`), so config is ALWAYS None by
-    // design and there is no real coordination plane to write to -- a
-    // promotion proceeds local-only here, exactly as a madsim demotion's
-    // local-only fallthrough above does.
-    let policy =
-        if on_demand { MaterializationPolicy::OnDemand } else { MaterializationPolicy::Eager };
-    state.sync_state.set_materialization_policy(&local_path, policy).map_err(|e| e.to_string())?;
-    Ok(None)
-}
-
-/// `yadorilink trash list`: flattens every linked folder's
-/// Refuses to unlink an eager (full-replica) folder on this device unless
-/// [`DaemonState::another_full_replica_is_ready`] confirms some OTHER full
-/// replica is, right now, durably holding the current version of every file
-/// in the group. Because there is no central storage, a full replica is a
-/// group's only durable copy, so unlinking the last one before a confirmed
-/// handoff risks permanent data loss — merely having another device's row
-/// recorded as "also a full replica" is not enough, since that device could
-/// be offline, behind, or missing blocks (this is the same gap
-/// `set_storage_mode`'s demotion gate closes; unlink is the same hazard by a
-/// different name). Unlinking an on-demand link (this device is a cache, not
-/// a durable holder) is always allowed regardless. A missing or unreadable
-/// link list defers to `remove_link` for the real outcome rather than
-/// blocking.
-///
-/// `force` bypasses the gate for a genuinely dead sole replica that would
-/// otherwise have no way to ever unlink — every forced override is logged
-/// here as an audit trail (`tracing::warn!`), since bypassing this gate can
-/// permanently lose the only copy of the group's data.
-///
-/// The readiness confirmation is itself a peer round trip, so there is a
-/// real window between it succeeding and the unlink actually committing
-/// during which this device's own durability-root set
-/// (`SyncState::enumerate_group_durability_roots`) could change (a local
-/// edit lands). To close that TOCTOU, the digest the peer was confirmed
-/// against ([`DaemonState::full_replica_handoff_ready_digest`]) is re-checked
-/// and the link row removed together, in one write transaction
-/// ([`SyncState::recheck_digest_then_remove_link`]), so a concurrent watcher
-/// index write cannot interleave between the re-check and the removal; a
-/// digest that no longer matches is treated exactly like an unconfirmed peer
-/// — refused unless `--force`. See `set_storage_mode`'s matching comment for
-/// the demote side of the same pattern.
-///
-/// Note this atomic re-check guards only the coordination-plane ROLE flip
-/// (removing this device's eager link), not block deletion. Actually
-/// reclaiming any version's blocks stays separately gated, per file, by the
-/// on-demand eviction custody check (`confirm_version_present_via_peer`),
-/// which is the real backstop against dropping the last copy of a version.
-///
-/// Returns which removal step the caller ([`handle_request`]) still owes: the
-/// eager ready path removes the link atomically here (`AlreadyRemoved`); every
-/// other path leaves the plain removal to the caller (`RemoveNormally`).
-async fn ensure_unlink_keeps_a_full_replica(
-    state: &DaemonState,
-    local_path: &str,
-    force: bool,
-) -> Result<UnlinkCommit, String> {
-    let Some(link) = state
-        .sync_state
-        .list_links()
-        .map_err(|e| format!("refusing to unlink because the local link table could not be read: {e}"))?
-        .into_iter()
-        .find(|l| l.local_path == local_path)
-    else {
-        return Ok(UnlinkCommit::RemoveNormally);
-    };
-    if link.materialization_policy != MaterializationPolicy::Eager {
-        return Ok(UnlinkCommit::RemoveNormally);
-    }
-    // A confirmed whole-group handoff yields the exact root-set digest it was
-    // made against (and, when a real peer confirmed it, that peer's device
-    // id); the atomic method below re-enumerates and removes the link
-    // in one transaction only if that digest still holds.
-    let mut lease_acquisition_failed = false;
-    if let Some((digest_at_check, ready_peer_device_id)) =
-        state.full_replica_handoff_ready_digest_and_peer(&link.group_id).await
-    {
-        // This device giving up its own eager status is exactly the
-        // role-loss shape coordination-worker's handoff-commit endpoint
-        // guards (see `HandoffResult`'s proto doc comment): confirm the
-        // named target is currently Active+eager and commit the role loss
-        // (`storage_mode` narrows to on-demand) atomically, coordination-
-        // side, before this device also removes its own local link. Only
-        // attempted when both a real confirming peer was named (not the
-        // vacuously-ready empty-group case, which has no peer to target)
-        // and this device actually has coordination-plane config recorded
-        // (`DaemonState::coordination_client_config`'s doc comment: absent
-        // under the deterministic simulator, on a device that never
-        // registered/logged in, and in most of this crate's own unit
-        // tests) — otherwise this falls back to exactly the pre-existing
-        // purely-local gate, unchanged.
-        // `Ok(None)`: no coordination-plane commit was attempted (falls back
-        // to the pre-existing purely-local gate) or attempted and refused
-        // (fail closed, same as an unconfirmed peer). `Ok(Some(result))`: a
-        // commit was attempted and succeeded, to be threaded into the
-        // eventual `UnlinkResponse`.
-        //
-        // Fix-saga: filled in inside the `Some(lease_id)` arm below, right
-        // before the coordination-worker commit, and consulted after the
-        // local recheck further down to close out (success) or compensate
-        // (failure) the journal row it names -- see
-        // `DaemonState::open_role_loss_operation`'s doc comment.
-        let mut role_loss_operation_id: Option<String> = None;
-        let coordination_result = match (&ready_peer_device_id, state.coordination_client_config())
-        {
-            (Some(target_device_id), Some(config)) => {
-                // A real confirming peer was named, i.e. a non-empty root
-                // set -- a live, peer-attested lease is now MANDATORY, not
-                // merely looked up best-effort: ask the confirmed target
-                // directly, over the authenticated peer channel, to verify
-                // and pin its own durability-root set and hand back a lease
-                // naming it (`DaemonState::obtain_handoff_lease_from_peer`),
-                // and refuse the whole commit if none can be obtained
-                // (unreachable, refused, or a digest mismatch -- the target
-                // isn't actually caught up to this device's exact set). The
-                // `--force` override below still lets a forced unlink
-                // proceed with no lease at all; this gate only governs the
-                // non-forced path.
-                match state
-                    .obtain_handoff_lease_from_peer(
-                        &link.group_id,
-                        target_device_id,
-                        digest_at_check,
-                    )
-                    .await
-                {
-                    None => {
-                        lease_acquisition_failed = true;
-                        tracing::warn!(
-                            group_id = %link.group_id,
-                            local_path,
-                            target_device_id = %target_device_id,
-                            "could not obtain a live handoff lease from the confirmed target \
-                             peer; a lease is mandatory for a non-empty root set -- unlink \
-                             readiness gate treats this the same as an unconfirmed peer (use \
-                             --force to override)"
-                        );
-                        Err(())
-                    }
-                    Some(lease_id) => {
-                        // Fix-saga: persist the durable Prepared journal row
-                        // FIRST and fail closed if it can't be written -- see
-                        // `set_storage_mode`'s matching Fix-saga comment. A
-                        // failed Prepared write routes to the same `Err(())`
-                        // the no-lease case uses, so the force-or-refuse tail
-                        // below still governs (a `--force` unlink can still
-                        // proceed, latching `DurabilityUnknown`; a non-forced
-                        // one is refused) -- but the Worker role-loss commit is
-                        // never reached without a durable rollback record.
-                        match state.open_role_loss_operation(
-                            &link.group_id,
-                            target_device_id,
-                            &lease_id,
-                            yadorilink_sync_core::index::RoleLossAction::Unlink,
-                            local_path,
-                        ) {
-                            Err(e) => {
-                                tracing::error!(
-                                    error = %e,
-                                    group_id = %link.group_id,
-                                    local_path,
-                                    target_device_id = %target_device_id,
-                                    "refusing the online unlink handoff: could not persist the \
-                                     durable role-loss rollback journal, so the role loss must \
-                                     not be committed on the coordination plane"
-                                );
-                                Err(())
-                            }
-                            Ok(operation_id) => {
-                                match crate::coordination_client::commit_handoff_role_loss(
-                                    &config.addr,
-                                    &config.access_token,
-                                    &link.group_id,
-                                    &state.device_id,
-                                    target_device_id,
-                                    Some(lease_id.as_str()),
-                                    "demote",
-                                )
-                                .await
-                                {
-                                    // `digest_at_check` is this device's own
-                                    // local durability-root digest, paired here
-                                    // purely for the caller's
-                                    // `HandoffResult.root_digest` output --
-                                    // never itself sent to coordination-worker
-                                    // (see `commit_handoff_role_loss`'s doc
-                                    // comment).
-                                    crate::coordination_client::RoleLossCommitOutcome::Committed(result) => {
-                                        state.mark_role_loss_worker_committed(
-                                            &operation_id,
-                                            result.membership_generation,
-                                        );
-                                        role_loss_operation_id = Some(operation_id);
-                                        Ok(Some((result, digest_at_check)))
-                                    }
-                                    crate::coordination_client::RoleLossCommitOutcome::DefinitelyRejected(e) => {
-                                        state.discard_role_loss_operation(&operation_id);
-                                        tracing::warn!(
-                                            error = %e,
-                                            group_id = %link.group_id,
-                                            local_path,
-                                            target_device_id = %target_device_id,
-                                            "coordination-plane handoff role-loss commit failed; \
-                                             unlink readiness gate treats this the same as an \
-                                             unconfirmed peer"
-                                        );
-                                        Err(())
-                                    }
-                                    crate::coordination_client::RoleLossCommitOutcome::Ambiguous(e) => {
-                                        tracing::error!(
-                                            error = %e,
-                                            group_id = %link.group_id,
-                                            local_path,
-                                            target_device_id = %target_device_id,
-                                            operation_id,
-                                            "unlink role-loss commit outcome is ambiguous; retaining the \
-                                             Prepared journal and compensating Worker state back to eager"
-                                        );
-                                        if let Err(compensation_error) =
-                                            state.compensate_role_loss_operation(&operation_id).await
-                                        {
-                                            tracing::error!(
-                                                error = %compensation_error,
-                                                operation_id,
-                                                "immediate ambiguous unlink compensation failed; the periodic \
-                                                 reconciler will retry"
-                                            );
-                                        }
-                                        Err(())
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // A confirmed handoff target with no coordination-plane config
-            // recorded -- a NON-EMPTY root set that now mandates a live
-            // lease, with no way to obtain one. Fail closed exactly like the
-            // no-lease-obtainable case above (`Err(())`), which the tail
-            // below routes to the existing force-or-refuse handling -- so
-            // `--force` still proceeds (latching `DurabilityUnknown`), a
-            // non-forced unlink is refused, and the mandatory-lease guarantee
-            // is encoded rather than resting on the implicit assumption that
-            // a confirmed peer cannot exist without config. Under the
-            // deterministic simulator config is always absent by design
-            // (`set_coordination_client_config` is `#[cfg(not(madsim))]`), so
-            // this case is not compiled there and the `_` arm's pre-existing
-            // local-only fallthrough stands.
-            #[cfg(not(madsim))]
-            (Some(target_device_id), None) => {
-                lease_acquisition_failed = true;
-                tracing::warn!(
-                    group_id = %link.group_id,
-                    local_path,
-                    target_device_id = %target_device_id,
-                    "confirmed a ready replica but cannot obtain the mandatory handoff lease: \
-                     coordination-plane configuration is unavailable"
-                );
-                Err(())
-            }
-            // Empty root set (vacuously ready -- no confirmed peer to name, no
-            // lease required), and, under the simulator, the (Some, None) case
-            // above (not compiled there) as its local-only path.
-            _ => Ok(None),
-        };
-        if let Ok(handoff_result) = coordination_result {
-            let recheck_result = state.sync_state.recheck_digest_then_remove_link(
-                &link.group_id,
-                local_path,
-                digest_at_check,
-            );
-            match recheck_result {
-                Ok(true) => {
-                    if let Some(operation_id) = &role_loss_operation_id {
-                        state.settle_role_loss_operation_success(operation_id);
-                    }
-                    return Ok(UnlinkCommit::AlreadyRemoved(handoff_result));
-                }
-                Ok(false) | Err(_) if role_loss_operation_id.is_some() => {
-                    // Fix-saga: the Worker commit above already succeeded, so a
-                    // local failure here (digest mismatch OR a storage error --
-                    // both handled identically, per `RoleLossOperation`'s state
-                    // machine) must not silently fall through to `--force`
-                    // completing an unlink whose digest was never re-verified
-                    // against the peer confirmation, nor leave a bare split
-                    // state on the non-forced path. Compensate by reverting the
-                    // Worker back to `eager` instead -- see `set_storage_mode`'s
-                    // matching Fix-saga comment for the full rationale (revert,
-                    // never force-complete, once the Worker has already
-                    // committed).
-                    let operation_id = role_loss_operation_id
-                        .clone()
-                        .expect("guarded by role_loss_operation_id.is_some() above");
-                    let local_failure_reason = match &recheck_result {
-                        Ok(false) => "this group's durable file/version set changed between the \
-                                      readiness check and the commit, so the earlier \
-                                      confirmation no longer covers it"
-                            .to_string(),
-                        Err(e) => e.to_string(),
-                        Ok(true) => unreachable!("Ok(true) handled by the arm above"),
-                    };
-                    return Err(match state.compensate_role_loss_operation(&operation_id).await {
-                        Ok(()) => format!(
-                            "unlink was committed on the coordination plane but the matching \
-                             local removal failed ({local_failure_reason}); the operation was \
-                             SAFELY ROLLED BACK -- this device's full-replica status was \
-                             restored on the coordination plane. Re-run unlink to try again."
-                        ),
-                        Err(compensation_err) => format!(
-                            "unlink was committed on the coordination plane but the matching \
-                             local removal failed ({local_failure_reason}); the automatic \
-                             rollback could not complete ({compensation_err}) and will be \
-                             retried automatically until it succeeds -- this device may briefly \
-                             appear demoted on the coordination plane even though it is still \
-                             storing this group eagerly locally."
-                        ),
-                    });
-                }
-                // No coordination-worker commit happened (empty root set, or no
-                // coordination-plane config) -- exactly the pre-existing
-                // behavior: the root set moved between the peer confirmation
-                // and the atomic re-check, so fall through to the same
-                // force-or-refuse handling as an unconfirmed peer.
-                Ok(false) => {}
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-    }
-    if force {
-        tracing::warn!(
-            group_id = %link.group_id,
-            local_path,
-            "forced unlink of an eager full replica with no other full replica confirmed \
-             ready -- proceeding anyway; this may have permanently lost the only complete \
-             copy of this folder's data"
-        );
-        // This override is exactly the case the local durability-status
-        // latch exists for: the group's remaining local replica (if any)
-        // must not be able to report `Healthy`/"synced" again until a real
-        // whole-group handoff re-check says so, even though nothing else
-        // about its own files just changed.
-        state.latch_group_durability_unknown(&link.group_id).map_err(|e| e.to_string())?;
-        return Ok(UnlinkCommit::RemoveNormally);
-    }
-    if lease_acquisition_failed {
-        return Err(unlink_handoff_lease_failure_message(local_path));
-    }
-    Err(format!(
-        "refusing to unlink {local_path}: no other full replica is confirmed ready to durably \
-         hold every file in this group yet, so unlinking it may permanently lose the only \
-         complete copy of this folder's data. Wait for another full replica to finish syncing, \
-         or re-run with --force to unlink anyway (data-loss risk)."
-    ))
-}
-
-/// Which link-row removal step the unlink dispatcher still owes after the
-/// durability gate ([`ensure_unlink_keeps_a_full_replica`]) returns.
-#[derive(Debug, PartialEq, Eq)]
-enum UnlinkCommit {
-    /// The eager ready path already removed the link row atomically with its
-    /// digest re-check; the caller must not remove it again. Carries the
-    /// coordination-plane handoff-commit result, paired with this device's
-    /// own locally-computed root digest (never sent to or read back from
-    /// coordination-worker — see `HandoffCommitResult`'s doc comment), when
-    /// that path actually ran one (`Some`) — see
-    /// `ensure_unlink_keeps_a_full_replica`'s doc comment for when it does
-    /// and doesn't.
-    AlreadyRemoved(Option<(crate::coordination_client::HandoffCommitResult, [u8; 32])>),
-    /// No atomic removal happened (on-demand cache, no link row, or a forced
-    /// bypass); the caller performs the plain `remove_link`.
-    RemoveNormally,
-}
-
-/// The not-ready group id list behind `CheckFullReplicaHandoffReadyExcluding`
-/// -- see that request's proto doc comment for the full contract. For each
-/// candidate group (either the single `group_id` given, or, when empty,
-/// every group this daemon has a local link for), a group only needs
-/// checking at all if `excluded_device_id` is actually recorded here as an
-/// eager full replica for it: revoking/removing an on-demand (cache) device,
-/// or one this daemon has no record of at all, never gives up a durable
-/// copy. This is necessarily a partial view -- this daemon only knows about
-/// groups/peers it itself participates in -- which is why the coordination
-/// Worker's own access-count guard still runs regardless of this answer.
-async fn full_replica_handoff_not_ready_excluding(
-    state: &Arc<DaemonState>,
-    group_id: &str,
-    excluded_device_id: &str,
-) -> Result<Vec<String>, yadorilink_sync_core::SyncError> {
-    let candidate_groups: Vec<String> = if group_id.is_empty() {
-        state
-            .sync_state
-            .list_links()?
-            .into_iter()
-            .map(|l| l.group_id)
-            .collect()
-    } else {
-        vec![group_id.to_string()]
-    };
-    let mut not_ready = Vec::new();
-    for candidate in candidate_groups {
-        if !state.peer_group_is_full_replica(excluded_device_id, &candidate) {
-            continue;
-        }
-        if !state.another_full_replica_is_ready_excluding(&candidate, excluded_device_id).await {
-            not_ready.push(candidate);
-        }
-    }
-    Ok(not_ready)
-}
-
-/// trashed files into one list, each tagged with the link's own
-/// `local_path` since `ListTrashRequest` spans every link at once — mirrors
-/// `list_link_statuses`'s own per-link iteration.
-fn list_trashed_files(
-    state: &DaemonState,
-) -> Result<Vec<TrashedFileInfo>, yadorilink_sync_core::SyncError> {
-    let mut out = Vec::new();
-    for link in state.sync_state.list_links()? {
-        for trashed in state.sync_state.list_trashed(&link.group_id)? {
-            out.push(TrashedFileInfo {
-                local_path: link.local_path.clone(),
-                path: trashed.path,
-                version_seq: trashed.version_seq,
-                last_known_size: trashed.last_known_size as i64,
-                origin_device_id: trashed.origin_device_id.unwrap_or_default(),
-                deleted_at_unix_nanos: trashed.deleted_at_unix_nanos,
-            });
-        }
-    }
-    Ok(out)
 }
 
 /// Maps the daemon's internal reachability into the control-socket wire
 /// enums (`PeerStatus.reachability` / `unreachable_category`). The category
 /// is `Unspecified` whenever the peer is not unreachable.
 fn reachability_to_proto(
-    reachability: crate::daemon_state::PeerReachability,
+    reachability: crate::peer_registry::PeerReachability,
 ) -> (
     yadorilink_ipc_proto::daemonctl::PeerReachability,
     yadorilink_ipc_proto::daemonctl::UnreachableCategory,
 ) {
-    use crate::daemon_state::{PeerReachability as Daemon, UnreachableCategory as DaemonCat};
+    use crate::peer_registry::{PeerReachability as Daemon, UnreachableCategory as DaemonCat};
     use yadorilink_ipc_proto::daemonctl::{
         PeerReachability as Wire, UnreachableCategory as WireCat,
     };
@@ -1944,9 +1152,9 @@ fn reachability_to_proto(
 /// Maps the daemon's internal per-group durability status into the
 /// control-socket wire enum (`LinkStatus.durability_status`).
 fn durability_status_to_proto(
-    status: crate::daemon_state::GroupDurabilityStatus,
+    status: crate::durability_service::GroupDurabilityStatus,
 ) -> GroupDurabilityStatus {
-    use crate::daemon_state::GroupDurabilityStatus as Daemon;
+    use crate::durability_service::GroupDurabilityStatus as Daemon;
     match status {
         Daemon::Healthy => GroupDurabilityStatus::Healthy,
         Daemon::Syncing => GroupDurabilityStatus::Syncing,
@@ -1955,238 +1163,152 @@ fn durability_status_to_proto(
     }
 }
 
-/// a lightweight health surface distinct from `StatusResponse`
-/// (see `daemon_control.proto`'s `HealthResponse` doc comment) — task
-/// liveness, connected-peer count, and a process-wide pending-changes
-/// total, all cheap to compute from state already held in memory (no SQLite
-/// queries, unlike `list_link_statuses`).
-pub(crate) fn health_snapshot(state: &DaemonState) -> HealthResponse {
-    let tasks = state
-        .task_liveness
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .iter()
-        .map(|(name, alive)| TaskLiveness { name: name.clone(), alive: *alive })
+/// `HealthView` (`crate::queries::health`, DaemonState-independent) -> the
+/// IPC wire type.
+pub(crate) fn encode_health(view: crate::queries::health::HealthView) -> HealthResponse {
+    let tasks = view
+        .tasks
+        .into_iter()
+        .map(|entry| TaskLiveness { name: entry.name, alive: entry.alive })
         .collect();
-
-    let peer_statuses = state.peer_statuses.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let connected_peer_count =
-        peer_statuses.values().filter(|info| info.reachability.is_connected()).count() as u32;
-
-    HealthResponse { tasks, connected_peer_count }
+    HealthResponse { tasks, connected_peer_count: view.connected_peer_count }
 }
 
-pub(crate) fn list_link_statuses(
-    state: &DaemonState,
-) -> Result<Vec<LinkStatus>, yadorilink_sync_core::SyncError> {
-    let links = state.sync_state.list_links()?;
-    let mut out = Vec::with_capacity(links.len());
-    for link in links {
-        let files = state.sync_state.list_files(&link.group_id)?;
-        let conflict_count =
-            files.iter().filter(|f| f.path.contains("(conflicted copy")).count() as u64;
-        let materialization = state.sync_state.materialization_counts(&link.group_id)?;
-        // Held-file and skipped-symlink status, populated from section
-        // 1's per-file `SyncState` getters. Deliberately `get_held_state`/
-        // `get_record_kind` per non-deleted file rather than a new
-        // aggregate SQL query on `index.rs` — this section's scope is the
-        // daemon/IPC surface only, and `index.rs` already exposes exactly
-        // the by-`(group_id, path)` accessors this needs (mirrors this
-        // same function's pre-existing `conflict_count`, an in-process
-        // filter over `files` rather than its own query). Two extra
-        // point-queries per non-deleted file is a real O(n) cost on a
-        // large link — acceptable for now (a `status`/`link list` call is
-        // infrequent, not a sync hot path), flagged here rather than
-        // silently accepted.
-        // NOT `?`: this resolver refuses an ambiguous group, and propagating
-        // that would fail the ENTIRE status listing -- for every group on the
-        // device, not just the offending one. Status is the surface that MAKES
-        // the ambiguity visible (see `ambiguous_local_paths` below), so letting
-        // it be the thing an ambiguous group breaks would hide the refusal
-        // behind a bare error string and leave the user with no way to see which
-        // folders collided. It would also turn a per-GROUP refusal into a
-        // per-DEVICE one, which is exactly what this invariant must never do.
-        //
-        // `false` is the safe default and costs nothing here: it only classifies
-        // symlinks as "skipped" for a cosmetic count, and an ambiguous group is
-        // refusing to sync anyway, so there is no materialization for it to be
-        // wrong about.
-        let windows_symlink_opt_in =
-            state.sync_state.windows_symlink_opt_in_for_group(&link.group_id).unwrap_or_else(|e| {
-                tracing::warn!(
-                    group_id = %link.group_id,
-                    error = %e,
-                    "cannot read this group's symlink policy for status; reporting the default"
-                );
-                false
-            });
-        let mut held_files = Vec::new();
-        let mut skipped_symlink_count = 0u64;
-        for file in files.iter().filter(|f| !f.deleted) {
-            if let Some(held) = state.sync_state.get_held_state(&link.group_id, &file.path)? {
-                held_files.push(HeldFile {
-                    path: file.path.clone(),
-                    reason: held.reason,
-                    held_since_unix_nanos: held.since_unix_nanos,
-                });
+// Wire conversions for recovery-journal rows/diagnoses now live in
+// crate::recovery_diagnosis::ipc, not here -- see that module's own doc
+// comment.
+
+/// `RuntimeStatusView` (`crate::queries::runtime_status`, DaemonState-
+/// independent) -> the IPC wire type. `overall_state`/`attention_reasons`
+/// are left at their zero values -- `overall_status` fills them in from
+/// this same response immediately after, so they can never disagree with
+/// the rest of the message they summarize.
+fn encode_runtime_status(
+    view: crate::queries::runtime_status::RuntimeStatusView,
+) -> StatusResponse {
+    let links = view.links.into_iter().map(encode_link_status).collect();
+    let peers = view
+        .peers
+        .into_iter()
+        .map(|peer| {
+            let (reachability, category) = reachability_to_proto(peer.reachability);
+            PeerStatus {
+                device_id: peer.device_id,
+                reachability: reachability as i32,
+                unreachable_category: category as i32,
             }
-            if is_skipped_windows_symlink(
-                &state.sync_state,
-                &link.group_id,
-                &file.path,
-                windows_symlink_opt_in,
-            )? {
-                skipped_symlink_count += 1;
-            }
-        }
-        let held_file_count = held_files.len() as u64;
-        // Independent of `paused` (a link can be paused and/or degraded
-        // at once — see `DegradedLinkInfo`'s doc comment).
-        let degraded_info = state.degraded_link_info(&link.local_path);
-        // This link's active-transfer rollup, if any is currently in
-        // flight.
-        let rollup = state.transfer_progress.link_rollup(&link.group_id);
-        let durability_status =
-            durability_status_to_proto(state.group_durability_status(&link.group_id));
-        // Every live folder registered for this group. More than one is the
-        // refusing state; the paths ARE the remedy, since unlinking is keyed by
-        // path. An unreadable link table surfaces as "not ambiguous" rather than
-        // failing the whole status listing: status must keep rendering, and the
-        // group is already refusing to sync on the paths that matter.
-        let ambiguous_local_paths =
-            state.sync_state.live_link_paths_for_group(&link.group_id).unwrap_or_else(|e| {
-                tracing::warn!(
-                    group_id = %link.group_id,
-                    error = %e,
-                    "cannot read this group's links to report whether it is linked twice"
-                );
-                Vec::new()
-            });
-        out.push(LinkStatus {
-            local_path: link.local_path.clone(),
-            group_id: link.group_id.clone(),
-            paused: link.paused,
-            conflict_count,
-            materialization_policy: link.materialization_policy.as_db_str().to_string(),
-            hydrated_count: materialization.hydrated,
-            placeholder_count: materialization.placeholder,
-            hydrating_count: materialization.hydrating,
-            held_file_count,
-            held_files,
-            skipped_symlink_count,
-            degraded: degraded_info.is_some(),
-            degraded_reason: degraded_info.map(|info| info.reason).unwrap_or_default(),
-            // This link's active-transfer rollup — absent (all zero,
-            // `has_active_transfer = false`) when nothing is currently
-            // in flight for this link.
-            has_active_transfer: rollup.is_some(),
-            transfer_bytes_done: rollup.map(|r| r.bytes_done).unwrap_or(0),
-            transfer_bytes_total: rollup.map(|r| r.bytes_total).unwrap_or(0),
-            transfer_blocks_done: rollup.map(|r| r.blocks_done).unwrap_or(0),
-            transfer_blocks_total: rollup.map(|r| r.blocks_total).unwrap_or(0),
-            transfer_eta_seconds: rollup.and_then(|r| r.eta_seconds).unwrap_or(0),
-            durability_status: durability_status as i32,
-            // Surfaces the same staleness gate admission and local emission
-            // fail closed on, so a group whose policy this daemon distrusts
-            // (own verification failure or coordinator-flagged invalid) is
-            // distinguishable in status from a healthy one.
-            policy_stale: state.is_group_policy_stale(&link.group_id),
-            // A folder group linked at more than one folder refuses to sync
-            // entirely (each folder's scan would delete the other's files on
-            // every device). The refusal is otherwise only a log line, which is
-            // loud in the code and silent in the UI — this is what makes it
-            // visible where the user actually looks, and names every folder
-            // involved so the remedy (unlink all but one) is actionable.
-            //
-            // Derived from the same live-link enumeration the invariant itself
-            // uses, so status cannot drift from behaviour. `list_links` above
-            // stays non-erroring on purpose: it is what keeps BOTH rows visible
-            // for recovery.
-            ambiguous: ambiguous_local_paths.len() > 1,
-            ambiguous_local_paths,
-        });
+        })
+        .collect();
+    let volumes = view
+        .volumes
+        .into_iter()
+        .map(|v| VolumeFreeSpace {
+            path: v.path,
+            state: v.state,
+            available_bytes: v.available_bytes,
+            headroom_bytes: v.headroom_bytes,
+        })
+        .collect();
+    let update = crate::update_ipc::encode_update_status(view.update);
+    let active_transfers = view
+        .active_transfers
+        .into_iter()
+        .map(|t| ActiveTransferProgress {
+            group_id: t.group_id,
+            path: t.path,
+            bytes_done: t.bytes_done,
+            bytes_total: t.bytes_total,
+            blocks_done: t.blocks_done,
+            blocks_total: t.blocks_total,
+            source_peer: t.source_peer,
+            started_at_unix: t.started_at_unix,
+        })
+        .collect();
+    let recent_errors = view
+        .recent_errors
+        .into_iter()
+        .map(|e| RecentSyncError {
+            category: e.category,
+            timestamp_unix: e.timestamp_unix,
+            coarse_context: e.coarse_context,
+        })
+        .collect();
+    StatusResponse {
+        links,
+        peers,
+        upload_limit_bytes_per_sec: view.upload_limit_bytes_per_sec,
+        download_limit_bytes_per_sec: view.download_limit_bytes_per_sec,
+        update_state: update.state,
+        update_available_version: update.available_version,
+        update_mandatory: update.mandatory,
+        update_waiting_for_safe_point: update.waiting_for_safe_point,
+        update_last_error_category: update.last_error_category,
+        update_channel: update.channel,
+        update_install_source: update.install_source,
+        update_holdback_reason: update.holdback_reason,
+        current_upload_bytes_per_sec: view.current_upload_bytes_per_sec,
+        current_download_bytes_per_sec: view.current_download_bytes_per_sec,
+        volumes,
+        block_store_total_bytes: view.block_store.total_bytes,
+        block_store_block_count: view.block_store.block_count,
+        last_gc_unix: view.last_gc_unix,
+        gc_reclaimable_estimate_bytes: view.gc_reclaimable_estimate_bytes,
+        active_transfers,
+        recent_errors,
+        overall_state: String::new(),
+        attention_reasons: Vec::new(),
     }
-    Ok(out)
 }
 
-/// Free-space state for every volume hosting the block store or a linked
-/// folder — the block-store root (via `BlockStore::free_space`, `None`
-/// for a backend with no real volume concept) plus one entry per distinct
-/// link `local_path` (paths can collide if a device somehow links the
-/// same directory twice, so this dedups by path rather than by link
-/// count). Best-effort: a link whose volume can't currently be queried
-/// (e.g. the folder was removed from disk without being unlinked) is
-/// silently skipped rather than failing the whole `status` response.
-pub(crate) fn volumes_free_space(
-    state: &DaemonState,
-    links: &[LinkStatus],
-) -> Vec<VolumeFreeSpace> {
-    let headroom_override = state.governance_config.load_or_default().headroom_override_bytes;
-    let mut seen_paths = std::collections::HashSet::new();
-    let mut volumes = Vec::new();
-
-    if let Ok(Some(space)) = state.block_store.free_space() {
-        // The block-store root path itself isn't tracked on `DaemonState`
-        // directly (only the trait object is) — `VolumeFreeSpace.path`
-        // reports a stable, recognizable label instead of guessing at a
-        // filesystem path the caller has no other way to confirm.
-        volumes.push(VolumeFreeSpace {
-            path: "<block store>".to_string(),
-            state: space.classify().as_str().to_string(),
-            available_bytes: space.available_bytes,
-            headroom_bytes: space.headroom_bytes,
-        });
+/// `LinkStatusView` (`crate::queries::link_status`, DaemonState-independent)
+/// -> the IPC wire type -- the one place this crate is allowed to know
+/// both sides.
+pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusView) -> LinkStatus {
+    let held_files: Vec<HeldFile> = view
+        .held_files
+        .into_iter()
+        .map(|held| HeldFile {
+            path: held.path,
+            reason: held.reason,
+            held_since_unix_nanos: held.held_since_unix_nanos,
+        })
+        .collect();
+    let held_file_count = held_files.len() as u64;
+    let durability_status = durability_status_to_proto(view.durability_status);
+    LinkStatus {
+        local_path: view.local_path,
+        group_id: view.group_id,
+        paused: view.paused,
+        conflict_count: view.conflict_count,
+        materialization_policy: view.materialization_policy,
+        hydrated_count: view.hydrated_count,
+        placeholder_count: view.placeholder_count,
+        hydrating_count: view.hydrating_count,
+        held_file_count,
+        held_files,
+        skipped_symlink_count: view.skipped_symlink_count,
+        degraded: view.degraded.is_some(),
+        degraded_reason: view.degraded.map(|d| d.reason).unwrap_or_default(),
+        // This link's active-transfer rollup -- absent (all zero,
+        // `has_active_transfer = false`) when nothing is currently
+        // in flight for this link.
+        has_active_transfer: view.transfer.is_some(),
+        transfer_bytes_done: view.transfer.as_ref().map(|t| t.bytes_done).unwrap_or(0),
+        transfer_bytes_total: view.transfer.as_ref().map(|t| t.bytes_total).unwrap_or(0),
+        transfer_blocks_done: view.transfer.as_ref().map(|t| t.blocks_done).unwrap_or(0),
+        transfer_blocks_total: view.transfer.as_ref().map(|t| t.blocks_total).unwrap_or(0),
+        transfer_eta_seconds: view.transfer.and_then(|t| t.eta_seconds).unwrap_or(0),
+        durability_status: durability_status as i32,
+        policy_stale: view.policy_stale,
+        // A folder group linked at more than one folder refuses to sync
+        // entirely (each folder's scan would delete the other's files on
+        // every device). The refusal is otherwise only a log line, which is
+        // loud in the code and silent in the UI -- this is what makes it
+        // visible where the user actually looks, and names every folder
+        // involved so the remedy (unlink all but one) is actionable.
+        ambiguous: view.ambiguous_local_paths.len() > 1,
+        ambiguous_local_paths: view.ambiguous_local_paths,
     }
-
-    for link in links {
-        if !seen_paths.insert(link.local_path.clone()) {
-            continue;
-        }
-        if let Ok(space) = yadorilink_local_storage::free_space::classify_volume(
-            std::path::Path::new(&link.local_path),
-            headroom_override,
-        ) {
-            volumes.push(VolumeFreeSpace {
-                path: link.local_path.clone(),
-                state: space.classify().as_str().to_string(),
-                available_bytes: space.available_bytes,
-                headroom_bytes: space.headroom_bytes,
-            });
-        }
-    }
-    volumes
-}
-
-/// Whether `path` is a symlink record this device's index tracks (and
-/// still syncs normally) but never materialized to disk under the
-/// Windows default-skip-with-visible-status policy — i.e. the local
-/// daemon is running on Windows, the record is `RecordKind::Symlink`, and
-/// this link never opted in to real Windows symlink materialization. On a
-/// non-Windows daemon this is always `false`: only the Windows
-/// default-skip policy ever leaves a symlink record unmaterialized —
-/// every POSIX symlink materializes via the ordinary atomic
-/// temp-path-then-rename path (`chunker::materialize_symlink`).
-#[cfg(windows)]
-fn is_skipped_windows_symlink(
-    state: &SyncState,
-    group_id: &str,
-    path: &str,
-    windows_symlink_opt_in: bool,
-) -> Result<bool, yadorilink_sync_core::SyncError> {
-    if windows_symlink_opt_in {
-        return Ok(false);
-    }
-    Ok(state.get_record_kind(group_id, path)?.is_some_and(|kind| kind == RecordKind::Symlink))
-}
-
-#[cfg(not(windows))]
-fn is_skipped_windows_symlink(
-    _state: &SyncState,
-    _group_id: &str,
-    _path: &str,
-    _windows_symlink_opt_in: bool,
-) -> Result<bool, yadorilink_sync_core::SyncError> {
-    Ok(false)
 }
 
 /// `StatusResponse.overall_state`'s three values, kept as a small internal
@@ -2403,37 +1525,78 @@ mod overall_status_tests {
     }
 }
 
-// --- Old-CLI/new-daemon and new-CLI/old-daemon compatibility, exercised
-// directly against `handle_request` (the actual dispatch a real
-// control-socket connection runs through) rather than only at the
-// wire-decode level (see `yadorilink_ipc_proto`'s own
-// `old_daemon_control_request_bytes_decode_with_zero_protocol_version`/
-// `..._response_...` tests for that layer).
+// --- Control-protocol exact-version enforcement, exercised directly
+// against `handle_request` (the actual dispatch a real control-socket
+// connection runs through).
 
 #[cfg(test)]
 mod migration_safety_tests {
     use std::sync::Arc;
 
+    use super::{enrollment_error_to_proto, membership_error_to_proto};
+    use crate::queries::link_status::LinkStatusReadPort;
+    use crate::replica_coordinator::ReplicaCoordinator;
+    use yadorilink_replica_domain::session_state::EnrollmentKind;
+
     use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
     use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
     use yadorilink_ipc_proto::daemonctl::{
-        DaemonControlRequest, LinkRequest, PendingEnrollmentKind, StatusRequest,
+        ApplicationErrorCode, DaemonControlRequest, LinkRequest, PendingEnrollmentKind,
+        StatusRequest,
     };
     use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_sync_core::index::SyncState;
 
     use crate::daemon_state::DaemonState;
 
     fn test_state() -> Arc<DaemonState> {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-        let sync_state = Arc::new(SyncState::open_in_memory().unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         let state = DaemonState::new("device-a".into(), sync_state, store);
         // A registered device with no signing key fails closed (see
-        // `link_manager::ensure_initial_change_history`'s doc comment) --
-        // any test driving `start_link_watch` needs one wired.
+        // `ensure_initial_change_history`'s doc comment) --
+        // any test driving a link watch start needs one wired.
         state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
         state
+    }
+
+    fn test_link_lifecycle(state: &Arc<DaemonState>) -> crate::application::LinkLifecycleService {
+        let controller = Arc::new(
+            crate::adapters::runtime::link_runtime_controller::LinkRuntimeController::new(
+                state.clone(),
+            ),
+        );
+        crate::application::LinkLifecycleService::new(
+            Arc::new(crate::adapters::runtime::link_lifecycle::DaemonLinkRepositoryAdapter::new(
+                state.clone(),
+            )),
+            Arc::new(crate::adapters::runtime::link_lifecycle::DaemonLinkWatcherAdapter::new(
+                state.clone(),
+                controller,
+            )),
+        )
+    }
+
+    #[test]
+    fn membership_ambiguity_maps_to_a_structured_application_error() {
+        let error = membership_error_to_proto(
+            crate::application::ReplicaMembershipError::CoordinationAmbiguous {
+                detail: "response was lost".into(),
+            },
+        );
+        assert_eq!(error.code, ApplicationErrorCode::CoordinationAmbiguous as i32);
+        assert!(error.message.contains("response was lost"));
+    }
+
+    #[test]
+    fn enrollment_compensation_pending_preserves_operation_identity() {
+        let error =
+            enrollment_error_to_proto(crate::application::EnrollmentError::CompensationPending {
+                operation_id: "operation-1".into(),
+                detail: "local unlink failed".into(),
+            });
+        assert_eq!(error.code, ApplicationErrorCode::CompensationPending as i32);
+        assert_eq!(error.operation_id, "operation-1");
     }
 
     /// A `LinkRequest` whose `pending_enrollment_operation_id` is set commits
@@ -2466,18 +1629,18 @@ mod migration_safety_tests {
             pending_enrollment_device_id: "device-a".to_string(),
         };
 
-        let result = super::link(&state, request);
+        let result = test_link_lifecycle(&state).link(super::decode_link_command(request)).await;
 
         assert!(
             result.is_err(),
             "a directory named .yadorilinkignore must fail to load as the ignore file"
         );
         assert!(
-            state.sync_state.list_links().unwrap().is_empty(),
+            state.replica_coordinator.link_repository().list_links().unwrap().is_empty(),
             "the link must be rolled back, not left behind"
         );
         assert!(
-            state.sync_state.list_pending_enrollments().unwrap().is_empty(),
+            state.replica_coordinator.enrollment_repository().list_pending_enrollments().unwrap().is_empty(),
             "the pending-enrollment marker must be rolled back too -- otherwise nothing ever \
              resolves it, since the link it names doesn't exist"
         );
@@ -2488,30 +1651,31 @@ mod migration_safety_tests {
     /// vacuously ready regardless of any peer, which these tests are
     /// deliberately not exercising).
     fn upsert_solo_file(state: &DaemonState, group_id: &str) {
-        use yadorilink_sync_core::types::{BlockInfo, FileRecord};
-        use yadorilink_sync_core::version_vector::VersionVector;
-        let mut version = VersionVector::new();
-        version.increment("device-a");
+        use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         state
-            .sync_state
-            .upsert_file(
+            .replica_coordinator
+            .file_index_repository().upsert_file(
                 group_id,
                 &FileRecord {
                     path: "solo.bin".into(),
                     size: 4,
                     mtime_unix_nanos: 0,
-                    version,
                     blocks: vec![BlockInfo { hash: vec![1u8; 32], offset: 0, size: 4 }],
                     deleted: false,
                 },
+                &permit,
             )
             .unwrap();
     }
 
     #[test]
     fn lease_acquisition_errors_are_not_reported_as_readiness_failures() {
-        let demotion = super::demotion_handoff_lease_failure_message();
-        let unlink = super::unlink_handoff_lease_failure_message("/tmp/group");
+        let demotion =
+            crate::application::replica_role_service::demotion_handoff_lease_failure_message();
+        let unlink = crate::application::replica_role_service::unlink_handoff_lease_failure_message(
+            "/tmp/group",
+        );
 
         for message in [&demotion, &unlink] {
             assert!(message.contains("confirmed a ready replica"));
@@ -2529,13 +1693,15 @@ mod migration_safety_tests {
     #[tokio::test]
     async fn last_full_replica_cannot_unlink() {
         let state = test_state();
-        state.sync_state.add_link("/home/alice/Photos", "group-1").unwrap();
+        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
         // A real file to hand off -- an empty group would be vacuously ready
         // regardless of any peer.
         upsert_solo_file(&state, "group-1");
         // Eager link (the default) => this device is a full replica. No peer
         // full-replica is recorded, so it is the last one.
-        let err = super::ensure_unlink_keeps_a_full_replica(&state, "/home/alice/Photos", false)
+        let err = crate::adapters::build_application_services(state.clone())
+            .replica_role
+            .ensure_unlink_keeps_a_full_replica("/home/alice/Photos", false)
             .await
             .expect_err("unlinking the only full replica must be refused");
         assert!(
@@ -2551,11 +1717,13 @@ mod migration_safety_tests {
     #[tokio::test]
     async fn recorded_peer_without_a_confirmed_ready_session_still_refused() {
         let state = test_state();
-        state.sync_state.add_link("/home/alice/Photos", "group-1").unwrap();
+        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
         upsert_solo_file(&state, "group-1");
         state.set_peer_group_full_replica("device-b", "group-1", true);
 
-        let err = super::ensure_unlink_keeps_a_full_replica(&state, "/home/alice/Photos", false)
+        let err = crate::adapters::build_application_services(state.clone())
+            .replica_role
+            .ensure_unlink_keeps_a_full_replica("/home/alice/Photos", false)
             .await
             .expect_err(
                 "a recorded-but-unconfirmed peer must not be treated as a ready handoff target",
@@ -2571,9 +1739,11 @@ mod migration_safety_tests {
     #[tokio::test]
     async fn full_replica_can_unlink_when_group_has_no_files() {
         let state = test_state();
-        state.sync_state.add_link("/home/alice/Photos", "group-1").unwrap();
+        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
 
-        super::ensure_unlink_keeps_a_full_replica(&state, "/home/alice/Photos", false)
+        crate::adapters::build_application_services(state.clone())
+            .replica_role
+            .ensure_unlink_keeps_a_full_replica("/home/alice/Photos", false)
             .await
             .expect("nothing to hand off, so unlink is vacuously allowed");
     }
@@ -2584,10 +1754,12 @@ mod migration_safety_tests {
     #[tokio::test]
     async fn forced_unlink_bypasses_the_readiness_gate() {
         let state = test_state();
-        state.sync_state.add_link("/home/alice/Photos", "group-1").unwrap();
+        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
         upsert_solo_file(&state, "group-1");
 
-        super::ensure_unlink_keeps_a_full_replica(&state, "/home/alice/Photos", true)
+        crate::adapters::build_application_services(state.clone())
+            .replica_role
+            .ensure_unlink_keeps_a_full_replica("/home/alice/Photos", true)
             .await
             .expect("--force must bypass the readiness gate even with no ready replica");
     }
@@ -2599,16 +1771,18 @@ mod migration_safety_tests {
     #[tokio::test]
     async fn forced_unlink_latches_group_durability_unknown() {
         let state = test_state();
-        state.sync_state.add_link("/home/alice/Photos", "group-1").unwrap();
+        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
         upsert_solo_file(&state, "group-1");
 
-        super::ensure_unlink_keeps_a_full_replica(&state, "/home/alice/Photos", true)
+        crate::adapters::build_application_services(state.clone())
+            .replica_role
+            .ensure_unlink_keeps_a_full_replica("/home/alice/Photos", true)
             .await
             .expect("--force must bypass the readiness gate even with no ready replica");
 
         assert_eq!(
             state.group_durability_status("group-1"),
-            crate::daemon_state::GroupDurabilityStatus::DurabilityUnknown,
+            crate::durability_service::GroupDurabilityStatus::DurabilityUnknown,
             "a force override must latch the group to DurabilityUnknown, never leave it \
              reporting Healthy"
         );
@@ -2621,17 +1795,19 @@ mod migration_safety_tests {
     #[tokio::test]
     async fn non_forced_unlink_does_not_latch_durability_unknown() {
         let state = test_state();
-        state.sync_state.add_link("/home/alice/Photos", "group-1").unwrap();
+        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
         // Nothing to hand off, so this succeeds vacuously without needing
         // --force at all.
 
-        super::ensure_unlink_keeps_a_full_replica(&state, "/home/alice/Photos", false)
+        crate::adapters::build_application_services(state.clone())
+            .replica_role
+            .ensure_unlink_keeps_a_full_replica("/home/alice/Photos", false)
             .await
             .expect("nothing to hand off, so unlink is vacuously allowed");
 
         assert_ne!(
             state.group_durability_status("group-1"),
-            crate::daemon_state::GroupDurabilityStatus::DurabilityUnknown,
+            crate::durability_service::GroupDurabilityStatus::DurabilityUnknown,
             "an unforced unlink must never latch the group's durability status"
         );
     }
@@ -2640,15 +1816,17 @@ mod migration_safety_tests {
     /// may always unlink regardless of any other full replica.
     #[tokio::test]
     async fn on_demand_device_can_always_unlink() {
-        use yadorilink_sync_core::types::MaterializationPolicy;
+        use yadorilink_replica_domain::session_state::MaterializationPolicy;
         let state = test_state();
-        state.sync_state.add_link("/home/alice/Photos", "group-1").unwrap();
+        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
         state
-            .sync_state
-            .set_materialization_policy("/home/alice/Photos", MaterializationPolicy::OnDemand)
+            .replica_coordinator
+            .link_repository().set_materialization_policy("/home/alice/Photos", MaterializationPolicy::OnDemand)
             .unwrap();
 
-        super::ensure_unlink_keeps_a_full_replica(&state, "/home/alice/Photos", false)
+        crate::adapters::build_application_services(state.clone())
+            .replica_role
+            .ensure_unlink_keeps_a_full_replica("/home/alice/Photos", false)
             .await
             .expect("an on-demand device may always unlink");
     }
@@ -2670,18 +1848,24 @@ mod migration_safety_tests {
     #[tokio::test]
     async fn policy_invalid_group_id_surfaces_in_status() {
         let healthy_state = test_state();
-        healthy_state.sync_state.add_link("/home/alice/Photos", "group-1").unwrap();
+        healthy_state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
 
         let policy_invalid_state = test_state();
-        policy_invalid_state.sync_state.add_link("/home/alice/Photos", "group-1").unwrap();
+        policy_invalid_state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
         // The closest real "policy invalid" signal the daemon can produce
         // today -- a real `policyInvalidGroupIds` entry never reaches this
         // call (that is exactly the gap), but this is the one state
         // transition `status` output would need to reflect once it does.
         policy_invalid_state.mark_group_policy_stale("group-1");
 
-        let healthy_status = super::list_link_statuses(&healthy_state).unwrap();
-        let policy_invalid_status = super::list_link_statuses(&policy_invalid_state).unwrap();
+        let healthy_status =
+            crate::adapters::query::link_status::DaemonLinkStatusReader::new(healthy_state)
+                .list_links()
+                .unwrap();
+        let policy_invalid_status =
+            crate::adapters::query::link_status::DaemonLinkStatusReader::new(policy_invalid_state)
+                .list_links()
+                .unwrap();
 
         assert_ne!(
             healthy_status, policy_invalid_status,
@@ -2703,7 +1887,7 @@ mod migration_safety_tests {
         let state = test_state();
         assert_eq!(
             state.group_durability_status("group-1"),
-            crate::daemon_state::GroupDurabilityStatus::Healthy,
+            crate::durability_service::GroupDurabilityStatus::Healthy,
             "sanity check: an untouched group with no files derives Healthy"
         );
 
@@ -2715,7 +1899,11 @@ mod migration_safety_tests {
             )),
             protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
         };
-        let resp = super::handle_request(&state, req).await;
+        let resp = super::handle_request(
+            &crate::control_context::ControlContext::from_state(state.clone()),
+            req,
+        )
+        .await;
         assert!(
             matches!(resp.payload, Some(RespPayload::LatchGroupDurabilityUnknown(_))),
             "expected a LatchGroupDurabilityUnknown response, got {:?}",
@@ -2724,56 +1912,329 @@ mod migration_safety_tests {
 
         assert_eq!(
             state.group_durability_status("group-1"),
-            crate::daemon_state::GroupDurabilityStatus::DurabilityUnknown,
+            crate::durability_service::GroupDurabilityStatus::DurabilityUnknown,
             "the latch must take effect through the real request-dispatch path"
         );
     }
 
-    /// Spec "Old CLI talks to newer daemon": a request shaped exactly the
-    /// way older CLI builds built one — a real payload
-    /// set, `protocol_version` left at its default (0) rather than the
-    /// current daemon's own `CONTROL_PROTOCOL_VERSION` — is handled
-    /// normally using backward-compatible defaults, not rejected just
-    /// because the version field is unset.
+    /// `ListRecoveryOperations`/`ShowRecoveryOperation` (Phase 2.1, Commit
+    /// 2.1-B) exercised through the real dispatch path, confirming the
+    /// proto conversion round-trips a valid row's fields and that `show`
+    /// resolves the same way `list` does.
     #[tokio::test]
-    async fn old_cli_request_with_zero_protocol_version_still_succeeds() {
+    async fn list_recovery_operations_reports_a_valid_row() {
+        use yadorilink_replica_domain::session_state::{EnrollmentOperation, EnrollmentOperationState};
+        use yadorilink_replica_domain::session_state::EnrollmentKind;
+
+        let state = test_state();
+        state
+            .replica_coordinator
+            .enrollment_repository().try_insert_enrollment_operation(&EnrollmentOperation {
+                operation_id: "op-1".to_string(),
+                kind: EnrollmentKind::Create,
+                group_id: Some("group-1".to_string()),
+                group_name: None,
+                device_id: "device-a".to_string(),
+                local_path: "/home/alice/Photos".to_string(),
+                storage_mode: "eager".to_string(),
+                state: EnrollmentOperationState::ActivationPending,
+                last_error: None,
+                attempts: 2,
+                created_at_unix: 1,
+                updated_at_unix: 1,
+            })
+            .unwrap();
+
+        let list_req = DaemonControlRequest {
+            payload: Some(ReqPayload::ListRecoveryOperations(
+                yadorilink_ipc_proto::daemonctl::ListRecoveryOperationsRequest {},
+            )),
+            protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+        };
+        let list_resp = super::handle_request(
+            &crate::control_context::ControlContext::from_state(state.clone()),
+            list_req,
+        )
+        .await;
+        let Some(RespPayload::ListRecoveryOperations(list)) = list_resp.payload else {
+            panic!("expected a ListRecoveryOperations response, got {:?}", list_resp.payload);
+        };
+        assert!(list.invalid.is_empty());
+        assert_eq!(list.operations.len(), 1);
+        let op = &list.operations[0];
+        assert_eq!(op.operation_id, "op-1");
+        assert_eq!(op.domain, "enrollment");
+        assert_eq!(op.action, "create");
+        assert_eq!(op.state, "activation_pending");
+        assert_eq!(op.severity, "pending");
+        assert_eq!(op.group_ids, vec!["group-1".to_string()]);
+        assert_eq!(op.device_id.as_deref(), Some("device-a"));
+        assert_eq!(op.attempts, 2);
+    }
+
+    /// An unrecognized `domain` value is rejected explicitly, never
+    /// silently treated as "operation not found" and never reaching the
+    /// coordination-config check or a remote lookup.
+    #[tokio::test]
+    async fn show_recovery_operation_rejects_an_unknown_domain() {
+        let state = test_state();
+        let req = DaemonControlRequest {
+            payload: Some(ReqPayload::ShowRecoveryOperation(
+                yadorilink_ipc_proto::daemonctl::ShowRecoveryOperationRequest {
+                    domain: "enrolment".to_string(), // typo
+                    operation_id: "op-1".to_string(),
+                },
+            )),
+            protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+        };
+        let resp = super::handle_request(
+            &crate::control_context::ControlContext::from_state(state.clone()),
+            req,
+        )
+        .await;
+        match resp.payload {
+            Some(RespPayload::Error(msg)) => {
+                assert!(
+                    msg.contains("unknown recovery domain"),
+                    "expected an unknown-domain error, got {msg:?}"
+                );
+            }
+            other => panic!("expected RespPayload::Error, got {other:?}"),
+        }
+    }
+
+    /// With no coordination-plane address/access token recorded on this
+    /// device, `show` must fail with a top-level operational error --
+    /// never fabricate remote evidence, and never even attempt a local
+    /// snapshot read.
+    #[tokio::test]
+    async fn show_recovery_operation_without_coordination_config_is_an_operational_error() {
+        let state = test_state();
+        assert!(state.coordination_client_config().is_none());
+
+        let req = DaemonControlRequest {
+            payload: Some(ReqPayload::ShowRecoveryOperation(
+                yadorilink_ipc_proto::daemonctl::ShowRecoveryOperationRequest {
+                    domain: "enrollment".to_string(),
+                    operation_id: "op-1".to_string(),
+                },
+            )),
+            protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+        };
+        let resp = super::handle_request(
+            &crate::control_context::ControlContext::from_state(state.clone()),
+            req,
+        )
+        .await;
+        match resp.payload {
+            Some(RespPayload::Error(msg)) => {
+                assert!(msg.contains("not configured"), "expected a config error, got {msg:?}");
+            }
+            other => panic!("expected RespPayload::Error, got {other:?}"),
+        }
+    }
+
+    /// A `show` request naming an id that exists in no journal row of the
+    /// requested domain reports `not_found` as a typed outcome, never the
+    /// top-level `RespPayload::Error` fallback -- and never performs a
+    /// remote lookup (the coordination address is set but never contacted,
+    /// since a real server isn't even running at that address).
+    #[tokio::test]
+    async fn show_recovery_operation_reports_not_found_for_an_unknown_id() {
+        let state = test_state();
+        state.set_coordination_client_config("http://127.0.0.1:1".to_string(), "t".to_string());
+
+        let req = DaemonControlRequest {
+            payload: Some(ReqPayload::ShowRecoveryOperation(
+                yadorilink_ipc_proto::daemonctl::ShowRecoveryOperationRequest {
+                    domain: "enrollment".to_string(),
+                    operation_id: "op-does-not-exist".to_string(),
+                },
+            )),
+            protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+        };
+        let resp = super::handle_request(
+            &crate::control_context::ControlContext::from_state(state.clone()),
+            req,
+        )
+        .await;
+        let Some(RespPayload::ShowRecoveryOperation(show)) = resp.payload else {
+            panic!("expected a ShowRecoveryOperation response, got {:?}", resp.payload);
+        };
+        match show.result {
+            Some(
+                yadorilink_ipc_proto::daemonctl::show_recovery_operation_response::Result::NotFound(
+                    not_found,
+                ),
+            ) => {
+                assert_eq!(not_found.key.unwrap().operation_id, "op-does-not-exist");
+            }
+            other => panic!("expected Result::NotFound, got {other:?}"),
+        }
+    }
+
+    /// A journal row that fails strict decoding reports `invalid` as a
+    /// typed outcome, observed before any remote lookup is attempted.
+    #[tokio::test]
+    async fn show_recovery_operation_reports_invalid_for_a_malformed_row() {
+        let state = test_state();
+        state.set_coordination_client_config("http://127.0.0.1:1".to_string(), "t".to_string());
+        state.replica_coordinator.plant_malformed_membership_operation_for_test("op-bad").unwrap();
+
+        let req = DaemonControlRequest {
+            payload: Some(ReqPayload::ShowRecoveryOperation(
+                yadorilink_ipc_proto::daemonctl::ShowRecoveryOperationRequest {
+                    domain: "membership".to_string(),
+                    operation_id: "op-bad".to_string(),
+                },
+            )),
+            protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+        };
+        let resp = super::handle_request(
+            &crate::control_context::ControlContext::from_state(state.clone()),
+            req,
+        )
+        .await;
+        let Some(RespPayload::ShowRecoveryOperation(show)) = resp.payload else {
+            panic!("expected a ShowRecoveryOperation response, got {:?}", resp.payload);
+        };
+        assert!(matches!(
+            show.result,
+            Some(
+                yadorilink_ipc_proto::daemonctl::show_recovery_operation_response::Result::Invalid(
+                    _
+                )
+            )
+        ));
+    }
+
+    /// End-to-end: a real journal row, a mocked coordination-plane 404
+    /// (`RecordNotFound`), and the resulting `Diagnosed` outcome carrying
+    /// the SAME operation summary the journal row itself has.
+    #[tokio::test]
+    async fn show_recovery_operation_returns_a_stable_diagnosis() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use yadorilink_replica_domain::session_state::{EnrollmentOperation, EnrollmentOperationState};
+        use yadorilink_replica_domain::session_state::EnrollmentKind;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/devices/enrollment-operations/op-1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let state = test_state();
+        state.set_coordination_client_config(server.uri(), "t".to_string());
+        state
+            .replica_coordinator
+            .enrollment_repository().try_insert_enrollment_operation(&EnrollmentOperation {
+                operation_id: "op-1".to_string(),
+                kind: EnrollmentKind::Create,
+                group_id: Some("group-1".to_string()),
+                group_name: Some("photos".to_string()),
+                device_id: "device-a".to_string(),
+                local_path: "/home/alice/Photos".to_string(),
+                storage_mode: "eager".to_string(),
+                state: EnrollmentOperationState::ActivationPending,
+                last_error: None,
+                attempts: 0,
+                created_at_unix: 1,
+                updated_at_unix: 1,
+            })
+            .unwrap();
+
+        let req = DaemonControlRequest {
+            payload: Some(ReqPayload::ShowRecoveryOperation(
+                yadorilink_ipc_proto::daemonctl::ShowRecoveryOperationRequest {
+                    domain: "enrollment".to_string(),
+                    operation_id: "op-1".to_string(),
+                },
+            )),
+            protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+        };
+        let resp = super::handle_request(
+            &crate::control_context::ControlContext::from_state(state.clone()),
+            req,
+        )
+        .await;
+        let Some(RespPayload::ShowRecoveryOperation(show)) = resp.payload else {
+            panic!("expected a ShowRecoveryOperation response, got {:?}", resp.payload);
+        };
+        match show.result {
+            Some(yadorilink_ipc_proto::daemonctl::show_recovery_operation_response::Result::Diagnosed(
+                diagnosis,
+            )) => {
+                let op = diagnosis.operation.unwrap();
+                assert_eq!(op.operation_id, "op-1");
+                assert_eq!(op.domain, "enrollment");
+                let remote = diagnosis.remote.unwrap();
+                assert_eq!(remote.status, "record_not_found");
+                assert!(!diagnosis.recommendation.is_empty());
+            }
+            other => panic!("expected Result::Diagnosed, got {other:?}"),
+        }
+    }
+
+    /// A request shaped exactly the way older CLI builds built one — a
+    /// real payload set, `protocol_version` left at its default (0)
+    /// rather than the current daemon's own `CONTROL_PROTOCOL_VERSION` —
+    /// is rejected before the payload is ever dispatched, not answered
+    /// using backward-compatible defaults: this repository has not
+    /// shipped a public release, so there is no supported skew to be
+    /// lenient about.
+    #[tokio::test]
+    async fn old_cli_request_with_zero_protocol_version_is_rejected() {
         let state = test_state();
         let req = DaemonControlRequest {
             payload: Some(ReqPayload::Status(StatusRequest {})),
             protocol_version: 0,
         };
 
-        let resp = super::handle_request(&state, req).await;
+        let resp = super::handle_request(
+            &crate::control_context::ControlContext::from_state(state.clone()),
+            req,
+        )
+        .await;
 
-        assert!(
-            matches!(resp.payload, Some(RespPayload::Status(_))),
-            "an old-shaped (unversioned) request must still get a normal response, not an \
-             error: {:?}",
-            resp.payload
-        );
+        match resp.payload {
+            Some(RespPayload::Error(msg)) => {
+                assert!(
+                    msg.contains("requires exactly protocol version"),
+                    "expected a version-mismatch message, got {msg:?}"
+                );
+            }
+            other => panic!("expected RespPayload::Error, got {other:?}"),
+        }
         assert_eq!(
             resp.daemon_protocol_version,
             yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
             "the daemon still stamps its own current version on the response even when \
-             answering an old-shaped request"
+             rejecting an old-shaped request"
         );
     }
 
-    /// Spec "New CLI talks to older supported daemon": stands in for a
-    /// newer CLI sending a request variant *this* daemon build has never
-    /// heard of — protobuf drops an unrecognized oneof field number
-    /// entirely, so from the daemon's point of view that decodes as
-    /// `payload: None`, exactly as constructed here, alongside a
-    /// `protocol_version` newer than what this daemon reports. The CLI
-    /// must be told to upgrade the daemon, not given the same generic
-    /// "empty request" a truly malformed/empty request gets.
+    /// Stands in for a newer CLI build sending a request variant *this*
+    /// daemon build has never heard of — protobuf drops an unrecognized
+    /// oneof field number entirely, so from the daemon's point of view
+    /// that decodes as `payload: None`, exactly as constructed here,
+    /// alongside a `protocol_version` newer than what this daemon
+    /// reports. The CLI must be told to upgrade the daemon, not given the
+    /// same generic "empty request" a truly malformed/empty request gets
+    /// — and the request must never reach payload dispatch to produce
+    /// that message, since it's rejected by the upfront version check.
     #[tokio::test]
     async fn newer_client_unset_payload_reports_upgrade_the_daemon() {
         let state = test_state();
         let newer_version = yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION + 1;
         let req = DaemonControlRequest { payload: None, protocol_version: newer_version };
 
-        let resp = super::handle_request(&state, req).await;
+        let resp = super::handle_request(
+            &crate::control_context::ControlContext::from_state(state.clone()),
+            req,
+        )
+        .await;
 
         match resp.payload {
             Some(RespPayload::Error(msg)) => {
@@ -2787,15 +2248,23 @@ mod migration_safety_tests {
     }
 
     /// Control case for the test above: a genuinely empty/malformed
-    /// request (no payload, and no newer-than-this-daemon version either)
-    /// still gets the plain "empty request" message, not the
-    /// version-mismatch one — the two failure modes stay distinguishable.
+    /// request from a *version-matched* client (no payload, but the
+    /// correct current `protocol_version`) gets the plain "empty
+    /// request" message, not a version-mismatch one — the two failure
+    /// modes stay distinguishable once the exact-version check passes.
     #[tokio::test]
     async fn truly_empty_request_still_reports_generic_empty_request() {
         let state = test_state();
-        let req = DaemonControlRequest { payload: None, protocol_version: 0 };
+        let req = DaemonControlRequest {
+            payload: None,
+            protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+        };
 
-        let resp = super::handle_request(&state, req).await;
+        let resp = super::handle_request(
+            &crate::control_context::ControlContext::from_state(state.clone()),
+            req,
+        )
+        .await;
 
         assert_eq!(resp.payload, Some(RespPayload::Error("empty request".to_string())));
     }
@@ -2826,16 +2295,30 @@ mod migration_safety_tests {
         let state = test_state();
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
-        super::link(&state, link_request(&a.path().to_string_lossy(), "group-1", true)).unwrap();
+        let link_lifecycle = test_link_lifecycle(&state);
+        link_lifecycle
+            .link(super::decode_link_command(link_request(
+                &a.path().to_string_lossy(),
+                "group-1",
+                true,
+            )))
+            .await
+            .unwrap();
 
-        let err = super::link(&state, link_request(&b.path().to_string_lossy(), "group-1", true))
+        let err = link_lifecycle
+            .link(super::decode_link_command(link_request(
+                &b.path().to_string_lossy(),
+                "group-1",
+                true,
+            )))
+            .await
             .expect_err("--yes must not buy past the one-live-link-per-group rule");
 
         assert!(
             err.to_string().contains("already linked"),
             "the error must name the real problem, got {err}"
         );
-        let links = state.sync_state.list_links().unwrap();
+        let links = state.replica_coordinator.link_repository().list_links().unwrap();
         assert_eq!(links.len(), 1, "the refusal must not add or delete a link");
         assert_eq!(links[0].local_path, a.path().to_string_lossy());
     }
@@ -2849,11 +2332,2262 @@ mod migration_safety_tests {
         let state = test_state();
         let a = tempfile::tempdir().unwrap();
         let path = a.path().to_string_lossy().to_string();
-        super::link(&state, link_request(&path, "group-1", true)).unwrap();
+        let link_lifecycle = test_link_lifecycle(&state);
+        link_lifecycle
+            .link(super::decode_link_command(link_request(&path, "group-1", true)))
+            .await
+            .unwrap();
 
-        super::link(&state, link_request(&path, "group-1", true))
+        link_lifecycle
+            .link(super::decode_link_command(link_request(&path, "group-1", true)))
+            .await
             .expect("re-linking the same folder to the same group must stay idempotent");
 
-        assert_eq!(state.sync_state.list_links().unwrap().len(), 1);
+        assert_eq!(state.replica_coordinator.link_repository().list_links().unwrap().len(), 1);
+    }
+
+    // `classify_link_failure`/`enrollment_link_spec` tests moved to
+    // `crate::adapters::runtime::enrollment_link`'s own test module (Phase
+    // 2 Commit 2) -- that adapter now owns this classification.
+
+    /// Phase 2.1-D1: qualifies `recovery show` for the Enrollment domain
+    /// end to end -- real file-backed SQLite, closed and reopened (a real
+    /// crash+restart, not an in-memory stand-in), through the actual
+    /// control-socket dispatch path (`super::handle_request`), against a
+    /// mocked coordination plane, down to the wire response. No randomness,
+    /// no sleep-based timing, no periodic-sweep dependency: every case is
+    /// deterministic by construction.
+    mod recovery_crash_tests {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::replica_coordinator::ReplicaCoordinator;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use yadorilink_replica_domain::session_state::{EnrollmentOperation, EnrollmentOperationState, MembershipCommitMode, MembershipDurabilityScope, MembershipOperation, MembershipOperationAction, MembershipOperationState, PendingEnrollment, RoleLossAction, RoleLossOperationParams, RoleLossOperationState};
+        use crate::recovery::{
+            LocalRecoveryEvidence, RecoveryLocalSnapshot, RecoveryOperationKey,
+        };
+        use yadorilink_replica_domain::recovery::RecoveryDomain;
+
+        use super::*;
+
+        const DEVICE_ID: &str = "device-a";
+        const LOCAL_PATH: &str = "/home/alice/Photos";
+        const GROUP_ID: &str = "group-1";
+        const GROUP_NAME: &str = "photos";
+
+        fn daemon_state_for(sync_state: Arc<ReplicaCoordinator>) -> Arc<DaemonState> {
+            let store_dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+            let state = DaemonState::new(DEVICE_ID.to_string(), sync_state, store);
+            // Called synchronously, before this function returns and before
+            // this task's first `.await` -- see
+            // `disable_membership_recovery_sweep_for_test`'s own doc comment
+            // for why that makes this race-free by construction: the daemon's
+            // own real-time periodic membership/role-loss reconciliation
+            // sweep would otherwise mutate or delete the exact journal rows
+            // this whole module plants to qualify `recovery show` against.
+            state.disable_membership_recovery_sweep_for_test();
+            state
+        }
+
+        fn base_operation(
+            kind: EnrollmentKind,
+            state: EnrollmentOperationState,
+            group_id: Option<&str>,
+            group_name: Option<&str>,
+            storage_mode: &str,
+        ) -> EnrollmentOperation {
+            EnrollmentOperation {
+                operation_id: "op-1".to_string(),
+                kind,
+                group_id: group_id.map(str::to_string),
+                group_name: group_name.map(str::to_string),
+                device_id: DEVICE_ID.to_string(),
+                local_path: LOCAL_PATH.to_string(),
+                storage_mode: storage_mode.to_string(),
+                state,
+                last_error: None,
+                attempts: 0,
+                created_at_unix: 1,
+                updated_at_unix: 1,
+            }
+        }
+
+        fn marker(kind: EnrollmentKind) -> PendingEnrollment {
+            PendingEnrollment {
+                operation_id: "op-1".to_string(),
+                kind,
+                group_id: GROUP_ID.to_string(),
+                device_id: DEVICE_ID.to_string(),
+                local_path: LOCAL_PATH.to_string(),
+            }
+        }
+
+        fn create_body(status: &str, result_group_id: Option<&str>) -> serde_json::Value {
+            serde_json::json!({
+                "operationId": "op-1",
+                "kind": "create",
+                "status": status,
+                "requestFingerprint": "fp",
+                "request": { "userId": "user-1", "groupName": GROUP_NAME, "deviceId": DEVICE_ID },
+                "result": result_group_id.map(|g| serde_json::json!({ "groupId": g })),
+            })
+        }
+
+        fn join_body(status: &str, result_group_id: Option<&str>) -> serde_json::Value {
+            serde_json::json!({
+                "operationId": "op-1",
+                "kind": "join",
+                "status": status,
+                "requestFingerprint": "fp",
+                "request": {
+                    "userId": "user-1",
+                    "groupId": GROUP_ID,
+                    "deviceId": DEVICE_ID,
+                    "storageMode": "eager",
+                },
+                "result": result_group_id.map(|g| serde_json::json!({ "groupId": g })),
+            })
+        }
+
+        /// Closes every handle to `sync_state`'s connection pool by dropping
+        /// the sole `Arc`, then opens a genuinely fresh `SyncState` over the
+        /// SAME file -- the actual crash-and-restart this module qualifies
+        /// against, not an in-memory stand-in that never round-trips through
+        /// disk at all.
+        fn reopen(db_path: &std::path::Path, sync_state: Arc<ReplicaCoordinator>) -> Arc<ReplicaCoordinator> {
+            drop(sync_state);
+            Arc::new(ReplicaCoordinator::open(db_path).unwrap())
+        }
+
+        /// The SAME typed evidence [`diagnose_stable`] itself reads (Phase
+        /// 2.1-C2-A's own `SyncState::recovery_local_snapshot`) -- full
+        /// journal row, link observation, and pending-marker observation,
+        /// not a hand-picked subset. Comparing this before/after a
+        /// diagnosis is the direct read-only invariant this module
+        /// qualifies, in the exact same terms `diagnose_stable`'s own race
+        /// detection already uses.
+        fn enrollment_evidence(sync_state: &ReplicaCoordinator) -> LocalRecoveryEvidence {
+            local_recovery_evidence(sync_state, RecoveryDomain::Enrollment, "op-1")
+        }
+
+        /// Shared across all three domains -- the SAME typed evidence
+        /// `diagnose_stable` itself reads for `(domain, operation_id)`.
+        fn local_recovery_evidence(
+            sync_state: &ReplicaCoordinator,
+            domain: RecoveryDomain,
+            operation_id: &str,
+        ) -> LocalRecoveryEvidence {
+            let key = RecoveryOperationKey { domain, operation_id: operation_id.to_string() };
+            match sync_state.recovery_snapshot_reader().recovery_local_snapshot(&key).unwrap() {
+                RecoveryLocalSnapshot::Found(evidence) => *evidence,
+                other => panic!("expected found evidence, got {other:?}"),
+            }
+        }
+
+        /// Shared across all three domains -- runs the real `recovery show`
+        /// request/response round trip through `handle_request` and
+        /// returns the decoded `ShowRecoveryOperationResponse`.
+        async fn run_show_request(
+            daemon_state: &Arc<DaemonState>,
+            domain: RecoveryDomain,
+            operation_id: &str,
+        ) -> yadorilink_ipc_proto::daemonctl::ShowRecoveryOperationResponse {
+            let req = DaemonControlRequest {
+                payload: Some(ReqPayload::ShowRecoveryOperation(
+                    yadorilink_ipc_proto::daemonctl::ShowRecoveryOperationRequest {
+                        domain: domain.as_str().to_string(),
+                        operation_id: operation_id.to_string(),
+                    },
+                )),
+                protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+            };
+            let resp = super::super::handle_request(
+                &crate::control_context::ControlContext::from_state(daemon_state.clone()),
+                req,
+            )
+            .await;
+            let Some(RespPayload::ShowRecoveryOperation(show)) = resp.payload else {
+                panic!("expected a ShowRecoveryOperation response, got {:?}", resp.payload);
+            };
+            show
+        }
+
+        /// Shared across all three domains -- the common assertions every
+        /// `RecoveryDiagnosis` proto qualifies on regardless of domain.
+        /// Domain-specific fields (action/local_state, link/marker/
+        /// remote-identity qualification) are asserted separately by each
+        /// domain's own case runner.
+        struct ExpectedDiagnosis {
+            operation_id: &'static str,
+            domain: &'static str,
+            remote_state: String,
+            recommendation: &'static str,
+            automatic_recovery_safe: bool,
+            reason_codes: &'static [&'static str],
+        }
+
+        fn assert_diagnosis(
+            label: &str,
+            diagnosis: &yadorilink_ipc_proto::daemonctl::RecoveryDiagnosis,
+            expected: &ExpectedDiagnosis,
+        ) {
+            let op = diagnosis.operation.as_ref().unwrap();
+            assert_eq!(op.operation_id, expected.operation_id, "[{label}] operation_id");
+            assert_eq!(op.domain, expected.domain, "[{label}] domain");
+            let remote = diagnosis.remote.as_ref().unwrap();
+            assert_eq!(remote.status, expected.remote_state, "[{label}] remote state");
+            assert_eq!(
+                diagnosis.recommendation, expected.recommendation,
+                "[{label}] recommendation"
+            );
+            assert_eq!(
+                diagnosis.automatic_recovery_safe, expected.automatic_recovery_safe,
+                "[{label}] automatic_recovery_safe"
+            );
+            assert_eq!(diagnosis.reason_codes, expected.reason_codes, "[{label}] reason_codes");
+        }
+
+        struct Case {
+            label: &'static str,
+            kind: EnrollmentKind,
+            state: EnrollmentOperationState,
+            group_id: Option<&'static str>,
+            group_name: Option<&'static str>,
+            storage_mode: &'static str,
+            with_link_and_marker: bool,
+            remote_status: Option<&'static str>,
+            remote_result_group_id: Option<&'static str>,
+            expected_recommendation: &'static str,
+            expected_automatic_recovery_safe: bool,
+            expected_reason_codes: &'static [&'static str],
+            expected_link_status: &'static str,
+            expected_marker_status: &'static str,
+            expected_remote_identity_status: &'static str,
+        }
+
+        async fn run_case(case: Case) {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("index.sqlite3");
+
+            // 1. Build a persisted journal state.
+            let sync_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
+            sync_state
+                .enrollment_repository().try_insert_enrollment_operation(&base_operation(
+                    case.kind,
+                    case.state,
+                    case.group_id,
+                    case.group_name,
+                    case.storage_mode,
+                ))
+                .unwrap();
+            if case.with_link_and_marker {
+                sync_state
+                    .enrollment_repository().add_link_with_pending_enrollment(LOCAL_PATH, GROUP_ID, &marker(case.kind))
+                    .unwrap();
+            }
+
+            // 2. Close, 3. reopen the SAME file -- the actual crash+restart.
+            let sync_state = reopen(&db_path, sync_state);
+            let before = enrollment_evidence(&sync_state);
+
+            // 4. Mock the coordination plane's evidence.
+            let server = MockServer::start().await;
+            let response = match case.remote_status {
+                None => ResponseTemplate::new(404),
+                Some(status) => {
+                    let body = match case.kind {
+                        EnrollmentKind::Create => create_body(status, case.remote_result_group_id),
+                        EnrollmentKind::Join => join_body(status, case.remote_result_group_id),
+                    };
+                    ResponseTemplate::new(200).set_body_json(body)
+                }
+            };
+            Mock::given(method("GET"))
+                .and(path("/devices/enrollment-operations/op-1"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let daemon_state = daemon_state_for(sync_state.clone());
+            daemon_state.set_coordination_client_config(server.uri(), "t".to_string());
+
+            // 5. Run the real `recovery show` path.
+            let req = DaemonControlRequest {
+                payload: Some(ReqPayload::ShowRecoveryOperation(
+                    yadorilink_ipc_proto::daemonctl::ShowRecoveryOperationRequest {
+                        domain: RecoveryDomain::Enrollment.as_str().to_string(),
+                        operation_id: "op-1".to_string(),
+                    },
+                )),
+                protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+            };
+            let resp = super::super::handle_request(
+                &crate::control_context::ControlContext::from_state(daemon_state.clone()),
+                req,
+            )
+            .await;
+
+            // 6. Verify the wire outcome.
+            let Some(RespPayload::ShowRecoveryOperation(show)) = resp.payload else {
+                panic!(
+                    "[{}] expected a ShowRecoveryOperation response, got {:?}",
+                    case.label, resp.payload
+                );
+            };
+            let Some(yadorilink_ipc_proto::daemonctl::show_recovery_operation_response::Result::Diagnosed(diagnosis)) =
+                show.result
+            else {
+                panic!("[{}] expected Diagnosed, got {:?}", case.label, show.result);
+            };
+
+            let op = diagnosis.operation.as_ref().unwrap();
+            assert_eq!(op.operation_id, "op-1", "[{}] operation_id", case.label);
+            assert_eq!(op.domain, "enrollment", "[{}] domain", case.label);
+            assert_eq!(
+                op.action,
+                match case.kind {
+                    EnrollmentKind::Create => "create",
+                    EnrollmentKind::Join => "join",
+                },
+                "[{}] action",
+                case.label
+            );
+            assert_eq!(op.state, case.state.as_db_str(), "[{}] local state", case.label);
+            let remote = diagnosis.remote.as_ref().unwrap();
+            let expected_remote_state = match case.remote_status {
+                None => "record_not_found".to_string(),
+                Some(s) => s.to_string(),
+            };
+            assert_eq!(remote.status, expected_remote_state, "[{}] remote state", case.label);
+            assert_eq!(
+                diagnosis.recommendation, case.expected_recommendation,
+                "[{}] recommendation",
+                case.label
+            );
+            assert_eq!(
+                diagnosis.automatic_recovery_safe, case.expected_automatic_recovery_safe,
+                "[{}] automatic_recovery_safe",
+                case.label
+            );
+            assert_eq!(
+                diagnosis.reason_codes, case.expected_reason_codes,
+                "[{}] reason_codes",
+                case.label
+            );
+
+            let qualification = diagnosis.qualification.as_ref().unwrap();
+            let link = qualification.link.as_ref().unwrap();
+            assert_eq!(
+                link.status, case.expected_link_status,
+                "[{}] link qualification",
+                case.label
+            );
+            assert!(link.mismatch_fields.is_empty(), "[{}] link mismatch_fields", case.label);
+            let marker = qualification.pending_marker.as_ref().unwrap();
+            assert_eq!(
+                marker.status, case.expected_marker_status,
+                "[{}] marker qualification",
+                case.label
+            );
+            assert!(marker.mismatch_fields.is_empty(), "[{}] marker mismatch_fields", case.label);
+            let remote_identity = qualification.remote_identity.as_ref().unwrap();
+            assert_eq!(
+                remote_identity.status, case.expected_remote_identity_status,
+                "[{}] remote identity qualification",
+                case.label
+            );
+            assert!(
+                remote_identity.mismatch_fields.is_empty(),
+                "[{}] remote_identity mismatch_fields",
+                case.label
+            );
+            assert!(
+                remote_identity.not_comparable_reasons.is_empty(),
+                "[{}] remote_identity not_comparable_reasons",
+                case.label
+            );
+            let expected_not_evaluated_reason =
+                case.remote_status.is_none().then(|| "record_not_found".to_string());
+            assert_eq!(
+                remote_identity.not_evaluated_reason, expected_not_evaluated_reason,
+                "[{}] remote_identity not_evaluated_reason",
+                case.label
+            );
+
+            // 7. Worker GET happened exactly once.
+            let received = server.received_requests().await.unwrap();
+            assert_eq!(received.len(), 1, "[{}] Worker GET count", case.label);
+
+            // 8. Read-only: the FULL typed local recovery evidence (journal
+            // row, link observation, pending-marker observation) is
+            // unchanged -- not a hand-picked subset.
+            let after = enrollment_evidence(&sync_state);
+            assert_eq!(before, after, "[{}] local recovery evidence must not change", case.label);
+        }
+
+        #[tokio::test]
+        async fn prepare_pending_no_link_no_marker_record_not_found_retries_same_request() {
+            run_case(Case {
+                label: "PreparePending/absent/404",
+                kind: EnrollmentKind::Create,
+                state: EnrollmentOperationState::PreparePending,
+                group_id: None,
+                group_name: Some(GROUP_NAME),
+                storage_mode: "eager",
+                with_link_and_marker: false,
+                remote_status: None,
+                remote_result_group_id: None,
+                expected_recommendation: "retry_same_remote_request",
+                expected_automatic_recovery_safe: true,
+                expected_reason_codes: &["remote_record_not_found"],
+                expected_link_status: "confirmed_absent",
+                expected_marker_status: "confirmed_absent",
+                expected_remote_identity_status: "not_evaluated",
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn prepare_pending_no_link_no_marker_preparing_waits() {
+            run_case(Case {
+                label: "PreparePending/absent/preparing",
+                kind: EnrollmentKind::Create,
+                state: EnrollmentOperationState::PreparePending,
+                group_id: None,
+                group_name: Some(GROUP_NAME),
+                storage_mode: "eager",
+                with_link_and_marker: false,
+                remote_status: Some("preparing"),
+                remote_result_group_id: None,
+                expected_recommendation: "wait_for_automatic_recovery",
+                expected_automatic_recovery_safe: true,
+                expected_reason_codes: &[],
+                expected_link_status: "confirmed_absent",
+                expected_marker_status: "confirmed_absent",
+                expected_remote_identity_status: "exact",
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn prepared_no_link_no_marker_prepared_with_result_waits() {
+            run_case(Case {
+                label: "Prepared/absent/prepared",
+                kind: EnrollmentKind::Create,
+                state: EnrollmentOperationState::Prepared,
+                group_id: Some(GROUP_ID),
+                group_name: Some(GROUP_NAME),
+                storage_mode: "eager",
+                with_link_and_marker: false,
+                remote_status: Some("prepared"),
+                remote_result_group_id: Some(GROUP_ID),
+                expected_recommendation: "wait_for_automatic_recovery",
+                expected_automatic_recovery_safe: true,
+                expected_reason_codes: &[],
+                expected_link_status: "confirmed_absent",
+                expected_marker_status: "confirmed_absent",
+                expected_remote_identity_status: "exact",
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn local_setup_pending_exact_evidence_prepared_waits() {
+            run_case(Case {
+                label: "LocalSetupPending/exact/prepared",
+                kind: EnrollmentKind::Create,
+                state: EnrollmentOperationState::LocalSetupPending,
+                group_id: Some(GROUP_ID),
+                group_name: Some(GROUP_NAME),
+                storage_mode: "eager",
+                with_link_and_marker: true,
+                remote_status: Some("prepared"),
+                remote_result_group_id: Some(GROUP_ID),
+                expected_recommendation: "wait_for_automatic_recovery",
+                expected_automatic_recovery_safe: true,
+                expected_reason_codes: &[],
+                expected_link_status: "exact",
+                expected_marker_status: "exact",
+                expected_remote_identity_status: "exact",
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn activation_pending_exact_evidence_prepared_retries_activation() {
+            run_case(Case {
+                label: "ActivationPending/exact/prepared",
+                kind: EnrollmentKind::Create,
+                state: EnrollmentOperationState::ActivationPending,
+                group_id: Some(GROUP_ID),
+                group_name: Some(GROUP_NAME),
+                storage_mode: "eager",
+                with_link_and_marker: true,
+                remote_status: Some("prepared"),
+                remote_result_group_id: Some(GROUP_ID),
+                expected_recommendation: "retry_remote_activation",
+                expected_automatic_recovery_safe: true,
+                expected_reason_codes: &[],
+                expected_link_status: "exact",
+                expected_marker_status: "exact",
+                expected_remote_identity_status: "exact",
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn activation_pending_exact_evidence_active_settles() {
+            run_case(Case {
+                label: "ActivationPending/exact/active",
+                kind: EnrollmentKind::Create,
+                state: EnrollmentOperationState::ActivationPending,
+                group_id: Some(GROUP_ID),
+                group_name: Some(GROUP_NAME),
+                storage_mode: "eager",
+                with_link_and_marker: true,
+                remote_status: Some("active"),
+                remote_result_group_id: Some(GROUP_ID),
+                expected_recommendation: "complete_local_settlement",
+                expected_automatic_recovery_safe: true,
+                expected_reason_codes: &[],
+                expected_link_status: "exact",
+                expected_marker_status: "exact",
+                expected_remote_identity_status: "exact",
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn activation_pending_no_link_no_marker_prepared_retries_cancellation() {
+            run_case(Case {
+                label: "ActivationPending/absent/prepared",
+                kind: EnrollmentKind::Create,
+                state: EnrollmentOperationState::ActivationPending,
+                group_id: Some(GROUP_ID),
+                group_name: Some(GROUP_NAME),
+                storage_mode: "eager",
+                with_link_and_marker: false,
+                remote_status: Some("prepared"),
+                remote_result_group_id: Some(GROUP_ID),
+                expected_recommendation: "retry_remote_cancellation",
+                expected_automatic_recovery_safe: true,
+                expected_reason_codes: &[],
+                expected_link_status: "confirmed_absent",
+                expected_marker_status: "confirmed_absent",
+                expected_remote_identity_status: "exact",
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn cancel_pending_no_link_no_marker_prepared_retries_cancellation() {
+            run_case(Case {
+                label: "CancelPending/absent/prepared",
+                kind: EnrollmentKind::Create,
+                state: EnrollmentOperationState::CancelPending,
+                group_id: Some(GROUP_ID),
+                group_name: Some(GROUP_NAME),
+                storage_mode: "eager",
+                with_link_and_marker: false,
+                remote_status: Some("prepared"),
+                remote_result_group_id: Some(GROUP_ID),
+                expected_recommendation: "retry_remote_cancellation",
+                expected_automatic_recovery_safe: true,
+                expected_reason_codes: &[],
+                expected_link_status: "confirmed_absent",
+                expected_marker_status: "confirmed_absent",
+                expected_remote_identity_status: "exact",
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn cancel_pending_no_link_no_marker_cancelled_settles() {
+            run_case(Case {
+                label: "CancelPending/absent/cancelled",
+                kind: EnrollmentKind::Create,
+                state: EnrollmentOperationState::CancelPending,
+                group_id: Some(GROUP_ID),
+                group_name: Some(GROUP_NAME),
+                storage_mode: "eager",
+                with_link_and_marker: false,
+                remote_status: Some("cancelled"),
+                remote_result_group_id: None,
+                expected_recommendation: "complete_local_settlement",
+                expected_automatic_recovery_safe: true,
+                expected_reason_codes: &[],
+                expected_link_status: "confirmed_absent",
+                expected_marker_status: "confirmed_absent",
+                expected_remote_identity_status: "exact",
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn recovery_blocked_is_always_manual_investigation() {
+            run_case(Case {
+                label: "RecoveryBlocked/absent/404",
+                kind: EnrollmentKind::Create,
+                state: EnrollmentOperationState::RecoveryBlocked,
+                group_id: None,
+                group_name: None,
+                storage_mode: "eager",
+                with_link_and_marker: false,
+                remote_status: None,
+                remote_result_group_id: None,
+                expected_recommendation: "manual_investigation",
+                expected_automatic_recovery_safe: false,
+                expected_reason_codes: &["recovery_blocked"],
+                expected_link_status: "confirmed_absent",
+                expected_marker_status: "confirmed_absent",
+                expected_remote_identity_status: "not_evaluated",
+            })
+            .await;
+        }
+
+        /// Create's local on-demand materialization request is a different
+        /// concept from the remote creator edge (always "eager") -- must
+        /// stay `exact`, never a spurious identity conflict.
+        #[tokio::test]
+        async fn create_local_on_demand_is_not_an_identity_conflict() {
+            run_case(Case {
+                label: "Create/on-demand/prepared",
+                kind: EnrollmentKind::Create,
+                state: EnrollmentOperationState::Prepared,
+                group_id: Some(GROUP_ID),
+                group_name: Some(GROUP_NAME),
+                storage_mode: "on-demand",
+                with_link_and_marker: false,
+                remote_status: Some("prepared"),
+                remote_result_group_id: Some(GROUP_ID),
+                expected_recommendation: "wait_for_automatic_recovery",
+                expected_automatic_recovery_safe: true,
+                expected_reason_codes: &[],
+                expected_link_status: "confirmed_absent",
+                expected_marker_status: "confirmed_absent",
+                expected_remote_identity_status: "exact",
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn join_activation_pending_exact_evidence_prepared_retries_activation() {
+            run_case(Case {
+                label: "Join/ActivationPending/exact/prepared",
+                kind: EnrollmentKind::Join,
+                state: EnrollmentOperationState::ActivationPending,
+                group_id: Some(GROUP_ID),
+                group_name: None,
+                storage_mode: "eager",
+                with_link_and_marker: true,
+                remote_status: Some("prepared"),
+                remote_result_group_id: Some(GROUP_ID),
+                expected_recommendation: "retry_remote_activation",
+                expected_automatic_recovery_safe: true,
+                expected_reason_codes: &[],
+                expected_link_status: "exact",
+                expected_marker_status: "exact",
+                expected_remote_identity_status: "exact",
+            })
+            .await;
+        }
+
+        /// A real IPC race, through `handle_request` end to end: the mocked
+        /// Worker response is held open by a genuine two-way barrier -- a
+        /// tiny raw TCP server that reads the request fully, signals
+        /// `request_received`, and then BLOCKS on `release_response` before
+        /// writing anything back -- not a fixed delay. While the response
+        /// is provably still withheld, a SEPARATE `SyncState` handle (as a
+        /// concurrent reconciler would use) mutates the same journal row,
+        /// and only THEN is the response released. The wire outcome must be
+        /// `local_evidence_changed`, never a diagnosis built from now-stale
+        /// local evidence, and never a second remote lookup -- no matter
+        /// how long the mutation itself takes.
+        struct HeldResponseServer {
+            base_url: String,
+            request_received: Arc<Notify>,
+            release_response: Arc<Notify>,
+            request_count: Arc<AtomicUsize>,
+            unexpected_request_count: Arc<AtomicUsize>,
+            protocol_violation: Arc<std::sync::Mutex<Option<String>>>,
+            task: tokio::task::JoinHandle<()>,
+        }
+
+        impl HeldResponseServer {
+            /// Starts a server that expects exactly one `expected_method
+            /// expected_path` request, holds its response until
+            /// `release_response` is signaled, and treats every other
+            /// connection attempt (wrong method/path, or a connection past
+            /// the first) as a recorded failure -- never silently accepted.
+            async fn start(
+                expected_method: &'static str,
+                expected_path: String,
+                body: serde_json::Value,
+            ) -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let request_received = Arc::new(Notify::new());
+                let release_response = Arc::new(Notify::new());
+                let request_count = Arc::new(AtomicUsize::new(0));
+                let unexpected_request_count = Arc::new(AtomicUsize::new(0));
+                let protocol_violation: Arc<std::sync::Mutex<Option<String>>> =
+                    Arc::new(std::sync::Mutex::new(None));
+                let body_bytes = serde_json::to_vec(&body).unwrap();
+
+                let task_received = request_received.clone();
+                let task_release = release_response.clone();
+                let task_count = request_count.clone();
+                let task_unexpected = unexpected_request_count.clone();
+                let task_violation = protocol_violation.clone();
+
+                let task = tokio::spawn(async move {
+                    // Exactly one request is ever the intended one -- served
+                    // sequentially so a second connection is provably
+                    // observed as extra, not raced against the held first
+                    // one.
+                    let mut served = false;
+                    loop {
+                        let Ok((mut socket, _)) = listener.accept().await else { return };
+                        if served {
+                            task_unexpected.fetch_add(1, Ordering::SeqCst);
+                            let _ = socket
+                                .write_all(
+                                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
+                                      Connection: close\r\n\r\n",
+                                )
+                                .await;
+                            continue;
+                        }
+
+                        // Bounded read -- a GET has no body, so the header
+                        // terminator ends the request; never loop
+                        // unboundedly on a client that never sends one.
+                        const MAX_HEADER_BYTES: usize = 16 * 1024;
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 1024];
+                        let head_ok = loop {
+                            if buf.len() > MAX_HEADER_BYTES {
+                                break false;
+                            }
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break false,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break true;
+                            }
+                        };
+                        if !head_ok {
+                            *task_violation.lock().unwrap() =
+                                Some("request headers not received cleanly".to_string());
+                            continue;
+                        }
+
+                        let line_end = buf.iter().position(|&b| b == b'\r').unwrap_or(buf.len());
+                        let request_line = String::from_utf8_lossy(&buf[..line_end]).to_string();
+                        let mut parts = request_line.split(' ');
+                        let (method, path) =
+                            (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                        if method != expected_method || path != expected_path {
+                            *task_violation.lock().unwrap() = Some(format!(
+                                "unexpected request line {request_line:?} (wanted {expected_method} \
+                                 {expected_path})"
+                            ));
+                            let _ = socket
+                                .write_all(
+                                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\
+                                      Connection: close\r\n\r\n",
+                                )
+                                .await;
+                            continue;
+                        }
+
+                        served = true;
+                        task_count.fetch_add(1, Ordering::SeqCst);
+                        // The barrier: the caller only learns the request
+                        // landed AFTER it is fully read and validated, and
+                        // this task will not write one byte of a response
+                        // until `release_response` is explicitly signaled --
+                        // regardless of how long that takes.
+                        task_received.notify_one();
+                        task_release.notified().await;
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
+                             {}\r\nConnection: close\r\n\r\n",
+                            body_bytes.len()
+                        );
+                        let _ = socket.write_all(header.as_bytes()).await;
+                        let _ = socket.write_all(&body_bytes).await;
+                        let _ = socket.shutdown().await;
+                    }
+                });
+
+                HeldResponseServer {
+                    base_url: format!("http://{addr}"),
+                    request_received,
+                    release_response,
+                    request_count,
+                    unexpected_request_count,
+                    protocol_violation,
+                    task,
+                }
+            }
+
+            fn request_count(&self) -> usize {
+                self.request_count.load(Ordering::SeqCst)
+            }
+
+            /// Asserts the server observed no malformed/mismatched request
+            /// and no connection beyond the one expected -- called at the
+            /// end of every race test alongside `request_count() == 1`.
+            fn assert_clean(&self, label: &str) {
+                assert_eq!(
+                    self.unexpected_request_count.load(Ordering::SeqCst),
+                    0,
+                    "[{label}] unexpected extra connection(s)"
+                );
+                assert_eq!(
+                    self.protocol_violation.lock().unwrap().clone(),
+                    None,
+                    "[{label}] protocol violation"
+                );
+            }
+        }
+
+        impl Drop for HeldResponseServer {
+            fn drop(&mut self) {
+                self.task.abort();
+            }
+        }
+
+        #[tokio::test]
+        async fn concurrent_local_mutation_during_remote_lookup_is_local_evidence_changed_on_the_wire(
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("index.sqlite3");
+
+            let sync_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
+            sync_state
+                .enrollment_repository().try_insert_enrollment_operation(&base_operation(
+                    EnrollmentKind::Create,
+                    EnrollmentOperationState::ActivationPending,
+                    Some(GROUP_ID),
+                    Some(GROUP_NAME),
+                    "eager",
+                ))
+                .unwrap();
+            sync_state
+                .enrollment_repository().add_link_with_pending_enrollment(
+                    LOCAL_PATH,
+                    GROUP_ID,
+                    &marker(EnrollmentKind::Create),
+                )
+                .unwrap();
+            let sync_state = reopen(&db_path, sync_state);
+
+            let server = HeldResponseServer::start(
+                "GET",
+                "/devices/enrollment-operations/op-1".to_string(),
+                create_body("prepared", Some(GROUP_ID)),
+            )
+            .await;
+
+            let daemon_state = daemon_state_for(sync_state.clone());
+            daemon_state.set_coordination_client_config(server.base_url.clone(), "t".to_string());
+
+            // A second, independent handle onto the SAME file -- standing in
+            // for a concurrent reconciler task, not the request-handling
+            // task itself.
+            let mutator_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
+
+            let req = DaemonControlRequest {
+                payload: Some(ReqPayload::ShowRecoveryOperation(
+                    yadorilink_ipc_proto::daemonctl::ShowRecoveryOperationRequest {
+                        domain: RecoveryDomain::Enrollment.as_str().to_string(),
+                        operation_id: "op-1".to_string(),
+                    },
+                )),
+                protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+            };
+            let handle = tokio::spawn(async move {
+                super::super::handle_request(
+                    &crate::control_context::ControlContext::from_state(daemon_state.clone()),
+                    req,
+                )
+                .await
+            });
+
+            // The barrier: the request has been fully read by the held-
+            // response server -- the remote lookup is PROVABLY in flight,
+            // and its response is PROVABLY not yet written, no matter how
+            // long the mutation below takes.
+            server.request_received.notified().await;
+            mutator_state
+                .enrollment_repository().mark_enrollment_operation_state(
+                    "op-1",
+                    EnrollmentOperationState::CancelPending,
+                    None,
+                    2,
+                )
+                .unwrap();
+            server.release_response.notify_one();
+
+            let resp = handle.await.unwrap();
+            let Some(RespPayload::ShowRecoveryOperation(show)) = resp.payload else {
+                panic!("expected a ShowRecoveryOperation response, got {:?}", resp.payload);
+            };
+            match show.result {
+                Some(
+                    yadorilink_ipc_proto::daemonctl::show_recovery_operation_response::Result::LocalEvidenceChanged(
+                        changed,
+                    ),
+                ) => {
+                    let key = changed.key.unwrap();
+                    assert_eq!(key.domain, "enrollment");
+                    assert_eq!(key.operation_id, "op-1");
+                }
+                other => panic!("expected LocalEvidenceChanged, got {other:?}"),
+            }
+
+            assert_eq!(server.request_count(), 1, "exactly one Worker GET, no automatic retry");
+            server.assert_clean("Enrollment race");
+        }
+
+        // ============================== Membership ==============================
+        //
+        // Membership has no link/marker observation of its own (the
+        // `qualify_membership_remote_identity` qualification only ever
+        // covers `remote_identity` -- see
+        // `crate::recovery_diagnosis::model::MembershipEvidenceQualification`'s
+        // own doc comment), and its remote-identity comparison never
+        // produces `NotComparable` (every field it compares is always
+        // present on both sides -- see `qualify_membership_remote_identity`)
+        // -- both intentionally absent from this section, not overlooked.
+
+        const MEMBERSHIP_REMOVED_DEVICE_ID: &str = "device-b";
+
+        struct MembershipFixture {
+            action: MembershipOperationAction,
+            commit_mode: MembershipCommitMode,
+            group_ids: &'static [&'static str],
+            target_device_ids: &'static [&'static str],
+            lease_ids: &'static [Option<&'static str>],
+            state: MembershipOperationState,
+            durability_scope: MembershipDurabilityScope,
+            latch_group_ids: &'static [&'static str],
+        }
+
+        fn insert_membership_fixture(
+            sync_state: &ReplicaCoordinator,
+            fixture: &MembershipFixture,
+        ) -> MembershipOperation {
+            let group_ids: Vec<String> = fixture.group_ids.iter().map(|s| s.to_string()).collect();
+            let target_device_ids: Vec<String> =
+                fixture.target_device_ids.iter().map(|s| s.to_string()).collect();
+            let lease_ids: Vec<Option<String>> =
+                fixture.lease_ids.iter().map(|l| l.map(str::to_string)).collect();
+            let latch_group_ids: Vec<String> =
+                fixture.latch_group_ids.iter().map(|s| s.to_string()).collect();
+            sync_state
+                .membership_operation_repository().try_insert_membership_operation(
+                    "op-1",
+                    fixture.action,
+                    fixture.commit_mode,
+                    MEMBERSHIP_REMOVED_DEVICE_ID,
+                    &group_ids,
+                    &target_device_ids,
+                    &lease_ids,
+                    fixture.state,
+                    fixture.durability_scope,
+                    &latch_group_ids,
+                    None,
+                    1,
+                )
+                .unwrap();
+            sync_state.membership_operation_repository().get_membership_operation("op-1").unwrap().unwrap()
+        }
+
+        fn membership_result_json(affected_group_ids: Option<&[&str]>) -> serde_json::Value {
+            serde_json::json!({
+                "affectedGroupIds": affected_group_ids
+                    .map(|ids| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+                "targetDeviceId": null,
+                "membershipGeneration": null,
+                "leaseId": null,
+            })
+        }
+
+        /// Builds a wire body IDENTITY-EXACT to `operation`'s own canonical
+        /// remote request (via the SAME `expected_membership_remote_request`
+        /// the classifier's own qualification calls), optionally overriding
+        /// `action` on BOTH the top-level and nested `request.action`
+        /// fields together -- keeping them consistent is what makes an
+        /// override still parse as a well-formed (if identity-mismatched)
+        /// response rather than a `MalformedResponse`.
+        fn membership_body(
+            operation: &MembershipOperation,
+            status: &str,
+            result: Option<serde_json::Value>,
+            action_override: Option<&str>,
+        ) -> serde_json::Value {
+            let expected =
+                crate::application::membership_operation_identity::expected_membership_remote_request(
+                    operation,
+                );
+            let action = action_override.unwrap_or(expected.action.as_str());
+            let groups: Vec<_> = expected
+                .groups
+                .iter()
+                .map(|g| {
+                    serde_json::json!({
+                        "groupId": g.group_id,
+                        "targetDeviceId": g.target_device_id,
+                        "leaseId": g.lease_id,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "operationId": "op-1",
+                "status": status,
+                "action": action,
+                "removedDeviceId": operation.removed_device_id,
+                "requestFingerprint": "fp",
+                "request": {
+                    "userId": "user-1",
+                    "action": action,
+                    "removedDeviceId": operation.removed_device_id,
+                    "mode": expected.mode,
+                    "groups": groups,
+                },
+                "result": result,
+                "rejectionCode": null,
+                "rejectionDetail": null,
+            })
+        }
+
+        fn membership_evidence(sync_state: &ReplicaCoordinator) -> LocalRecoveryEvidence {
+            local_recovery_evidence(sync_state, RecoveryDomain::Membership, "op-1")
+        }
+
+        struct MembershipCase {
+            label: &'static str,
+            fixture: MembershipFixture,
+            /// `None` means a 404 (`RecordNotFound`); `Some(status, body)`
+            /// mocks a 200 with that body; a bare non-2xx status is mocked
+            /// via `remote_error_status` instead when the case needs
+            /// `Unavailable` rather than a well-formed record.
+            remote: Option<(&'static str, serde_json::Value)>,
+            remote_error_status: Option<u16>,
+            /// Overrides the wire `action` on BOTH the top-level and nested
+            /// `request.action` fields together -- see `membership_body`'s
+            /// own doc comment for why keeping them consistent is what
+            /// makes this still parse as well-formed (if identity-
+            /// mismatched), the way an unrelated genuine request under the
+            /// same reused operation_id would.
+            action_override: Option<&'static str>,
+            expected: ExpectedDiagnosis,
+            expected_remote_identity_status: &'static str,
+            expected_remote_identity_mismatch_fields: &'static [&'static str],
+        }
+
+        async fn run_membership_case(case: MembershipCase) {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("index.sqlite3");
+
+            let sync_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
+            let operation = insert_membership_fixture(&sync_state, &case.fixture);
+            let sync_state = reopen(&db_path, sync_state);
+            let before = membership_evidence(&sync_state);
+
+            let server = MockServer::start().await;
+            let response = if let Some(status) = case.remote_error_status {
+                ResponseTemplate::new(status)
+            } else {
+                match &case.remote {
+                    None => ResponseTemplate::new(404),
+                    Some((status, body)) => {
+                        let body = membership_body(
+                            &operation,
+                            status,
+                            Some(body.clone()),
+                            case.action_override,
+                        );
+                        ResponseTemplate::new(200).set_body_json(body)
+                    }
+                }
+            };
+            Mock::given(method("GET"))
+                .and(path("/devices/membership-operations/op-1"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let daemon_state = daemon_state_for(sync_state.clone());
+            daemon_state.set_coordination_client_config(server.uri(), "t".to_string());
+
+            let show = run_show_request(&daemon_state, RecoveryDomain::Membership, "op-1").await;
+            let Some(yadorilink_ipc_proto::daemonctl::show_recovery_operation_response::Result::Diagnosed(diagnosis)) =
+                show.result
+            else {
+                panic!("[{}] expected Diagnosed, got {:?}", case.label, show.result);
+            };
+
+            assert_diagnosis(case.label, &diagnosis, &case.expected);
+            let op = diagnosis.operation.as_ref().unwrap();
+            assert_eq!(op.action, case.fixture.action.as_db_str(), "[{}] action", case.label);
+            assert_eq!(op.state, case.fixture.state.as_db_str(), "[{}] local state", case.label);
+
+            let qualification = diagnosis.qualification.as_ref().unwrap();
+            assert!(qualification.link.is_none(), "[{}] membership has no link field", case.label);
+            assert!(
+                qualification.pending_marker.is_none(),
+                "[{}] membership has no marker field",
+                case.label
+            );
+            let remote_identity = qualification.remote_identity.as_ref().unwrap();
+            assert_eq!(
+                remote_identity.status, case.expected_remote_identity_status,
+                "[{}] remote identity qualification",
+                case.label
+            );
+            assert_eq!(
+                remote_identity.mismatch_fields, case.expected_remote_identity_mismatch_fields,
+                "[{}] remote identity mismatch_fields",
+                case.label
+            );
+            assert!(
+                remote_identity.not_comparable_reasons.is_empty(),
+                "[{}] membership remote identity is never not_comparable",
+                case.label
+            );
+
+            let received = server.received_requests().await.unwrap();
+            assert_eq!(received.len(), 1, "[{}] Worker GET count", case.label);
+
+            let after = membership_evidence(&sync_state);
+            assert_eq!(before, after, "[{}] local recovery evidence must not change", case.label);
+        }
+
+        fn known_no_latch() -> MembershipFixture {
+            MembershipFixture {
+                action: MembershipOperationAction::Revoke,
+                commit_mode: MembershipCommitMode::PlainRevoke,
+                group_ids: &["group-1"],
+                target_device_ids: &[],
+                lease_ids: &[],
+                state: MembershipOperationState::Prepared,
+                durability_scope: MembershipDurabilityScope::Known,
+                latch_group_ids: &[],
+            }
+        }
+
+        #[tokio::test]
+        async fn membership_prepared_record_not_found_retries_same_request() {
+            run_membership_case(MembershipCase {
+                label: "Membership/Prepared/RecordNotFound",
+                fixture: MembershipFixture {
+                    state: MembershipOperationState::Prepared,
+                    ..known_no_latch()
+                },
+                remote: None,
+                remote_error_status: None,
+                action_override: None,
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "membership",
+                    remote_state: "record_not_found".to_string(),
+                    recommendation: "retry_same_remote_request",
+                    automatic_recovery_safe: true,
+                    reason_codes: &["remote_record_not_found"],
+                },
+                expected_remote_identity_status: "not_evaluated",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn membership_prepared_unavailable_waits_for_remote_evidence() {
+            run_membership_case(MembershipCase {
+                label: "Membership/Prepared/Unavailable",
+                fixture: MembershipFixture {
+                    state: MembershipOperationState::Prepared,
+                    ..known_no_latch()
+                },
+                remote: None,
+                remote_error_status: Some(500),
+                action_override: None,
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "membership",
+                    remote_state: "unavailable".to_string(),
+                    recommendation: "wait_for_remote_evidence",
+                    automatic_recovery_safe: false,
+                    reason_codes: &["remote_unavailable"],
+                },
+                expected_remote_identity_status: "not_evaluated",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn membership_ambiguous_committed_settles_with_local_unsettled_reason() {
+            run_membership_case(MembershipCase {
+                label: "Membership/Ambiguous/Committed",
+                fixture: MembershipFixture {
+                    state: MembershipOperationState::Ambiguous,
+                    ..known_no_latch()
+                },
+                remote: Some(("committed", membership_result_json(None))),
+                remote_error_status: None,
+                action_override: None,
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "membership",
+                    remote_state: "committed".to_string(),
+                    recommendation: "complete_local_settlement",
+                    automatic_recovery_safe: true,
+                    reason_codes: &["remote_committed_local_unsettled"],
+                },
+                expected_remote_identity_status: "exact",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn membership_local_settlement_pending_known_scope_unavailable_settles() {
+            run_membership_case(MembershipCase {
+                label: "Membership/LocalSettlementPending/Known/Unavailable",
+                fixture: MembershipFixture {
+                    state: MembershipOperationState::LocalSettlementPending,
+                    ..known_no_latch()
+                },
+                remote: None,
+                remote_error_status: Some(500),
+                action_override: None,
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "membership",
+                    remote_state: "unavailable".to_string(),
+                    recommendation: "complete_local_settlement",
+                    automatic_recovery_safe: true,
+                    reason_codes: &[],
+                },
+                expected_remote_identity_status: "not_evaluated",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn membership_local_settlement_pending_unknown_scope_unavailable_waits() {
+            run_membership_case(MembershipCase {
+                label: "Membership/LocalSettlementPending/Unknown/Unavailable",
+                fixture: MembershipFixture {
+                    state: MembershipOperationState::LocalSettlementPending,
+                    durability_scope: MembershipDurabilityScope::Unknown,
+                    ..known_no_latch()
+                },
+                remote: None,
+                remote_error_status: Some(500),
+                action_override: None,
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "membership",
+                    remote_state: "unavailable".to_string(),
+                    recommendation: "wait_for_remote_evidence",
+                    automatic_recovery_safe: false,
+                    reason_codes: &["remote_unavailable", "durability_scope_unknown"],
+                },
+                expected_remote_identity_status: "not_evaluated",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn membership_completed_terminal_crash_window_row_settles() {
+            run_membership_case(MembershipCase {
+                label: "Membership/Completed/RecordNotFound",
+                fixture: MembershipFixture {
+                    state: MembershipOperationState::Completed,
+                    ..known_no_latch()
+                },
+                remote: None,
+                remote_error_status: None,
+                action_override: None,
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "membership",
+                    remote_state: "record_not_found".to_string(),
+                    recommendation: "complete_local_settlement",
+                    automatic_recovery_safe: true,
+                    reason_codes: &[],
+                },
+                expected_remote_identity_status: "not_evaluated",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn membership_definitely_rejected_terminal_crash_window_row_settles() {
+            run_membership_case(MembershipCase {
+                label: "Membership/DefinitelyRejected/Unavailable",
+                fixture: MembershipFixture {
+                    state: MembershipOperationState::DefinitelyRejected,
+                    ..known_no_latch()
+                },
+                remote: None,
+                remote_error_status: Some(500),
+                action_override: None,
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "membership",
+                    remote_state: "unavailable".to_string(),
+                    recommendation: "complete_local_settlement",
+                    automatic_recovery_safe: true,
+                    reason_codes: &[],
+                },
+                expected_remote_identity_status: "not_evaluated",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn membership_recovery_blocked_is_always_manual_investigation() {
+            run_membership_case(MembershipCase {
+                label: "Membership/RecoveryBlocked",
+                fixture: MembershipFixture {
+                    state: MembershipOperationState::RecoveryBlocked,
+                    ..known_no_latch()
+                },
+                remote: None,
+                remote_error_status: None,
+                action_override: None,
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "membership",
+                    remote_state: "record_not_found".to_string(),
+                    recommendation: "manual_investigation",
+                    automatic_recovery_safe: false,
+                    reason_codes: &["recovery_blocked"],
+                },
+                expected_remote_identity_status: "not_evaluated",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn membership_committed_remove_device_missing_affected_groups_is_manual() {
+            run_membership_case(MembershipCase {
+                label: "Membership/Committed/RemoveDevice/MissingAffectedGroups",
+                fixture: MembershipFixture {
+                    action: MembershipOperationAction::RemoveDevice,
+                    commit_mode: MembershipCommitMode::PlainRemoveDevice,
+                    group_ids: &[],
+                    target_device_ids: &[],
+                    lease_ids: &[],
+                    state: MembershipOperationState::Prepared,
+                    durability_scope: MembershipDurabilityScope::Known,
+                    latch_group_ids: &[],
+                },
+                remote: Some(("committed", membership_result_json(None))),
+                remote_error_status: None,
+                action_override: None,
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "membership",
+                    remote_state: "committed".to_string(),
+                    recommendation: "manual_investigation",
+                    automatic_recovery_safe: false,
+                    reason_codes: &["remote_result_incomplete"],
+                },
+                expected_remote_identity_status: "exact",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn membership_committed_revoke_with_empty_result_is_not_malformed() {
+            run_membership_case(MembershipCase {
+                label: "Membership/Committed/Revoke/EmptyResult",
+                fixture: MembershipFixture {
+                    state: MembershipOperationState::Prepared,
+                    ..known_no_latch()
+                },
+                remote: Some(("committed", membership_result_json(None))),
+                remote_error_status: None,
+                action_override: None,
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "membership",
+                    remote_state: "committed".to_string(),
+                    recommendation: "complete_local_settlement",
+                    automatic_recovery_safe: true,
+                    reason_codes: &["remote_committed_local_unsettled"],
+                },
+                expected_remote_identity_status: "exact",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn membership_committed_remove_device_multiple_affected_groups_settles() {
+            run_membership_case(MembershipCase {
+                label: "Membership/Committed/RemoveDevice/MultipleAffectedGroups",
+                fixture: MembershipFixture {
+                    action: MembershipOperationAction::RemoveDevice,
+                    commit_mode: MembershipCommitMode::PlainRemoveDevice,
+                    group_ids: &[],
+                    target_device_ids: &[],
+                    lease_ids: &[],
+                    state: MembershipOperationState::LocalSettlementPending,
+                    durability_scope: MembershipDurabilityScope::Known,
+                    latch_group_ids: &[],
+                },
+                remote: Some(("committed", membership_result_json(Some(&["group-1", "group-2"])))),
+                remote_error_status: None,
+                action_override: None,
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "membership",
+                    remote_state: "committed".to_string(),
+                    recommendation: "complete_local_settlement",
+                    automatic_recovery_safe: true,
+                    reason_codes: &[],
+                },
+                expected_remote_identity_status: "exact",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn membership_latch_missing_for_known_scope_is_manual_reason_but_still_settles() {
+            run_membership_case(MembershipCase {
+                label: "Membership/Known/LatchMissing",
+                fixture: MembershipFixture {
+                    action: MembershipOperationAction::RemoveDevice,
+                    commit_mode: MembershipCommitMode::PlainRemoveDevice,
+                    group_ids: &[],
+                    target_device_ids: &[],
+                    lease_ids: &[],
+                    state: MembershipOperationState::LocalSettlementPending,
+                    durability_scope: MembershipDurabilityScope::Known,
+                    latch_group_ids: &["group-1"],
+                },
+                remote: Some(("committed", membership_result_json(Some(&["group-1"])))),
+                remote_error_status: None,
+                action_override: None,
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "membership",
+                    remote_state: "committed".to_string(),
+                    recommendation: "complete_local_settlement",
+                    automatic_recovery_safe: true,
+                    reason_codes: &["durability_latch_missing"],
+                },
+                expected_remote_identity_status: "exact",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn membership_remote_identity_mismatch_is_conflict() {
+            run_membership_case(MembershipCase {
+                label: "Membership/IdentityMismatch",
+                fixture: MembershipFixture {
+                    state: MembershipOperationState::Prepared,
+                    ..known_no_latch()
+                },
+                remote: Some(("committed", membership_result_json(None))),
+                remote_error_status: None,
+                action_override: Some("remove-device"),
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "membership",
+                    remote_state: "committed".to_string(),
+                    recommendation: "conflict",
+                    automatic_recovery_safe: false,
+                    reason_codes: &["remote_identity_mismatch"],
+                },
+                expected_remote_identity_status: "mismatch",
+                expected_remote_identity_mismatch_fields: &["action"],
+            })
+            .await;
+        }
+
+        /// A malformed journal row is a typed `invalid` wire outcome
+        /// observed BEFORE any remote lookup -- never `manual_investigation`
+        /// (that comes from the classifier, which never even runs here).
+        #[tokio::test]
+        async fn membership_malformed_row_is_a_typed_invalid_outcome_before_any_lookup() {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("index.sqlite3");
+            let sync_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
+            sync_state.plant_malformed_membership_operation_for_test("op-1").unwrap();
+            let sync_state = reopen(&db_path, sync_state);
+
+            let daemon_state = daemon_state_for(sync_state.clone());
+            // No coordination config at all -- a lookup would panic this
+            // test if one were ever attempted.
+            daemon_state
+                .set_coordination_client_config("http://127.0.0.1:1".to_string(), "t".to_string());
+
+            let show = run_show_request(&daemon_state, RecoveryDomain::Membership, "op-1").await;
+            assert!(
+                matches!(
+                    show.result,
+                    Some(yadorilink_ipc_proto::daemonctl::show_recovery_operation_response::Result::Invalid(_))
+                ),
+                "expected Result::Invalid, got {:?}",
+                show.result
+            );
+        }
+
+        /// A real IPC race for Membership, through `handle_request` end to
+        /// end, using the same genuine two-way barrier as the Enrollment
+        /// race -- see that test's own doc comment.
+        #[tokio::test]
+        async fn membership_concurrent_local_mutation_during_remote_lookup_is_local_evidence_changed_on_the_wire(
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("index.sqlite3");
+
+            let sync_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
+            let operation = insert_membership_fixture(
+                &sync_state,
+                &MembershipFixture {
+                    state: MembershipOperationState::Prepared,
+                    ..known_no_latch()
+                },
+            );
+            let sync_state = reopen(&db_path, sync_state);
+
+            let body =
+                membership_body(&operation, "committed", Some(membership_result_json(None)), None);
+            let server = HeldResponseServer::start(
+                "GET",
+                "/devices/membership-operations/op-1".to_string(),
+                body,
+            )
+            .await;
+
+            let daemon_state = daemon_state_for(sync_state.clone());
+            daemon_state.set_coordination_client_config(server.base_url.clone(), "t".to_string());
+
+            let mutator_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
+
+            let daemon_state_task = daemon_state.clone();
+            let handle = tokio::spawn(async move {
+                run_show_request(&daemon_state_task, RecoveryDomain::Membership, "op-1").await
+            });
+
+            server.request_received.notified().await;
+            mutator_state
+                .membership_operation_repository().mark_membership_operation_state(
+                    "op-1",
+                    MembershipOperationState::LocalSettlementPending,
+                    None,
+                    2,
+                )
+                .unwrap();
+            server.release_response.notify_one();
+
+            let show = handle.await.unwrap();
+            match show.result {
+                Some(
+                    yadorilink_ipc_proto::daemonctl::show_recovery_operation_response::Result::LocalEvidenceChanged(
+                        changed,
+                    ),
+                ) => {
+                    let key = changed.key.unwrap();
+                    assert_eq!(key.domain, "membership");
+                    assert_eq!(key.operation_id, "op-1");
+                }
+                other => panic!("expected LocalEvidenceChanged, got {other:?}"),
+            }
+
+            assert_eq!(server.request_count(), 1, "exactly one Worker GET, no automatic retry");
+            server.assert_clean("Membership race");
+        }
+
+        // ============================== Role loss ================================
+        //
+        // Role-loss has no `not_evaluated`/`not_comparable`-vs-`Mismatch`
+        // subtlety beyond what Enrollment/Membership already exercise, but
+        // it has a property neither does: a local link mismatch is a
+        // REASON, never a recommendation-gating conflict -- the
+        // safe-direction Worker compensation this domain drives never reads
+        // the local link at all (see `classify_role_loss`'s own doc
+        // comment). Several cases below exist specifically to pin that.
+
+        const ROLE_LOSS_GROUP_ID: &str = "group-1";
+        const ROLE_LOSS_SOURCE_DEVICE_ID: &str = "device-c";
+        const ROLE_LOSS_TARGET_DEVICE_ID: &str = "device-d";
+        const ROLE_LOSS_LEASE_ID: &str = "lease-1";
+
+        struct RoleLossFixture {
+            action: RoleLossAction,
+            state: RoleLossOperationState,
+            worker_membership_generation: Option<i64>,
+        }
+
+        fn insert_role_loss_fixture(
+            sync_state: &ReplicaCoordinator,
+            fixture: &RoleLossFixture,
+        ) -> yadorilink_replica_domain::session_state::RoleLossOperation {
+            sync_state
+                .role_loss_operation_repository().insert_role_loss_operation(
+                    "op-1",
+                    ROLE_LOSS_GROUP_ID,
+                    RoleLossOperationParams {
+                        source_device_id: ROLE_LOSS_SOURCE_DEVICE_ID,
+                        target_device_id: ROLE_LOSS_TARGET_DEVICE_ID,
+                        lease_id: Some(ROLE_LOSS_LEASE_ID),
+                        action: fixture.action,
+                        local_path: Some(LOCAL_PATH),
+                        now_unix: 1,
+                    },
+                )
+                .unwrap();
+            if fixture.state != RoleLossOperationState::Prepared {
+                sync_state
+                    .role_loss_operation_repository().mark_role_loss_worker_committed(
+                        "op-1",
+                        fixture.worker_membership_generation.unwrap_or(4),
+                        1,
+                    )
+                    .unwrap();
+                if fixture.state != RoleLossOperationState::WorkerCommitted {
+                    sync_state.role_loss_operation_repository().advance_role_loss_operation("op-1", fixture.state, 1).unwrap();
+                }
+            }
+            sync_state.role_loss_operation_repository().get_role_loss_operation("op-1").unwrap().unwrap()
+        }
+
+        enum RoleLossRemote {
+            NotFound,
+            Unavailable(u16),
+            Found {
+                action: &'static str,
+                source_device_id: &'static str,
+                target_device_id: &'static str,
+                lease_id: Option<&'static str>,
+                membership_generation: i64,
+            },
+        }
+
+        impl RoleLossRemote {
+            fn exact() -> Self {
+                RoleLossRemote::Found {
+                    action: "demote",
+                    source_device_id: ROLE_LOSS_SOURCE_DEVICE_ID,
+                    target_device_id: ROLE_LOSS_TARGET_DEVICE_ID,
+                    lease_id: Some(ROLE_LOSS_LEASE_ID),
+                    membership_generation: 4,
+                }
+            }
+        }
+
+        fn role_loss_body(
+            action: &str,
+            source_device_id: &str,
+            target_device_id: &str,
+            lease_id: Option<&str>,
+            membership_generation: i64,
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "operationId": "op-1",
+                "groupId": ROLE_LOSS_GROUP_ID,
+                "sourceDeviceId": source_device_id,
+                "targetDeviceId": target_device_id,
+                "leaseId": lease_id,
+                "action": action,
+                "membershipGeneration": membership_generation,
+                "committedAt": 1,
+            })
+        }
+
+        fn role_loss_evidence(sync_state: &ReplicaCoordinator) -> LocalRecoveryEvidence {
+            local_recovery_evidence(sync_state, RecoveryDomain::RoleLoss, "op-1")
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum RoleLossLink {
+            Absent,
+            Exact,
+            GroupMismatch,
+        }
+
+        struct RoleLossCase {
+            label: &'static str,
+            fixture: RoleLossFixture,
+            link: RoleLossLink,
+            remote: RoleLossRemote,
+            expected: ExpectedDiagnosis,
+            expected_link_status: &'static str,
+            expected_remote_identity_status: &'static str,
+            expected_remote_identity_mismatch_fields: &'static [&'static str],
+        }
+
+        async fn run_role_loss_case(case: RoleLossCase) {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("index.sqlite3");
+
+            let sync_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
+            insert_role_loss_fixture(&sync_state, &case.fixture);
+            match case.link {
+                RoleLossLink::Absent => {}
+                RoleLossLink::Exact => {
+                    sync_state.link_repository().add_link(LOCAL_PATH, ROLE_LOSS_GROUP_ID).unwrap();
+                }
+                RoleLossLink::GroupMismatch => {
+                    sync_state.link_repository().add_link(LOCAL_PATH, "group-DIFFERENT").unwrap();
+                }
+            }
+            let sync_state = reopen(&db_path, sync_state);
+            let before = role_loss_evidence(&sync_state);
+
+            let server = MockServer::start().await;
+            let response = match &case.remote {
+                RoleLossRemote::NotFound => ResponseTemplate::new(404),
+                RoleLossRemote::Unavailable(status) => ResponseTemplate::new(*status),
+                RoleLossRemote::Found {
+                    action,
+                    source_device_id,
+                    target_device_id,
+                    lease_id,
+                    membership_generation,
+                } => {
+                    let body = role_loss_body(
+                        action,
+                        source_device_id,
+                        target_device_id,
+                        *lease_id,
+                        *membership_generation,
+                    );
+                    ResponseTemplate::new(200).set_body_json(body)
+                }
+            };
+            Mock::given(method("GET"))
+                .and(path("/devices/role-loss-operations/op-1"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let daemon_state = daemon_state_for(sync_state.clone());
+            daemon_state.set_coordination_client_config(server.uri(), "t".to_string());
+
+            let show = run_show_request(&daemon_state, RecoveryDomain::RoleLoss, "op-1").await;
+            let Some(yadorilink_ipc_proto::daemonctl::show_recovery_operation_response::Result::Diagnosed(diagnosis)) =
+                show.result
+            else {
+                panic!("[{}] expected Diagnosed, got {:?}", case.label, show.result);
+            };
+
+            assert_diagnosis(case.label, &diagnosis, &case.expected);
+            let op = diagnosis.operation.as_ref().unwrap();
+            assert_eq!(
+                op.action,
+                match case.fixture.action {
+                    RoleLossAction::Demote => "demote",
+                    RoleLossAction::Unlink => "unlink",
+                    RoleLossAction::Revoke => "revoke",
+                },
+                "[{}] action",
+                case.label
+            );
+            assert_eq!(op.state, case.fixture.state.as_db_str(), "[{}] local state", case.label);
+
+            let qualification = diagnosis.qualification.as_ref().unwrap();
+            let link = qualification.link.as_ref().unwrap();
+            assert_eq!(
+                link.status, case.expected_link_status,
+                "[{}] link qualification",
+                case.label
+            );
+            assert!(
+                qualification.pending_marker.is_none(),
+                "[{}] role-loss has no marker field",
+                case.label
+            );
+            let remote_identity = qualification.remote_identity.as_ref().unwrap();
+            assert_eq!(
+                remote_identity.status, case.expected_remote_identity_status,
+                "[{}] remote identity qualification",
+                case.label
+            );
+            assert_eq!(
+                remote_identity.mismatch_fields, case.expected_remote_identity_mismatch_fields,
+                "[{}] remote identity mismatch_fields",
+                case.label
+            );
+
+            let received = server.received_requests().await.unwrap();
+            assert_eq!(received.len(), 1, "[{}] Worker GET count", case.label);
+
+            let after = role_loss_evidence(&sync_state);
+            assert_eq!(before, after, "[{}] local recovery evidence must not change", case.label);
+        }
+
+        #[tokio::test]
+        async fn role_loss_prepared_record_not_found_continues_compensation() {
+            run_role_loss_case(RoleLossCase {
+                label: "RoleLoss/Prepared/RecordNotFound",
+                fixture: RoleLossFixture {
+                    action: RoleLossAction::Demote,
+                    state: RoleLossOperationState::Prepared,
+                    worker_membership_generation: None,
+                },
+                link: RoleLossLink::Absent,
+                remote: RoleLossRemote::NotFound,
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "role-loss",
+                    remote_state: "record_not_found".to_string(),
+                    recommendation: "continue_automatic_compensation",
+                    automatic_recovery_safe: true,
+                    reason_codes: &[
+                        "remote_record_not_found",
+                        "local_link_missing",
+                        "legacy_role_loss_receipt_uncertain",
+                        "role_loss_compensation_required",
+                    ],
+                },
+                expected_link_status: "confirmed_absent",
+                expected_remote_identity_status: "not_evaluated",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn role_loss_prepared_unavailable_continues_compensation() {
+            run_role_loss_case(RoleLossCase {
+                label: "RoleLoss/Prepared/Unavailable",
+                fixture: RoleLossFixture {
+                    action: RoleLossAction::Demote,
+                    state: RoleLossOperationState::Prepared,
+                    worker_membership_generation: None,
+                },
+                link: RoleLossLink::Exact,
+                remote: RoleLossRemote::Unavailable(500),
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "role-loss",
+                    remote_state: "unavailable".to_string(),
+                    recommendation: "continue_automatic_compensation",
+                    automatic_recovery_safe: true,
+                    reason_codes: &["remote_unavailable", "role_loss_compensation_required"],
+                },
+                expected_link_status: "exact",
+                expected_remote_identity_status: "not_evaluated",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn role_loss_worker_committed_with_receipt_continues_compensation() {
+            run_role_loss_case(RoleLossCase {
+                label: "RoleLoss/WorkerCommitted/Found",
+                fixture: RoleLossFixture {
+                    action: RoleLossAction::Demote,
+                    state: RoleLossOperationState::WorkerCommitted,
+                    worker_membership_generation: Some(4),
+                },
+                link: RoleLossLink::Exact,
+                remote: RoleLossRemote::exact(),
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "role-loss",
+                    remote_state: "role_loss_committed".to_string(),
+                    recommendation: "continue_automatic_compensation",
+                    automatic_recovery_safe: true,
+                    reason_codes: &[],
+                },
+                expected_link_status: "exact",
+                expected_remote_identity_status: "exact",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn role_loss_compensating_with_unavailable_remote_is_not_abandoned() {
+            run_role_loss_case(RoleLossCase {
+                label: "RoleLoss/Compensating/Unavailable",
+                fixture: RoleLossFixture {
+                    action: RoleLossAction::Demote,
+                    state: RoleLossOperationState::Compensating,
+                    worker_membership_generation: Some(4),
+                },
+                link: RoleLossLink::Exact,
+                remote: RoleLossRemote::Unavailable(500),
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "role-loss",
+                    remote_state: "unavailable".to_string(),
+                    recommendation: "continue_automatic_compensation",
+                    automatic_recovery_safe: true,
+                    reason_codes: &["remote_unavailable", "role_loss_compensation_required"],
+                },
+                expected_link_status: "exact",
+                expected_remote_identity_status: "not_evaluated",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        /// Local link ABSENT never stops compensation -- see this section's
+        /// own doc comment. The reason code still records it.
+        #[tokio::test]
+        async fn role_loss_worker_committed_with_local_link_absent_still_continues_compensation() {
+            run_role_loss_case(RoleLossCase {
+                label: "RoleLoss/WorkerCommitted/LinkAbsent",
+                fixture: RoleLossFixture {
+                    action: RoleLossAction::Demote,
+                    state: RoleLossOperationState::WorkerCommitted,
+                    worker_membership_generation: Some(4),
+                },
+                link: RoleLossLink::Absent,
+                remote: RoleLossRemote::exact(),
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "role-loss",
+                    remote_state: "role_loss_committed".to_string(),
+                    recommendation: "continue_automatic_compensation",
+                    automatic_recovery_safe: true,
+                    reason_codes: &["local_link_missing"],
+                },
+                expected_link_status: "confirmed_absent",
+                expected_remote_identity_status: "exact",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        /// Local link MISMATCH (present, wrong group) also never stops
+        /// compensation -- distinguishing this from Enrollment/Membership's
+        /// own local-identity-mismatch handling is exactly the point.
+        #[tokio::test]
+        async fn role_loss_worker_committed_with_local_link_mismatch_still_continues_compensation()
+        {
+            run_role_loss_case(RoleLossCase {
+                label: "RoleLoss/WorkerCommitted/LinkMismatch",
+                fixture: RoleLossFixture {
+                    action: RoleLossAction::Demote,
+                    state: RoleLossOperationState::WorkerCommitted,
+                    worker_membership_generation: Some(4),
+                },
+                link: RoleLossLink::GroupMismatch,
+                remote: RoleLossRemote::exact(),
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "role-loss",
+                    remote_state: "role_loss_committed".to_string(),
+                    recommendation: "continue_automatic_compensation",
+                    automatic_recovery_safe: true,
+                    reason_codes: &["local_link_identity_mismatch"],
+                },
+                expected_link_status: "mismatch",
+                expected_remote_identity_status: "exact",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn role_loss_remote_identity_mismatch_is_conflict() {
+            run_role_loss_case(RoleLossCase {
+                label: "RoleLoss/IdentityMismatch",
+                fixture: RoleLossFixture {
+                    action: RoleLossAction::Demote,
+                    state: RoleLossOperationState::WorkerCommitted,
+                    worker_membership_generation: Some(4),
+                },
+                link: RoleLossLink::Exact,
+                remote: RoleLossRemote::Found {
+                    action: "demote",
+                    source_device_id: "device-DIFFERENT",
+                    target_device_id: ROLE_LOSS_TARGET_DEVICE_ID,
+                    lease_id: Some(ROLE_LOSS_LEASE_ID),
+                    membership_generation: 4,
+                },
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "role-loss",
+                    remote_state: "role_loss_committed".to_string(),
+                    recommendation: "conflict",
+                    automatic_recovery_safe: false,
+                    reason_codes: &["remote_identity_mismatch"],
+                },
+                expected_link_status: "exact",
+                expected_remote_identity_status: "mismatch",
+                expected_remote_identity_mismatch_fields: &["source_device_id"],
+            })
+            .await;
+        }
+
+        /// The classifier's OWN generation check -- distinct from the B1
+        /// identity comparison above (which never even looks at
+        /// `membership_generation`): a receipt whose generation disagrees
+        /// with what this device already confirmed is a genuine conflict,
+        /// never trusted as this operation's own success.
+        #[tokio::test]
+        async fn role_loss_membership_generation_mismatch_is_conflict() {
+            run_role_loss_case(RoleLossCase {
+                label: "RoleLoss/GenerationMismatch",
+                fixture: RoleLossFixture {
+                    action: RoleLossAction::Demote,
+                    state: RoleLossOperationState::WorkerCommitted,
+                    worker_membership_generation: Some(2),
+                },
+                link: RoleLossLink::Exact,
+                remote: RoleLossRemote::Found {
+                    action: "demote",
+                    source_device_id: ROLE_LOSS_SOURCE_DEVICE_ID,
+                    target_device_id: ROLE_LOSS_TARGET_DEVICE_ID,
+                    lease_id: Some(ROLE_LOSS_LEASE_ID),
+                    membership_generation: 99,
+                },
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "role-loss",
+                    remote_state: "role_loss_committed".to_string(),
+                    recommendation: "conflict",
+                    automatic_recovery_safe: false,
+                    reason_codes: &["remote_result_conflict"],
+                },
+                expected_link_status: "exact",
+                expected_remote_identity_status: "exact",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn role_loss_local_committed_terminal_crash_window_row_settles() {
+            run_role_loss_case(RoleLossCase {
+                label: "RoleLoss/LocalCommitted",
+                fixture: RoleLossFixture {
+                    action: RoleLossAction::Demote,
+                    state: RoleLossOperationState::LocalCommitted,
+                    worker_membership_generation: Some(4),
+                },
+                link: RoleLossLink::Exact,
+                remote: RoleLossRemote::exact(),
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "role-loss",
+                    remote_state: "role_loss_committed".to_string(),
+                    recommendation: "complete_local_settlement",
+                    automatic_recovery_safe: true,
+                    reason_codes: &[],
+                },
+                expected_link_status: "exact",
+                expected_remote_identity_status: "exact",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn role_loss_completed_terminal_crash_window_row_settles() {
+            run_role_loss_case(RoleLossCase {
+                label: "RoleLoss/Completed",
+                fixture: RoleLossFixture {
+                    action: RoleLossAction::Demote,
+                    state: RoleLossOperationState::Completed,
+                    worker_membership_generation: Some(4),
+                },
+                link: RoleLossLink::Exact,
+                remote: RoleLossRemote::exact(),
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "role-loss",
+                    remote_state: "role_loss_committed".to_string(),
+                    recommendation: "complete_local_settlement",
+                    automatic_recovery_safe: true,
+                    reason_codes: &[],
+                },
+                expected_link_status: "exact",
+                expected_remote_identity_status: "exact",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn role_loss_unlink_action_maps_to_wire_demote_and_continues_compensation() {
+            run_role_loss_case(RoleLossCase {
+                label: "RoleLoss/Unlink",
+                fixture: RoleLossFixture {
+                    action: RoleLossAction::Unlink,
+                    state: RoleLossOperationState::Prepared,
+                    worker_membership_generation: None,
+                },
+                link: RoleLossLink::Exact,
+                remote: RoleLossRemote::NotFound,
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "role-loss",
+                    remote_state: "record_not_found".to_string(),
+                    recommendation: "continue_automatic_compensation",
+                    automatic_recovery_safe: true,
+                    reason_codes: &[
+                        "remote_record_not_found",
+                        "legacy_role_loss_receipt_uncertain",
+                        "role_loss_compensation_required",
+                    ],
+                },
+                expected_link_status: "exact",
+                expected_remote_identity_status: "not_evaluated",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        /// `Revoke` is reserved and never written by production role-loss
+        /// code (only `Demote`/`Unlink` are) -- a fail-closed negative case,
+        /// not a claim this shape occurs in real operation. Wins over
+        /// everything else, checked before even the remote identity
+        /// comparison.
+        #[tokio::test]
+        async fn role_loss_reserved_revoke_action_is_fail_closed_manual_investigation() {
+            run_role_loss_case(RoleLossCase {
+                label: "RoleLoss/ReservedRevoke",
+                fixture: RoleLossFixture {
+                    action: RoleLossAction::Revoke,
+                    state: RoleLossOperationState::Prepared,
+                    worker_membership_generation: None,
+                },
+                link: RoleLossLink::Exact,
+                remote: RoleLossRemote::NotFound,
+                expected: ExpectedDiagnosis {
+                    operation_id: "op-1",
+                    domain: "role-loss",
+                    remote_state: "record_not_found".to_string(),
+                    recommendation: "manual_investigation",
+                    automatic_recovery_safe: false,
+                    reason_codes: &["unsupported_role_loss_action"],
+                },
+                expected_link_status: "exact",
+                expected_remote_identity_status: "not_evaluated",
+                expected_remote_identity_mismatch_fields: &[],
+            })
+            .await;
+        }
+
+        /// A malformed journal row is a typed `invalid` wire outcome
+        /// observed BEFORE any remote lookup.
+        #[tokio::test]
+        async fn role_loss_malformed_row_is_a_typed_invalid_outcome_before_any_lookup() {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("index.sqlite3");
+            let sync_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
+            sync_state.plant_malformed_role_loss_operation_for_test("op-1").unwrap();
+            let sync_state = reopen(&db_path, sync_state);
+
+            let daemon_state = daemon_state_for(sync_state.clone());
+            daemon_state
+                .set_coordination_client_config("http://127.0.0.1:1".to_string(), "t".to_string());
+
+            let show = run_show_request(&daemon_state, RecoveryDomain::RoleLoss, "op-1").await;
+            assert!(
+                matches!(
+                    show.result,
+                    Some(yadorilink_ipc_proto::daemonctl::show_recovery_operation_response::Result::Invalid(_))
+                ),
+                "expected Result::Invalid, got {:?}",
+                show.result
+            );
+        }
+
+        /// A real IPC race for Role-loss, through `handle_request` end to
+        /// end, using the same genuine two-way barrier as the Enrollment
+        /// and Membership races.
+        #[tokio::test]
+        async fn role_loss_concurrent_local_mutation_during_remote_lookup_is_local_evidence_changed_on_the_wire(
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("index.sqlite3");
+
+            let sync_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
+            insert_role_loss_fixture(
+                &sync_state,
+                &RoleLossFixture {
+                    action: RoleLossAction::Demote,
+                    state: RoleLossOperationState::WorkerCommitted,
+                    worker_membership_generation: Some(4),
+                },
+            );
+            sync_state.link_repository().add_link(LOCAL_PATH, ROLE_LOSS_GROUP_ID).unwrap();
+            let sync_state = reopen(&db_path, sync_state);
+
+            let body = role_loss_body(
+                "demote",
+                ROLE_LOSS_SOURCE_DEVICE_ID,
+                ROLE_LOSS_TARGET_DEVICE_ID,
+                Some(ROLE_LOSS_LEASE_ID),
+                4,
+            );
+            let server = HeldResponseServer::start(
+                "GET",
+                "/devices/role-loss-operations/op-1".to_string(),
+                body,
+            )
+            .await;
+
+            let daemon_state = daemon_state_for(sync_state.clone());
+            daemon_state.set_coordination_client_config(server.base_url.clone(), "t".to_string());
+
+            let mutator_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
+
+            let daemon_state_task = daemon_state.clone();
+            let handle = tokio::spawn(async move {
+                run_show_request(&daemon_state_task, RecoveryDomain::RoleLoss, "op-1").await
+            });
+
+            server.request_received.notified().await;
+            mutator_state
+                .role_loss_operation_repository().advance_role_loss_operation("op-1", RoleLossOperationState::Compensating, 2)
+                .unwrap();
+            server.release_response.notify_one();
+
+            let show = handle.await.unwrap();
+            match show.result {
+                Some(
+                    yadorilink_ipc_proto::daemonctl::show_recovery_operation_response::Result::LocalEvidenceChanged(
+                        changed,
+                    ),
+                ) => {
+                    let key = changed.key.unwrap();
+                    assert_eq!(key.domain, "role-loss");
+                    assert_eq!(key.operation_id, "op-1");
+                }
+                other => panic!("expected LocalEvidenceChanged, got {other:?}"),
+            }
+
+            assert_eq!(server.request_count(), 1, "exactly one Worker GET, no automatic retry");
+            server.assert_clean("RoleLoss race");
+        }
     }
 }

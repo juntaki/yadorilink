@@ -409,6 +409,19 @@ impl PeerChannel {
         self.outbound_tx.send(payload.into()).await.map_err(|_| TransportError::ChannelClosed)
     }
 
+    /// Non-blocking counterpart to [`Self::send`]: never awaits the outbound
+    /// queue having room, so a caller on a hot admission-control path (a
+    /// bulk rejection reply, for example) cannot itself become an unbounded
+    /// resource by spawning one task per rejection that then blocks on a
+    /// stalled/backed-up peer forever. Returns `false` (never panics or
+    /// blocks) both when the queue is momentarily full and when the peer's
+    /// send loop is already gone — the caller's own reply is best-effort
+    /// either way, since the requester's bounded retry loop is what
+    /// actually recovers from a dropped reply, not this method succeeding.
+    pub fn try_send(&self, payload: impl Into<Bytes>) -> bool {
+        self.outbound_tx.try_send(payload.into()).is_ok()
+    }
+
     pub async fn recv(&self) -> Option<Vec<u8>> {
         self.inbound_rx.lock().await.recv().await
     }

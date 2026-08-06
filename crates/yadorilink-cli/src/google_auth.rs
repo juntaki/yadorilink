@@ -10,18 +10,18 @@
 //! secret if the selected client type requires one:
 //!
 //! - Desktop: this crate still opens the browser to Google's consent screen
-//!  and receives the authorization code on a loopback listener (unchanged
-//!  from the prior design), but hands that code + PKCE verifier to
-//!  coordination-worker's `POST /auth/google/desktop/exchange`, which
-//!  returns a YadoriLink session directly. This crate never performs the
-//!  code-for-token exchange itself and never sees a Google ID token for
-//!  this flow.
+//!   and receives the authorization code on a loopback listener (unchanged
+//!   from the prior design), but hands that code + PKCE verifier to
+//!   coordination-worker's `POST /auth/google/desktop/exchange`, which
+//!   returns a YadoriLink session directly. This crate never performs the
+//!   code-for-token exchange itself and never sees a Google ID token for
+//!   this flow.
 //! - CLI: this crate never talks to Google at all. `login_via_device_grant`
-//!  only calls coordination-worker's `POST /auth/google/device/start` and
-//!  `POST /auth/google/device/poll`, which proxy Google's Device
-//!  Authorization Grant server-side
-//!  (coordination-worker/src/auth/google-broker.ts), including the RFC
-//!  8628 `authorization_pending`/`slow_down` polling/backoff handling.
+//!   only calls coordination-worker's `POST /auth/google/device/start` and
+//!   `POST /auth/google/device/poll`, which proxy Google's Device
+//!   Authorization Grant server-side
+//!   (coordination-worker/src/auth/google-broker.ts), including the RFC
+//!   8628 `authorization_pending`/`slow_down` polling/backoff handling.
 
 use oauth2::basic::BasicClient;
 use oauth2::{

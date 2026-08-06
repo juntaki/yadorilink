@@ -22,16 +22,15 @@ mod unix_socket_tests {
         SyncState as ShellSyncState,
     };
     use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_sync_core::index::SyncState;
-    use yadorilink_sync_core::types::FileRecord;
-    use yadorilink_sync_core::version_vector::VersionVector;
+    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+    use yadorilink_replica_domain::file::FileRecord;
 
     async fn start_daemon() -> (std::path::PathBuf, Arc<DaemonState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
-        let sync_state = Arc::new(SyncState::open(dir.path().join("sync.sqlite3")).unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
         sync_state
-            .add_link(dir.path().join("photos").to_string_lossy().as_ref(), "group-1")
+            .link_repository().add_link(dir.path().join("photos").to_string_lossy().as_ref(), "group-1")
             .unwrap();
         std::fs::create_dir_all(dir.path().join("photos")).unwrap();
 
@@ -52,17 +51,17 @@ mod unix_socket_tests {
     async fn status_query_reflects_indexed_file() {
         let (socket_path, state, dir) = start_daemon().await;
         state
-            .sync_state
-            .upsert_file(
+            .replica_coordinator
+            .file_index_repository().upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "vacation.jpg".into(),
                     size: 1,
                     mtime_unix_nanos: 0,
-                    version: VersionVector::new(),
                     blocks: vec![],
                     deleted: false,
                 },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
 
@@ -102,9 +101,9 @@ mod unix_socket_tests {
         // spawned connection handler a moment to reach its subscribe call.
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        // Simulate a local change being indexed, as `link_manager` would do.
+        // Simulate a local change being indexed, as the daemon's own link-runtime tasks would do.
         let absolute_path = dir.path().join("photos/new.jpg").to_string_lossy().to_string();
-        let _ = state.status_push_tx.send(yadorilink_ipc_proto::shellipc::StatusPush {
+        state.telemetry.push_status(yadorilink_ipc_proto::shellipc::StatusPush {
             path: absolute_path.clone(),
             state: ShellSyncState::Synced as i32,
             materialization_state: yadorilink_ipc_proto::shellipc::MaterializationState::Hydrated
@@ -161,17 +160,17 @@ mod unix_socket_tests {
     async fn pin_item_context_action_pins_an_already_hydrated_file() {
         let (socket_path, state, dir) = start_daemon().await;
         state
-            .sync_state
-            .upsert_file(
+            .replica_coordinator
+            .file_index_repository().upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "vacation.jpg".into(),
                     size: 5,
                     mtime_unix_nanos: 0,
-                    version: VersionVector::new(),
                     blocks: vec![],
                     deleted: false,
                 },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
 
@@ -194,7 +193,7 @@ mod unix_socket_tests {
             panic!("expected a ContextActionResponse")
         };
         assert!(r.ok);
-        assert!(state.sync_state.is_pinned("group-1", "vacation.jpg").unwrap());
+        assert!(state.replica_coordinator.file_index_repository().is_pinned("group-1", "vacation.jpg").unwrap());
     }
 
     /// Evicting an unpinned, hydrated file via the shell extension's
@@ -202,26 +201,67 @@ mod unix_socket_tests {
     #[tokio::test]
     async fn evict_item_context_action_turns_a_hydrated_file_into_a_placeholder() {
         let (socket_path, state, dir) = start_daemon().await;
+        // This test is about the eviction gate's own success path, not the
+        // on-demand pipeline's real-vs-fake state, so unconditionally
+        // connect the fake here. See `DaemonState::
+        // set_test_placeholder_pipeline_connected`'s own doc comment for why
+        // a daemon integration test needs this instead of the production
+        // probe (unconditionally `false`) or the free function's
+        // thread-local `OverrideForTest` (unreliable across this
+        // multi-threaded runtime).
+        state.set_test_placeholder_pipeline_connected(true);
+        // `start_daemon` above only registers the link row in the
+        // repository, never a real `LinkRuntimeController::start`/watcher,
+        // so `hydration::evict`'s own `root_lease_for` lookup (which
+        // resolves through the live runtime registry) has nothing to find.
+        // See `install_test_root_commit_authority`'s own doc comment (same
+        // pattern used by `multi_peer_hydration.rs` for the same reason).
+        state.install_test_root_commit_authority("group-1");
+        // `start_daemon` only registers the link row in the repository
+        // directly, never adopting a real root identity token the way the
+        // control-socket `Link` handler does -- without this, the
+        // materialization write path's own `VerifiedRoot::verify` fails
+        // with "the link has no previously-adopted root token" once it's
+        // reached (which it now is, since the two gates above no longer
+        // short-circuit first). See `multi_peer_hydration.rs`'s own
+        // `seed_placeholder` for the identical pattern and its doc comment
+        // on why this must happen before any index row exists for the
+        // group.
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &dir.path().join("photos"),
+            "group-1",
+            state.replica_coordinator.as_ref(),
+        )
+        .unwrap();
         let content = vec![7u8; 500];
         std::fs::write(dir.path().join("photos/notes.txt"), &content).unwrap();
-        let mut version = VersionVector::new();
-        version.increment("device-a");
+        // The block hash must be real, not a placeholder: `evict_file`
+        // verifies on-disk bytes against indexed blocks before reclaiming
+        // anything, so a hash that cannot possibly match this file's real
+        // content makes eviction silently bail out as "changed" (`Ok`, but
+        // nothing evicted) rather than actually evicting it -- see
+        // `control_socket.rs`'s own `evict_via_control_socket_succeeds_for_
+        // an_indexed_hydrated_file` for the identical pattern.
+        let hash = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&content).to_vec()
+        };
         state
-            .sync_state
-            .upsert_file(
+            .replica_coordinator
+            .file_index_repository().upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "notes.txt".into(),
                     size: 500,
                     mtime_unix_nanos: 0,
-                    version,
-                    blocks: vec![yadorilink_sync_core::types::BlockInfo {
-                        hash: vec![0x22u8; 32],
+                    blocks: vec![yadorilink_replica_domain::file::BlockInfo {
+                        hash,
                         offset: 0,
                         size: 500,
                     }],
                     deleted: false,
                 },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
 
@@ -245,8 +285,8 @@ mod unix_socket_tests {
         };
         assert!(r.ok);
         assert_eq!(
-            state.sync_state.get_materialization_state("group-1", "notes.txt").unwrap(),
-            Some(yadorilink_sync_core::types::MaterializationState::Placeholder)
+            state.replica_coordinator.materialization_state_repository().get_materialization_state("group-1", "notes.txt").unwrap(),
+            Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder)
         );
         assert_ne!(std::fs::read(dir.path().join("photos/notes.txt")).unwrap(), content);
     }
@@ -271,32 +311,31 @@ mod unix_socket_tests {
     #[tokio::test]
     async fn hydrate_request_for_unreachable_placeholder_returns_an_error() {
         let (socket_path, state, dir) = start_daemon().await;
-        let mut version = VersionVector::new();
-        version.increment("device-b");
         state
-            .sync_state
-            .upsert_file(
+            .replica_coordinator
+            .file_index_repository().upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "big.zip".into(),
                     size: 100,
                     mtime_unix_nanos: 0,
-                    version,
-                    blocks: vec![yadorilink_sync_core::types::BlockInfo {
+                    blocks: vec![yadorilink_replica_domain::file::BlockInfo {
                         hash: vec![0xABu8; 32],
                         offset: 0,
                         size: 100,
                     }],
                     deleted: false,
                 },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
         state
-            .sync_state
-            .set_materialization_state(
+            .replica_coordinator
+            .materialization_state_repository().set_materialization_state(
                 "group-1",
                 "big.zip",
-                yadorilink_sync_core::types::MaterializationState::Placeholder,
+                yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
 
@@ -329,17 +368,17 @@ mod unix_socket_tests {
     async fn status_query_reports_materialization_state() {
         let (socket_path, state, dir) = start_daemon().await;
         state
-            .sync_state
-            .upsert_file(
+            .replica_coordinator
+            .file_index_repository().upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "vacation.jpg".into(),
                     size: 1,
                     mtime_unix_nanos: 0,
-                    version: VersionVector::new(),
                     blocks: vec![],
                     deleted: false,
                 },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
 
@@ -378,9 +417,8 @@ mod windows_pipe_tests {
         HydrateRequest, ShellIpcMessage, SyncState as ShellSyncState,
     };
     use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_sync_core::index::SyncState;
-    use yadorilink_sync_core::types::FileRecord;
-    use yadorilink_sync_core::version_vector::VersionVector;
+    use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+    use yadorilink_replica_domain::file::FileRecord;
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -392,7 +430,7 @@ mod windows_pipe_tests {
     async fn start_daemon() -> (String, Arc<DaemonState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
-        let sync_state = Arc::new(SyncState::open(dir.path().join("sync.sqlite3")).unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
         sync_state
             .add_link(dir.path().join("photos").to_string_lossy().as_ref(), "group-1")
             .unwrap();
@@ -418,17 +456,17 @@ mod windows_pipe_tests {
     async fn status_query_reflects_indexed_file_over_named_pipe() {
         let (pipe_name, state, dir) = start_daemon().await;
         state
-            .sync_state
+            .replica_coordinator
             .upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "vacation.jpg".into(),
                     size: 1,
                     mtime_unix_nanos: 0,
-                    version: VersionVector::new(),
                     blocks: vec![],
                     deleted: false,
                 },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
 
@@ -468,7 +506,7 @@ mod windows_pipe_tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         let absolute_path = dir.path().join("photos/new.jpg").to_string_lossy().to_string();
-        let _ = state.status_push_tx.send(yadorilink_ipc_proto::shellipc::StatusPush {
+        state.telemetry.push_status(yadorilink_ipc_proto::shellipc::StatusPush {
             path: absolute_path.clone(),
             state: ShellSyncState::Synced as i32,
             materialization_state: yadorilink_ipc_proto::shellipc::MaterializationState::Hydrated
@@ -496,32 +534,31 @@ mod windows_pipe_tests {
     #[tokio::test]
     async fn hydrate_request_for_unreachable_placeholder_returns_an_error_over_named_pipe() {
         let (pipe_name, state, dir) = start_daemon().await;
-        let mut version = VersionVector::new();
-        version.increment("device-b");
         state
-            .sync_state
+            .replica_coordinator
             .upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "big.zip".into(),
                     size: 100,
                     mtime_unix_nanos: 0,
-                    version,
-                    blocks: vec![yadorilink_sync_core::types::BlockInfo {
+                    blocks: vec![yadorilink_replica_domain::file::BlockInfo {
                         hash: vec![0xABu8; 32],
                         offset: 0,
                         size: 100,
                     }],
                     deleted: false,
                 },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
         state
-            .sync_state
+            .replica_coordinator
             .set_materialization_state(
                 "group-1",
                 "big.zip",
-                yadorilink_sync_core::types::MaterializationState::Placeholder,
+                yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
 
@@ -557,17 +594,17 @@ mod windows_pipe_tests {
     async fn two_concurrent_clients_are_both_served() {
         let (pipe_name, state, dir) = start_daemon().await;
         state
-            .sync_state
+            .replica_coordinator
             .upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "vacation.jpg".into(),
                     size: 1,
                     mtime_unix_nanos: 0,
-                    version: VersionVector::new(),
                     blocks: vec![],
                     deleted: false,
                 },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
 

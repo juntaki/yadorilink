@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use yadorilink_ipc_proto::shellipc::SyncState as ShellSyncState;
 
-use crate::daemon_state::DaemonState;
+use crate::replica_coordinator::ReplicaCoordinator;
 
 /// Canonicalizes `path`, falling back to canonicalizing its parent
 /// directory (and rejoining the file name) if `path` itself doesn't exist
@@ -39,7 +39,7 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
 /// looks like `/var/...`), while a stored `local_path` may still be in
 /// whatever form it was linked with.
 pub fn resolve_group_and_rel_path(
-    state: &DaemonState,
+    sync_state: &ReplicaCoordinator,
     absolute_path: &str,
 ) -> Option<(String, String)> {
     let canonical_query = canonicalize_best_effort(Path::new(absolute_path));
@@ -48,11 +48,11 @@ pub fn resolve_group_and_rel_path(
     // synced path" (no overlay), which is the safe direction here. Surfaced
     // rather than silently collapsed -- the same shape on a write path would be
     // a data-loss bug, so it must never look routine.
-    let links = state.sync_state.list_links().unwrap_or_else(|e| {
+    let links = sync_state.link_repository().list_links().unwrap_or_else(|e| {
         tracing::warn!(error = %e, "cannot read link table; shell overlay will show no synced paths");
         Vec::new()
     });
-    let mut matches: Vec<(&yadorilink_sync_core::index::FolderLink, PathBuf)> = links
+    let mut matches: Vec<(&yadorilink_replica_domain::session_state::FolderLink, PathBuf)> = links
         .iter()
         .filter(|l| !l.orphaned)
         .map(|l| (l, canonicalize_best_effort(Path::new(&l.local_path))))
@@ -61,11 +61,7 @@ pub fn resolve_group_and_rel_path(
     matches.sort_by_key(|(_, root)| std::cmp::Reverse(root.components().count()));
     let (link, canonical_root) = matches.first()?;
     let best_depth = canonical_root.components().count();
-    if matches
-        .iter()
-        .skip(1)
-        .any(|(_, root)| root.components().count() == best_depth)
-    {
+    if matches.iter().skip(1).any(|(_, root)| root.components().count() == best_depth) {
         tracing::warn!(
             absolute_path,
             "path resolves equally well to multiple linked roots; refusing to choose a sync group"
@@ -78,12 +74,12 @@ pub fn resolve_group_and_rel_path(
     Some((link.group_id.clone(), rel_path))
 }
 
-pub fn resolve_status(state: &DaemonState, absolute_path: &str) -> ShellSyncState {
-    let Some((group_id, rel_path)) = resolve_group_and_rel_path(state, absolute_path) else {
+pub fn resolve_status(sync_state: &ReplicaCoordinator, absolute_path: &str) -> ShellSyncState {
+    let Some((group_id, rel_path)) = resolve_group_and_rel_path(sync_state, absolute_path) else {
         return ShellSyncState::Unspecified;
     };
 
-    match state.sync_state.get_file(&group_id, &rel_path) {
+    match sync_state.file_index_repository().get_file(&group_id, &rel_path) {
         Ok(Some(record)) if record.deleted => ShellSyncState::Unspecified,
         Ok(Some(record)) if record.path.contains("(conflicted copy") => ShellSyncState::Error,
         Ok(Some(_)) => ShellSyncState::Synced,
@@ -101,11 +97,11 @@ pub fn resolve_status(state: &DaemonState, absolute_path: &str) -> ShellSyncStat
 /// indexed at all (e.g. an `Eager` folder's files are always `Hydrated`
 /// in practice, but report `None` rather than a state if never indexed).
 pub fn resolve_materialization_state(
-    state: &DaemonState,
+    sync_state: &ReplicaCoordinator,
     absolute_path: &str,
-) -> Option<yadorilink_sync_core::types::MaterializationState> {
-    let (group_id, rel_path) = resolve_group_and_rel_path(state, absolute_path)?;
-    state.sync_state.get_materialization_state(&group_id, &rel_path).ok().flatten()
+) -> Option<yadorilink_replica_domain::session_state::MaterializationState> {
+    let (group_id, rel_path) = resolve_group_and_rel_path(sync_state, absolute_path)?;
+    sync_state.materialization_state_repository().get_materialization_state(&group_id, &rel_path).ok().flatten()
 }
 
 #[cfg(test)]
@@ -113,15 +109,16 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_sync_core::types::FileRecord;
-    use yadorilink_sync_core::version_vector::VersionVector;
+    use yadorilink_replica_domain::file::FileRecord;
+
+    use crate::daemon_state::DaemonState;
 
     fn state_with_link(local_path: &str, group_id: &str) -> Arc<DaemonState> {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
         let sync_state =
-            Arc::new(yadorilink_sync_core::index::SyncState::open_in_memory().unwrap());
-        sync_state.add_link(local_path, group_id).unwrap();
+            Arc::new(crate::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap());
+        sync_state.link_repository().add_link(local_path, group_id).unwrap();
         DaemonState::new("device-a".into(), sync_state, store)
     }
 
@@ -129,7 +126,7 @@ mod tests {
     async fn path_outside_any_link_is_unspecified() {
         let state = state_with_link("/home/alice/Photos", "group-1");
         assert_eq!(
-            resolve_status(&state, "/home/alice/Downloads/file.txt"),
+            resolve_status(&state.replica_coordinator, "/home/alice/Downloads/file.txt"),
             ShellSyncState::Unspecified
         );
     }
@@ -137,22 +134,23 @@ mod tests {
     #[tokio::test]
     async fn indexed_file_is_synced() {
         let state = state_with_link("/home/alice/Photos", "group-1");
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         state
-            .sync_state
-            .upsert_file(
+            .replica_coordinator
+            .file_index_repository().upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "vacation.jpg".into(),
                     size: 10,
                     mtime_unix_nanos: 0,
-                    version: VersionVector::new(),
                     blocks: vec![],
                     deleted: false,
                 },
+                &permit,
             )
             .unwrap();
         assert_eq!(
-            resolve_status(&state, "/home/alice/Photos/vacation.jpg"),
+            resolve_status(&state.replica_coordinator, "/home/alice/Photos/vacation.jpg"),
             ShellSyncState::Synced
         );
     }
@@ -161,7 +159,7 @@ mod tests {
     async fn unindexed_file_under_link_is_pending() {
         let state = state_with_link("/home/alice/Photos", "group-1");
         assert_eq!(
-            resolve_status(&state, "/home/alice/Photos/brand-new.jpg"),
+            resolve_status(&state.replica_coordinator, "/home/alice/Photos/brand-new.jpg"),
             ShellSyncState::Pending
         );
     }
@@ -169,23 +167,24 @@ mod tests {
     #[tokio::test]
     async fn conflicted_copy_is_error() {
         let state = state_with_link("/home/alice/Photos", "group-1");
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         state
-            .sync_state
-            .upsert_file(
+            .replica_coordinator
+            .file_index_repository().upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "shared (conflicted copy, 2026-01-01-000000, device-b).txt".into(),
                     size: 10,
                     mtime_unix_nanos: 0,
-                    version: VersionVector::new(),
                     blocks: vec![],
                     deleted: false,
                 },
+                &permit,
             )
             .unwrap();
         assert_eq!(
             resolve_status(
-                &state,
+                &state.replica_coordinator,
                 "/home/alice/Photos/shared (conflicted copy, 2026-01-01-000000, device-b).txt"
             ),
             ShellSyncState::Error
@@ -204,15 +203,13 @@ mod tests {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
         let sync_state =
-            Arc::new(yadorilink_sync_core::index::SyncState::open_in_memory().unwrap());
-        sync_state
-            .add_link(&parent.path().to_string_lossy(), "parent-group")
-            .unwrap();
-        sync_state.add_link(&child.to_string_lossy(), "child-group").unwrap();
+            Arc::new(crate::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap());
+        sync_state.link_repository().add_link(&parent.path().to_string_lossy(), "parent-group").unwrap();
+        sync_state.link_repository().add_link(&child.to_string_lossy(), "child-group").unwrap();
         let state = DaemonState::new("device-a".into(), sync_state, store);
 
         let query = child.join("file.txt").to_string_lossy().to_string();
-        let (group, rel) = resolve_group_and_rel_path(&state, &query)
+        let (group, rel) = resolve_group_and_rel_path(&state.replica_coordinator, &query)
             .expect("a path under the nested child link must resolve");
         assert_eq!(group, "child-group");
         assert_eq!(rel, "file.txt");
@@ -221,29 +218,31 @@ mod tests {
     #[tokio::test]
     async fn orphaned_link_resolves_to_no_status() {
         let state = state_with_link("/home/alice/Photos", "group-1");
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         state
-            .sync_state
-            .upsert_file(
+            .replica_coordinator
+            .file_index_repository().upsert_file(
                 "group-1",
                 &FileRecord {
                     path: "vacation.jpg".into(),
                     size: 10,
                     mtime_unix_nanos: 0,
-                    version: VersionVector::new(),
                     blocks: vec![],
                     deleted: false,
                 },
+                &permit,
             )
             .unwrap();
-        state.sync_state.mark_link_orphaned("/home/alice/Photos").unwrap();
+        state.replica_coordinator.link_repository().mark_link_orphaned("/home/alice/Photos").unwrap();
 
         assert_eq!(
-            resolve_status(&state, "/home/alice/Photos/vacation.jpg"),
+            resolve_status(&state.replica_coordinator, "/home/alice/Photos/vacation.jpg"),
             ShellSyncState::Unspecified,
             "an orphaned link's files must not report a live sync status"
         );
         assert!(
-            resolve_group_and_rel_path(&state, "/home/alice/Photos/vacation.jpg").is_none(),
+            resolve_group_and_rel_path(&state.replica_coordinator, "/home/alice/Photos/vacation.jpg")
+                .is_none(),
             "an orphaned link must not resolve for the shell-IPC hydrate/pin/unpin/evict path \
              either"
         );

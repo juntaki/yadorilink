@@ -1,18 +1,25 @@
 //! Shared report schema, redaction, consent, and queue types for
-//! YadoriLink's opt-in OSS usage/error reporting. This crate holds
-//! only the shared shape and safety logic — actual persistence (config
-//! storage, the on-disk queue) lives in `yadorilink-daemon`, and the
-//! optional HTTPS submission client is a separate concern layered on
-//! top of `schema::ReportEnvelope`.
+//! YadoriLink's opt-in OSS usage/error reporting, plus the
+//! `local_store` module's plain filesystem-JSON persistence for the
+//! consent state and error-candidate store. The optional HTTPS
+//! submission client is a separate concern layered on top of
+//! `schema::ReportEnvelope`.
 //!
 //! `schema`, `consent`, `queue`, `redact`, and `builder` deliberately
 //! depend on nothing daemon/CLI-specific (no `tokio`, no filesystem
 //! access, no clock): every function there is a pure transformation
 //! over caller-supplied data, which is what makes the privacy
 //! properties in `redact` and `schema::ReportEnvelope::validate`
-//! testable in isolation.
+//! testable in isolation. `local_store` is the one exception among the
+//! non-`submission` modules — it does real filesystem I/O — but it has
+//! no daemon-specific coupling either, which is why it lives here rather
+//! than in `yadorilink-daemon`: both the CLI and the daemon can use it
+//! directly. The on-disk submission *queue* and usage *counters* still
+//! live in `yadorilink-daemon` (they're entangled with daemon-specific
+//! counting and scheduling), reusing `local_store::entry_store` as their
+//! storage engine.
 //!
-//! `submission` is the one exception: it's the optional HTTPS
+//! `submission` is the other exception: it's the optional HTTPS
 //! submission client, so it necessarily depends on a
 //! minimal-feature `tokio` + `reqwest` for real async I/O — but it's
 //! still self-contained, taking only a `&ReportEnvelope` and a plain
@@ -22,6 +29,7 @@
 pub mod builder;
 pub mod consent;
 pub mod diagnostics;
+pub mod local_store;
 pub mod queue;
 pub mod redact;
 pub mod schema;
@@ -35,6 +43,7 @@ pub use consent::ConsentState;
 pub use diagnostics::{
     diagnostics_summary_count, redact_diagnostics_text, redact_diagnostics_value,
 };
+pub use local_store::{consent_store::ConsentStore, error_candidates::ErrorCandidateStore};
 pub use queue::{QueuedReportMetadata, RetentionPolicy, SubmissionReceipt};
 pub use redact::{redact, redact_lines, RedactionCategory, RedactionSummary};
 pub use schema::{

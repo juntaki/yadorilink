@@ -5,7 +5,7 @@
 //! needed for new pairings, ACL changes, and endpoint-candidate refresh.
 //!
 //! This drives the real daemon stack (real `DaemonState` +
-//! `link_manager::start_link_watch` + `peer_orchestrator::run`, discovering
+//! `LinkRuntimeController::start` + `peer_orchestrator::run`, discovering
 //! its peer from the in-process fake coordination plane's netmap) rather than
 //! the lighter-weight `connect_two_daemons` pairing, so the coordination-plane
 //! outage is a genuine outage of the seam the orchestrator actually depends on:
@@ -19,10 +19,11 @@ use std::time::Duration;
 
 use support::fake_coordination::FakeCoordination;
 use support::{daemon_status_summary, register_with_fake, wait_until, wait_until_with_context};
+use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_daemon::{link_manager, peer_orchestrator};
+use yadorilink_daemon::peer_orchestrator;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_sync_core::index::SyncState;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_transport::DeviceKeyPair;
 
 struct TestDaemon {
@@ -34,15 +35,35 @@ fn new_test_daemon(device_id: &str) -> TestDaemon {
     // Leaked deliberately: the block store must outlive the test; the process
     // tears the temp dir down on exit.
     let store = Arc::new(FsBlockStore::new(Box::leak(Box::new(store_dir)).path()).unwrap());
-    let sync_state = Arc::new(SyncState::open_in_memory().unwrap());
+    let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state = DaemonState::new(device_id.to_string(), sync_state, store);
     TestDaemon { state }
 }
 
 fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
     let local_path = root.to_string_lossy().to_string();
-    state.sync_state.add_link(&local_path, group_id).unwrap();
-    link_manager::start_link_watch(state.clone(), local_path, group_id.to_string()).unwrap();
+    state.replica_coordinator.link_repository().add_link(&local_path, group_id).unwrap();
+    LinkRuntimeController::new(state.clone()).start(local_path, group_id.to_string()).unwrap();
+}
+
+/// Diagnostic-only: one device's index state for `path` -- distinguishes
+/// "never arrived in the index at all" (delivery/DAG-admission never
+/// reached it) from "indexed but not materialized" (e.g. stuck
+/// `Hydrating`/`Placeholder`, or held) from "DAG head advanced, index says
+/// live, but the bytes never landed on disk" (a materialization bug).
+/// Mirrors `monkey_chaos.rs`'s `describe_index_state`.
+fn describe_index_state(state: &DaemonState, group_id: &str, path: &str) -> String {
+    let record = state.replica_coordinator.file_index_repository().get_file(group_id, path);
+    let materialization = state.replica_coordinator.materialization_state_repository().get_materialization_state(group_id, path);
+    let held = state.replica_coordinator.materialization_state_repository().get_held_state(group_id, path);
+    let heads = state
+        .replica_coordinator
+        .sqlite().dag_group_heads(group_id)
+        .map(|hs| hs.iter().map(|h| h.to_hex()).collect::<Vec<_>>());
+    format!(
+        "record={record:?} materialization={materialization:?} held={held:?} \
+         dag_group_heads={heads:?}"
+    )
 }
 
 fn spawn_orchestrator(
@@ -101,18 +122,8 @@ async fn peers_keep_syncing_after_coordination_plane_goes_unreachable() {
     // Establish both peer sessions before checking the healthy-sync probe.
     wait_until_with_context(
         || {
-            daemon_a
-                .state
-                .sessions
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains_key(device_b_id)
-                && daemon_b
-                    .state
-                    .sessions
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .contains_key(device_a_id)
+            daemon_a.state.peers.has_session(device_b_id)
+                && daemon_b.state.peers.has_session(device_a_id)
         },
         Duration::from_secs(60),
         || {
@@ -134,6 +145,32 @@ async fn peers_keep_syncing_after_coordination_plane_goes_unreachable() {
                 "initial sync failed\ndaemon-a: {}\ndaemon-b: {}",
                 daemon_status_summary(&daemon_a.state),
                 daemon_status_summary(&daemon_b.state)
+            )
+        },
+    )
+    .await;
+
+    // Confirm the LIVE watcher -> debounce -> DAG-emit -> announce path also
+    // works before the outage, not just the initial-scan path
+    // `before-outage.txt` exercised above. Without this, a post-outage sync
+    // failure below is ambiguous between "coordination unavailability broke
+    // peer sync" (what this test exists to catch) and "the live watcher
+    // pipeline has an unrelated bug" (this test's post-outage writes would
+    // otherwise be the *first* time either device's live watcher is
+    // exercised at all in this scenario) -- indistinguishable failure modes
+    // without a working live-watcher baseline recorded first.
+    std::fs::write(root_a.path().join("live-before-outage.txt"), b"live watcher works").unwrap();
+    wait_until_with_context(
+        || root_b.path().join("live-before-outage.txt").exists(),
+        Duration::from_secs(30),
+        || {
+            format!(
+                "pre-outage LIVE watcher sync failed (coordination plane is still up here -- \
+                 this isolates a live-watcher-pipeline bug from a coordination-availability bug)\n\
+                 daemon-a: {}\ndaemon-b: {}\ndaemon-a live-before-outage.txt: {}",
+                daemon_status_summary(&daemon_a.state),
+                daemon_status_summary(&daemon_b.state),
+                describe_index_state(&daemon_a.state, group_id, "live-before-outage.txt"),
             )
         },
     )
@@ -166,9 +203,12 @@ async fn peers_keep_syncing_after_coordination_plane_goes_unreachable() {
         Duration::from_secs(30),
         || {
             format!(
-                "post-outage A-to-B sync failed\ndaemon-a: {}\ndaemon-b: {}",
+                "post-outage A-to-B sync failed\ndaemon-a: {}\ndaemon-b: {}\n\
+                 daemon-a after-outage-from-a.txt: {}\ndaemon-b after-outage-from-a.txt: {}",
                 daemon_status_summary(&daemon_a.state),
-                daemon_status_summary(&daemon_b.state)
+                daemon_status_summary(&daemon_b.state),
+                describe_index_state(&daemon_a.state, group_id, "after-outage-from-a.txt"),
+                describe_index_state(&daemon_b.state, group_id, "after-outage-from-a.txt"),
             )
         },
     )
@@ -178,9 +218,12 @@ async fn peers_keep_syncing_after_coordination_plane_goes_unreachable() {
         Duration::from_secs(30),
         || {
             format!(
-                "post-outage B-to-A sync failed\ndaemon-a: {}\ndaemon-b: {}",
+                "post-outage B-to-A sync failed\ndaemon-a: {}\ndaemon-b: {}\n\
+                 daemon-a after-outage-from-b.txt: {}\ndaemon-b after-outage-from-b.txt: {}",
                 daemon_status_summary(&daemon_a.state),
-                daemon_status_summary(&daemon_b.state)
+                daemon_status_summary(&daemon_b.state),
+                describe_index_state(&daemon_a.state, group_id, "after-outage-from-b.txt"),
+                describe_index_state(&daemon_b.state, group_id, "after-outage-from-b.txt"),
             )
         },
     )

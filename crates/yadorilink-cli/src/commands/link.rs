@@ -5,7 +5,7 @@ use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPay
 use yadorilink_ipc_proto::daemonctl::{
     HandoffResult, LinkRequest, LinkStatus, ListLinksRequest, PendingEnrollmentKind, UnlinkRequest,
 };
-use yadorilink_sync_core::link_preflight::{self, LinkPreflightReport};
+use yadorilink_local_storage::link_preflight::{self, LinkPreflightReport};
 
 use crate::commands::share::resolve_group_id;
 use crate::control_client;
@@ -48,7 +48,7 @@ fn skipped_symlink_suffix(link: &LinkStatus) -> String {
 /// versions / 30 days) applied to every link, with nothing to configure here.
 ///
 /// `--dry-run` runs the local preflight
-/// (`yadorilink_sync_core::link_preflight`) and prints its findings
+/// (`yadorilink_local_storage::link_preflight`) and prints its findings
 /// without ever contacting the daemon to register a link (so nothing is
 /// persisted; no persisted writes occur). Otherwise, the same
 /// preflight always runs first and its summary is always printed;
@@ -325,7 +325,16 @@ pub async fn unlink(local_path: String, force: bool) -> Result<(), CliError> {
     let handoff_result = send_unlink(&local_path, force).await?;
     println!("Unlinked {local_path}");
     if let Some(result) = handoff_result {
-        crate::commands::durability_force::print_handoff_result(&result);
+        println!(
+            "  handoff completed: target={} membership_generation={}{}",
+            result.target_device_id,
+            result.membership_generation,
+            if result.lease_id.is_empty() {
+                String::new()
+            } else {
+                format!(" lease={}", result.lease_id)
+            }
+        );
     }
     Ok(())
 }

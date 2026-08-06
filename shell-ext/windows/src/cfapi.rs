@@ -5,36 +5,36 @@
 //!
 //! Scope/known limitations, stated up front rather than discovered late:
 //! - MVP hydrates whole files only (no byte-range
-//!  hydration), so the sync root's `Hydration` policy is `FULL` and the
-//!  fetch-data callback always serves the entire file regardless of the
-//!  OS-requested range.
+//!   hydration), so the sync root's `Hydration` policy is `FULL` and the
+//!   fetch-data callback always serves the entire file regardless of the
+//!   OS-requested range.
 //! - Nested directories under an OnDemand folder are created as ordinary
-//!  (non-placeholder) directories, not lazily-populated placeholder
-//!  directories — `CfCreatePlaceholders` is only used for files. This
-//!  matches the design's file-level (not directory-listing-level)
-//!  on-demand scope.
+//!   (non-placeholder) directories, not lazily-populated placeholder
+//!   directories — `CfCreatePlaceholders` is only used for files. This
+//!   matches the design's file-level (not directory-listing-level)
+//!   on-demand scope.
 //! - A placeholder's `FileIdentity` blob carries only the relative path
-//!  as an opaque marker, not real block/version state: `CfCreatePlaceholders`
-//!  documents `FileIdentity` as *mandatory for files* (confirmed the hard
-//!  way — a null/empty identity fails with
-//!  `ERROR_CLOUD_FILE_INVALID_REQUEST`, 0x8007017C, verified against real
-//!  cfapi on a Windows 11 VM), so it can't be omitted; the daemon remains
-//!  the sole source of truth for block/version state, looked up by path
-//!  over shell-IPC in the fetch callback rather than decoded from this
-//!  blob, avoiding a second, potentially-stale copy of that state.
+//!   as an opaque marker, not real block/version state: `CfCreatePlaceholders`
+//!   documents `FileIdentity` as *mandatory for files* (confirmed the hard
+//!   way — a null/empty identity fails with
+//!   `ERROR_CLOUD_FILE_INVALID_REQUEST`, 0x8007017C, verified against real
+//!   cfapi on a Windows 11 VM), so it can't be omitted; the daemon remains
+//!   the sole source of truth for block/version state, looked up by path
+//!   over shell-IPC in the fetch callback rather than decoded from this
+//!   blob, avoiding a second, potentially-stale copy of that state.
 //! - `hydration::hydrate` (the daemon-side function this ultimately
-//!  drives, over shell-IPC's `HydrateRequest`) writes a placeholder's
-//!  real content by reconstructing to a temp file and rename-replacing
-//!  the target (`yadorilink_sync_core::chunker::reconstruct_file`) — this
-//!  was written and tested against the platform-neutral placeholder
-//!  representation on a non-Windows dev machine, not against
-//!  a real cfapi reparse-point placeholder. A rename-replace over a file
-//!  with an in-flight `CF_CALLBACK_TYPE_FETCH_DATA` callback is expected
-//!  to work (the placeholder's reparse point and sparse ranges are
-//!  simply replaced by an ordinary, fully-present file, which is a
-//!  documented-valid way for a provider to "finish" a placeholder), but
-//!  this specific interaction has NOT been exercised against a live
-//!  Explorer file-open on real hardware.
+//!   drives, over shell-IPC's `HydrateRequest`) writes a placeholder's
+//!   real content by reconstructing to a temp file and rename-replacing
+//!   the target (`yadorilink_sync_core::chunker::reconstruct_file`) — this
+//!   was written and tested against the platform-neutral placeholder
+//!   representation on a non-Windows dev machine, not against
+//!   a real cfapi reparse-point placeholder. A rename-replace over a file
+//!   with an in-flight `CF_CALLBACK_TYPE_FETCH_DATA` callback is expected
+//!   to work (the placeholder's reparse point and sparse ranges are
+//!   simply replaced by an ordinary, fully-present file, which is a
+//!   documented-valid way for a provider to "finish" a placeholder), but
+//!   this specific interaction has NOT been exercised against a live
+//!   Explorer file-open on real hardware.
 
 use std::collections::HashMap;
 use std::ffi::c_void;

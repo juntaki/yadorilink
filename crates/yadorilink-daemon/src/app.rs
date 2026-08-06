@@ -33,14 +33,15 @@ use yadorilink_local_storage::FsBlockStore;
 // `FsBlockStore`, so importing the trait there would be an unused import.
 #[cfg(madsim)]
 use yadorilink_local_storage::BlockStore;
-use yadorilink_sync_core::index::SyncState;
-use yadorilink_sync_core::materialization;
+use crate::replica_coordinator::ReplicaCoordinator;
 use yadorilink_transport::DeviceKeyPair;
 
+use crate::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use crate::daemon_state::DaemonState;
 use crate::device_config::config_dir;
 use crate::supervise::EssentialTasks;
-use crate::{device_config, link_manager, peer_orchestrator, token_store};
+use crate::{device_config, peer_orchestrator, token_store};
+
 // The control-socket and shell-IPC transports are not started under the
 // deterministic simulator (their essential tasks are `cfg(not(madsim))` —
 // see `run`), so their modules go unused there.
@@ -80,7 +81,15 @@ impl DaemonInstanceLock {
 
         std::fs::create_dir_all(config_dir)?;
         let lock_path = config_dir.join(DAEMON_INSTANCE_LOCK_FILE);
-        let file = OpenOptions::new().create(true).read(true).write(true).open(&lock_path)?;
+        // `truncate(false)` is explicit, not incidental: this is a lock file,
+        // never a content file, so an existing file's bytes (if any) are
+        // irrelevant and must not be discarded just by opening it.
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -88,10 +97,15 @@ impl DaemonInstanceLock {
         }
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(Self { _file: file }),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => anyhow::bail!(
-                "another YadoriLink daemon is already running for {}",
-                config_dir.display()
-            ),
+            // Compared by raw OS error, not ErrorKind: see resource_lock.rs's
+            // take_exclusive_lock doc comment for why ErrorKind::WouldBlock
+            // does not reliably match Windows' real contention error.
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                anyhow::bail!(
+                    "another YadoriLink daemon is already running for {}",
+                    config_dir.display()
+                )
+            }
             Err(error) => Err(anyhow::anyhow!(
                 "failed to acquire daemon instance lock {}: {error}",
                 lock_path.display()
@@ -100,7 +114,7 @@ impl DaemonInstanceLock {
     }
 }
 
-/// How often `pending_enrollment::reconcile` re-runs after its first pass at
+/// How often `EnrollmentRecoveryService::reconcile_once` re-runs after its first pass at
 /// startup. A few minutes: far below `daemon_state`'s hour-scale
 /// retention-expiry sweep (retrying a coordination-plane call is cheap, so
 /// there's no reason to wait that long), but well above its sub-two-minute
@@ -275,7 +289,10 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         // Matched exhaustively with no catch-all arm, so a variant added
         // later must state its own case here instead of silently inheriting
         // a wrong one.
-        Err(e @ device_config::DeviceConfigError::UnsupportedConfigDowngrade { .. }) => {
+        Err(
+            e @ (device_config::DeviceConfigError::UnsupportedConfigDowngrade { .. }
+            | device_config::DeviceConfigError::StaleConfigVersion { .. }),
+        ) => {
             return Err(anyhow::anyhow!(
                 "refusing to start: {e}. Nothing on disk has been modified, and this device is \
                  still registered: do not delete device.json and do not run `yadorilink device \
@@ -370,14 +387,23 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             record_startup_error_best_effort("daemon_startup", "block-store", e.to_string());
         })?),
     };
-    let sync_state = Arc::new(SyncState::open(&sync_db_path).inspect_err(|e| {
+    // Phase 7D-10.9: builds the daemon's one replica/DAG/materialization
+    // composition-root handle directly -- `DaemonState` no longer holds a
+    // separate `yadorilink_sync_core::index::SyncState` this used to open
+    // first and forward from. `ReplicaCoordinator::open` mirrors
+    // `SyncState::open`'s own field construction (same `SyncDatabase::open`
+    // + schema-bootstrap sequence), just without the `sync-core`-owned
+    // wrapper type.
+    let replica_coordinator = Arc::new(ReplicaCoordinator::open(&sync_db_path).inspect_err(|e| {
         record_startup_error_best_effort("daemon_startup", "sync-state", e.to_string());
     })?);
 
     // Recover any file left permanently stuck `Hydrating` by a
     // previous crash before anything else runs — see
-    // `SyncState::reset_stale_hydrating_to_placeholder`'s doc comment.
-    match sync_state.reset_stale_hydrating_to_placeholder() {
+    // `yadorilink_sync_core::index::SyncState::reset_stale_hydrating_to_placeholder`'s
+    // doc comment (verbatim same behavior, now read through
+    // `replica_coordinator`).
+    match replica_coordinator.materialization_state_repository().reset_stale_hydrating_to_placeholder() {
         Ok(0) => {}
         Ok(n) => tracing::info!(count = n, "reset stale Hydrating rows to Placeholder on startup"),
         Err(e) => tracing::warn!(error = %e, "failed to reset stale Hydrating rows on startup"),
@@ -387,109 +413,41 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // (before its placeholder commit) — otherwise nothing ever reconciles it and
     // the file is wedged. Reset to `Placeholder` (blocks are always still
     // retained at this point), the state safe for both interrupted-eviction disk
-    // cases — see `SyncState::reset_stale_evicting_to_placeholder`'s doc comment.
-    match sync_state.reset_stale_evicting_to_placeholder() {
+    // cases — see `yadorilink_sync_core::index::SyncState::reset_stale_evicting_to_placeholder`'s
+    // doc comment.
+    match replica_coordinator.materialization_state_repository().reset_stale_evicting_to_placeholder() {
         Ok(0) => {}
         Ok(n) => tracing::info!(count = n, "reset stale Evicting rows to Placeholder on startup"),
         Err(e) => tracing::warn!(error = %e, "failed to reset stale Evicting rows on startup"),
     }
 
-    // Run before any link
-    // watcher starts or any new write happens, so nothing new can be
-    // mistaken for one of last run's orphaned temp files, and no on-demand
-    // hydration/materialize can race the repair pass below. Order matters:
-    // the block-store root's own stale temp files are cleaned first
-    // (`FsBlockStore::put` uses the identical `unique_tmp_path` naming
-    // scheme as `chunker.rs`), then each link's local folder, then the
-    // per-link `Hydrated`-but-inconsistent repair — see
-    // `materialization::repair_interrupted_materializations`'s doc comment
-    // for exactly which crash window this closes (the one the
-    // `Hydrating` reset above does not: a crash between the index commit
-    // and the completed rename of an *eager* materialization write).
-    let stale_block_store_tmp = materialization::cleanup_stale_temp_files(&block_store_root);
+    // Run before any link watcher starts or any new write happens, so
+    // nothing new can be mistaken for one of last run's orphaned temp
+    // files. Per-link interrupted-materialization/restore-operation repair
+    // used to run here too, before any `SyncRootLock` existed for any
+    // link -- it now runs inside the daemon's own `LinkRuntimeController::start_inner`,
+    // immediately after that specific link's `SyncRootLock` is acquired,
+    // so repair goes through the same `RootLease` every other mutation for
+    // that link uses instead of a startup-only stand-in with no real
+    // exclusion (see that function's own doc comment).
+    let stale_block_store_tmp =
+        yadorilink_filesystem_sync::stale_temp_files::cleanup_stale_temp_files(&block_store_root);
     if !stale_block_store_tmp.is_empty() {
         tracing::info!(
             count = stale_block_store_tmp.len(),
             "removed stale temp files from block store on startup"
         );
     }
-    // Links (by `local_path`) whose startup interrupted-materialization repair
-    // errored this boot. Their initial reconcile scan must NOT emit any
-    // missing-file tombstone this boot: repair is the crash-vs-offline-delete
-    // disambiguator, and without it a `Hydrated`-but-missing file (a crash
-    // mid-materialize, reconstructable from present blocks) is indistinguishable
-    // from a genuine offline deletion. Fail-closed — defer the delete decision
-    // to a later boot on which repair succeeds. Consulted at the
-    // `start_link_watch_gating_tombstones` call below.
-    let mut repair_failed_local_paths: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    // Enumerate the links ONCE, for both the repair pass here and the watcher
-    // resume further down, and fail startup if the table cannot be read.
-    // Collapsing this error into "there are no links" would silently skip both
-    // passes -- no crash-recovery repair, and no watcher or startup scan for any
-    // folder -- while the peer path, which resolves its roots from the same
-    // table independently, would carry on applying changes into folders this
-    // boot never scanned. A daemon that cannot read its own link table has
-    // nothing safe to do, so it must not pretend it has no work.
-    let links = sync_state.list_links()?;
-    for link in &links {
-        // An orphaned link's coordination-side authorization is confirmed
-        // gone -- this repair pass writes to disk (removing temp files,
-        // reconstructing/rewriting placeholders), which would violate
-        // "orphaned never touches on-disk files" the same way any other
-        // sync activity would.
-        if link.orphaned {
-            continue;
-        }
-        let root = PathBuf::from(&link.local_path);
-        match materialization::reconcile_restore_operations(&sync_state, &root, &link.group_id) {
-            Ok(report)
-                if report.committed.is_empty()
-                    && report.discarded_unstarted.is_empty()
-                    && report.preserved_divergent.is_empty() => {}
-            Ok(report) => tracing::info!(
-                local_path = %link.local_path,
-                committed = report.committed.len(),
-                discarded_unstarted = report.discarded_unstarted.len(),
-                preserved_divergent = report.preserved_divergent.len(),
-                "reconciled interrupted restore operations on startup"
-            ),
-            Err(e) => {
-                return Err(e.into());
-            }
-        }
-        let stale_tmp = materialization::cleanup_stale_temp_files(&root);
-        if !stale_tmp.is_empty() {
-            tracing::info!(
-                count = stale_tmp.len(),
-                local_path = %link.local_path,
-                "removed stale temp files from linked folder on startup"
-            );
-        }
-        match materialization::repair_interrupted_materializations(
-            &sync_state,
-            block_store.as_ref(),
-            &root,
-            &link.group_id,
-        ) {
-            Ok(report) if report.is_empty() => {}
-            Ok(report) => tracing::info!(
-                local_path = %link.local_path,
-                reconstructed = report.reconstructed.len(),
-                demoted_to_placeholder = report.demoted_to_placeholder.len(),
-                "repaired interrupted materializations found on startup"
-            ),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    local_path = %link.local_path,
-                    "failed to run startup materialization repair for linked folder; \
-                     deferring this boot's initial-scan delete emission for it"
-                );
-                repair_failed_local_paths.insert(link.local_path.clone());
-            }
-        }
-    }
+    // Enumerate the links ONCE, for both `start_link_watch_gating_
+    // tombstones` below and the watcher resume loop further down, and fail
+    // startup if the table cannot be read. Collapsing this error into
+    // "there are no links" would silently skip both -- no watcher or
+    // startup scan for any folder -- while the peer path, which resolves
+    // its roots from the same table independently, would carry on applying
+    // changes into folders this boot never scanned. A daemon that cannot
+    // read its own link table has nothing safe to do, so it must not
+    // pretend it has no work.
+    let links = replica_coordinator.link_repository().list_links()?;
 
     #[cfg(not(madsim))]
     let device_id = device_config.as_ref().map(|c| c.device_id.clone()).unwrap_or_default();
@@ -504,7 +462,18 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
         None => device_config.as_ref().map(|c| c.device_id.clone()).unwrap_or_default(),
     };
 
-    let state = DaemonState::new(device_id.clone(), sync_state.clone(), block_store.clone());
+    // Construction (`DaemonState::build`) and starting `MaintenanceCoordinator`
+    // are two explicit steps here, not the single `DaemonState::new` every
+    // test call site uses -- this composition root is the one place that
+    // needs to sequence maintenance startup relative to its OWN later setup
+    // (headroom enforcement, custody confirmer, signing key), not just get a
+    // fully-running `DaemonState` back. Starting maintenance immediately
+    // after `build` (before any of that later setup) preserves the exact
+    // ordering `DaemonState::new` always had -- this is not a behavior
+    // change, just the same two steps made explicit and separately owned.
+    let build = DaemonState::build(device_id.clone(), replica_coordinator.clone(), block_store.clone());
+    crate::maintenance_coordinator::start(&build.state, build.forward_rx);
+    let state = build.state;
     // Only the real `yadorilink-daemon`
     // binary itself opts into disk-headroom enforcement — see
     // `DaemonState::enable_disk_headroom_enforcement`'s doc comment for why
@@ -572,29 +541,30 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // reconcile` marked it orphaned, and staying stopped across restarts is
     // exactly what "no longer a live sync target" means; its on-disk files
     // are untouched either way.
+    let link_runtime_controller = LinkRuntimeController::new(state.clone());
     for link in &links {
         if link.orphaned {
             continue;
         }
-        // Suppress this link's initial-scan tombstone emission for this boot
-        // when its startup materialization repair errored above (fail-closed:
-        // a crash-mid-materialize that repair could not disambiguate this boot
-        // must not be misread as an offline delete and propagated group-wide).
-        //
-        // The additive-scan flag a two-live-roots recovery arms on the survivor
-        // is NOT consulted here: `start_link_watch_inner` reads it itself and
-        // ANDs it with this, so every entry point that starts a watch honours it
-        // rather than only the one caller that remembered to.
-        let emit_tombstones = !repair_failed_local_paths.contains(&link.local_path);
-        if let Err(e) = link_manager::start_link_watch_gating_tombstones(
-            state.clone(),
+        // `LinkRuntimeController::start_inner` runs this link's own startup
+        // materialization repair itself (right after acquiring its
+        // `SyncRootLock`) and ANDs its own `emit_tombstones` gate down to
+        // `false` if repair fails for THIS link -- fail-closed: a
+        // crash-mid-materialize that repair could not disambiguate this
+        // boot must not be misread as an offline delete and propagated
+        // group-wide. `true` here is just this caller's own "no other
+        // reason to suppress" default (mirroring `LinkRuntimeController::start`'s
+        // identical hardcoded `true`); the additive-scan flag a two-live-
+        // roots recovery arms on the survivor is similarly read and ANDed
+        // in by `start_inner` itself, not by this caller.
+        if let Err(e) = link_runtime_controller.start_gating_tombstones(
             link.local_path.clone(),
             link.group_id.clone(),
-            emit_tombstones,
+            true,
         ) {
             // Continuing is deliberate: one unwatchable folder must not stop the
             // daemon for every other link. It is only safe because
-            // `start_link_watch_inner` arms this group's startup gate before any
+            // `start_inner` arms this group's startup gate before any
             // fallible step, so the failure leaves the gate Failed and peer apply
             // for this group defers rather than overwriting un-indexed local
             // content. Error, not warn: this folder syncs nothing until fixed.
@@ -617,13 +587,24 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // test drives the daemon through `DaemonState`/`shutdown_tx` directly
     // (see the `state_probe` seam above) rather than over this socket.
     // Production (`not(madsim)`) is byte-for-byte unchanged.
+    // `app.rs` is the sole composition root: `application`/`queries` are
+    // built exactly once here, after `state`'s own setup above (headroom
+    // enforcement, custody confirmer, signing key) is complete, and handed
+    // down through `ControlContext` -- `control_socket::*_transport::serve`
+    // no longer builds either itself.
+    let control_context = std::sync::Arc::new(crate::control_context::ControlContext::new(
+        crate::adapters::build_application_services(state.clone()),
+        crate::adapters::build_query_services(state.clone()),
+    ));
+
     #[cfg(all(unix, not(madsim)))]
     {
         let state = state.clone();
+        let control_context = control_context.clone();
         let path = control_socket_path.clone();
         state.set_task_alive(TASK_CONTROL_SOCKET, true);
         essential.spawn(async move {
-            if let Err(e) = control_socket::unix_transport::serve(&path, state.clone()).await {
+            if let Err(e) = control_socket::unix_transport::serve(&path, control_context).await {
                 tracing::error!(error = %e, task = TASK_CONTROL_SOCKET, "essential task failed");
             } else {
                 tracing::warn!(task = TASK_CONTROL_SOCKET, "essential task exited");
@@ -635,11 +616,12 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         let state = state.clone();
+        let control_context = control_context.clone();
         let pipe_name = device_config::control_pipe_name();
         state.set_task_alive(TASK_CONTROL_SOCKET, true);
         essential.spawn(async move {
             if let Err(e) =
-                control_socket::windows_transport::serve(&pipe_name, state.clone()).await
+                control_socket::windows_transport::serve(&pipe_name, control_context).await
             {
                 tracing::error!(error = %e, task = TASK_CONTROL_SOCKET, "essential task failed");
             } else {
@@ -745,11 +727,12 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
                     });
                 }
 
-                // Crash-safe create/join enrollment (see `pending_enrollment`'s
-                // module doc): finish confirming (or, failing that, cancel) any
-                // local link this device committed whose matching
-                // coordination-plane activation never got confirmed -- the CLI
-                // process that would have done so was killed first, or its own
+                // Crash-safe create/join enrollment (see
+                // `EnrollmentRecoveryService`'s own module doc): finish
+                // confirming (or, failing that, cancel) any local link this
+                // device committed whose matching coordination-plane
+                // activation never got confirmed -- the CLI process that
+                // would have done so was killed first, or its own
                 // confirmation call never reached the daemon. Runs once
                 // immediately (covering a marker left over from before this
                 // startup) and then on a fixed interval, so a marker left
@@ -759,16 +742,14 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
                 // the coordination plane leaves its marker in place for the
                 // next one.
                 {
-                    let addr = addr.clone();
-                    let token = token.clone();
-                    let state = state.clone();
+                    let application = control_context.application.clone();
                     crate::supervise::spawn_logged("pending-enrollment-reconcile", async move {
                         let mut interval =
                             tokio::time::interval(PENDING_ENROLLMENT_RECONCILE_SWEEP_INTERVAL);
                         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         loop {
                             interval.tick().await;
-                            crate::pending_enrollment::reconcile(&state, &addr, &token).await;
+                            application.enrollment_recovery.reconcile_once().await;
                         }
                     });
                 }
@@ -943,18 +924,56 @@ async fn graceful_shutdown(
     // now applied uniformly to every shutdown path.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Stop generating new local changes first: abort every link's
-    // watcher/executor tasks (the debounce accumulator and the flush
-    // executor) before anything else,
-    // so nothing new gets queued while the rest of shutdown runs.
-    let link_tasks: Vec<_> =
-        state.link_tasks.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).drain().collect();
-    for (local_path, handles) in link_tasks {
-        tracing::debug!(local_path, count = handles.len(), "aborting link watcher tasks");
-        for handle in handles {
-            handle.abort();
+    // Stop generating new local changes first: shut down every link's
+    // runtime (watcher/executor/repair/dirty-journal tasks, then the
+    // operation fence) before anything else, so nothing new gets queued
+    // while the rest of shutdown runs. `LinkRuntime::shutdown`, not
+    // `abort_tasks` -- see that method's own doc for why: this function
+    // does not exit the process immediately afterward (it still drains
+    // in-flight broadcasts, up to 3s, and checkpoints SQLite), so a
+    // still-running scan/flush/backstop operation must be genuinely
+    // finished, not merely asked to stop, before its root lock is allowed
+    // to drop. Every link shuts down concurrently, not one at a time --
+    // each shutdown's own wait is independent of every other link's.
+    let link_runtimes = state.links.drain_for_shutdown();
+    futures_util::future::join_all(link_runtimes.into_iter().map(|drained| async move {
+        let (local_path, runtime) = match drained {
+            crate::link_registry::DrainedLink::Ready { local_path, runtime } => {
+                (local_path, runtime)
+            }
+            // A start attempt is genuinely in flight for this path at the
+            // moment of shutdown -- rare, but not impossible. There is no
+            // `LinkRuntime` to shut down yet; the in-progress `start_link_
+            // watch_inner` call runs to completion (or fails) on its own,
+            // independent of this drained map entry, and the process is
+            // about to exit regardless.
+            crate::link_registry::DrainedLink::Starting { local_path } => {
+                tracing::debug!(
+                    local_path,
+                    "graceful_shutdown: a start attempt was still in flight for this link; \
+                     nothing to shut down yet"
+                );
+                return;
+            }
+        };
+        tracing::debug!(local_path, "shutting down link runtime");
+        // `link_runtimes` was the only place this `Arc` was ever cloned
+        // from, so removing it there (via `drain` above) leaves exactly
+        // one strong reference: this one.
+        match Arc::try_unwrap(runtime) {
+            Ok(runtime) => runtime.shutdown().await,
+            Err(shared) => {
+                tracing::error!(
+                    local_path,
+                    refs = Arc::strong_count(&shared),
+                    "graceful_shutdown: Arc<LinkRuntime> unexpectedly still shared after \
+                     removal from link_runtimes; falling back to abort-only teardown"
+                );
+                shared.abort_tasks();
+            }
         }
-    }
+    }))
+    .await;
 
     // Drain in-flight broadcasts (bounded — see
     // `DaemonState::wait_for_broadcasts_to_drain`'s doc comment) before
@@ -1061,8 +1080,7 @@ mod instance_lock_tests {
         let owner = DaemonInstanceLock::acquire(dir.path()).unwrap();
 
         let error = DaemonInstanceLock::acquire(dir.path())
-            .err()
-            .expect("a second daemon must not acquire the same config lock");
+            .expect_err("a second daemon must not acquire the same config lock");
         assert!(error.to_string().contains("already running"));
 
         drop(owner);
@@ -1117,7 +1135,7 @@ mod startup_config_validation_tests {
     /// build supports — the "unsupported downgrade" case.
     fn too_new_device_json() -> String {
         format!(
-            r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","config_version":{}}}"#,
+            r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","nat":{{}},"wireguard_public_key":"wg-pub","signing_public_key":"signing-pub","config_version":{}}}"#,
             device_config::CONFIG_VERSION + 1
         )
     }
@@ -1125,7 +1143,8 @@ mod startup_config_validation_tests {
     /// Runs daemon startup against a config directory holding exactly
     /// `device_json`, and seeds the block-store root with a file named to the
     /// `.yadorilink-tmp.<pid>.<counter>` scheme that
-    /// `materialization::cleanup_stale_temp_files` deletes on sight, with no
+    /// `yadorilink_filesystem_sync::stale_temp_files::cleanup_stale_temp_files`
+    /// deletes on sight, with no
     /// age threshold. That file surviving is the observable proof that
     /// startup stopped before the sweep-and-repair pass rather than merely
     /// returning the right error at the end of it.
@@ -1179,7 +1198,7 @@ mod startup_config_validation_tests {
 
     fn current_device_json() -> String {
         format!(
-            r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","config_version":{}}}"#,
+            r#"{{"device_id":"device-a","coordination_addr":"http://127.0.0.1:1","nat":{{}},"wireguard_public_key":"wg-pub","signing_public_key":"signing-pub","config_version":{}}}"#,
             device_config::CONFIG_VERSION
         )
     }
@@ -1240,7 +1259,7 @@ mod startup_config_validation_tests {
         let too_new = start_daemon_with_device_json(&too_new_device_json()).await;
 
         assert!(
-            corrupt.error.contains("is not a valid device config"),
+            corrupt.error.contains("is not a valid current device config"),
             "a corrupt device.json must say so: {}",
             corrupt.error
         );

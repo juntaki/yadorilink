@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
-use yadorilink_sync_core::peer_session::PeerSyncSession;
+use yadorilink_peer_session::peer_session::{PeerSyncSession, PeerSyncSessionDeps};
 use yadorilink_transport::{
     diff_netmap, public_key_from_bytes, run_burst, CandidateClass, DeviceKeyPair, NatClass,
     NetmapDiff, NetmapSnapshot, PeerChannel, PunchConfig, PunchDecision, PunchLimiter, PunchTarget,
@@ -48,9 +48,10 @@ use yadorilink_transport::{
 
 use crate::connection_trace::{AddressClass, AttemptOutcome, CandidateSource};
 use crate::coordination_client::EndpointCandidate;
-use crate::daemon_state::{DaemonState, PeerReachability, PeerStatusInfo, UnreachableCategory};
+use crate::daemon_state::DaemonState;
 use crate::device_config;
 use crate::error::DaemonError;
+use crate::peer_registry::{PeerReachability, UnreachableCategory};
 use crate::supervise::BackoffConfig;
 
 pub struct OrchestratorConfig {
@@ -261,13 +262,7 @@ fn apply_authoritative_peer_metadata(
         &effective_groups,
         &effective_full_replica_groups,
     );
-    if let Some(session) = state
-        .sessions
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(device_id)
-        .cloned()
-    {
+    if let Some(session) = state.peers.session(device_id) {
         session.set_authorized_groups(effective_groups.iter().cloned());
     }
     effective_groups
@@ -308,7 +303,11 @@ fn record_group_policy_states(
                 // The persisted per-group watermark is the highest chain this
                 // device has ever verified and never moves backward; reject any
                 // snapshot that would roll it back or fork it.
-                let stored = state.sync_state.policy_watermark(&log.group_id)?;
+                let stored = state
+                    .replica_coordinator
+                    .policy_watermark_repository()
+                    .policy_watermark(&log.group_id)
+                    .map_err(crate::sync_error::SyncError::from)?;
                 match policy.watermark_verdict(stored.as_ref()) {
                     crate::change_policy::WatermarkVerdict::Accept(watermark) => {
                         // Persist the (never-lowered) watermark BEFORE adopting
@@ -316,7 +315,11 @@ fn record_group_policy_states(
                         // durable even if the daemon dies immediately after —
                         // a restart then still sees the higher watermark and
                         // refuses the old chain.
-                        state.sync_state.upsert_policy_watermark(&log.group_id, &watermark)?;
+                        state
+                            .replica_coordinator
+                            .policy_watermark_repository()
+                            .upsert_policy_watermark(&log.group_id, &watermark)
+                            .map_err(crate::sync_error::SyncError::from)?;
                         states.insert(log.group_id.clone(), policy);
                     }
                     crate::change_policy::WatermarkVerdict::Reject(reason) => {
@@ -442,7 +445,7 @@ pub async fn run(
                 // A clean stream end still means the coordination-plane
                 // connection is no longer up (`run` is about to redial),
                 // not a per-peer attempt so `peer_device_id` is empty.
-                state.connection_traces.record(
+                state.telemetry.record_connection_attempt(
                     "",
                     CandidateSource::CoordinationPlane,
                     AddressClass::Wan,
@@ -459,7 +462,7 @@ pub async fn run(
                     attempt,
                     "coordination netmap subscription attempt failed; reconnecting"
                 );
-                state.connection_traces.record(
+                state.telemetry.record_connection_attempt(
                     "",
                     CandidateSource::CoordinationPlane,
                     AddressClass::Wan,
@@ -737,7 +740,7 @@ mod ws_netmap {
         // Record a successful coordination-plane connect so a doctor read
         // mid-outage can see the coordination plane itself is reachable,
         // separately from any peer's direct-path state.
-        state.connection_traces.record(
+        state.telemetry.record_connection_attempt(
             "",
             CandidateSource::CoordinationPlane,
             AddressClass::Wan,
@@ -1019,12 +1022,7 @@ mod ws_netmap {
                 );
                 let candidates: Vec<SocketAddr> =
                     peer.endpoints.iter().filter_map(|e| e.address.parse().ok()).collect();
-                let existing_session = {
-                    let sessions =
-                        state.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    sessions.get(&peer.device_id).cloned()
-                };
-                if let Some(session) = existing_session {
+                if let Some(session) = state.peers.session(&peer.device_id) {
                     session.replace_coordination_candidates(candidates).await;
                     continue;
                 }
@@ -1222,21 +1220,13 @@ fn service_key_pins_path() -> PathBuf {
 /// connected (module docs on the deliberately-simple session lifecycle).
 #[cfg(test)]
 fn peer_already_connected(state: &DaemonState, peer_device_id: &str) -> bool {
-    state
-        .sessions
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains_key(peer_device_id)
+    state.peers.has_session(peer_device_id)
 }
 
 /// Records `peer_device_id`'s current reachability for the control socket,
 /// overwriting any previous value.
 fn set_reachability(state: &DaemonState, peer_device_id: &str, reachability: PeerReachability) {
-    state
-        .peer_statuses
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(peer_device_id.to_string(), PeerStatusInfo { reachability });
+    state.peers.set_reachability(peer_device_id.to_string(), reachability);
 }
 
 /// A session about to race candidates is reported `Connecting` — not yet
@@ -1255,12 +1245,23 @@ fn mark_connecting(state: &DaemonState, peer_device_id: &str) {
 /// `sessions` entry keeping `PeerSyncSession` (and the channel `Arc` it
 /// also holds) alive past the session's end.
 fn end_session(state: &DaemonState, peer_device_id: &str) {
-    state.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(peer_device_id);
-    state
-        .peer_statuses
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(peer_device_id);
+    state.peers.remove(peer_device_id);
+    state.peers.clear_status(peer_device_id);
+}
+
+/// Same as [`end_session`], but only removes the session (and its status)
+/// if it is still exactly `session` — so a task ending a session it once
+/// owned never deletes a newer session a fresher connection has since
+/// installed for the same device. Used at the natural end of a session's
+/// own `run().await`, where the session's identity is already in hand.
+fn end_session_if_current(
+    state: &DaemonState,
+    peer_device_id: &str,
+    session: &Arc<PeerSyncSession>,
+) {
+    if state.peers.remove_if_current(peer_device_id, session) {
+        state.peers.clear_status(peer_device_id);
+    }
 }
 
 /// Acts on one netmap update's diff (`diff_netmap`'s output). Whole-device
@@ -1268,13 +1269,13 @@ fn end_session(state: &DaemonState, peer_device_id: &str) {
 /// transport layer alone (the tunnel stays up — that's simply the
 /// *absence* of a teardown call here) but now call
 /// [`PeerSyncSession::revoke_group`] on that peer's still-live session
-/// (found via `state.sessions`, the same map `teardown_peer` reads for
+/// (found via `state.peers.sessions`, the same map `teardown_peer` reads for
 /// the whole-device case) so `yadorilink-sync-core`'s per-request
 /// re-validation actually learns about the narrower revocation instead
 /// of continuing to check the construction-time `shared_group_ids`
 /// snapshot forever. `PeerSyncSession` has no reference to any
 /// daemon-level "current netmap" of its own, and a `PeerChannel` has no
-/// concept of a session or a group at all — `state.sessions` is the one
+/// concept of a session or a group at all — `state.peers.sessions` is the one
 /// place both a `device_id` and its live `Arc<PeerSyncSession>` are
 /// available together.
 fn apply_netmap_diff(diff: &NetmapDiff, state: &Arc<DaemonState>, diff_state: &NetmapDiffState) {
@@ -1291,9 +1292,7 @@ fn apply_netmap_diff(diff: &NetmapDiff, state: &Arc<DaemonState>, diff_state: &N
             group = %group_id,
             "group-share edge revoked but another shared group remains; tunnel stays up, re-validating that group's session-level authorization"
         );
-        if let Some(session) =
-            state.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(device_id)
-        {
+        if let Some(session) = state.peers.session(device_id) {
             // this is the actual enforcement step for the
             // group-edge case — from this call onward, `session`'s
             // `shares_group(group_id)` (consulted fresh by every
@@ -1307,7 +1306,7 @@ fn apply_netmap_diff(diff: &NetmapDiff, state: &Arc<DaemonState>, diff_state: &N
         // No live session found is not a bug: the device may not have
         // finished `PeerChannel::connect` yet (synchronous
         // `session_tasks` insert races ahead of the session existing in
-        // `state.sessions`), or its session may have just ended on its
+        // `state.peers.sessions`), or its session may have just ended on its
         // own between this diff being computed and this loop running. In
         // either case there is nothing currently live to re-validate,
         // and any future session for this device is constructed fresh
@@ -1326,7 +1325,7 @@ fn apply_netmap_diff(diff: &NetmapDiff, state: &Arc<DaemonState>, diff_state: &N
 ///
 /// That last step is hydration-candidate-pruning wiring:
 /// `hydration::hydrate_inner` looks up authorized candidate peers live from
-/// `state.sessions` on every hydration attempt (not a cached/snapshotted
+/// `state.peers.sessions` on every hydration attempt (not a cached/snapshotted
 /// candidate list), so removing this entry here — synchronously, in the
 /// same update that detected the revocation — is what makes a removed
 /// device immediately stop being offered as a multi-peer hydration
@@ -1422,7 +1421,7 @@ fn spawn_peer_session(
             Ok(c) => Arc::new(c),
             Err(e) => {
                 tracing::warn!(peer = %peer_device_id, error = %e, "failed to establish peer channel");
-                state.connection_traces.record(
+                state.telemetry.record_connection_attempt(
                     peer_device_id.clone(),
                     CandidateSource::DirectPath,
                     AddressClass::Unknown,
@@ -1434,7 +1433,7 @@ fn spawn_peer_session(
                 );
                 // The status entry stays so `yadorilink status` shows
                 // "cannot connect"; the next netmap push re-attempts (this
-                // peer is not in `state.sessions`, so it is not suppressed
+                // peer is not in `state.peers.sessions`, so it is not suppressed
                 // as connected).
                 set_reachability(
                     &state,
@@ -1464,69 +1463,84 @@ fn spawn_peer_session(
         tokio::spawn(poll_reachability(state.clone(), peer_device_id.clone(), channel.clone()));
 
         let sync_roots = sync_roots_for_groups(&state, &shared_group_ids);
-        let session = PeerSyncSession::new_with_forwarding(
+        let dependencies = PeerSyncSessionDeps {
+            // Every session shares this daemon's one global upload/download
+            // token-bucket pair (never an independent per-session copy).
+            rate_limiters: state.rate_limiters.clone(),
+            block_serve_engine: state.block_serve_engine.clone(),
+            // This session's own disk-headroom preflight is turned on only
+            // once `main.rs` has opted the whole daemon into enforcement
+            // (see `DaemonState::disk_headroom_enforcement_enabled`'s doc
+            // comment for why that's not just always-on here).
+            headroom_enforced: state.disk_headroom_enforcement_enabled(),
+            // Lets this session's `reconcile_one_file` force a racing local
+            // change out of this device's per-link debounce accumulators
+            // before comparing/applying a peer update — see
+            // `PendingLocalChangeFlush for DaemonState`'s doc comment
+            // (the daemon's own `LinkRuntimeController`).
+            pending_local_change_flush: state.clone(),
+            root_commit_authority_provider: state.clone(),
+            // Admit incoming change-history changes only when this device
+            // has pinned the author's signing key and the author is an
+            // authorized writer for the change's group — both mirrored from
+            // the netmap onto `DaemonState`. Without an authenticator a
+            // session announces heads and serves stored changes but never
+            // admits an incoming one.
+            change_authenticator: crate::change_auth::NetmapChangeAuthenticator::new(state.clone()),
+            // Lets this session author a captured change for content its
+            // own materialize path displaces during custody transfer (see
+            // `PeerSyncSession::set_change_emitter`'s doc comment). A device
+            // that has not yet been provisioned a signing key is left with
+            // no emitter -- the same fail-closed default the field itself
+            // documents -- so a future caller must retain rather than
+            // author in that case; it never falls back to an unsigned or
+            // wrong-identity write.
+            change_emitter: state.device_signing_key().map(|signing_key| {
+                Arc::new(yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
+                    state.device_id.clone(),
+                    signing_key,
+                ))
+            }),
+            // Lets this session answer an incoming peer `HandoffLeaseRequest`
+            // by running this device's own target-side lease flow — see
+            // `HandoffLeaseResponder for DaemonState`'s doc comment
+            // (`daemon_state.rs`).
+            handoff_lease_responder: state.clone(),
+            block_write_activity_provider: state.clone(),
+            // Lets this session answer an incoming peer `HandoffTicketRequest`
+            // (from a different device removing/revoking this one) by running
+            // this device's own removed-device-ticket flow — see
+            // `HandoffTicketResponder for DaemonState`'s doc comment
+            // (`daemon_state.rs`).
+            handoff_ticket_responder: state.clone(),
+            // Lets this session answer an incoming peer `RebootstrapSnapshotRequest`
+            // and process an incoming `RebootstrapSnapshotResponse` by running this
+            // device's own signing identity and pinned-key trust resolver — see
+            // `DaemonRebootstrapHandler`'s doc comment (`rebootstrap_handler.rs`).
+            rebootstrap_handler: crate::rebootstrap_handler::DaemonRebootstrapHandler::new(
+                state.clone(),
+            ),
+            ..PeerSyncSessionDeps::standalone()
+        };
+        let session = PeerSyncSession::new_with_dependencies(
             channel,
             local_device_id,
             peer_device_id.clone(),
-            state.sync_state.clone(),
-            state.block_store.clone(),
+            state.replica_coordinator.clone(),
+            Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                state.block_store.clone(),
+            )),
             shared_group_ids.clone(),
             sync_roots,
             Some(state.forward_tx.clone()),
+            dependencies,
         );
-        // Every session shares this daemon's one global upload/download
-        // token-bucket pair (never an independent per-session copy), and
-        // its own disk-headroom preflight is turned on only once
-        // `main.rs` has opted the whole daemon into enforcement (see
-        // `DaemonState::disk_headroom_enforcement_enabled`'s doc comment
-        // for why that's not just always-on here).
-        session.set_rate_limiters(state.rate_limiters.clone());
-        if state.disk_headroom_enforcement_enabled() {
-            session.set_headroom_enforced(true);
-        }
-        // Lets this session's `reconcile_one_file` force a racing local
-        // change out of this device's per-link debounce accumulators
-        // before comparing/applying a peer update — see
-        // `PendingLocalChangeFlush for DaemonState`'s doc comment
-        // (`link_manager.rs`).
-        session.set_pending_local_change_flush(state.clone());
-        // Admit incoming change-history changes only when this device has
-        // pinned the author's signing key and the author is an authorized
-        // writer for the change's group — both mirrored from the netmap onto
-        // `DaemonState`. Without an authenticator a session announces heads
-        // and serves stored changes but never admits an incoming one.
-        session.set_change_authenticator(crate::change_auth::NetmapChangeAuthenticator::new(
-            state.clone(),
-        ));
-        // Lets this session answer an incoming peer `HandoffLeaseRequest` by
-        // running this device's own target-side lease flow — see
-        // `HandoffLeaseResponder for DaemonState`'s doc comment
-        // (`daemon_state.rs`).
-        session.set_handoff_lease_responder(state.clone());
-        session.set_block_write_activity_provider(state.clone());
-        // Lets this session answer an incoming peer `HandoffTicketRequest`
-        // (from a different device removing/revoking this one) by running
-        // this device's own removed-device-ticket flow — see
-        // `HandoffTicketResponder for DaemonState`'s doc comment
-        // (`daemon_state.rs`).
-        session.set_handoff_ticket_responder(state.clone());
-        // Lets this session answer an incoming peer `RebootstrapSnapshotRequest`
-        // and process an incoming `RebootstrapSnapshotResponse` by running this
-        // device's own signing identity and pinned-key trust resolver — see
-        // `DaemonRebootstrapHandler`'s doc comment (`rebootstrap_handler.rs`).
-        session.set_rebootstrap_handler(crate::rebootstrap_handler::DaemonRebootstrapHandler::new(
-            state.clone(),
-        ));
-        state
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(peer_device_id.clone(), session.clone());
+        state.peers.register_session(peer_device_id.clone(), session.clone());
 
-        if let Err(e) = session.run().await {
+        if let Err(e) = session.clone().run().await {
             tracing::warn!(peer = %peer_device_id, error = %e, "peer sync session ended with an error");
         }
-        end_session(&state, &peer_device_id);
+        end_session_if_current(&state, &peer_device_id, &session);
         // The session ended on its own (not via `teardown_peer`, which
         // already would have removed this entry) — clean up the
         // bookkeeping `teardown_peer` would otherwise use to find a
@@ -1573,11 +1587,8 @@ async fn poll_reachability(
             };
             (map_transport_reachability(&reachability), connected_class)
         };
-        {
-            let mut statuses =
-                state.peer_statuses.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let Some(info) = statuses.get_mut(&peer_device_id) else { break }; // session ended
-            info.reachability = current;
+        if !state.peers.update_reachability_if_present(&peer_device_id, current) {
+            break; // session ended
         }
         // A reachability transition is itself a meaningful connection event
         // (a confirmed direct path, or the loss of one) — recorded once per
@@ -1618,7 +1629,7 @@ fn record_reachability_transition(
             // success — this keeps NAT classification from misjudging the
             // network as UDP-blocked once any peer connects.
             state.nat_observations.record_punch_attempt(true);
-            state.connection_traces.record(
+            state.telemetry.record_connection_attempt(
                 peer_device_id.to_string(),
                 CandidateSource::DirectPath,
                 connected_class.unwrap_or(AddressClass::Unknown),
@@ -1629,7 +1640,7 @@ fn record_reachability_transition(
                 Some(true),
             );
         }
-        PeerReachability::Unreachable(category) => state.connection_traces.record(
+        PeerReachability::Unreachable(category) => state.telemetry.record_connection_attempt(
             peer_device_id.to_string(),
             CandidateSource::DirectPath,
             AddressClass::Unknown,
@@ -1694,7 +1705,7 @@ fn map_transport_category(
 fn sync_roots_for_groups(state: &DaemonState, group_ids: &[String]) -> HashMap<String, PathBuf> {
     let mut roots = HashMap::new();
     for group_id in group_ids {
-        match state.sync_state.live_link_local_path_for_group(group_id) {
+        match state.replica_coordinator.link_repository().live_link_local_path_for_group(group_id) {
             Ok(Some(local_path)) => {
                 roots.insert(group_id.clone(), PathBuf::from(local_path));
             }
@@ -1885,58 +1896,73 @@ fn spawn_direct_peer_session(
             sync_roots = sync_roots_for_groups(&state, &shared_group_ids);
         }
 
-        let session = PeerSyncSession::new_with_forwarding(
+        let dependencies = PeerSyncSessionDeps {
+            rate_limiters: state.rate_limiters.clone(),
+            block_serve_engine: state.block_serve_engine.clone(),
+            headroom_enforced: state.disk_headroom_enforcement_enabled(),
+            pending_local_change_flush: state.clone(),
+            root_commit_authority_provider: state.clone(),
+            // Admit incoming change-history changes only when this device
+            // has pinned the author's signing key and the author is an
+            // authorized writer for the change's group — both mirrored from
+            // the netmap onto `DaemonState`. Without an authenticator a
+            // session announces heads and serves stored changes but never
+            // admits an incoming one.
+            change_authenticator: crate::change_auth::NetmapChangeAuthenticator::new(state.clone()),
+            // Lets this session author a captured change for content its
+            // own materialize path displaces during custody transfer (see
+            // `PeerSyncSession::set_change_emitter`'s doc comment). A device
+            // that has not yet been provisioned a signing key is left with
+            // no emitter -- the same fail-closed default the field itself
+            // documents -- so a future caller must retain rather than
+            // author in that case; it never falls back to an unsigned or
+            // wrong-identity write.
+            change_emitter: state.device_signing_key().map(|signing_key| {
+                Arc::new(yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
+                    state.device_id.clone(),
+                    signing_key,
+                ))
+            }),
+            // Lets this session answer an incoming peer `HandoffLeaseRequest`
+            // by running this device's own target-side lease flow — see
+            // `HandoffLeaseResponder for DaemonState`'s doc comment
+            // (`daemon_state.rs`).
+            handoff_lease_responder: state.clone(),
+            block_write_activity_provider: state.clone(),
+            // Lets this session answer an incoming peer `HandoffTicketRequest`
+            // (from a different device removing/revoking this one) by running
+            // this device's own removed-device-ticket flow — see
+            // `HandoffTicketResponder for DaemonState`'s doc comment
+            // (`daemon_state.rs`).
+            handoff_ticket_responder: state.clone(),
+            // Lets this session answer an incoming peer `RebootstrapSnapshotRequest`
+            // and process an incoming `RebootstrapSnapshotResponse` by running this
+            // device's own signing identity and pinned-key trust resolver — see
+            // `DaemonRebootstrapHandler`'s doc comment (`rebootstrap_handler.rs`).
+            rebootstrap_handler: crate::rebootstrap_handler::DaemonRebootstrapHandler::new(
+                state.clone(),
+            ),
+            ..PeerSyncSessionDeps::standalone()
+        };
+        let session = PeerSyncSession::new_with_dependencies(
             channel,
             local_device_id,
             peer_device_id.clone(),
-            state.sync_state.clone(),
-            state.block_store.clone(),
+            state.replica_coordinator.clone(),
+            Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                state.block_store.clone(),
+            )),
             shared_group_ids,
             sync_roots,
             Some(state.forward_tx.clone()),
+            dependencies,
         );
-        session.set_rate_limiters(state.rate_limiters.clone());
-        if state.disk_headroom_enforcement_enabled() {
-            session.set_headroom_enforced(true);
-        }
-        session.set_pending_local_change_flush(state.clone());
-        // Admit incoming change-history changes only when this device has
-        // pinned the author's signing key and the author is an authorized
-        // writer for the change's group — both mirrored from the netmap onto
-        // `DaemonState`. Without an authenticator a session announces heads
-        // and serves stored changes but never admits an incoming one.
-        session.set_change_authenticator(crate::change_auth::NetmapChangeAuthenticator::new(
-            state.clone(),
-        ));
-        // Lets this session answer an incoming peer `HandoffLeaseRequest` by
-        // running this device's own target-side lease flow — see
-        // `HandoffLeaseResponder for DaemonState`'s doc comment
-        // (`daemon_state.rs`).
-        session.set_handoff_lease_responder(state.clone());
-        session.set_block_write_activity_provider(state.clone());
-        // Lets this session answer an incoming peer `HandoffTicketRequest`
-        // (from a different device removing/revoking this one) by running
-        // this device's own removed-device-ticket flow — see
-        // `HandoffTicketResponder for DaemonState`'s doc comment
-        // (`daemon_state.rs`).
-        session.set_handoff_ticket_responder(state.clone());
-        // Lets this session answer an incoming peer `RebootstrapSnapshotRequest`
-        // and process an incoming `RebootstrapSnapshotResponse` by running this
-        // device's own signing identity and pinned-key trust resolver — see
-        // `DaemonRebootstrapHandler`'s doc comment (`rebootstrap_handler.rs`).
-        session.set_rebootstrap_handler(crate::rebootstrap_handler::DaemonRebootstrapHandler::new(
-            state.clone(),
-        ));
-        state
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(peer_device_id.clone(), session.clone());
+        state.peers.register_session(peer_device_id.clone(), session.clone());
 
-        if let Err(e) = session.run().await {
+        if let Err(e) = session.clone().run().await {
             tracing::warn!(peer = %peer_device_id, error = %e, "peer sync session ended with an error");
         }
-        end_session(&state, &peer_device_id);
+        end_session_if_current(&state, &peer_device_id, &session);
         diff_state
             .channels
             .lock()
@@ -1951,7 +1977,7 @@ mod tests {
     use boringtun::x25519::{PublicKey as X25519PublicKey, StaticSecret};
     use std::net::SocketAddr as StdSocketAddr;
     use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_sync_core::index::SyncState;
+    use crate::replica_coordinator::ReplicaCoordinator;
 
     #[test]
     fn peer_key_pinning_detects_key_changes() {
@@ -2045,7 +2071,7 @@ mod tests {
 
     // --- peer_orchestrator tests -------------------------------
     //
-    // `state.sessions`/`state.peer_statuses` are keyed on real
+    // `state.peers.sessions`/`state.peers.peer_statuses` are keyed on real
     // `Arc<PeerSyncSession>`/`PeerChannel` types from other crates, so a
     // couple of these tests build one real (but peer-less) `PeerChannel`
     // against a candidate address that never answers — a lightweight "fake
@@ -2056,7 +2082,7 @@ mod tests {
     fn test_state() -> Arc<DaemonState> {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-        let sync_state = Arc::new(SyncState::open_in_memory().unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         DaemonState::new("local-device".into(), sync_state, store)
     }
 
@@ -2073,12 +2099,12 @@ mod tests {
     #[tokio::test]
     async fn sync_roots_for_groups_omits_an_ambiguous_group() {
         let state = test_state();
-        state.sync_state.add_link("/home/alice/Photos", "group-1").unwrap();
+        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
         state
-            .sync_state
-            .force_second_live_link_for_test("/home/alice/PhotosCopy", "group-1")
+            .replica_coordinator
+            .link_repository().force_second_live_link_for_test("/home/alice/PhotosCopy", "group-1")
             .unwrap();
-        state.sync_state.add_link("/home/alice/Docs", "group-2").unwrap();
+        state.replica_coordinator.link_repository().add_link("/home/alice/Docs", "group-2").unwrap();
 
         let roots = sync_roots_for_groups(&state, &["group-1".to_string(), "group-2".to_string()]);
 
@@ -2096,9 +2122,9 @@ mod tests {
     #[tokio::test]
     async fn sync_roots_for_groups_excludes_an_orphaned_link() {
         let state = test_state();
-        state.sync_state.add_link("/home/alice/Photos", "group-1").unwrap();
-        state.sync_state.add_link("/home/alice/Docs", "group-2").unwrap();
-        state.sync_state.mark_link_orphaned("/home/alice/Photos").unwrap();
+        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
+        state.replica_coordinator.link_repository().add_link("/home/alice/Docs", "group-2").unwrap();
+        state.replica_coordinator.link_repository().mark_link_orphaned("/home/alice/Photos").unwrap();
 
         let roots = sync_roots_for_groups(&state, &["group-1".to_string(), "group-2".to_string()]);
 
@@ -2114,7 +2140,7 @@ mod tests {
         (secret, public)
     }
 
-    /// A `PeerChannel` that's real enough to exercise `state.sessions`'s
+    /// A `PeerChannel` that's real enough to exercise `state.peers.sessions`'s
     /// concrete type and to be handed to `poll_reachability`, but doesn't
     /// need (or wait for) an actual peer on the other end — its candidate
     /// address never answers, so the channel just races it and stays
@@ -2139,8 +2165,10 @@ mod tests {
             channel,
             "local-device".into(),
             "device-b".into(),
-            state.sync_state.clone(),
-            state.block_store.clone(),
+            state.replica_coordinator.clone(),
+            Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                state.block_store.clone(),
+            )),
             vec![],
             HashMap::new(),
             Some(state.forward_tx.clone()),
@@ -2157,11 +2185,7 @@ mod tests {
 
         assert!(!peer_already_connected(&state, "device-b"));
 
-        state
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert("device-b".into(), session);
+        state.peers.register_session("device-b".into(), session);
         assert!(peer_already_connected(&state, "device-b"));
         // An unrelated peer id is never suppressed by another peer's entry.
         assert!(!peer_already_connected(&state, "device-c"));
@@ -2171,11 +2195,7 @@ mod tests {
     async fn authoritative_netmap_replaces_metadata_for_an_existing_session() {
         let state = test_state();
         let session = fake_session(&state, fake_channel().await);
-        state
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert("device-b".into(), session.clone());
+        state.peers.register_session("device-b".into(), session.clone());
 
         let initial_groups = HashSet::from(["group-1".to_string(), "group-2".to_string()]);
         apply_authoritative_peer_metadata(
@@ -2324,29 +2344,20 @@ mod tests {
     async fn status_transitions_start_connecting_then_reach_a_terminal_state() {
         let state = test_state();
 
-        assert!(state
-            .peer_statuses
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get("device-b")
-            .is_none());
+        assert!(state.peers.reachability("device-b").is_none());
 
         mark_connecting(&state, "device-b");
         {
-            let statuses =
-                state.peer_statuses.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let info = statuses.get("device-b").unwrap();
-            assert_eq!(info.reachability, PeerReachability::Connecting);
-            assert!(!info.reachability.is_connected());
+            let reachability = state.peers.reachability("device-b").unwrap();
+            assert_eq!(reachability, PeerReachability::Connecting);
+            assert!(!reachability.is_connected());
         }
 
         set_reachability(&state, "device-b", PeerReachability::Connected);
         {
-            let statuses =
-                state.peer_statuses.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let info = statuses.get("device-b").unwrap();
-            assert!(info.reachability.is_connected());
-            assert_eq!(info.reachability.as_str(), "connected");
+            let reachability = state.peers.reachability("device-b").unwrap();
+            assert!(reachability.is_connected());
+            assert_eq!(reachability.as_str(), "connected");
         }
 
         set_reachability(
@@ -2355,12 +2366,10 @@ mod tests {
             PeerReachability::Unreachable(UnreachableCategory::NoResponse),
         );
         {
-            let statuses =
-                state.peer_statuses.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let info = statuses.get("device-b").unwrap();
-            assert!(!info.reachability.is_connected());
-            assert_eq!(info.reachability.as_str(), "unreachable");
-            assert_eq!(info.reachability.unreachable_category_str(), "no_response");
+            let reachability = state.peers.reachability("device-b").unwrap();
+            assert!(!reachability.is_connected());
+            assert_eq!(reachability.as_str(), "unreachable");
+            assert_eq!(reachability.unreachable_category_str(), "no_response");
         }
     }
 
@@ -2377,38 +2386,18 @@ mod tests {
 
         mark_connecting(&state, "device-b");
         set_reachability(&state, "device-b", PeerReachability::Connected);
-        state
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert("device-b".into(), session.clone());
+        state.peers.register_session("device-b".into(), session.clone());
 
         let poller =
             tokio::spawn(poll_reachability(state.clone(), "device-b".into(), channel.clone()));
 
-        assert!(state
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key("device-b"));
-        assert!(state
-            .peer_statuses
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key("device-b"));
+        assert!(state.peers.has_session("device-b"));
+        assert!(state.peers.reachability("device-b").is_some());
 
         end_session(&state, "device-b");
 
-        assert!(!state
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key("device-b"));
-        assert!(!state
-            .peer_statuses
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key("device-b"));
+        assert!(!state.peers.has_session("device-b"));
+        assert!(state.peers.reachability("device-b").is_none());
 
         // `poll_reachability` only checks every 2s; give it a couple of
         // ticks to observe the removed entry and exit.
@@ -2437,8 +2426,10 @@ mod tests {
             channel,
             "local-device".into(),
             peer_device_id.into(),
-            state.sync_state.clone(),
-            state.block_store.clone(),
+            state.replica_coordinator.clone(),
+            Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                state.block_store.clone(),
+            )),
             shared_group_ids,
             HashMap::new(),
             Some(state.forward_tx.clone()),
@@ -2446,8 +2437,8 @@ mod tests {
     }
 
     /// Registers a fake connected peer the same way `spawn_peer_session`
-    /// would once `PeerChannel::connect` succeeds: `state.sessions`,
-    /// `state.peer_statuses`, and `diff_state.channels` all populated —
+    /// would once `PeerChannel::connect` succeeds: `state.peers.sessions`,
+    /// `state.peers.peer_statuses`, and `diff_state.channels` all populated —
     /// everything `teardown_peer`/`apply_netmap_diff` act on.
     async fn register_fake_peer(
         state: &Arc<DaemonState>,
@@ -2458,11 +2449,7 @@ mod tests {
         let channel = fake_channel().await;
         let session = fake_session_for(state, channel.clone(), peer_device_id, shared_group_ids);
         set_reachability(state, peer_device_id, PeerReachability::Connected);
-        state
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(peer_device_id.to_string(), session);
+        state.peers.register_session(peer_device_id.to_string(), session);
         diff_state
             .channels
             .lock()
@@ -2475,9 +2462,9 @@ mod tests {
     /// the tunnel down entirely — `PeerChannel::revoke` is called (handshake-refusal
     /// primitive; exercised cryptographically for
     /// real in `yadorilink_transport::peer_channel`'s own tests) — *and*
-    /// immediately drops the peer from `state.sessions`, which is exactly
+    /// immediately drops the peer from `state.peers.sessions`, which is exactly
     /// what is required: `hydration.rs`'s `candidate_sessions` reads
-    /// `state.sessions` live, so removing it here is what makes the
+    /// `state.peers.sessions` live, so removing it here is what makes the
     /// device stop being offered as a hydration candidate right away,
     /// not merely once its session times out on its own.
     #[tokio::test]
@@ -2496,19 +2483,11 @@ mod tests {
 
         assert!(channel.is_revoked(), "whole-device revocation must revoke its PeerChannel");
         assert!(
-            !state
-                .sessions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .contains_key("device-b"),
-            "revoked device must be immediately gone from state.sessions, which hydration's \
+            !state.peers.has_session("device-b"),
+            "revoked device must be immediately gone from the peer registry, which hydration's \
              candidate_sessions reads live"
         );
-        assert!(!state
-            .peer_statuses
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key("device-b"));
+        assert!(state.peers.reachability("device-b").is_none());
         assert!(!diff_state
             .channels
             .lock()
@@ -2546,11 +2525,7 @@ mod tests {
             "a device that still shares another group must keep its tunnel up"
         );
         assert!(
-            state
-                .sessions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .contains_key("device-b"),
+            state.peers.has_session("device-b"),
             "a group-edge-only revocation must not remove the still-authorized session"
         );
         assert!(diff_state
@@ -2580,13 +2555,7 @@ mod tests {
             vec!["group-1".into(), "group-2".into()],
         )
         .await;
-        let session = state
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get("device-b")
-            .unwrap()
-            .clone();
+        let session = state.peers.session("device-b").unwrap();
         assert!(session.shares_group("group-1"));
         assert!(session.shares_group("group-2"));
 
@@ -2680,11 +2649,7 @@ mod tests {
         }
 
         assert!(channel.is_revoked());
-        assert!(!state
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key("device-b"));
+        assert!(!state.peers.has_session("device-b"));
         assert!(!diff_state
             .session_tasks
             .lock()
@@ -2699,7 +2664,7 @@ mod tests {
     /// unchanged by this task) only ever suppresses opening a *second*
     /// session for an already-connected peer; it never re-adds one that
     /// `apply_netmap_diff` just tore down within the same update, since
-    /// `teardown_peer` removes the `state.sessions` entry that check
+    /// `teardown_peer` removes the `state.peers.sessions` entry that check
     /// reads before the subsequent `for peer in update.peers` loop runs.
     #[test]
     fn diff_netmap_reused_from_transport_classifies_a_realistic_mixed_update() {

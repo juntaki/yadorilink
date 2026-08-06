@@ -4,31 +4,19 @@ mod http {
     //! peer, so grants carry no read/write distinction.
 
     use serde::{Deserialize, Serialize};
-    use uuid::Uuid;
     use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
     use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
     use yadorilink_ipc_proto::daemonctl::{
-        CheckFullReplicaHandoffReadyRequest, ListLinksRequest, PendingEnrollmentKind,
-        RemovePendingEnrollmentRequest, SetStorageModeRequest,
+        create_and_link_command_response, join_and_link_command_response,
+        revoke_device_command_response, revoke_edge_command_response, ApplicationErrorCode,
+        CheckFullReplicaHandoffReadyRequest, CreateAndLinkCommandRequest,
+        JoinAndLinkCommandRequest, ListLinksRequest, RevokeDeviceCommandRequest,
+        RevokeEdgeCommandRequest, SetStorageModeRequest,
     };
 
     use crate::control_client;
     use crate::error::CliError;
-    use crate::http_client::{
-        coordination_http_addr, get_json, post_json, post_json_no_content, require_access_token,
-    };
-    // Reuses the daemon crate's own activate/`ActivateOutcome` classification
-    // rather than re-deriving it here: `coordination_client::post_activate`
-    // already distinguishes a confirmed 404 (`Deleted`) from every other
-    // failure (`TransientFailure` -- network error, timeout, or any other
-    // non-2xx status), which is exactly the ambiguous-vs-confirmed
-    // distinction `activate_disposition` below needs. `pending_enrollment
-    // ::reconcile` (this same daemon crate) already relies on this exact
-    // classification for its own retry logic, so this keeps the CLI and the
-    // daemon's reconciliation sweep reading the SAME signal from the
-    // coordination plane instead of two independently-maintained ones.
-    use yadorilink_daemon::coordination_client::{activate_create, activate_join, ActivateOutcome};
-
+    use crate::http_client::{get_json, post_json_no_content, require_access_token};
     /// Maps the `--storage-mode` value to the daemon's `on_demand` flag:
     /// `eager` (store everything) links a fully-hydrated folder; `on-demand`
     /// (store only needed files) creates placeholders fetched on first access.
@@ -40,19 +28,6 @@ mod http {
                 "invalid --storage-mode {other:?} (expected eager or on-demand)"
             ))),
         }
-    }
-
-    /// The device id registered on this machine, or a friendly error pointing
-    /// the user at `device register`.
-    fn local_device_id() -> Result<String, CliError> {
-        crate::device_config::load()
-            .map_err(|_| {
-                CliError::Other(
-                    "no local device registered — run `yadorilink device register` first"
-                        .to_string(),
-                )
-            })
-            .map(|cfg| cfg.device_id)
     }
 
     #[derive(Deserialize)]
@@ -119,11 +94,6 @@ mod http {
         name: &'a str,
         creating_device_id: &'a str,
     }
-    #[derive(Deserialize)]
-    struct CreateGroupResponse {
-        group_id: String,
-    }
-
     // --- crash-safe Pending -> Active enrollment ----------------------------
     //
     // `create_and_link` and `join` (further down) authorize a device on the
@@ -135,12 +105,14 @@ mod http {
     // is the compensating delete for a still-Pending row when a step fails.
     // Every one is idempotent by `operationId`, generated fresh per attempt.
 
+    #[cfg(test)]
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct OperationIdBody<'a> {
         operation_id: &'a str,
     }
 
+    #[cfg(test)]
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct PrepareCreateRequest<'a> {
@@ -149,6 +121,7 @@ mod http {
         creating_device_id: &'a str,
     }
 
+    #[cfg(test)]
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct PrepareJoinRequest<'a> {
@@ -157,121 +130,12 @@ mod http {
         storage_mode: &'a str,
     }
 
+    #[cfg(test)]
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct JoinOperationBody<'a> {
         operation_id: &'a str,
         device_id: &'a str,
-    }
-
-    /// Confirms to the daemon that a pending-enrollment marker's
-    /// coordination-plane activation succeeded (or was compensated), so it
-    /// can drop the marker now instead of waiting for its own
-    /// `PENDING_ENROLLMENT_RECONCILE_SWEEP_INTERVAL`-paced sweep to notice
-    /// the same thing. Best-effort: if the daemon is unreachable, the
-    /// marker simply survives until that sweep runs, exactly as if this
-    /// call had never been made -- correctness never depends on it landing.
-    async fn remove_pending_enrollment_marker(operation_id: &str) {
-        if let Err(e) = control_client::send(ReqPayload::RemovePendingEnrollment(
-            RemovePendingEnrollmentRequest { operation_id: operation_id.to_string() },
-        ))
-        .await
-        {
-            tracing::debug!(
-                operation_id,
-                error = %e,
-                "failed to confirm pending-enrollment marker removal with the daemon; its own \
-                 reconciliation sweep will clean it up"
-            );
-        }
-    }
-
-    /// Bounded, backed-off, logged retries for a compensating cancel call
-    /// (CREATE's `/cancel` or JOIN's `/join/cancel`) — the immediate
-    /// compensation for a create/join whose local link or activate step
-    /// failed. Every failed attempt is logged with `operation_id` so one
-    /// enrollment's whole retry history is findable after the fact. A cancel
-    /// that outlasts every attempt is NOT escalated to the user as a second
-    /// error — the coordination plane's TTL sweep terminally removes a
-    /// still-Pending row that was never canceled, so the original failure is
-    /// what gets reported.
-    async fn cancel_with_retries<B: Serialize>(
-        path: &str,
-        body: &B,
-        access_token: &str,
-        operation_id: Uuid,
-    ) {
-        const MAX_ATTEMPTS: u32 = 3;
-        const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
-        for attempt in 1..=MAX_ATTEMPTS {
-            if post_json_no_content(path, body, Some(access_token)).await.is_ok() {
-                return;
-            }
-            tracing::warn!(
-                %operation_id,
-                path,
-                attempt,
-                max_attempts = MAX_ATTEMPTS,
-                "create/join enrollment compensation (cancel) failed; retrying"
-            );
-            if attempt < MAX_ATTEMPTS {
-                tokio::time::sleep(RETRY_BACKOFF).await;
-            }
-        }
-        tracing::warn!(
-            %operation_id,
-            path,
-            "enrollment compensation exhausted its retries; leaving the still-Pending row for the coordination plane's TTL sweep"
-        );
-    }
-
-    /// What to do locally once a create/join's activate call has resolved,
-    /// given as an [`ActivateOutcome`] rather than a raw HTTP success/failure
-    /// so a lost RESPONSE (a transport error, timeout, or 5xx -- all folded
-    /// into `TransientFailure` by `coordination_client::post_activate`) is
-    /// distinguishable from an explicit, confirmed "this operation was never
-    /// activated" (`Deleted`, a 404). Every prior version of `create_and_link`
-    /// / `join` rolled back (unlinked + canceled + dropped the marker) on ANY
-    /// activate failure -- including `TransientFailure`, where the
-    /// coordination plane may already have committed the activation and only
-    /// the response never arrived. That wrongly deleted a real local link
-    /// (and its marker) out from under a coordination-plane row the plane
-    /// itself still considers Active, reintroducing exactly the
-    /// phantom-full-replica-without-a-local-copy hazard this whole
-    /// enrollment protocol exists to prevent (just with the phantom now on
-    /// the *coordination* side instead of the local one).
-    enum ActivateDisposition {
-        /// Activated, or already active (a retry of an idempotent call) --
-        /// drop the marker and report success.
-        Finalize,
-        /// Confirmed permanently gone -- the ONLY outcome that rolls back
-        /// (unlink + cancel + drop the marker), because this is the one case
-        /// where the coordination plane has definitively said it never
-        /// committed.
-        RollBack,
-        /// Unconfirmed: a transport error, timeout, 5xx, or any other
-        /// unclassifiable failure. The coordination plane MAY have already
-        /// committed this activation -- fail safe by doing nothing
-        /// destructive. The local link and its pending-enrollment marker are
-        /// left exactly as they are; the daemon's own reconciliation sweep
-        /// (`pending_enrollment::reconcile`) is what resolves it from here,
-        /// by retrying activate once the plane is reachable again and either
-        /// finalizing (already committed) or rolling back (confirmed never
-        /// committed).
-        LeaveForReconcile,
-    }
-
-    fn activate_disposition(outcome: ActivateOutcome) -> ActivateDisposition {
-        match outcome {
-            ActivateOutcome::Success | ActivateOutcome::AlreadyActive => {
-                ActivateDisposition::Finalize
-            }
-            ActivateOutcome::Deleted => ActivateDisposition::RollBack,
-            // Fail-safe default: anything that isn't a clear, confirmed
-            // "never activated" answer is treated as ambiguous, never as a
-            // rollback trigger.
-            ActivateOutcome::TransientFailure => ActivateDisposition::LeaveForReconcile,
-        }
     }
 
     /// Create a group and link an already-resolved, already-preflighted local
@@ -283,10 +147,8 @@ mod http {
     /// link is rolled back, so no phantom full replica (an eager server edge
     /// with no local copy) is ever left counted. If activate instead comes
     /// back AMBIGUOUS (the response was lost, but the coordination plane may
-    /// already have committed it), nothing is rolled back -- see
-    /// `activate_disposition`'s doc comment for why guessing wrong there is
-    /// exactly as dangerous as the phantom this whole protocol prevents, just
-    /// on the opposite side. Returns the new group id. Shared by the CLI
+    /// already have committed it), the daemon leaves the link and marker for
+    /// reconciliation. Returns the new group id. Shared by the CLI
     /// `create` command (which preflights first) and the desktop onboarding
     /// wizard (which preflighted in its preview step).
     ///
@@ -306,100 +168,26 @@ mod http {
         on_demand: bool,
         acknowledge_risks: bool,
     ) -> Result<String, CliError> {
-        let access_token = require_access_token()?;
-        let device_id = local_device_id()?;
-        let operation_id = Uuid::new_v4();
-        let operation_id_str = operation_id.to_string();
-
-        // PREPARE: authorize a Pending group + the creating device's Pending
-        // eager membership. Neither counts anywhere the plane treats a row as
-        // real until activate, so a crash before then leaves nothing phantom.
-        let prepared: CreateGroupResponse = post_json(
-            "/shares/groups/prepare",
-            &PrepareCreateRequest {
-                operation_id: &operation_id_str,
-                name: &group_name,
-                creating_device_id: &device_id,
+        let response =
+            control_client::send(ReqPayload::CreateAndLinkCommand(CreateAndLinkCommandRequest {
+                group_name,
+                local_path: absolute_path.to_string_lossy().to_string(),
+                on_demand,
+                acknowledge_risks,
+            }))
+            .await?;
+        match response.payload {
+            Some(RespPayload::CreateAndLinkCommand(response)) => match response.result {
+                Some(create_and_link_command_response::Result::Outcome(outcome)) => {
+                    Ok(outcome.group_id)
+                }
+                Some(create_and_link_command_response::Result::Error(error)) => {
+                    Err(application_error(error))
+                }
+                None => Err(CliError::Other("daemon returned an empty create result".into())),
             },
-            Some(&access_token),
-        )
-        .await?;
-        let group_id = prepared.group_id;
-        tracing::debug!(
-            %operation_id,
-            %group_id,
-            "create_and_link: pending group prepared; committing local link"
-        );
-
-        // Commit the local link and its pending-enrollment marker together:
-        // the daemon writes both in one SQLite transaction
-        // (`SyncState::add_link_with_pending_enrollment`), so a failure here
-        // means neither exists -- there is no window where a real link
-        // exists with no marker (or vice versa). On failure, compensate by
-        // canceling the still-Pending group; nothing local needs cleaning up.
-        let local_path = absolute_path.to_string_lossy().to_string();
-        if let Err(link_err) = crate::commands::link::link_resolved_with_mode(
-            absolute_path,
-            group_id.clone(),
-            on_demand,
-            acknowledge_risks,
-            Some(crate::commands::link::PendingEnrollmentFields {
-                operation_id: operation_id_str.clone(),
-                kind: PendingEnrollmentKind::Create,
-                device_id,
-            }),
-        )
-        .await
-        {
-            cancel_with_retries(
-                &format!("/shares/groups/{group_id}/cancel"),
-                &OperationIdBody { operation_id: &operation_id_str },
-                &access_token,
-                operation_id,
-            )
-            .await;
-            return Err(link_err);
-        }
-
-        // ACTIVATE: flip the Pending group + creator edge to real. Only a
-        // CONFIRMED "never activated" outcome rolls the local link back and
-        // cancels the still-Pending group -- an ambiguous outcome (the
-        // response was lost, but the plane may have already committed)
-        // leaves the local link AND its pending-enrollment marker exactly as
-        // they are, so the daemon's own reconciliation sweep can resolve it
-        // instead of this process guessing wrong. See `activate_disposition`'s
-        // doc comment.
-        let outcome =
-            activate_create(&coordination_http_addr(), &access_token, &group_id, &operation_id_str)
-                .await;
-        match activate_disposition(outcome) {
-            ActivateDisposition::Finalize => {
-                remove_pending_enrollment_marker(&operation_id_str).await;
-                Ok(group_id)
-            }
-            ActivateDisposition::RollBack => {
-                let _ = crate::commands::link::send_unlink(&local_path, false).await;
-                cancel_with_retries(
-                    &format!("/shares/groups/{group_id}/cancel"),
-                    &OperationIdBody { operation_id: &operation_id_str },
-                    &access_token,
-                    operation_id,
-                )
-                .await;
-                remove_pending_enrollment_marker(&operation_id_str).await;
-                Err(CliError::Other(format!(
-                    "folder group {group_id} activation (operation {operation_id_str}) was not \
-                     confirmed by the coordination plane; rolled back the local link"
-                )))
-            }
-            ActivateDisposition::LeaveForReconcile => {
-                Err(CliError::EnrollmentPendingReconciliation(format!(
-                    "could not confirm activation of folder group {group_id} with the \
-                     coordination plane (operation {operation_id_str}); the local link and the \
-                     daemon's pending-enrollment marker were kept so the daemon can retry and \
-                     finish this automatically once the coordination plane is reachable again"
-                )))
-            }
+            Some(RespPayload::Error(error)) => Err(CliError::Other(error)),
+            _ => Err(CliError::Other("unexpected daemon response to create-and-link".into())),
         }
     }
 
@@ -443,9 +231,8 @@ mod http {
     /// `yadorilink share revoke <group> <device> [--force]`. Before touching
     /// the coordination plane, asks the local daemon whether `device_id`
     /// giving up this group would leave it without a confirmed-ready full
-    /// replica (see `commands::durability_force`'s doc comment for why this
-    /// is advisory and layered on top of the Worker's own count guard, not a
-    /// replacement for it). `--force` bypasses a refusal with a data-loss
+    /// replica. The daemon owns this fail-closed decision and the Worker's
+    /// count guard remains an independent final check. `--force` bypasses a refusal with a data-loss
     /// warning and an audit log line; without it, an unready revoke is
     /// refused before any coordination-plane write happens at all.
     pub async fn revoke(
@@ -455,60 +242,65 @@ mod http {
     ) -> Result<(), CliError> {
         let access_token = require_access_token()?;
         let group_id = resolve_group_id(&access_token, &group_name).await?;
-        let outcome = crate::commands::durability_force::guard_against_forced_replica_loss(
-            "revoke this device's access",
-            Some(group_id.clone()),
-            &device_id,
-            force,
-        )
-        .await?;
-        // A cross-device removal that went through the removed-device-ticket
-        // path already performed the revoke itself, atomically bound to the
-        // lease it presented -- see `RemovalOutcome`'s doc comment. Issuing
-        // the plain revoke below too would be the exact time-of-check/
-        // time-of-use gap this fix closes, so it only runs when the guard
-        // reports there is still a plain call left to make.
-        if outcome == crate::commands::durability_force::RemovalOutcome::ProceedWithPlainCall {
-            post_json_no_content(
-                &format!("/shares/groups/{group_id}/revoke"),
-                &DeviceIdBody { device_id: &device_id },
-                Some(&access_token),
-            )
+        let response =
+            control_client::send(ReqPayload::RevokeDeviceCommand(RevokeDeviceCommandRequest {
+                group_id,
+                device_id: device_id.clone(),
+                force,
+            }))
             .await?;
+        match response.payload {
+            Some(RespPayload::RevokeDeviceCommand(response)) => match response.result {
+                Some(revoke_device_command_response::Result::Outcome(outcome)) => {
+                    crate::commands::membership_render::render_membership_outcome("revoke", &outcome);
+                }
+                Some(revoke_device_command_response::Result::Error(error)) => {
+                    return Err(application_error(error));
+                }
+                None => {
+                    return Err(CliError::Other("daemon returned an empty revoke result".into()))
+                }
+            },
+            Some(RespPayload::Error(error)) => return Err(CliError::Other(error)),
+            _ => return Err(CliError::Other("unexpected daemon response to revoke".into())),
         }
         println!("Revoked {device_id} access to {group_name}");
         Ok(())
     }
 
-    /// `yadorilink share revoke <edge-id> [--force]`. Resolves the edge's
-    /// `group_id`/`device_id` from the account's own edge listing first so
-    /// the same durability readiness gate `revoke` runs can be applied here
-    /// too; an edge that can't be found in that listing (already revoked, or
-    /// belongs to a different account view) skips the gate and lets the
-    /// delete call report the real outcome.
+    /// `yadorilink share revoke <edge-id> [--force]`. The daemon resolves
+    /// `edge_id` to its `group_id`/`device_id` on the coordination plane and
+    /// runs the same durability readiness gate `revoke` runs; the CLI never
+    /// lists edges or deletes one directly over HTTP itself, so there is no
+    /// window between a listing and a delete where the gate could be
+    /// skipped. An edge that no longer exists is treated as already revoked.
     pub async fn revoke_edge(edge_id: String, force: bool) -> Result<(), CliError> {
-        let access_token = require_access_token()?;
-        let resp: ListSharesResponse = get_json("/shares", Some(&access_token)).await?;
-        // As with `revoke` above: a cross-device removal that already went
-        // through the removed-device-ticket path has performed the revoke
-        // itself, atomically bound to the presented lease -- the plain
-        // per-edge delete below must be skipped in that case, never issued
-        // as a redundant unconditional follow-up.
-        let mut already_completed = false;
-        if let Some(edge) = resp.edges.iter().find(|e| e.edge_id == edge_id) {
-            let outcome = crate::commands::durability_force::guard_against_forced_replica_loss(
-                "revoke this share edge",
-                Some(edge.group_id.clone()),
-                &edge.device_id,
+        let response =
+            control_client::send(ReqPayload::RevokeEdgeCommand(RevokeEdgeCommandRequest {
+                edge_id: edge_id.clone(),
                 force,
-            )
+            }))
             .await?;
-            already_completed =
-                outcome == crate::commands::durability_force::RemovalOutcome::AlreadyCompleted;
-        }
-        if !already_completed {
-            post_json_no_content::<()>(&format!("/shares/{edge_id}"), &(), Some(&access_token))
-                .await?;
+        match response.payload {
+            Some(RespPayload::RevokeEdgeCommand(response)) => match response.result {
+                Some(revoke_edge_command_response::Result::Outcome(outcome)) => {
+                    crate::commands::membership_render::render_membership_outcome("revoke", &outcome);
+                }
+                Some(revoke_edge_command_response::Result::Error(error)) => {
+                    if ApplicationErrorCode::try_from(error.code)
+                        .is_ok_and(|code| code == ApplicationErrorCode::TargetNotFound)
+                    {
+                        println!("Share edge already revoked: {edge_id}");
+                        return Ok(());
+                    }
+                    return Err(application_error(error));
+                }
+                None => {
+                    return Err(CliError::Other("daemon returned an empty revoke result".into()));
+                }
+            },
+            Some(RespPayload::Error(error)) => return Err(CliError::Other(error)),
+            _ => return Err(CliError::Other("unexpected daemon response to revoke".into())),
         }
         println!("Revoked share edge: {edge_id}");
         Ok(())
@@ -617,8 +409,7 @@ mod http {
     /// cancels only the Pending membership (never the group) and rolls the
     /// local link back; an AMBIGUOUS activate outcome instead leaves the
     /// local link and its marker in place for the daemon's reconciliation
-    /// sweep -- see `create_and_link`'s doc comment (identical reasoning) and
-    /// `activate_disposition`'s.
+    /// sweep -- see `create_and_link`'s doc comment for the identical reasoning.
     pub async fn join(
         group_name: String,
         path: String,
@@ -648,98 +439,44 @@ mod http {
         on_demand: bool,
         acknowledged: bool,
     ) -> Result<(), CliError> {
-        let access_token = require_access_token()?;
-        let device_id = local_device_id()?;
-        let operation_id = Uuid::new_v4();
-        let operation_id_str = operation_id.to_string();
         let local_path = absolute.to_string_lossy().to_string();
-
-        // PREPARE: authorize a Pending membership. It counts nowhere the plane
-        // treats a row as real until activate, so a crash before then strands
-        // nothing.
-        post_json_no_content(
-            &format!("/shares/groups/{group_id}/join/prepare"),
-            &PrepareJoinRequest {
-                operation_id: &operation_id_str,
-                device_id: &device_id,
-                storage_mode: storage_mode_str(on_demand),
+        let response =
+            control_client::send(ReqPayload::JoinAndLinkCommand(JoinAndLinkCommandRequest {
+                group_id,
+                group_name: group_name.clone(),
+                local_path: local_path.clone(),
+                on_demand,
+                acknowledge_risks: acknowledged,
+            }))
+            .await?;
+        match response.payload {
+            Some(RespPayload::JoinAndLinkCommand(response)) => match response.result {
+                Some(join_and_link_command_response::Result::Outcome(_)) => {
+                    println!(
+                        "Joined {group_name} and linked it at {local_path}{}",
+                        if on_demand { " (on-demand)" } else { "" },
+                    );
+                    Ok(())
+                }
+                Some(join_and_link_command_response::Result::Error(error)) => {
+                    Err(application_error(error))
+                }
+                None => Err(CliError::Other("daemon returned an empty join result".into())),
             },
-            Some(&access_token),
-        )
-        .await?;
-
-        // Commit the local link and its pending-enrollment marker together:
-        // the daemon writes both in one SQLite transaction
-        // (`SyncState::add_link_with_pending_enrollment`), so a failure here
-        // means neither exists. On failure, compensate by canceling the
-        // still-Pending membership; nothing local needs cleaning up.
-        if let Err(link_err) = crate::commands::link::link_resolved_with_mode(
-            absolute,
-            group_id.clone(),
-            on_demand,
-            acknowledged,
-            Some(crate::commands::link::PendingEnrollmentFields {
-                operation_id: operation_id_str.clone(),
-                kind: PendingEnrollmentKind::Join,
-                device_id: device_id.clone(),
-            }),
-        )
-        .await
-        {
-            cancel_with_retries(
-                &format!("/shares/groups/{group_id}/join/cancel"),
-                &JoinOperationBody { operation_id: &operation_id_str, device_id: &device_id },
-                &access_token,
-                operation_id,
-            )
-            .await;
-            return Err(link_err);
+            Some(RespPayload::Error(error)) => Err(CliError::Other(error)),
+            _ => Err(CliError::Other("unexpected daemon response to join-and-link".into())),
         }
+    }
 
-        // ACTIVATE. Only a CONFIRMED "never activated" outcome unlinks and
-        // cancels the Pending membership; an AMBIGUOUS outcome (response
-        // lost, plane may have already committed) leaves the local link and
-        // its marker untouched -- see `activate_disposition`'s doc comment.
-        let outcome = activate_join(
-            &coordination_http_addr(),
-            &access_token,
-            &group_id,
-            &operation_id_str,
-            &device_id,
-        )
-        .await;
-        match activate_disposition(outcome) {
-            ActivateDisposition::Finalize => {
-                remove_pending_enrollment_marker(&operation_id_str).await;
-                println!(
-                    "Joined {group_name} and linked it at {local_path}{}",
-                    if on_demand { " (on-demand)" } else { "" },
-                );
-                Ok(())
-            }
-            ActivateDisposition::RollBack => {
-                let _ = crate::commands::link::send_unlink(&local_path, false).await;
-                cancel_with_retries(
-                    &format!("/shares/groups/{group_id}/join/cancel"),
-                    &JoinOperationBody { operation_id: &operation_id_str, device_id: &device_id },
-                    &access_token,
-                    operation_id,
-                )
-                .await;
-                remove_pending_enrollment_marker(&operation_id_str).await;
-                Err(CliError::Other(format!(
-                    "joining folder group {group_name} (operation {operation_id_str}) was not \
-                     confirmed by the coordination plane; rolled back the local link"
-                )))
-            }
-            ActivateDisposition::LeaveForReconcile => {
-                Err(CliError::EnrollmentPendingReconciliation(format!(
-                    "could not confirm this device joining folder group {group_name} with the \
-                     coordination plane (operation {operation_id_str}); the local link and the \
-                     daemon's pending-enrollment marker were kept so the daemon can retry and \
-                     finish this automatically once the coordination plane is reachable again"
-                )))
-            }
+    fn application_error(
+        error: yadorilink_ipc_proto::daemonctl::ApplicationCommandError,
+    ) -> CliError {
+        if ApplicationErrorCode::try_from(error.code)
+            .is_ok_and(|code| code == ApplicationErrorCode::ActivationAmbiguous)
+        {
+            CliError::EnrollmentPendingReconciliation(error.message)
+        } else {
+            CliError::Other(error.message)
         }
     }
 
@@ -834,7 +571,16 @@ mod http {
         // `SetStorageModeResponse.handoff_result`'s own proto doc comment.
         if let Some(RespPayload::SetStorageMode(r)) = flip_resp.payload {
             if let Some(result) = r.handoff_result {
-                crate::commands::durability_force::print_handoff_result(&result);
+                println!(
+                    "  handoff completed: target={} membership_generation={}{}",
+                    result.target_device_id,
+                    result.membership_generation,
+                    if result.lease_id.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" lease={}", result.lease_id)
+                    }
+                );
             }
         }
         Ok(())
@@ -910,78 +656,6 @@ mod http {
         fn storage_mode_str_maps_the_on_demand_flag() {
             assert_eq!(storage_mode_str(false), "eager");
             assert_eq!(storage_mode_str(true), "on-demand");
-        }
-    }
-
-    // --- activate-response-loss fault injection (fix/activate-response-loss) --
-    //
-    // `activate_disposition` is the exact fix for the bug: every activate
-    // failure used to roll back (unlink + cancel + drop the marker)
-    // regardless of WHY it failed, so a lost response after the coordination
-    // plane had already committed the activation wrongly deleted a real
-    // local link out from under a row the plane still considers Active. Kept
-    // in its own module, separate from the request-body/formatting coverage
-    // in `mod tests` above.
-    #[cfg(test)]
-    mod activate_response_loss_tests {
-        use super::*;
-
-        #[test]
-        fn success_and_already_active_finalize() {
-            assert!(matches!(
-                activate_disposition(ActivateOutcome::Success),
-                ActivateDisposition::Finalize
-            ));
-            assert!(matches!(
-                activate_disposition(ActivateOutcome::AlreadyActive),
-                ActivateDisposition::Finalize
-            ));
-        }
-
-        /// The ONLY outcome that rolls back is a coordination-plane response
-        /// that explicitly and confirmedly says this operation was never
-        /// activated (a 404 -- `Deleted`).
-        #[test]
-        fn explicit_deleted_rolls_back() {
-            assert!(matches!(
-                activate_disposition(ActivateOutcome::Deleted),
-                ActivateDisposition::RollBack
-            ));
-        }
-
-        /// `coordination_client::post_activate` (this daemon-crate function
-        /// is reused verbatim by both `create_and_link` and `join`, not
-        /// re-implemented here) already folds a transport error, a timeout,
-        /// and any 5xx response into this same `TransientFailure` outcome --
-        /// none of them say anything final about whether the coordination
-        /// plane actually committed the activation. This is the crux of the
-        /// fix: every one of those must be handed to the daemon's
-        /// reconciliation loop, never treated as a rollback trigger.
-        #[test]
-        fn transient_failure_covering_transport_error_timeout_and_5xx_is_ambiguous_and_never_rolls_back(
-        ) {
-            assert!(matches!(
-                activate_disposition(ActivateOutcome::TransientFailure),
-                ActivateDisposition::LeaveForReconcile
-            ));
-        }
-
-        /// The scenario this whole fix targets: the coordination plane
-        /// actually committed the activation, but this process only ever
-        /// observes the ambiguous (lost-response) outcome -- there is no
-        /// separate "confirmed committed" signal the CLI can see at this
-        /// layer (that confirmation only ever arrives via a LATER, separate
-        /// call -- either this same operation retried, or the daemon's own
-        /// reconciliation sweep). `activate_disposition` must still resolve
-        /// to `LeaveForReconcile` here, exactly as it does for a genuine
-        /// outage: the CLI can never tell the two apart from a single failed
-        /// call, which is exactly why rolling back on ANY failure was wrong.
-        #[test]
-        fn activate_commits_but_response_is_lost_is_still_left_for_reconcile() {
-            assert!(matches!(
-                activate_disposition(ActivateOutcome::TransientFailure),
-                ActivateDisposition::LeaveForReconcile
-            ));
         }
     }
 }

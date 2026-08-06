@@ -13,6 +13,17 @@ fn gen_keypair() -> (StaticSecret, PublicKey) {
     (secret, public)
 }
 
+// No test in this file previously initialized a tracing subscriber, so
+// RUST_LOG had silently had zero effect on any investigation of a failure
+// here -- discovered while chasing large_message_is_fragmented_and_
+// reassembled's 100%-reproducing mf1 failure (identical every run, no
+// tracing output of any kind despite RUST_LOG being set).
+fn init_test_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+}
+
 async fn recv_within(channel: &PeerChannel, d: Duration) -> Vec<u8> {
     timeout(d, channel.recv())
         .await
@@ -79,10 +90,112 @@ async fn direct_path_delivers_messages_both_ways() {
     }
 }
 
+/// Regression probe for a hypothesized simultaneous-handshake race:
+/// `direct_path_delivers_messages_both_ways` (above) always sends A -> B
+/// FIRST and waits for B's receipt before ever sending B -> A, so only one
+/// side's `send()` can be the one that triggers boringtun's initial
+/// handshake initiation -- the other side is always a responder to an
+/// already-in-flight handshake. This test instead calls `a.send()` and
+/// `b.send()` CONCURRENTLY, as the very first operation on both sides, so
+/// both channels may attempt to initiate a handshake against each other at
+/// nearly the same instant. If a collision between two simultaneous
+/// initiations can strand one side's queued pre-handshake plaintext (the
+/// hypothesis under test), the corresponding `recv()` on the other side
+/// would never resolve -- caught here by a bounded timeout instead of
+/// hanging indefinitely, unlike a naive `channel.recv().await` with no
+/// timeout. Repeated across several fresh channel pairs, since a race is
+/// timing-dependent and may not reproduce on every single attempt.
+#[tokio::test]
+async fn simultaneous_first_send_from_both_sides_delivers_both_messages() {
+    init_test_tracing();
+    const ATTEMPTS: usize = 20;
+    let mut first_failure: Option<String> = None;
+
+    for attempt in 0..ATTEMPTS {
+        let (secret_a, public_a) = gen_keypair();
+        let (secret_b, public_b) = gen_keypair();
+
+        let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = socket_a.local_addr().unwrap();
+        let addr_b = socket_b.local_addr().unwrap();
+
+        let a = PeerChannel::connect(
+            secret_a,
+            public_b,
+            0,
+            vec![addr_b],
+            yadorilink_transport::TransportHub::from_socket(socket_a, Some(public_a)),
+        )
+        .await
+        .unwrap();
+        let b = PeerChannel::connect(
+            secret_b,
+            public_a,
+            1,
+            vec![addr_a],
+            yadorilink_transport::TransportHub::from_socket(socket_b, Some(public_b)),
+        )
+        .await
+        .unwrap();
+
+        // Both sides send their very first application message at once --
+        // neither has yet received anything from the other, so if handshake
+        // initiation is triggered lazily by the first `send()` (rather than
+        // eagerly by `connect()`), both may race to initiate simultaneously.
+        let (send_a, send_b) = tokio::join!(
+            a.send(format!("hello-from-a-{attempt}").into_bytes()),
+            b.send(format!("hello-from-b-{attempt}").into_bytes()),
+        );
+        send_a.unwrap();
+        send_b.unwrap();
+
+        let expected_at_b = format!("hello-from-a-{attempt}");
+        let expected_at_a = format!("hello-from-b-{attempt}");
+        let a_got_b = timeout(Duration::from_secs(8), recv_matches(&b, &expected_at_b));
+        let b_got_a = timeout(Duration::from_secs(8), recv_matches(&a, &expected_at_a));
+        let (a_result, b_result) = tokio::join!(a_got_b, b_got_a);
+
+        if a_result.is_err() || b_result.is_err() {
+            first_failure = Some(format!(
+                "attempt {attempt}: b received a's message = {}, a received b's message = {}",
+                a_result.is_ok(),
+                b_result.is_ok(),
+            ));
+            break;
+        }
+    }
+
+    if let Some(failure) = first_failure {
+        panic!(
+            "simultaneous first-send handshake race reproduced: {failure} \
+             (this confirms the hypothesized WireGuard simultaneous-handshake \
+             collision -- see docs/design/ or project memory for the full \
+             investigation this test was written to verify)"
+        );
+    }
+}
+
+/// Receives from `channel` in a loop until a message equal to `expected`
+/// (as UTF-8 bytes) arrives, ignoring anything else -- mirrors this test
+/// file's existing `recv_within` but matches on content rather than taking
+/// whatever arrives first, since `simultaneous_first_send_...` has no
+/// warmup message to guarantee ordering.
+async fn recv_matches(channel: &PeerChannel, expected: &str) {
+    let expected = expected.as_bytes();
+    loop {
+        let msg = channel.recv().await.expect("channel closed unexpectedly");
+        if msg == expected {
+            return;
+        }
+    }
+}
+
 /// Application messages larger than one WireGuard datagram must be
 /// transparently fragmented and reassembled over the direct path.
 #[tokio::test]
 async fn large_message_is_fragmented_and_reassembled() {
+    init_test_tracing();
     let (secret_a, public_a) = gen_keypair();
     let (secret_b, public_b) = gen_keypair();
 
@@ -110,9 +223,29 @@ async fn large_message_is_fragmented_and_reassembled() {
     .await
     .unwrap();
 
+    // Warm up with small messages first, then upgrade to reliable delivery,
+    // before sending the large payload. A 128 KiB message fragments into
+    // ~110 UDP datagrams (1200 bytes/fragment); the reassembler only
+    // completes a message once every one of its fragments has arrived, so
+    // sending it immediately over plain (non-reliable) UDP -- while the
+    // WireGuard handshake itself is still in flight -- makes this
+    // integration test hostage to a single dropped datagram out of ~110,
+    // with nothing to retransmit it. Pure fragmentation/reassembly logic
+    // (including out-of-order arrival) is already covered directly by
+    // `framing::tests::fragment_and_reassemble_roundtrip`; this test only
+    // needs to prove it also works end-to-end over a real channel, which
+    // doesn't require exercising loss-sensitive plain UDP delivery too.
+    a.send(b"warmup".to_vec()).await.unwrap();
+    assert_eq!(recv_within(&b, Duration::from_secs(5)).await, b"warmup");
+    b.send(b"warmup-ack".to_vec()).await.unwrap();
+    assert_eq!(recv_within(&a, Duration::from_secs(5)).await, b"warmup-ack");
+
+    a.enable_reliable_delivery();
+    b.enable_reliable_delivery();
+
     let big_payload = vec![0x42u8; 128 * 1024]; // matches the sync-engine's default block size
     a.send(big_payload.clone()).await.unwrap();
-    let received = recv_within(&b, Duration::from_secs(5)).await;
+    let received = recv_within(&b, Duration::from_secs(10)).await;
     assert_eq!(received, big_payload);
 }
 

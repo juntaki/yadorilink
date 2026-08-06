@@ -3,51 +3,59 @@
 //! `yadorilink-sync-core/src/hazard.rs`'s pure unit tests (`RESERVED_
 //! BASENAMES`, `invalid_name_reason`, `NamePolicy`), which only prove the
 //! hazard-detection *logic* in isolation against a bare `SyncState` +
-//! tempdir. This file instead exercises what actually happens end-to-end
-//! when two real devices race to create a hazardous name, going through
-//! the genuine peer-session reconcile/materialize/conflict path.
+//! tempdir, and to `yadorilink-sync-sqlite`'s own `dag_store::tests`
+//! (`admit_change_rejects_a_reserved_windows_device_name_path`/
+//! `emit_local_change_refuses_a_reserved_windows_device_name`/their
+//! trailing-dot/illegal-character siblings), which prove the DAG-admission
+//! rejection this file's scenarios 1-3 depend on returns the right `Result`
+//! directly, on both the receiving and local-authoring call sites, without
+//! any daemon/network machinery in the way. This file instead exercises
+//! what actually happens end-to-end when two real devices race to create a
+//! hazardous name over the real watcher/local-capture/peer-session/signing
+//! pipeline.
 //!
-//! Ground truth for every assertion below, read directly out of
-//! `peer_session.rs` before writing this file (not guessed):
+//! **Current understanding, read directly out of the source (this
+//! corrects an earlier version of this file's header, which described the
+//! OPPOSITE of scenarios 1-3's actual mechanism — the two must not be
+//! left contradicting each other in one file):**
 //!
-//! - `PeerSyncSession::hazard_reason_for` always evaluates
-//!   `hazard::NamePolicy::local` — i.e. gated on *this device's own*
-//!   real host platform, never on any wire-carried "I am Windows" flag.
-//!   Since both simulated devices in this file's tests share one OS
-//!   process, that means either *both* devices apply the Windows rules or
-//!   *neither* does — there is no way, within one test run, to have one
-//!   simulated device be "the Windows one." `cfg!(windows)` therefore
-//!   branches per test-run, not per device.
-//! - The hazard check only ever runs inside `materialize`/`hydrate_file`
-//!   — i.e. only when a device is about to write a *record* (its own or a
-//!   peer's) to disk. A file a device created itself via a direct
-//!   `std::fs::write` (discovered by `local_change.rs`'s scan/watch, not
-//!   routed through `materialize` at all — confirmed by grep: no
-//!   `hazard`/`held` reference anywhere in `local_change.rs`) is *never*
-//!   hazard-checked against its own device's policy; it simply sits on
-//!   disk. The hazard only ever bites the *other* device, when it
-//!   receives that record over the wire and tries to materialize it
-//!   locally.
-//! - `hold_record` (`peer_session.rs`) never renames and never writes
-//!   under any alternate name — a held record only gets a
-//!   `SyncState::upsert_file`/`set_held` pair; `SyncState::get_held_state`
-//!   is the direct, non-flaky way to observe that from a test, rather
-//!   than inferring "held" from a timing-sensitive absence-of-file check.
-//! - For a genuine same-path create/create race (scenario 1 below), both
-//!   devices run `resolve_and_apply_conflict`, which calls `materialize`
-//!   for *both* the winning path (the original name) and the losing path
-//!   (`conflict::conflict_copy_path`'s `"<stem> (conflicted copy, <ts>,
-//!  <device>).<ext>"` shape) — on both devices, since materializing the
-//!   locally-already-present side is not skipped just because it's
-//!   "already right" (its final path may have changed to the conflict-
-//!   copy name). Critically, `windows_invalid_name_detail`'s reserved-
-//!   basename check compares the stem *before the first `.`* for an exact
-//!   match — `"CON (conflicted copy,..., device-b)"` is not `"CON"`, so
-//!   the conflict-copy variant is never itself reserved even when the
-//!   original bare name is. That makes the Windows-specific outcome for
-//!   scenario 1 a verified prediction, not a guess: the original name is
-//!   held (never on disk, on either device), while the conflict-copy name
-//!   materializes normally.
+//! - Scenarios 1-3 below (`concurrent_create_of_a_windows_reserved_
+//!   basename`, `concurrent_create_with_trailing_dot_or_space`,
+//!   `concurrent_create_with_illegal_windows_characters`) all trip
+//!   `yadorilink_root_authority::reserved_namespace::path_has_non_
+//!   portable_wire_component`, invoked via `yadorilink_sync_sqlite::
+//!   dag_store::serving_authorization_index::validate_no_reserved_paths`.
+//!   Per that function's own doc comment ("An independent review's
+//!   finding"), this check is **platform-independent** (never gated on
+//!   `cfg!(windows)`) and runs on **both** the receiving side
+//!   (`admit_change`) and the local-authoring side (`emit_local_change`
+//!   and its own callers). So a hazardous name is refused DAG admission
+//!   the moment each device tries to capture its OWN local write — before
+//!   there is ever a change to send to a peer, let alone materialize or
+//!   hold. Each device keeps only its own local content forever; neither
+//!   ever learns the other created the same (or a different) hazardous
+//!   name at all. This is a permanent, by-design refusal, not a timing
+//!   gap, and it applies identically on every platform — there is no
+//!   "Windows device" vs. "non-Windows device" distinction for this check
+//!   at all, unlike scenario 4 below.
+//! - `PeerSyncSession::hazard_reason_for` (host-gated on
+//!   `hazard::NamePolicy::local`, evaluated only inside `materialize`/
+//!   `hydrate_file` when a device is about to write a RECEIVED record to
+//!   disk) is a SEPARATE, materialize-time mechanism this file's scenarios
+//!   1-3 do NOT exercise at all: `validate_no_reserved_paths` rejects
+//!   these hazardous names at DAG admission, before any of them could ever
+//!   reach a receiving device's `materialize` call. Since both simulated
+//!   devices in this file share one OS process, there is also no way,
+//!   within one test run, to have one simulated device be "the Windows
+//!   one" for that host-gated mechanism regardless — `cfg!(windows)` would
+//!   branch per test-run, not per device.
+//! - Scenario 4 (`long_path_near_windows_max_path_length`) is a genuinely
+//!   different, unrelated code path: Windows' `MAX_PATH` is an OS/Win32-API
+//!   constraint with nothing to do with `hazard.rs`'s or `reserved_
+//!   namespace`'s logic. Both devices' creates ARE admitted and
+//!   materialized normally here (a real create/create conflict-copy
+//!   scenario, same shape as `collision_matrix.rs`'s scenario 1) — this
+//!   scenario's own doc comment covers its own ground truth separately.
 
 mod support;
 
@@ -55,10 +63,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use support::{
-    open_file_backed_sync_state, real_entry_names, wait_until_with_context, TestAccount,
+    open_file_backed_replica_coordinator, real_entry_names, wait_until_with_context, TestAccount,
 };
+use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_daemon::link_manager;
 use yadorilink_local_storage::FsBlockStore;
 use yadorilink_transport::DeviceKeyPair;
 
@@ -73,7 +81,7 @@ struct TestDevice {
     _store_dir: tempfile::TempDir,
     // Uses file-backed WAL (production's concurrency model) instead of
     // open_in_memory's shared-cache backend — see
-    // open_file_backed_sync_state's doc comment. Held only to keep the
+    // open_file_backed_replica_coordinator's doc comment. Held only to keep the
     // backing temp file alive for the test's duration.
     _index_dir: tempfile::TempDir,
 }
@@ -83,7 +91,7 @@ async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
     let device_id = support::register_device(account, name, keypair.public_bytes()).await;
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-    let (sync_state, index_dir) = open_file_backed_sync_state();
+    let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
     let state = DaemonState::new(device_id.clone(), sync_state, store);
     // Give the device a change-signing key before its link watch starts (see
@@ -102,8 +110,10 @@ async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
 
 async fn start_watching(device: &TestDevice, group_id: &str) {
     let local_path = device.root.path().to_string_lossy().to_string();
-    device.state.sync_state.add_link(&local_path, group_id).unwrap();
-    link_manager::start_link_watch(device.state.clone(), local_path, group_id.to_string()).unwrap();
+    device.state.replica_coordinator.link_repository().add_link(&local_path, group_id).unwrap();
+    LinkRuntimeController::new(device.state.clone())
+        .start(local_path, group_id.to_string())
+        .unwrap();
 }
 
 async fn two_synced_devices(test_name: &str) -> (TestDevice, TestDevice, String) {
@@ -135,6 +145,52 @@ async fn two_synced_devices(test_name: &str) -> (TestDevice, TestDevice, String)
 
 fn is_conflict_copy(name: &str) -> bool {
     name.contains("conflicted copy")
+}
+
+/// Creates an ordinary, non-hazardous file on `writer` and waits for it to
+/// propagate to `reader` -- proof that the watcher, local-capture, peer
+/// session, and signing are all genuinely live for this pairing, not merely
+/// that "nothing arrived" (which would be trivially true if the whole
+/// pipeline were dead). Every scenario below that expects a hazardous name
+/// to be permanently, silently refused calls this alongside its hazardous
+/// write, so a failure to observe non-propagation is distinguishable from a
+/// pipeline that simply never ran.
+async fn prove_pipeline_is_live_with_a_sentinel_file(
+    writer: &TestDevice,
+    reader: &TestDevice,
+    sentinel_name: &str,
+) {
+    let content = format!("sentinel content proving the pipeline is live: {sentinel_name}");
+    std::fs::write(writer.root.path().join(sentinel_name), content.as_bytes()).unwrap();
+    wait_until_with_context(
+        || std::fs::read(reader.root.path().join(sentinel_name)).ok().as_deref() == Some(content.as_bytes()),
+        Duration::from_secs(15),
+        || {
+            format!(
+                "sentinel file {sentinel_name:?} never propagated -- the watcher/local-capture/\
+                 peer-session/signing pipeline itself may not be live, which would make any \
+                 \"the hazardous name never arrived\" observation elsewhere in this test \
+                 meaningless: reader entries={:?}",
+                real_entry_names(reader.root.path())
+            )
+        },
+    )
+    .await;
+}
+
+/// Whether `device`'s own local file index/DAG ever admitted `path` for
+/// `group_id` -- the direct, non-flaky way to check "this path never
+/// entered the local index or DAG," rather than inferring it from an
+/// absence on the OTHER device (which conflates "never admitted locally"
+/// with "admitted locally but never delivered/received").
+fn admitted_to_local_index(device: &TestDevice, group_id: &str, path: &str) -> bool {
+    device
+        .state
+        .replica_coordinator
+        .file_index_repository()
+        .get_file(group_id, path)
+        .unwrap()
+        .is_some()
 }
 
 /// A directory's real (non-artifact) entries as a name→content map — plain
@@ -182,10 +238,38 @@ fn host_supports_literal_filename(name: &str) -> bool {
 // --- Scenario 1: concurrent create of a Windows-reserved device basename ----
 
 /// Both devices concurrently create a file named `CON.txt` — a Windows-
-/// reserved device basename (`hazard.rs`'s `RESERVED_BASENAMES`) — with
-/// different content, racing exactly like `collision_matrix.rs` scenario 1's
-/// ordinary edit-edit conflict, except at a name that is only ordinary on
-/// some platforms.
+/// reserved device basename.
+///
+/// **Corrected from this file's original premise** (see the module header's
+/// "ground truth" list): that list only accounted for `hazard_reason_for`'s
+/// MATERIALIZE-time, host-gated (`NamePolicy::local`) hold. There is a
+/// SEPARATE, always-on, platform-INDEPENDENT check that runs first and
+/// supersedes it for this exact hazard shape: `yadorilink_root_authority::
+/// reserved_namespace::path_has_non_portable_wire_component` (via
+/// `yadorilink_sync_sqlite::dag_store::serving_authorization_index::
+/// validate_no_reserved_paths`) flags any path whose basename is a Windows
+/// reserved device name (`is_windows_reserved_device_name` — `"CON"` among
+/// them, matched on the stem before the first `.`, so `"CON.txt"`
+/// qualifies), and — per `dag_store::emit_local_change`'s own doc comment
+/// on "An independent review's finding" — this check now runs on BOTH the
+/// receiving side (`admit_change`) AND the local-authoring side
+/// (`emit_local_change`), on every platform, not gated on `cfg!(windows)`
+/// at all. So `CON.txt` is refused a DAG admission at the moment each
+/// device tries to CAPTURE its own local write, before there is ever a
+/// change to send to a peer, let alone materialize/hold. Confirmed by
+/// direct observation on this (non-Windows) host: instrumented polling
+/// showed each device keeps only its own local content forever, with
+/// neither ever learning the other created the same name at all — not a
+/// timing gap, a permanent, by-design refusal. Since the admission check
+/// is host-independent by its own doc's explicit design goal ("every peer
+/// in a group ... must reach the identical verdict for the identical wire
+/// path"), the SAME refusal applies on a genuine Windows host too — the
+/// `hazard_reason_for`/`held` mechanism this test originally exercised is
+/// simply unreachable for this input on any platform, since the admission
+/// check throws first. This still needs live re-verification on a real
+/// Windows machine (nothing here runs one), but it is the correct
+/// prediction from what the source actually does, not a guess -- same
+/// caveat as `long_path_near_windows_max_path_length`'s own doc comment.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_create_of_a_windows_reserved_basename() {
     let (device_a, device_b, group_id) =
@@ -195,110 +279,79 @@ async fn concurrent_create_of_a_windows_reserved_basename() {
     tokio::time::sleep(Duration::from_millis(30)).await; // distinguishable mtime ordering
     std::fs::write(device_b.root.path().join("CON.txt"), b"from B, different and longer").unwrap();
 
-    if cfg!(windows) {
-        // Verified from peer_session.rs (see this file's header comment):
-        // the winning side's path is still literally "CON.txt", which
-        // `hazard_reason_for` holds on *both* devices (each applies its own
-        // NamePolicy::local when materializing the record assigned to
-        // that path) — so it must never appear as a real on-disk entry on
-        // either device, while the conflict-copy side (a different stem)
-        // must materialize normally on both.
-        wait_until_with_context(
-            || {
-                device_a.state.sync_state.get_held_state(&group_id, "CON.txt").unwrap().is_some()
-                    && device_b
-                        .state
-                        .sync_state
-                        .get_held_state(&group_id, "CON.txt")
-                        .unwrap()
-                        .is_some()
-            },
-            Duration::from_secs(20),
-            || "expected \"CON.txt\" to end up held on both devices under a Windows policy".into(),
-        )
-        .await;
+    // Proves the pipeline is genuinely alive (watcher/local-capture/peer-
+    // session/signing all ran for real) before trusting the "CON.txt never
+    // arrived" observation below -- otherwise that observation would be
+    // trivially true even if nothing ran at all. Also doubles as the wait
+    // itself: a same-content, cross-device round trip is strictly slower
+    // than a single device's own local DAG-admission attempt, so once this
+    // returns, CON.txt's own (much faster, purely local) admission attempt
+    // has certainly already been made and refused, if it was ever going to
+    // succeed at all.
+    prove_pipeline_is_live_with_a_sentinel_file(
+        &device_a,
+        &device_b,
+        "sentinel-reserved-basename-a-to-b.txt",
+    )
+    .await;
+    prove_pipeline_is_live_with_a_sentinel_file(
+        &device_b,
+        &device_a,
+        "sentinel-reserved-basename-b-to-a.txt",
+    )
+    .await;
 
-        // Full name→content convergence (not a bare name-set equality): both
-        // devices must agree on the conflict-copy artifact's bytes, not just
-        // that both happen to list a conflict-copy name.
-        wait_until_with_context(
-            || {
-                let a = snapshot(device_a.root.path());
-                let b = snapshot(device_b.root.path());
-                a == b && a.keys().any(|n| is_conflict_copy(n))
-            },
-            Duration::from_secs(20),
-            || {
-                format!(
-                    "device-a={:?} device-b={:?}",
-                    real_entry_names(device_a.root.path()),
-                    real_entry_names(device_b.root.path())
-                )
-            },
-        )
-        .await;
+    // Both devices keep their OWN local `CON.txt` -- never admitted to the
+    // DAG, so never overwritten by a peer's version either. The name being
+    // present on both sides is expected; what proves non-propagation is
+    // that each side's CONTENT is still exactly, only, what that device
+    // itself wrote (never the other device's bytes).
+    let names_a = real_entry_names(device_a.root.path());
+    let names_b = real_entry_names(device_b.root.path());
+    assert!(names_a.contains(&"CON.txt".to_string()), "{names_a:?}");
+    assert!(names_b.contains(&"CON.txt".to_string()), "{names_b:?}");
+    assert_eq!(std::fs::read(device_a.root.path().join("CON.txt")).unwrap(), b"from A");
+    assert_eq!(
+        std::fs::read(device_b.root.path().join("CON.txt")).unwrap(),
+        b"from B, different and longer"
+    );
 
-        let names = real_entry_names(device_a.root.path());
-        assert!(
-            !names.contains(&"CON.txt".to_string()),
-            "held name must never reach disk: {names:?}"
-        );
-        assert_eq!(names.iter().filter(|n| is_conflict_copy(n)).count(), 1, "{names:?}");
-    } else {
-        // Not reserved on the current (non-Windows) host platform:
-        // NamePolicy::local is Posix, so `invalid_name_reason` always
-        // returns None here (hazard.rs's own
-        // `posix_policy_never_holds_anything_windows_would_reject` unit
-        // test already pins that down) — this degenerates to an ordinary
-        // create/create conflict, same shape as collision_matrix.rs
-        // scenario 1.
-        //
-        // Deliberately not plain `wait_for_convergence`: both devices
-        // trivially agree on `["CON.txt"]` the instant the two
-        // `std::fs::write` calls complete — before either device's
-        // debounce window, let alone real conflict resolution, has run at
-        // all — so a bare name-set-equality wait returns immediately and
-        // this assertion would then race real synchronization instead of
-        // waiting for it (the exact premature-convergence trap
-        // `collision_matrix.rs`'s `concurrent_edit_edit_keeps_both_copies_
-        // as_original_plus_conflict_copy` documents and works around).
-        // Wait for the conflict-copy artifact to actually exist AND for
-        // both devices to agree on every file's *content* (a name→content
-        // snapshot), so this can't pass on a transient name-set match
-        // before content has propagated under each name.
-        wait_until_with_context(
-            || {
-                let a = snapshot(device_a.root.path());
-                let b = snapshot(device_b.root.path());
-                a.len() > 1 && a == b
-            },
-            Duration::from_secs(20),
-            || {
-                format!(
-                    "device-a={:?} device-b={:?}",
-                    real_entry_names(device_a.root.path()),
-                    real_entry_names(device_b.root.path())
-                )
-            },
-        )
-        .await;
-
-        let names = real_entry_names(device_a.root.path());
-        assert!(names.contains(&"CON.txt".to_string()), "{names:?}");
-        assert_eq!(names.iter().filter(|n| is_conflict_copy(n)).count(), 1, "{names:?}");
-    }
+    // Not just "never appeared on the other device" (which the filesystem
+    // assertions above already cover) -- directly confirm the hazardous
+    // path never entered either device's own local file index/DAG at all,
+    // the repository-level observation a reviewer's finding asked this
+    // file to add.
+    assert!(
+        !admitted_to_local_index(&device_a, &group_id, "CON.txt"),
+        "CON.txt must never have been admitted to device-a's own local index/DAG"
+    );
+    assert!(
+        !admitted_to_local_index(&device_b, &group_id, "CON.txt"),
+        "CON.txt must never have been admitted to device-b's own local index/DAG"
+    );
 }
 
 // --- Scenario 2: concurrent create of trailing-dot vs. trailing-space names -
 
 /// One device creates `notes.txt.` (trailing dot), the other creates
-/// `notes.txt ` (trailing space) — two hazardous name variants on Windows,
-/// but two ordinary and completely distinct filenames on the current host
-/// whenever it isn't Windows. Since the two strings are literally different,
-/// `hazard::case_fold_collision` (which only ever compares same-directory
-/// siblings that fold to the same lowercase name) never even considers them
-/// related to one another — this is not a collision at any layer except
-/// each name's own individual Windows-invalid-name check.
+/// `notes.txt ` (trailing space) — two hazardous name variants on Windows.
+/// Since the two strings are literally different, `hazard::
+/// case_fold_collision` (which only ever compares same-directory siblings
+/// that fold to the same lowercase name) never even considers them related
+/// to one another — this is not a collision at any layer except each name's
+/// own individual Windows-invalid-name check.
+///
+/// **Corrected from this file's original premise**, same root cause and
+/// same fix rationale as `concurrent_create_of_a_windows_reserved_
+/// basename`'s own doc comment: `path_has_non_portable_wire_component`
+/// treats a name a Windows peer's own trailing-dot/space normalization
+/// would silently alter (`strip_windows_trailing_normalization(component)
+/// != component`, true for both `"notes.txt."` and `"notes.txt "`) as
+/// non-portable, checked at DAG admission on both the receiving AND the
+/// local-authoring side, on every platform — so neither device's own write
+/// is ever admitted to the DAG at all, on either platform. Each device
+/// keeps only its own local file, forever; the two are never even offered
+/// to each other, let alone held or hazard-checked on receipt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_create_with_trailing_dot_or_space() {
     if !host_supports_literal_filename("probe.txt.")
@@ -317,73 +370,55 @@ async fn concurrent_create_with_trailing_dot_or_space() {
     std::fs::write(device_a.root.path().join("notes.txt."), b"trailing dot from A").unwrap();
     std::fs::write(device_b.root.path().join("notes.txt "), b"trailing space from B").unwrap();
 
-    if cfg!(windows) {
-        // Two unrelated, non-colliding paths -- each is hazard-checked only
-        // by the *receiving* device (see header comment: a device's own
-        // locally-authored file never goes through `materialize` at all).
-        // So device-b must hold A's "notes.txt." (never write it under
-        // that name), and device-a must hold B's "notes.txt " -- while
-        // each device's own locally-created file is untouched on its own
-        // disk, since local_change.rs never hazard-checks a device's own
-        // already-on-disk file.
-        wait_until_with_context(
-            || {
-                device_b.state.sync_state.get_held_state(&group_id, "notes.txt.").unwrap().is_some()
-                    && device_a
-                        .state
-                        .sync_state
-                        .get_held_state(&group_id, "notes.txt ")
-                        .unwrap()
-                        .is_some()
-            },
-            Duration::from_secs(20),
-            || "expected device-b to hold A's trailing-dot name and device-a to hold B's trailing-space name".into(),
-        )
-        .await;
+    // Proves the pipeline is genuinely alive before trusting the
+    // non-propagation observation below -- see scenario 1's doc comment for
+    // why this matters and why it also serves as the wait itself.
+    prove_pipeline_is_live_with_a_sentinel_file(
+        &device_a,
+        &device_b,
+        "sentinel-trailing-dot-space-a-to-b.txt",
+    )
+    .await;
+    prove_pipeline_is_live_with_a_sentinel_file(
+        &device_b,
+        &device_a,
+        "sentinel-trailing-dot-space-b-to-a.txt",
+    )
+    .await;
 
-        let a_names = real_entry_names(device_a.root.path());
-        let b_names = real_entry_names(device_b.root.path());
-        assert!(a_names.contains(&"notes.txt.".to_string()), "{a_names:?}");
-        assert!(
-            !a_names.contains(&"notes.txt ".to_string()),
-            "held, must not reach disk: {a_names:?}"
-        );
-        assert!(b_names.contains(&"notes.txt ".to_string()), "{b_names:?}");
-        assert!(
-            !b_names.contains(&"notes.txt.".to_string()),
-            "held, must not reach disk: {b_names:?}"
-        );
-    } else {
-        // Ordinary, non-hazardous, non-colliding filenames here: both must
-        // simply coexist as two distinct real files on both devices once
-        // sync converges -- never a conflict of any kind. Wait on a full
-        // name→content snapshot so this holds only once each device has
-        // actually materialized the peer's file (with its bytes), not the
-        // instant both filenames merely appear in the listing.
-        wait_until_with_context(
-            || {
-                let a = snapshot(device_a.root.path());
-                let b = snapshot(device_b.root.path());
-                a == b && a.contains_key("notes.txt.") && a.contains_key("notes.txt ")
-            },
-            Duration::from_secs(20),
-            || {
-                format!(
-                    "device-a={:?} device-b={:?}",
-                    real_entry_names(device_a.root.path()),
-                    real_entry_names(device_b.root.path())
-                )
-            },
-        )
-        .await;
+    let a_names = real_entry_names(device_a.root.path());
+    let b_names = real_entry_names(device_b.root.path());
+    assert!(
+        a_names.contains(&"notes.txt.".to_string()) && !b_names.contains(&"notes.txt.".to_string()),
+        "device-a's own trailing-dot write must stay exactly as this device wrote it, and must \
+         never reach device-b: device-a={a_names:?} device-b={b_names:?}"
+    );
+    assert!(
+        b_names.contains(&"notes.txt ".to_string()) && !a_names.contains(&"notes.txt ".to_string()),
+        "device-b's own trailing-space write must stay exactly as this device wrote it, and must \
+         never reach device-a: device-a={a_names:?} device-b={b_names:?}"
+    );
+    assert_eq!(
+        std::fs::read(device_a.root.path().join("notes.txt.")).unwrap(),
+        b"trailing dot from A"
+    );
+    assert_eq!(
+        std::fs::read(device_b.root.path().join("notes.txt ")).unwrap(),
+        b"trailing space from B"
+    );
 
-        let names = real_entry_names(device_a.root.path());
-        assert_eq!(
-            names.iter().filter(|n| is_conflict_copy(n)).count(),
-            0,
-            "two literally-distinct names must never produce a conflict copy: {names:?}"
-        );
-    }
+    // Directly confirm neither hazardous path ever entered either device's
+    // own local file index/DAG, not just "never appeared on the other
+    // device."
+    assert!(
+        !admitted_to_local_index(&device_a, &group_id, "notes.txt."),
+        "notes.txt. must never have been admitted to device-a's own local index/DAG"
+    );
+    assert!(
+        !admitted_to_local_index(&device_b, &group_id, "notes.txt "),
+        "notes.txt  (trailing space) must never have been admitted to device-b's own local \
+         index/DAG"
+    );
 }
 
 // --- Scenario 3: concurrent create with Windows-illegal characters ---------
@@ -391,8 +426,13 @@ async fn concurrent_create_with_trailing_dot_or_space() {
 /// Both devices create files whose names contain characters illegal on
 /// Windows (`<>:"|?*`) at two distinct, non-colliding names. Same shape as
 /// scenario 2 (two independent hazardous-elsewhere names, not a collision
-/// with each other) but exercising the forbidden-character branch of
-/// `windows_invalid_name_detail` rather than the trailing-dot/space branch.
+/// with each other) but exercising `path_has_non_portable_wire_component`'s
+/// forbidden-character/colon branch rather than its trailing-dot/space
+/// branch — both are DAG-admission-time checks, per the module header; this
+/// scenario does NOT exercise `windows_invalid_name_detail` (a
+/// materialize-time branch this file's scenarios no longer reach for any
+/// of these hazard shapes, corrected from an earlier version of this
+/// comment).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_create_with_illegal_windows_characters() {
     let name_a = "report:v2.txt";
@@ -411,63 +451,56 @@ async fn concurrent_create_with_illegal_windows_characters() {
     std::fs::write(device_a.root.path().join(name_a), b"colon name from A").unwrap();
     std::fs::write(device_b.root.path().join(name_b), b"angle bracket name from B").unwrap();
 
-    if cfg!(windows) {
-        // Same asymmetric held-on-the-receiver-only shape as scenario 2:
-        // each device's own locally-authored illegal-character file stays
-        // untouched on its own disk (never hazard-checked, matching header
-        // comment), while the *other* device holds it on receipt and never
-        // writes it under that name.
-        wait_until_with_context(
-            || {
-                device_b.state.sync_state.get_held_state(&group_id, name_a).unwrap().is_some()
-                    && device_a
-                        .state
-                        .sync_state
-                        .get_held_state(&group_id, name_b)
-                        .unwrap()
-                        .is_some()
-            },
-            Duration::from_secs(20),
-            || format!("expected device-b to hold {name_a:?} and device-a to hold {name_b:?}"),
-        )
-        .await;
+    // Proves the pipeline is genuinely alive before trusting the
+    // non-propagation observation below -- both `:` and `< >` are in
+    // `wire_component_is_non_portable`'s `WINDOWS_RESERVED_FILENAME_CHARS`/
+    // colon check, so neither device's own write is ever admitted to the
+    // DAG at all, on either platform -- same root cause and fix rationale
+    // as `concurrent_create_of_a_windows_reserved_basename`'s own doc
+    // comment. See that scenario's doc comment for why the sentinel also
+    // serves as the wait itself.
+    prove_pipeline_is_live_with_a_sentinel_file(
+        &device_a,
+        &device_b,
+        "sentinel-illegal-characters-a-to-b.txt",
+    )
+    .await;
+    prove_pipeline_is_live_with_a_sentinel_file(
+        &device_b,
+        &device_a,
+        "sentinel-illegal-characters-b-to-a.txt",
+    )
+    .await;
 
-        let a_names = real_entry_names(device_a.root.path());
-        let b_names = real_entry_names(device_b.root.path());
-        assert!(a_names.contains(&name_a.to_string()), "{a_names:?}");
-        assert!(!a_names.contains(&name_b.to_string()), "held, must not reach disk: {a_names:?}");
-        assert!(b_names.contains(&name_b.to_string()), "{b_names:?}");
-        assert!(!b_names.contains(&name_a.to_string()), "held, must not reach disk: {b_names:?}");
-    } else {
-        // Neither name is hazardous under a Posix policy -- both must
-        // propagate end to end and converge on both devices, since the
-        // hazard logic exists to protect a Windows peer even when this
-        // particular test happens to run on a non-Windows one. Wait on a
-        // full name→content snapshot so convergence means both devices hold
-        // both files with their correct bytes, not just matching names.
-        wait_until_with_context(
-            || {
-                let a = snapshot(device_a.root.path());
-                let b = snapshot(device_b.root.path());
-                a == b && a.contains_key(name_a) && a.contains_key(name_b)
-            },
-            Duration::from_secs(20),
-            || {
-                format!(
-                    "device-a={:?} device-b={:?}",
-                    real_entry_names(device_a.root.path()),
-                    real_entry_names(device_b.root.path())
-                )
-            },
-        )
-        .await;
+    let a_names = real_entry_names(device_a.root.path());
+    let b_names = real_entry_names(device_b.root.path());
+    assert!(
+        a_names.contains(&name_a.to_string()) && !b_names.contains(&name_a.to_string()),
+        "device-a's own illegal-character write must stay exactly as this device wrote it, and \
+         must never reach device-b: device-a={a_names:?} device-b={b_names:?}"
+    );
+    assert!(
+        b_names.contains(&name_b.to_string()) && !a_names.contains(&name_b.to_string()),
+        "device-b's own illegal-character write must stay exactly as this device wrote it, and \
+         must never reach device-a: device-a={a_names:?} device-b={b_names:?}"
+    );
+    assert_eq!(std::fs::read(device_a.root.path().join(name_a)).unwrap(), b"colon name from A");
+    assert_eq!(
+        std::fs::read(device_b.root.path().join(name_b)).unwrap(),
+        b"angle bracket name from B"
+    );
 
-        assert_eq!(std::fs::read(device_b.root.path().join(name_a)).unwrap(), b"colon name from A");
-        assert_eq!(
-            std::fs::read(device_a.root.path().join(name_b)).unwrap(),
-            b"angle bracket name from B"
-        );
-    }
+    // Directly confirm neither hazardous path ever entered either device's
+    // own local file index/DAG, not just "never appeared on the other
+    // device."
+    assert!(
+        !admitted_to_local_index(&device_a, &group_id, name_a),
+        "{name_a:?} must never have been admitted to device-a's own local index/DAG"
+    );
+    assert!(
+        !admitted_to_local_index(&device_b, &group_id, name_b),
+        "{name_b:?} must never have been admitted to device-b's own local index/DAG"
+    );
 }
 
 // --- Scenario 4: a full path near Windows' traditional MAX_PATH (260) ------

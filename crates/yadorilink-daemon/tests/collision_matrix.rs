@@ -24,12 +24,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use support::{
-    daemon_status_summary, open_file_backed_sync_state, real_entry_names, wait_until,
+    daemon_status_summary, open_file_backed_replica_coordinator, real_entry_names, wait_until,
     wait_until_with_context, TestAccount,
 };
+use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_daemon::link_manager;
 use yadorilink_local_storage::FsBlockStore;
+use yadorilink_daemon::sync_error::SyncError;
 use yadorilink_transport::DeviceKeyPair;
 
 struct TestDevice {
@@ -39,7 +40,7 @@ struct TestDevice {
     _store_dir: tempfile::TempDir,
     // Uses file-backed WAL (production's concurrency model) instead of
     // open_in_memory's shared-cache backend — see
-    // open_file_backed_sync_state's doc comment. Held only to keep the
+    // open_file_backed_replica_coordinator's doc comment. Held only to keep the
     // backing temp file alive for the test's duration.
     _index_dir: tempfile::TempDir,
 }
@@ -49,7 +50,7 @@ async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
     let device_id = support::register_device(account, name, keypair.public_bytes()).await;
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-    let (sync_state, index_dir) = open_file_backed_sync_state();
+    let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
     let state = DaemonState::new(device_id.clone(), sync_state, store);
     // Give the device a change-signing key before its link watch starts, so the
@@ -67,8 +68,10 @@ async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
 
 async fn start_watching(device: &TestDevice, group_id: &str) {
     let local_path = device.root.path().to_string_lossy().to_string();
-    device.state.sync_state.add_link(&local_path, group_id).unwrap();
-    link_manager::start_link_watch(device.state.clone(), local_path, group_id.to_string()).unwrap();
+    device.state.replica_coordinator.link_repository().add_link(&local_path, group_id).unwrap();
+    LinkRuntimeController::new(device.state.clone())
+        .start(local_path, group_id.to_string())
+        .unwrap();
 }
 
 /// Sets up two devices, both syncing a fresh folder group, and waits for
@@ -120,8 +123,8 @@ fn snapshot(root: &std::path::Path) -> HashMap<String, String> {
 
 fn index_summary(device: &TestDevice, group_id: &str, path: &str) -> String {
     match (
-        device.state.sync_state.get_file(group_id, path),
-        device.state.sync_state.list_versions(group_id, path),
+        device.state.replica_coordinator.file_index_repository().get_file(group_id, path).map_err(SyncError::from),
+        device.state.replica_coordinator.sqlite().dag_list_versions(group_id, path).map_err(SyncError::from),
     ) {
         (Ok(current), Ok(versions)) => format!("current={current:?} versions={versions:?}"),
         (Err(error), _) | (_, Err(error)) => format!("versions_error={error}"),
@@ -465,7 +468,7 @@ async fn concurrent_differently_cased_create_is_a_hazard_on_case_insensitive_fil
     let (device_a, device_b, group_id) = two_synced_devices("collision-case-fold").await;
     let _ = group_id;
 
-    if !yadorilink_sync_core::hazard::is_case_insensitive_filesystem(device_a.root.path()) {
+    if !yadorilink_peer_session::hazard::is_case_insensitive_filesystem(device_a.root.path()) {
         eprintln!("skipping: {} is case-sensitive here", device_a.root.path().display());
         return;
     }

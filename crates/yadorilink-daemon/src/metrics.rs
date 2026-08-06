@@ -27,16 +27,9 @@ impl DaemonMetrics {
     }
 
     pub fn render_openmetrics(&self) -> String {
-        let active_transfers = self.state.transfer_progress.active_transfer_count();
-        let active_peers = self
-            .state
-            .peer_statuses
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .values()
-            .filter(|info| info.reachability.is_connected())
-            .count();
-        let transfer_bytes_total = self.state.transfer_progress.transfer_bytes_total();
+        let active_transfers = self.state.telemetry.active_transfer_count();
+        let active_peers = self.state.peers.connected_peer_count();
+        let transfer_bytes_total = self.state.telemetry.transfer_bytes_total();
 
         let mut out = String::new();
         out += "# TYPE yadorilink_transfer_bytes_total counter\n";
@@ -47,7 +40,7 @@ impl DaemonMetrics {
         out += &format!("yadorilink_active_peers {active_peers}\n");
 
         out += "# TYPE yadorilink_sync_errors_total counter\n";
-        let mut category_counts = self.state.recent_errors.category_counts();
+        let mut category_counts = self.state.telemetry.recent_error_category_counts();
         // Deterministic ordering — cosmetic only (a `HashMap` iteration
         // order would still be a valid OpenMetrics document), but makes
         // the endpoint's output byte-stable for a fixed set of categories,
@@ -57,7 +50,7 @@ impl DaemonMetrics {
             out += &format!("yadorilink_sync_errors_total{{category=\"{category}\"}} {count}\n");
         }
 
-        out += &self.state.transfer_progress.render_block_fetch_histogram();
+        out += &self.state.telemetry.render_block_fetch_histogram();
         out
     }
 }
@@ -67,15 +60,16 @@ mod tests {
     use std::sync::Arc;
 
     use yadorilink_local_storage::FsBlockStore;
-    use yadorilink_sync_core::index::SyncState;
+    use crate::replica_coordinator::ReplicaCoordinator;
 
     use super::*;
-    use crate::daemon_state::{DaemonState, PeerReachability, PeerStatusInfo, UnreachableCategory};
+    use crate::daemon_state::DaemonState;
+    use crate::peer_registry::{PeerReachability, UnreachableCategory};
 
     fn test_state() -> Arc<DaemonState> {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-        let sync_state = Arc::new(SyncState::open_in_memory().unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         DaemonState::new("device-a".into(), sync_state, store)
     }
 
@@ -95,20 +89,15 @@ mod tests {
     #[tokio::test]
     async fn reflects_live_state_active_peers_transfers_bytes_and_errors() {
         let state = test_state();
-        state.peer_statuses.lock().unwrap().insert(
-            "peer-a".to_string(),
-            PeerStatusInfo { reachability: PeerReachability::Connected },
-        );
-        state.peer_statuses.lock().unwrap().insert(
+        state.peers.set_reachability("peer-a".to_string(), PeerReachability::Connected);
+        state.peers.set_reachability(
             "peer-b".to_string(),
-            PeerStatusInfo {
-                reachability: PeerReachability::Unreachable(UnreachableCategory::NoResponse),
-            },
+            PeerReachability::Unreachable(UnreachableCategory::NoResponse),
         );
-        let _guard = state.transfer_progress.begin("group-1", "big.bin", 100, 1);
-        state.transfer_progress.record_block_done("group-1", "big.bin", 42, "peer-a");
-        state.recent_errors.record("disk_pressure", "sweep");
-        state.recent_errors.record("disk_pressure", "sweep");
+        let _guard = state.telemetry.begin_transfer("group-1", "big.bin", 100, 1);
+        state.telemetry.record_transfer_block_done("group-1", "big.bin", 42, "peer-a");
+        state.telemetry.record_recent_error("disk_pressure", "sweep");
+        state.telemetry.record_recent_error("disk_pressure", "sweep");
 
         let metrics = DaemonMetrics::new(state);
         let rendered = metrics.render_openmetrics();
@@ -124,19 +113,18 @@ mod tests {
     #[tokio::test]
     async fn privacy_safe_metrics_never_contain_content_paths_keys_tokens_or_ips() {
         let state = test_state();
-        state.peer_statuses.lock().unwrap().insert(
-            "peer-secret-device-id".to_string(),
-            PeerStatusInfo { reachability: PeerReachability::Connected },
-        );
+        state
+            .peers
+            .set_reachability("peer-secret-device-id".to_string(), PeerReachability::Connected);
         let _guard =
-            state.transfer_progress.begin("group-1", "/Users/alice/secret-plans.docx", 1000, 10);
-        state.transfer_progress.record_block_done(
+            state.telemetry.begin_transfer("group-1", "/Users/alice/secret-plans.docx", 1000, 10);
+        state.telemetry.record_transfer_block_done(
             "group-1",
             "/Users/alice/secret-plans.docx",
             500,
             "peer-secret-device-id",
         );
-        state.recent_errors.record("disk_pressure", "hydration");
+        state.telemetry.record_recent_error("disk_pressure", "hydration");
 
         let metrics = DaemonMetrics::new(state);
         let rendered = metrics.render_openmetrics();

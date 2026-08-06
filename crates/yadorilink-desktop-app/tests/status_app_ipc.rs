@@ -19,7 +19,7 @@ use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPaylo
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{LinkRequest, PendingEnrollmentKind, StatusRequest};
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_sync_core::index::SyncState;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
@@ -27,8 +27,12 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     std::env::set_var("YADORILINK_UPDATE_MANIFEST_URL", "http://127.0.0.1:1/manifest.json");
 
     let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
-    let sync_state = Arc::new(SyncState::open(dir.path().join("sync.sqlite3")).unwrap());
+    let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
+    // A registered (non-empty device_id) device with no signing key fails
+    // closed (`link_manager::ensure_initial_change_history`) -- see
+    // `yadorilink-cli`'s `tests/desktop_status_parity.rs`'s identical setup.
+    state.set_device_signing_key(yadorilink_transport::DeviceSigningKeyPair::generate().signing);
     // Pin volume classification to "ok" regardless of this sandbox's real
     // (possibly near-full) host disk — see `yadorilink-cli`'s
     // `tests/desktop_status_parity.rs`' identical comment for the full
@@ -39,17 +43,22 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     // whatever was on disk *before* this call) — the same method
     // `control_socket`'s `limits set`/headroom-override handlers call
     // after persisting a change, for the identical reason.
-    state.governance_config.set_headroom_override_bytes(Some(1)).unwrap();
-    state.apply_governance_config();
+    let config = state.governance_config.set_headroom_override_bytes(Some(1)).unwrap();
+    state.block_store.set_headroom_override_bytes(config.headroom_override_bytes);
 
     let socket_path = dir.path().join("daemon.sock");
     std::env::set_var("YADORILINK_CONTROL_SOCKET", &socket_path);
 
     let serve_path = socket_path.clone();
-    let serve_state = state.clone();
+    let serve_context = std::sync::Arc::new(
+        yadorilink_daemon::control_context::ControlContext::from_state(state.clone()),
+    );
     tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(&serve_path, serve_state)
-            .await;
+        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
+            &serve_path,
+            serve_context,
+        )
+        .await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     (dir, state)

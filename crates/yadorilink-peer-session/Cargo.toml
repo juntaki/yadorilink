@@ -1,0 +1,124 @@
+[package]
+name = "yadorilink-peer-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# See yadorilink-local-storage/Cargo.toml's identical section for why.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
+
+[features]
+# Exposes test-only helpers to OTHER crates' test builds -- mirrors
+# yadorilink-sync-core's own identical test-support feature.
+test-support = ["yadorilink-root-authority/test-support"]
+
+[dependencies]
+yadorilink-transport = { path = "../yadorilink-transport" }
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+yadorilink-replica-engine = { path = "../yadorilink-replica-engine" }
+yadorilink-root-authority = { path = "../yadorilink-root-authority" }
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+yadorilink-sync-wire = { path = "../yadorilink-sync-wire" }
+thiserror.workspace = true
+tracing.workspace = true
+# `ports::PeerReplicaStatePort`/`PeerMessageChannel` wrap async trait
+# methods -- a plain trait cannot name those in dyn-compatible form
+# without this. Same reasoning as yadorilink-sync-core's identical
+# dependency.
+async-trait = "0.1"
+sha2.workspace = true
+bytes.workspace = true
+# `FuturesUnordered` substitutes for `tokio::task::JoinSet` in the
+# bounded-concurrency reconcile loop -- madsim's tokio shim has no
+# `JoinSet` at all.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+hex = "0.4"
+# hazard.rs's NFC/NFD sibling-collision detection.
+unicode-normalization = "0.1"
+caseless = "0.2.2"
+# Negotiated zstd compression for block and index-exchange payloads.
+zstd = { workspace = true }
+# Retry-jitter randomness and session-secret generation.
+rand = "0.10.2"
+
+[dev-dependencies]
+tempfile = "3"
+# Signs test fixture changes.
+ed25519-dalek = "2"
+boringtun = { version = "0.7", default-features = false }
+# This crate's own #[cfg(test)] tests need `RootCommitPermit::for_tests`/
+# `RootLease::for_tests` (both `#[cfg(any(test, feature = "test-support"))]`
+# in yadorilink-root-authority), but `cfg(test)` is crate-local -- building
+# this crate's own tests does not turn on that cfg inside the
+# yadorilink-root-authority artifact this crate links against. This
+# self-referencing dev-dependency turns the feature on instead. Mirrors
+# yadorilink-sync-core's own identical dev-dependency override for the
+# same reason.
+yadorilink-peer-session = { path = ".", features = ["test-support"] }
+# `tests/peer_session.rs`/`tests/crash_recovery.rs`/
+# `tests/dag_two_device_wire_convergence.rs`/`tests/dag_wire_support/mod.rs`
+# (moved here from `yadorilink-sync-core` in Phase 7D-10's own dedicated
+# `peer_session.rs` pass) build their fixture state as a real
+# `yadorilink_daemon::replica_coordinator::ReplicaCoordinator` and drive
+# `PeerSyncSession` against it directly -- the same type
+# `yadorilink-daemon`'s own production code constructs, coerced to
+# `Arc<dyn ports::PeerReplicaStatePort>` the same way. This is a dev-only
+# back-edge against this crate's own normal (non-dev) dependency direction
+# (`yadorilink-daemon` depends on `yadorilink-peer-session`, not the
+# reverse) -- cargo permits this: building this crate's *library* never
+# needs `yadorilink-daemon`'s lib, only compiling this crate's *test*
+# binaries does. Same dev-only back-edge shape as `yadorilink-sync-sqlite`'s
+# existing `dag_store` back-edge onto `yadorilink-sync-core` and
+# `yadorilink-filesystem-sync`'s identical one. `test-support` is needed for
+# `ReplicaCoordinator::open_in_memory`, a test-only constructor
+# (`#[cfg(any(test, feature = "test-support"))]`) that opens a standalone
+# in-memory database rather than sharing a live `SyncState`'s already-open
+# one.
+yadorilink-daemon = { path = "../yadorilink-daemon", features = ["test-support"] }
+# Every `yadorilink-sync-core` surface these fixtures once used --
+# `materialization::evict_file`/`repair_interrupted_materializations`,
+# `index::ChangeContent`/`VersionState`, `ports::BlockContentStore`, the
+# `watcher` re-export shim, and (last, Phase 7D-10.5) `dag_import` -- turned
+# out to already be stale import paths for real code that lives elsewhere
+# (`yadorilink-filesystem-sync`, `yadorilink-replica-domain`,
+# `yadorilink-local-storage`, and now `yadorilink-daemon::dag_import`, which
+# physically relocated out of `yadorilink-sync-core` in Phase 7D-10.5) and
+# were repointed directly onto those crates, all of which this crate already
+# depends on (`yadorilink-daemon` via the dev-dependency above). This crate
+# no longer references `yadorilink-sync-core` at all.
+# `dag_wire_support::DagProducer::commit_create` and the fixtures above call
+# straight through to `yadorilink-sync-sqlite`'s `ChangeEmitter` trait and
+# `dag_store` types -- a normal public surface, so no `test-support` feature
+# needed here (unlike the `yadorilink-sync-core` back-edge above).
+yadorilink-sync-sqlite = { path = "../yadorilink-sync-sqlite" }
+# `LocalChangeProcessor`/`LocalChangeOutcome` construction in the moved
+# fixtures -- same dev-only back-edge shape as `yadorilink-sync-core`'s own
+# identical dependency on this crate for its (now-moved) test binaries.
+yadorilink-local-capture = { path = "../yadorilink-local-capture", features = ["test-support"] }
+# `peer_session.rs` constructs `yadorilink_filesystem_sync::block_liveness::
+# BlockLivenessGate` directly (a normal public type, no feature gate needed)
+# as part of its `materialization_eviction::evict_file`/`materialization_
+# repair::repair_interrupted_materializations` fixture calls (repointed here
+# from the `yadorilink-sync-core` re-export paths in Phase 7D-10.5).
+yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync" }
+# The moved fixtures construct `yadorilink_ipc_proto::sync` messages
+# directly and call `prost::Message` methods on them to exercise
+# `PeerSyncSession`'s own wire handling -- same reasoning as
+# `yadorilink-sync-core`'s own identical dev-dependency for this file
+# before the move.
+yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
+prost = "0.14.4"
+# `peer_session.rs`'s own raw-`rusqlite::Connection` fixtures exercise a
+# `ChangeEmitter` failure path directly against SQLite -- same version pin
+# as `yadorilink-sync-core`'s own (moved-from) dependency.
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# `tokio` is swapped for `madsim`'s tokio-compatible shim only when the
+# deterministic-simulation test binary is built with
+# `RUSTFLAGS="--cfg madsim"` -- same split as yadorilink-sync-core.
+[target.'cfg(not(madsim))'.dependencies]
+tokio.workspace = true
+
+[target.'cfg(madsim)'.dependencies]
+tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }

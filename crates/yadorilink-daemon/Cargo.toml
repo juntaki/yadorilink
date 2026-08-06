@@ -32,9 +32,77 @@ path = "src/bin/sign_manifest.rs"
 # YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX and enable this feature. See
 # `update::manifest::enforce_release_trust_root_gate`.
 enforce-release-trust-root = []
+# Exposes this crate's own `#[cfg(test)]`-only test fixtures (currently just
+# `DaemonState::install_test_root_commit_authority`) to integration test
+# binaries in OTHER crates that depend on this one as an ordinary library --
+# `#[cfg(test)]` alone is never active for such a caller. Previously mirrored
+# `yadorilink-sync-core`'s identical `test-support` feature/gate pattern (now
+# deleted).
+#
+# Forwards `yadorilink-root-authority/test-support` too: `RootLease::
+# for_tests`/`RootCommitPermit::for_tests` (this crate's own
+# `root_commit_authority.rs` `#[cfg(test)]` fixtures, among others) are
+# identically gated there, for the identical "cfg(test) is crate-local"
+# reason -- needed by any OTHER crate's dev-dependency on this one with
+# `features = ["test-support"]` requested (e.g. `yadorilink-filesystem-sync`'s
+# `tests/dst_materialization_crash_recovery.rs`), since building that
+# crate's own test target never turns on `cfg(test)` inside this crate's
+# compiled dependency graph either.
+#
+# Forwards `yadorilink-sqlite-runtime/test-support` too:
+# `SyncDatabase::pool_for_test` (`recovery.rs`/`recovery_snapshot.rs`'s own
+# test fixtures) is identically gated there, for the identical "cfg(test) is
+# crate-local" reason. Propagating through `yadorilink-sync-sqlite/test-support`
+# alone would not reach it -- `yadorilink-sqlite-runtime` needs its own
+# explicit forward, same as `yadorilink-sync-core`'s identical two-hop
+# forward used to (its own comment: "a downstream consumer that enables
+# only this crate's test-support, not sqlite-runtime's, would otherwise
+# fail to compile with a 'no method named pool_for_test' error").
+#
+# Forwards `yadorilink-sync-sqlite/test-support`: `ReplicaCoordinator`'s own
+# `#[cfg(any(test, feature = "test-support"))]` methods
+# (`plant_malformed_membership_operation_for_test`,
+# `plant_malformed_role_loss_operation_for_test`,
+# `add_link_with_pending_enrollment_for_test`) delegate straight to
+# identically-gated methods on `yadorilink-sync-sqlite`'s own repository
+# types -- `cfg(test)` is crate-local, so building *this* crate's tests
+# never turns on sync-sqlite's `cfg(test)`, only this feature does. Reached
+# via this crate's own `[dev-dependencies]` self-reference below (mirrors
+# every other crate's identical self-dependency override in this
+# workspace): building `yadorilink-daemon`'s own test targets activates
+# `test-support` on itself through that self-dependency, which now also
+# activates it on `yadorilink-sync-sqlite`. Previously reached transitively
+# through the now-deleted `yadorilink-sync-core`'s own `test-support`
+# forward (its own dev-dependency on this crate carried `features =
+# ["test-support"]`), an indirect path this pass makes direct instead of
+# leaving orphaned.
+test-support = [
+    "yadorilink-sync-sqlite/test-support",
+    "yadorilink-sqlite-runtime/test-support",
+    "yadorilink-root-authority/test-support",
+]
 
 [dependencies]
-yadorilink-sync-core = { path = "../yadorilink-sync-core" }
+async-trait = "0.1"
+yadorilink-local-capture = { path = "../yadorilink-local-capture" }
+# `convergence/engine.rs` names `MaterializationJob`/`MaterializationJobState`
+# directly (Phase 7D-7.1 moved their definition here from the
+# now-deleted `yadorilink-sync-core`, which used to re-expose the
+# persistence methods through `SyncState`'s own API but no longer owned
+# these types).
+yadorilink-sync-sqlite = { path = "../yadorilink-sync-sqlite" }
+# `replica_coordinator.rs`'s `ReplicaCoordinator` (Phase 7D-10.2) names
+# `SyncDatabase` directly to build its own repository/registry fields
+# against the same pooled connection/writer gate -- see that module's own
+# doc comment. Previously only a transitive dependency (through the
+# now-deleted `yadorilink-sync-core`/`-sync-sqlite`); named directly here
+# now that this crate's own source references the type by path.
+yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
+yadorilink-peer-session = { path = "../yadorilink-peer-session" }
+yadorilink-root-authority = { path = "../yadorilink-root-authority" }
+yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync" }
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
+yadorilink-replica-engine = { path = "../yadorilink-replica-engine" }
 yadorilink-transport = { path = "../yadorilink-transport" }
 yadorilink-local-storage = { path = "../yadorilink-local-storage" }
 yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
@@ -50,6 +118,16 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "linux-
 serde.workspace = true
 serde_json = "1"
 boringtun = { version = "0.7", default-features = false }
+# `commit_orchestration::orchestrator`/`plan_driver` (moved from
+# yadorilink-sync-core, 7D-9E) drive the commit boundary directly against an
+# open `&mut Connection` -- matches the version yadorilink-sync-core links so
+# the bundled SQLite is unified to one copy.
+rusqlite = { version = "0.31", features = ["bundled"] }
+# `sync_error::SyncError`'s `Pool`/`Watch` variants (moved from
+# yadorilink-sync-core, Phase 7D-10 Tier 2) name `r2d2::Error`/
+# `notify::Error` directly -- same versions yadorilink-sync-core links.
+r2d2 = "0.8"
+notify = "8"
 sha2.workspace = true
 uuid = { version = "1", features = ["v4"] }
 # Signed-manifest HTTPS fetch and artifact
@@ -106,19 +184,33 @@ tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }
 madsim = "0.2"
 
 [dev-dependencies]
-# Test-only: the one-live-link-per-group guards make the two-live-roots state
-# unreachable through the ordinary API, so a test that pins what the daemon does
-# about an ALREADY-duplicated database has to forge it.
-yadorilink-sync-core = { path = "../yadorilink-sync-core", features = ["test-support"] }
+# The impact-map completeness lint (`tests/dst_impact_map_lint.rs`) and the
+# runbook freshness lint (`tests/dst_runbook_freshness_lint.rs`) parse
+# `dst_support/impact_map.toml` / the cargo aliases as TOML. Moved from
+# `yadorilink-sync-core/Cargo.toml`'s identical dev-dependency in Phase
+# 7D-10.4 along with `dst_support/` and its 3 lint guards.
+toml = "0.8"
+# This crate's own `tests/*.rs` integration binaries link against
+# `yadorilink-daemon` as an ordinary external library, so `#[cfg(test)]` is
+# never active for it there -- `DaemonState::install_test_root_commit_authority`/
+# `set_test_placeholder_pipeline_connected` (both `#[cfg(any(test, feature =
+# "test-support"))]`) need this self-referencing dev-dependency to enable the
+# feature half of that gate. Mirrors `yadorilink-sync-core`'s identical
+# dev-dependency override for the same reason.
+yadorilink-daemon = { path = ".", features = ["test-support"] }
+# Test-only: `placeholder_backend::OverrideForTest` needs this feature to be
+# reachable from this crate's own `#[cfg(test)]` unit tests and integration
+# binaries, same reason as the two overrides above. Deliberately does NOT
+# also enable `yadorilink-filesystem-sync`'s separate
+# `evict-custody-test-bypass` feature: this crate's own eviction tests
+# (`preflight_disk_pressure_runs_eviction_sweep_for_on_demand_link_first`,
+# `gc::tests::eviction_without_remote_lease_never_reaches_physical_reclaim`)
+# assert that an instantaneous custody confirmation without a durable
+# remote lease must NOT authorize physical block deletion, so they need the
+# real `verify_reclaim_custody`, not the bypass.
+yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync", features = ["test-support"] }
 tempfile = "3"
 rand = "0.10.2"
-# Test-only: lets a handoff-lease test open a second connection to a
-# file-backed sync database and drop a table out from under an in-flight
-# operation, deterministically forcing a local storage error to exercise the
-# error-cleanup path. Matches the version sync-core links so the bundled
-# SQLite is unified to one copy. Dev-dependency features only affect the test
-# build, never `cargo build`.
-rusqlite = { version = "0.31", features = ["bundled"] }
 # The in-process fake coordination service the full-stack E2E tests point the
 # real `peer_orchestrator` at needs a WebSocket *server* (the netmap
 # subscription). The crate's own (non-dev) dependency is client-only
@@ -137,5 +229,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Storage_CloudFilters",
+    "Win32_Storage_FileSystem",
+    "Win32_System_CorrelationVector",
+    "Win32_System_IO",
     "Win32_System_Threading",
 ] }

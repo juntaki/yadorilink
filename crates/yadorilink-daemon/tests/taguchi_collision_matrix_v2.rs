@@ -52,11 +52,12 @@ use std::time::Duration;
 use sha2::Digest;
 use support::fake_coordination::FakeCoordination;
 use support::{
-    open_file_backed_sync_state, real_entry_names, register_with_fake, wait_until,
+    open_file_backed_replica_coordinator, real_entry_names, register_with_fake, wait_until,
     wait_until_with_context,
 };
+use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_daemon::{link_manager, peer_orchestrator};
+use yadorilink_daemon::peer_orchestrator;
 use yadorilink_local_storage::FsBlockStore;
 use yadorilink_transport::DeviceKeyPair;
 
@@ -67,7 +68,7 @@ struct TestDevice {
     _store_dir: tempfile::TempDir,
     // Uses file-backed WAL (production's concurrency model) instead of
     // open_in_memory's shared-cache backend — see
-    // open_file_backed_sync_state's doc comment. Held only to keep the
+    // open_file_backed_replica_coordinator's doc comment. Held only to keep the
     // backing temp file alive for the test's duration.
     _index_dir: tempfile::TempDir,
 }
@@ -99,7 +100,7 @@ async fn setup_device(fake: &FakeCoordination, device_id: &str, groups: &[&str])
     let keypair = Arc::new(DeviceKeyPair::generate());
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-    let (sync_state, index_dir) = open_file_backed_sync_state();
+    let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
     let state = DaemonState::new(device_id.to_string(), sync_state, store);
     let root = tempfile::tempdir().unwrap();
@@ -108,8 +109,9 @@ async fn setup_device(fake: &FakeCoordination, device_id: &str, groups: &[&str])
 
     let local_path = root.path().to_string_lossy().to_string();
     for group_id in groups {
-        state.sync_state.add_link(&local_path, group_id).unwrap();
-        link_manager::start_link_watch(state.clone(), local_path.clone(), group_id.to_string())
+        state.replica_coordinator.link_repository().add_link(&local_path, group_id).unwrap();
+        LinkRuntimeController::new(state.clone())
+            .start(local_path.clone(), group_id.to_string())
             .unwrap();
     }
 
@@ -134,10 +136,10 @@ async fn wait_for_mesh(devices: &[&TestDevice]) {
     wait_until(
         || {
             devices.iter().all(|d| {
-                let sessions = d.state.sessions.lock().unwrap();
                 devices.iter().filter(|o| o.device_id != d.device_id).all(|o| {
-                    sessions
-                        .get(&o.device_id)
+                    d.state
+                        .peers
+                        .session(&o.device_id)
                         .is_some_and(|session| session.change_dag_negotiated())
                 })
             })
@@ -302,8 +304,8 @@ fn file_hash(path: &std::path::Path) -> Option<String> {
     Some(hex::encode(sha2::Sha256::digest(&content)))
 }
 
-/// Waits for every device in `active` to report an identical, present
-/// content hash for `rel_path`, panicking with a per-device diagnostic
+/// Waits for every device in `active` to report identical, present content
+/// and owner-exec metadata for `rel_path`, panicking with a per-device diagnostic
 /// (including all five factor levels and which convergence phase timed
 /// out) if that never happens within the timeout.
 #[allow(clippy::too_many_arguments)]
@@ -323,7 +325,7 @@ async fn wait_for_content_convergence(
     // `DEFAULT_HYDRATION_TIMEOUT` budget under contention from several
     // devices racing to fetch/re-fetch overlapping conflict content for
     // the same path, silently falling back to the next periodic full-index
-    // resync (`DEFAULT_FULL_INDEX_RESYNC_INTERVAL`, 90s) rather than a
+    // resync (`DEFAULT_MAINTENANCE_RECONCILE_INTERVAL`, 90s) rather than a
     // faster targeted retry -- confirmed deterministic convergence at
     // ~93s for row 16 (size_level=4, churn_level=2) via an isolated,
     // extended-timeout repro; this is documented, intentional fallback
@@ -335,9 +337,14 @@ async fn wait_for_content_convergence(
     let timeout = if churn_level == 2 { Duration::from_secs(180) } else { Duration::from_secs(90) };
     wait_until_with_context(
         || {
-            let reference = file_hash(&active[0].root.path().join(rel_path));
-            reference.is_some()
-                && active[1..].iter().all(|d| file_hash(&d.root.path().join(rel_path)) == reference)
+            let reference_path = active[0].root.path().join(rel_path);
+            let reference_hash = file_hash(&reference_path);
+            let reference_exec = read_exec_bit(&reference_path);
+            reference_hash.is_some()
+                && active[1..].iter().all(|d| {
+                    let path = d.root.path().join(rel_path);
+                    file_hash(&path) == reference_hash && read_exec_bit(&path) == reference_exec
+                })
         },
         timeout,
         || {
@@ -346,7 +353,12 @@ async fn wait_for_content_convergence(
                 .enumerate()
                 .map(|(i, d)| {
                     let p = d.root.path().join(rel_path);
-                    format!("device-{i} exists={} hash={:?}", p.exists(), file_hash(&p))
+                    format!(
+                        "device-{i} exists={} hash={:?} exec={}",
+                        p.exists(),
+                        file_hash(&p),
+                        read_exec_bit(&p)
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
@@ -462,11 +474,13 @@ async fn run_taguchi_v2_row(
     // --- FACTOR D level 4: a second round, toggling the exec bit only
     // after the file content itself has already converged once.
     if exec_level == 4 {
-        for device in &active_refs {
-            let full_path = device.root.path().join(&rel_path);
-            let current = read_exec_bit(&full_path);
-            set_exec_bit(&full_path, !current);
-        }
+        // Mutate one replica, like a real metadata edit. Toggling every
+        // replica at once makes the convergence predicate true immediately
+        // (before any watcher has captured the chmod), then creates several
+        // concurrent metadata changes after the wait has already returned.
+        let full_path = active_refs[0].root.path().join(&rel_path);
+        let current = read_exec_bit(&full_path);
+        set_exec_bit(&full_path, !current);
         wait_for_content_convergence(
             &active_refs,
             &rel_path,
@@ -480,11 +494,6 @@ async fn run_taguchi_v2_row(
         )
         .await;
     }
-
-    // A final settle window, matching v1's own reasoning: content-hash
-    // convergence (checked above) doesn't guarantee the exec-bit
-    // metadata field has finished propagating too.
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let reference_path = active_refs[0].root.path().join(&rel_path);
     let reference_hash = file_hash(&reference_path).unwrap_or_else(|| {

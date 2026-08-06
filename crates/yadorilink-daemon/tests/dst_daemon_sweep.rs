@@ -39,14 +39,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
+use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::app::{self, DaemonConfig};
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_daemon::link_manager;
 use yadorilink_daemon::peer_orchestrator::{SimDiscovery, SimPeer};
-use yadorilink_sync_core::debounce::DebounceConfig;
-use yadorilink_sync_core::index::SyncState;
-use yadorilink_sync_core::version_vector::{VersionVector, VvOrdering};
-use yadorilink_sync_core::watcher::{FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource};
+use yadorilink_filesystem_sync::debounce::DebounceConfig;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource};
 use yadorilink_transport::DeviceKeyPair;
 
 // --------------------------------------------------------------------------
@@ -140,11 +139,11 @@ struct SimDaemon {
 }
 
 impl SimDaemon {
-    fn sync_state(&self) -> &SyncState {
-        self.state.sync_state.as_ref()
+    fn sync_state(&self) -> &ReplicaCoordinator {
+        self.state.replica_coordinator.as_ref()
     }
     fn get_record(&self, path: &str) -> Option<(VersionVector, bool, u64)> {
-        self.sync_state()
+        self.replica_coordinator()
             .get_file(GROUP_ID, path)
             .ok()
             .flatten()
@@ -183,17 +182,17 @@ async fn boot_daemon(
         .ok_or_else(|| "daemon never reached steady state".to_string())?;
 
     state
-        .sync_state
+        .replica_coordinator
         .add_link(&root.to_string_lossy(), GROUP_ID)
         .map_err(|e| format!("add_link: {e}"))?;
     let (watch_source, events_tx) = SimulatedFolderWatchSource::new(64);
-    link_manager::start_link_watch_with_source(
-        state.clone(),
-        root.to_string_lossy().to_string(),
-        GROUP_ID.to_string(),
-        Arc::new(watch_source),
-    )
-    .map_err(|e| format!("start_link_watch_with_source: {e}"))?;
+    LinkRuntimeController::new(state.clone())
+        .start_with_source(
+            root.to_string_lossy().to_string(),
+            GROUP_ID.to_string(),
+            Arc::new(watch_source),
+        )
+        .map_err(|e| format!("start_link_watch_with_source: {e}"))?;
 
     Ok((
         SimDaemon {
@@ -337,7 +336,7 @@ async fn wait_write_applied(
 ) -> Result<VersionVector, String> {
     wait_for(
         || match daemon.get_record(rel) {
-            Some((v, deleted, _)) => !deleted && v.compare(prev) == VvOrdering::After,
+            Some((v, deleted, _)) => !deleted && v.compare(prev) == ChangeOrdering::After,
             None => false,
         },
         LOCAL_INDEX_TIMEOUT,
@@ -493,7 +492,7 @@ async fn scenario_body(seed: u64) -> Result<Vec<Violation>, String> {
 
     // Pin the session clock onto the same seed-derived timeline the stamped
     // mtimes sit on (matches the two-device test).
-    yadorilink_sync_core::peer_session::set_test_clock_override(base_mtime_nanos(seed));
+    yadorilink_peer_session::peer_session::set_test_clock_override(base_mtime_nanos(seed));
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -548,9 +547,9 @@ async fn scenario_body(seed: u64) -> Result<Vec<Violation>, String> {
         .await;
 
     // ---- Run the full oracle suite against both real roots + SyncStates.
-    let devices: [(&Path, &SyncState); 2] = [
-        (daemon_a.root.as_path(), daemon_a.sync_state()),
-        (daemon_b.root.as_path(), daemon_b.sync_state()),
+    let devices: [(&Path, &ReplicaCoordinator); 2] = [
+        (daemon_a.root.as_path(), daemon_a.replica_coordinator()),
+        (daemon_b.root.as_path(), daemon_b.replica_coordinator()),
     ];
 
     let mut violations = Vec::new();
@@ -597,7 +596,7 @@ fn flat_snapshot(root: &Path) -> BTreeMap<String, u64> {
 }
 
 fn session_connected(state: &DaemonState, peer_device_id: &str) -> bool {
-    state.sessions.lock().unwrap_or_else(|p| p.into_inner()).contains_key(peer_device_id)
+    state.peers.has_session(peer_device_id)
 }
 
 async fn wait_for_state(probe: &app::StateProbe, timeout: Duration) -> Option<Arc<DaemonState>> {

@@ -12,7 +12,8 @@ path = "src/main.rs"
 yadorilink-ipc-proto = { path = "../yadorilink-ipc-proto" }
 yadorilink-transport = { path = "../yadorilink-transport" }
 yadorilink-local-storage = { path = "../yadorilink-local-storage" }
-yadorilink-sync-core = { path = "../yadorilink-sync-core" }
+yadorilink-root-authority = { path = "../yadorilink-root-authority" }
+yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
 yadorilink-reporting = { path = "../yadorilink-reporting" }
 # Promoted from dev-dependency (it was already one, for this crate's own
 # daemon-backed integration tests) to a real dependency — the CLI-only
@@ -60,9 +61,25 @@ url = { version = "2" }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+# Test-only: integration tests seed a `ReplicaCoordinator` fixture directly
+# (bypassing the daemon's normal write path), which requires a
+# `RootCommitPermit` -- `RootCommitPermit::for_tests()` is only compiled in
+# with this feature. `yadorilink-sync-core` (which used to carry this same
+# override, for `SyncState` fixtures) was deleted in Phase 7D-10's final
+# elimination pass; this crate's own fixtures already use
+# `yadorilink-daemon`'s `ReplicaCoordinator` instead, so only this one
+# override is needed now.
+# `DaemonState::install_test_root_commit_authority` also needs this feature
+# to be reachable from an integration test binary in this crate.
+yadorilink-daemon = { path = "../yadorilink-daemon", features = ["test-support"] }
+# Test-only: `placeholder_backend::OverrideForTest` needs this feature to be
+# reachable from an integration test binary in this crate (same
+# `#[cfg(any(test, feature = "test-support"))]` gate the module itself uses).
+yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync", features = ["test-support"] }
 tempfile = "3"
 hex = "0.4"
 sha2.workspace = true
+ed25519-dalek = "2"
 # Mocks Google's device authorization/token endpoints for
 # `google_auth.rs`'s device-grant
 # polling/backoff test. Same version already used by `yadorilink-daemon`'s

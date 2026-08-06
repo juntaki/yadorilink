@@ -32,4 +32,35 @@ pub enum StorageError {
         available_bytes: u64,
         headroom_bytes: u64,
     },
+
+    /// A materialization write/delete target resolved outside its
+    /// designated root (a symlinked intermediate path component, planted
+    /// locally or raced in) -- defense-in-depth, distinct from `InvalidPath`
+    /// so callers can tell "this specific escape check refused it" apart
+    /// from a generically malformed path.
+    #[error("materialization target {0:?} resolved outside its sync root (symlinked path component?)")]
+    PathEscapesRoot(String),
+
+    /// `chunker::chunk_file`/`chunk_file_content_defined` decode a
+    /// content-store `put` result (a hex-encoded content hash) back into
+    /// raw bytes for `BlockInfo::hash` -- this is that decode failing.
+    /// Distinct from `Io` so a caller can tell "the store returned a
+    /// malformed hash" apart from a filesystem failure. Moved here
+    /// alongside `chunker.rs` in Phase 7D-8.1; `yadorilink-sync-core`'s
+    /// `From<StorageError> for SyncError` maps this back to its own
+    /// `SyncError::Hex` variant so the observable error category is
+    /// unchanged from before the move.
+    #[error("hex decode error: {0}")]
+    Hex(#[from] hex::FromHexError),
+
+    /// `chunker::chunk_file_content_defined`: an error from the `fastcdc`
+    /// streaming chunker (I/O failure reading the source file, or an
+    /// internal chunker error) -- distinct from `Io` since it's
+    /// specifically about the CDC chunk-boundary-finding process, not a
+    /// bare filesystem call. Moved here alongside `chunker.rs` in Phase
+    /// 7D-8.1; `yadorilink-sync-core`'s `From<StorageError> for SyncError`
+    /// maps this back to its own `SyncError::Chunking` variant so the
+    /// observable error category is unchanged from before the move.
+    #[error("content-defined chunking error: {0}")]
+    Chunking(String),
 }

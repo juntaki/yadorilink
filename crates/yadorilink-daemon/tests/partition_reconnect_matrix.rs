@@ -16,7 +16,7 @@
 //!    is reconciled, so a paused device also ignores whatever a still-online
 //!    peer sends it during the pause window. That message is dropped, not
 //!    queued — there is no redelivery-on-unpause.
-//! 2. Because of (1), `link_manager::resume_link` on *just* the
+//! 2. Because of (1), `LinkRuntimeController::resume` on *just* the
 //!    previously-paused device is not sufficient to converge these
 //!    scenarios, unlike `e2e_three_devices.rs`'s pause/resume test (whose
 //!    online device never changes anything during the pause window, so it
@@ -24,7 +24,7 @@
 //!    changes were broadcast *while the peer was paused* and silently
 //!    dropped on arrival; nothing re-sends them automatically short of that
 //!    device's own ~90s periodic full-index resync
-//!    (`peer_session::DEFAULT_FULL_INDEX_RESYNC_INTERVAL`), far too slow for
+//!    (`peer_session::DEFAULT_MAINTENANCE_RECONCILE_INTERVAL`), far too slow for
 //!    a test. So every reconnect below calls `resume_link` on *both*
 //!    devices — a harmless no-op on the never-paused side as far as pause
 //!    state goes, but it forces that device to (re-)broadcast its current
@@ -46,10 +46,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use support::{
-    open_file_backed_sync_state, real_entry_names, wait_until, wait_until_with_context, TestAccount,
+    open_file_backed_replica_coordinator, real_entry_names, wait_until, wait_until_with_context, TestAccount,
 };
+use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_daemon::link_manager;
 use yadorilink_local_storage::FsBlockStore;
 use yadorilink_transport::DeviceKeyPair;
 
@@ -59,7 +59,7 @@ struct TestDevice {
     root: tempfile::TempDir,
     _store_dir: tempfile::TempDir,
     // File-backed WAL (production's concurrency model) instead of
-    // open_in_memory's shared-cache backend — see open_file_backed_sync_state's
+    // open_in_memory's shared-cache backend — see open_file_backed_replica_coordinator's
     // doc comment. Held only to keep the backing temp file alive for the test's
     // duration.
     _index_dir: tempfile::TempDir,
@@ -70,7 +70,7 @@ async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
     let device_id = support::register_device(account, name, keypair.public_bytes()).await;
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-    let (sync_state, index_dir) = open_file_backed_sync_state();
+    let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
     let state = DaemonState::new(device_id.clone(), sync_state, store);
     // Give the device a change-signing key before its link watch starts, so the
@@ -88,8 +88,10 @@ async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
 
 async fn start_watching(device: &TestDevice, group_id: &str) {
     let local_path = device.root.path().to_string_lossy().to_string();
-    device.state.sync_state.add_link(&local_path, group_id).unwrap();
-    link_manager::start_link_watch(device.state.clone(), local_path, group_id.to_string()).unwrap();
+    device.state.replica_coordinator.link_repository().add_link(&local_path, group_id).unwrap();
+    LinkRuntimeController::new(device.state.clone())
+        .start(local_path, group_id.to_string())
+        .unwrap();
 }
 
 /// Sets up two devices, both syncing a fresh folder group, and waits for
@@ -164,7 +166,7 @@ async fn wait_for_convergence(a: &TestDevice, b: &TestDevice, timeout: Duration)
 }
 
 fn pause(device: &TestDevice) {
-    device.state.sync_state.set_paused(device.root.path().to_str().unwrap(), true).unwrap();
+    device.state.replica_coordinator.link_repository().set_paused(device.root.path().to_str().unwrap(), true).unwrap();
 }
 
 /// Reconnects both devices — see this file's header doc comment for why
@@ -172,8 +174,14 @@ fn pause(device: &TestDevice) {
 /// actually paused) for a still-online peer's offline-window changes to
 /// ever reach the other side.
 async fn reconnect_both(a: &TestDevice, b: &TestDevice) {
-    link_manager::resume_link(&a.state, a.root.path().to_str().unwrap()).await.unwrap();
-    link_manager::resume_link(&b.state, b.root.path().to_str().unwrap()).await.unwrap();
+    LinkRuntimeController::new(a.state.clone())
+        .resume(a.root.path().to_str().unwrap())
+        .await
+        .unwrap();
+    LinkRuntimeController::new(b.state.clone())
+        .resume(b.root.path().to_str().unwrap())
+        .await
+        .unwrap();
 }
 
 /// Waits until `device`'s own index reflects a locally-processed (not just
@@ -187,12 +195,13 @@ async fn wait_for_local_edit_indexed(device: &TestDevice, group_id: &str, path: 
         || {
             device
                 .state
-                .sync_state
-                .get_file(group_id, path)
+                .replica_coordinator
+                .file_index_repository().get_file(group_id, path)
                 .ok()
                 .flatten()
-                .map(|r| !r.deleted && r.version.get(&device.device_id) > 0)
+                .map(|r| !r.deleted)
                 .unwrap_or(false)
+                && current_version_seq(device, group_id, path) > 0
         },
         Duration::from_secs(15),
     )
@@ -207,11 +216,11 @@ async fn wait_for_local_delete_indexed(device: &TestDevice, group_id: &str, path
         || {
             device
                 .state
-                .sync_state
-                .get_file(group_id, path)
+                .replica_coordinator
+                .file_index_repository().get_file(group_id, path)
                 .ok()
                 .flatten()
-                .map(|r| r.deleted && r.version.get(&device.device_id) > 0)
+                .map(|r| r.deleted)
                 .unwrap_or(false)
         },
         Duration::from_secs(15),
@@ -219,21 +228,25 @@ async fn wait_for_local_delete_indexed(device: &TestDevice, group_id: &str, path
     .await;
 }
 
-/// Returns `device`'s own current version-vector counter for `path` — used
-/// as the baseline for `wait_for_local_edit_indexed_past` below.
-fn local_version(device: &TestDevice, group_id: &str, path: &str) -> u64 {
+/// Returns the current retained `version_seq` for `path` — the per-path
+/// monotonic counter that replaced the per-device version vector, used as the
+/// baseline for `wait_for_local_edit_indexed_past` below.
+fn current_version_seq(device: &TestDevice, group_id: &str, path: &str) -> i64 {
     device
         .state
-        .sync_state
-        .get_file(group_id, path)
+        .replica_coordinator
+        .sqlite().dag_list_versions(group_id, path)
         .ok()
-        .flatten()
-        .map(|r| r.version.get(&device.device_id))
+        .and_then(|versions| versions.first().map(|v| v.version_seq))
         .unwrap_or(0)
 }
 
+fn local_version(device: &TestDevice, group_id: &str, path: &str) -> i64 {
+    current_version_seq(device, group_id, path)
+}
+
 /// Like `wait_for_local_edit_indexed`, but waits until `device`'s own
-/// version-vector entry for `path` exceeds `min_version` rather than
+/// retained `version_seq` for `path` exceeds `min_version` rather than
 /// merely being nonzero. Required whenever the SAME device edits the SAME
 /// path more than once within a test: a bare `> 0` check trivially passes
 /// on the version already committed by an earlier edit and returns before
@@ -250,18 +263,19 @@ async fn wait_for_local_edit_indexed_past(
     device: &TestDevice,
     group_id: &str,
     path: &str,
-    min_version: u64,
+    min_version: i64,
 ) {
     wait_until(
         || {
             device
                 .state
-                .sync_state
-                .get_file(group_id, path)
+                .replica_coordinator
+                .file_index_repository().get_file(group_id, path)
                 .ok()
                 .flatten()
-                .map(|r| !r.deleted && r.version.get(&device.device_id) > min_version)
+                .map(|r| !r.deleted)
                 .unwrap_or(false)
+                && current_version_seq(device, group_id, path) > min_version
         },
         Duration::from_secs(15),
     )
@@ -593,9 +607,11 @@ async fn partition_both_devices_paused_simultaneously_resume_races_converges() {
 
     // Resume both at once, racing the reconnect ordering rather than
     // sequencing it.
+    let controller_a = LinkRuntimeController::new(device_a.state.clone());
+    let controller_b = LinkRuntimeController::new(device_b.state.clone());
     let (resume_a, resume_b) = tokio::join!(
-        link_manager::resume_link(&device_a.state, device_a.root.path().to_str().unwrap()),
-        link_manager::resume_link(&device_b.state, device_b.root.path().to_str().unwrap()),
+        controller_a.resume(device_a.root.path().to_str().unwrap()),
+        controller_b.resume(device_b.root.path().to_str().unwrap()),
     );
     resume_a.unwrap();
     resume_b.unwrap();

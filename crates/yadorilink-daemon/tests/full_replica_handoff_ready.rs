@@ -10,12 +10,12 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use support::{connect_two_daemons, ensure_device_signing_key, open_file_backed_sync_state};
+use support::{connect_two_daemons, ensure_device_signing_key, open_file_backed_replica_coordinator};
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_sync_core::peer_session::PeerSyncSession;
-use yadorilink_sync_core::types::{BlockInfo, FileRecord, MaterializationPolicy};
-use yadorilink_sync_core::version_vector::VersionVector;
+use yadorilink_peer_session::peer_session::PeerSyncSession;
+use yadorilink_replica_domain::session_state::MaterializationPolicy;
+use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 
 const GROUP: &str = "handoff-group";
 
@@ -29,22 +29,19 @@ struct Daemon {
 fn new_daemon(device_id: &str) -> Daemon {
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-    let (sync_state, index_dir) = open_file_backed_sync_state();
+    let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
     let root = tempfile::tempdir().unwrap();
-    state.sync_state.add_link(&root.path().to_string_lossy(), GROUP).unwrap();
+    state.replica_coordinator.link_repository().add_link(&root.path().to_string_lossy(), GROUP).unwrap();
     Daemon { state, _store_dir: store_dir, _index_dir: index_dir, _root: root }
 }
 
 fn record_referencing(path: &str, hash_bytes: Vec<u8>, size: u64) -> FileRecord {
-    let mut version = VersionVector::new();
-    version.increment("device-a");
     FileRecord {
         path: path.to_string(),
         size,
         mtime_unix_nanos: 0,
-        version,
         blocks: vec![BlockInfo { hash: hash_bytes, offset: 0, size: size as u32 }],
         deleted: false,
     }
@@ -60,7 +57,11 @@ fn record_referencing(path: &str, hash_bytes: Vec<u8>, size: u64) -> FileRecord 
 fn put_and_record(daemon: &Daemon, data: &[u8]) -> Vec<u8> {
     let hash_hex = daemon.state.block_store.put(data).unwrap();
     let hash_bytes = hex::decode(&hash_hex).unwrap();
-    daemon.state.sync_state.record_group_block_provenance(GROUP, &[hash_bytes.clone()]).unwrap();
+    daemon
+        .state
+        .replica_coordinator
+        .change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&hash_bytes))
+        .unwrap();
     hash_bytes
 }
 
@@ -84,7 +85,14 @@ async fn no_connected_full_replica_peer_is_not_ready() {
     support::ensure_isolated_config_dir();
     let b = new_daemon("device-b");
     let record = record_referencing("solo.bin", vec![1u8; 32], 4);
-    b.state.sync_state.upsert_file(GROUP, &record).unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     assert!(
         !b.state.another_full_replica_is_ready(GROUP).await,
@@ -104,14 +112,42 @@ async fn ready_when_another_replica_holds_every_file() {
     let first = b"first file's content";
     let first_bytes = put_and_record(&a, first);
     let first_record = record_referencing("first.bin", first_bytes, first.len() as u64);
-    a.state.sync_state.upsert_file(GROUP, &first_record).unwrap();
-    b.state.sync_state.upsert_file(GROUP, &first_record).unwrap();
+    a.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &first_record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &first_record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     let second = b"second file's content";
     let second_bytes = put_and_record(&a, second);
     let second_record = record_referencing("second.bin", second_bytes, second.len() as u64);
-    a.state.sync_state.upsert_file(GROUP, &second_record).unwrap();
-    b.state.sync_state.upsert_file(GROUP, &second_record).unwrap();
+    a.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &second_record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &second_record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
     b.state.set_peer_group_full_replica("device-a", GROUP, true);
@@ -144,10 +180,10 @@ async fn not_ready_when_no_single_peer_holds_every_file() {
     // on-demand B holds and relays nothing, so C stays file1-only and D
     // file2-only, deterministically.
     let b_link =
-        b.state.sync_state.list_links().unwrap().into_iter().find(|l| l.group_id == GROUP).unwrap();
+        b.state.replica_coordinator.link_repository().list_links().unwrap().into_iter().find(|l| l.group_id == GROUP).unwrap();
     b.state
-        .sync_state
-        .set_materialization_policy(&b_link.local_path, MaterializationPolicy::OnDemand)
+        .replica_coordinator
+        .link_repository().set_materialization_policy(&b_link.local_path, MaterializationPolicy::OnDemand)
         .unwrap();
 
     // file1: held (indexed + stored) by C, and indexed by B. D never indexes
@@ -155,16 +191,44 @@ async fn not_ready_when_no_single_peer_holds_every_file() {
     let file1 = b"file one's content";
     let file1_bytes = put_and_record(&c, file1);
     let file1_record = record_referencing("file1.bin", file1_bytes, file1.len() as u64);
-    b.state.sync_state.upsert_file(GROUP, &file1_record).unwrap();
-    c.state.sync_state.upsert_file(GROUP, &file1_record).unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &file1_record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    c.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &file1_record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     // file2: held (indexed + stored) by D, and indexed by B. C never indexes
     // it, so C cannot confirm it.
     let file2 = b"file two's content";
     let file2_bytes = put_and_record(&d, file2);
     let file2_record = record_referencing("file2.bin", file2_bytes, file2.len() as u64);
-    b.state.sync_state.upsert_file(GROUP, &file2_record).unwrap();
-    d.state.sync_state.upsert_file(GROUP, &file2_record).unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &file2_record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    d.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &file2_record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     connect_two_daemons(&b.state, "device-b", &c.state, "device-c", &[GROUP.to_string()]).await;
     connect_two_daemons(&b.state, "device-b", &d.state, "device-d", &[GROUP.to_string()]).await;
@@ -191,14 +255,42 @@ async fn not_ready_when_another_replica_is_missing_one_files_blocks() {
     let held = b"content device-a actually holds";
     let held_bytes = put_and_record(&a, held);
     let held_record = record_referencing("held.bin", held_bytes, held.len() as u64);
-    a.state.sync_state.upsert_file(GROUP, &held_record).unwrap();
-    b.state.sync_state.upsert_file(GROUP, &held_record).unwrap();
+    a.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &held_record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &held_record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     // Both index this path, but device-a's block store never received the
     // block it references — a behind/incompletely-synced replica.
     let missing_record = record_referencing("missing.bin", vec![9u8; 32], 4);
-    a.state.sync_state.upsert_file(GROUP, &missing_record).unwrap();
-    b.state.sync_state.upsert_file(GROUP, &missing_record).unwrap();
+    a.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &missing_record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &missing_record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
     b.state.set_peer_group_full_replica("device-a", GROUP, true);
@@ -232,22 +324,40 @@ async fn not_ready_when_peer_holds_current_but_not_a_retained_version() {
     // The superseded version's content: device-a never received or stored
     // this block at all -- it never held this version. Written first, then
     // superseded by `current_record` below (same path).
-    let mut superseded_version = VersionVector::new();
-    superseded_version.increment("device-b");
     let superseded_record = FileRecord {
         path: "a.bin".into(),
         size: 32,
         mtime_unix_nanos: 0,
-        version: superseded_version,
         blocks: vec![BlockInfo { hash: vec![7u8; 32], offset: 0, size: 32 }],
         deleted: false,
     };
-    b.state.sync_state.upsert_file(GROUP, &superseded_record).unwrap();
-    b.state.sync_state.upsert_file(GROUP, &current_record).unwrap(); // supersedes it
+    b.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &superseded_record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &current_record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap(); // supersedes it
 
     // Device-a only ever indexes the CURRENT version of a.bin -- it never
     // held the superseded one at all.
-    a.state.sync_state.upsert_file(GROUP, &current_record).unwrap();
+    a.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &current_record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
     b.state.set_peer_group_full_replica("device-a", GROUP, true);
@@ -282,8 +392,22 @@ async fn ready_when_another_replica_holds_current_and_retained_history() {
     // Both devices index the same history: old (now superseded) then new
     // (current) -- and device-a's block store actually holds both.
     for state in [&a.state, &b.state] {
-        state.sync_state.upsert_file(GROUP, &old_record).unwrap();
-        state.sync_state.upsert_file(GROUP, &new_record).unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository().upsert_file(
+                GROUP,
+                &old_record,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository().upsert_file(
+                GROUP,
+                &new_record,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
     }
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
@@ -317,8 +441,22 @@ async fn full_replica_handoff_ready_digest_detects_a_root_set_change_before_comm
     let content = b"the only file, at check time";
     let bytes = put_and_record(&a, content);
     let record = record_referencing("a.bin", bytes, content.len() as u64);
-    a.state.sync_state.upsert_file(GROUP, &record).unwrap();
-    b.state.sync_state.upsert_file(GROUP, &record).unwrap();
+    a.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
     b.state.set_peer_group_full_replica("device-a", GROUP, true);
@@ -345,7 +483,14 @@ async fn full_replica_handoff_ready_digest_detects_a_root_set_change_before_comm
     // A local edit lands in the window between the check and the commit —
     // exactly the race the re-confirm exists to catch.
     let second_record = record_referencing("second.bin", vec![9u8; 32], 4);
-    b.state.sync_state.upsert_file(GROUP, &second_record).unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &second_record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     // The re-confirm: a fresh local digest no longer matches the one the
     // peer's confirmation covered, so the caller must fail closed.
@@ -373,7 +518,14 @@ async fn handoff_skips_a_peer_that_never_advertised_version_hash_exact() {
     let b = new_daemon("device-b");
 
     let record = record_referencing("solo.bin", vec![9u8; 32], 4);
-    b.state.sync_state.upsert_file(GROUP, &record).unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     // A session that never ran a `ClusterConfig` handshake at all — the same
     // starting state as one that did run it against an old peer that
@@ -384,8 +536,10 @@ async fn handoff_skips_a_peer_that_never_advertised_version_hash_exact() {
         fake_channel,
         "device-b".to_string(),
         "device-a".to_string(),
-        b.state.sync_state.clone(),
-        b.state.block_store.clone(),
+        b.state.replica_coordinator.clone(),
+        std::sync::Arc::new(yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            b.state.block_store.clone(),
+        )),
         vec![GROUP.to_string()],
         std::collections::HashMap::new(),
     );
@@ -393,11 +547,7 @@ async fn handoff_skips_a_peer_that_never_advertised_version_hash_exact() {
         !fake_session.version_hash_exact_negotiated(),
         "a session that never completed the handshake must default to unsupported"
     );
-    b.state
-        .sessions
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert("device-a".to_string(), fake_session);
+    b.state.peers.register_session("device-a".to_string(), fake_session);
     b.state.set_peer_group_full_replica("device-a", GROUP, true);
     b.state.set_peer_group_writer("device-a", GROUP, true);
 
@@ -431,16 +581,29 @@ async fn handoff_uses_a_peer_that_advertised_version_hash_exact() {
     let content = b"content the capable peer durably holds";
     let bytes = put_and_record(&a, content);
     let record = record_referencing("a.bin", bytes, content.len() as u64);
-    a.state.sync_state.upsert_file(GROUP, &record).unwrap();
-    b.state.sync_state.upsert_file(GROUP, &record).unwrap();
+    a.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository().upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
     b.state.set_peer_group_full_replica("device-a", GROUP, true);
     tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
     {
-        let sessions = b.state.sessions.lock().unwrap_or_else(|p| p.into_inner());
-        let session = sessions.get("device-a").expect("session with device-a must exist");
+        let session = b.state.peers.session("device-a").expect("session with device-a must exist");
         assert!(
             session.version_hash_exact_negotiated(),
             "two current-build daemons must negotiate supports_version_hash_exact in their \

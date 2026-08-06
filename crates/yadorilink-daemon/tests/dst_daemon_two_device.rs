@@ -40,12 +40,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
+use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::app::{self, DaemonConfig};
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_daemon::link_manager;
 use yadorilink_daemon::peer_orchestrator::{SimDiscovery, SimPeer};
-use yadorilink_sync_core::debounce::DebounceConfig;
-use yadorilink_sync_core::watcher::{FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource};
+use yadorilink_filesystem_sync::debounce::DebounceConfig;
+use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource};
 use yadorilink_transport::DeviceKeyPair;
 
 const GROUP_ID: &str = "dst-daemon-two-device-group";
@@ -123,17 +123,17 @@ async fn boot_daemon(
     // finds this device's local root), and the watch source lets the
     // harness deliver synthetic events for local writes.
     state
-        .sync_state
+        .replica_coordinator
         .add_link(&root.to_string_lossy(), GROUP_ID)
         .map_err(|e| format!("add_link: {e}"))?;
     let (watch_source, events_tx) = SimulatedFolderWatchSource::new(64);
-    link_manager::start_link_watch_with_source(
-        state.clone(),
-        root.to_string_lossy().to_string(),
-        GROUP_ID.to_string(),
-        Arc::new(watch_source),
-    )
-    .map_err(|e| format!("start_link_watch_with_source: {e}"))?;
+    LinkRuntimeController::new(state.clone())
+        .start_with_source(
+            root.to_string_lossy().to_string(),
+            GROUP_ID.to_string(),
+            Arc::new(watch_source),
+        )
+        .map_err(|e| format!("start_link_watch_with_source: {e}"))?;
 
     Ok((
         SimDaemon {
@@ -210,7 +210,7 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
     // Pin the session clock onto the same seed-derived synthetic timeline
     // the stamped mtimes sit on, matching the smoke test.
     let mtime_nanos = deterministic_mtime_nanos(seed);
-    yadorilink_sync_core::peer_session::set_test_clock_override(mtime_nanos);
+    yadorilink_peer_session::peer_session::set_test_clock_override(mtime_nanos);
 
     // Give both peer channels a beat to pair up under simulated time before
     // generating traffic (not strictly required -- the first index update
@@ -254,14 +254,7 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
         format!(
             "daemon B never materialized the file synced from A (exists={}, sessions_b={:?})",
             file_b.exists(),
-            daemon_b
-                .state
-                .sessions
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
+            daemon_b.state.peers.all_sessions().into_iter().map(|(id, _)| id).collect::<Vec<_>>()
         )
     })?;
 
@@ -286,7 +279,7 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
 }
 
 fn session_connected(state: &DaemonState, peer_device_id: &str) -> bool {
-    state.sessions.lock().unwrap_or_else(|p| p.into_inner()).contains_key(peer_device_id)
+    state.peers.has_session(peer_device_id)
 }
 
 /// Polls the probe slot (under simulated time) until `app::run` publishes

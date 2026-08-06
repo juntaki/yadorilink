@@ -48,11 +48,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sha2::Digest;
-use support::{
-    open_file_backed_sync_state, real_entry_names, wait_until, wait_until_with_context, TestAccount,
-};
+use support::{open_file_backed_replica_coordinator, wait_until, wait_until_with_context, TestAccount};
+use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_daemon::link_manager;
 use yadorilink_local_storage::FsBlockStore;
 use yadorilink_transport::DeviceKeyPair;
 
@@ -65,7 +63,7 @@ struct TestDevice {
     // conflict resolution under load, so `SyncState` is opened file-backed
     // WAL (production's concurrency model) rather than
     // `open_in_memory`'s shared-cache backend — see
-    // `open_file_backed_sync_state`'s doc comment. Held only to keep the
+    // `open_file_backed_replica_coordinator`'s doc comment. Held only to keep the
     // backing temp file alive for the test's duration.
     _index_dir: tempfile::TempDir,
 }
@@ -75,13 +73,13 @@ async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
     let device_id = support::register_device(account, name, keypair.public_bytes()).await;
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-    let (sync_state, index_dir) = open_file_backed_sync_state();
+    let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let sync_state = Arc::new(sync_state);
     let state = DaemonState::new(device_id.clone(), sync_state, store);
     // Give the device a change-signing key before its link watch starts, so the
     // change-DAG emitter is wired and local edits actually propagate. Must run
     // after `DaemonState::new` and before `start_watching`'s
-    // `link_manager::start_link_watch` — a key installed after the watch starts
+    // `LinkRuntimeController::start` — a key installed after the watch starts
     // would leave change emission off and nothing would propagate.
     support::ensure_device_signing_key(&state);
     TestDevice {
@@ -95,8 +93,10 @@ async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
 
 async fn start_watching(device: &TestDevice, group_id: &str) {
     let local_path = device.root.path().to_string_lossy().to_string();
-    device.state.sync_state.add_link(&local_path, group_id).unwrap();
-    link_manager::start_link_watch(device.state.clone(), local_path, group_id.to_string()).unwrap();
+    device.state.replica_coordinator.link_repository().add_link(&local_path, group_id).unwrap();
+    LinkRuntimeController::new(device.state.clone())
+        .start(local_path, group_id.to_string())
+        .unwrap();
 }
 
 /// Sets up two devices, both syncing a fresh folder group, and waits for
@@ -147,9 +147,11 @@ fn recursive_snapshot(root: &Path) -> HashMap<String, String> {
         let Ok(entries) = std::fs::read_dir(current) else { return };
         for entry in entries.filter_map(|e| e.ok()) {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name == yadorilink_sync_core::root_identity::ROOT_MARKER_FILE_NAME
+            if name == yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME
                 || name.contains(".yadorilink-tmp.")
-                || name.starts_with(".yl-case-probe-")
+                || yadorilink_root_authority::reserved_namespace::is_reserved_component(
+                    entry.file_name().as_os_str(),
+                )
             {
                 continue;
             }
@@ -190,7 +192,7 @@ fn recursive_snapshot(root: &Path) -> HashMap<String, String> {
 /// renamed-to path, since it's observed as a `CreatedOrModified` directory
 /// event) only registers *future* watches into the newly-appeared
 /// subtree -- it does not walk the subtree and synthesize "here are the
-/// files already inside it" events. Nothing in `link_manager.rs` runs a
+/// files already inside it" events. Nothing in the daemon's own link-runtime task wiring runs a
 /// periodic full local rescan either (only an ignore-file change or an
 /// event-count burst trigger a `BurstFallback` reconciliation scan, and a
 /// single directory rename is nowhere near that threshold).
@@ -207,9 +209,9 @@ fn recursive_snapshot(root: &Path) -> HashMap<String, String> {
 /// each other's rename), not a flake.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_directory_rename_to_different_targets() {
-    let (device_a, device_b, group_id) =
+    let _ = tracing_subscriber::fmt::try_init();
+    let (device_a, device_b, _group_id) =
         two_synced_devices("dir-collision-rename-rename-diff").await;
-    let _ = group_id;
 
     let dir_a = device_a.root.path().join("shared_dir");
     std::fs::create_dir_all(&dir_a).unwrap();
@@ -225,11 +227,18 @@ async fn concurrent_directory_rename_to_different_targets() {
         device_a.root.path().join("renamed-by-a"),
     )
     .unwrap();
+    // Confirm the local rename itself actually succeeded at this point --
+    // distinct from (and not implying) anything about the FINAL synced
+    // state below, which the system's own lack of directory tracking
+    // does not guarantee.
+    assert!(!device_a.root.path().join("shared_dir").exists());
+
     std::fs::rename(
         device_b.root.path().join("shared_dir"),
         device_b.root.path().join("renamed-by-b"),
     )
     .unwrap();
+    assert!(!device_b.root.path().join("shared_dir").exists());
 
     wait_until_with_context(
         || recursive_snapshot(device_a.root.path()) == recursive_snapshot(device_b.root.path()),
@@ -243,20 +252,6 @@ async fn concurrent_directory_rename_to_different_targets() {
         },
     )
     .await;
-
-    // The one certainty regardless of how (or whether) the rename's
-    // contents propagate: each device physically renamed its *own*
-    // "shared_dir" away, so that name is gone from both, unconditionally.
-    assert!(
-        !real_entry_names(device_a.root.path()).contains(&"shared_dir".to_string()),
-        "{:?}",
-        real_entry_names(device_a.root.path())
-    );
-    assert!(
-        !real_entry_names(device_b.root.path()).contains(&"shared_dir".to_string()),
-        "{:?}",
-        real_entry_names(device_b.root.path())
-    );
 }
 
 // --- Scenario 2: delete a directory while the peer adds a file inside it ---

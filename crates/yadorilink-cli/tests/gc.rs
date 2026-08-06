@@ -22,7 +22,7 @@ use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPaylo
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{GcRequest, StatusRequest};
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_sync_core::index::SyncState;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -30,16 +30,21 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>, std::path::Path
 
     let blocks_root = dir.path().join("blocks");
     let store = Arc::new(FsBlockStore::new(&blocks_root).unwrap());
-    let sync_state = Arc::new(SyncState::open(dir.path().join("sync.sqlite3")).unwrap());
+    let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
     let state = DaemonState::new("device-under-test".into(), sync_state, store);
 
     let socket_path = dir.path().join("daemon.sock");
     std::env::set_var("YADORILINK_CONTROL_SOCKET", &socket_path);
 
     let serve_path = socket_path.clone();
-    let serve_state = state.clone();
+    let serve_context = std::sync::Arc::new(
+        yadorilink_daemon::control_context::ControlContext::from_state(state.clone()),
+    );
     tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(&serve_path, serve_state)
+        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
+            &serve_path,
+            serve_context,
+        )
             .await;
     });
     tokio::time::sleep(Duration::from_millis(100)).await;

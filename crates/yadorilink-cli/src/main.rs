@@ -1,6 +1,6 @@
 //! `yadorilink` CLI.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use yadorilink_cli::commands;
 use yadorilink_cli::error::CliError;
 
@@ -28,6 +28,13 @@ enum Command {
     Share {
         #[command(subcommand)]
         action: ShareAction,
+    },
+    /// Inspect the local recovery-journal inventory (create/join enrollment,
+    /// account-membership, and role-loss operations still in flight or
+    /// requiring operator attention). Strictly read-only.
+    Recovery {
+        #[command(subcommand)]
+        action: RecoveryAction,
     },
     /// Link a local directory to a folder group.
     Link {
@@ -342,6 +349,50 @@ enum ReportConsentAction {
 }
 
 #[derive(Subcommand)]
+enum RecoveryAction {
+    /// List every local recovery-journal row (enrollment, membership, and
+    /// role-loss alike), plus any row that failed to decode.
+    List {
+        /// Print machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diagnose one recovery operation against the coordination plane's own
+    /// evidence: local journal state, exactly one remote lookup, and a
+    /// recommendation. The three recovery journals share no cross-table id
+    /// uniqueness, so `domain` is required to disambiguate which journal to
+    /// look in.
+    Show {
+        domain: RecoveryDomainArg,
+        operation_id: String,
+        /// Print machine-readable JSON instead of plain text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Mirrors `yadorilink_sync_core::recovery::RecoveryDomain::as_str`'s own
+/// wire strings -- a closed set, not a free-form string, so an invalid
+/// domain is rejected by clap itself before any request is even built.
+#[derive(Clone, Copy, ValueEnum)]
+enum RecoveryDomainArg {
+    Enrollment,
+    Membership,
+    #[value(name = "role-loss")]
+    RoleLoss,
+}
+
+impl RecoveryDomainArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enrollment => "enrollment",
+            Self::Membership => "membership",
+            Self::RoleLoss => "role-loss",
+        }
+    }
+}
+
+#[derive(Subcommand)]
 enum DeviceAction {
     Register {
         #[arg(long, default_value = "this device")]
@@ -531,6 +582,12 @@ async fn run(command: Command) -> Result<(), CliError> {
             DeviceAction::List => commands::device::list().await,
             DeviceAction::Remove { device_id, force } => {
                 commands::device::remove(device_id, force).await
+            }
+        },
+        Command::Recovery { action } => match action {
+            RecoveryAction::List { json } => commands::recovery::list(json).await,
+            RecoveryAction::Show { domain, operation_id, json } => {
+                commands::recovery::show(domain.as_str(), operation_id, json).await
             }
         },
         Command::Share { action } => match action {

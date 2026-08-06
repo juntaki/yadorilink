@@ -116,6 +116,14 @@ impl BackoffConfig {
     pub const RECONNECT: BackoffConfig =
         BackoffConfig { initial: Duration::from_secs(1), max: Duration::from_secs(45) };
 
+    /// Convergence Engine scheduler loop restart backoff — matches the
+    /// job-level backoff schedule's own cap
+    /// (`yadorilink_daemon::convergence::backoff::next_backoff`) so a
+    /// panicking/erroring scheduler recovers on roughly the same timescale
+    /// as an ordinary job retry.
+    pub const CONVERGENCE_ENGINE: BackoffConfig =
+        BackoffConfig { initial: Duration::from_secs(1), max: Duration::from_secs(30) };
+
     /// A Degraded (disk-pressure) link's periodic free-space re-check
     /// schedule — starts at 5s (disk pressure can resolve quickly, e.g. a
     /// user manually deleting a large file) and caps at 5 minutes (a

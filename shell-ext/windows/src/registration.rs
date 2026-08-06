@@ -34,12 +34,6 @@ const SLOTS: &[OverlaySlot] = &[
     OverlaySlot { clsid: crate::overlay::CLSID_SYNCING, name: "YadoriLinkSyncing" },
     OverlaySlot { clsid: crate::overlay::CLSID_ERROR, name: "YadoriLinkError" },
     OverlaySlot { clsid: crate::overlay::CLSID_ONLINE_ONLY, name: "YadoriLinkOnlineOnly" },
-    // A 5th overlay slot for the "open
-    // elsewhere" edit-presence badge. Windows exposes a
-    // limited number of overlay slots system-wide (commonly ~15, several
-    // OS-reserved) shared across every installed cloud-sync client, so
-    // this is one more real deployments should expect to compete for.
-    OverlaySlot { clsid: crate::overlay::CLSID_OPEN_ELSEWHERE, name: "YadoriLinkOpenElsewhere" },
 ];
 
 fn guid_to_registry_string(guid: GUID) -> String {

@@ -7,20 +7,19 @@
 //! the wire types.
 //!
 //! Liveness is computed fresh from the index
-//! (`SyncState::live_block_hashes`) on every sweep rather than
-//! transactionally refcounted, so this module needs no persisted state of
-//! its own beyond simple bookkeeping counters (below) — a crash mid-sweep
-//! just leaves some already-deleted blocks deleted and the rest
-//! untouched, safely resumed by the next sweep (content-addressed
+//! (`SyncState::live_block_hashes_including_all_dag_retention_roots`) on
+//! every sweep rather than transactionally refcounted, so this module needs
+//! no persisted state of its own beyond simple bookkeeping counters (below)
+//! — a crash mid-sweep just leaves some already-deleted blocks deleted and
+//! the rest untouched, safely resumed by the next sweep (content-addressed
 //! `delete` is idempotent).
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use yadorilink_local_storage::GcReport;
-use yadorilink_sync_core::block_deletion::{BlockDeletionCoordinator, BlockDeletionReason};
 
+use crate::adapters::block_store_ports::BlockStorePortsAdapter;
 use crate::daemon_state::DaemonState;
 
 /// "Comfortably larger than normal sync-burst duration" — the daemon must
@@ -44,83 +43,6 @@ pub const GC_GRACE_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// poll cadence), short enough that a sweep starts promptly once the
 /// daemon does go idle.
 pub const GC_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Daemon-wide GC coordination and last-run bookkeeping —
-/// one instance lives on `DaemonState`, shared by the idle scheduler and
-/// every on-demand `gc`/`gc --dry-run` request, so both go through the
-/// exact same mutual-exclusion and reporting state.
-pub struct GcState {
-    /// "only one sweep runs at a time daemon-wide" — claimed via
-    /// `compare_exchange` in `run_sweep` regardless of which trigger (idle
-    /// scheduler vs. on-demand IPC request) is attempting it, so an
-    /// on-demand trigger firing mid-idle-sweep never starts a second,
-    /// concurrent sweep.
-    running: AtomicBool,
-    /// Unix seconds of the last *real* (non-dry-run) sweep's completion;
-    /// `0` if none has ever completed since this daemon's block store was
-    /// created.
-    last_run_unix: AtomicI64,
-    last_blocks_deleted: AtomicU64,
-    last_bytes_reclaimed: AtomicU64,
-    /// The most recently *computed* delete-set size: reset to `0`
-    /// immediately after a real sweep (everything reclaimable as of that
-    /// snapshot was just reclaimed), or left at the reported delete-set
-    /// size after a `gc --dry-run` — going stale as new writes/deletes
-    /// happen until the next sweep/dry-run computes it again (this is
-    /// disclosed dry-run behavior — modulo the ordinary passage of time —
-    /// not a bug). Backs
-    /// `StatusResponse.gc_reclaimable_estimate_bytes`.
-    reclaimable_estimate_bytes: AtomicU64,
-}
-
-impl Default for GcState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl GcState {
-    pub fn new() -> Self {
-        Self {
-            running: AtomicBool::new(false),
-            last_run_unix: AtomicI64::new(0),
-            last_blocks_deleted: AtomicU64::new(0),
-            last_bytes_reclaimed: AtomicU64::new(0),
-            reclaimable_estimate_bytes: AtomicU64::new(0),
-        }
-    }
-
-    pub fn last_run_unix(&self) -> i64 {
-        self.last_run_unix.load(Ordering::SeqCst)
-    }
-
-    pub fn last_blocks_deleted(&self) -> u64 {
-        self.last_blocks_deleted.load(Ordering::SeqCst)
-    }
-
-    pub fn last_bytes_reclaimed(&self) -> u64 {
-        self.last_bytes_reclaimed.load(Ordering::SeqCst)
-    }
-
-    pub fn reclaimable_estimate_bytes(&self) -> u64 {
-        self.reclaimable_estimate_bytes.load(Ordering::SeqCst)
-    }
-}
-
-/// RAII guard releasing `GcState::running` on drop — mirrors
-/// `BroadcastGuard`/`WriteActivityGuard` (`daemon_state.rs`) so a sweep
-/// that returns early via `?` (or, in principle, panics) still gets
-/// counted back out, never wedging every future sweep attempt behind a
-/// permanently-stuck flag.
-struct GcRunGuard<'a> {
-    running: &'a AtomicBool,
-}
-
-impl Drop for GcRunGuard<'_> {
-    fn drop(&mut self) {
-        self.running.store(false, Ordering::SeqCst);
-    }
-}
 
 /// Why a requested sweep did not run (or did not complete).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,7 +93,8 @@ fn now_unix() -> i64 {
 /// -style runtime hygiene, mirroring `FsBlockStore::present_blocks`:
 /// the actual sweep is synchronous, batch-throttled blocking I/O
 /// (`FsBlockStore::sweep`'s own pacing sleep between batches,
-/// `SyncState::live_block_hashes`'s SQLite scan) — run through
+/// `SyncState::live_block_hashes_including_all_dag_retention_roots`'s SQLite
+/// scan) — run through
 /// `block_in_place` off the async caller's own poll when a multi-threaded
 /// tokio runtime is current, so a large sweep never stalls the runtime's
 /// other work (the control socket, peer sessions,...) for its duration.
@@ -216,10 +139,7 @@ fn run_sweep_sync(
     dry_run: bool,
     grace_cutoff: SystemTime,
 ) -> Result<GcReport, GcTriggerError> {
-    if state.gc.running.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-        return Err(GcTriggerError::AlreadyRunning);
-    }
-    let _guard = GcRunGuard { running: &state.gc.running };
+    let _guard = state.gc.try_start().map_err(|()| GcTriggerError::AlreadyRunning)?;
 
     // "Never mid-burst" — checked *after* claiming `running` (so a
     // genuinely concurrent attempt observes the more specific
@@ -237,13 +157,9 @@ fn run_sweep_sync(
     // `live`) or waits until deletion has completed.
     let _block_deletion = state.begin_block_deletion();
 
-    // `live_block_hashes` already includes every retained
+    // `live_block_hashes` alone already includes every retained
     // version/trash record's blocks (any `deleted = 0` row,
-    // current or superseded/trashed alike — see its own doc comment), so
-    // no separate version-history extra-roots call is needed here yet;
-    // `live_block_hashes_with_extra_roots` remains available as the
-    // extension point for a future root category that
-    // isn't already representable as a `files` row.
+    // current or superseded/trashed alike — see its own doc comment).
     //
     // This is also why a full-replica-handoff lease's pin needs no block-level
     // awareness here: a leased `(path, version_seq)` row only stops being a
@@ -253,26 +169,38 @@ fn run_sweep_sync(
     // `SyncState::leased_version_keys_for_group` gates. As long as the row
     // survives retention, its blocks are already live from this sweep's own
     // point of view — the pin's real enforcement point is retention, not GC.
-    let live =
-        state.sync_state.live_block_hashes().map_err(|e| GcTriggerError::Failed(e.to_string()))?;
-    let report = BlockDeletionCoordinator::new(state.block_store.as_ref())
-        .sweep(
-            &_block_deletion,
-            BlockDeletionReason::GloballyUnreferenced,
-            &live,
-            grace_cutoff,
-            dry_run,
-        )
+    //
+    // A `full_payload` `dag_retention_roots` entry, though, is not always
+    // backed by a `files` row yet — `captured_authoring` registers one for
+    // its newly signed change before that content is ever adopted into the
+    // materialized index — so `live_block_hashes` alone is not enough here;
+    // `live_block_hashes_including_all_dag_retention_roots` unions in every
+    // such root across every group in one query, matching the daemon-wide
+    // scope of this sweep (one block store shared by every group).
+    let live = state
+        .replica_coordinator
+        .materialization_state_repository().live_block_hashes_including_all_dag_retention_roots()
         .map_err(|e| GcTriggerError::Failed(e.to_string()))?;
+    // `DaemonState::block_store` is already an erased `Arc<dyn BlockStore +
+    // Send + Sync>`, which does not itself unsize-coerce to `&dyn
+    // BlockReclamationStore` (that re-coercion needs a declared supertrait
+    // relationship, not one established only via a blanket impl) — wrap it
+    // through the adapter, same as every other daemon-side call site below.
+    let block_reclamation = BlockStorePortsAdapter::new(state.block_store.clone());
+    let report = yadorilink_filesystem_sync::block_deletion::sweep_globally_unreferenced_blocks(
+        &_block_deletion,
+        &block_reclamation,
+        &live,
+        grace_cutoff,
+        dry_run,
+    )
+    .map_err(|e| GcTriggerError::Failed(e.to_string()))?;
 
     if dry_run {
-        state.gc.reclaimable_estimate_bytes.store(report.bytes_reclaimed, Ordering::SeqCst);
+        state.gc.record_dry_run(report.bytes_reclaimed);
     } else {
-        state.gc.last_run_unix.store(now_unix(), Ordering::SeqCst);
-        state.gc.last_blocks_deleted.store(report.blocks_deleted, Ordering::SeqCst);
-        state.gc.last_bytes_reclaimed.store(report.bytes_reclaimed, Ordering::SeqCst);
         // Everything reclaimable as of this snapshot was just reclaimed.
-        state.gc.reclaimable_estimate_bytes.store(0, Ordering::SeqCst);
+        state.gc.record_real_sweep(now_unix(), report.blocks_deleted, report.bytes_reclaimed);
     }
     Ok(report)
 }
@@ -318,7 +246,7 @@ pub async fn maybe_run_idle_sweep(
 /// never stops the sweep from covering the rest, mirroring
 /// `run_retention_expiry_sweep`'s own per-link error handling.
 pub fn run_periodic_capacity_eviction_sweep(state: &DaemonState) {
-    let links = match state.sync_state.list_links() {
+    let links = match state.replica_coordinator.link_repository().list_links() {
         Ok(links) => links,
         Err(e) => {
             tracing::warn!(error = %e, "periodic capacity-eviction sweep: failed to list links");
@@ -334,20 +262,61 @@ pub fn run_periodic_capacity_eviction_sweep(state: &DaemonState) {
             continue;
         }
         if link.materialization_policy
-            != yadorilink_sync_core::types::MaterializationPolicy::OnDemand
+            != yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand
             || link.max_local_size_bytes.is_none()
         {
             continue;
         }
+        if !yadorilink_filesystem_sync::placeholder_backend::on_demand_pipeline_is_connected() {
+            tracing::warn!(
+                group_id = %link.group_id,
+                local_path = %link.local_path,
+                "periodic capacity-eviction sweep: on-demand placeholder pipeline is not \
+                 connected; refusing to evict"
+            );
+            continue;
+        }
         let root = std::path::Path::new(&link.local_path);
+        let root_lease = match state.root_lease_for(&link.group_id) {
+            Ok(lease) => lease,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    group_id = %link.group_id,
+                    local_path = %link.local_path,
+                    "periodic capacity-eviction sweep: no live root lease for this link"
+                );
+                continue;
+            }
+        };
+        let root_op = match root_lease.begin_operation() {
+            Ok(op) => op,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    group_id = %link.group_id,
+                    local_path = %link.local_path,
+                    "periodic capacity-eviction sweep: root lease refused a new operation"
+                );
+                continue;
+            }
+        };
+        let root_commit_permit = root_op.permit();
+        // See `run_sweep_sync`'s matching comment: `state.block_store` is an
+        // already-erased `Arc<dyn BlockStore + Send + Sync>`, so it needs the
+        // adapter to reach `&dyn BlockReclamationStore`.
+        let block_reclamation = BlockStorePortsAdapter::new(state.block_store.clone());
         // This loop only reaches OnDemand links, so this device is not a full
         // replica of the group; custody is consulted per file so the sweep only
         // reclaims blocks a full replica is confirmed to hold.
-        match yadorilink_sync_core::materialization::run_eviction_sweep(
-            &state.sync_state,
-            state.block_liveness_gate(),
-            state.block_store.as_ref(),
-            root,
+        match yadorilink_filesystem_sync::materialization_eviction::run_eviction_sweep(
+            yadorilink_filesystem_sync::materialization_eviction::MaterializationContext {
+                state: state.replica_coordinator.as_ref(),
+                liveness_gate: state.block_liveness_gate(),
+                store: &block_reclamation,
+                root,
+                permit: &root_commit_permit,
+            },
             &link.group_id,
             false,
             link.max_local_size_bytes,
@@ -375,13 +344,11 @@ pub fn run_periodic_capacity_eviction_sweep(state: &DaemonState) {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::sync::atomic::Ordering as TestOrdering;
     use std::sync::{Condvar, Mutex};
 
     use yadorilink_local_storage::{BlockStore, ContentHash, FsBlockStore, StorageError};
-    use yadorilink_sync_core::index::SyncState;
-    use yadorilink_sync_core::types::{BlockInfo, FileRecord};
-    use yadorilink_sync_core::version_vector::VersionVector;
+    use crate::replica_coordinator::ReplicaCoordinator;
+    use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 
     use super::*;
 
@@ -393,7 +360,7 @@ mod tests {
     fn test_state() -> (Arc<DaemonState>, tempfile::TempDir) {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
-        let sync_state = Arc::new(SyncState::open_in_memory().unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         (DaemonState::new("device-a".into(), sync_state, store), store_dir)
     }
 
@@ -452,8 +419,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn eviction_without_remote_lease_never_reaches_physical_reclaim() {
-        use yadorilink_sync_core::change::{VersionBlock, VersionHash};
-        use yadorilink_sync_core::materialization::evict_file;
+        use yadorilink_replica_domain::file::VersionBlock;
+        use yadorilink_replica_domain::ids::VersionHash;
+        use yadorilink_filesystem_sync::materialization_eviction::{evict_file, MaterializationContext};
 
         let store_dir = tempfile::tempdir().unwrap();
         let (reclaim_started_tx, reclaim_started_rx) = std::sync::mpsc::sync_channel(1);
@@ -462,10 +430,22 @@ mod tests {
             sweep_started: reclaim_started_tx,
             sweep_release: Arc::new((Mutex::new(false), Condvar::new())),
         });
-        let sync_state = Arc::new(SyncState::open_in_memory().unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let materialized_root = tempfile::tempdir().unwrap();
+        // `evict_file` now verifies the root's adopted identity before
+        // touching it; a real link row is required so the token it writes
+        // actually persists (see `materialization.rs`'s own `adopt_root`
+        // test helper doc for why -- `set_link_root_token_for_group` is a
+        // no-op `UPDATE` without one).
+        sync_state.link_repository().add_link(&materialized_root.path().to_string_lossy(), "group-a").unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            materialized_root.path(),
+            "group-a",
+            sync_state.as_ref(),
+        )
+        .unwrap();
         let state = DaemonState::new("device-a".into(), sync_state, store);
         let bytes = b"shared block adopted during eviction";
-        let materialized_root = tempfile::tempdir().unwrap();
         std::fs::write(materialized_root.path().join("evicted.txt"), bytes).unwrap();
         let hash = state.block_store.put(bytes).unwrap();
         let block =
@@ -474,17 +454,18 @@ mod tests {
             path: "evicted.txt".into(),
             size: bytes.len() as u64,
             mtime_unix_nanos: 0,
-            version: VersionVector::new(),
             blocks: vec![block],
             deleted: false,
         };
-        state.sync_state.upsert_file("group-a", &target).unwrap();
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        state.replica_coordinator.file_index_repository().upsert_file("group-a", &target, &permit).unwrap();
         state
-            .sync_state
-            .set_materialization_state(
+            .replica_coordinator
+            .materialization_state_repository().set_materialization_state(
                 "group-a",
                 "evicted.txt",
-                yadorilink_sync_core::types::MaterializationState::Hydrated,
+                yadorilink_replica_domain::session_state::MaterializationState::Hydrated,
+                &permit,
             )
             .unwrap();
         state.set_custody_confirmer(Arc::new(
@@ -494,11 +475,16 @@ mod tests {
         let reclaim_state = state.clone();
         let reclaim_root = materialized_root.path().to_path_buf();
         let outcome = tokio::task::spawn_blocking(move || {
+            let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+            let block_reclamation = BlockStorePortsAdapter::new(reclaim_state.block_store.clone());
             evict_file(
-                &reclaim_state.sync_state,
-                reclaim_state.block_liveness_gate(),
-                reclaim_state.block_store.as_ref(),
-                &reclaim_root,
+                MaterializationContext {
+                    state: reclaim_state.replica_coordinator.as_ref(),
+                    liveness_gate: reclaim_state.block_liveness_gate(),
+                    store: &block_reclamation,
+                    root: &reclaim_root,
+                    permit: &permit,
+                },
                 "group-a",
                 "evicted.txt",
                 false,
@@ -527,7 +513,7 @@ mod tests {
             sweep_started: sweep_started_tx,
             sweep_release: sweep_release.clone(),
         });
-        let sync_state = Arc::new(SyncState::open_in_memory().unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         let state = DaemonState::new("device-a".into(), sync_state, store);
         let bytes = b"orphaned before the GC live snapshot";
         let hash = state.block_store.put(bytes).unwrap();
@@ -555,17 +541,15 @@ mod tests {
                 writer_hash,
                 "the write must deduplicate"
             );
-            let mut version = VersionVector::new();
-            version.increment("device-a");
+            let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
             writer_state
-                .sync_state
-                .upsert_file(
+                .replica_coordinator
+                .file_index_repository().upsert_file(
                     "group-a",
                     &FileRecord {
                         path: "adopted.txt".into(),
                         size: bytes.len() as u64,
                         mtime_unix_nanos: 0,
-                        version,
                         blocks: vec![BlockInfo {
                             hash: hex::decode(&writer_hash).unwrap(),
                             offset: 0,
@@ -573,6 +557,7 @@ mod tests {
                         }],
                         deleted: false,
                     },
+                    &permit,
                 )
                 .unwrap();
             writer_committed_tx.send(()).unwrap();
@@ -599,7 +584,7 @@ mod tests {
     }
 
     /// GC must not start while a sync burst is active —
-    /// simulated here exactly the way `link_manager`'s flush
+    /// simulated here exactly the way the daemon's own `LinkRuntimeController`'s flush
     /// executor and `hydration.rs`'s hydrate/evict/restore paths mark
     /// activity in production (`begin_write_activity`'s RAII guard), not
     /// by directly poking the write-safe-point flag.
@@ -620,7 +605,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_sweep_attempt_is_rejected_while_one_is_already_running() {
         let (state, _dir) = test_state();
-        state.gc.running.store(true, TestOrdering::SeqCst);
+        state.gc.mark_running_for_test();
 
         let result = run_sweep(state.clone(), false).await;
 
@@ -646,10 +631,10 @@ mod tests {
             sweep_started: sweep_started_tx,
             sweep_release: sweep_release.clone(),
         });
-        let sync_state = Arc::new(SyncState::open_in_memory().unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         let state = DaemonState::new("device-a".into(), sync_state, store);
-        state.sync_state.add_link("/tmp/yadorilink-gc-test-a", "group-a").unwrap();
-        state.sync_state.add_link("/tmp/yadorilink-gc-test-b", "group-b").unwrap();
+        state.replica_coordinator.link_repository().add_link("/tmp/yadorilink-gc-test-a", "group-a").unwrap();
+        state.replica_coordinator.link_repository().add_link("/tmp/yadorilink-gc-test-b", "group-b").unwrap();
 
         let first_state = state.clone();
         let first = tokio::spawn(run_sweep(first_state, false));
@@ -723,7 +708,7 @@ mod tests {
     async fn on_demand_trigger_during_an_idle_sweep_does_not_double_run() {
         let (state, _dir) = test_state();
         state.set_last_activity_unix_for_test(now_unix() - 3600);
-        state.gc.running.store(true, TestOrdering::SeqCst); // idle sweep already in flight
+        state.gc.mark_running_for_test(); // idle sweep already in flight
 
         let manual = run_sweep(state.clone(), false).await;
 

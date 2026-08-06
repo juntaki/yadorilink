@@ -1,0 +1,296 @@
+digraph {
+
+    graph [
+        label="yadorilink_sync_core @ 40e3456e",
+        labelloc=t,
+
+        pad=0.4,
+
+        // Consider rendering the graph using a different layout algorithm, such as:
+        // [dot, neato, twopi, circo, fdp, sfdp]
+        layout=dot,
+        overlap=false,
+        splines="line",
+        rankdir=LR,
+
+        fontname="Helvetica", 
+        fontsize="36",
+    ];
+
+    node [
+        fontname="monospace",
+        fontsize="10",
+        shape="box",
+        style="filled",
+    ];
+
+    edge [
+        fontname="monospace",
+        fontsize="10",
+    ];
+
+    "yadorilink_sync_core" [label="yadorilink_sync_core @ 40e3456e", fillcolor="#5397c8"]; // "crate" node
+    "yadorilink_sync_core::__peer_session_impl" [label="__peer_session_impl @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::adaptive_window" [label="adaptive_window @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::authenticated_history" [label="authenticated_history @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::block_deletion" [label="block_deletion @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::block_liveness" [label="block_liveness @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::block_serve" [label="block_serve @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::captured_authoring" [label="captured_authoring @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::change" [label="change @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::chunker" [label="chunker @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::commit_path_locks" [label="commit_path_locks @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_sync_core::compaction" [label="compaction @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::conflict" [label="conflict @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::custody" [label="custody @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::custody_transfer" [label="custody_transfer @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::dag_import" [label="dag_import @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::dag_store" [label="dag_store @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::debounce" [label="debounce @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::early_physical_recovery" [label="early_physical_recovery @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::error" [label="error @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_sync_core::filesystem_transaction" [label="filesystem_transaction @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::fs_capabilities" [label="fs_capabilities @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::fs_commit" [label="fs_commit @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::fs_identity" [label="fs_identity @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::hazard" [label="hazard @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::ignore_patterns" [label="ignore_patterns @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::index" [label="index @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::link_preflight" [label="link_preflight @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::local_change" [label="local_change @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::materialization" [label="materialization @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::materialization_jobs" [label="materialization_jobs @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::materialized_generation" [label="materialized_generation @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::optimistic_placement" [label="optimistic_placement @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::orchestrator" [label="orchestrator @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::peer_session" [label="peer_session @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::placeholder_backend" [label="placeholder_backend @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::plan_driver" [label="plan_driver @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::rate_limiter" [label="rate_limiter @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::rebootstrap" [label="rebootstrap @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::rebootstrap_snapshot" [label="rebootstrap_snapshot @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::recovery" [label="recovery @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::repair_election" [label="repair_election @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::reserved_namespace" [label="reserved_namespace @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::resolution_planning" [label="resolution_planning @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::retained_obligation" [label="retained_obligation @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::retroactive_conflict" [label="retroactive_conflict @ 40e3456e", fillcolor="#f8c04c"]; // "mod" node
+    "yadorilink_sync_core::root_commit" [label="root_commit @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::root_identity" [label="root_identity @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::single_pass_capture" [label="single_pass_capture @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::sync_root_lock" [label="sync_root_lock @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::types" [label="types @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+    "yadorilink_sync_core::watcher" [label="watcher @ 40e3456e", fillcolor="#81c169"]; // "mod" node
+
+    "yadorilink_sync_core" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::__peer_session_impl" -> "yadorilink_sync_core::adaptive_window" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::__peer_session_impl" -> "yadorilink_sync_core::block_serve" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::__peer_session_impl" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::__peer_session_impl" -> "yadorilink_sync_core::chunker" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::__peer_session_impl" -> "yadorilink_sync_core::compaction" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::__peer_session_impl" -> "yadorilink_sync_core::conflict" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::__peer_session_impl" -> "yadorilink_sync_core::dag_store" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::__peer_session_impl" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::__peer_session_impl" -> "yadorilink_sync_core::hazard" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::__peer_session_impl" -> "yadorilink_sync_core::ignore_patterns" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::__peer_session_impl" -> "yadorilink_sync_core::index" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::__peer_session_impl" -> "yadorilink_sync_core::materialization" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::__peer_session_impl" -> "yadorilink_sync_core::rate_limiter" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::__peer_session_impl" -> "yadorilink_sync_core::rebootstrap" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::__peer_session_impl" -> "yadorilink_sync_core::root_commit" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::__peer_session_impl" -> "yadorilink_sync_core::types" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::authenticated_history" -> "yadorilink_sync_core::__peer_session_impl" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::authenticated_history" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::authenticated_history" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::authenticated_history" -> "yadorilink_sync_core::index" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::block_deletion" -> "yadorilink_sync_core::block_liveness" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::block_deletion" -> "yadorilink_sync_core::custody" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::block_deletion" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::block_deletion" -> "yadorilink_sync_core::index" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::block_deletion" -> "yadorilink_sync_core::types" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::captured_authoring" -> "yadorilink_sync_core::block_liveness" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::captured_authoring" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::captured_authoring" -> "yadorilink_sync_core::dag_store" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::captured_authoring" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::captured_authoring" -> "yadorilink_sync_core::filesystem_transaction" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::captured_authoring" -> "yadorilink_sync_core::single_pass_capture" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::change" -> "yadorilink_sync_core::types" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::chunker" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::chunker" -> "yadorilink_sync_core::types" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::commit_path_locks" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::commit_path_locks" -> "yadorilink_sync_core::filesystem_transaction" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::compaction" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::compaction" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::conflict" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::conflict" -> "yadorilink_sync_core::types" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::custody" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::custody_transfer" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::custody_transfer" -> "yadorilink_sync_core::filesystem_transaction" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::custody_transfer" -> "yadorilink_sync_core::fs_commit" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::custody_transfer" -> "yadorilink_sync_core::fs_identity" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::custody_transfer" -> "yadorilink_sync_core::reserved_namespace" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::dag_import" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::dag_import" -> "yadorilink_sync_core::dag_store" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::dag_import" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::dag_import" -> "yadorilink_sync_core::index" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::dag_import" -> "yadorilink_sync_core::reserved_namespace" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::dag_import" -> "yadorilink_sync_core::sync_root_lock" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::dag_import" -> "yadorilink_sync_core::types" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::dag_store" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::dag_store" -> "yadorilink_sync_core::compaction" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::dag_store" -> "yadorilink_sync_core::conflict" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::dag_store" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::dag_store" -> "yadorilink_sync_core::filesystem_transaction" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::dag_store" -> "yadorilink_sync_core::index" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::dag_store" -> "yadorilink_sync_core::reserved_namespace" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::dag_store" -> "yadorilink_sync_core::sync_root_lock" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::debounce" -> "yadorilink_sync_core::watcher" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::early_physical_recovery" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::early_physical_recovery" -> "yadorilink_sync_core::filesystem_transaction" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::early_physical_recovery" -> "yadorilink_sync_core::fs_commit" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::early_physical_recovery" -> "yadorilink_sync_core::fs_identity" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::early_physical_recovery" -> "yadorilink_sync_core::reserved_namespace" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::early_physical_recovery" -> "yadorilink_sync_core::retained_obligation" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::error" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::filesystem_transaction" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::filesystem_transaction" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::filesystem_transaction" -> "yadorilink_sync_core::fs_capabilities" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::filesystem_transaction" -> "yadorilink_sync_core::fs_identity" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::filesystem_transaction" -> "yadorilink_sync_core::materialized_generation" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::fs_capabilities" -> "yadorilink_sync_core::fs_identity" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::fs_commit" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::fs_commit" -> "yadorilink_sync_core::fs_capabilities" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::fs_commit" -> "yadorilink_sync_core::fs_identity" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::fs_commit" -> "yadorilink_sync_core::reserved_namespace" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::hazard" -> "yadorilink_sync_core::types" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::index" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::index" -> "yadorilink_sync_core::compaction" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::index" -> "yadorilink_sync_core::dag_store" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::index" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::index" -> "yadorilink_sync_core::materialization_jobs" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::index" -> "yadorilink_sync_core::materialized_generation" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::index" -> "yadorilink_sync_core::rebootstrap" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::index" -> "yadorilink_sync_core::rebootstrap_snapshot" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::index" -> "yadorilink_sync_core::recovery" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::index" -> "yadorilink_sync_core::repair_election" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::index" -> "yadorilink_sync_core::retroactive_conflict" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::index" -> "yadorilink_sync_core::root_commit" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::index" -> "yadorilink_sync_core::types" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::link_preflight" -> "yadorilink_sync_core::ignore_patterns" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::local_change" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::local_change" -> "yadorilink_sync_core::chunker" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::local_change" -> "yadorilink_sync_core::dag_store" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::local_change" -> "yadorilink_sync_core::debounce" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::local_change" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::local_change" -> "yadorilink_sync_core::ignore_patterns" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::local_change" -> "yadorilink_sync_core::index" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::local_change" -> "yadorilink_sync_core::reserved_namespace" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::local_change" -> "yadorilink_sync_core::root_identity" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::local_change" -> "yadorilink_sync_core::sync_root_lock" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::local_change" -> "yadorilink_sync_core::types" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::local_change" -> "yadorilink_sync_core::watcher" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::materialization" -> "yadorilink_sync_core::block_deletion" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::materialization" -> "yadorilink_sync_core::block_liveness" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::materialization" -> "yadorilink_sync_core::chunker" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::materialization" -> "yadorilink_sync_core::custody" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::materialization" -> "yadorilink_sync_core::dag_store" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::materialization" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::materialization" -> "yadorilink_sync_core::index" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::materialization" -> "yadorilink_sync_core::reserved_namespace" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::materialization" -> "yadorilink_sync_core::root_commit" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::materialization" -> "yadorilink_sync_core::root_identity" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::materialization" -> "yadorilink_sync_core::types" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::materialization_jobs" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::materialized_generation" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::materialized_generation" -> "yadorilink_sync_core::dag_store" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::materialized_generation" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::materialized_generation" -> "yadorilink_sync_core::fs_identity" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::optimistic_placement" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::optimistic_placement" -> "yadorilink_sync_core::chunker" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::optimistic_placement" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::optimistic_placement" -> "yadorilink_sync_core::filesystem_transaction" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::optimistic_placement" -> "yadorilink_sync_core::fs_capabilities" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::optimistic_placement" -> "yadorilink_sync_core::fs_commit" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::optimistic_placement" -> "yadorilink_sync_core::fs_identity" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::optimistic_placement" -> "yadorilink_sync_core::materialized_generation" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::optimistic_placement" -> "yadorilink_sync_core::reserved_namespace" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::orchestrator" -> "yadorilink_sync_core::block_liveness" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::orchestrator" -> "yadorilink_sync_core::captured_authoring" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::orchestrator" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::orchestrator" -> "yadorilink_sync_core::commit_path_locks" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::orchestrator" -> "yadorilink_sync_core::custody_transfer" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::orchestrator" -> "yadorilink_sync_core::dag_store" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::orchestrator" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::orchestrator" -> "yadorilink_sync_core::filesystem_transaction" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::orchestrator" -> "yadorilink_sync_core::fs_capabilities" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::orchestrator" -> "yadorilink_sync_core::fs_commit" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::orchestrator" -> "yadorilink_sync_core::fs_identity" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::orchestrator" -> "yadorilink_sync_core::materialized_generation" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::orchestrator" -> "yadorilink_sync_core::optimistic_placement" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::orchestrator" -> "yadorilink_sync_core::reserved_namespace" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::orchestrator" -> "yadorilink_sync_core::resolution_planning" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::orchestrator" -> "yadorilink_sync_core::retained_obligation" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::orchestrator" -> "yadorilink_sync_core::single_pass_capture" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::peer_session" -> "yadorilink_sync_core::__peer_session_impl" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::peer_session" -> "yadorilink_sync_core::block_serve" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::peer_session" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::peer_session" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::peer_session" -> "yadorilink_sync_core::index" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::peer_session" -> "yadorilink_sync_core::rate_limiter" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::peer_session" -> "yadorilink_sync_core::rebootstrap" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::peer_session" -> "yadorilink_sync_core::types" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::placeholder_backend" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::plan_driver" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::plan_driver" -> "yadorilink_sync_core::filesystem_transaction" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::plan_driver" -> "yadorilink_sync_core::optimistic_placement" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::plan_driver" -> "yadorilink_sync_core::orchestrator" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::plan_driver" -> "yadorilink_sync_core::resolution_planning" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::rebootstrap" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::rebootstrap" -> "yadorilink_sync_core::compaction" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::rebootstrap" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::rebootstrap_snapshot" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::rebootstrap_snapshot" -> "yadorilink_sync_core::compaction" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::rebootstrap_snapshot" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::rebootstrap_snapshot" -> "yadorilink_sync_core::types" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::recovery" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::recovery" -> "yadorilink_sync_core::index" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::recovery" -> "yadorilink_sync_core::types" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::repair_election" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::resolution_planning" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::resolution_planning" -> "yadorilink_sync_core::conflict" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::resolution_planning" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::resolution_planning" -> "yadorilink_sync_core::filesystem_transaction" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::resolution_planning" -> "yadorilink_sync_core::fs_capabilities" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::resolution_planning" -> "yadorilink_sync_core::fs_identity" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::retained_obligation" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::retained_obligation" -> "yadorilink_sync_core::dag_store" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::retained_obligation" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::retained_obligation" -> "yadorilink_sync_core::filesystem_transaction" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::retained_obligation" -> "yadorilink_sync_core::fs_commit" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::retained_obligation" -> "yadorilink_sync_core::fs_identity" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::retained_obligation" -> "yadorilink_sync_core::single_pass_capture" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::retained_obligation" -> "yadorilink_sync_core::types" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::retroactive_conflict" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::retroactive_conflict" -> "yadorilink_sync_core::conflict" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::retroactive_conflict" -> "yadorilink_sync_core::dag_store" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::retroactive_conflict" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::root_commit" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::root_commit" -> "yadorilink_sync_core::sync_root_lock" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::root_identity" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::root_identity" -> "yadorilink_sync_core::index" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::root_identity" -> "yadorilink_sync_core::materialization" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::root_identity" -> "yadorilink_sync_core::types" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::single_pass_capture" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::single_pass_capture" -> "yadorilink_sync_core::chunker" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::single_pass_capture" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::single_pass_capture" -> "yadorilink_sync_core::fs_identity" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::single_pass_capture" -> "yadorilink_sync_core::types" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::sync_root_lock" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::sync_root_lock" -> "yadorilink_sync_core::fs_identity" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::types" -> "yadorilink_sync_core::change" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::types" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::watcher" -> "yadorilink_sync_core::error" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::watcher" -> "yadorilink_sync_core::ignore_patterns" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "yadorilink_sync_core::watcher" -> "yadorilink_sync_core::reserved_namespace" [label="uses @ 40e3456e", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+
+}
