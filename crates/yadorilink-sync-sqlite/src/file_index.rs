@@ -49,6 +49,17 @@ use yadorilink_replica_domain::session_state::{
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_sqlite_runtime::SyncDatabase;
 
+/// Capabilities and authorization shared by every local change emission.
+/// Keeping them together prevents repository callers from accidentally
+/// pairing an emitter with a permit or authorization stamp from another
+/// operation while keeping mutation-specific data explicit.
+#[derive(Clone, Copy)]
+pub struct ChangeEmissionContext<'a, 'permit> {
+    pub emitter: &'a ChangeEmitter,
+    pub permit: &'a RootCommitPermit<'permit>,
+    pub auth: ChangeAuth,
+}
+
 /// Current wall-clock time in nanoseconds since the Unix epoch, clamped to
 /// `0` if the clock reads before the epoch. Deliberately duplicated here
 /// rather than depending on `yadorilink-sync-core`'s own `index.rs::
@@ -181,13 +192,16 @@ impl FileIndexRepository {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         meta: Option<&LocalFileMetaColumns>,
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
-        auth: ChangeAuth,
+        emission: ChangeEmissionContext<'_, '_>,
     ) -> Result<ChangeHash, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            let change =
-                dag_store::emit_local_change(tx, group_id, content.ops.clone(), auth, emitter)?;
+            let change = dag_store::emit_local_change(
+                tx,
+                group_id,
+                content.ops.clone(),
+                emission.auth,
+                emission.emitter,
+            )?;
             for version in content.versions {
                 dag_store::put_file_version(tx, group_id, version)?;
             }
@@ -201,7 +215,7 @@ impl FileIndexRepository {
             // during the work above (chunking/hashing already happened
             // in the caller before this call, but `emit_local_change`'s
             // own DB work takes real time too).
-            permit.verify()?;
+            emission.permit.verify()?;
             Ok(change_hash)
         })
     }
@@ -234,9 +248,7 @@ impl FileIndexRepository {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         metas: &[Option<LocalFileMetaColumns>],
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
-        auth: ChangeAuth,
+        emission: ChangeEmissionContext<'_, '_>,
     ) -> Result<Option<ChangeHash>, SyncSqliteError> {
         if records.is_empty() {
             return Ok(None);
@@ -262,8 +274,13 @@ impl FileIndexRepository {
             )));
         }
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            let change =
-                dag_store::emit_local_change(tx, group_id, content.ops.clone(), auth, emitter)?;
+            let change = dag_store::emit_local_change(
+                tx,
+                group_id,
+                content.ops.clone(),
+                emission.auth,
+                emission.emitter,
+            )?;
             let change_hash = change.compute_hash();
             for version in content.versions {
                 dag_store::put_file_version(tx, group_id, version)?;
@@ -274,7 +291,7 @@ impl FileIndexRepository {
                     apply_local_meta_columns_in_tx(tx, group_id, &record.path, meta)?;
                 }
             }
-            permit.verify()?;
+            emission.permit.verify()?;
             Ok(Some(change_hash))
         })
     }
@@ -366,9 +383,7 @@ impl FileIndexRepository {
         path: &str,
         device_id: &str,
         observed_at_unix_nanos: i64,
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
-        auth: ChangeAuth,
+        emission: ChangeEmissionContext<'_, '_>,
     ) -> Result<ChangeHash, SyncSqliteError> {
         let mut record = self.get_file(group_id, path)?.unwrap_or(FileRecord {
             path: path.to_string(),
@@ -381,10 +396,16 @@ impl FileIndexRepository {
         record.mtime_unix_nanos = observed_at_unix_nanos;
         let ops = vec![Op::Delete { path: SyncPath(path.to_string()) }];
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            let change = dag_store::emit_local_change(tx, group_id, ops.clone(), auth, emitter)?;
+            let change = dag_store::emit_local_change(
+                tx,
+                group_id,
+                ops.clone(),
+                emission.auth,
+                emission.emitter,
+            )?;
             let change_hash = change.compute_hash();
             upsert_file_in_tx(tx, group_id, &record, device_id, Some(&change_hash))?;
-            permit.verify()?;
+            emission.permit.verify()?;
             Ok(change_hash)
         })
     }

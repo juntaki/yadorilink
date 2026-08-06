@@ -532,9 +532,7 @@ impl ReplicaCoordinator {
             origin_device_id,
             content,
             meta,
-            emitter,
-            permit,
-            auth,
+            yadorilink_sync_sqlite::file_index::ChangeEmissionContext { emitter, permit, auth },
         )?)
     }
 
@@ -557,9 +555,7 @@ impl ReplicaCoordinator {
             origin_device_id,
             content,
             metas,
-            emitter,
-            permit,
-            auth,
+            yadorilink_sync_sqlite::file_index::ChangeEmissionContext { emitter, permit, auth },
         )?)
     }
 
@@ -579,9 +575,7 @@ impl ReplicaCoordinator {
             path,
             device_id,
             observed_at_unix_nanos,
-            emitter,
-            permit,
-            auth,
+            yadorilink_sync_sqlite::file_index::ChangeEmissionContext { emitter, permit, auth },
         )?)
     }
 

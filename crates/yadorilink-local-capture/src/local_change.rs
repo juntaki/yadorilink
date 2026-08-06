@@ -944,8 +944,10 @@ impl LocalChangeProcessor {
                     &self.device_id,
                     ChangeContent { ops: chunk_ops, versions: &chunk_versions },
                     chunk_metas,
-                    emitter,
-                    &self.begin_operation()?.permit(),
+                    crate::ports::LocalChangeEmission {
+                        emitter,
+                        permit: &self.begin_operation()?.permit(),
+                    },
                 ) {
                     Ok(_) => committed.extend_from_slice(chunk_records),
                     // The group's policy is stale or has not loaded yet this
@@ -1321,8 +1323,10 @@ impl LocalChangeProcessor {
                                     versions: std::slice::from_ref(&version),
                                 },
                                 Some(&meta),
-                                emitter,
-                                &self.begin_operation()?.permit(),
+                                crate::ports::LocalChangeEmission {
+                                    emitter,
+                                    permit: &self.begin_operation()?.permit(),
+                                },
                             )?;
                         }
                         None => {

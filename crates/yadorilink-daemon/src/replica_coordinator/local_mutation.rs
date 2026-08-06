@@ -56,7 +56,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use yadorilink_local_capture::ports::LocalMutationStore;
+use yadorilink_local_capture::ports::{LocalChangeEmission, LocalMutationStore};
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::session_state::{
@@ -169,8 +169,7 @@ impl LocalMutationStore for ReplicaCoordinator {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         meta: Option<&LocalFileMetaColumns>,
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
+        emission: LocalChangeEmission<'_, '_>,
     ) -> Result<ChangeHash, SyncSqliteError> {
         let auth = self.local_emission_auth(group_id).map_err(SyncSqliteError::from)?;
         self.file_index_repository().upsert_file_emitting_change(
@@ -179,9 +178,11 @@ impl LocalMutationStore for ReplicaCoordinator {
             origin_device_id,
             content,
             meta,
-            emitter,
-            permit,
-            auth,
+            yadorilink_sync_sqlite::file_index::ChangeEmissionContext {
+                emitter: emission.emitter,
+                permit: emission.permit,
+                auth,
+            },
         )
     }
 
@@ -217,8 +218,7 @@ impl LocalMutationStore for ReplicaCoordinator {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         metas: &[Option<LocalFileMetaColumns>],
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
+        emission: LocalChangeEmission<'_, '_>,
     ) -> Result<Option<ChangeHash>, SyncSqliteError> {
         let auth = self.local_emission_auth(group_id).map_err(SyncSqliteError::from)?;
         self.file_index_repository().upsert_files_batch_emitting_change(
@@ -227,9 +227,11 @@ impl LocalMutationStore for ReplicaCoordinator {
             origin_device_id,
             content,
             metas,
-            emitter,
-            permit,
-            auth,
+            yadorilink_sync_sqlite::file_index::ChangeEmissionContext {
+                emitter: emission.emitter,
+                permit: emission.permit,
+                auth,
+            },
         )
     }
 
@@ -265,9 +267,7 @@ impl LocalMutationStore for ReplicaCoordinator {
             path,
             device_id,
             observed_at_unix_nanos,
-            emitter,
-            permit,
-            auth,
+            yadorilink_sync_sqlite::file_index::ChangeEmissionContext { emitter, permit, auth },
         )
     }
 
