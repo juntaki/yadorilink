@@ -1,0 +1,2922 @@
+# Phase 7D-9A residual ledger: every production module under
+# crates/yadorilink-sync-core/src/, registered ahead of the module-by-module
+# elimination that Phase 7D-9B through 7D-9F execute. See
+# docs/design/phase7d9-dependency-plan.md for the full routing rules this
+# ledger's `destinations`/`removal_phase` fields were assigned against, and
+# docs/design/phase7d8-exit-report.md / phase7d8-local-change-boundary-ledger.md
+# for the prose-ledger precedent this TOML is a more structured version of.
+#
+# `status` starts as "pending" for every entry (7D-9A's initial state,
+# nothing moved yet) and flips to "migrated" once an entry's real code has
+# physically moved to its `destinations` and every real caller has been
+# repointed (Phase 7D-9B was first to do this, for its own six entries).
+# Checked by scripts/check-phase7d9-residual-ledger.py (registration
+# completeness, plus -- since 7D-9B -- that `status`, when present, is one
+# of the known values; it does not require every entry to reach
+# "migrated").
+#
+# Large files that genuinely mix responsibility categories at a scale worth
+# tracking separately are registered as MULTIPLE [[module]] entries sharing
+# the same `path` (index.rs, early_physical_recovery.rs, optimistic_placement.rs,
+# materialization.rs, resolution_planning.rs, retained_obligation.rs,
+# block_deletion.rs, root_identity.rs) -- see each entry's `responsibilities`
+# for which slice of the file it covers.
+#
+# 2026-08-06 (Phase 7D-10.5 classification pass, see
+# docs/design/phase7d10-exit-report.md's dated addendum for the full
+# per-file evidence table): every remaining `pending` entry as of this pass
+# was checked against real `crates/yadorilink-daemon/src/` production call
+# sites (excluding that crate's own `#[cfg(test)]` blocks) to distinguish
+# two shapes that both show up as `blocked_by: ["index.rs"]` but are NOT the
+# same kind of blocker:
+#   (A) `ports/peer_replica_state_impl.rs`, `ports/root_verification_state.rs`,
+#       `authenticated_history_bridge.rs`,
+#       `index/rebootstrap_store/retroactive_conflict_store.rs`, `index.rs`
+#       itself, and `lib.rs` -- `ReplicaCoordinator` already has its OWN
+#       independent, separately-written body for each (confirmed: not a
+#       shared function call, a second full implementation against its own
+#       accessors). These genuinely dissolve, unrelocated, the moment
+#       `DaemonState.sync_state: Arc<SyncState>` itself is finally removed
+#       (a deliberately separate, not-yet-done follow-up step) and the crate
+#       is `git rm -r`'d. No individual migration required.
+#   (C) `sync_runtime/{path_locks,startup_readiness,materialization_wake,mod}.rs`,
+#       `storage/{schema,mod}.rs`, `repository/{recovery_snapshot,mod}.rs`,
+#       `ports/materialization_state.rs`, `block_deletion.rs`, `error.rs`,
+#       `change.rs`, and `recovery.rs` -- confirmed via direct code
+#       inspection to be genuinely called by `ReplicaCoordinator`'s own real
+#       production code (not merely mentioned in a doc comment), but each is
+#       ALSO still directly used by `SyncState`'s own live production surface
+#       (a field it owns, a function it calls, or -- for the two runtime
+#       registries -- literally the SAME shared `Arc` instance passed to
+#       `ReplicaCoordinator::from_database` rather than an independent copy,
+#       per that constructor's own doc comment on the deadlock this
+#       prevents). Relocating any of these to `yadorilink-daemon` while
+#       `SyncState`/`index.rs` still needs them would make
+#       `yadorilink-sync-core` depend back on `yadorilink-daemon` -- a real
+#       dependency cycle, not a resourcing gap -- so despite having a real
+#       `ReplicaCoordinator` production consumer today, these are NOT
+#       actually unblocked the way `dag_import.rs` turned out to be (see
+#       that entry's own migrated note below): their `blocked_by:
+#       ["index.rs"]` is accurate and load-bearing, not stale. Left
+#       `pending`, unchanged, correctly.
+# `dag_import.rs` (below) was the one exception this pass found and
+# resolved: every real production caller already passed a
+# `&ReplicaCoordinator` exclusively, so nothing shared an instance or
+# created a cycle -- only the physical file move itself was outstanding.
+#
+# 2026-08-06 (Phase 7E closeout): CLOSED, historical record. Commit
+# 5869a160 physically deleted `crates/yadorilink-sync-core` (Phase 7D-10
+# final elimination). `scripts/check-phase7d9-residual-ledger.py` validates
+# only TOML-internal consistency (module-entry registration, and that any
+# `status` present is one of the known enum values) -- it has never read
+# `crates/yadorilink-sync-core/src` from disk, so it still passes cleanly
+# post-deletion (81 module entries, 62 migrated / 19 pending, unchanged from
+# the 7D-10.5 classification pass above). "pending=0" is not a meaningful
+# target for this ledger anymore: every remaining `pending` entry was, by
+# the classification above, either shape (B) (dissolved along with
+# `SyncState`/`index.rs` at deletion time, needing no individual migration
+# step -- confirmed true, since the whole crate including `index.rs` is now
+# gone) or shape (C) (blocked on `index.rs` staying alive specifically to
+# avoid a `yadorilink-sync-core` -> `yadorilink-daemon` dependency cycle --
+# also moot, since there is no `yadorilink-sync-core` left to cycle back
+# from). Flipping the remaining 19 entries' `status` to "migrated" post hoc
+# would misrepresent history (nothing there was ever individually migrated;
+# it was deleted in bulk with its parent crate) and would erase the shape-
+# (B)/(C) distinction the 7D-10.5 evidence table exists to preserve for
+# future readers. This ledger is left exactly as it stood at 7D-10.5,
+# frozen as the historical record of how `yadorilink-sync-core` was
+# actually retired -- no further updates expected.
+
+# ---------------------------------------------------------------------------
+# index.rs (9,549 lines) -- the SyncState facade. Split into 6 entries per a
+# dedicated read-through of its full impl-block structure. ~99% of the file
+# is thin delegation to crate::repository::*/yadorilink_sync_sqlite -- direct
+# SQL inside index.rs itself is ~0 statements outside doc-comment mentions.
+# ---------------------------------------------------------------------------
+
+[[module]]
+path = "index.rs"
+lines = 288
+responsibilities = ["temporary facade / delegation", "daemon orchestration", "task lifecycle"]
+destinations = ["yadorilink-sqlite-runtime", "yadorilink-daemon"]
+status = "pending"
+blocked_by = []
+removal_phase = "7D-9F"
+# Group 1 (lines ~220-508): connection-pool construction (`pool`, `open`,
+# `open_in_memory`), auth-provider injection, group startup-readiness gates
+# (`begin_group_startup`/`mark_group_ready`/`mark_group_failed`), path-level
+# concurrency locking (`path_lock`). Thin wrappers over `SyncDatabase`,
+# `StartupReadinessRegistry`, `PathLockRegistry`.
+#
+# 7D-9-sweep re-verification: per `phase7d9f-exit-report.md` §14.3-14.5
+# (7D-9F's own closing addendum), `open`/`open_in_memory` are two of
+# `SyncState`'s 17 permanently-remaining production methods (constructors,
+# classified `composition`) and `storage/schema.rs`'s bootstrap hook is
+# "inherent composition-root glue for `SyncState`'s own constructors, not
+# extractable independent of them" (§14.5 item 4). `blocked_by` correctly
+# stays `[]` (nothing else must land first), but this entry cannot itself
+# land before `SyncState`'s own crate-level retirement (Phase 7D-10) --
+# confirmed still accurate, not stale.
+
+[[module]]
+path = "index.rs"
+lines = 544
+responsibilities = ["temporary facade / delegation", "SQLite SQL / row mapping"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "pending"
+blocked_by = []
+removal_phase = "7D-9F"
+# Group 2 (lines ~534-1077): file upsert/deletion emission (delegates to
+# file_index_repository) and DAG query/admit/history operations (delegates
+# to change_history_repository / yadorilink_sync_sqlite). All real version-
+# ordering/DAG-ancestry logic already lives in the repositories.
+#
+# 7D-9-sweep re-verification: per the per-method ledger
+# (`phase7d9f-syncstate-method-ledger.toml`), the file-upsert/deletion
+# entry points in this range (`upsert_file_emitting_change`/
+# `upsert_files_batch_emitting_change`/`mark_deleted_emitting_change`/
+# `append_initial_import`/`append_history_backfill`) are among the 17
+# permanently-remaining `SyncState` methods -- each resolves
+# `local_emission_auth` (a real precondition) before delegating, so
+# classified `composition`, not mechanical delegation. `blocked_by` stays
+# `[]` correctly; genuinely blocked only on `SyncState`'s own retirement
+# (Phase 7D-10).
+
+[[module]]
+path = "index.rs"
+lines = 950
+responsibilities = ["temporary facade / delegation", "SQLite SQL / row mapping", "task lifecycle"]
+destinations = ["yadorilink-sync-sqlite", "yadorilink-filesystem-sync"]
+status = "pending"
+blocked_by = ["ports/materialization_state.rs"]
+removal_phase = "7D-9C"
+# Group 3 (lines ~1085-2035): materialization job-queue lifecycle methods
+# (delegate to yadorilink_sync_sqlite::MaterializationJobRepository) and
+# file metadata/materialization-state queries (delegate to
+# file_index_repository / materialization_state_repository). Grouped with
+# 7D-9C rather than 7D-9F because it must land alongside materialization.rs's
+# own MaterializationStorePort work, not the generic facade cleanup.
+#
+# `blocked_by` corrected this pass: `materialization.rs` dropped -- its own
+# 3-way core split completed in the sixth 7D-9C pass (see exit report §12),
+# so that half of this blocker is resolved. `ports/materialization_state.rs`
+# remains a real, mutual blocker (see that entry's own note). Separately,
+# this pass moved `repository/materialization_state.rs`'s pure-SQL
+# `MaterializationStateRepository` to `yadorilink-sync-sqlite` verbatim
+# (its own now-`migrated` ledger entry); `index.rs`'s own ~20 thin wrapper
+# methods over that repository were repointed at the new crate with
+# `.map_err(SyncError::from)` at the boundary, same pattern
+# `dirty_path_repository`'s own wrappers already used -- this does not
+# shrink this entry's own remaining line count (the wrapper methods
+# themselves are still here, part of this entry's "temporary facade /
+# delegation" scope, not deleted), but is a real, verified step of the work
+# this entry itself charters.
+#
+# Eighth pass re-examination (per this pass's own task brief, which asked
+# whether this entry should reclassify to 7D-9F the way commit_path_locks.rs/
+# debounce.rs did): re-read `phase7d9-dependency-plan.md`'s 7D-9F section --
+# its own "why this order" reasoning explicitly authorizes `index.rs`
+# shrinking incrementally across 9B-9E ("`index.rs` only shrinks to zero once
+# every other sub-phase's targets have fully landed"), which is a different
+# claim from "every index.rs entry must wait for 9F". This entry's own
+# grouping rationale (lands alongside materialization's port work, which
+# this sub-phase produced) is exactly that kind of in-place shrink, not the
+# same category of misclassification commit_path_locks.rs/debounce.rs were
+# (those were daemon-orchestration code mislabeled as filesystem-execution,
+# not facade shrinkage). Reclassifying to 7D-9F would contradict the
+# dependency plan's own explicit design, not correct a mistake -- left at
+# 7D-9C. Still genuinely blocked: `ports/materialization_state.rs` (below)
+# re-confirmed still live, so this mutual pair is accurately `pending`.
+#
+# 7D-9-sweep re-verification: `ports/materialization_state.rs` confirmed
+# by `phase7d9f-exit-report.md` §14.4 to be orphan-rule-pinned --
+# `impl MaterializationStatePort for SyncState` can only live in the crate
+# that defines `SyncState` (Rust's orphan rule), so it "would only move if
+# `SyncState` itself moved crates, which is 7D-10's scope." This mutual
+# blocker is therefore not a stale reference to re-narrow -- both halves
+# resolve together only at `SyncState`'s own Phase 7D-10 retirement.
+# `blocked_by` left unchanged.
+
+[[module]]
+path = "index.rs"
+lines = 245
+responsibilities = ["temporary facade / delegation", "root authority", "task lifecycle"]
+destinations = ["yadorilink-root-authority", "yadorilink-sync-sqlite"]
+status = "pending"
+blocked_by = []
+removal_phase = "7D-9B"
+# Group 4 (lines ~2060-2305): folder link lifecycle (`add_link`/`remove_link`/
+# `link_root_token_for_group`/`ensure_unambiguous_group`, delegates to
+# link_repository) and enrollment operation state machines (delegates to
+# enrollment_repository). Root-token management ties this slice to 7D-9B's
+# root-authority foundation work.
+#
+# 7D-9B follow-up (missed-entry resolution): `repository/link.rs` dropped
+# from `blocked_by` -- migrated (see that entry's own note). Still blocked
+# on `repository/enrollment.rs`, which owns the two cross-table atomic
+# methods (`add_link_with_pending_enrollment[_and_begin_setup]`) this
+# group's own `add_link_with_pending_enrollment` wrapper delegates to; that
+# entry is itself now unblocked (see its own note) but not migrated by this
+# pass.
+#
+# 7D-9F ninth pass: dropped `repository/enrollment.rs` from `blocked_by` --
+# it migrated this pass (see that entry's own note). This whole-file-line-range
+# entry is stale relative to the per-method ledger
+# (`docs/design/phase7d9f-syncstate-method-ledger.toml`) at this point in
+# 7D-9F's own strangler-fig removal: most of the individual delegate methods
+# this entry originally described (245 lines' worth, as of 7D-9B) were
+# themselves deleted from `index.rs` by later 7D-9F passes, replaced by
+# direct-accessor callers -- `index.rs`'s current production-line total
+# (1155, per the strangler gate) is already far smaller than this entry's own
+# recorded `lines`. Left `pending` rather than reclassified `migrated`: this
+# per-file ledger tracks whole-file/whole-range disposition, and neither
+# `add_link`/`remove_link`/`link_root_token_for_group`/
+# `ensure_unambiguous_group` (still real `SyncState` inherent methods, not
+# pure delegates -- see the per-method ledger's own `composition` tag for
+# several of them) nor `index.rs` itself have been fully retired, so
+# reclassifying this coarse entry would overstate what's actually done.
+
+[[module]]
+path = "index.rs"
+lines = 800
+responsibilities = ["temporary facade / delegation", "SQLite SQL / row mapping", "daemon orchestration"]
+destinations = ["yadorilink-sync-sqlite", "yadorilink-daemon"]
+status = "pending"
+blocked_by = []
+removal_phase = "7D-9F"
+# Group 5 (lines ~2359-3160): retention policy/quota/feature configuration,
+# durability-root/handoff-lease queries, membership/role-loss recovery
+# operations. All delegate to their matching repository/* module.
+#
+# 7D-9-sweep re-verification: all five originally-listed blockers
+# (`repository/policy_watermark.rs`, `repository/dirty_path.rs`,
+# `repository/handoff_lease.rs`, `repository/role_loss_operation.rs`,
+# `repository/membership_operation.rs`) are confirmed `status = "migrated"`
+# in this same ledger as of 7D-9F's ninth (closing) pass. `blocked_by`
+# cleared and `removal_phase` corrected 7D-9E -> 7D-9F to match. Same
+# whole-file/whole-range caveat as the neighboring Group 4 entry applies:
+# per `docs/design/phase7d9f-syncstate-method-ledger.toml` and
+# `phase7d9f-exit-report.md` §14.3, this range's individual delegate
+# methods were either deleted in favor of direct-accessor callers or, where
+# they resolve a real precondition (e.g. durability-root/handoff-lease
+# sequencing), reclassified `composition`/`business logic` and folded into
+# `SyncState`'s 17 permanently-remaining production methods -- not left as
+# unresolved delegation. Left `status = "pending"` rather than reclassified
+# `migrated`: this coarse whole-range entry does not track per-method
+# disposition, and `index.rs`/`SyncState` itself has not been retired.
+# Genuinely blocked only on `SyncState`'s own crate-level retirement
+# (Phase 7D-10), not on any other ledger entry.
+
+[[module]]
+path = "index.rs"
+lines = 95
+responsibilities = ["temporary facade / delegation"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "pending"
+blocked_by = []
+removal_phase = "7D-9F"
+# 7D-9D eleventh pass: `removal_phase` corrected from "7D-9D" to "7D-9F",
+# resolving the mix-up the tenth pass flagged (exit report §13.6) against
+# the *other*, 288-line Group-1 `index.rs` entry (connection-pool/
+# auth-provider/startup-readiness wrappers, genuinely 7D-9F). This group
+# is NOT a mislabeled duplicate of that one -- both are correctly 7D-9F,
+# for a structural reason neither the tenth pass nor earlier passes
+# checked: `impl CompactionDagStore for SyncState` (and the two sibling
+# impls below) is an inherent trait impl FOR the concrete `SyncState`
+# type. Rust's orphan rules mean this impl block can only ever live in
+# whichever crate defines `SyncState` (sync-core) or whichever crate
+# defines the `CompactionDagStore`/`DeviceFrontierStore`/`CheckpointStore`
+# traits (yadorilink-replica-engine, already ruled out -- replica-engine
+# must never depend back on sync-core for `SyncState`, the exact reverse
+# of every other 7D-9 move's direction). It cannot become a free function
+# taking `&Connection`, unlike every other migrated entry in this ledger:
+# `yadorilink-daemon` calls `compaction::execute_prune` and friends with
+# a live `Arc<SyncState>` as the concrete store argument (confirmed,
+# `rebootstrap_handler.rs`), so `SyncState` must keep implementing these
+# traits for as long as `SyncState` itself exists to be passed that way.
+# This is genuinely tied to the facade's own retirement (7D-9F), not
+# resolvable by the usual "free-function-ize + thin wrapper" pattern this
+# sub-phase used everywhere else -- there is no wrapper to write once the
+# impl block itself cannot leave. Not attempted this pass; `blocked_by`
+# stays `[]` on purpose (nothing sequences before it; it simply cannot
+# land before `SyncState` does).
+# Group 6 (lines ~3174-3270): CompactionDagStore/DeviceFrontierStore/
+# CheckpointStore trait shims, all delegating to self.sqlite / dag_store free
+# functions -- exist only to satisfy the compaction engine's trait bounds.
+# 7D-9D second pass: `blocked_by` cleared -- `compaction.rs` migrated to
+# yadorilink-replica-engine this pass; these three impls already repointed
+# at yadorilink_replica_engine::compaction's trait definitions (now
+# returning ReplicaEngineError, bridged at this boundary).
+
+[[module]]
+path = "index/rebootstrap_store.rs"
+lines = 15
+responsibilities = ["temporary facade / delegation"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# 7D-9D eleventh pass: this file's only real content, `pub(crate) use
+# base::init_rebootstrap_schema;`, is gone -- `storage/schema.rs` now calls
+# `yadorilink_sync_sqlite::rebootstrap_store::init_rebootstrap_schema`
+# directly (see `base.rs`'s own entry below). What remains is exactly
+# `mod base; mod retroactive_conflict_store; pub use
+# retroactive_conflict_store::RetroactiveRepairOutcome;` -- pure module
+# wiring for `retroactive_conflict_store.rs` (a separate, still-pending
+# 7D-9E entry, blocked on `index.rs`), which cannot itself disappear
+# before that file moves. Not a "nothing to migrate" case: the one thing
+# this file actually delegated is migrated; the mod declaration it still
+# needs to exist for is a different file's own separately-tracked entry.
+
+[[module]]
+path = "index/rebootstrap_store/base.rs"
+lines = 1914
+responsibilities = ["SQLite SQL / row mapping", "root authority"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# 7D-9D second pass: `blocked_by` cleared -- `rebootstrap.rs` migrated to
+# yadorilink-replica-engine this pass; this file's own
+# Checkpoint/CheckpointHash/PrunePlan/HistoryBase/SnapshotManifest/
+# RebootstrapSnapshot imports already repointed there. Not attempted
+# itself this pass (1914 lines of real rusqlite/row-mapping code, a
+# distinct, larger task from the pure-decision move that unblocked it).
+#
+# 7D-9D eleventh pass: migrated. The "root authority" responsibility tag
+# was stale -- a fresh read found zero production `yadorilink_root_
+# authority`/`VerifiedRoot` references anywhere in the file (only two
+# `RootCommitPermit::for_tests()` calls inside the test module); dropped
+# from the moved module's own doc comment rather than carried forward
+# unexamined. The schema constant, `init_rebootstrap_schema`, and all 7
+# `impl SyncState` methods (`history_base`, `history_base_previous_
+# checkpoint_hash`, `checkpoint_snapshot`, `compacted_parent_auth`,
+# `build_compaction_snapshot`, `commit_compaction_snapshot`,
+# `install_rebootstrap_snapshot`) plus every already-`&Connection`-taking
+# free helper moved verbatim to `yadorilink_sync_sqlite::
+# rebootstrap_store` (1148 lines) -- each method's body was already a
+# `self.database.read(|conn| ..)`/`self.database.write_immediate(|tx| ..)`
+# closure over exactly this shape, so unwrapping the closure into a real
+# free function taking `conn`/`tx` directly changed no behavior. The one
+# real adaptation: `install_rebootstrap_snapshot` needed one piece of live
+# `SyncState`-instance state (`self.local_emission_auth`, an injected
+# signing-policy callback) -- resolved by the thin `SyncState` wrapper
+# left behind in sync-core, BEFORE its transaction opens, and passed into
+# the moved function as an already-snapshotted `Option<ChangeAuth>`
+# (mirrors `retained_obligation.rs`'s `evaluate_deletion` split's own
+# "gather via SyncState, then call a pure/SQL function with the
+# already-resolved value" pattern). `build_compaction_snapshot`'s
+# current-heads check, previously a *separate*
+# `self.database.read`-via-`SyncState::dag_group_heads` call before the
+# snapshot-building read, was folded into the same `conn`/read inside the
+# moved function -- both were already read-only, so this can only make
+# the two reads more mutually consistent (one snapshot instead of two
+# independently-acquired ones), never a behavior regression. What stays
+# in `yadorilink-sync-core` (now 972 lines, down from 1914): the 7 thin
+# `impl SyncState` wrapper methods (opening `self.database`'s pooled
+# connection/transaction, the one `local_emission_auth` resolution) plus
+# the file's own ~780-line integration test suite (kept physically in
+# sync-core rather than split, exercising the moved module end-to-end
+# through `SyncState`'s public API -- same precedent as `retained_
+# obligation.rs`'s own 7D-9D fourth-pass CRUD move). Real production
+# consumers confirmed unaffected: `checkpoint_snapshot`/`install_
+# rebootstrap_snapshot` (daemon's `rebootstrap_handler.rs`), `history_
+# base_previous_checkpoint_hash` (via `CheckpointStore` for `SyncState`,
+# consumed by `yadorilink-replica-engine::rebootstrap`), `compacted_
+# parent_auth` (via a trait bridge in `authenticated_history_bridge.rs`,
+# consumed by `yadorilink-replica-engine::authenticated_history`) -- all
+# call the same unchanged public `SyncState` method signatures.
+
+[[module]]
+path = "index/rebootstrap_store/retroactive_conflict_store.rs"
+lines = 379
+responsibilities = ["daemon orchestration"]
+destinations = ["yadorilink-daemon"]
+status = "pending"
+blocked_by = ["index.rs"]
+removal_phase = "7D-9E"
+# 7D-9D second pass: re-verified the open question the first pass flagged
+# rather than resolved. Re-read `impl SyncState::repair_retroactive_
+# conflict_copy_obligations` (this file's only production content) in
+# full: it reads `self.repair_election_provider` (an injected,
+# SyncState-instance-scoped election callback), calls
+# `self.local_emission_auth(group_id)` twice (a live policy check, not a
+# row read), signs and emits through a live `&ChangeEmitter`, and calls
+# `self.notify_materialization_wake()` (a worker-wake signal, not
+# persistence) -- election -> auth-check -> sign/emit -> re-check ->
+# wake-notify is a multi-step orchestration sequence over live
+# SyncState-instance state, the same shape as `orchestrator.rs`'s own
+# pending entries, not a plain `Connection`-taking SQL function nor a
+# pure decision function over pre-snapshotted values. Reclassified from
+# `["yadorilink-sync-sqlite", "yadorilink-replica-engine"]`/7D-9D to
+# `["yadorilink-daemon"]`/7D-9E -- it belongs with `orchestrator.rs`'s own
+# "ALL move into yadorilink-daemon" 7D-9E destination in the dependency
+# plan, not this sub-phase's SQL/pure-decision split. `blocked_by`
+# updated to `index.rs` for the same reason `orchestrator.rs`'s own
+# 7D-9E entries are: `index.rs` is deliberately the LAST sub-phase
+# (7D-9F) per the dependency plan's ordering rationale. Not moved this
+# pass -- 7D-9E must not start until 7D-9D is fully closed, per this
+# sub-phase's own task brief.
+#
+# 7D-9-sweep re-verification: `repair_retroactive_conflict_copy_obligations`
+# is one of `SyncState`'s 17 permanently-remaining production methods per
+# `phase7d9f-syncstate-method-ledger.toml` (classified `business logic`),
+# confirmed by `phase7d9f-exit-report.md` §14.4 as real logic that must
+# move with its own transaction/sequencing, not a mechanical repository
+# repoint. `blocked_by = ["index.rs"]` genuinely still accurate -- tied to
+# `SyncState`'s own Phase 7D-10 retirement, not to `index.rs`'s own
+# shrinking (already complete).
+#
+# 2026-08-06: `RetroactiveRepairOutcome` (the return type of the one method
+# above) relocated OUT of this file to `yadorilink_replica_domain::
+# session_state`, alongside `StartupFailed`'s identical existing precedent
+# -- pure data, no `SyncState` coupling, needed identically by this file's
+# `SyncState` method and `yadorilink-daemon`'s independent `ReplicaCoordinator::
+# repair_retroactive_conflict_copy_obligations`. This file still exists
+# (now only `pub use yadorilink_replica_domain::session_state::
+# RetroactiveRepairOutcome;` plus the unchanged `SyncState` method), so its
+# own status/blocked_by/removal_phase above are unchanged -- the file itself
+# is still Category A (dissolves with `SyncState`), this note just records
+# that its one exported type no longer needs to wait for that.
+
+# ---------------------------------------------------------------------------
+# Top-level files, group A
+# ---------------------------------------------------------------------------
+
+[[module]]
+path = "authenticated_history_bridge.rs"
+lines = 71
+responsibilities = ["temporary facade / delegation"]
+destinations = ["yadorilink-replica-engine"]
+status = "pending"
+blocked_by = ["index.rs"]
+removal_phase = "7D-9F"
+# 7D-9-sweep re-verification: read the file fresh. `impl
+# AuthenticatedHistorySource for SyncState` names the concrete `SyncState`
+# type directly -- orphan-rule-pinned to sync-core, exactly like
+# `ports/materialization_state.rs` and `index.rs`'s own Group-6 trait
+# shims. The module's own doc comment already states `yadorilink-replica-
+# engine` "must not depend back on `yadorilink-sync-core`... even if it
+# could." `destinations` lists `yadorilink-replica-engine` for the trait
+# *definitions* (already there); the `impl` blocks themselves cannot
+# follow until `SyncState` retires (Phase 7D-10). `blocked_by = ["index.rs"]`
+# confirmed accurate, not stale.
+
+[[module]]
+path = "block_deletion.rs"
+lines = 53
+responsibilities = ["filesystem execution"]
+destinations = ["yadorilink-filesystem-sync"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9C"
+# The real block-store filesystem deletion/sweep half (`sweep`, renamed
+# `sweep_globally_unreferenced_blocks`) -- unblocked once block_liveness.rs
+# itself migrated. Dropped the BlockDeletionReason guard/enum carried over
+# from the original entry's estimate: a workspace-wide grep found its only
+# non-GloballyUnreferenced variant is never constructed anywhere, so the
+# guard gated a value nothing ever passes. Returns
+# yadorilink_local_storage::StorageError directly (the same type
+# BlockReclamationStore::sweep already returns) rather than SyncError --
+# no new error type needed, the one real caller already immediately
+# stringifies the error regardless of which type it is.
+
+[[module]]
+path = "block_deletion.rs"
+lines = 333
+responsibilities = ["pure domain / policy / planning", "SQLite SQL / row mapping"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-10"
+# 2026-08-06: unblocked by `ports/materialization_state.rs`'s own trait
+# relocation (see that entry's own updated note, and
+# `docs/design/phase7d10-exit-report.md`'s 2026-08-06 addenda) and moved in
+# full to `yadorilink-sync-sqlite::block_deletion` -- `reclaim_cached_blocks`
+# needed `&dyn MaterializationStatePort`, which now lives in that crate, and
+# nothing else in this file depended on anything unique to sync-core. Not
+# split: `yadorilink-replica-engine` (this entry's old speculative
+# destination) was never actually needed -- `VerifiedCustody` is a
+# parameter type this file only borrows, not something it defines or
+# converts. This file no longer exists in `yadorilink-sync-core` at all
+# (`crates/yadorilink-sync-core/src/block_deletion.rs` deleted, `pub mod
+# block_deletion;` removed from `lib.rs`). Its `#[cfg(test)]` module did
+# NOT move to `yadorilink-sync-sqlite` alongside it -- those tests exercise
+# a real `SyncState`, and reaching `SyncState` from `yadorilink-sync-sqlite`
+# would require a `[dev-dependencies]` edge on `yadorilink-sync-core`, which
+# (now that `MaterializationStatePort` itself lives in
+# `yadorilink-sync-sqlite`) would be a genuine self-referential dev-dependency
+# cycle -- confirmed by attempting it and reading the resulting "multiple
+# different versions of crate `yadorilink_sync_sqlite`" compiler error. The
+# test module relocated instead to `yadorilink-sync-core::ports::
+# materialization_execution_impl::block_deletion_tests`, which already
+# depends on `yadorilink-sync-sqlite` in the correct (production) direction.
+#
+# Prior reasoning (superseded by the above -- kept for history, not deleted):
+# 7D-9D first pass: line count corrected from 7D-9A's original 146 to the
+# file's actual current size (333) -- the filesystem-execution half
+# already migrated separately (see the sibling "migrated" entry above)
+# left more behind than originally counted. `blocked_by` re-verified
+# still real: both `index.rs` (deliberately last, 7D-9F) and
+# `ports/materialization_state.rs` still exist unmoved. Not attempted
+# this pass.
+#
+# 7D-9D eleventh pass: `index.rs` dropped from `blocked_by` -- a fresh
+# read of the file's only remaining production code,
+# `BlockDeletionCoordinator::reclaim_cached_blocks`, found zero direct
+# reference to `SyncState`/`crate::index` (the only `use crate::index::
+# SyncState` in the file is inside `#[cfg(test)]`, to build a
+# `MaterializationStatePort` implementor for its own tests). The real,
+# confirmed-current blocker is narrower and different: the function's
+# `state: &dyn crate::ports::MaterializationStatePort` parameter names a
+# trait DEFINED in `ports/materialization_state.rs` (still fully inside
+# sync-core, its own separate, unresolved 7D-9C-labeled ledger entry) --
+# `yadorilink-replica-engine`/`yadorilink-sync-sqlite` cannot reference
+# that trait at all until its definition itself moves to one of them
+# first (neither may depend on sync-core). `crate::ports::
+# BlockReclamationStore` and `crate::types::MaterializationState`, this
+# function's other two named types, are already thin re-exports of
+# `yadorilink_local_storage`/`yadorilink_replica_domain` types respectively
+# (not sync-core-owned), so neither is a real blocker. Moving `ports/
+# materialization_state.rs` itself (647 lines, its own trait impl entangled
+# with `SyncState` the same "impl-for-a-local-type" way `index.rs`'s Group-6
+# entry above is) is out of this pass's chartered scope -- not attempted;
+# left `pending` with this corrected, narrower reasoning rather than the
+# stale `index.rs` reference.
+# Remote-custody verification / cross-check coordination half -- pairs with
+# "remaining custody" under 7D-9D.
+#
+# 7D-9-sweep re-verification: `ports/materialization_state.rs` confirmed
+# (`phase7d9f-exit-report.md` §14.4) orphan-rule-pinned -- cannot move
+# independently of `SyncState` itself (Phase 7D-10). `blocked_by` and this
+# entry's reasoning remain accurate; still not attemptable.
+
+[[module]]
+path = "block_liveness.rs"
+lines = 61
+responsibilities = ["filesystem execution"]
+destinations = ["yadorilink-filesystem-sync"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9C"
+# Routing correction: originally guessed daemon/replica-engine under 7D-9D.
+# Reading the module (pure std::sync::{Mutex,Condvar} exclusion between
+# BlockDeletionCoordinator's physical deletion and evict_file's reference
+# writes -- zero index/SQL/state/policy dependency) shows it belongs
+# alongside the eviction/materialization execution logic in
+# yadorilink-filesystem-sync instead, and it was a direct, small
+# prerequisite for materialization.rs's own 7D-9C split (one of its
+# blocked_by entries), so it landed here rather than waiting for 7D-9D.
+
+[[module]]
+path = "change.rs"
+lines = 652
+responsibilities = ["pure domain / policy / planning (test suite only, post-migration)"]
+destinations = ["yadorilink-replica-domain"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-10"
+# 2026-08-06 (7D-10 residual pass, item 2 of the STOP-report's two remaining
+# blockers): `PolicyUnavailable` moved to
+# `yadorilink_replica_domain::change::PolicyUnavailable`, placed directly
+# after `ChangeAuth` (its Ok/Err counterpart -- every real call site produces
+# `Result<ChangeAuth, PolicyUnavailable>`). What remains in this file is only
+# its own `#[cfg(test)]` `Change`/`Op`/`ChangeAuth` encoding round-trip suite
+# (verified to not reference `PolicyUnavailable` at all before this move).
+#
+# The prior "7D-10.1 re-verification" note below argued the opposite
+# destination (`yadorilink-daemon`, once `ReplicaCoordinator` lands) and is
+# now confirmed STALE, re-verified against the current tree rather than
+# trusted: `ReplicaCoordinator` exists today (`daemon/src/replica_coordinator.rs`),
+# but `SyncState`'s own `index.rs` (Category A -- dissolves only when the
+# crate itself is deleted, not before) still directly names `PolicyUnavailable`
+# in production signatures (`LocalChangeAuthProvider`/`RepairElectionProvider`
+# type aliases, `local_emission_auth`'s own return type) as of this pass --
+# moving the type into `yadorilink-daemon` today would make `yadorilink-sync-core`
+# depend back on `yadorilink-daemon`, a real cycle (daemon depends on
+# sync-core, never the reverse). `yadorilink-replica-domain` is the only
+# crate BOTH `yadorilink-sync-core` (for `SyncState`'s own signatures, until
+# the crate's eventual deletion) and `yadorilink-daemon` (for
+# `ReplicaCoordinator::local_emission_auth`, its independent, byte-identical
+# counterpart) already depend on in production -- no new edge, no cycle.
+#
+# Objection (1) from the note below (the type "is not serialized domain
+# data" so doesn't belong in the domain crate) does not hold once inspected
+# against precedent already in the same module: `ChangeAuth` itself is
+# exactly as much an in-memory-only, non-serialized authorization stamp as
+# `PolicyUnavailable` is, and already lives in
+# `yadorilink_replica_domain::change` for the identical reason (every real
+# caller produces/consumes the pair together). Co-locating them is coherent
+# domain modeling, not a category violation.
+#
+# Real call sites repointed (verified via workspace grep before and after):
+# `yadorilink-sync-core::{index.rs, error.rs, index/rebootstrap_store/
+# retroactive_conflict_store.rs (test-only)}`, `yadorilink-daemon::{daemon_state.rs,
+# replica_coordinator.rs, sync_error.rs, dag_import.rs (test-only),
+# commit_orchestration/orchestrator.rs (doc-comment only)}`,
+# `yadorilink-local-capture::local_change.rs (test-only)`,
+# `yadorilink-filesystem-sync::materialization_execution.rs (doc-comment
+# only)`. `yadorilink-local-capture`/`yadorilink-filesystem-sync`'s own
+# independently-defined mirror error variants (`SyncError::PolicyUnavailable`,
+# `MaterializationExecutionError::PolicyUnavailable`) were confirmed
+# unaffected -- they do not reference the marker struct itself, matching the
+# prior note's own already-correct finding on that point.
+#
+# Verification: `cargo check --workspace --all-targets` clean;
+# `cargo test -p yadorilink-sync-core --lib` 303/303;
+# `cargo test -p yadorilink-replica-domain --lib` 11/11;
+# `cargo test -p yadorilink-local-capture --lib` 69/69;
+# `cargo test -p yadorilink-daemon --lib` 689 passed / 1 failed (the
+# documented pre-existing `control_socket::migration_safety_tests::
+# an_idempotent_same_path_relink_is_not_refused` flake, unchanged).
+#
+# --- Superseded notes below, kept for history, no longer accurate ---
+#
+# Only `PolicyUnavailable` remains -- the rest of the former domain model
+# already moved to yadorilink_replica_domain.
+#
+# 7D-9-sweep re-verification: `PolicyUnavailable` (46 lines of real
+# content, the rest `#[cfg(test)]`) is small and self-contained, but a
+# workspace grep found real, non-test callers in `yadorilink-daemon`
+# (`daemon_state.rs`, `commit_orchestration/orchestrator.rs`),
+# `yadorilink-local-capture` (`local_change.rs`), and
+# `yadorilink-filesystem-sync` (`materialization_execution.rs`,
+# `materialization_repair.rs`) -- moving it to `yadorilink-replica-domain`
+# is a real, mechanical but wide rename across four crates' worth of call
+# sites, not attempted this pass (no architectural blocker, just out of
+# this pass's own budget). `blocked_by` stays `[]` correctly.
+#
+# 7D-10.1 re-verification (this entry is the same item
+# `phase7d10-elimination-plan.md` §5's 7D-10.1 list separately names
+# "error.rs's PolicyUnavailable rename" -- reconciled here as one item,
+# not two; the "4-crate" count in that plan text matches exactly this
+# entry's four named crates): re-read this file plus every real caller
+# fresh. The "no architectural blocker" framing above does not survive
+# contact with the code. Two things the prior passes missed:
+#
+# 1. `change.rs`'s own current doc comment gives a live, considered reason
+#    NOT to move `PolicyUnavailable` to `yadorilink-replica-domain` (the
+#    only destination ever named for it): "it is not serialized domain
+#    data, it is a signal about this *engine's* own inability to produce
+#    an authorization stamp right now, so it stays here rather than in the
+#    domain crate." This is a different, still-live rationale, not the
+#    same shape as `EnrollmentKind`'s superseded "DB-string-coupled"
+#    reasoning in `types.rs`'s old doc comment.
+# 2. Of the four crates, only `yadorilink-daemon` (`daemon_state.rs`)
+#    imports the marker struct itself in production code
+#    (`use yadorilink_sync_core::change::PolicyUnavailable;`, feeding
+#    `SyncState::set_local_change_auth_provider`); `yadorilink-local-capture`
+#    and `yadorilink-filesystem-sync`'s real production references are to
+#    their OWN independently-defined mirror types (`SyncError::
+#    PolicyUnavailable`, `MaterializationExecutionError::PolicyUnavailable`),
+#    which do not move regardless of where the marker struct ends up.
+#    `PolicyUnavailable` is also named directly in `yadorilink-sync-core`'s
+#    own production type signatures (`index.rs`'s `LocalChangeAuthProvider`/
+#    `RepairElectionProvider` type aliases, `local_emission_auth`) -- so it
+#    cannot move to `yadorilink-daemon` even though that is its one real
+#    external production consumer: `yadorilink-daemon` depends on
+#    `yadorilink-sync-core`, not the reverse, and sync-core needs the type
+#    locally for its own signatures. `yadorilink-replica-domain` is the
+#    only crate ever proposed as a destination, and (1) above is a live
+#    objection to it.
+#
+# `phase7d10-elimination-plan.md` §2.2-2.3's own architecture answer names
+# exactly this surface (`local_change_auth_provider`, `local_emission_auth`)
+# as belonging to daemon's future `ReplicaCoordinator` (7D-10.2, explicitly
+# out of this pass's scope) -- once that exists, `PolicyUnavailable` has an
+# actual cycle-free destination in `yadorilink-daemon` itself. Deliberately
+# NOT relocated this pass: picking an interim crate now risks redoing this
+# exact work once `ReplicaCoordinator` lands. `status` stays `pending`;
+# `blocked_by` left `[]` (no *listed* blocker file, but this note records
+# the real dependency on 7D-10.2's own architectural step).
+
+[[module]]
+path = "chunker.rs"
+lines = 0
+responsibilities = ["daemon orchestration"]
+destinations = ["deleted -- see note"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9C"
+# Eighth pass: the "mutual pair" this entry and single_pass_capture.rs's own
+# entry carried (blocked_by pointing at each other) did not survive contact
+# with the real dependency graph -- read_up_to (chunker.rs's only remaining
+# content, a pub(crate) short-read-retry loop) has zero dependency of its
+# own on single_pass_capture.rs; the relationship only ever ran the other
+# way (single_pass_capture.rs is read_up_to's one consumer). Once
+# single_pass_capture.rs moved to yadorilink-filesystem-sync (duplicating
+# read_up_to locally rather than sharing it, the same "duplicate small leaf
+# helpers" precedent this very function was itself already an instance of),
+# chunker.rs's read_up_to had zero remaining callers anywhere in the
+# workspace (confirmed by a workspace-wide grep before deleting) -- deleted
+# outright, not moved; `pub mod chunker;` removed from lib.rs. This file no
+# longer exists.
+#
+# Re-verification (seventh pass) had found the original blocked_by =
+# ["ports/mod.rs"] guess did not survive contact with the actual code: every
+# SyncError-converting wrapper this file held (verify_write_target_within_
+# root/verify_write_target_within_canonical_root/verify_delete_target_
+# within_root/verify_delete_target_within_canonical_root/reconstruct_file/
+# write_placeholder/materialize_symlink/materialize_symlink_windows/
+# apply_exec_bit) was already a thin pass-through with zero
+# ports/MaterializationStatePort dependency -- the same "wrapper adds
+# nothing beyond what `?` already does" shape this sub-phase's
+# disk-verification wrapper removal established first, not a `ports/mod.rs`
+# blocker at all. Deleted then; coverage relocated to
+# yadorilink-local-storage::materialize_write's own test module first (a
+# separate commit), since chunker.rs's tests were the only coverage those
+# functions had.
+
+[[module]]
+path = "commit_path_locks.rs"
+lines = 353
+responsibilities = ["daemon orchestration", "root authority"]
+destinations = ["yadorilink-daemon"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9E"
+# Fourth pass: moved together with `orchestrator.rs` and `plan_driver.rs` as
+# one atomic three-file group -- see `orchestrator.rs`'s own entry for the
+# shared reasoning. New home: `yadorilink-daemon::commit_orchestration::
+# commit_path_locks`, `pub(crate)` (same effective scope as its previous
+# `pub(crate) mod commit_path_locks;` in sync-core's own lib.rs -- reachable
+# within the daemon crate, not outside it). Its only real caller
+# remains `orchestrator::run_slice`, now a sibling in the same crate instead
+# of the same file tree one level up. All 7 of its own tests pass unchanged
+# at the new location.
+
+[[module]]
+path = "compaction.rs"
+lines = 477
+responsibilities = ["pure domain / policy / planning"]
+destinations = ["yadorilink-replica-engine"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# 7D-9D second pass: resolved the circularity the first pass flagged
+# rather than resolved. Full read confirmed this module and
+# `rebootstrap.rs` reference each other (this module's `execute_prune`
+# reads `rebootstrap::COMPACTION_SCHEDULING_READY`; `rebootstrap.rs`
+# depends on this module's `Checkpoint`/`CompactionStore`), but neither
+# ever touches `rusqlite`/`Connection` -- both are entirely generic over
+# the `CompactionDagStore`/`DeviceFrontierStore`/`CheckpointStore` traits
+# declared here, with the concrete SQL-backed implementation living on
+# `SyncState` in `index.rs`, never in these two files. Not a genuine
+# crate-dependency cycle: both moved to yadorilink-replica-engine
+# together in one commit, where the mutual reference is now an ordinary
+# same-crate one. The ledger's original two-destination guess
+# (replica-engine + sync-sqlite) did not survive contact with the code:
+# `CHECKPOINT_TABLE_MIGRATION`, the one SQL artefact, had zero consumers
+# left in sync-core (yadorilink-sync-sqlite carries its own independent,
+# deliberately duplicated copy) and was dropped as dead code rather than
+# moved -- so this responsibility list drops "SQLite SQL / row mapping"
+# entirely; there was never a real SQL half here.
+
+[[module]]
+path = "custody_transfer.rs"
+lines = 971
+responsibilities = ["filesystem execution"]
+destinations = ["yadorilink-filesystem-sync"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# 7D-9D second pass: moved as one unit. Fresh full read confirmed the
+# ledger's original two-destination guess (filesystem-sync +
+# root-authority) did not survive contact with the code, the same
+# pattern already seen for retroactive_conflict.rs/single_pass_capture.rs
+# in earlier sub-phases: every line calls INTO yadorilink-root-authority
+# (a dependency filesystem-sync already has), never code that itself
+# belongs there. The module's outer, EXECUTION_ENABLED-gated
+# `transfer_to_custody` could not move verbatim (filesystem-sync cannot
+# depend on sync-sqlite, which is where that gate lives, without a
+# cycle); collapsed into the one entry point its real caller
+# (orchestrator::drive_captured_placement, itself already gated) actually
+# used, ungated -- matching fs_commit.rs's own established no-gate-at-
+# this-layer pattern. Unblocks `retained_obligation.rs`'s 900-line
+# pure-decision entry, still pending below.
+
+[[module]]
+path = "dag_import.rs"
+lines = 803
+responsibilities = ["pure domain / policy / planning", "SQLite SQL / row mapping", "daemon orchestration"]
+# Migrated whole to yadorilink-daemon (crates/yadorilink-daemon/src/dag_import.rs)
+# in Phase 7D-10.5: every real production caller of ensure_initial_import/
+# backfill_missing_history already passed a &ReplicaCoordinator exclusively
+# (confirmed via grep of yadorilink-daemon/src -- daemon_state.rs,
+# link_runtime/startup.rs), so this was never actually blocked_by index.rs
+# in the structural-cycle sense the sync_runtime/storage/repository clusters
+# are -- only the physical move itself was outstanding. IMPORT_BATCH_OP_LIMIT
+# split out separately to yadorilink_replica_domain::change (yadorilink-local-
+# capture's own production RECONCILE_CHUNK_OP_LIMIT needs it and sits below
+# yadorilink-daemon in the dependency graph). yadorilink-peer-session's and
+# yadorilink-local-capture's own #[cfg(test)] suites reach
+# yadorilink_daemon::dag_import via the same dev-only back-edge pattern
+# yadorilink-peer-session already used for ReplicaCoordinator itself.
+destinations = ["yadorilink-daemon", "yadorilink-replica-domain"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9E"
+# 7D-9-sweep investigation (never previously classified beyond this coarse
+# entry -- read fresh in full this pass). `ensure_initial_import`/
+# `backfill_missing_history`/`import_create_op` and their helpers take
+# `state: &SyncState` directly and call real, still-`SyncState`-owned
+# production methods on it (`state.file_index_repository()`,
+# `state.sqlite()`, `state.path_lock_registry()`,
+# `state.change_history_repository()`,
+# `state.append_initial_import`/`append_history_backfill` -- the latter
+# two among the 17 permanently-remaining `SyncState` methods per
+# `phase7d9f-syncstate-method-ledger.toml`, each resolving
+# `local_emission_auth` before delegating). Unlike `retained_obligation.rs`
+# (migrated this pass), this file is NOT unwired: every function here is a
+# real, live entry point taking a concrete `&SyncState`/`&mut SyncState`.
+# Moving it to `yadorilink-replica-engine` or `yadorilink-daemon` as-is
+# would require either (a) those crates depending back on
+# `yadorilink-sync-core` for `SyncState` -- backwards, since sync-core
+# already depends on both in production -- or (b) rewriting every function
+# to take the underlying repositories/ports directly instead of
+# `&SyncState`, which is real, non-mechanical surgery (not just caller
+# repointing) requiring its own dedicated pass, not attempted here.
+# `blocked_by = ["index.rs"]` confirmed accurate: genuinely tied to
+# `SyncState`'s own Phase 7D-10 retirement (once nothing needs `&SyncState`
+# anymore, this file's own signatures can finally change), not to
+# `index.rs`'s already-complete production-line shrinkage.
+#
+# 7D-10 (this pass): option (b) above -- the "real, non-mechanical surgery"
+# -- turned out tractable after all, once actually attempted. Every method
+# `ensure_initial_import`/`backfill_missing_history`/`import_create_op` call
+# on `state` (`sqlite()`, `file_index_repository()`,
+# `change_history_repository()`, `path_lock_registry()`,
+# `append_initial_import()`, `append_history_backfill()`) already existed
+# verbatim on `yadorilink-daemon`'s `ReplicaCoordinator` (added by 7D-10.2/
+# 7D-10.3). Added a narrow `DagImportSource` trait in this file (same
+# crate-local pattern as `RecoveryInventorySource`/
+# `MaterializationIntentJournal`), implemented for `SyncState` (unchanged
+# behavior) and, in `yadorilink-daemon`, for `ReplicaCoordinator` (orphan-rule
+# legal). All three functions are now generic over `S: DagImportSource`.
+# This resolved the last two genuinely-blocked production `&SyncState`
+# call sites from `phase7d10-exit-report.md`'s 7D-10.11 punch list
+# (`link_runtime/startup.rs`'s `ensure_initial_import` call,
+# `daemon_state.rs`'s `backfill_missing_history` call), both now repointed
+# onto `replica_coordinator`. `status`/`blocked_by` deliberately NOT changed
+# by this pass: the FILE itself still cannot physically move out of
+# `yadorilink-sync-core` while `SyncState` remains its own crate-internal
+# caller (dst suites, `yadorilink-local-capture`'s tests) needing a
+# fully-functional concrete `SyncState` -- the same "generalize now, move
+# later once SyncState itself retires" shape `recovery.rs`'s own
+# `RecoveryInventorySource` generalization (7D-10.11) already established.
+# See `phase7d10-exit-report.md`'s dag_import.rs addendum for the full
+# reasoning and verification.
+
+[[module]]
+path = "debounce.rs"
+lines = 1281
+responsibilities = ["filesystem execution"]
+destinations = ["yadorilink-filesystem-sync"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9E"
+# Second pass: migrated to `yadorilink-filesystem-sync::debounce`, verbatim
+# apart from its one import (`crate::watcher::{FsChangeEvent,FsChangeKind}`,
+# now in-crate instead of a cross-crate shim reference).
+#
+# The `["yadorilink-daemon"]` destination this entry previously carried
+# (and the "task scheduling stays daemon" reasoning the first pass's own
+# note gave for it) turned out to be structurally wrong, not merely stale
+# -- the same category of error the first pass found for `sync_runtime/*`,
+# discovered here by actually tracing every real consumer instead of
+# trusting the module's own "knows nothing about indexing" doc comment at
+# face value. `DebounceFlush` (this module's output type) is a genuine
+# *production* dependency of `yadorilink-local-capture::local_change::
+# process_flush` (not merely a test-harness convenience) -- confirmed by
+# reading `local_change.rs:23`'s `use yadorilink_sync_core::debounce::
+# DebounceFlush;`. `yadorilink-local-capture` sits *below*
+# `yadorilink-daemon` in the dependency graph (daemon depends on it, never
+# the reverse), so moving this module to daemon would require
+# local-capture to depend back on daemon -- a real cycle, exactly as
+# impossible as `sync_runtime/*`'s case. `yadorilink-filesystem-sync`
+# already owns this module's one real dependency
+# (`watcher::{FsChangeEvent,FsChangeKind}`, itself migrated there in
+# 7D-9C) and already sits below both `yadorilink-local-capture` (which
+# reaches it today only through sync-core's own re-export shim, not a
+# direct dependency edge -- not changed this pass) and `yadorilink-daemon`
+# (an existing direct dependency), so it is the correct common-ancestor
+# destination.  `responsibilities` corrected from `["daemon orchestration"]`
+# to `["filesystem execution"]` to match: it is now grouped with
+# `watcher.rs`, its one real dependency and closest sibling in shape
+# (raw-event -> processed-event boundary code), not with the
+# daemon-orchestration modules this sub-phase otherwise charters.
+#
+# sync-core's own `debounce.rs` became a `pub use` re-export shim (same
+# shape as `watcher.rs`'s own shim), so every existing
+# `crate::debounce::*`/`yadorilink_sync_core::debounce::*` consumer --
+# `yadorilink-daemon`'s `link_runtime::{factory,tasks}`/
+# `link_runtime::operations::capture_local_change`/
+# `adapters::runtime::link_runtime_controller` and their own
+# `dst_daemon_*.rs` suite, `yadorilink-local-capture::local_change` and its
+# own tests, and this crate's own `dst_watcher_debounce.rs`/
+# `dst_disk_crash_chaos.rs`/`dst_generated_sweep.rs`/
+# `dst_directory_move_edit_race.rs`/`dst_two_device_chaos.rs`/
+# `dst_peer_reconcile_race.rs`/`dst_three_device_mesh_chaos.rs`/
+# `dst_network_fault_chaos.rs`/`dst_directory_chaos.rs` chaos-test harness
+# -- needed zero code change. `yadorilink-filesystem-sync`'s own
+# `Cargo.toml` gained a `tracing-subscriber` dev-dependency for the two
+# fallback-trigger tests that assert on log content (same dependency
+# sync-core's own tests carried before the move). Net test count: zero
+# lost, 16 moved from `yadorilink-sync-core --lib` (448 -> 432) to
+# `yadorilink-filesystem-sync --lib` (81 -> 97, 1 still ignored) --
+# confirmed exact arithmetic both ways.
+
+[[module]]
+path = "error.rs"
+lines = 742
+responsibilities = ["pure domain / policy / planning"]
+destinations = ["yadorilink-daemon"]
+status = "pending"
+blocked_by = []
+removal_phase = "7D-10"
+# 2026-08-06 correction (Phase 7D-10 Tier 2, this task): the "4-way split"
+# destinations recorded above were stale evidence, predating
+# `ReplicaCoordinator`'s existence -- see this pass's own investigation.
+# `SyncError` is the union type a composition root needs to `?`-propagate
+# from every already-split subsystem crate, the same shape that already
+# justified hosting `ReplicaCoordinator`/`dag_import.rs` in
+# `yadorilink-daemon` (not a genuine 4-way decomposition; nearly every
+# variant already has a narrower, subsystem-owned equivalent this type is
+# the union of).
+#
+# `crates/yadorilink-daemon/src/sync_error.rs` now holds a byte-identical
+# copy of this type, and every real production `SyncError` call site in
+# `yadorilink-daemon` (~93 sites across `replica_coordinator.rs` and its
+# submodules, `dag_import.rs`, `queries/*`, `application/*`, etc.) uses it.
+# THIS file (`crates/yadorilink-sync-core/src/error.rs`) is deliberately left
+# completely unmoved/unchanged, not deleted or shrunk: `SyncState`
+# (`index.rs`) is still live production surface and its own methods return
+# `Result<_, error::SyncError>` throughout, and two `yadorilink-local-capture`
+# -owned port traits (`LocalMutationStore`, `MaterializationStatePort`) are
+# pinned to this exact type in their own foreign method signatures --
+# `yadorilink-local-capture` sits below `yadorilink-daemon` in the dependency
+# graph and cannot depend on the new daemon-owned type without creating a
+# cycle. Two daemon files (`replica_coordinator/local_mutation.rs`,
+# `replica_coordinator/materialization_state.rs`) implement those two traits
+# for `ReplicaCoordinator` and therefore still import this crate's
+# `SyncError` directly, converting at that one boundary via lossless
+# `From` impls in both directions (`crate::sync_error`'s own doc comment,
+# daemon side). `status` stays `pending` and `blocked_by` stays `[]`: this
+# module cannot retire (the type cannot be deleted from this crate) before
+# `SyncState`/`index.rs` itself retires -- it is not independently movable,
+# matching the same "genuinely tied to SyncState's own Phase 7D-10 removal"
+# reasoning the prior note already recorded, just with the destination
+# corrected from a 4-way split to `yadorilink-daemon` and the coexistence
+# made explicit.
+
+[[module]]
+path = "lib.rs"
+lines = 123
+responsibilities = ["temporary facade / delegation", "test-only support"]
+destinations = ["deleted (crate root, no successor -- removed with yadorilink-sync-core itself in Phase 7D-10)"]
+status = "pending"
+blocked_by = []
+removal_phase = "7D-10"
+# 7D-9-sweep correction: `destinations`/`removal_phase` updated from "7D-9F"
+# to "Phase 7D-10" -- `phase7d9f-exit-report.md` §14.6 confirms 7D-9F
+# closed WITHOUT deleting `yadorilink-sync-core` or this crate-root file;
+# crate deletion is explicitly Phase 7D-10's own job, a separate,
+# not-yet-started phase. The crate root cannot retire before every other
+# module it declares does.
+
+[[module]]
+path = "link_preflight.rs"
+lines = 685
+responsibilities = ["pure domain / policy / planning", "root authority"]
+destinations = ["yadorilink-local-storage"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9B"
+# Landed in yadorilink-local-storage, not this entry's original
+# yadorilink-root-authority guess: link_preflight.rs needs both free_space
+# (native to local-storage) and ignore_patterns (root-authority, already a
+# local-storage dependency) -- routing it to root-authority would need the
+# reverse edge, a real crate cycle (local-storage already depends on
+# root-authority). See yadorilink-local-storage/Cargo.toml's own comment.
+
+[[module]]
+path = "materialized_generation.rs"
+lines = 40
+responsibilities = ["temporary facade / delegation"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9C"
+# Was already a pure `pub use` shim (7D-7.5 hoisted every real item into
+# yadorilink-sync-sqlite). Deleted; its ~10 in-crate consumers repointed at
+# yadorilink_sync_sqlite::{file_identity_codec,materialized_generation}
+# directly. No external crate depended on this module.
+
+[[module]]
+path = "placeholder_backend.rs"
+lines = 250
+responsibilities = ["pure domain / policy / planning"]
+destinations = ["yadorilink-filesystem-sync"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9C"
+# Moved verbatim (the PlaceholderCapability/PlaceholderBackend trait seam).
+# Its one sync-core dependency, SyncError as the trait's Result error type,
+# repointed at yadorilink_root_authority::RootAuthorityError (already a
+# filesystem-sync dependency, already carries an identical Io variant) --
+# same reuse-over-duplicate-type judgment 7D-9B's fs_commit.rs move made.
+# Every real consumer (yadorilink-daemon's hydration.rs/daemon_state.rs/
+# link_runtime/factory.rs/gc.rs/adapters/runtime/link_lifecycle.rs/
+# placeholder_backend_windows.rs, yadorilink-cli's materialization.rs test)
+# repointed at yadorilink_filesystem_sync::placeholder_backend.
+
+[[module]]
+path = "rebootstrap.rs"
+lines = 167
+responsibilities = ["pure domain / policy / planning"]
+destinations = ["yadorilink-replica-engine"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# 7D-9D second pass: moved together with compaction.rs (see that entry's
+# own note for the circularity this resolves). Never touched rusqlite/
+# Connection -- responsibilities corrected to drop "SQLite SQL / row
+# mapping"; the ledger's original split guess did not survive contact
+# with the code.
+
+[[module]]
+path = "rebootstrap_snapshot.rs"
+lines = 708
+responsibilities = ["pure domain / policy / planning"]
+destinations = ["yadorilink-replica-engine"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# 7D-9D second pass: moved in the same commit as compaction.rs/
+# rebootstrap.rs, its only sync-core dependency. Entirely encode/decode/
+# hash over already-derived values, never rusqlite/Connection --
+# responsibilities corrected to drop "SQLite SQL / row mapping" for the
+# same reason as its two siblings above.
+
+[[module]]
+path = "recovery.rs"
+lines = 517
+responsibilities = ["pure domain / policy / planning", "SQLite SQL / row mapping"]
+destinations = ["yadorilink-daemon"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-10"
+# 2026-08-06: relocated whole to `yadorilink-daemon/src/recovery.rs`. The
+# prior pass's own `blocked_by: ["index.rs", "types.rs"]` turned out to be
+# stale, same shape as `dag_import.rs`'s own re-classification: a fresh
+# workspace-wide grep for `yadorilink_sync_core::recovery::` found every
+# real (non-test, non-doc-comment) caller already went through
+# `yadorilink-daemon`'s own `ReplicaCoordinator` (`queries/recovery.rs`,
+# `replica_coordinator.rs`'s `impl RecoveryInventorySource`) -- the
+# `state.enrollment_repository()`/etc. calls against a live `&SyncState`
+# the prior note flagged as load-bearing were, on direct inspection, all
+# inside `index.rs`'s own `#[cfg(test)] mod tests`, never production.
+# `impl RecoveryInventorySource for SyncState` (this file's former
+# not-orphan-rule-required impl) was dropped rather than kept as a
+# `dag_import.rs`-style dev-back-edge shim: no test outside `index.rs`'s
+# own suite ever called `recovery::inventory` against a bare `SyncState`,
+# so there was nothing left needing it. That `index.rs` test suite (~40
+# tests covering `inventory()` and, for `repository/recovery_snapshot.rs`
+# below, `recovery_local_snapshot`) moved verbatim into this file's and
+# `recovery_snapshot.rs`'s own `#[cfg(test)] mod tests`, fixtures
+# retyped from `SyncState` to `ReplicaCoordinator` (identical accessor
+# names on both, confirmed via direct inspection of
+# `replica_coordinator.rs`). `SyncState`'s own `recovery_snapshot_reader`
+# field/accessor (index.rs) removed alongside its test suite: it had no
+# production reader of its own left either.
+
+[[module]]
+path = "retroactive_conflict.rs"
+lines = 662
+responsibilities = ["pure domain / policy / planning", "SQLite SQL / row mapping"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# 7D-9D first pass: moved as one unit to `yadorilink-sync-sqlite`, not
+# split replica-engine/sync-sqlite as originally classified. The pure
+# per-path resolution decision (resolve_path_heads) already lived in
+# `yadorilink-replica-engine` before this pass -- this file only ever
+# called into it as a library function, never duplicated its logic. What
+# remained (plan_retroactive_merge/path_heads_at_frontier/read_change) is
+# DAG-traversal-plus-bin-packing that reads incrementally from
+# `rusqlite::Connection` throughout its own loop, not a pre-snapshotted
+# pure decision function -- the same Connection-based-orchestration shape
+# `dag_store`/`materialized_generation` already have as sync-sqlite
+# modules, so a second destination was never warranted. The original
+# 7D-9A dual-destination classification is corrected here based on a
+# fresh read of the actual code, matching every later pass's finding that
+# 7D-9A's classification needs re-verification rather than blind trust.
+# Its one in-crate consumer, `index/rebootstrap_store/retroactive_conflict_
+# store.rs`, is repointed at `yadorilink_sync_sqlite::retroactive_conflict`;
+# that consumer itself stays in sync-core (deeply tied to `SyncState`'s
+# repair-election/auth/materialization-wake machinery) and remains a
+# separate, still-pending 7D-9D ledger entry.
+
+[[module]]
+path = "root_identity.rs"
+lines = 600
+responsibilities = ["root authority", "filesystem execution"]
+destinations = ["yadorilink-root-authority"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9B"
+# VerifiedRoot (unchanged -- a private canonicalized PathBuf, exactly as
+# before), marker-file I/O, and RootVerificationStatePort's trait
+# definition all landed in yadorilink-root-authority::root_identity.
+# Marker-file I/O (read_marker/write_marker/mint_root_token) and the opaque
+# VerifiedRoot value type itself -- pure fs + no SyncState coupling.
+
+[[module]]
+path = "root_identity.rs"
+lines = 531
+responsibilities = ["root authority", "SQLite SQL / row mapping"]
+destinations = ["yadorilink-root-authority", "yadorilink-sync-core"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9B"
+# Refined from this entry's original daemon/sync-sqlite guess: the real
+# split was RootVerificationStatePort's trait definition (root-authority)
+# plus `impl ... for SyncState` staying in sync-core -- tracked separately
+# as `ports/root_verification_state.rs` (removal_phase 7D-9F, since it
+# cannot leave sync-core before SyncState itself does), same shape 7D-6
+# used for PeerReplicaStatePort/SyncState. No SQLite/daemon destination was
+# ever actually needed -- SyncState is not itself a daemon or sync-sqlite
+# type.
+# The index-consulting half (list_files/get_record_kind/get_symlink_target/
+# get_materialization_state/ensure_unambiguous_group corroboration) that
+# needs a concrete &SyncState today -- per the 7D-8.4 finding, this becomes
+# a RootVerificationStatePort implemented by whichever crate ends up owning
+# the equivalent state (daemon adapter or sync-sqlite), never a trait object
+# threaded through VerifiedRoot itself.
+
+# ---------------------------------------------------------------------------
+# Top-level files, group B
+# ---------------------------------------------------------------------------
+
+[[module]]
+path = "single_pass_capture.rs"
+lines = 0
+responsibilities = ["filesystem execution"]
+destinations = ["yadorilink-filesystem-sync"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9C"
+# Eighth pass: moved verbatim to yadorilink_filesystem_sync::
+# single_pass_capture. The ledger's original two-destination guess
+# (filesystem-sync + replica-engine) and blocked_by = ["chunker.rs"] both
+# did not survive contact with the actual code: every line is
+# filesystem-execution-shaped (opens a real file, reads/hashes/chunks it,
+# writes to a BlockStore) -- the CDC-vs-fixed-size threshold decision is an
+# implementation detail already duplicated identically in
+# yadorilink-local-storage (CDC_SIZE_THRESHOLD), not a separable
+# domain-policy layer, so there was never a real replica-engine-shaped
+# piece to split out. `chunker.rs` was never a real blocker either -- its
+# own read_up_to had zero dependency on this file; the dependency only ran
+# the other way (this file is read_up_to's one consumer), duplicated
+# locally here rather than shared (see chunker.rs's own now-`migrated`
+# entry). Zero production callers existed before this move (per the
+# module's own doc comment, unchanged), so this was zero production-risk.
+# SinglePassCaptureError no longer wraps SyncError -- it now names
+# std::io::Error/StorageError/hex::FromHexError directly; the one real
+# in-crate consumer (captured_authoring.rs) had its own error-conversion
+# `impl` repointed to match, in the same commit sequence.
+
+[[module]]
+path = "state_model.rs"
+lines = 434
+responsibilities = ["pure domain / policy / planning"]
+destinations = ["yadorilink-replica-domain"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9E"
+# Third pass: read the file fresh (749 lines at read time, not the 904 this
+# entry's stale line count claimed -- itself already flagged stale by the
+# second pass). Not a single movable unit: `FolderLink`,
+# `RoleLossOperationParams`, the `RoleLossOperation` cluster, and the
+# `MembershipOperation` cluster (434 lines) have no coupling to anything
+# still in yadorilink-sync-core and moved to
+# `yadorilink_replica_domain::session_state` in `3d59544c`. The
+# `Enrollment*` cluster and `InventoryScanResult<T>` (the remaining ~315
+# lines) did NOT move -- see the `state_model.rs` entry immediately below,
+# added by this pass to track them separately now that this entry no
+# longer covers the whole file.
+
+[[module]]
+path = "state_model.rs"
+lines = 0
+responsibilities = ["pure domain / policy / planning"]
+destinations = ["yadorilink-replica-domain"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-10.1"
+# 7D-10.1: file deleted. Its own single real caller (`index.rs`) now
+# re-exports every type straight from its real home
+# (`yadorilink_replica_domain::session_state`/`recovery`,
+# `yadorilink_sync_sqlite`, `yadorilink_filesystem_sync`) instead of
+# through this intermediate hop; `ContentHash` (a plain alias, not a
+# cross-crate re-export) moved verbatim into `index.rs`, its one caller.
+# The prior pass's claim of "one external caller" was itself re-verified
+# and found to be a false positive: a workspace grep for
+# `yadorilink_sync_core::state_model::` found exactly one hit outside this
+# crate, and it was a stale doc comment in
+# `yadorilink-sync-sqlite::policy_watermark.rs`, not real code -- zero
+# actual external callers existed. `now_unix_nanos` (the "dead code"
+# `cargo check` flagged) was not actually dead: it is used, but only from
+# inside `index.rs`'s own `#[cfg(test)] mod tests` via a `#[cfg(test)]`-
+# gated re-export, invisible to a plain `cargo check` build. Moved
+# directly into `index.rs` as a private `#[cfg(test)]` fn, matching its
+# real (test-only) usage. `cargo test -p yadorilink-sync-core --lib`: 317
+# passed, 0 failed, both before and after (pure relocation).
+
+[[module]]
+path = "types.rs"
+lines = 0
+responsibilities = ["pure domain / policy / planning", "temporary facade / delegation"]
+destinations = ["yadorilink-replica-domain"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-10.1"
+# 7D-10.1: file deleted. The prior pass's "one external caller" claim did
+# NOT hold up on fresh review -- a workspace grep found 31 files (not 1)
+# with a real, non-comment `yadorilink_sync_core::types::` reference,
+# spread across `yadorilink-daemon` (27 files, `src/` and `tests/`),
+# `yadorilink-cli` (1 test file), `yadorilink-replica-engine` (1 doc
+# comment only, not a real caller), plus this crate's own internal
+# `crate::types::` callers (8 files: `index.rs`, `recovery.rs`,
+# `block_deletion.rs`, `materialization.rs`,
+# `repository/recovery_snapshot.rs`, and three `ports/*.rs` orphan-impl
+# files) and its own `tests/` directory (6 files, `peer_session.rs` alone
+# accounting for ~35 call sites). Every one of these was mechanically
+# repointed straight at `yadorilink_replica_domain::session_state::
+# {EnrollmentKind, MaterializationPolicy, MaterializationState}` (the
+# file's own real, already-relocated contents) -- a wider blast radius
+# than the prior pass estimated, but still fully mechanical, no
+# architectural blocker: every consuming crate already depended on
+# `yadorilink-replica-domain` directly. `cargo check --workspace
+# --all-targets` clean (no new warnings); full per-crate `--lib` test
+# runs for every touched crate (sync-core, daemon, local-capture, cli,
+# replica-engine, peer-session, filesystem-sync, sync-sqlite) all green
+# except the one pre-existing documented flake
+# (`control_socket::migration_safety_tests::
+# an_idempotent_same_path_relink_is_not_refused`), no new failures.
+
+[[module]]
+path = "watcher.rs"
+lines = 0
+responsibilities = ["filesystem execution"]
+destinations = ["yadorilink-filesystem-sync"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9C"
+# Eighth pass: moved to yadorilink_filesystem_sync::watcher, verbatim
+# (real OS-level filesystem watching -- notify::RecommendedWatcher, the
+# new-directory-registration deadlock/race-avoidance scheme documented in
+# its own module doc comment -- unchanged). ~21 consumers confirmed by a
+# workspace-wide grep (matching the seventh pass's own "~20" estimate):
+# this crate's own debounce.rs plus its dst_*.rs/madsim chaos-test harness,
+# yadorilink-daemon's link_runtime module and its own dst_daemon_*.rs
+# suite, and yadorilink-local-capture's local_change.rs. Every one of them
+# needed zero change except two real repoints, both caused by
+# FolderWatchSource::watch's return type: this crate cannot depend back on
+# yadorilink-sync-core, so the trait now returns a new crate-local
+# WatcherError (Io/Watch variants), not SyncError.
+#
+# sync-core's own watcher.rs became a `pub use` re-export shim (same shape
+# as materialization.rs's own shims for its moved pieces), so every
+# existing `crate::watcher::*`/`yadorilink_sync_core::watcher::*` import
+# path needed no change; a new `impl From<WatcherError> for SyncError` in
+# error.rs (reproducing the exact Io/Watch classification split the
+# pre-move code already had) lets any caller that still needs SyncError
+# convert losslessly. The two real repoints, both in yadorilink-daemon:
+# link_runtime/factory.rs's one production `?`-propagating call site
+# (now `.map_err(SyncError::from)?`, the same pattern hydration.rs::evict
+# already established for MaterializationExecutionError), and
+# adapters/runtime/link_runtime_controller.rs's own test-only
+# FailingWatchSource (a FolderWatchSource impl whose trait signature and
+# constructed error updated to WatcherError). Every other consumer
+# (RealFolderWatchSource/SimulatedFolderWatchSource, and every caller that
+# only Display-formats or .unwrap()s the error) needed no change.
+#
+# `responsibilities` was corrected in the seventh pass: "network/session"
+# dropped -- a direct grep of the whole file for
+# peer/wire/transport/session/udp/tcp tokens found only doc-comment
+# mentions in passing, never real network code.
+
+[[module]]
+path = "work_class_queue.rs"
+lines = 994
+responsibilities = ["daemon orchestration", "pure domain / policy / planning"]
+destinations = ["yadorilink-daemon"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9E"
+# Fifth pass: moved verbatim to `yadorilink-daemon::work_class_queue`
+# (`pub(crate)`, flat file at the crate's `src/` root, matching the existing
+# `resource_lock.rs` precedent for a self-contained generic primitive that is
+# not one particular subsystem's own concern -- not placed under
+# `commit_orchestration/` despite `orchestrator.rs`'s own doc comment naming
+# it as a "downstream concern", since the primitive is explicitly documented
+# as "one per resource the caller wants to arbitrate" -- SQLite writer turns,
+# hashing worker slots, file descriptors, disk-write slots, not just
+# orchestrator's own commit path). Re-verified freshly before moving, per the
+# task brief's explicit instruction: `orchestrator.rs`'s prior blocker
+# resolved when it migrated to `yadorilink-daemon` in the fourth pass, and a
+# fresh grep for `WorkClassQueue`/`WorkClass::`/`work_class_queue` across the
+# whole workspace at the start of this pass found zero real callers anywhere
+# (including inside `orchestrator.rs` itself, which only mentions it in a doc
+# comment -- "a downstream concern, not wired here") -- the same "genuinely
+# zero callers" shape the fourth pass found for the
+# orchestrator.rs/plan_driver.rs/commit_path_locks.rs cluster itself, not
+# merely a resolved blocker. Zero `SyncError`/`crate::`-relative imports in
+# the file (pure `std`/`tokio::sync`), so the move needed no import fixups
+# beyond the `mod` declaration relocating from
+# `yadorilink-sync-core/src/lib.rs` to `yadorilink-daemon/src/lib.rs`. Single
+# commit (no shim/repoint step needed -- there was no external consumer to
+# keep resolving through the old path).
+#
+# Second pass: `blocked_by = []` corrected to `["orchestrator.rs"]` -- a
+# genuinely wrong-as-written entry, not merely stale, found by tracing every
+# real consumer (the same category of error the first pass found for
+# `sync_runtime/*`, and this pass found for `debounce.rs`'s destination).
+# `WorkClassQueue` is a pure, self-contained tokio-only async admission-
+# control primitive (no `SyncState`, no `rusqlite`) with exactly one
+# in-crate consumer: `orchestrator.rs`. `orchestrator.rs` itself is
+# 7D-9E-chartered to `yadorilink-daemon` but still fully `pending` -- and
+# `yadorilink-daemon` already depends on `yadorilink-sync-core` (never the
+# reverse), so moving `work_class_queue.rs` out from under its only
+# consumer now would need either a `yadorilink-sync-core` dependency on
+# `yadorilink-daemon` (a real cycle) or leaving it unused dead code in
+# daemon until `orchestrator.rs` eventually follows -- neither is a real
+# move. Unlike `policy_watermark.rs`/`restore_operation.rs` (7D-9E first
+# pass), whose consumer's crate (`yadorilink-sync-sqlite`) sits *below*
+# `yadorilink-sync-core`, `yadorilink-daemon` sits *above* it, so there is
+# no direct-call escape hatch available here. Must move together with (or
+# strictly after) `orchestrator.rs`, not independently.
+
+[[module]]
+path = "plan_driver.rs"
+lines = 1728
+responsibilities = ["pure domain / policy / planning", "task lifecycle", "SQLite SQL / row mapping"]
+destinations = ["yadorilink-daemon"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9E"
+# Fourth pass: moved together with `orchestrator.rs` and `commit_path_locks.rs`
+# as one atomic three-file group -- see `orchestrator.rs`'s own entry for the
+# shared reasoning. `destinations` corrected from the stale two-way
+# `["yadorilink-daemon", "yadorilink-replica-engine"]` guess to a single
+# `["yadorilink-daemon"]`: a full read found no internally-mixed halves to
+# split (its `resolution_planning`/`replica-engine` calls are all through
+# already-migrated modules in other crates, not code of its own that could
+# peel off into `yadorilink-replica-engine`). New home:
+# `yadorilink-daemon::commit_orchestration::plan_driver`, `pub(crate)`. All
+# 16 of its own tests pass unchanged at the new location.
+
+[[module]]
+path = "captured_authoring.rs"
+lines = 2165
+responsibilities = ["pure domain / policy / planning", "SQLite SQL / row mapping"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9C"
+# Ninth pass: moved as one unit into `yadorilink-sync-sqlite`, not split
+# 3 ways. Investigated the eighth pass's own "needs its own SQL-transaction
+# port" finding and found the premise did not hold up under a full re-read:
+# this file's production code has ZERO direct filesystem operations of its
+# own (std::fs appears only in `#[cfg(test)]` fixture helpers). Its one real
+# filesystem touch is a call to `classify_single_pass(store: &dyn BlockStore,
+# path: &Path)` -- a function that already lives in
+# `yadorilink-filesystem-sync` (moved there in the eighth pass) and takes no
+# `Connection`/`Transaction` of its own. There is therefore no filesystem-
+# execution half left inside this file to extract via a port: the module is,
+# and always was, pure DAG/SQL-transaction policy over `rusqlite::Connection`/
+# `TransactionBehavior` -- exactly the shape `dag_store`/`materialized_
+# generation`/`filesystem_transaction` already have as first-class
+# `yadorilink-sync-sqlite` modules, not a shape that needs a port to reach
+# that crate. Confirmed no dependency cycle: `yadorilink-sync-sqlite`
+# already depends on `yadorilink-filesystem-sync` (for `materialization_
+# state.rs`'s existing `EvictableFile` import), so `BlockLivenessGate`/
+# `BlockReferenceWriteGuard`/`classify_single_pass` all resolve without a new
+# reverse edge. Added `yadorilink-local-storage` as a new direct dependency
+# of `yadorilink-sync-sqlite` (transitively already present via
+# `yadorilink-filesystem-sync`, so still no cycle) for `BlockStore`/
+# `FsBlockStore`/`StorageError`. `CapturedAuthoringError::Sync` now wraps
+# this crate's own `SyncSqliteError` instead of `yadorilink-sync-core::
+# SyncError`; `SyncSqliteError` gained `Hex`/`Chunking`/`Storage` variants
+# (mirroring `SyncError`'s own) to carry what `SinglePassCaptureError`'s
+# conversion needs. `yadorilink-sync-core::error::SyncError`'s own `impl
+# From<SyncSqliteError>` extended to cover the three new variants so the
+# reverse bridge back to `SyncError` (still used by every other sync-core
+# caller) stays total. The one real in-crate consumer, `orchestrator.rs`
+# (plus `storage/schema.rs`'s schema-init call), repointed to `yadorilink_
+# sync_sqlite::captured_authoring::*` directly. `single_pass_capture.rs`'s
+# sync-core re-export shim (kept by the eighth pass specifically so this
+# file needed no `use` path change) is now deleted along with this file's own
+# old sync-core copy -- its only reason to exist was this file staying in
+# sync-core, and `retained_obligation.rs`/`orchestrator.rs`'s own imports of
+# `StabilityFingerprint`/`SinglePassCaptureError` repointed to `yadorilink_
+# filesystem_sync::single_pass_capture` directly in the same commit
+# sequence. `blocked_by = []` unchanged and still accurate.
+#
+# Prior (eighth) pass's own corrections, superseded by the above but kept
+# for history: `single_pass_capture.rs` dropped from `blocked_by` (migrated
+# that pass); `block_liveness.rs`/`index.rs` dropped in the seventh pass
+# (block_liveness.rs migrated third pass; index.rs was never a real
+# dependency of this file).
+
+[[module]]
+path = "ports/materialization_execution_impl.rs"
+lines = 304
+responsibilities = ["temporary facade / delegation"]
+destinations = ["yadorilink-filesystem-sync"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9C"
+# impl yadorilink_filesystem_sync::materialization_execution::
+# MaterializationExecutionPort for SyncState -- the trait DEFINITION already
+# lives in yadorilink-filesystem-sync (this file is the impl-for-SyncState
+# half, which stays in sync-core under the orphan rule, mirroring
+# ports/peer_replica_state_impl.rs's own precedent). Marked "migrated"
+# because the trait itself, and the evict_file family it now serves, are
+# both already out of sync-core -- this file is the permanent sync-core-side
+# adapter, not a temporary waypoint like ports/materialization_state.rs
+# below.
+
+[[module]]
+path = "ports/materialization_state.rs"
+lines = 605
+responsibilities = ["temporary facade / delegation", "SQLite SQL / row mapping"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-10"
+# 2026-08-06: `MaterializationStatePort`'s trait DEFINITION (all 38 methods,
+# the three `EvictionEligibilitySnapshot`/`EvictionRevalidationSnapshot`/
+# `RepairRowSnapshot` structs, and the `OpenMaterializationIntent` marker
+# trait) relocated to `yadorilink-sync-sqlite::materialization_state_port`.
+# Every method now returns `yadorilink_sync_sqlite::SyncSqliteError`
+# directly instead of this crate's wide `SyncError` catch-all -- 36 of 38
+# converted by simply dropping `.map_err(SyncError::from)` (every
+# repository call already natively returned `SyncSqliteError`);
+# `verify_root`/`open_root` converted for free once `SyncSqliteError:
+# From<RootAuthorityError>` was confirmed to already exist;
+# `mark_deleted_emitting_change` (the method flagged as needing real work
+# in the prior addendum below) now inlines its own `local_emission_auth`
+# pre-check and repository write directly, since its real error surface is
+# exactly `{PolicyUnavailable, SyncSqliteError}` -- both already nameable
+# from `yadorilink-sync-sqlite`, and `SyncSqliteError` gained its own
+# `PolicyUnavailable` variant (mirroring `MaterializationExecutionError`'s
+# identical variant) to carry it losslessly.
+#
+# This file (`ports/materialization_state.rs`) itself did NOT disappear --
+# marked "migrated" on the same basis as `ports/peer_replica_state_impl.rs`'s
+# own precedent immediately above: it is the permanent sync-core-side
+# `impl MaterializationStatePort for SyncState` (orphan-rule-pinned to this
+# crate, since `SyncState` lives here), not a temporary waypoint. `index.rs`
+# is no longer a real blocker for the trait DEFINITION's own crate location
+# -- `blocked_by` cleared -- though `SyncState`'s own eventual removal
+# (unchanged, still pending) is what would let this specific impl file be
+# deleted outright. See `docs/design/phase7d10-exit-report.md`'s 2026-08-06
+# "item 1" addendum (the one directly preceding this pass's own addendum)
+# for the full investigation and the `MaterializationIntentGuard::open`
+# error-narrowing this move was gated on.
+#
+# Prior reasoning (accurate as of the 7D-9-sweep re-verification, superseded
+# by the above -- kept for history, not deleted):
+# `blocked_by` corrected this pass: `materialization.rs` dropped -- its own
+# 3-way core split is now fully complete (sixth 7D-9C pass, exit report
+# §12.6); `evict_file`'s family and the crash-recovery/repair group both
+# moved to yadorilink-filesystem-sync's narrower MaterializationExecutionPort,
+# so the wide, still-CRUD-shaped MaterializationStatePort defined here is no
+# longer blocked on that split. `index.rs` remains a real, mutual blocker
+# (its own 950-line group-3 entry above depends back on this port trait's
+# eventual crate move) -- confirmed still live, per the sixth pass's own
+# re-check: real remaining consumers are block_deletion.rs::
+# reclaim_cached_blocks (7D-9D-chartered, never 7D-9C),
+# ports/materialization_execution_impl.rs's own three snapshot-method
+# delegates, ports/mod.rs, and yadorilink-sync-sqlite's SyncState impl site
+# -- not deletable, not independently movable ahead of index.rs's own
+# facade shrinkage. Not moved this pass.
+#
+# Eighth pass re-verification (per this pass's own task brief's explicit
+# request to check whether this port is now genuinely dead code): re-grepped
+# every real (non-doc-comment) consumer of `MaterializationStatePort`
+# workspace-wide. Still not dead: `block_deletion.rs::reclaim_cached_blocks`
+# (7D-9D-chartered) and `ports/materialization_execution_impl.rs`'s three
+# snapshot-method delegates are both still real call sites, and
+# `yadorilink-daemon`'s own `adapters/mod.rs` coercion test
+# (`let _materialization: Arc<dyn MaterializationStatePort> = state;`)
+# confirms `Arc<SyncState>` still needs to satisfy this trait in production
+# wiring, not merely in this crate's own tests. `yadorilink-sync-sqlite`'s
+# two references (`lib.rs`, `store.rs`) are doc-comment mentions only, not
+# real code. Same conclusion as the sixth pass, independently re-confirmed
+# rather than assumed: still `blocked_by = ["index.rs"]`, still not
+# deletable, still a genuine mutual pair.
+# Still pending a crate move (impl MaterializationStatePort for SyncState
+# stays in sync-core until materialization.rs's own callers move out from
+# under it), but MaterializationStatePort's shape itself was reshaped this
+# pass: three provided (default-implemented) snapshot-shaped methods
+# (eviction_eligibility_snapshot/eviction_revalidation_snapshot/
+# repair_row_snapshot) added, each replacing a cluster of CRUD reads
+# materialization.rs's real callers already issued together with no
+# intervening mutation. Every existing granular method stays on the trait
+# unchanged (SyncState's own inherent methods, used directly by many
+# callers well beyond this port per a workspace-wide grep, were not
+# touched), so this is additive, not a breaking reshape. Not every method
+# was forced into the snapshot shape -- mutations/journal ops/listing
+# queries/root verification stay individual, single-purpose, and already
+# command-shaped.
+#
+# 7D-9-sweep re-verification: `phase7d9f-exit-report.md` §14.4 (7D-9F's own
+# closing addendum) confirms this file's `impl MaterializationStatePort for
+# SyncState` block is orphan-rule-pinned alongside the other four `ports/`
+# trait impls -- structurally permanent regardless of any future phase
+# short of `SyncState` itself moving crates (Phase 7D-10). `index.rs`'s own
+# 950-line group-3 entry remains the accurate mutual blocker; nothing
+# resolved this pass. Not a stale reference -- reconfirmed, not migrated.
+
+[[module]]
+path = "ports/mod.rs"
+lines = 65
+responsibilities = ["temporary facade / delegation"]
+destinations = [
+  "yadorilink-peer-session",
+  "yadorilink-replica-engine",
+  "yadorilink-root-authority",
+  "yadorilink-filesystem-sync",
+  "yadorilink-daemon",
+]
+status = "pending"
+blocked_by = []
+removal_phase = "7D-9F"
+# Per 9F's rule: no new catch-all "ports" crate -- each trait definition
+# moves to wherever its real consumer crate already is.
+
+[[module]]
+path = "ports/peer_replica_state_impl.rs"
+lines = 501
+responsibilities = ["temporary facade / delegation", "SQLite SQL / row mapping"]
+destinations = ["yadorilink-sync-sqlite", "yadorilink-peer-session"]
+status = "pending"
+blocked_by = ["index.rs"]
+removal_phase = "7D-9F"
+# 7D-9-sweep re-verification: `impl PeerReplicaStatePort for SyncState`
+# names the concrete `SyncState` type directly (67 references in this
+# 544-line file) -- orphan-rule-pinned to sync-core, the same shape
+# `phase7d9f-exit-report.md` §14.4 confirmed permanent for the other four
+# `ports/` trait impls. `blocked_by = ["index.rs"]` stays accurate: only
+# `SyncState`'s own Phase 7D-10 retirement resolves it, not `index.rs`'s
+# own production-line shrinkage (already complete, per §14.3).
+
+[[module]]
+path = "ports/root_verification_state.rs"
+lines = 120
+responsibilities = ["root authority"]
+destinations = ["yadorilink-daemon"]
+status = "pending"
+blocked_by = ["index.rs"]
+removal_phase = "7D-9F"
+# New in Phase 7D-9B: `impl yadorilink_root_authority::root_identity::
+# RootVerificationStatePort for SyncState`. Stays in this crate (mirrors
+# `ports/peer_replica_state_impl.rs`'s identical shape) until `SyncState`
+# itself has a successor to implement the trait for -- grouped with 7D-9F
+# rather than 7D-9B despite being introduced there, since it cannot move
+# before `index.rs`'s own facade does.
+
+[[module]]
+path = "storage/mod.rs"
+lines = 7
+responsibilities = ["temporary facade / delegation"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "pending"
+blocked_by = []
+removal_phase = "7D-9F"
+# 7D-9-sweep re-verification: confirmed by `phase7d9f-exit-report.md`
+# §14.4 as "not a migration candidate: it is the composition root's own
+# schema-sequencing glue... inherently tied to SyncState's own
+# constructors." Genuinely permanent until `SyncState`'s own Phase 7D-10
+# retirement, not independently movable. `blocked_by` stays `[]` correctly
+# (nothing sequences before it).
+#
+# 2026-08-06 update: `crates/yadorilink-daemon/src/sync_error.rs` (Phase
+# 7D-10 Tier 2) already covers the composition-root SyncError itself; the
+# same coexistence treatment is now applied one level down, to
+# `SyncState`'s own runtime-coordination fields (`sync_runtime/*`,
+# `storage/schema.rs` immediately below) and `MaterializationIntentGuard`
+# (`materialization.rs`'s own entry, later in this file) -- see those
+# entries' own dated updates.
+
+[[module]]
+path = "storage/schema.rs"
+lines = 56
+responsibilities = ["SQLite SQL / row mapping", "temporary facade / delegation"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "pending"
+blocked_by = []
+removal_phase = "7D-9F"
+# 7D-9-sweep re-verification: same finding as `storage/mod.rs` above --
+# `phase7d9f-exit-report.md` §14.4 confirms this file is the schema-
+# bootstrap hook `SyncDatabase::open`/`open_in_memory` pass in
+# (`pre_dag_schema` -> `yadorilink_sqlite_runtime::init_schema` ->
+# `post_dag_schema`), inherently tied to `SyncState`'s own constructors.
+# Genuinely permanent until Phase 7D-10.
+#
+# 2026-08-06 update (Task A, this pass): confirmed `SyncState` has zero
+# production callers workspace-wide (see `sync_runtime/*` entries below),
+# so this file's own bootstrap glue is now exercised only by that crate's
+# own test suite. `ReplicaCoordinator::open`/`open_in_memory`
+# (`yadorilink-daemon`) needed the identical `pre_dag_schema` ->
+# `yadorilink_sqlite_runtime::init_schema` -> `post_dag_schema` sequencing
+# for its own composition-root construction and could not share this
+# file's copy across the crate boundary -- duplicated verbatim to
+# `crates/yadorilink-daemon/src/sync_runtime/schema.rs` (same
+# "temporary coexistence" pattern as `error.rs`/`SyncError`). This file
+# stays unmoved/unchanged; status stays "pending" since it has not actually
+# left sync-core, only gained an independent daemon-side twin.
+
+[[module]]
+path = "sync_runtime/materialization_wake.rs"
+lines = 50
+responsibilities = ["daemon orchestration"]
+destinations = ["yadorilink-daemon"]
+status = "pending"
+blocked_by = ["index.rs"]
+removal_phase = "7D-9E"
+# First pass: re-verified the inherited `blocked_by = []` and found it
+# stale. `MaterializationWake` is not free-standing utility code -- it is a
+# private field SyncState (index.rs) owns and constructs directly
+# (`index.rs:218`/`294`/`369`), and every real caller (sync-core's own
+# `index/rebootstrap_store/retroactive_conflict_store.rs`,
+# `ports/peer_replica_state_impl.rs`) reaches it only through SyncState's
+# own delegating methods. yadorilink-daemon itself never touches the type,
+# only `SyncState::materialization_wake_notified` via
+# `state.sync_state.materialization_wake_notified()`
+# (`daemon/src/convergence/engine.rs:215`). Moving the type definition to
+# yadorilink-daemon while index.rs still needs to own an instance as a
+# private field is structurally impossible without a dependency cycle
+# (daemon already depends on sync-core; sync-core cannot depend back on
+# daemon). Genuinely blocked on `index.rs`/`SyncState`'s own 7D-9F
+# retirement -- or a deliberate ownership inversion (daemon owns the
+# runtime-coordination state, SyncState reaches it through a port daemon
+# implements) that is itself a real architectural decision, not a
+# mechanical move, so not attempted this pass. Same reasoning applies to
+# the other three sync_runtime/* entries below (`mod.rs` just re-exports
+# these three).
+#
+# 2026-08-06 update (Task A, this pass): re-derived the "daemon itself
+# never touches the type" premise above and found it stale -- by Phase
+# 7D-10.2-10.5, `ReplicaCoordinator` had grown its own real, unconditional
+# `MaterializationWake` field/accessor and directly imported this type
+# (`replica_coordinator.rs`). Re-checked whether the ownership-inversion
+# option this note names is now viable: `DaemonState` stopped holding a
+# `SyncState` at all (Phase 7D-10.9), so `SyncState`'s own field is
+# unreachable from any production daemon path -- there is no live
+# `SyncState` instance left for `ReplicaCoordinator` to invert ownership
+# with, or to stay synchronized with. Applied the "temporary coexistence"
+# pattern instead (matching `error.rs`/`SyncError`): duplicated verbatim to
+# `crates/yadorilink-daemon/src/sync_runtime/materialization_wake.rs`, and
+# repointed `ReplicaCoordinator`'s field/accessor to the daemon-owned copy.
+# This crate's copy (`index.rs`'s field, this file) is unchanged and now
+# exercised only by this crate's own tests. Status stays "pending" -- the
+# file has not left sync-core, only gained an independent twin.
+
+[[module]]
+path = "sync_runtime/mod.rs"
+lines = 9
+responsibilities = ["temporary facade / delegation"]
+destinations = ["yadorilink-daemon"]
+status = "pending"
+blocked_by = ["index.rs"]
+removal_phase = "7D-9E"
+# See sync_runtime/materialization_wake.rs's entry above -- this file only
+# declares the three sibling modules private to the crate; it cannot leave
+# before they do.
+#
+# 2026-08-06 update: `crates/yadorilink-daemon/src/sync_runtime/mod.rs` is
+# now the daemon-owned twin's equivalent facade -- see
+# sync_runtime/materialization_wake.rs's entry above.
+
+[[module]]
+path = "sync_runtime/path_locks.rs"
+lines = 199
+responsibilities = ["daemon orchestration"]
+destinations = ["yadorilink-daemon"]
+status = "pending"
+blocked_by = ["index.rs"]
+removal_phase = "7D-9E"
+# See sync_runtime/materialization_wake.rs's entry above: `PathLockRegistry`
+# is likewise a private SyncState field (`index.rs:` `path_lock_registry`),
+# same structural blocker.
+#
+# 2026-08-06 update: duplicated verbatim to
+# `crates/yadorilink-daemon/src/sync_runtime/path_locks.rs` -- see
+# sync_runtime/materialization_wake.rs's entry above for the full
+# reasoning (identical here: the historical shared-Arc invariant with a
+# live `SyncState` no longer applies since `DaemonState` stopped holding
+# one).
+
+[[module]]
+path = "sync_runtime/startup_readiness.rs"
+lines = 223
+responsibilities = ["daemon orchestration", "task lifecycle"]
+destinations = ["yadorilink-daemon"]
+status = "pending"
+blocked_by = ["index.rs"]
+removal_phase = "7D-9E"
+# See sync_runtime/materialization_wake.rs's entry above: `StartupReadinessRegistry`
+# is likewise a private SyncState field (`index.rs:` `startup_readiness`),
+# and `StartupGeneration`/`StartupFailed` are re-exported through
+# `yadorilink_sync_core::index` and consumed that way by daemon
+# (`link_runtime/startup.rs`), same structural blocker.
+#
+# 2026-08-06 update: duplicated verbatim to
+# `crates/yadorilink-daemon/src/sync_runtime/startup_readiness.rs`;
+# `link_runtime/startup.rs` now names
+# `crate::sync_runtime::startup_readiness::StartupGeneration` directly
+# instead of the `yadorilink_sync_core::index` re-export. See
+# sync_runtime/materialization_wake.rs's entry above for the full
+# reasoning.
+
+# ---------------------------------------------------------------------------
+# repository/ (SQL/row-mapping cluster, group C)
+# ---------------------------------------------------------------------------
+
+[[module]]
+path = "repository/mod.rs"
+lines = 22
+responsibilities = ["SQLite SQL / row mapping"]
+destinations = ["deleted (dissolved with its one remaining child, repository/recovery_snapshot.rs, Phase 7D-10)"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-10"
+# 2026-08-06: this entry's own predicted trigger fired -- once
+# `recovery_snapshot.rs` (its only remaining child module) relocated to
+# `yadorilink-daemon`, `repository/mod.rs` had nothing left to declare and
+# the whole `repository/` directory was deleted alongside it (`git rm -r`).
+# No content moved anywhere; the file simply stopped needing to exist.
+# 7D-9-sweep re-verification: confirmed by `phase7d9f-exit-report.md`
+# §14.4 -- now a 5-line module-doc-comment-only file (down from this
+# entry's stale 40) after the ninth pass removed its last real content
+# (`read_inventory_operation_id`, `enrollment`'s own last in-crate
+# caller). Declares only `pub(crate) mod recovery_snapshot;` plus doc
+# comments now. Cannot retire independently of `recovery_snapshot.rs`
+# itself (see that entry). `blocked_by` stays `[]` correctly.
+#
+# 7D-10.1 re-verification: re-read fresh (still 22 lines, matching the
+# 7D-9-sweep count, not this entry's stale 40). Confirmed there is
+# genuinely nothing left to trim: the file is `pub(crate) mod
+# recovery_snapshot;` plus module-doc-comment prose, already at floor.
+# No code change made this pass -- correctly still blocked (structurally,
+# not via a listed `blocked_by` entry) on `recovery_snapshot.rs`'s own
+# larger cross-repository migration, which `phase7d10-elimination-plan.md`
+# §2.4 assigns to daemon's future `ReplicaCoordinator` (7D-10.2/10.3),
+# out of this pass's scope.
+
+[[module]]
+path = "repository/policy_watermark.rs"
+lines = 105
+responsibilities = ["SQLite SQL / row mapping"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9E"
+# First pass: moved verbatim (a plain Arc<SyncDatabase>-backed repository,
+# zero SyncState coupling) to yadorilink_sync_sqlite::policy_watermark,
+# following dirty_path.rs's/handoff_lease.rs's own precedent. PolicyWatermark
+# (the persisted value type) moved with it -- state_model.rs now re-exports
+# it at its old path, same "value type follows its one real repository"
+# shape RestoreOperation's own 7D-9C move already used. index.rs's two thin
+# wrapper methods repointed with `.map_err(SyncError::from)`.
+# crate::repository::policy_watermark deleted. Two commits (add module /
+# repoint+delete), each cargo check --workspace --all-targets clean.
+# sync-sqlite --lib 235/235 unchanged, sync-core --lib 448/448 unchanged
+# (net zero: code moved without moving its one covering test, which lives
+# in index.rs's own test module and stayed there, still passing).
+
+[[module]]
+path = "repository/dirty_path.rs"
+lines = 140
+responsibilities = ["SQLite SQL / row mapping", "root authority"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9C"
+# Moved verbatim (pure local_dirty_paths CRUD, RootCommitPermit-gated writes)
+# to yadorilink-sync-sqlite::dirty_path::DirtyPathRepository, following the
+# same now_unix_nanos-duplication/RootCommitPermit-direct pattern already
+# established by materialization_job_repository.rs. Its DirtyPath value type
+# was already in yadorilink-replica-domain::session_state (no move needed).
+# index.rs's own wrapper methods now map_err(SyncError::from) at the
+# SyncSqliteError->SyncError boundary; behavior unchanged.
+
+[[module]]
+path = "repository/handoff_lease.rs"
+lines = 287
+responsibilities = ["SQLite SQL / row mapping", "pure domain / policy / planning"]
+destinations = ["yadorilink-sync-sqlite", "yadorilink-replica-engine"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# Tenth pass: resolved the ninth pass's own flagged discrepancy (exit report
+# addendum sec. 13.5/13.6) between the eighth pass's closing summary (which
+# claimed this entry was "deliberately-last-sequenced 7D-9E-adjacent" and
+# gated behind 7D-9E/7D-9F) and this entry's own recorded `blocked_by = []`/
+# `removal_phase = "7D-9D"`. The eighth pass's claim was the stale one: this
+# file appears in the `index.rs` 800-line/7D-9E entry's own `blocked_by`
+# list (above), but being named as a BLOCKER for a later-phase entry means
+# it must land NO LATER than that phase, not that it is itself gated by
+# that phase -- the eighth pass read that relationship backwards. Read this
+# file in full: its only "policy" content is a TTL validation guard and a
+# `created_at_unix + ttl_seconds + safety_margin` deadline computation, no
+# different in kind from `retained_obligation.rs`'s already-migrated
+# connection-free judgment split. Grepped every consumer of `HandoffLease`/
+# `HandoffLeaseState`/`PinnedVersion`/`HandoffLeaseRepository` workspace-wide
+# -- every other crate's own `HandoffLease*`-named symbol (sync-wire's wire
+# frames, peer-session's `PeerHandoffLeaseGrant`, daemon's
+# `coordination_client::HandoffLeaseGrant`) is an unrelated, already-distinct
+# type; only `index.rs` itself (the facade) consumed these types. Split:
+# `HANDOFF_LEASE_PIN_SAFETY_MARGIN_SECS`/TTL-validation/deadline arithmetic
+# moved to `yadorilink_replica_engine::handoff_lease::compute_pin_deadline`
+# (new module, unit-tested with no database); the SQL CRUD and the
+# `HandoffLease`/`HandoffLeaseState`/`PinnedVersion` persisted types moved
+# verbatim to `yadorilink_sync_sqlite::handoff_lease`, calling the new
+# replica-engine function instead of inlining the arithmetic.
+# `index.rs`'s wrapper methods repointed at the new crate with
+# `.map_err(SyncError::from)`, matching `dirty_path_repository`'s own
+# established idiom; `crate::repository::handoff_lease` deleted.
+# Three separate commits (replica-engine module / sync-sqlite module /
+# sync-core repoint+delete), each `cargo check --workspace --all-targets`
+# clean. No leakage: neither new module touches `std::fs`/filesystem
+# execution, and `yadorilink-filesystem-sync` was not touched.
+
+[[module]]
+path = "repository/link.rs"
+lines = 840
+responsibilities = ["SQLite SQL / row mapping"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9B"
+# 7D-9B follow-up: this entry was 7D-9A's own inventory guess, never
+# attempted in the six passes 7D-9B actually chartered (see
+# phase7d9b-exit-report.md §4, "Deferred") -- a real gap, not a deliberate
+# defer. Picked up as a standalone follow-up pass. The original
+# `["SQLite SQL / row mapping", "pure domain / policy / planning", "root
+# authority"]`/two-destination classification did not survive a fresh full
+# read: every method is plain rusqlite SQL over `SyncDatabase::read/write/
+# write_immediate`, the same "connection-based orchestration" shape
+# `dirty_path.rs`/`materialization_state.rs` already have as first-class
+# `yadorilink-sync-sqlite` modules -- there is no separable pure-decision
+# layer distinct from the SQL, and nothing in the file names
+# `VerifiedRoot`/`RootCommitPermit`/any other `yadorilink-root-authority`
+# type (`root_token` is a persisted string column, not a root-authority
+# call). `FolderLink`/`LinkGate`/`MaterializationPolicy` already live in
+# `yadorilink-replica-domain`, already a `yadorilink-sync-sqlite`
+# dependency, so the move needed no new crate edge and no port. Moved
+# verbatim to `yadorilink-sync-sqlite::link` (`SyncError` -> the crate's own
+# `SyncSqliteError`, which gained a dedicated `AmbiguousLink` variant first
+# so the round trip through `SyncError` stays lossless, mirroring
+# `6decabc4`'s identical fix for the `RootAuthorityError` bridge).
+# `insert_link_row`/the struct/its constructor widen `pub(crate)` ->
+# `pub`: `yadorilink-sync-core`'s own `repository::enrollment::
+# EnrollmentRepository` calls `insert_link_row` directly on its own
+# already-open transaction, for the same cross-table atomicity reason the
+# original file's own doc comment gave. That call now crosses a crate
+# boundary with a `&rusqlite::Transaction<'_>` parameter -- flagged
+# explicitly rather than silently accepted: `yadorilink-sync-sqlite`'s own
+# `file_index::enumerate_group_durability_roots_on_conn` (pub, taking
+# `&rusqlite::Connection`, called from this same file before the move) is
+# pre-existing precedent for a `yadorilink-sync-core` caller reaching a
+# `yadorilink-sync-sqlite` function with a live connection/transaction it
+# already holds; `yadorilink-sync-core` is not filesystem-sync or
+# replica-engine -- it depends on `rusqlite` directly and is the crate this
+# whole sub-phase is dissolving, not one this rule protects from SQL
+# leakage. No behavior change: the same "check and write in one
+# `BEGIN IMMEDIATE` transaction" atomicity the original file's own doc
+# comment required. Four commits (AmbiguousLink round-trip fix / additive
+# sync-sqlite module / consumer repoint / legacy deletion), each
+# `cargo check --workspace --all-targets` clean. Test counts unchanged at
+# every step: `yadorilink-sync-sqlite --lib` 264 passed, `yadorilink-sync-
+# core --lib` 349 passed (link.rs carried no unit tests of its own; its
+# coverage is exercised through `SyncState`'s unchanged public API in this
+# crate's own `tests/*.rs` integration suite, none of which needed a code
+# change). Forbidden-leakage check: no `std::fs`, no `RootLease`/
+# `RootCommitPermit`, no placeholder-backend code, no path-based mutation
+# decision anywhere in the moved module.
+
+[[module]]
+path = "repository/materialization_state.rs"
+lines = 624
+responsibilities = ["SQLite SQL / row mapping", "pure domain / policy / planning"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9C"
+# `MaterializationStateRepository` (all pure SQL over the `files` table --
+# materialization-state get/set/transition, held state, eviction-candidate
+# queries, block-liveness live-set queries) moved verbatim to
+# yadorilink-sync-sqlite::materialization_state, following dirty_path.rs's
+# own exact precedent. `MaterializationCounts` (a pure value type) moved
+# with it; `crate::state_model::MaterializationCounts` now re-exports it, so
+# no consumer needed a type-path change. `ContentHash`/`HeldState`/
+# `MaterializationState` needed no move -- `ContentHash` is duplicated
+# locally as a plain `String` alias per this workspace's own established
+# "duplicate small leaf types" precedent, `HeldState`/`MaterializationState`
+# were already in yadorilink-replica-domain. `EvictableFile` was already in
+# yadorilink-filesystem-sync (moved in an earlier 7D-9C pass), so this move
+# added a new yadorilink-sync-sqlite -> yadorilink-filesystem-sync Cargo
+# dependency edge -- no cycle risk confirmed (filesystem-sync does not
+# depend back on sync-sqlite). index.rs's ~20 thin wrapper methods over this
+# repository were repointed at the new crate with `.map_err(SyncError::from)`
+# at the boundary, same pattern dirty_path_repository's own wrappers already
+# used. No unit tests existed in the original file (all coverage is
+# integration-level, through index.rs's own wrapper methods), so none moved.
+
+[[module]]
+path = "repository/enrollment.rs"
+lines = 778
+responsibilities = ["SQLite SQL / row mapping", "pure domain / policy / planning", "task lifecycle"]
+destinations = ["yadorilink-sync-sqlite", "yadorilink-daemon"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9F"
+# 7D-9F ninth pass: MIGRATED. The separately-scoped follow-up this entry's
+# own eighth-pass note called for (move `EnrollmentOperation`/
+# `PendingEnrollment`/`EnrollmentKind` and their `*Scan`/`Invalid*` siblings
+# to `yadorilink_replica_domain::session_state`, mirroring the RoleLoss/
+# Membership precedent) landed first, in its own commit -- resolving the
+# real blocker this note flagged. With that done, `EnrollmentRepository`
+# itself moved to `yadorilink-sync-sqlite::enrollment` verbatim: `SyncError`
+# -> `SyncSqliteError` throughout, `pub(crate) fn new` -> `pub fn new`,
+# `crate::repository::read_inventory_operation_id` calls repointed at this
+# crate's own identical copy (already added alongside
+# `role_loss_operation.rs`/`membership_operation.rs`'s own move), and
+# `crate::link::LinkRepository::insert_link_row` calls simplified from the
+# old cross-crate `yadorilink_sync_sqlite::link::...` path to the
+# now-same-crate `crate::link::...` one. `row_to_enrollment_operation`/
+# `row_to_pending_enrollment` bumped `pub(crate)` -> `pub`, same reason and
+# precedent as `row_to_membership_operation`/`row_to_role_loss_operation_strict`'s
+# own bump: `repository/recovery_snapshot.rs`'s `RecoverySnapshotReader`
+# (staying in `yadorilink-sync-core`, genuinely cross-repository) still needs
+# them. `index.rs`'s field/two constructors/accessor repointed at
+# `yadorilink_sync_sqlite::enrollment::EnrollmentRepository`; the one
+# composition method that stays on `SyncState`
+# (`add_link_with_pending_enrollment_for_test`) gained one
+# `.map_err(SyncError::from)` to preserve its exact prior return type, same
+# pattern every earlier repository-relocation pass used at its own
+# composition-method boundary.
+# 7D-9F eighth pass: the `recovery.rs`/`repository/mod.rs`
+# `InvalidRecoveryOperation`/`RecoveryDomain`/`InventoryScanResult` blocker
+# this entry (and `role_loss_operation.rs`/`membership_operation.rs` below)
+# shared is resolved -- those three types moved to
+# `yadorilink_replica_domain::recovery` (re-exported at their old paths, so
+# every existing `crate::recovery::*`/`crate::state_model::InventoryScanResult`
+# reference keeps resolving unchanged), unblocking
+# `role_loss_operation.rs`/`membership_operation.rs`/`change_history.rs`,
+# which all three moved to `yadorilink-sync-sqlite` this same pass (see their
+# own entries). `enrollment.rs` itself did NOT move: dropped from
+# `blocked_by` and re-verified as still `pending` because it has a SEPARATE,
+# still-real blocker the other two shared this file's own coupling with --
+# its value types (`EnrollmentOperation`/`PendingEnrollment`/
+# `EnrollmentOperationState`/etc., `crates/yadorilink-sync-core/src/
+# state_model.rs`) and `EnrollmentKind`
+# (`crates/yadorilink-sync-core/src/types.rs`) still live in
+# `yadorilink-sync-core` itself, unlike `RoleLossOperation`/
+# `MembershipOperation`'s own value types, which already lived in
+# `yadorilink_replica_domain::session_state` before this pass (moved there in
+# 7D-9E's third pass) -- the real, structural difference between why those
+# two clusters were mechanically movable this pass and this one is not.
+# `types.rs`'s own doc comment records a DELIBERATE prior design decision to
+# keep `EnrollmentKind` in `yadorilink-sync-core` ("tightly coupled to this
+# crate's own DB string representation, not part of the pure replica domain
+# model, and not needed by `PeerReplicaStatePort`"), unlike
+# `RoleLossAction`/`MembershipOperationAction` (identically DB-string-coupled
+# enums that did move) -- moving it now would deliberately reverse that
+# documented decision, which this pass judged out of scope for a mechanical
+# repository relocation: it is a real, separately-scoped follow-up (move
+# `EnrollmentOperation`/`PendingEnrollment`/`EnrollmentKind` and their own
+# `*Scan`/`Invalid*` siblings to `yadorilink_replica_domain::session_state`,
+# mirroring the RoleLoss/Membership precedent exactly), not a stop condition
+# and not blocked by anything architectural -- just not attempted this pass.
+# 7D-9B follow-up: `repository/link.rs` dropped from `blocked_by` -- it
+# migrated to `yadorilink-sync-sqlite::link` this pass (see that entry's own
+# note); this entry's two cross-table atomic methods
+# (`add_link_with_pending_enrollment[_and_begin_setup]`) already repointed
+# at `yadorilink_sync_sqlite::link::LinkRepository::insert_link_row`
+# directly. Now unblocked -- flagged for whichever 7D-9E pass picks this
+# entry up next; not attempted itself here (out of this pass's own
+# chartered scope, which was `repository/link.rs` alone).
+#
+# 7D-9E sixth pass: the `blocked_by = []` left by the follow-up above did
+# not survive a fresh read -- corrected, not merely re-stated. Read the
+# whole file: every method is genuinely 100% SQL/row-mapping (confirming
+# the "pure domain / policy / planning" tag is stale, matching this
+# initiative's own recurring "responsibility tag drifted from the file"
+# finding), but the file has two real structural dependencies still inside
+# `yadorilink-sync-core` that block a move to `yadorilink-sync-sqlite`
+# today: (1) `crate::repository::read_inventory_operation_id`
+# (`repository/mod.rs`, a `pub(crate)` helper with zero domain coupling of
+# its own -- purely `rusqlite::Row` TEXT-affinity decoding -- but itself
+# tagged `removal_phase = "7D-9F"`, out of this sub-phase's own charter);
+# (2) `scan_all_enrollment_operations` constructs
+# `crate::recovery::InvalidRecoveryOperation { domain:
+# crate::recovery::RecoveryDomain::Enrollment, .. }` directly, AND its
+# return type `InventoryScanResult<EnrollmentOperation>`
+# (`state_model.rs`) is itself hardcoded to
+# `invalid: Vec<crate::recovery::InvalidRecoveryOperation>` -- not merely
+# a generic-over-error-type wrapper, so this coupling cannot be designed
+# away by picking a different destination for the value type alone.
+# `recovery.rs` is still `pending`, itself blocked on `index.rs`/`types.rs`
+# (7D-9F-adjacent). `yadorilink-sync-sqlite`'s only dependency on
+# `yadorilink-sync-core` is a dev-dependency (test fixtures only, see that
+# crate's own `Cargo.toml` comment) -- moving this file's production code
+# into `yadorilink-sync-sqlite` while it still needs
+# `crate::recovery::{InvalidRecoveryOperation, RecoveryDomain}` from
+# sync-core would require sync-sqlite to gain a real, non-dev dependency
+# back on sync-core, a genuine cycle (sync-core already depends on
+# sync-sqlite in the production direction). This is the identical shape of
+# finding this sub-phase's first pass made for `sync_runtime/*` and its
+# third pass made for `state_model.rs`'s own Enrollment* remainder -- not
+# a stop condition (nothing here requires a product-meaning decision, and
+# the cycle is resolvable in the ordinary way, by `recovery.rs`/
+# `repository/mod.rs` migrating first), just not tractable in this pass.
+# The identical `crate::recovery::{InvalidRecoveryOperation, RecoveryDomain}`
+# coupling was found, freshly, in `repository/membership_operation.rs` and
+# `repository/role_loss_operation.rs` too (see their own entries below) --
+# their `blocked_by` lists previously named only `repository/mod.rs`,
+# missing this second, equally-real blocker; corrected there as well.
+
+[[module]]
+path = "repository/change_history.rs"
+lines = 460
+responsibilities = ["SQLite SQL / row mapping", "temporary facade / delegation"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9F"
+# 7D-9F eighth pass: moved verbatim to `yadorilink_sync_sqlite::
+# change_history` -- this file never had any real `yadorilink-sync-core`-only
+# coupling (it already called into this crate's own `dag_store` free
+# functions and depended on nothing but `yadorilink-replica-domain` value
+# types), so the move is a pure location change plus a `SyncError` ->
+# `SyncSqliteError` return-type swap; `index.rs`'s `change_history_repository`
+# field/accessor/two constructors repointed to
+# `yadorilink_sync_sqlite::ChangeHistoryRepository`, and its two remaining
+# composition methods on `SyncState` (`append_initial_import`/
+# `append_history_backfill`, which resolve `local_emission_auth` before
+# delegating) each gained one `.map_err(SyncError::from)`. `cargo check
+# --workspace --all-targets` clean; `sync-sqlite --lib` 264/264, `sync-core
+# --lib` 349/349, both unchanged (net zero, no test moved).
+
+[[module]]
+path = "repository/membership_operation.rs"
+lines = 443
+responsibilities = ["SQLite SQL / row mapping", "pure domain / policy / planning"]
+destinations = ["yadorilink-sync-sqlite", "yadorilink-daemon"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9E"
+# 7D-9E sixth pass: `recovery.rs` added to `blocked_by`, found while
+# verifying `repository/enrollment.rs` (see that entry's own note for the
+# full reasoning). `scan_open_membership_operations`' inventory-scan sibling
+# constructs `crate::recovery::InvalidRecoveryOperation` directly and
+# returns `InventoryScanResult<MembershipOperation>` (`state_model.rs`),
+# itself hardcoded to `crate::recovery::InvalidRecoveryOperation` -- the
+# same real blocker as `repository/enrollment.rs`, previously undetected
+# here.
+#
+# 7D-9F eighth pass: unblocked and moved. Its own value types
+# (`MembershipOperation`/`MembershipOperationState`/etc.) already lived in
+# `yadorilink_replica_domain::session_state` since 7D-9E's third pass -- the
+# `InvalidRecoveryOperation`/`RecoveryDomain` coupling above was the ONLY
+# real blocker, resolved this pass by relocating those two types (plus
+# `InventoryScanResult<T>`) to `yadorilink_replica_domain::recovery`.
+# `read_inventory_operation_id` duplicated as a `pub(crate)` copy at
+# `yadorilink-sync-sqlite`'s own crate root (a five-line pure `rusqlite::Row`
+# decoder -- not worth a shared-crate relocation for its own sake).
+# `row_to_membership_operation` bumped `pub(crate)` -> `pub`: a real,
+# legitimate cross-crate need, since `repository/recovery_snapshot.rs`
+# (staying in `yadorilink-sync-core`, genuinely cross-repository/cross-crate
+# per its own doc comment) decodes a `membership_operations` row itself
+# inside its own single-transaction snapshot read and must reuse the exact
+# same decoder rather than duplicate its shape-validation rules.
+# `index.rs`'s `membership_operation_repository` field/accessor/two
+# constructors repointed to `yadorilink_sync_sqlite::
+# MembershipOperationRepository`; its one remaining test-only forward
+# (`plant_malformed_membership_operation_for_test`) gained
+# `.map_err(SyncError::from)`; one real production call site
+# (`yadorilink-daemon/src/adapters/persistence/membership.rs`'s
+# `scan_open_operations`) needed the same. `cargo check --workspace
+# --all-targets` clean; `sync-sqlite --lib` 264/264, `sync-core --lib`
+# 349/349, `daemon --lib` 630/1-pre-existing-flake, all unchanged (net zero,
+# no test moved).
+
+[[module]]
+path = "repository/recovery_snapshot.rs"
+lines = 373
+responsibilities = ["SQLite SQL / row mapping"]
+destinations = ["yadorilink-daemon"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-10"
+# 2026-08-06: relocated whole to `yadorilink-daemon/src/recovery_snapshot.rs`,
+# per `phase7d10-elimination-plan.md` §2.4's own pre-made decision
+# (`RecoverySnapshotReader` becomes `ReplicaCoordinator`-owned, "for the
+# identical reason: nothing outside yadorilink-daemon calls it"). Smaller
+# than it looked: `ReplicaCoordinator` already held its own field of this
+# type and exposed `recovery_snapshot_reader()` (since 7D-10.2), so this
+# pass moved only the type DEFINITION to catch up with an accessor that
+# already worked -- `replica_coordinator.rs`'s `use` line repointed from
+# `yadorilink_sync_core::repository::recovery_snapshot::RecoverySnapshotReader`
+# to `crate::recovery_snapshot::RecoverySnapshotReader`, no other code
+# change needed there. Re-verified this pass's own task brief: the earlier
+# "confirmed test-only in production" claim about `SyncState`'s
+# `recovery_snapshot_reader()` accessor (`control_socket.rs`) still holds --
+# a fresh grep found that exact call site is inside
+# `#[cfg(test)] mod recovery_crash_tests`, nested inside
+# `#[cfg(test)] mod migration_safety_tests`. `SyncState`'s own field/
+# constructors/accessor for this type (`index.rs`) were removed, along with
+# `index.rs`'s ~24-test suite exercising `recovery_local_snapshot` -- moved
+# verbatim into this file's own `#[cfg(test)] mod tests`, fixtures retyped
+# from `SyncState` to `ReplicaCoordinator`. Sole destination is now
+# `yadorilink-daemon`, not the two-way `yadorilink-sync-sqlite`/
+# `yadorilink-daemon` split an earlier pass's `destinations` speculated:
+# this type stays a single cross-repository composition over four
+# `yadorilink-sync-sqlite` repositories' tables, reading through
+# `Arc<SyncDatabase>` directly (`unchecked_transaction`) rather than
+# through any one repository -- moving it INTO `yadorilink-sync-sqlite`
+# was never attempted or required once daemon-ownership was confirmed as
+# the real answer.
+# 7D-9F eighth pass: dropped `repository/membership_operation.rs`/
+# `repository/role_loss_operation.rs` from `blocked_by` -- both migrated to
+# `yadorilink-sync-sqlite` this pass, and this file's own
+# `snapshot_membership_in_tx`/`snapshot_role_loss_in_tx` were repointed to
+# call `yadorilink_sync_sqlite::{membership_operation,
+# role_loss_operation}::row_to_*` directly (both bumped `pub` for this real
+# cross-crate need). `repository/enrollment.rs` stays in `blocked_by`: this
+# file itself is genuinely cross-repository/cross-crate by design (see its
+# own module doc comment -- one `Deferred` transaction spanning `links`,
+# `pending_enrollments`, `enrollment_operations`, `membership_operations`,
+# `role_loss_operations`, and `durability_unknown_latches` depending on the
+# key's domain), not itself a migration candidate to `yadorilink-sync-sqlite`
+# until `enrollment.rs` moves too (its `snapshot_enrollment_in_tx` still
+# calls `crate::repository::enrollment::{row_to_enrollment_operation,
+# row_to_pending_enrollment}`, unchanged this pass).
+#
+# 7D-9F ninth pass: dropped `repository/enrollment.rs` from `blocked_by` --
+# it migrated to `yadorilink-sync-sqlite::enrollment` this pass (see that
+# entry's own note), and this file's `snapshot_enrollment_in_tx` was
+# repointed to call `yadorilink_sync_sqlite::enrollment::{row_to_enrollment_operation,
+# row_to_pending_enrollment}` directly (both already `pub` from that same
+# move, for this exact cross-crate need). `blocked_by` is now empty, but
+# `status` stays `pending`, not `migrated`: this file itself is STILL
+# genuinely cross-repository/cross-crate by design -- one `Deferred`
+# transaction spanning tables now owned by four different
+# `yadorilink-sync-sqlite` repositories (`link`, `enrollment`,
+# `membership_operation`, `role_loss_operation`) plus its own
+# `durability_unknown_latches` read. Moving `RecoverySnapshotReader` itself
+# to `yadorilink-sync-sqlite` is a real, separately-scoped question (does a
+# single-consistent-read type belong inside the crate whose repositories it
+# spans, or does it stay a `yadorilink-sync-core`-side composition over
+# them?) -- not attempted this pass, and not blocked by any of the four
+# repository moves individually; every prerequisite this ledger tracked for
+# it is now satisfied.
+#
+# 7D-9-sweep: re-verified all four listed prerequisites remain migrated
+# and no new blocker appeared. Per `phase7d9-dependency-plan.md`'s own
+# general placement rule ("SQL -> yadorilink-sync-sqlite"), the answer to
+# the "real, separately-scoped question" above already leans toward
+# `yadorilink-sync-sqlite` -- this is a genuinely tractable, unblocked
+# migration, just not yet attempted (a real caller-repointing/behavior-
+# preservation effort in its own right, not a product-meaning decision).
+# Flagged as the most promising candidate for a dedicated future pass;
+# not attempted in this sweep to keep this pass's own scope bounded to
+# what it could fully verify end-to-end.
+
+[[module]]
+path = "repository/restore_operation.rs"
+lines = 322
+responsibilities = ["SQLite SQL / row mapping"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9E"
+# First pass: re-verified the inherited "pure domain / policy / planning" +
+# yadorilink-daemon responsibility/destination tag against the actual file
+# and found it stale -- the file is 100% SQL-backed repository code (two
+# cross-cluster atomic operations that also touch files/DAG state in the
+# same transaction, same shape as handoff_lease.rs's own atomic pin), zero
+# daemon-orchestration content, zero SyncState coupling. Moved verbatim to
+# yadorilink_sync_sqlite::restore_operation. RestoreOperation/
+# RestoreCommitOutcome/RestoreOperationState already lived in
+# yadorilink_filesystem_sync::materialization_types since 7D-9C, so this
+# move only relocated the SQL half; LocalFileMetaColumns imported directly
+# from yadorilink_replica_domain::session_state instead of through
+# state_model's re-export. index.rs's six thin wrapper methods repointed
+# with `.map_err(SyncError::from)`; crate::repository::restore_operation
+# deleted. Two commits (add module / repoint+delete), each
+# cargo check --workspace --all-targets clean. sync-sqlite --lib 235/235
+# unchanged, sync-core --lib 448/448 unchanged (net zero, no test moved).
+
+[[module]]
+path = "repository/role_loss_operation.rs"
+lines = 356
+responsibilities = ["SQLite SQL / row mapping", "pure domain / policy / planning"]
+destinations = ["yadorilink-sync-sqlite", "yadorilink-daemon"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9E"
+# 7D-9E sixth pass: `recovery.rs` added to `blocked_by`, found while
+# verifying `repository/enrollment.rs` (see that entry's own note for the
+# full reasoning). `scan_open_role_loss_operations`' inventory-scan sibling
+# constructs `crate::recovery::InvalidRecoveryOperation` directly and
+# returns `InventoryScanResult<RoleLossOperation>` (`state_model.rs`),
+# itself hardcoded to `crate::recovery::InvalidRecoveryOperation` -- the
+# same real blocker as `repository/enrollment.rs`, previously undetected
+# here.
+#
+# 7D-9F eighth pass: unblocked and moved, same shape as
+# `repository/membership_operation.rs`'s own note above -- its value types
+# already lived in `yadorilink_replica_domain::session_state`, the
+# `InvalidRecoveryOperation`/`RecoveryDomain` coupling was the only real
+# blocker, resolved by this pass's relocation of those types. `index.rs`'s
+# `role_loss_operation_repository` field/accessor/two constructors repointed
+# to `yadorilink_sync_sqlite::RoleLossOperationRepository`; its one
+# remaining test-only forward (`plant_malformed_role_loss_operation_for_test`)
+# gained `.map_err(SyncError::from)`; no other production call site needed a
+# fix (every real daemon caller already went through the accessor and
+# propagates via `?` into a `SyncError`-returning function, which
+# auto-converts). `row_to_role_loss_operation_strict` bumped `pub(crate)` ->
+# `pub` for the same `repository/recovery_snapshot.rs` reason as
+# `row_to_membership_operation` above. `cargo check --workspace
+# --all-targets` clean; `sync-sqlite --lib` 264/264, `sync-core --lib`
+# 349/349, `daemon --lib` 630/1-pre-existing-flake, all unchanged.
+
+# ---------------------------------------------------------------------------
+# The 7 large, never-individually-surveyed modules flagged by the phase7d8
+# exit report.
+# ---------------------------------------------------------------------------
+
+[[module]]
+path = "orchestrator.rs"
+lines = 4179
+responsibilities = ["daemon orchestration", "task lifecycle"]
+destinations = ["yadorilink-daemon"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9E"
+# Fourth pass: moved together with `commit_path_locks.rs` and `plan_driver.rs`
+# as one atomic three-file group, confirming the third pass's own
+# characterization (commit_path_locks.rs's only caller is this file; this
+# file is plan_driver.rs's only caller; plan_driver.rs cannot stay behind once
+# this file leaves sync-core without sync-core depending back on
+# yadorilink-daemon). New home: `yadorilink-daemon::commit_orchestration::
+# orchestrator`, `pub(crate)` -- mirroring the existing `link_runtime.rs` +
+# `link_runtime/` convention, and unreachable from outside the daemon crate,
+# so `run_slice`'s `&mut rusqlite::Connection` parameter never crosses a
+# crate boundary. Confirmed before moving that this file (like the other two)
+# had zero real callers anywhere in the workspace outside its own tests --
+# `pub mod orchestrator` was reachable in principle from any crate but never
+# referenced by one. The move does not wire a real caller; that remains
+# future work, matching this file's own doc comment ("must move to
+# daemon/src/application after all of them have a stable home outside
+# sync-core") without claiming more than the doc comment itself does. All 20
+# of this file's own tests pass unchanged at the new location.
+
+[[module]]
+path = "early_physical_recovery.rs"
+lines = 4057
+responsibilities = ["SQLite SQL / row mapping", "filesystem execution"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9E"
+# Third pass: the original three-way replica-engine/sync-sqlite/daemon split
+# (2000/1000/1056 lines respectively, across the three entries this single
+# entry replaces) never matched the file's actual shape -- confirmed by
+# reading it in full. `run()` is one synchronous, `&Connection`-driven sweep
+# whose SQL reads/writes, physical-observation decisions and one filesystem
+# mutation (`cleanup_unstarted_artefact`, via `yadorilink_filesystem_sync::
+# fs_commit::ParentDirHandle`) are woven through a single control-flow
+# function by function -- there is no clean gather/decide/execute seam to
+# split on without rewriting the crash-recovery logic itself. It has zero
+# daemon-specific content (no async, no signing/policy provider -- enforced
+# by the module's own "run takes only a &Connection" design constraint), so
+# `yadorilink-daemon` was never a real destination for any portion of it.
+# Its two real dependencies beyond this crate's own SQL
+# (`yadorilink_root_authority`, `yadorilink_filesystem_sync::fs_commit::
+# ParentDirHandle`) are already production dependencies of
+# `yadorilink-sync-sqlite`, making that crate the correct common-ancestor
+# destination for the whole module -- the same category of genuinely-wrong
+# routing classification `sync_runtime/*`, `debounce.rs`, and
+# `work_class_queue.rs` were each found to carry in earlier passes, resolved
+# here as a full migration rather than a blocker correction. Moved verbatim
+# (all 30 tests, one Windows-only) in `948f3510`/`c826a070`. As of this
+# move, `run()` still has zero production callers anywhere in the
+# workspace (only `orchestrator.rs`'s own test exercises it) -- wiring the
+# real daemon-startup call site remains a genuinely open gap the module's
+# own doc comment already flagged, not something this move changes or
+# closes.
+
+[[module]]
+path = "optimistic_placement.rs"
+lines = 0
+responsibilities = ["filesystem execution"]
+destinations = ["yadorilink-filesystem-sync"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# 7D-9D first pass: `blocked_by = ["fs_commit.rs"]` was stale --
+# fs_commit.rs was already moved to yadorilink-root-authority in 7D-9B
+# and no longer exists in sync-core. This entry is genuinely unblocked
+# now, but not attempted this pass: `optimistic_placement.rs` is 4,018
+# total lines across its two ledger entries (this one plus the
+# filesystem/SQLite entry below), correctness-critical placement-decision
+# code, and the file itself needs a fresh full read to confirm the actual
+# current pure/impure line split before any move -- left for a dedicated
+# future pass per this sub-phase's own risk-ordering discipline (smallest/
+# cleanest splits first).
+# `prepare_target`'s fast-path selection/ranking logic -- target shape:
+# choose_placement(snapshot, policy) -> PlacementDecision, with every DB/
+# clock/network/fs-probe read snapshotted before the call, per 9D's rule.
+#
+# 7D-9D fifth pass: line estimate reduced from 2,500 to ~2,460 -- the one
+# genuinely pure, self-contained slice this pass found on a real read
+# (`select_fast_path` and its own types) has its own entry now, below.
+# What remains here: `prepare_target`/`prepare_target_unchecked`'s actual
+# staging logic (open/copy/reflink/hardlink the bytes, verify content
+# hash, apply metadata, fsync) and everything in
+# `execute_short_commit_window_core` (353 lines, the file's largest
+# function) -- both are staged/committed I/O interleaved with the
+# decisions about *how* to do that I/O in the same function bodies, the
+# same "read-then-decide-then-write" shape this sub-phase's task brief
+# treats as legitimate to leave pending rather than force apart. Not
+# attempted this pass; still the strongest remaining candidate in this
+# file for a future pass to read in full.
+#
+# 7D-9D eighth pass: migrated, and this entry's `responsibilities`/
+# `destinations` corrected. A full read (not a repeat of the fifth pass's
+# reconnaissance) found this was never really "pure domain / policy /
+# planning" -> `yadorilink-replica-engine" -- it is real filesystem I/O
+# (ioctl `FICLONE`, `clonefile(2)`, `copy_file_range`, `hard_link`, content
+# hashing, exec-bit application, durability flush) with no `Connection`/SQL
+# anywhere in it, i.e. exactly `yadorilink-filesystem-sync`'s charter, not
+# replica-engine's. `prepare_target`/`prepare_target_unchecked` (collapsed
+# into one ungated `prepare_target`, mirroring `custody_transfer.rs`'s own
+# earlier collapse -- its one real caller, `orchestrator.rs`, already
+# checks `filesystem_transaction::require_execution_enabled` once at its
+# own entry point) plus every helper it calls (`finish_staged_file`,
+# `finish_hardlinked_stage`, three platform `clone_whole_file` variants,
+# `copy_into`, two `range_clone_whole_file` variants,
+# `hardlink_immutable_source`) and `PreparationCounters`/`PreparedArtifact`/
+# `PrepareRequest`/`PrepareError` moved to `yadorilink-filesystem-sync::
+# optimistic_placement` as one mechanical unit, alongside the
+# `durable_flush`/`durable_flush_directory`/`retry_eintr`/
+# `retry_eintr_syscall` syscall-retry helpers shared with the commit window
+# (still `pub fn durable_flush_directory`, called back from sync-core's
+# `execute_short_commit_window_core`, an existing dependency edge). Its 9
+# tests moved verbatim; the one gate-refusal test
+# (`prepare_target_is_refused_while_execution_is_disabled`) was dropped
+# with the collapsed gate, same reasoning as `custody_transfer.rs`'s own
+# dropped gate test -- the gate is still enforced one layer up, unchanged.
+# `PrepareError::Sync(SyncError)` could not move as-is (filesystem-sync
+# must not depend on sync-core); replaced with direct `InvalidInput(String)`/
+# `ReservedNamespaceCollision(String)`/`Storage(yadorilink_local_storage::
+# StorageError)` variants -- no caller outside this file matched on
+# `PrepareError::Sync` specifically (verified by workspace grep), so no
+# other crate needed a change beyond the two import/call-site repoints in
+# `orchestrator.rs`/`plan_driver.rs`. See the exit report's eighth-pass
+# addendum for the full account.
+
+[[module]]
+path = "optimistic_placement.rs"
+lines = 40
+responsibilities = ["pure domain / policy / planning"]
+destinations = ["yadorilink-replica-engine"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# 7D-9D fifth pass: `select_fast_path` -- already labeled "pure -- no I/O"
+# in its own pre-existing section-header comment and doc comment, and
+# confirmed genuinely `Connection`/`std::fs`-free on a close read -- moved
+# verbatim to `yadorilink-replica-engine::optimistic_placement`, along
+# with `FastPath`/`FastPathRejection`/`FastPathDecision`/`CloneSource`/
+# `PlacementInputs` (every type its signature touches) and its own 9
+# decision-table unit tests. `CloneSource::path` (used by
+# `prepare_target_unchecked`'s real staging code, which stayed in
+# sync-core) went from private to `pub` for the cross-crate call.
+# `yadorilink-replica-engine` gained a new dependency on
+# `yadorilink-root-authority` for `PlacementInputs.capabilities:
+# &FilesystemSafetyCapabilities` -- no cycle, since
+# `yadorilink-root-authority` itself depends on nothing but
+# `yadorilink-replica-domain`. `orchestrator.rs`'s own
+# `PlacementInputs`/`CloneSource` imports repointed to the new home. See
+# `docs/design/phase7d9d-exit-report.md`'s fifth-pass addendum.
+
+[[module]]
+path = "optimistic_placement.rs"
+lines = 0
+responsibilities = ["filesystem execution", "SQLite SQL / row mapping"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# 7D-9D first pass: `blocked_by = ["fs_commit.rs", "chunker.rs"]` was
+# stale -- both were already moved out of sync-core (fs_commit.rs to
+# yadorilink-root-authority in 7D-9B, chunker.rs to yadorilink-local-
+# storage in 7D-8.1) and neither exists in sync-core anymore. Genuinely
+# unblocked now; not attempted this pass for the same reason as the
+# sibling pure-decision entry above.
+# `execute_short_commit_window`: the one atomic platform exchange plus its
+# one-transaction SQLite publish.
+#
+# 7D-9D eighth pass (§12.7 of the exit report): read fresh and left pending
+# on the finding that the claim/commit/publish sequence is "genuinely
+# I/O-interleaved with a SQL transaction by design", the correctness
+# property the whole module exists to provide -- splitting it would either
+# break that transactional unity or introduce a cross-crate call sequence a
+# crash could interleave.
+#
+# 7D-9D ninth pass: migrated whole, and the destination corrected from
+# `["yadorilink-filesystem-sync", "yadorilink-sync-sqlite"]` to
+# `["yadorilink-sync-sqlite"]` alone. A fresh, close read of
+# `execute_short_commit_window_core` confirmed the eighth pass's
+# "I/O-interleaved with a SQL transaction" observation but found it had
+# been read as ruling out a move it does not actually rule out: the
+# function never holds one `rusqlite::Transaction` open across the
+# adapter's filesystem call. Its own "Defect 1" comment explains why not --
+# the `Committing` transaction is deliberately committed *before* the
+# adapter runs, specifically to avoid holding SQLite's single writer lock
+# for however long an unbounded platform exchange/rename syscall takes. The
+# actual shape is SQL transaction, then real I/O (the adapter call, then a
+# durability flush), then a second SQL transaction -- sequential, not
+# nested -- and every type that sequence touches
+# (`filesystem_transaction`, `materialized_generation`,
+# `FilesystemCommitAdapter`, `durable_flush_directory`) was already
+# reachable from `yadorilink-sync-sqlite`, which has depended on
+# `yadorilink-filesystem-sync` since the eighth pass's own move of
+# preparation there. So this needed neither a port (the
+# `MaterializationExecutionPort`/`RootVerificationStatePort` shape) nor a
+# split: the whole orchestrating function simply moved to the one crate
+# that already depends on both halves it coordinates. `yadorilink-
+# filesystem-sync` is dropped from `destinations` because nothing new
+# moved there -- every real-I/O primitive this module calls (the adapter
+# trait, `durable_flush_directory`) already lived there before this pass.
+# `CommitWindowError::Sync`'s payload became `yadorilink_sync_sqlite::
+# SyncSqliteError` (was this crate's own `SyncError`) at the one
+# crate-boundary seam that changed; `execute_short_commit_window_
+# unchecked_keeping_reservations` went from `pub(crate)` to `pub` since its
+# one real caller, `orchestrator.rs`, stayed in `yadorilink-sync-core` and
+# now reaches it cross-crate. Renamed `commit_window.rs` in its new home --
+# "optimistic_placement" (a name about *which* fast path to use) no longer
+# described this file's content at all once preparation moved out in the
+# eighth pass; three crates (`yadorilink-replica-engine`,
+# `yadorilink-filesystem-sync`, and until this pass `yadorilink-sync-core`)
+# each having their own same-named-but-unrelated `optimistic_placement.rs`
+# was also a standing source of doc-comment ambiguity this rename removes
+# for this one. All 16 of its own tests moved verbatim
+# (`cargo test -p yadorilink-sync-sqlite --lib` went from 219 to 235; `-p
+# yadorilink-sync-core --lib` went from 464 to 448, exact arithmetic
+# match). See the exit report's ninth-pass addendum for the full account.
+
+[[module]]
+path = "materialization.rs"
+lines = 70
+responsibilities = ["temporary facade / delegation", "filesystem execution"]
+destinations = ["yadorilink-local-storage"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9C"
+# check_disk_headroom/disk_content_comparison/disk_bytes_match_indexed_blocks
+# deleted (they were already thin Ok(yadorilink_local_storage::...(...)?)
+# wrappers, per 7D-8's finding). Internal call sites now call the real
+# yadorilink_local_storage functions directly via a plain `use`, relying on
+# the same existing `From<StorageError> for SyncError` impl the wrappers
+# used internally -- production behavior unchanged. The one external
+# consumer (disk_bytes_match_indexed_blocks, from yadorilink-daemon's
+# hydration.rs) repointed at yadorilink_local_storage directly.
+# disk_content_comparison/disk_bytes_match_indexed_blocks/check_disk_headroom/
+# intent_target_hash -- already thin Ok(yadorilink_local_storage::...(...)?)
+# wrappers per the 7D-6 move; just needs its callers redirected and the
+# wrapper deleted.
+
+[[module]]
+path = "materialization.rs"
+lines = 90
+responsibilities = ["filesystem execution"]
+destinations = ["yadorilink-filesystem-sync"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9C"
+# cleanup_stale_temp_files/walk_and_remove_stale_temp_files/
+# is_own_stale_temp_file_name/is_ascii_digits -- real filesystem execution
+# with zero index/SQL/state dependency (no SyncState, no
+# MaterializationStatePort, no rusqlite), moved verbatim to
+# yadorilink_filesystem_sync::stale_temp_files. Every real consumer
+# (yadorilink-daemon's app.rs/link_runtime/factory.rs, and sync-core's own
+# integration tests) repointed at the new path directly; the materialization.rs
+# re-export shim used during the move is deleted.
+
+[[module]]
+path = "materialization.rs"
+lines = 470
+responsibilities = ["filesystem execution"]
+destinations = ["yadorilink-filesystem-sync"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9C"
+# evict_file/run_eviction_sweep/run_disk_pressure_eviction_sweep/
+# refresh_missing_last_accessed/MaterializationContext/EvictionOutcome/
+# disk_identity moved verbatim to
+# yadorilink_filesystem_sync::materialization_eviction, now consuming the
+# new narrower MaterializationExecutionPort (see
+# ports/materialization_execution_impl.rs's own entry) instead of this
+# crate's wider MaterializationStatePort. materialization.rs re-exports
+# every pub item here at its original path, so no consumer (yadorilink-daemon's
+# gc.rs/hydration.rs, tests/peer_session.rs) needed repointing. See
+# docs/design/phase7d9c-exit-report.md's fourth-pass addendum for the full
+# port-design rationale and the reclaim_cached_blocks/OpenMaterializationIntent
+# structural-blocker resolutions that unblocked this move.
+
+[[module]]
+path = "materialization.rs"
+lines = 630
+responsibilities = ["filesystem execution"]
+destinations = ["yadorilink-filesystem-sync"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9C"
+# repair_interrupted_materializations[_emitting_deletes]/_inner/
+# reconstruct_file_journaled/reconcile_restore_operations/
+# quarantine_dirty_disk_file/MaterializationRepairReport/RestoreRecoveryReport
+# moved verbatim to yadorilink_filesystem_sync::materialization_repair (sixth
+# pass), now consuming MaterializationExecutionPort -- a method-by-method
+# audit (per the fifth pass's own exit-report addendum, phase7d9c-exit-
+# report.md's Sec 11.5) found the port already covered every state/index
+# call this group makes, so no port extension was needed, only the module
+# split itself. materialization.rs re-exports every pub item here at its
+# original path, so no consumer needed repointing except yadorilink-daemon's
+# repair_materialization.rs, whose own Result<_, SyncError> return type
+# needed one .map_err(SyncError::from) at the new
+# MaterializationExecutionError boundary (same pattern hydration.rs::evict
+# already used for evict_file's own error-type change).
+
+[[module]]
+path = "materialization.rs"
+lines = 100
+responsibilities = ["filesystem execution"]
+destinations = ["yadorilink-sync-core"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9C"
+# MaterializationIntentGuard<'a> (the struct itself, `open`/`clear`, and
+# both OpenMaterializationIntent marker-trait impls) stays in sync-core --
+# it borrows a concrete &'a SyncState, the same reason
+# open_materialization_intent_guard is a narrow delegate on
+# MaterializationExecutionPort rather than a trait-object constructor (see
+# materialization_execution.rs's own doc comment). "Migrated" here means
+# this residual is settled at its final, permanent home, not that it moved
+# crates: everything that CONSUMES a guard (the repair group above, the live
+# peer materialize path) now only ever sees it through the opaque
+# Box<dyn OpenMaterializationIntent> a port method returns, never this
+# concrete type directly. materialization.rs itself is not deleted because
+# this struct's own doc comment requires it stay a concrete &SyncState
+# borrow; the file is now the guard's definition plus re-export shims plus
+# its own #[cfg(test)] module (~2,000 lines, covering both this group and
+# evict_file's own group via the re-exports), not a "thin husk" the task
+# brief's deletion criterion is aimed at.
+#
+# 2026-08-06 update: the note above predates the guard's own genericization
+# (`MaterializationIntentGuard<'a, T: MaterializationIntentJournal>`, a
+# later pass) -- `ReplicaCoordinator` has used a generic instantiation since
+# then. That still left the three foreign OpenMaterializationIntent
+# marker-trait impls only writable in a crate that both owns the guard type
+# locally AND depends on all three of yadorilink-peer-session/
+# -filesystem-sync/-sync-sqlite -- re-investigated this pass (Task B) and
+# confirmed no crate below yadorilink-daemon satisfies both (hoisting the
+# guard to yadorilink-replica-domain would require that crate to depend
+# upward on all three consumer crates, inverting the exact dependency order
+# the 7D-9D hoist relies on; yadorilink-peer-session already depends on
+# yadorilink-sync-sqlite, ruling that crate out too). Applied the same
+# "temporary coexistence" duplication as `sync_runtime/*` immediately
+# above: `crates/yadorilink-daemon/src/materialization_intent.rs` now holds
+# an independent `MaterializationIntentGuard`/`MaterializationIntentJournal`
+# plus its own three marker-trait impls (legal under the orphan rule the
+# same way sync-core's original copy is: type local, traits foreign, every
+# dependency edge already exists since yadorilink-daemon is the composition
+# root). `ReplicaCoordinator`'s three production call sites
+# (materialization_execution.rs, materialization_state.rs,
+# peer_replica_state.rs) and its `MaterializationIntentJournal` impl now use
+# this daemon-owned copy instead. This crate's (`yadorilink-sync-core`'s)
+# copy is unchanged -- `SyncState` is the sole remaining implementor here
+# and has no production callers workspace-wide, so it is exercised only by
+# this crate's own test suite and disappears with the crate; status stays
+# "migrated" for the same "settled at its final, permanent home" reasoning
+# as before, now with a second, independent permanent home in
+# yadorilink-daemon as well.
+
+[[module]]
+path = "resolution_planning.rs"
+lines = 40
+responsibilities = ["pure domain / policy / planning"]
+destinations = ["yadorilink-replica-engine"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# 7D-9D sixth pass: `desired_frontier_hash`/`PathFrontier` (plus their
+# `put_u32`/`put_str` byte-encoding helpers and 7 unit tests) -- the one
+# slice of this file's "pure domain" content with no entanglement in
+# `yadorilink-sync-sqlite`'s row-shaped types. Moved verbatim to
+# `yadorilink-replica-engine::resolution_planning`. No compatibility
+# re-export left behind (`scripts/check-phase7d3-replica-engine-
+# boundary.py` forbids `pub use yadorilink_replica_engine::` in sync-core)
+# -- `plan_driver.rs`/`orchestrator.rs` import the moved symbols directly,
+# and gained a `From<ReplicaEngineError>` bridge on `PlanDriverError`/
+# `OrchestratorError` (mirrors the existing `SyncSqliteError` bridge) since
+# the function's error type changed from `SyncError` to `ReplicaEngineError`.
+# See `docs/design/phase7d9d-exit-report.md`'s sixth-pass addendum.
+
+[[module]]
+path = "resolution_planning.rs"
+lines = 0
+responsibilities = ["pure domain / policy / planning"]
+destinations = ["yadorilink-replica-engine"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# Generate/validate/staleness-judge a ResolutionPlan/PlanSlice.
+#
+# 7D-9D seventh pass: the sixth pass's dependency-cycle blocker resolved.
+# `PlacementRole`/`ReservationRole`/`ReservationScope`/`NewReservation`/
+# `EpochState` relocated to `yadorilink-replica-domain::
+# filesystem_placement` (confirmed genuinely plain -- no `rusqlite`/
+# `Connection` in their own definitions; their SQL-string codec,
+# `as_db_str`/`from_db_str`, stayed behind in `yadorilink-sync-sqlite` as a
+# local trait impl per type, preserving the exact `Result<_,
+# SyncSqliteError>` corrupt-row error path). `EpochRecord` itself could NOT
+# follow -- it aggregates `DirectoryIdentity`/`FileIdentity`
+# (`yadorilink-root-authority`) and `GenerationId`
+# (`yadorilink-sync-sqlite`'s own materialized-generation codec), and
+# `yadorilink-replica-domain` must not depend on either (real SQL/
+# filesystem-identity coupling, not just naming) -- resolved narrowly by
+# changing `epoch_is_provably_untouched_by_adapter`'s signature from
+# `fn(&EpochRecord) -> bool` to `fn(EpochState, Option<&str>) -> bool`
+# (its only two real reads), so `EpochRecord` stays in
+# `yadorilink-sync-sqlite` untouched. With the types relocated,
+# `resolution_to_group`/`slice_plan`/`slice_reservation_requests`/
+# `classify_epoch`/`epoch_reflects_committed_placement`/
+# `epoch_is_pre_commit_leftover`/`epoch_is_provably_untouched_by_adapter`
+# and the `PlannedPlacement`/`ExtraReservation`/`PlacementGroup`/
+# `SliceBounds`/`PlanSlice`/`EpochDisposition` types they share all moved
+# to `yadorilink-replica-engine::resolution_planning` (which already
+# depends on `yadorilink-replica-domain`). No compatibility re-export left
+# in sync-core (`scripts/check-phase7d3-replica-engine-boundary.py`
+# forbids `pub use yadorilink_replica_engine::` there); `orchestrator.rs`/
+# `plan_driver.rs` import the moved symbols directly.
+# `allocate_slice_epochs`/`plan_progress`/`plan_is_stale`/`replan`/
+# `replan_unchecked` (this same file, all `&Connection`-typed) were not
+# moved -- they sit in the separate SQL-shaped entry below and the
+# daemon-orchestration entry further below, both unchanged this pass.
+
+[[module]]
+path = "resolution_planning.rs"
+lines = 0
+responsibilities = ["SQLite SQL / row mapping"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# Eighth pass: `FilesystemResolutionPlan`, `allocate_slice_epochs[_unchecked]`,
+# `plan_progress`, `plan_is_stale`, `replan[_unchecked]` -- everything that
+# remained in `yadorilink-sync-core::resolution_planning` after the sixth and
+# seventh passes' pure-domain extractions -- moved to `yadorilink-sync-
+# sqlite::resolution_planning` as one mechanical unit (same "already-SQL-
+# shaped, no separable pure fragment" pattern as `retained_obligation.rs`'s
+# fourth-pass CRUD move). `yadorilink-sync-core`'s own `resolution_planning.
+# rs` file is now deleted entirely; `plan_driver.rs`/`orchestrator.rs`/
+# `early_physical_recovery.rs` import the new module directly (`allocate_
+# slice_epochs_unchecked`/`replan_unchecked` promoted from `pub(crate)` to
+# `pub` for the cross-crate call). See the exit report's eighth-pass
+# addendum for the full account, including why the task brief's own
+# ~1,915-line `replan_unchecked` figure (repeated across five prior passes'
+# reconnaissance) turned out to be stale: a fresh read found the actual
+# current `replan_unchecked` only ~135 lines, its one embedded decision
+# already factored out to the pure `epoch_is_pre_commit_leftover` predicate
+# by the seventh pass -- there was no large function left to decompose, only
+# a small, already-correctly-shaped SQL orchestrator to relocate.
+
+[[module]]
+path = "resolution_planning.rs"
+lines = 0
+responsibilities = ["daemon orchestration", "task lifecycle"]
+destinations = ["yadorilink-daemon"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# Eighth pass correction: this entry's original 1,190-line estimate (7D-9A)
+# does not correspond to any content that actually exists in the current
+# `resolution_planning.rs`. A full top-to-bottom read of the file this pass
+# (not another line-count-only reconnaissance) found exactly six production
+# items -- `FilesystemResolutionPlan`, `allocate_slice_epochs`,
+# `allocate_slice_epochs_unchecked`, `plan_progress`, `plan_is_stale`,
+# `replan`/`replan_unchecked` -- covered in full by the SQL entry directly
+# above; there is no separate "slice execution/retry/worker placement"
+# daemon-orchestration slice left in this file to move. Most likely
+# explanation: this was always an overcount (or described content that
+# migrated away, uncredited, during one of the six prior passes' own moves
+# without the ledger being corrected) rather than a real, still-pending
+# body of code -- flagged with evidence rather than silently deleted, per
+# this sub-phase's own re-verify-before-trusting discipline (the same
+# discipline that corrected `block_deletion.rs`'s line count and multiple
+# stale `blocked_by` references in earlier passes). Marked `migrated` with
+# `lines = 0` (not deleted outright) so the ledger keeps a record that this
+# entry was investigated and closed, not merely forgotten.
+
+[[module]]
+path = "fs_commit.rs"
+lines = 3137
+responsibilities = ["filesystem execution"]
+destinations = ["yadorilink-filesystem-sync"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9B"
+# Platform commit adapter (FilesystemCommitAdapter::commit_placement/
+# observe_identity) -- the one place a prepared replacement is atomically
+# swapped into a live filesystem location. Explicitly named in 9B's target
+# module list; zero SQL, 81 std::fs/tokio::fs/walkdir sites.
+
+[[module]]
+path = "retained_obligation.rs"
+lines = 730
+responsibilities = ["pure domain / policy / planning"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# 7D-9D fourth pass: `reject_time_regression`, `captured_change_binds_
+# obligation`, `require_enabled`, and the per-field validation embedded in
+# `create`/`record_late_write`/`record_captured_change`/
+# `mark_authorization_permanently_lost` -- the "read-then-decide-then-write"
+# shape the third pass correctly identified as not decomposable into a
+# separate pure/impure split -- moved as one mechanical unit *together
+# with* the SQL entry directly below, into `yadorilink-sync-sqlite::
+# retained_obligation`, rather than attempting the per-function surgery the
+# third pass judged out of budget. This is exactly the "straightforward
+# SQL-module move, no pure/impure split needed" case the task brief called
+# out for this file's remaining CRUD half: these functions are already
+# fully SQL-shaped (every one takes `&Connection`/`&mut Connection`), so
+# there was no separable pure fragment to leave behind. `destinations`
+# corrected from the original `yadorilink-replica-engine` guess to the
+# crate this content actually landed in; see
+# `docs/design/phase7d9d-exit-report.md`'s fourth-pass addendum.
+
+[[module]]
+path = "retained_obligation.rs"
+lines = 170
+responsibilities = ["pure domain / policy / planning"]
+destinations = ["yadorilink-replica-engine"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# 7D-9D third pass: `evaluate_deletion`'s three-precondition deletion
+# judgment -- `ObligationState`, `RetentionReason`, `DeletionDecision`,
+# `WriterExclusionProven`/`NoWriterExclusionProof`, and a two-stage
+# `evaluate_deletion_pre_durability`/`evaluate_deletion_final_step` split --
+# moved to `yadorilink-replica-engine::retained_obligation`, genuinely
+# `Connection`-free. `yadorilink-sync-core::retained_obligation::
+# evaluate_deletion` was, at the time, a thin orchestrator: pre-durability
+# guards (no SQL) -> two durability-proof SQL reads (then still in
+# sync-core) -> final writer-exclusion step (no SQL), preserving the
+# original single function's exact short-circuiting. See
+# `docs/design/phase7d9d-exit-report.md`'s third-pass addendum for the full
+# design rationale and verification. (Fourth pass note: `evaluate_deletion`
+# itself, including its two durability-proof SQL reads, subsequently moved
+# to `yadorilink-sync-sqlite::retained_obligation` as part of the 1800-line
+# SQL entry below -- see that entry's own updated note.)
+
+[[module]]
+path = "retained_obligation.rs"
+lines = 1800
+responsibilities = ["SQLite SQL / row mapping"]
+destinations = ["yadorilink-sync-sqlite"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9D"
+# Obligation/frontier/prune records -- highest raw rusqlite/Connection
+# reference count of any file in the crate (61), consistent with this being
+# the module's dominant fraction.
+#
+# 7D-9D fourth pass: moved to `yadorilink-sync-sqlite::retained_obligation`
+# as one unit together with the 730-line pure-domain entry above --
+# `RetainedObligation`/`NewObligation`/`RetainedObligationError`, the
+# `retained_preimages`/`retained_preimage_deletion_intents` schema, every
+# CRUD function (`get`/`create`/`record_late_write`/
+# `record_captured_change`/`mark_authorization_permanently_lost`/
+# `set_capacity_degraded`), `verify_durable_representation`, and
+# `evaluate_deletion` (now including its own two durability-proof SQL
+# reads, folded back in -- see the 170-line entry's updated note). What
+# stayed in `yadorilink-sync-core::retained_obligation`: `DeletionOutcome`
+# and the three real-filesystem functions in the 372-line entry below
+# (`delete_if_eligible`/`complete_deletion_after_unlink`/
+# `unlink_and_complete_deletion` and their `_unchecked` cores), which read
+# `std::fs`/`yadorilink_root_authority::fs_identity`/
+# `yadorilink_filesystem_sync::fs_commit::ParentDirHandle` and call back
+# into the new sync-sqlite module's now-`pub` `get`/`evaluate_deletion`/
+# `reject_time_regression`/`load_deletion_intent`/`require_enabled`.
+# `RetainedObligationError`'s `Sync(SyncError)` variant became
+# `Sync(SyncSqliteError)`; sync-core's own fs-execution functions and test
+# suite (which stayed in sync-core, since almost every test exercises the
+# fs-execution half too -- see the exit-report addendum) construct
+# `SyncSqliteError` directly at the few points that used to construct
+# `SyncError`. Added `impl From<yadorilink_replica_engine::error::
+# ReplicaEngineError> for SyncSqliteError` (mirroring `SyncError`'s own
+# identical bridge) since `ObligationState::from_str`/
+# `evaluate_deletion_pre_durability` return that type. See
+# `docs/design/phase7d9d-exit-report.md`'s fourth-pass addendum.
+
+[[module]]
+path = "retained_obligation.rs"
+lines = 372
+responsibilities = ["daemon orchestration", "filesystem execution"]
+destinations = ["yadorilink-daemon"]
+status = "migrated"
+blocked_by = []
+removal_phase = "7D-9-sweep"
+# 7D-9-sweep: migrated to `yadorilink-daemon::commit_orchestration::
+# retained_obligation`, verbatim apart from its module doc comment (updated
+# to describe the new home; no code/logic change). The prior pass's own
+# "structural, not stale" blocker no longer holds: a fresh grep of
+# `yadorilink-daemon/Cargo.toml` found `rusqlite = { version = "0.31",
+# features = ["bundled"] }` is now a real `[dependencies]` entry (not
+# dev-only), added when `commit_orchestration::orchestrator`/`plan_driver`
+# moved there in 7D-9E ("drive the commit boundary directly against an open
+# `&mut Connection`", per that Cargo.toml's own comment) -- the exact
+# precedent this entry's prior reasoning said daemon lacked. Daemon also
+# already depends on `yadorilink-filesystem-sync` (for `ParentDirHandle`,
+# already used by `orchestrator.rs`) and `yadorilink-sync-sqlite`/
+# `yadorilink-replica-engine`/`yadorilink-root-authority` (for the
+# retained-obligation SQL functions/`DeletionDecision`/`fs_identity` this
+# file's own functions call) -- no new production dependency edge was
+# added by this move, only a new module using dependencies that already
+# existed. Zero real callers anywhere in the workspace outside this file's
+# own tests both before and after the move (re-confirmed by a fresh
+# workspace-wide grep) -- a pure relocation, matching the same
+# already-unwired precedent `orchestrator.rs`/`plan_driver.rs` themselves
+# were moved under. `cargo check --workspace --all-targets` clean; `cargo
+# test -p yadorilink-sync-core --lib` and `cargo test -p yadorilink-daemon
+# --lib` both pass with the file's 30 tests moving intact (net zero across
+# the two crates). See `docs/design/phase7d9-sweep-exit-report.md` for the
+# full writeup.
+# 7D-9D first pass: `fs_commit.rs`/`single_pass_capture.rs` dropped from
+# `blocked_by` -- both already moved out of sync-core (7D-9B and 7D-9C
+# respectively) and no longer exist there. `index.rs` remains a real,
+# correct blocker: it is deliberately the LAST sub-phase (7D-9F) per the
+# dependency plan's own ordering rationale, not a stale reference.
+# Execution schedule for the retained-preimage custody queue, plus the small
+# real-fs slice (6 std::fs/tokio::fs/walkdir sites).
+#
+# 7D-9D eleventh pass: re-verified with fresh evidence, per this pass's own
+# instruction not to inherit "blocked on index.rs" claims uncritically (the
+# way the tenth pass found `handoff_lease.rs`'s claim was backwards). A full
+# read of `delete_if_eligible[_unchecked]`/`complete_deletion_after_unlink
+# [_unchecked]`/`unlink_and_complete_deletion` found zero `SyncState`
+# reference in production code (only the `#[cfg(test)] mod tests` module
+# opens one, to drive the pipeline end-to-end) -- these are plain functions
+# over `&mut Connection`/`&ParentDirHandle`, and this file's own module doc
+# comment confirms they are deliberately unwired: "Not decided by this
+# module -- every entry point here is unwired state until a future
+# orchestrator drives it." A workspace-wide grep confirms zero real callers
+# anywhere outside this file's own tests. So the literal `index.rs` code
+# dependency this ledger entry implies does not exist today; the genuine
+# blocker is structural, not a stale reference to fix: these three
+# functions need BOTH `rusqlite::Connection` (for the same-transaction
+# `IMMEDIATE` intent/finalize SQL the crash-safety protocol requires) AND
+# real `std::fs`/`ParentDirHandle` filesystem mutation in the same call.
+# `yadorilink-filesystem-sync` has zero `rusqlite` dependency and must stay
+# that way (forbidden-leakage rule); `yadorilink-sync-sqlite` must never
+# perform real filesystem mutation (same rule, and this file's own doc
+# comment already states this explicitly: "read `std::fs`, ... none of
+# which yadorilink-sync-sqlite may depend on"). `yadorilink-daemon` is
+# architecturally free of both restrictions, but confirmed NOT a drop-in
+# destination either: `rusqlite` is only a dev-dependency there today
+# (grepped -- zero production `rusqlite::Connection` use anywhere in
+# `yadorilink-daemon/src/`; every existing SQL access goes through
+# `SyncState`/sync-sqlite's own abstraction, never a raw `Connection`), so
+# moving these functions there as-is would be the first production
+# raw-`Connection` dependency in daemon and a new, currently-nonexistent
+# calling convention -- exactly the kind of speculative move this
+# initiative's own guidance warns against attempting without a real,
+# already-wired caller to design against. `index.rs`/`SyncState`'s own
+# retirement (7D-9F) is what will finally settle how daemon is meant to
+# reach SQL+fs-combined operations like this one; kept as the `blocked_by`
+# entry (shorthand for "awaiting the facade's successor design", the same
+# use every other 7D-9F-gated entry in this ledger already makes of it)
+# rather than invented as a new, unprecedented blocker name. Genuinely
+# still blocked, not attempted; not a mislabeled reference.

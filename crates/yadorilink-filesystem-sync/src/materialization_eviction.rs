@@ -315,7 +315,8 @@ pub fn evict_file(
     // cross-group references only after exclusivity is established.
     drop(reference_write);
     let physical_deletion = liveness_gate.begin_physical_deletion();
-    let report = state.reclaim_cached_blocks(&physical_deletion, verified_custody, store)?;
+    let report =
+        state.reclaim_verified_cached_blocks(&physical_deletion, verified_custody, store)?;
     if report.blocks_deleted == 0 {
         return Ok(EvictionOutcome {
             blocks_retained: true,

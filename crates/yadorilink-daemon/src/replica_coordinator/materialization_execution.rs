@@ -314,7 +314,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         })
     }
 
-    fn reclaim_cached_blocks(
+    fn reclaim_verified_cached_blocks(
         &self,
         deletion_guard: &BlockPhysicalDeletionGuard<'_>,
         custody: VerifiedCustody<'_>,

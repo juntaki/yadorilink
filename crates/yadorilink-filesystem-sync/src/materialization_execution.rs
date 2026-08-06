@@ -382,7 +382,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// `impl MaterializationExecutionPort for SyncState` performs the
     /// concrete call internally, where `self` already satisfies the wider
     /// trait.
-    fn reclaim_cached_blocks(
+    fn reclaim_verified_cached_blocks(
         &self,
         deletion_guard: &BlockPhysicalDeletionGuard<'_>,
         custody: VerifiedCustody<'_>,
