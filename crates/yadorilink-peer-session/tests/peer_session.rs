@@ -389,6 +389,25 @@ fn spawn_session_with_authenticator(
     )
 }
 
+fn spawn_session_with_authenticator_and_resync_interval(
+    channel: Arc<PeerChannel>,
+    device: &Device,
+    peer_device_id: &str,
+    change_authenticator: Arc<dyn ChangeAuthenticator>,
+    resync_interval: Duration,
+) -> Arc<PeerSyncSession> {
+    spawn_session_configured_ex(
+        channel,
+        device,
+        peer_device_id,
+        vec![GROUP.to_string()],
+        Some(resync_interval),
+        true,
+        change_authenticator,
+        Some(AlwaysValidRootCommitAuthorityProvider::shared()),
+    )
+}
+
 /// Admits any device whose signing key matches the deterministic per-id key
 /// `Device::new` assigns (Sha256(device_id)) — the trust material the daemon
 /// would inject from the coordination plane's netmap. Wired automatically by
@@ -904,11 +923,15 @@ async fn eager_peer_adoption_waits_for_block_deletion_gate_before_index_commit()
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a =
-        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let _session_a = spawn_session_with_authenticator_and_resync_interval(
+        channel_a,
+        &device_a,
+        "device-b",
+        auth.clone(),
+        Duration::from_millis(100),
+    );
     // A short periodic heads-announce reliably carries device-a's committed
     // change to device-b over loopback so the eager adoption enters the gate.
-    session_a.set_full_index_resync_interval(Duration::from_millis(100));
     let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(1);
     let release = Arc::new((Mutex::new(false), Condvar::new()));
     let session_b = PeerSyncSession::new_with_dependencies(
@@ -988,11 +1011,15 @@ async fn ondemand_peer_adoption_waits_for_block_deletion_gate_before_index_commi
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a =
-        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let _session_a = spawn_session_with_authenticator_and_resync_interval(
+        channel_a,
+        &device_a,
+        "device-b",
+        auth.clone(),
+        Duration::from_millis(100),
+    );
     // A short periodic heads-announce reliably carries device-a's committed
     // change to device-b over loopback so the on-demand adoption enters the gate.
-    session_a.set_full_index_resync_interval(Duration::from_millis(100));
     let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(1);
     let release = Arc::new((Mutex::new(false), Condvar::new()));
     let session_b = PeerSyncSession::new_with_dependencies(
@@ -1093,12 +1120,20 @@ async fn same_version_resync_rehydrates_a_missing_eager_file() {
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a =
-        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b =
-        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    session_a.set_full_index_resync_interval(Duration::from_millis(100));
-    session_b.set_full_index_resync_interval(Duration::from_millis(100));
+    let session_a = spawn_session_with_authenticator_and_resync_interval(
+        channel_a,
+        &device_a,
+        "device-b",
+        auth.clone(),
+        Duration::from_millis(100),
+    );
+    let session_b = spawn_session_with_authenticator_and_resync_interval(
+        channel_b,
+        &device_b,
+        "device-a",
+        auth.clone(),
+        Duration::from_millis(100),
+    );
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let replicated_path = device_b.root_path().join(file_name);
@@ -1166,12 +1201,20 @@ async fn same_version_resync_does_not_hydrate_an_ondemand_placeholder() {
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let auth = dag_authenticator(&[&device_a, &device_b]);
-    let session_a =
-        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
-    let session_b =
-        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    session_a.set_full_index_resync_interval(Duration::from_millis(100));
-    session_b.set_full_index_resync_interval(Duration::from_millis(100));
+    let session_a = spawn_session_with_authenticator_and_resync_interval(
+        channel_a,
+        &device_a,
+        "device-b",
+        auth.clone(),
+        Duration::from_millis(100),
+    );
+    let session_b = spawn_session_with_authenticator_and_resync_interval(
+        channel_b,
+        &device_b,
+        "device-a",
+        auth.clone(),
+        Duration::from_millis(100),
+    );
     wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let replicated_path = device_b.root_path().join(file_name);
