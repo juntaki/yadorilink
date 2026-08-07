@@ -1218,7 +1218,6 @@ fn service_key_pins_path() -> PathBuf {
 /// check `run_netmap_attempt`'s update loop uses to avoid opening a
 /// second `PeerChannel`/`PeerSyncSession` for a peer that's already
 /// connected (module docs on the deliberately-simple session lifecycle).
-#[cfg(test)]
 fn peer_already_connected(state: &DaemonState, peer_device_id: &str) -> bool {
     state.peers.has_session(peer_device_id)
 }

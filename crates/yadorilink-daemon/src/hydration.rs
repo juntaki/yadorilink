@@ -3335,7 +3335,9 @@ mod tests {
                 .file_index_repository()
                 .get_symlink_target(GROUP, PATH)
                 .unwrap(),
-            Some(b"v1-target".to_vec()),
+            Some(yadorilink_root_authority::fs_identity::target_to_bytes(std::path::Path::new(
+                "v1-target"
+            ))),
             "the current row's symlink_target must be updated to match the restored version"
         );
     }
