@@ -1218,6 +1218,10 @@ fn service_key_pins_path() -> PathBuf {
 /// check `run_netmap_attempt`'s update loop uses to avoid opening a
 /// second `PeerChannel`/`PeerSyncSession` for a peer that's already
 /// connected (module docs on the deliberately-simple session lifecycle).
+/// Its only non-test caller is `run_sim`, `#[cfg(madsim)]`-only -- gated
+/// the same way here so a plain non-test, non-madsim build (which has no
+/// caller at all) doesn't trip `-D dead-code`.
+#[cfg(any(test, madsim))]
 fn peer_already_connected(state: &DaemonState, peer_device_id: &str) -> bool {
     state.peers.has_session(peer_device_id)
 }
