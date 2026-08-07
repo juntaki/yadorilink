@@ -35,6 +35,7 @@
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, HANDLE};
 use windows_sys::Win32::Storage::CloudFilters::{
@@ -674,3 +675,24 @@ fn unix_nanos_to_filetime(unix_nanos: i64) -> i64 {
 // `--lib` unit test): that only needs this crate's compiled rlib, not the
 // whole crate's `#[cfg(test)]` module graph, part of which is not yet
 // Windows-portable (unrelated to this module).
+
+/// This crate's half of [`select_placeholder_backend`] -- the only
+/// constructor for a real [`PlaceholderBackend`] on Windows. Registration
+/// failure (no `SeCreateSymbolicLinkPrivilege`-style precondition on this
+/// path, but `CfRegisterSyncRoot` can still fail, e.g. `root` already
+/// registered by another provider) returns `None`, matching this function's
+/// contract of "no provider available" rather than propagating a Windows
+/// error type into a cross-platform caller.
+pub(crate) fn select_placeholder_backend(root: &Path) -> Option<Arc<dyn PlaceholderBackend>> {
+    match WindowsCfApiBackend::register(root) {
+        Ok(backend) => Some(Arc::new(backend)),
+        Err(e) => {
+            tracing::warn!(
+                root = %root.display(),
+                error = %e,
+                "failed to register Windows Cloud Filter API sync root for placeholder provider"
+            );
+            None
+        }
+    }
+}

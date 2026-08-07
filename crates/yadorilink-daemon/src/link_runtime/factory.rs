@@ -260,6 +260,33 @@ impl LinkRuntimeFactory {
         };
         let emit_tombstones = emit_tombstones && !suppress_after_recovery && repair_succeeded;
 
+        // On-demand placeholder-provider session, attached once here and
+        // held for this link's whole lifetime (`LinkRuntime`'s own `provider`
+        // field doc) -- placed after `root_lease` (a resource attach could
+        // itself need to reference) and before the watcher/task spawn below,
+        // so no watcher or task ever observes an OnDemand link running
+        // without its provider already attached. Only reachable for an
+        // OnDemand-policy link, which the `on_demand_pipeline_is_connected()`
+        // check earlier in this function already refuses in every real
+        // build today -- this attach step is exercised only under a test's
+        // `OverrideForTest`, not in production, until the remaining gaps
+        // that function's own doc comment lists also close.
+        let provider = match deps
+            .replica_coordinator
+            .link_repository()
+            .materialization_policy_for_group(&group_id)
+        {
+            Ok(Some(yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand)) => {
+                Some(select_placeholder_backend(Path::new(&local_path)).ok_or_else(|| {
+                    DaemonError::Config(format!(
+                        "link {local_path} (group {group_id}) is configured OnDemand, but no \
+                             placeholder provider is available on this platform for its root"
+                    ))
+                })?)
+            }
+            _ => None,
+        };
+
         // Bind the watcher *before* the initial scan below: `notify` starts
         // buffering OS-level events into its channel as soon as it's created,
         // so any file created mid-scan is still caught (see `scan_existing_files`'s
@@ -355,6 +382,171 @@ impl LinkRuntimeFactory {
             vec![accumulator_handle, executor_handle, repair_handle, dirty_journal_handle],
             flush_handle,
             root_lease,
+            provider,
         ))
+    }
+}
+
+/// Selects and constructs the live [`yadorilink_filesystem_sync::
+/// placeholder_backend::PlaceholderBackend`] for `root` on this platform, or
+/// `None` if no real provider is available here -- the single point this
+/// module calls to attach a per-link session (gap #1 of
+/// `on_demand_pipeline_is_connected`'s own doc comment). Lives here, not in
+/// `yadorilink-filesystem-sync`, because the real Windows implementation
+/// (`placeholder_backend_windows::WindowsCfApiBackend`) depends on
+/// `windows-sys`/the Cloud Filter API, which must never enter that crate.
+fn select_placeholder_backend(
+    root: &Path,
+) -> Option<Arc<dyn yadorilink_filesystem_sync::placeholder_backend::PlaceholderBackend>> {
+    #[cfg(test)]
+    if let Some(overridden) = TEST_BACKEND_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return overridden;
+    }
+    select_platform_placeholder_backend(root)
+}
+
+#[cfg(windows)]
+fn select_platform_placeholder_backend(
+    root: &Path,
+) -> Option<Arc<dyn yadorilink_filesystem_sync::placeholder_backend::PlaceholderBackend>> {
+    crate::placeholder_backend_windows::select_placeholder_backend(root)
+}
+
+#[cfg(not(windows))]
+fn select_platform_placeholder_backend(
+    root: &Path,
+) -> Option<Arc<dyn yadorilink_filesystem_sync::placeholder_backend::PlaceholderBackend>> {
+    let _ = root;
+    None
+}
+
+// Test-only override of `select_placeholder_backend` for the current
+// thread, mirroring `placeholder_backend::OverrideForTest`'s identical
+// per-thread-not-process-wide reasoning (concurrent `cargo test` threads
+// must never see each other's override). Lets a test exercise
+// `LinkRuntimeFactory::build()`'s provider-attach step with a
+// deterministic fake session without needing a real per-platform backend.
+#[cfg(test)]
+thread_local! {
+    static TEST_BACKEND_OVERRIDE: std::cell::RefCell<
+        Option<Option<Arc<dyn yadorilink_filesystem_sync::placeholder_backend::PlaceholderBackend>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard installing a [`select_placeholder_backend`] override for the
+/// current thread only -- see [`TEST_BACKEND_OVERRIDE`]'s own doc.
+#[cfg(test)]
+pub(crate) struct PlaceholderBackendOverrideForTest {
+    previous: Option<
+        Option<Arc<dyn yadorilink_filesystem_sync::placeholder_backend::PlaceholderBackend>>,
+    >,
+}
+
+#[cfg(test)]
+impl PlaceholderBackendOverrideForTest {
+    pub(crate) fn install(
+        backend: Option<
+            Arc<dyn yadorilink_filesystem_sync::placeholder_backend::PlaceholderBackend>,
+        >,
+    ) -> Self {
+        let previous = TEST_BACKEND_OVERRIDE.with(|cell| cell.replace(Some(backend)));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PlaceholderBackendOverrideForTest {
+    fn drop(&mut self) {
+        TEST_BACKEND_OVERRIDE.with(|cell| *cell.borrow_mut() = self.previous.take());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use yadorilink_filesystem_sync::placeholder_backend::{
+        PlaceholderBackend, PlaceholderCapability, PlaceholderGeneration, PlaceholderStatus,
+    };
+    use yadorilink_root_authority::RootAuthorityError;
+
+    use super::{select_placeholder_backend, PlaceholderBackendOverrideForTest};
+
+    /// A deterministic, in-memory [`PlaceholderBackend`] for phase-1 tests:
+    /// no OS interaction at all, mints a fixed generation, and always
+    /// reports the placeholder untouched.
+    struct FakePlaceholderBackend;
+
+    impl PlaceholderBackend for FakePlaceholderBackend {
+        fn probe(_root: &std::path::Path) -> PlaceholderCapability {
+            PlaceholderCapability::Supported { name: "fake-test-backend" }
+        }
+
+        fn create(
+            &self,
+            _path: &std::path::Path,
+            _size: u64,
+            _mtime_unix_nanos: i64,
+        ) -> Result<PlaceholderGeneration, RootAuthorityError> {
+            Ok(PlaceholderGeneration(1))
+        }
+
+        fn inspect(
+            &self,
+            _path: &std::path::Path,
+            _expected: PlaceholderGeneration,
+        ) -> Result<PlaceholderStatus, RootAuthorityError> {
+            Ok(PlaceholderStatus::Untouched)
+        }
+
+        fn hydrate(
+            &self,
+            _path: &std::path::Path,
+            _content: &mut dyn std::io::Read,
+        ) -> Result<(), RootAuthorityError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn select_placeholder_backend_returns_none_by_default_on_this_platform() {
+        // No override installed: on every non-Windows CI/dev platform this
+        // is `None` today (no real provider exists yet) -- and on Windows
+        // it would be `Some` only if a real sync-root registration
+        // succeeds against a real filesystem path, which this test does
+        // not attempt. Either way, without an override this function must
+        // never panic and must not silently fabricate a provider.
+        let root = std::path::Path::new("/does/not/matter/for/this/assertion");
+        let _ = select_placeholder_backend(root); // must not panic
+    }
+
+    #[test]
+    fn override_returns_the_installed_fake() {
+        let root = std::path::Path::new("/fake/root");
+        let backend: Arc<dyn PlaceholderBackend> = Arc::new(FakePlaceholderBackend);
+        {
+            let _guard = PlaceholderBackendOverrideForTest::install(Some(backend.clone()));
+            let selected = select_placeholder_backend(root).expect("override installed Some");
+            assert_eq!(
+                selected.create(root, 0, 0).unwrap(),
+                PlaceholderGeneration(1),
+                "the overridden Fake, not a real platform backend, must answer"
+            );
+        }
+        // The guard's Drop must restore the pre-override answer, mirroring
+        // `placeholder_backend::OverrideForTest`'s identical scoping rule.
+        // On a platform with no real backend (every CI/dev platform this
+        // test runs on) that pre-override answer is `None`.
+        assert!(
+            select_placeholder_backend(root).is_none(),
+            "override must not outlive the guard that installed it"
+        );
+    }
+
+    #[test]
+    fn override_can_install_none_to_force_no_provider_available() {
+        let root = std::path::Path::new("/fake/root");
+        let _guard = PlaceholderBackendOverrideForTest::install(None);
+        assert!(select_placeholder_backend(root).is_none());
     }
 }

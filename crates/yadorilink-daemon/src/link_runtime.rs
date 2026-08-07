@@ -84,6 +84,25 @@ pub struct LinkRuntime {
     /// `SyncRootLock` (owned by the lease, not this struct directly) stays
     /// alive for as long as either clone does.
     root_lease: Arc<yadorilink_root_authority::root_commit::RootLease>,
+    /// The live OS placeholder-provider session for this link, held for its
+    /// whole lifetime -- gap #1 in `placeholder_backend::
+    /// on_demand_pipeline_is_connected`'s own doc comment ("a live, per-link
+    /// `PlaceholderBackend` provider session held for the link's whole
+    /// lifetime... not constructed ad hoc per call"). `None` for every
+    /// Eager link (no provider needed) and, today, for every OnDemand link
+    /// too: `LinkRuntimeFactory::build()` already refuses to reach this
+    /// constructor for an OnDemand-policy link while
+    /// `on_demand_pipeline_is_connected()` is `false`, which it
+    /// unconditionally is in every real build until the remaining gaps
+    /// (generation persistence, provider-based dirty detection,
+    /// provider-routed materialization) also close. Written by every
+    /// build (phase 1) but not yet read by any -- `local_change.rs`'s
+    /// dirty detection and `materialization.rs`'s create/hydrate/evict
+    /// paths start reading it once they route through this session
+    /// instead of size/mtime heuristics and `write_placeholder`
+    /// respectively (phases 2-4).
+    #[allow(dead_code)]
+    provider: Option<Arc<dyn yadorilink_filesystem_sync::placeholder_backend::PlaceholderBackend>>,
 }
 
 impl LinkRuntime {
@@ -98,8 +117,11 @@ impl LinkRuntime {
         tasks: Vec<JoinHandle<()>>,
         flush_handle: Arc<LinkFlushHandle>,
         root_lease: Arc<yadorilink_root_authority::root_commit::RootLease>,
+        provider: Option<
+            Arc<dyn yadorilink_filesystem_sync::placeholder_backend::PlaceholderBackend>,
+        >,
     ) -> Self {
-        Self { tasks, flush_handle, root_lease }
+        Self { tasks, flush_handle, root_lease, provider }
     }
 
     /// Forces every currently-pending, undispatched local change in this
