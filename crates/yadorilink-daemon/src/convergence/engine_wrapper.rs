@@ -28,40 +28,50 @@ fn eligible_rank_for_elapsed(elapsed: Duration) -> usize {
 }
 
 pub async fn run(state: Arc<DaemonState>) {
-    // Each loop is spawned as its own task, tracked in a `JoinSet`, rather
-    // than raced directly via `tokio::select!` on the bare futures:
-    // `run_retroactive_repair_loop` calls several synchronous, blocking
-    // `SyncState` methods; racing that future directly alongside the main
-    // engine's on the SAME task would let a slow synchronous call in this
-    // poll starve the engine's own tick for as long as it runs (`select!`
-    // only gets to poll whichever branch it currently has control in) --
-    // exactly the kind of added per-tick latency the row-14 stress
-    // scenario's stall detector is tuned to catch. Spawning each onto its
-    // own task lets tokio schedule them on genuinely separate worker
-    // threads (the blocking `SyncState` calls inside the repair loop are
-    // themselves further isolated via `spawn_blocking` at each call site
-    // below, since a plain `tokio::spawn` alone only guarantees a
-    // *possibly*-different async worker thread, not the dedicated blocking
-    // pool -- see `run_retroactive_repair_loop`'s own doc comment).
+    // Each loop is spawned as its own task rather than raced directly via
+    // `tokio::select!` on the bare futures: `run_retroactive_repair_loop`
+    // calls several synchronous, blocking `SyncState` methods; racing that
+    // future directly alongside the main engine's on the SAME task would
+    // let a slow synchronous call in this poll starve the engine's own tick
+    // for as long as it runs (`select!` only gets to poll whichever branch
+    // it currently has control in) -- exactly the kind of added per-tick
+    // latency the row-14 stress scenario's stall detector is tuned to
+    // catch. Spawning each onto its own task lets tokio schedule them on
+    // genuinely separate worker threads (the blocking `SyncState` calls
+    // inside the repair loop are themselves further isolated via
+    // `spawn_blocking` at each call site below, since a plain
+    // `tokio::spawn` alone only guarantees a *possibly*-different async
+    // worker thread, not the dedicated blocking pool -- see
+    // `run_retroactive_repair_loop`'s own doc comment).
     //
-    // `JoinSet::shutdown` -- not a bare `tokio::select!` over the two
-    // `JoinHandle`s -- gives the "either dies, both restart" semantics this
-    // wrapper's own doc comment describes: a `JoinHandle` a `select!`
-    // branch drops only DETACHES its task rather than cancelling it (it
-    // keeps running), so `spawn_restarting`'s subsequent restart would
-    // otherwise leave the old survivor running undetached alongside a
-    // brand new pair of tasks -- duplicate materialization engines or
-    // duplicate repair loops, compounding on every restart. `shutdown`
-    // aborts every task still in the set and awaits their completion, so
-    // this function never returns while either task is still alive.
+    // Explicit abort-and-await of the two survivors below, not a bare
+    // `tokio::select!` on the three `JoinHandle`s alone, gives the "either
+    // dies, all restart" semantics this wrapper's own doc comment
+    // describes: a `JoinHandle` a `select!` branch drops only DETACHES its
+    // task rather than cancelling it (it keeps running), so
+    // `spawn_restarting`'s subsequent restart would otherwise leave the old
+    // survivors running undetached alongside a brand new set of tasks --
+    // duplicate materialization engines or repair loops, compounding on
+    // every restart. `tokio::task::JoinSet` would give this same shape more
+    // directly, but is unavailable under `madsim-tokio`'s shim (no
+    // `JoinSet` at all), so this manual select-then-abort-and-await
+    // reproduces its exact "aborts every remaining task and awaits their
+    // completion" contract explicitly -- this function never returns while
+    // any of the three tasks is still alive.
     let engine_state = state.clone();
     let retire_state = state.clone();
-    let mut tasks = tokio::task::JoinSet::new();
-    tasks.spawn(super::engine_impl::run(engine_state));
-    tasks.spawn(run_retroactive_repair_loop(state));
-    tasks.spawn(run_ephemeral_conflict_copy_retire_loop(retire_state));
-    let _ = tasks.join_next().await;
-    tasks.shutdown().await;
+    let mut engine_handle = tokio::spawn(super::engine_impl::run(engine_state));
+    let mut repair_handle = tokio::spawn(run_retroactive_repair_loop(state));
+    let mut retire_handle = tokio::spawn(run_ephemeral_conflict_copy_retire_loop(retire_state));
+    tokio::select! {
+        _ = &mut engine_handle => {}
+        _ = &mut repair_handle => {}
+        _ = &mut retire_handle => {}
+    }
+    for handle in [&mut engine_handle, &mut repair_handle, &mut retire_handle] {
+        handle.abort();
+        let _ = handle.await;
+    }
 }
 
 /// Independent loop driving `PeerSyncSession::reconcile_local_materialization_
