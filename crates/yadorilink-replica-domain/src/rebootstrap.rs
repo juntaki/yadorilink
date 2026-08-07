@@ -142,7 +142,11 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    pub fn new(group_id: FolderGroupId, mut frontier: Vec<ChangeHash>, snapshot_hash: [u8; 32]) -> Self {
+    pub fn new(
+        group_id: FolderGroupId,
+        mut frontier: Vec<ChangeHash>,
+        snapshot_hash: [u8; 32],
+    ) -> Self {
         frontier.sort();
         frontier.dedup();
         Self { group_id, frontier, snapshot_hash }

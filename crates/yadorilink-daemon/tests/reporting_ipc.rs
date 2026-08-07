@@ -13,6 +13,7 @@ use tokio::net::UnixStream;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use yadorilink_daemon::daemon_state::DaemonState;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::ConsentAction;
@@ -25,7 +26,6 @@ use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_local_storage::FsBlockStore;
 use yadorilink_reporting::builder::{build_usage_envelope, ReportEnvironment};
 use yadorilink_reporting::schema::{OsFamily, ReportEnvelope, UsagePayload};
-use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 
 /// `YADORILINK_CONFIG_DIR` is a process-global env var (same pattern used
 /// by `yadorilink-cli`'s `tests/materialization.rs`), so every test here

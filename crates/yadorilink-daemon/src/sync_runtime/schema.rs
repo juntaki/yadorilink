@@ -17,9 +17,7 @@ use crate::sync_error::SyncError;
 /// `ReplicaCoordinator::open`/`open_in_memory` to reproduce
 /// `SyncState::open`/`open_in_memory`'s own schema-bootstrap sequencing when
 /// opening a database of its own.
-pub fn pre_dag_schema(
-    conn: &Connection,
-) -> Result<(), yadorilink_sqlite_runtime::DatabaseError> {
+pub fn pre_dag_schema(conn: &Connection) -> Result<(), yadorilink_sqlite_runtime::DatabaseError> {
     // `conflict_copy_provenance` must exist BEFORE `init_dag_schema` runs:
     // that call's own internal retained-history repair pass promotes
     // orphans, which runs carrier validation against this table.
@@ -39,9 +37,7 @@ pub fn pre_dag_schema(
 }
 
 /// See [`pre_dag_schema`]'s doc comment above.
-pub fn post_dag_schema(
-    conn: &Connection,
-) -> Result<(), yadorilink_sqlite_runtime::DatabaseError> {
+pub fn post_dag_schema(conn: &Connection) -> Result<(), yadorilink_sqlite_runtime::DatabaseError> {
     yadorilink_sync_sqlite::rebootstrap_store::init_rebootstrap_schema(conn)
         .map_err(|e| schema_err(SyncError::from(e)))?;
     yadorilink_sync_sqlite::init_materialization_jobs_schema(conn)

@@ -7,8 +7,8 @@
 //! vary (a fake ticket port for ticket-lifecycle tests never needs a fake
 //! journal too, and vice versa).
 
-use yadorilink_replica_domain::session_state::{FolderLink, MembershipOperationScan};
 use crate::sync_error::SyncError;
+use yadorilink_replica_domain::session_state::{FolderLink, MembershipOperationScan};
 
 use super::common::BoxFuture;
 use crate::application::model::{

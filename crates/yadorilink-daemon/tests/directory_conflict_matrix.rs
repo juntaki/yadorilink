@@ -48,10 +48,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sha2::Digest;
-use support::{open_file_backed_replica_coordinator, wait_until, wait_until_with_context, TestAccount};
+use support::{
+    open_file_backed_replica_coordinator, wait_until, wait_until_with_context, TestAccount,
+};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::FsBlockStore;
+
+// These cases drive real watchers, encrypted UDP sessions, and file-backed
+// SQLite on both peers. In particular, macOS hosted runners can spend tens of
+// seconds retrying transient SQLite lock contention. Keep the assertion exact,
+// but give the same convergence budget as the other full-stack DAG tests.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(90);
 use yadorilink_transport::DeviceKeyPair;
 
 struct TestDevice {
@@ -242,7 +250,7 @@ async fn concurrent_directory_rename_to_different_targets() {
 
     wait_until_with_context(
         || recursive_snapshot(device_a.root.path()) == recursive_snapshot(device_b.root.path()),
-        Duration::from_secs(20),
+        SETTLE_TIMEOUT,
         || {
             format!(
                 "device-a={:?} device-b={:?}",
@@ -322,7 +330,7 @@ async fn delete_directory_while_peer_adds_a_file_inside_it() {
             let b = recursive_snapshot(device_b.root.path());
             a == b && a.get("target_dir/new_from_b.txt") == Some(&new_file_hash)
         },
-        Duration::from_secs(20),
+        SETTLE_TIMEOUT,
         || {
             format!(
                 "device-a={:?} device-b={:?}",
@@ -398,7 +406,7 @@ async fn nested_rename_races_a_child_file_edit() {
             recursive_snapshot(device_a.root.path()).values().any(|h| h == &edited_hash)
                 && recursive_snapshot(device_b.root.path()).values().any(|h| h == &edited_hash)
         },
-        Duration::from_secs(20),
+        SETTLE_TIMEOUT,
         || {
             format!(
                 "device-a={:?} device-b={:?}",
@@ -448,7 +456,7 @@ async fn concurrently_creating_same_named_directory_with_different_files_inside(
             let b = recursive_snapshot(device_b.root.path());
             a == b && a.contains_key("newdir/only-a.txt") && a.contains_key("newdir/only-b.txt")
         },
-        Duration::from_secs(20),
+        SETTLE_TIMEOUT,
         || {
             format!(
                 "device-a={:?} device-b={:?}",
@@ -501,7 +509,7 @@ async fn concurrently_creating_same_named_directory_with_a_conflicting_file_insi
             let b = recursive_snapshot(device_b.root.path());
             a == b && a.contains_key("newdir/shared.txt") && a.keys().any(|k| is_conflict_copy(k))
         },
-        Duration::from_secs(20),
+        SETTLE_TIMEOUT,
         || {
             format!(
                 "device-a={:?} device-b={:?}",

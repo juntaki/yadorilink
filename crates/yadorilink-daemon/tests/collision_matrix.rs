@@ -29,8 +29,8 @@ use support::{
 };
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::FsBlockStore;
 use yadorilink_daemon::sync_error::SyncError;
+use yadorilink_local_storage::FsBlockStore;
 use yadorilink_transport::DeviceKeyPair;
 
 struct TestDevice {
@@ -123,8 +123,18 @@ fn snapshot(root: &std::path::Path) -> HashMap<String, String> {
 
 fn index_summary(device: &TestDevice, group_id: &str, path: &str) -> String {
     match (
-        device.state.replica_coordinator.file_index_repository().get_file(group_id, path).map_err(SyncError::from),
-        device.state.replica_coordinator.sqlite().dag_list_versions(group_id, path).map_err(SyncError::from),
+        device
+            .state
+            .replica_coordinator
+            .file_index_repository()
+            .get_file(group_id, path)
+            .map_err(SyncError::from),
+        device
+            .state
+            .replica_coordinator
+            .sqlite()
+            .dag_list_versions(group_id, path)
+            .map_err(SyncError::from),
     ) {
         (Ok(current), Ok(versions)) => format!("current={current:?} versions={versions:?}"),
         (Err(error), _) | (_, Err(error)) => format!("versions_error={error}"),

@@ -11,10 +11,10 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
+use crate::error::SyncSqliteError;
 use yadorilink_replica_domain::change::{Change, Op};
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
-use crate::error::SyncSqliteError;
 use yadorilink_root_authority::reserved_namespace::{
     path_has_artefact_component_in_wire_path, path_has_non_portable_wire_component,
 };
@@ -276,9 +276,9 @@ pub fn put_file_version(
     group_id: &str,
     version: &FileVersion,
 ) -> Result<bool, SyncSqliteError> {
-    version
-        .verify_hash()
-        .map_err(|_| SyncSqliteError::NotFound("file version hash does not match its encoding".into()))?;
+    version.verify_hash().map_err(|_| {
+        SyncSqliteError::NotFound("file version hash does not match its encoding".into())
+    })?;
     let changed = conn.execute(
         "INSERT OR IGNORE INTO file_versions (version_hash, group_id, encoded) VALUES (?1, ?2, ?3)",
         rusqlite::params![&version.version_hash.0[..], group_id, version.canonical_encoding()],

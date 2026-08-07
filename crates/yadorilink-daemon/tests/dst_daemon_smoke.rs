@@ -39,7 +39,9 @@ use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeCo
 use yadorilink_daemon::app::{self, DaemonConfig};
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_filesystem_sync::debounce::DebounceConfig;
-use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource};
+use yadorilink_filesystem_sync::watcher::{
+    FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
+};
 
 const GROUP_ID: &str = "dst-daemon-smoke-group";
 
@@ -88,7 +90,8 @@ type IndexSnapshot = Vec<(String, i64, Vec<String>)>;
 /// Reads the linked group's live records out of `DaemonState` and folds
 /// them into a deterministic, order-independent [`IndexSnapshot`].
 fn capture_index(state: &DaemonState) -> Result<IndexSnapshot, String> {
-    let files = state.replica_coordinator.list_files(GROUP_ID).map_err(|e| format!("list_files: {e}"))?;
+    let files =
+        state.replica_coordinator.list_files(GROUP_ID).map_err(|e| format!("list_files: {e}"))?;
     let mut snapshot: IndexSnapshot = files
         .iter()
         .filter(|r| !r.deleted)

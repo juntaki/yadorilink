@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
-use yadorilink_replica_domain::session_state::{TrashedFile, VersionRecord};
 use crate::sync_error::SyncError;
+use yadorilink_replica_domain::session_state::{TrashedFile, VersionRecord};
 
 use crate::queries::linked_path::LinkedPathResolver;
 use crate::replica_coordinator::ReplicaCoordinator;

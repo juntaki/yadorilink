@@ -348,9 +348,13 @@ fn scan_directory(root: &Path) -> ScanResult {
         // at exactly this path is always a genuine collision worth naming
         // before the user links the folder — this device will place its
         // OS lock at this exact path the moment the link starts.
-        let is_sync_root_lock = yadorilink_root_authority::sync_root_lock::is_sync_root_lock_relative_path(relative);
-        if yadorilink_root_authority::reserved_namespace::path_has_reserved_component(relative) || is_sync_root_lock {
-            if yadorilink_root_authority::reserved_namespace::path_has_artefact_component(relative) || is_sync_root_lock
+        let is_sync_root_lock =
+            yadorilink_root_authority::sync_root_lock::is_sync_root_lock_relative_path(relative);
+        if yadorilink_root_authority::reserved_namespace::path_has_reserved_component(relative)
+            || is_sync_root_lock
+        {
+            if yadorilink_root_authority::reserved_namespace::path_has_artefact_component(relative)
+                || is_sync_root_lock
             {
                 reserved_namespace_blocked_paths.push(relative.to_string_lossy().into_owned());
             }

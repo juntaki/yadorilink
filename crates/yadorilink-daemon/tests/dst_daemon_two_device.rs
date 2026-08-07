@@ -45,7 +45,9 @@ use yadorilink_daemon::app::{self, DaemonConfig};
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_orchestrator::{SimDiscovery, SimPeer};
 use yadorilink_filesystem_sync::debounce::DebounceConfig;
-use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource};
+use yadorilink_filesystem_sync::watcher::{
+    FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
+};
 use yadorilink_transport::DeviceKeyPair;
 
 const GROUP_ID: &str = "dst-daemon-two-device-group";

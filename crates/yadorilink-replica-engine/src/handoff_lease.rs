@@ -52,7 +52,9 @@ pub fn compute_pin_deadline(
             "handoff lease ttl_seconds must be positive, got {ttl_seconds}"
         )));
     }
-    Ok(created_at_unix.saturating_add(ttl_seconds).saturating_add(HANDOFF_LEASE_PIN_SAFETY_MARGIN_SECS))
+    Ok(created_at_unix
+        .saturating_add(ttl_seconds)
+        .saturating_add(HANDOFF_LEASE_PIN_SAFETY_MARGIN_SECS))
 }
 
 #[cfg(test)]

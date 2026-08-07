@@ -260,7 +260,10 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<MaterializationJob> {
 /// state is written" variant) rather than a bespoke variant, since the
 /// caller-facing contract is the same: a bad transition is refused, not
 /// partially applied.
-fn invalid_transition(from: MaterializationJobState, to: MaterializationJobState) -> SyncSqliteError {
+fn invalid_transition(
+    from: MaterializationJobState,
+    to: MaterializationJobState,
+) -> SyncSqliteError {
     SyncSqliteError::InvalidInput(format!(
         "illegal materialization job transition: {:?} -> {:?}",
         from, to

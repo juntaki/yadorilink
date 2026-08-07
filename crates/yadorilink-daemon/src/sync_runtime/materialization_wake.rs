@@ -18,6 +18,12 @@ pub struct MaterializationWake {
     notify: tokio::sync::Notify,
 }
 
+impl Default for MaterializationWake {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MaterializationWake {
     pub fn new() -> Self {
         Self { notify: tokio::sync::Notify::new() }

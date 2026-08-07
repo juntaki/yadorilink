@@ -63,14 +63,14 @@ use dst_support::clock::HarnessClock;
 use dst_support::oracle::GlobalOracle;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
-use yadorilink_local_storage::FsBlockStore;
-use yadorilink_filesystem_sync::debounce::{self, DebounceConfig, FlushPathRequest};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
-use yadorilink_peer_session::peer_session::{PeerSyncSession, PendingLocalChangeFlush};
+use yadorilink_filesystem_sync::debounce::{self, DebounceConfig, FlushPathRequest};
 use yadorilink_filesystem_sync::watcher::{
     FolderWatchSource, FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
 };
+use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
+use yadorilink_local_storage::FsBlockStore;
+use yadorilink_peer_session::peer_session::{PeerSyncSession, PendingLocalChangeFlush};
 use yadorilink_transport::PeerChannel;
 
 /// The most recent change `device` authored touching `path` — the causal
@@ -193,7 +193,7 @@ struct ChaosDevice {
 
 impl ChaosDevice {
     /// Harness twin of
-    /// `link_manager::LinkFlushHandle::capture_undiscovered_local_change`:
+    /// `link_runtime::LinkFlushHandle::capture_undiscovered_local_change`:
     /// when the debounce accumulator reports nothing pending for a path,
     /// check the path on disk directly rather than concluding there is
     /// nothing local to protect. Same `CreatedOrModified`-only,
@@ -255,7 +255,7 @@ impl PendingLocalChangeFlush for ChaosDevice {
                 _ => None,
             };
             // Mirrors production's
-            // `link_manager::LinkFlushHandle::flush_pending_local_change`,
+            // `link_runtime::LinkFlushHandle::flush_pending_local_change`,
             // which does *not* treat a `None` reply as "nothing to protect":
             // it falls back to a direct, disk-authoritative
             // `capture_undiscovered_local_change` for this exact path. This
@@ -339,7 +339,8 @@ impl PendingLocalChangeFlush for ChaosDevice {
 /// Sets up one device's real watcher-boundary/debounce/`LocalChangeProcessor`
 /// pipeline, with the executor forwarding every non-empty flush result to
 /// this device's (not-yet-connected) session the same way
-/// `link_manager::announce_local_change` -> `DaemonState::broadcast_change`
+/// `link_runtime::operations::capture_local_change::announce_local_change`
+/// -> `DaemonState::broadcast_change`
 /// does in production for a send-receive link.
 fn setup_device(
     device_id: &str,
@@ -1166,7 +1167,7 @@ async fn run_scenario(
     // PF (fidelity/artifact-reduction) F.2, agmsg investigation 2026-07-09:
     // a real daemon runs `repair_interrupted_materializations` +
     // `cleanup_stale_temp_files` at startup and periodically
-    // (`link_manager.rs`) -- this bare-`PeerSyncSession` harness never
+    // (`link_runtime`) -- this bare-`PeerSyncSession` harness never
     // called either, so an interrupted eager materialize's window
     // (`materialize`'s own `upsert_file_with_origin`-before-`reconstruct_
     // file` ordering, see its doc comment) left a live-but-fileless index

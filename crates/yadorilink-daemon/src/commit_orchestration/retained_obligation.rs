@@ -81,11 +81,11 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
+use yadorilink_filesystem_sync::fs_commit::{ParentDirHandle, RemoveChildIdentityError};
+use yadorilink_filesystem_sync::single_pass_capture::StabilityFingerprint;
+use yadorilink_root_authority::fs_identity::{FileIdentity, IdentityComparison};
 use yadorilink_sync_sqlite::dag_store::{self, RetentionClass};
 use yadorilink_sync_sqlite::SyncSqliteError;
-use yadorilink_filesystem_sync::fs_commit::{ParentDirHandle, RemoveChildIdentityError};
-use yadorilink_root_authority::fs_identity::{FileIdentity, IdentityComparison};
-use yadorilink_filesystem_sync::single_pass_capture::StabilityFingerprint;
 // The SQL-backed half of this lifecycle (schema, CRUD, durability proof,
 // the read-only deletion decision, the orphaned-root sweep) lives in
 // `yadorilink-sync-sqlite` -- see this crate's own module doc, "crate
@@ -101,7 +101,9 @@ use yadorilink_sync_sqlite::retained_obligation::{
 // Pure deletion-decision policy types this module's own signatures still
 // need directly (`DeletionOutcome`'s `RetentionReason` field,
 // `unlink_and_complete_deletion`'s `&dyn WriterExclusionProven` parameter).
-use yadorilink_replica_engine::retained_obligation::{DeletionDecision, RetentionReason, WriterExclusionProven};
+use yadorilink_replica_engine::retained_obligation::{
+    DeletionDecision, RetentionReason, WriterExclusionProven,
+};
 
 /// Outcome of the retained-preimage deletion state machine.
 #[derive(Debug)]
@@ -135,8 +137,7 @@ pub fn delete_if_eligible(
     now_unix_nanos: i64,
     observed_fingerprint: StabilityFingerprint,
     writer_exclusion: &dyn WriterExclusionProven,
-) -> Result<DeletionOutcome, yadorilink_sync_sqlite::retained_obligation::RetainedObligationError>
-{
+) -> Result<DeletionOutcome, yadorilink_sync_sqlite::retained_obligation::RetainedObligationError> {
     require_enabled()?;
     delete_if_eligible_unchecked(
         conn,
@@ -180,8 +181,7 @@ pub fn delete_if_eligible_unchecked(
     now_unix_nanos: i64,
     observed_fingerprint: StabilityFingerprint,
     writer_exclusion: &dyn WriterExclusionProven,
-) -> Result<DeletionOutcome, yadorilink_sync_sqlite::retained_obligation::RetainedObligationError>
-{
+) -> Result<DeletionOutcome, yadorilink_sync_sqlite::retained_obligation::RetainedObligationError> {
     use yadorilink_sync_sqlite::retained_obligation::RetainedObligationError;
 
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -234,8 +234,13 @@ pub fn delete_if_eligible_unchecked(
     };
     reject_time_regression(retained_id, obligation.updated_at_unix_nanos, now_unix_nanos)?;
 
-    let decision =
-        evaluate_deletion(&tx, &obligation, now_unix_nanos, observed_fingerprint, writer_exclusion)?;
+    let decision = evaluate_deletion(
+        &tx,
+        &obligation,
+        now_unix_nanos,
+        observed_fingerprint,
+        writer_exclusion,
+    )?;
     let DeletionDecision::Eligible = decision else {
         let DeletionDecision::Retain(reason) = decision else { unreachable!() };
         return Ok(DeletionOutcome::Retained(reason));
@@ -256,10 +261,11 @@ pub fn delete_if_eligible_unchecked(
         }
         Err(error) => return Err(RetainedObligationError::Sync(SyncSqliteError::Io(error))),
     };
-    let parent = Path::new(&obligation.custody_path)
-        .parent()
-        .ok_or_else(|| SyncSqliteError::CorruptState("retained custody path has no parent".into()))?;
-    let granularity = yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(parent);
+    let parent = Path::new(&obligation.custody_path).parent().ok_or_else(|| {
+        SyncSqliteError::CorruptState("retained custody path has no parent".into())
+    })?;
+    let granularity =
+        yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(parent);
     if !matches!(
         observed_identity.compare(&recorded_identity, granularity),
         IdentityComparison::SameObject
@@ -300,8 +306,7 @@ pub fn complete_deletion_after_unlink(
     group_id: &str,
     retained_id: &str,
     now_unix_nanos: i64,
-) -> Result<DeletionOutcome, yadorilink_sync_sqlite::retained_obligation::RetainedObligationError>
-{
+) -> Result<DeletionOutcome, yadorilink_sync_sqlite::retained_obligation::RetainedObligationError> {
     require_enabled()?;
     complete_deletion_after_unlink_unchecked(conn, group_id, retained_id, now_unix_nanos)
 }
@@ -311,8 +316,7 @@ pub fn complete_deletion_after_unlink_unchecked(
     group_id: &str,
     retained_id: &str,
     now_unix_nanos: i64,
-) -> Result<DeletionOutcome, yadorilink_sync_sqlite::retained_obligation::RetainedObligationError>
-{
+) -> Result<DeletionOutcome, yadorilink_sync_sqlite::retained_obligation::RetainedObligationError> {
     use yadorilink_sync_sqlite::retained_obligation::RetainedObligationError;
 
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -389,8 +393,7 @@ pub fn unlink_and_complete_deletion(
     now_unix_nanos: i64,
     observed_fingerprint: StabilityFingerprint,
     writer_exclusion: &dyn WriterExclusionProven,
-) -> Result<DeletionOutcome, yadorilink_sync_sqlite::retained_obligation::RetainedObligationError>
-{
+) -> Result<DeletionOutcome, yadorilink_sync_sqlite::retained_obligation::RetainedObligationError> {
     use yadorilink_sync_sqlite::retained_obligation::RetainedObligationError;
 
     require_enabled()?;
@@ -426,7 +429,8 @@ pub fn unlink_and_complete_deletion(
     })?;
     let expected_identity =
         yadorilink_sync_sqlite::file_identity_codec::decode_file_identity(&filesystem_identity)?;
-    let granularity = yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(parent_dir.path());
+    let granularity =
+        yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(parent_dir.path());
     match parent_dir.remove_child_if_identity_matches(name, &expected_identity, granularity) {
         Ok(()) | Err(RemoveChildIdentityError::Absent) => {}
         Err(error) => {
@@ -441,18 +445,22 @@ pub fn unlink_and_complete_deletion(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
-    use yadorilink_replica_domain::file::{BlockInfo, FileMeta, FileVersion, RecordKind, VersionBlock};
-    use yadorilink_replica_domain::ids::{BlockHash, ChangeHash, DeviceId, FolderGroupId, SyncPath, VersionHash};
     use ed25519_dalek::SigningKey;
-    use yadorilink_sync_sqlite::retained_obligation::{
-        create, grace_period_nanos, init_retained_obligations_schema,
-        mark_authorization_permanently_lost, orphan_root_grace_period_nanos, record_captured_change,
-        record_late_write, set_capacity_degraded, sweep_orphaned_captured_authoring_roots,
-        sweep_orphaned_captured_authoring_roots_unchecked, NewObligation, OrphanRootSweepReport,
-        RetainedObligationError,
+    use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
+    use yadorilink_replica_domain::file::{
+        BlockInfo, FileMeta, FileVersion, RecordKind, VersionBlock,
+    };
+    use yadorilink_replica_domain::ids::{
+        BlockHash, ChangeHash, DeviceId, FolderGroupId, SyncPath, VersionHash,
     };
     use yadorilink_replica_engine::retained_obligation::{NoWriterExclusionProof, ObligationState};
+    use yadorilink_sync_sqlite::retained_obligation::{
+        create, grace_period_nanos, init_retained_obligations_schema,
+        mark_authorization_permanently_lost, orphan_root_grace_period_nanos,
+        record_captured_change, record_late_write, set_capacity_degraded,
+        sweep_orphaned_captured_authoring_roots, sweep_orphaned_captured_authoring_roots_unchecked,
+        NewObligation, OrphanRootSweepReport, RetainedObligationError,
+    };
 
     /// Test-only stand-in for a real writer-exclusion proof -- always
     /// `true`, used ONLY by tests that specifically want to isolate the
@@ -672,7 +680,9 @@ mod tests {
         // still inside the window -- everything else (fingerprint, DAG,
         // conflict copy, and the captured-change/version pairing) is
         // proven, only expiry is missing.
-        let decision = evaluate_deletion(&conn, &obligation, 1_000, observed, &NoWriterExclusionProof).unwrap();
+        let decision =
+            evaluate_deletion(&conn, &obligation, 1_000, observed, &NoWriterExclusionProof)
+                .unwrap();
         assert_eq!(decision, DeletionDecision::Retain(RetentionReason::GraceWindowNotExpired));
     }
 
@@ -688,9 +698,14 @@ mod tests {
 
         let after_grace = grace_period_nanos() + 1;
         let stale_handle_wrote_again = StabilityFingerprint([2u8; 32]);
-        let decision =
-            evaluate_deletion(&conn, &obligation, after_grace, stale_handle_wrote_again, &NoWriterExclusionProof)
-                .unwrap();
+        let decision = evaluate_deletion(
+            &conn,
+            &obligation,
+            after_grace,
+            stale_handle_wrote_again,
+            &NoWriterExclusionProof,
+        )
+        .unwrap();
         assert_eq!(decision, DeletionDecision::Retain(RetentionReason::FingerprintChanged));
     }
 
@@ -703,7 +718,9 @@ mod tests {
         let obligation = get(&conn, "g", "ep0").unwrap().unwrap();
 
         let after_grace = grace_period_nanos() + 1;
-        let decision = evaluate_deletion(&conn, &obligation, after_grace, fp, &NoWriterExclusionProof).unwrap();
+        let decision =
+            evaluate_deletion(&conn, &obligation, after_grace, fp, &NoWriterExclusionProof)
+                .unwrap();
         assert_eq!(decision, DeletionDecision::Retain(RetentionReason::NoCapturedChange));
     }
 
@@ -731,7 +748,9 @@ mod tests {
         let obligation = get(&conn, "g", "ep0").unwrap().unwrap();
 
         let after_grace = grace_period_nanos() + 1;
-        let decision = evaluate_deletion(&conn, &obligation, after_grace, fp, &NoWriterExclusionProof).unwrap();
+        let decision =
+            evaluate_deletion(&conn, &obligation, after_grace, fp, &NoWriterExclusionProof)
+                .unwrap();
         assert_eq!(decision, DeletionDecision::Retain(RetentionReason::DagRepresentationUnproven));
     }
 
@@ -858,7 +877,9 @@ mod tests {
         let obligation = get(&conn, "g", "ep0").unwrap().unwrap();
 
         let after_grace = grace_period_nanos() + 1;
-        let decision = evaluate_deletion(&conn, &obligation, after_grace, fp, &NoWriterExclusionProof).unwrap();
+        let decision =
+            evaluate_deletion(&conn, &obligation, after_grace, fp, &NoWriterExclusionProof)
+                .unwrap();
         assert_eq!(decision, DeletionDecision::Retain(RetentionReason::ConflictCopyUnproven));
     }
 
@@ -892,7 +913,9 @@ mod tests {
 
         let obligation = get(&conn, "g", "ep0").unwrap().unwrap();
         let after_grace = grace_period_nanos() + 1;
-        let decision = evaluate_deletion(&conn, &obligation, after_grace, fp, &NoWriterExclusionProof).unwrap();
+        let decision =
+            evaluate_deletion(&conn, &obligation, after_grace, fp, &NoWriterExclusionProof)
+                .unwrap();
         assert_eq!(decision, DeletionDecision::Retain(RetentionReason::ConflictCopyUnproven));
     }
 
@@ -911,7 +934,8 @@ mod tests {
         let custody_path = dir.path().join("custody-ep0");
         std::fs::write(&custody_path, b"retained preimage bytes").unwrap();
         let observed = FileIdentity::observe_path(&custody_path).unwrap();
-        let filesystem_identity = yadorilink_sync_sqlite::file_identity_codec::encode_file_identity(&observed);
+        let filesystem_identity =
+            yadorilink_sync_sqlite::file_identity_codec::encode_file_identity(&observed);
         let custody_path_str = custody_path.to_string_lossy().into_owned();
 
         let mut conn = open();
@@ -943,7 +967,8 @@ mod tests {
         // fixture shape with `AlwaysProvenWriterExclusion` instead) -- only
         // `NoWriterExclusionProof` differs here.
         let decision =
-            evaluate_deletion(&conn, &obligation, after_grace, fp, &NoWriterExclusionProof).unwrap();
+            evaluate_deletion(&conn, &obligation, after_grace, fp, &NoWriterExclusionProof)
+                .unwrap();
         assert_eq!(decision, DeletionDecision::Retain(RetentionReason::WriterExclusionUnproven));
 
         // The gated forward driver must refuse identically, not merely the
@@ -958,10 +983,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(
-                outcome,
-                DeletionOutcome::Retained(RetentionReason::WriterExclusionUnproven)
-            ),
+            matches!(outcome, DeletionOutcome::Retained(RetentionReason::WriterExclusionUnproven)),
             "expected Retained(WriterExclusionUnproven), got {outcome:?}"
         );
         assert!(custody_path.exists(), "an unproven writer-exclusion decision must not unlink");
@@ -977,7 +999,8 @@ mod tests {
         let custody_path = dir.path().join("custody-ep0");
         std::fs::write(&custody_path, b"retained preimage bytes").unwrap();
         let observed = FileIdentity::observe_path(&custody_path).unwrap();
-        let filesystem_identity = yadorilink_sync_sqlite::file_identity_codec::encode_file_identity(&observed);
+        let filesystem_identity =
+            yadorilink_sync_sqlite::file_identity_codec::encode_file_identity(&observed);
         let custody_path_str = custody_path.to_string_lossy().into_owned();
 
         let mut conn = open();
@@ -1005,7 +1028,8 @@ mod tests {
 
         let after_grace = grace_period_nanos() + 1;
         let decision =
-            evaluate_deletion(&conn, &obligation, after_grace, fp, &AlwaysProvenWriterExclusion).unwrap();
+            evaluate_deletion(&conn, &obligation, after_grace, fp, &AlwaysProvenWriterExclusion)
+                .unwrap();
         assert_eq!(decision, DeletionDecision::Eligible);
 
         // Phase one: preparing the intent must not touch disk yet.
@@ -1055,10 +1079,20 @@ mod tests {
         assert_eq!(obligation.state, ObligationState::LocalRecoveryOnly);
 
         let after_grace = grace_period_nanos() + 1;
-        let decision = evaluate_deletion(&conn, &obligation, after_grace, fp, &NoWriterExclusionProof).unwrap();
+        let decision =
+            evaluate_deletion(&conn, &obligation, after_grace, fp, &NoWriterExclusionProof)
+                .unwrap();
         assert_eq!(decision, DeletionDecision::Retain(RetentionReason::LocalRecoveryOnly));
 
-        let outcome = delete_if_eligible_unchecked(&mut conn, "g", "ep0", after_grace, fp, &NoWriterExclusionProof).unwrap();
+        let outcome = delete_if_eligible_unchecked(
+            &mut conn,
+            "g",
+            "ep0",
+            after_grace,
+            fp,
+            &NoWriterExclusionProof,
+        )
+        .unwrap();
         assert!(matches!(outcome, DeletionOutcome::Retained(RetentionReason::LocalRecoveryOnly)));
         assert!(get(&conn, "g", "ep0").unwrap().is_some());
     }
@@ -1091,7 +1125,14 @@ mod tests {
         assert!(obligation.last_captured_version_hash.is_none());
 
         let after_grace = grace_period_nanos() + 1;
-        let decision = evaluate_deletion(&conn, &obligation, after_grace, new_bytes_fp, &NoWriterExclusionProof).unwrap();
+        let decision = evaluate_deletion(
+            &conn,
+            &obligation,
+            after_grace,
+            new_bytes_fp,
+            &NoWriterExclusionProof,
+        )
+        .unwrap();
         assert_eq!(decision, DeletionDecision::Retain(RetentionReason::NoCapturedChange));
 
         // Even re-observing the stale fingerprint (the exploit's actual
@@ -1100,7 +1141,8 @@ mod tests {
         // `Eligible`, since the captured-change pairing is gone regardless
         // of which fingerprint is presented.
         let decision_with_stale_fp =
-            evaluate_deletion(&conn, &obligation, after_grace, stale_fp, &NoWriterExclusionProof).unwrap();
+            evaluate_deletion(&conn, &obligation, after_grace, stale_fp, &NoWriterExclusionProof)
+                .unwrap();
         assert_eq!(
             decision_with_stale_fp,
             DeletionDecision::Retain(RetentionReason::FingerprintChanged)
@@ -1293,7 +1335,14 @@ mod tests {
 
             let deleter = std::thread::spawn(move || {
                 barrier2.wait();
-                delete_if_eligible_unchecked(&mut conn_a, "g", "ep0", after_grace, fp, &NoWriterExclusionProof)
+                delete_if_eligible_unchecked(
+                    &mut conn_a,
+                    "g",
+                    "ep0",
+                    after_grace,
+                    fp,
+                    &NoWriterExclusionProof,
+                )
             });
 
             barrier.wait();

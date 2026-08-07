@@ -67,7 +67,9 @@ pub struct CurrentVersionSnapshot {
 /// foreign to both of them but local to neither -- this crate already
 /// depends on `yadorilink-replica-domain`, so it's the only crate that can
 /// legally own this `From` impl (Rust's orphan rule).
-impl From<CurrentVersionSnapshot> for yadorilink_replica_domain::session_state::CurrentVersionRecord {
+impl From<CurrentVersionSnapshot>
+    for yadorilink_replica_domain::session_state::CurrentVersionRecord
+{
     fn from(snapshot: CurrentVersionSnapshot) -> Self {
         Self {
             blocks: snapshot.blocks,

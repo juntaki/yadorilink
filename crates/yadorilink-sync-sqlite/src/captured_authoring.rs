@@ -306,15 +306,15 @@
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-use yadorilink_filesystem_sync::block_liveness::{BlockLivenessGate, BlockReferenceWriteGuard};
-use yadorilink_replica_domain::change::{ChangeAuth, Op, PutOrigin};
-use yadorilink_replica_domain::ids::{ChangeHash, SyncPath};
 use crate::dag_store::{self, ChangeEmitter, RetentionClass};
 use crate::error::SyncSqliteError;
 use crate::filesystem_transaction;
+use yadorilink_filesystem_sync::block_liveness::{BlockLivenessGate, BlockReferenceWriteGuard};
 use yadorilink_filesystem_sync::single_pass_capture::{
     classify_single_pass, SinglePassCaptureError, SinglePassClassification, StabilityFingerprint,
 };
+use yadorilink_replica_domain::change::{ChangeAuth, Op, PutOrigin};
+use yadorilink_replica_domain::ids::{ChangeHash, SyncPath};
 
 use std::path::Path;
 
@@ -777,12 +777,13 @@ fn validate_candidate_authorization(
         let Some(encoded) = dag_store::get_encoded(conn, parent)? else {
             continue;
         };
-        let parent_change = yadorilink_replica_domain::change::Change::from_wire_bytes(&encoded).map_err(|error| {
-            SyncSqliteError::CorruptState(format!(
-                "captured change's parent {} no longer decodes: {error}",
-                parent.to_hex()
-            ))
-        })?;
+        let parent_change = yadorilink_replica_domain::change::Change::from_wire_bytes(&encoded)
+            .map_err(|error| {
+                SyncSqliteError::CorruptState(format!(
+                    "captured change's parent {} no longer decodes: {error}",
+                    parent.to_hex()
+                ))
+            })?;
         if candidate.auth_seq < parent_change.auth_seq
             || candidate.auth_epoch < parent_change.auth_epoch
         {
@@ -831,12 +832,13 @@ fn version_written_at(
             change_hash.to_hex()
         ))));
     };
-    let change = yadorilink_replica_domain::change::Change::from_wire_bytes(&encoded).map_err(|error| {
-        SyncSqliteError::CorruptState(format!(
-            "receipted captured change {} no longer decodes: {error}",
-            change_hash.to_hex()
-        ))
-    })?;
+    let change =
+        yadorilink_replica_domain::change::Change::from_wire_bytes(&encoded).map_err(|error| {
+            SyncSqliteError::CorruptState(format!(
+                "receipted captured change {} no longer decodes: {error}",
+                change_hash.to_hex()
+            ))
+        })?;
     change
         .ops
         .iter()
@@ -938,7 +940,7 @@ pub fn prepare_captured_change<'gate>(
     gate: &'gate BlockLivenessGate,
     request: CapturedAuthoringRequest<'_>,
 ) -> Result<PrepareOutcome<'gate>, CapturedAuthoringError> {
-    filesystem_transaction::require_execution_enabled().map_err(|e| CapturedAuthoringError::Sync(SyncSqliteError::from(e)))?;
+    filesystem_transaction::require_execution_enabled().map_err(CapturedAuthoringError::Sync)?;
     prepare_captured_change_unchecked(conn, store, gate, request)
 }
 
@@ -1056,7 +1058,7 @@ pub fn admit_prepared_captured_change(
     authorization: CandidateAuthorizationCoordinate,
     prepared: PreparedCapturedChange<'_>,
 ) -> Result<CapturedAuthoringResult, CapturedAuthoringError> {
-    filesystem_transaction::require_execution_enabled().map_err(|e| CapturedAuthoringError::Sync(SyncSqliteError::from(e)))?;
+    filesystem_transaction::require_execution_enabled().map_err(CapturedAuthoringError::Sync)?;
     admit_prepared_captured_change_unchecked(conn, emitter, authorization, prepared)
 }
 
@@ -1243,7 +1245,7 @@ pub fn author_captured_change(
     authorization: CandidateAuthorizationCoordinate,
     request: CapturedAuthoringRequest<'_>,
 ) -> Result<CapturedAuthoringResult, CapturedAuthoringError> {
-    filesystem_transaction::require_execution_enabled().map_err(|e| CapturedAuthoringError::Sync(SyncSqliteError::from(e)))?;
+    filesystem_transaction::require_execution_enabled().map_err(CapturedAuthoringError::Sync)?;
     author_captured_change_unchecked(conn, store, gate, emitter, authorization, request)
 }
 
@@ -1267,11 +1269,11 @@ pub fn author_captured_change_unchecked(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yadorilink_replica_domain::ids::FolderGroupId;
     use crate::dag_store::{emit_local_change, ChangeEmitter};
     use crate::materialized_generation::{self, DiskGenerationBasis, MaterializedObjectKind};
     use ed25519_dalek::SigningKey;
     use yadorilink_local_storage::FsBlockStore;
+    use yadorilink_replica_domain::ids::FolderGroupId;
 
     fn conn() -> Connection {
         let c = Connection::open_in_memory().unwrap();

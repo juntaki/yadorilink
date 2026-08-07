@@ -12,8 +12,8 @@
 
 use std::sync::Arc;
 
-use yadorilink_local_capture::LocalChangeProcessor;
 use crate::sync_error::SyncError;
+use yadorilink_local_capture::LocalChangeProcessor;
 
 use crate::link_runtime::dependencies::LinkRuntimeDependencies;
 
@@ -134,7 +134,10 @@ impl GroupStartupReadyGuard {
     /// Success path: publish `Ready` for this generation and defuse the
     /// fail-closed `Drop`.
     pub(crate) fn mark_ready(&mut self) {
-        self.deps.replica_coordinator.startup_readiness().mark_group_ready(&self.group_id, self.generation);
+        self.deps
+            .replica_coordinator
+            .startup_readiness()
+            .mark_group_ready(&self.group_id, self.generation);
         self.resolved = true;
     }
 
@@ -143,7 +146,11 @@ impl GroupStartupReadyGuard {
     /// unwind this future). Publishes `Failed` for this generation and defuses
     /// the `Drop`.
     pub(crate) fn mark_failed(&mut self, reason: impl Into<String>) {
-        self.deps.replica_coordinator.startup_readiness().mark_group_failed(&self.group_id, self.generation, reason);
+        self.deps.replica_coordinator.startup_readiness().mark_group_failed(
+            &self.group_id,
+            self.generation,
+            reason,
+        );
         self.resolved = true;
     }
 
@@ -210,9 +217,8 @@ mod tests {
         let store_dir = tempfile::tempdir().unwrap();
         let block_store =
             Arc::new(yadorilink_local_storage::FsBlockStore::new(store_dir.path()).unwrap());
-        let replica_coordinator = Arc::new(
-            crate::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap(),
-        );
+        let replica_coordinator =
+            Arc::new(crate::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap());
         Arc::new(LinkRuntimeDependencies {
             replica_coordinator,
             block_store,

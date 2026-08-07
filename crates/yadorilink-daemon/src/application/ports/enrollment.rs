@@ -4,8 +4,11 @@
 //! the control-socket module's own `link` function) and a fake (backed by
 //! in-memory state, for unit tests) can both satisfy them.
 
-use yadorilink_replica_domain::session_state::{EnrollmentOperation, EnrollmentOperationScan, EnrollmentOperationState, FolderLink, PendingEnrollment, PendingEnrollmentScan};
 use crate::sync_error::SyncError;
+use yadorilink_replica_domain::session_state::{
+    EnrollmentOperation, EnrollmentOperationScan, EnrollmentOperationState, FolderLink,
+    PendingEnrollment, PendingEnrollmentScan,
+};
 
 use super::common::BoxFuture;
 use crate::application::model::{

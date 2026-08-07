@@ -280,7 +280,7 @@ impl<'a> From<&'a RecoverySnapshotAfterLookup> for SnapshotAfterLookupJson<'a> {
 enum ShowOutputJson<'a> {
     #[serde(rename = "diagnosed")]
     Diagnosed {
-        operation: RecoveryOperationJson<'a>,
+        operation: Box<RecoveryOperationJson<'a>>,
         remote: RemoteStateJson<'a>,
         recommendation: &'a str,
         reason_codes: &'a [String],
@@ -399,7 +399,7 @@ pub async fn show(domain: &str, operation_id: String, json: bool) -> Result<(), 
                     .as_ref()
                     .expect("local_revision is always set on a Diagnosed outcome");
                 return print_json(&ShowOutputJson::Diagnosed {
-                    operation: op.into(),
+                    operation: Box::new(op.into()),
                     remote: remote.into(),
                     recommendation: &diagnosis.recommendation,
                     reason_codes: &diagnosis.reason_codes,
@@ -606,7 +606,7 @@ mod tests {
         let qualification = d.qualification.as_ref().unwrap();
         let local_revision = d.local_revision.as_ref().unwrap();
         let output = ShowOutputJson::Diagnosed {
-            operation: op.into(),
+            operation: Box::new(op.into()),
             remote: remote.into(),
             recommendation: &d.recommendation,
             reason_codes: &d.reason_codes,

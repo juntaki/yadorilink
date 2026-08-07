@@ -8,13 +8,15 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use support::{connect_two_daemons, ensure_device_signing_key, open_file_backed_replica_coordinator};
+use support::{
+    connect_two_daemons, ensure_device_signing_key, open_file_backed_replica_coordinator,
+};
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::{BlockStore, FsBlockStore};
-use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
-use yadorilink_replica_domain::ids::{BlockHash, VersionHash};
 use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
+use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
+use yadorilink_replica_domain::ids::{BlockHash, VersionHash};
 
 const GROUP: &str = "custody-group";
 
@@ -32,7 +34,11 @@ fn new_daemon(device_id: &str) -> Daemon {
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
     let root = tempfile::tempdir().unwrap();
-    state.replica_coordinator.link_repository().add_link(&root.path().to_string_lossy(), GROUP).unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&root.path().to_string_lossy(), GROUP)
+        .unwrap();
     Daemon { state, _store_dir: store_dir, _index_dir: index_dir, _root: root }
 }
 
@@ -55,7 +61,11 @@ fn new_daemon_with_slow_get(
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
     let root = tempfile::tempdir().unwrap();
-    state.replica_coordinator.link_repository().add_link(&root.path().to_string_lossy(), GROUP).unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&root.path().to_string_lossy(), GROUP)
+        .unwrap();
     (Daemon { state, _store_dir: store_dir, _index_dir: index_dir, _root: root }, slow)
 }
 
@@ -82,7 +92,8 @@ fn put_and_record(daemon: &Daemon, data: &[u8]) -> Vec<u8> {
     daemon
         .state
         .replica_coordinator
-        .change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&hash_bytes))
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash_bytes))
         .unwrap();
     hash_bytes
 }
@@ -118,7 +129,8 @@ async fn custody_is_confirmed_only_when_a_full_replica_holds_the_blocks() {
     let held_record = record_referencing("held.bin", held_bytes.clone(), held.len() as u64);
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &held_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -126,7 +138,8 @@ async fn custody_is_confirmed_only_when_a_full_replica_holds_the_blocks() {
         .unwrap();
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &held_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -139,7 +152,8 @@ async fn custody_is_confirmed_only_when_a_full_replica_holds_the_blocks() {
     let missing_record = record_referencing("missing.bin", vec![7u8; 32], 4);
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &missing_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -147,7 +161,8 @@ async fn custody_is_confirmed_only_when_a_full_replica_holds_the_blocks() {
         .unwrap();
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &missing_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -216,7 +231,8 @@ async fn eviction_custody_does_not_confirm_from_a_retained_only_peer() {
     // (superseded) version.
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &v1_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -224,7 +240,8 @@ async fn eviction_custody_does_not_confirm_from_a_retained_only_peer() {
         .unwrap();
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &v2_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -233,7 +250,8 @@ async fn eviction_custody_does_not_confirm_from_a_retained_only_peer() {
     // B: current is still V1 (it never received the V2 edit).
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &v1_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -315,7 +333,8 @@ async fn confirm_version_present_skips_a_peer_that_never_advertised_the_capabili
 
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record_referencing("held.bin", vec![9u8; 32], 4),
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -396,7 +415,8 @@ async fn no_reclaim_after_membership_epoch_change() {
     let record = record_referencing("epoch.bin", hash_bytes.clone(), content.len() as u64);
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -404,7 +424,8 @@ async fn no_reclaim_after_membership_epoch_change() {
         .unwrap();
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -478,7 +499,8 @@ async fn no_reclaim_from_corrupt_replica_block() {
     let record = record_referencing("corrupt.bin", hash_bytes.clone(), content.len() as u64);
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -486,7 +508,8 @@ async fn no_reclaim_from_corrupt_replica_block() {
         .unwrap();
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -551,7 +574,8 @@ async fn no_confirm_after_block_store_wipe() {
     let record = record_referencing("wiped.bin", hash_bytes.clone(), content.len() as u64);
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -559,7 +583,8 @@ async fn no_confirm_after_block_store_wipe() {
         .unwrap();
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -593,7 +618,13 @@ async fn no_confirm_after_block_store_wipe() {
         !a.state.block_store.exists(&hash_hex).unwrap(),
         "the block must actually be gone from device-a's store after the wipe"
     );
-    let record_after = a.state.replica_coordinator.file_index_repository().get_file(GROUP, "wiped.bin").unwrap().unwrap();
+    let record_after = a
+        .state
+        .replica_coordinator
+        .file_index_repository()
+        .get_file(GROUP, "wiped.bin")
+        .unwrap()
+        .unwrap();
     assert!(
         record_after.blocks.iter().any(|blk| blk.hash == hash_bytes),
         "device-a's index record must still name the (now-absent) block"
@@ -628,7 +659,8 @@ async fn custody_rejects_a_query_whose_version_hash_differs_despite_matching_blo
     let record = record_referencing("meta.bin", hash_bytes.clone(), content.len() as u64);
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -636,7 +668,8 @@ async fn custody_rejects_a_query_whose_version_hash_differs_despite_matching_blo
         .unwrap();
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -696,7 +729,8 @@ async fn custody_binds_the_exec_bit_from_the_atomic_current_row() {
     let record = record_referencing("script.sh", hash_bytes.clone(), content.len() as u64);
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -704,7 +738,8 @@ async fn custody_binds_the_exec_bit_from_the_atomic_current_row() {
         .unwrap();
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -714,7 +749,8 @@ async fn custody_binds_the_exec_bit_from_the_atomic_current_row() {
     // is over exec_bit=true.
     a.state
         .replica_coordinator
-        .file_index_repository().set_exec_bit(
+        .file_index_repository()
+        .set_exec_bit(
             GROUP,
             "script.sh",
             true,

@@ -260,8 +260,13 @@ fn dump_conflict_diagnostic_snapshot(
             "device-{i}: dag_group_heads={:?}\n",
             heads.map(|hs| hs.iter().map(|h| hex::encode(h.0)).collect::<Vec<_>>())
         ));
-        let job =
-            device.state.replica_coordinator.materialization_job_repository().materialization_get_job(group_id, source_path).ok().flatten();
+        let job = device
+            .state
+            .replica_coordinator
+            .materialization_job_repository()
+            .materialization_get_job(group_id, source_path)
+            .ok()
+            .flatten();
         let now_nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)
@@ -283,9 +288,18 @@ fn dump_conflict_diagnostic_snapshot(
         ));
         for (label, hash) in [("winner", winner_hash), ("loser", loser_hash)] {
             let Some(hash) = hash else { continue };
-            let has_change = device.state.replica_coordinator.change_history_repository().dag_has_change(&hash).unwrap_or(false);
-            let has_orphan_or_change =
-                device.state.replica_coordinator.change_history_repository().dag_has_change_or_buffered_orphan(&hash).unwrap_or(false);
+            let has_change = device
+                .state
+                .replica_coordinator
+                .change_history_repository()
+                .dag_has_change(&hash)
+                .unwrap_or(false);
+            let has_orphan_or_change = device
+                .state
+                .replica_coordinator
+                .change_history_repository()
+                .dag_has_change_or_buffered_orphan(&hash)
+                .unwrap_or(false);
             let status = if has_change {
                 "admitted"
             } else if has_orphan_or_change {
@@ -309,7 +323,13 @@ fn dump_conflict_diagnostic_snapshot(
                     match device.state.replica_coordinator.sqlite().dag_get_change(&h) {
                         Ok(Some(change)) => {
                             for parent in &change.parents {
-                                if device.state.replica_coordinator.change_history_repository().dag_has_change(parent).unwrap_or(false) {
+                                if device
+                                    .state
+                                    .replica_coordinator
+                                    .change_history_repository()
+                                    .dag_has_change(parent)
+                                    .unwrap_or(false)
+                                {
                                     stack.push(*parent);
                                 } else {
                                     missing.push(*parent);
@@ -501,7 +521,8 @@ async fn row14_strict_acceptance() {
         let all_quiescent = devices.iter().all(|d| {
             d.state
                 .replica_coordinator
-                .materialization_job_repository().materialization_list_unfinished_jobs()
+                .materialization_job_repository()
+                .materialization_list_unfinished_jobs()
                 .map(|jobs| jobs.is_empty())
                 .unwrap_or(false)
         });
@@ -512,7 +533,12 @@ async fn row14_strict_acceptance() {
     }
 
     for (i, device) in devices.iter().enumerate() {
-        let unfinished = device.state.replica_coordinator.materialization_job_repository().materialization_list_unfinished_jobs().unwrap();
+        let unfinished = device
+            .state
+            .replica_coordinator
+            .materialization_job_repository()
+            .materialization_list_unfinished_jobs()
+            .unwrap();
         assert!(
             unfinished.is_empty(),
             "row14_strict_acceptance: device-{i} has {} non-terminal materialization_jobs row(s) \

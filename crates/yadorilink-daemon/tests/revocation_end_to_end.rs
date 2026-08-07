@@ -20,8 +20,8 @@ use support::{register_with_fake, wait_until};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_orchestrator;
-use yadorilink_local_storage::FsBlockStore;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+use yadorilink_local_storage::FsBlockStore;
 use yadorilink_transport::DeviceKeyPair;
 
 static TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -242,7 +242,7 @@ async fn device_remove_while_peer_offline_is_reflected_on_its_next_subscribe() {
          session to the removed device"
     );
     assert!(
-        !daemon_a.state.peers.reachability(device_b_id).is_some(),
+        daemon_a.state.peers.reachability(device_b_id).is_none(),
         "a removed device must never even appear as connecting/connected in peer status"
     );
 }

@@ -59,8 +59,8 @@ impl DaemonMetrics {
 mod tests {
     use std::sync::Arc;
 
-    use yadorilink_local_storage::FsBlockStore;
     use crate::replica_coordinator::ReplicaCoordinator;
+    use yadorilink_local_storage::FsBlockStore;
 
     use super::*;
     use crate::daemon_state::DaemonState;

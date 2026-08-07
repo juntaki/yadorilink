@@ -45,6 +45,12 @@ pub struct PathLockRegistry {
     locks: Mutex<PathLockMap>,
 }
 
+impl Default for PathLockRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PathLockRegistry {
     pub fn new() -> Self {
         Self { locks: Mutex::new(HashMap::new()) }

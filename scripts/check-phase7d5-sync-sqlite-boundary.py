@@ -9,7 +9,7 @@ remote admission) and why.
 
 Checked here:
 
-- `yadorilink-sync-sqlite`'s `Cargo.toml`/source reference no
+- `yadorilink-sync-sqlite`'s production dependencies/source reference no
   `yadorilink-sync-core`, `yadorilink-daemon`, `yadorilink-peer-session`,
   `yadorilink-transport`, or `yadorilink-sync-wire`.
 - No `Pool<SqliteConnectionManager>` construction or `writer_gate` field
@@ -17,7 +17,8 @@ Checked here:
   `Arc<SyncDatabase>`, never a second pool/writer-gate.
 - `SqliteSyncStore`'s only constructor is `pub fn new(database:
   Arc<SyncDatabase>)` -- no `open`, no `Path`/URL parameter anywhere in its
-  public API.
+  production API. Private helpers inside `#[cfg(test)]` modules may open
+  isolated fixture databases.
 - No public function or trait method in `yadorilink-sync-sqlite` exposes
   `rusqlite::Transaction`/`&Transaction` in its signature -- the physical
   SQLite transaction boundary stays inside this crate, never leaked to a
@@ -56,6 +57,7 @@ from __future__ import annotations
 import argparse
 import re
 import tempfile
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,14 +114,53 @@ REQUIRED_EXCEPTION_FIELDS = (
 def cargo_toml_violations(cargo_toml: Path) -> list[str]:
     if not cargo_toml.is_file():
         return [f"{cargo_toml} does not exist"]
-    text = cargo_toml.read_text(encoding="utf-8")
+    manifest = tomllib.loads(cargo_toml.read_text(encoding="utf-8"))
     failures = []
+    production_dependencies = dict(manifest.get("dependencies", {}))
+    for target in manifest.get("target", {}).values():
+        production_dependencies.update(target.get("dependencies", {}))
     for dep in SYNC_SQLITE_FORBIDDEN_CARGO_DEPS:
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith(f"{dep} ") or stripped.startswith(f"{dep}="):
-                failures.append(f"{cargo_toml} depends on forbidden crate {dep!r}")
+        if dep in production_dependencies:
+            failures.append(f"{cargo_toml} depends on forbidden crate {dep!r}")
     return failures
+
+
+def production_lines(path: Path) -> list[tuple[int, str]]:
+    """Return lines outside items gated exclusively by ``cfg(test)``.
+
+    Unit-test modules may use integration fixtures and private in-memory
+    SQLite connections. ``test-support`` feature items remain in scope.
+    """
+    result: list[tuple[int, str]] = []
+    pending_test_cfg = False
+    skipped_depth: int | None = None
+    depth = 0
+    for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        opens = line.count("{")
+        closes = line.count("}")
+        if skipped_depth is not None:
+            depth += opens - closes
+            if depth <= skipped_depth:
+                skipped_depth = None
+            continue
+        if re.fullmatch(r"\s*#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*", line):
+            pending_test_cfg = True
+            continue
+        if pending_test_cfg:
+            if "{" in line:
+                skipped_depth = depth
+                depth += opens - closes
+                if depth <= skipped_depth:
+                    skipped_depth = None
+                pending_test_cfg = False
+                continue
+            if ";" in line:
+                pending_test_cfg = False
+                continue
+            continue
+        result.append((i, line))
+        depth += opens - closes
+    return result
 
 
 def source_violations(src_dir: Path) -> list[str]:
@@ -127,7 +168,7 @@ def source_violations(src_dir: Path) -> list[str]:
     if not src_dir.is_dir():
         return failures
     for path in sorted(src_dir.rglob("*.rs")):
-        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        for i, line in production_lines(path):
             if COMMENT_LINE.match(line):
                 continue
             for token in SYNC_SQLITE_FORBIDDEN_SOURCE_TOKENS:
@@ -270,6 +311,30 @@ def self_test() -> None:
             ), f"failed to detect Cargo.toml dep {dep!r}"
         reset()
         assert not violations(crate_dir, sync_core_dir, exceptions_file)
+
+        # Test-only integration fixtures may depend on the daemon without
+        # creating a production dependency cycle.
+        (crate_dir / "Cargo.toml").write_text(
+            '[package]\nname = "yadorilink-sync-sqlite"\n\n'
+            "[dependencies]\nyadorilink-sqlite-runtime.workspace = true\n"
+            "[dev-dependencies]\nyadorilink-daemon = \"1\"\n",
+            encoding="utf-8",
+        )
+        assert not violations(crate_dir, sync_core_dir, exceptions_file)
+        reset()
+
+        # A private fixture opener and daemon-backed fixture in a cfg(test)
+        # module are not production construction paths.
+        (src_dir / "store.rs").write_text(
+            "pub struct SqliteSyncStore;\n"
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    fn open() { yadorilink_daemon::fixture(); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        assert not violations(crate_dir, sync_core_dir, exceptions_file)
+        reset()
 
         for token in SYNC_SQLITE_FORBIDDEN_SOURCE_TOKENS:
             (src_dir / "store.rs").write_text(f"fn f() {{ {token}bar(); }}\n", encoding="utf-8")

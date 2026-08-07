@@ -36,28 +36,34 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
 use crate::adaptive_window::AdaptiveWindow;
-use yadorilink_replica_domain::change::Change;
-use yadorilink_replica_domain::file::{FileVersion, VersionBlock};
-use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
-use yadorilink_replica_engine::change_ops::{collect_op_paths, op_version_hash};
+use crate::error::PeerSessionError;
+use crate::hazard;
+use crate::rate_limiter::RateLimiters;
+use yadorilink_local_storage::check_disk_headroom;
 use yadorilink_local_storage::{
     apply_exec_bit, reconstruct_file, verify_delete_target_within_canonical_root,
     verify_delete_target_within_root, verify_write_target_within_canonical_root,
     verify_write_target_within_root, write_placeholder,
 };
-use yadorilink_replica_engine::conflict::{change_touches_path, path_head_from_change, resolve_path_heads, PathHead, PathResolution};
 use yadorilink_replica_domain::admission::ChangeOrdering;
-use crate::error::PeerSessionError;
-use crate::hazard;
-use yadorilink_root_authority::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
-use yadorilink_replica_domain::session_state::LinkGate;
-use yadorilink_local_storage::check_disk_headroom;
-use yadorilink_replica_engine::outcomes::{CausalAuthOutcome, ChangeAdmissionOutcome, ChangeAdmissionRejection};
-use crate::rate_limiter::RateLimiters;
-use yadorilink_replica_domain::rebootstrap::RebootstrapRequired;
-use yadorilink_root_authority::root_commit::RootCommitPermit;
-use yadorilink_replica_domain::session_state::{MaterializationPolicy, MaterializationState};
+use yadorilink_replica_domain::change::Change;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
+use yadorilink_replica_domain::file::{FileVersion, VersionBlock};
+use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
+use yadorilink_replica_domain::rebootstrap::RebootstrapRequired;
+use yadorilink_replica_domain::session_state::LinkGate;
+use yadorilink_replica_domain::session_state::{MaterializationPolicy, MaterializationState};
+use yadorilink_replica_engine::change_ops::{collect_op_paths, op_version_hash};
+use yadorilink_replica_engine::conflict::{
+    change_touches_path, path_head_from_change, resolve_path_heads, PathHead, PathResolution,
+};
+use yadorilink_replica_engine::outcomes::{
+    CausalAuthOutcome, ChangeAdmissionOutcome, ChangeAdmissionRejection,
+};
+use yadorilink_root_authority::ignore_patterns::{
+    is_ignore_file_relative_path, EffectiveIgnoreSet,
+};
+use yadorilink_root_authority::root_commit::RootCommitPermit;
 
 /// Mirrors `yadorilink-sync-core`'s own `chunker::MAX_BLOCK_SIZE` (moved
 /// out of this file's scope in Phase 7D-6's crate split) as a `usize` --
@@ -609,16 +615,29 @@ impl Drop for PendingBlockGuard<'_> {
 /// tested, and ready, but a symlink genuinely cannot cross the wire from
 /// a peer that classified it during section 2's scan/watch path on a
 /// *different* device.
-fn materialize_symlink_at(
-    state: &dyn crate::ports::PeerReplicaStatePort,
-    root: &Path,
-    group_id: &str,
-    record: &FileRecord,
+struct SymlinkMaterialization<'a, 'permit> {
+    state: &'a dyn crate::ports::PeerReplicaStatePort,
+    root: &'a Path,
+    group_id: &'a str,
     windows_opt_in: bool,
-    origin_device_id: &str,
-    authoring_change_hash: Option<&ChangeHash>,
-    permit: &RootCommitPermit<'_>,
+    origin_device_id: &'a str,
+    authoring_change_hash: Option<&'a ChangeHash>,
+    permit: &'a RootCommitPermit<'permit>,
+}
+
+fn materialize_symlink_at(
+    context: SymlinkMaterialization<'_, '_>,
+    record: &FileRecord,
 ) -> Result<(), PeerSessionError> {
+    let SymlinkMaterialization {
+        state,
+        root,
+        group_id,
+        windows_opt_in,
+        origin_device_id,
+        authoring_change_hash,
+        permit,
+    } = context;
     match authoring_change_hash {
         Some(hash) => state.upsert_file_with_origin_and_author(
             group_id,
@@ -672,7 +691,7 @@ fn materialize_symlink_at(
         // correctly onward to a POSIX peer), but nothing is written to
         // disk here unless this link explicitly opted in.
         if windows_opt_in {
-            yadorilink_local_storage::materialize_symlink_windows(&out_path, &target)
+            Ok(yadorilink_local_storage::materialize_symlink_windows(&out_path, &target)?)
         } else {
             Ok(())
         }
@@ -941,7 +960,10 @@ pub trait PendingLocalChangeFlush: Send + Sync {
 /// exactly like any other "this link isn't available" failure, never
 /// synthesize a permissive fallback lease.
 pub trait RootCommitAuthorityProvider: Send + Sync {
-    fn root_lease_for(&self, group_id: &str) -> Option<Arc<yadorilink_root_authority::root_commit::RootLease>>;
+    fn root_lease_for(
+        &self,
+        group_id: &str,
+    ) -> Option<Arc<yadorilink_root_authority::root_commit::RootLease>>;
 }
 
 /// Test-only default installed by [`PeerSyncSession::new_with_forwarding`]
@@ -959,7 +981,10 @@ struct AlwaysValidRootCommitAuthorityProvider;
 
 #[cfg(any(test, feature = "test-support"))]
 impl RootCommitAuthorityProvider for AlwaysValidRootCommitAuthorityProvider {
-    fn root_lease_for(&self, _group_id: &str) -> Option<Arc<yadorilink_root_authority::root_commit::RootLease>> {
+    fn root_lease_for(
+        &self,
+        _group_id: &str,
+    ) -> Option<Arc<yadorilink_root_authority::root_commit::RootLease>> {
         Some(Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()))
     }
 }
@@ -977,7 +1002,10 @@ impl RootCommitAuthorityProvider for AlwaysValidRootCommitAuthorityProvider {
 struct DenyRootCommitAuthorityProvider;
 
 impl RootCommitAuthorityProvider for DenyRootCommitAuthorityProvider {
-    fn root_lease_for(&self, _group_id: &str) -> Option<Arc<yadorilink_root_authority::root_commit::RootLease>> {
+    fn root_lease_for(
+        &self,
+        _group_id: &str,
+    ) -> Option<Arc<yadorilink_root_authority::root_commit::RootLease>> {
         None
     }
 }
@@ -2324,17 +2352,20 @@ impl PeerSyncSession {
             })
             .collect();
         let live_authorized_groups = LiveGroupAuthorization::new(&shared_group_ids);
-        let replica_state_adapter =
-            std::sync::Arc::new(crate::replica_engine_ports::PeerReplicaStateAdapter(state.clone()));
+        let replica_state_adapter = std::sync::Arc::new(
+            crate::replica_engine_ports::PeerReplicaStateAdapter(state.clone()),
+        );
         let replica_engine = yadorilink_replica_engine::PeerReplicaEngine::new(
             yadorilink_replica_engine::ReplicaEngineDependencies {
                 history: replica_state_adapter.clone(),
                 admission: replica_state_adapter.clone(),
                 frontier: replica_state_adapter,
-                durability: std::sync::Arc::new(crate::replica_engine_ports::DurabilityEvidenceAdapter {
-                    state: state.clone(),
-                    store: store.clone(),
-                }),
+                durability: std::sync::Arc::new(
+                    crate::replica_engine_ports::DurabilityEvidenceAdapter {
+                        state: state.clone(),
+                        store: store.clone(),
+                    },
+                ),
             },
         );
         Arc::new(Self {
@@ -2455,7 +2486,10 @@ impl PeerSyncSession {
     /// with a deny-by-default provider (see `PeerSyncSessionOneTimeDeps::
     /// denied`), which reports no live link for every group and so hits
     /// this same `NotFound` outcome unconditionally.
-    fn root_lease_for(&self, group_id: &str) -> Result<Arc<yadorilink_root_authority::root_commit::RootLease>, PeerSessionError> {
+    fn root_lease_for(
+        &self,
+        group_id: &str,
+    ) -> Result<Arc<yadorilink_root_authority::root_commit::RootLease>, PeerSessionError> {
         self.root_commit_authority_provider.root_lease_for(group_id).ok_or_else(|| {
             PeerSessionError::NotFound(format!(
                 "no live root-commit authority for group {group_id} (no established link, \
@@ -2487,7 +2521,10 @@ impl PeerSyncSession {
         // trace line here means the guard never ran on that route at all,
         // which is a different bug from it running and finding nothing.
         crate::dst_trace(rel_path, || {
-            format!("flush guard entered on {} (peer={})", self.local_device_id, self.peer_device_id)
+            format!(
+                "flush guard entered on {} (peer={})",
+                self.local_device_id, self.peer_device_id
+            )
         });
         tracing::debug!(
             group_id,
@@ -3297,14 +3334,18 @@ impl PeerSyncSession {
     /// resulting bytes over `channel`. The sole way to send an outbound
     /// message (Phase 7C.5 commit 4) -- every send call site in this file
     /// now builds an `OutboundFrame`, not `proto::SyncMessage` directly.
-    async fn send_frame(&self, frame: yadorilink_sync_wire::OutboundFrame) -> Result<(), PeerSessionError> {
+    async fn send_frame(
+        &self,
+        frame: yadorilink_sync_wire::OutboundFrame,
+    ) -> Result<(), PeerSessionError> {
         // Never expected in practice -- every OutboundFrame variant maps to
         // a real proto message (see ProtobufPeerWireCodec::encode's own
         // doc comment) -- but WireError isn't a PeerSessionError variant (peer_wire
         // is a lower-level, protobuf-free-boundary module that must not
         // know about this crate's own top-level error type), so an encode
         // failure still needs an explicit conversion.
-        let bytes = self.codec.encode(frame).map_err(|e| PeerSessionError::InvalidInput(e.to_string()))?;
+        let bytes =
+            self.codec.encode(frame).map_err(|e| PeerSessionError::InvalidInput(e.to_string()))?;
         self.channel.send(bytes).await?;
         Ok(())
     }
@@ -3495,7 +3536,9 @@ impl PeerSyncSession {
     /// exercised by `change_emitter_defaults_to_none_and_set_change_emitter_
     /// installs_one` below.
     #[allow(dead_code)]
-    pub fn change_emitter(&self) -> Option<Arc<yadorilink_replica_domain::admission::ChangeEmitter>> {
+    pub fn change_emitter(
+        &self,
+    ) -> Option<Arc<yadorilink_replica_domain::admission::ChangeEmitter>> {
         self.change_emitter.clone()
     }
 
@@ -3805,7 +3848,9 @@ impl PeerSyncSession {
             .state
             .list_files(group_id)?
             .into_iter()
-            .filter(|r| !r.deleted && yadorilink_replica_domain::conflict::is_conflict_copy_path(&r.path))
+            .filter(|r| {
+                !r.deleted && yadorilink_replica_domain::conflict::is_conflict_copy_path(&r.path)
+            })
             .collect();
         if copy_shaped.is_empty() {
             return Ok(());
@@ -4001,7 +4046,11 @@ impl PeerSyncSession {
         .await
     }
 
-    async fn request_changes(&self, group_id: &str, want: &[ChangeHash]) -> Result<(), PeerSessionError> {
+    async fn request_changes(
+        &self,
+        group_id: &str,
+        want: &[ChangeHash],
+    ) -> Result<(), PeerSessionError> {
         if want.is_empty() {
             return Ok(());
         }
@@ -4103,16 +4152,20 @@ impl PeerSyncSession {
             );
             return None;
         };
-        let public_key = match yadorilink_replica_domain::change::verifying_key_from_bytes(&key_bytes) {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::warn!(error = %e, "pinned signing key is malformed; dropping change");
-                return None;
-            }
-        };
-        if let Err(e) =
-            yadorilink_replica_domain::change::verify_change(&change, &claimed_hash, &public_key, |_, _| true)
-        {
+        let public_key =
+            match yadorilink_replica_domain::change::verifying_key_from_bytes(&key_bytes) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!(error = %e, "pinned signing key is malformed; dropping change");
+                    return None;
+                }
+            };
+        if let Err(e) = yadorilink_replica_domain::change::verify_change(
+            &change,
+            &claimed_hash,
+            &public_key,
+            |_, _| true,
+        ) {
             tracing::warn!(
                 group_id,
                 author = %change.device_id.as_str(),
@@ -5320,9 +5373,7 @@ impl PeerSyncSession {
                 self.handle_version_present_ack(ack);
                 Ok(())
             }
-            InboundFrame::HandoffLeaseRequest(req) => {
-                self.handle_handoff_lease_request(req).await
-            }
+            InboundFrame::HandoffLeaseRequest(req) => self.handle_handoff_lease_request(req).await,
             InboundFrame::HandoffLeaseGrant(grant) => {
                 self.handle_handoff_lease_grant(grant);
                 Ok(())
@@ -5383,7 +5434,11 @@ impl PeerSyncSession {
     /// examination` and `try_send_block_reply_busy` both exist to prevent.
     /// See `try_send_block_reply_busy`'s own doc for why `bool` (a dropped
     /// best-effort reply is expected, not an error to propagate).
-    fn try_send_block_request_rejected(&self, req: &yadorilink_sync_wire::BlockRequestFrame, reason: &str) -> bool {
+    fn try_send_block_request_rejected(
+        &self,
+        req: &yadorilink_sync_wire::BlockRequestFrame,
+        reason: &str,
+    ) -> bool {
         self.try_send_frame(Self::block_request_rejected_frame(req, reason))
     }
 
@@ -5391,13 +5446,15 @@ impl PeerSyncSession {
         req: &yadorilink_sync_wire::BlockRequestFrame,
         reason: &str,
     ) -> yadorilink_sync_wire::OutboundFrame {
-        yadorilink_sync_wire::OutboundFrame::BlockReply(yadorilink_sync_wire::BlockReplyOutboundFrame {
-            block_hash: req.block_hash.clone(),
-            outcome: yadorilink_sync_wire::BlockReplyOutboundOutcome::Rejected {
-                reason: reason.to_string(),
+        yadorilink_sync_wire::OutboundFrame::BlockReply(
+            yadorilink_sync_wire::BlockReplyOutboundFrame {
+                block_hash: req.block_hash.clone(),
+                outcome: yadorilink_sync_wire::BlockReplyOutboundOutcome::Rejected {
+                    reason: reason.to_string(),
+                },
+                request_id: req.request_id,
             },
-            request_id: req.request_id,
-        })
+        )
     }
 
     /// Non-blocking "don't have it" reply for `req` — a soft, possibly
@@ -5407,18 +5464,23 @@ impl PeerSyncSession {
     /// failures. See `try_send_block_request_rejected`'s own doc for why
     /// this is non-blocking: its only caller runs before `examination_
     /// permits` is dropped.
-    fn try_send_block_request_dont_have(&self, req: &yadorilink_sync_wire::BlockRequestFrame) -> bool {
+    fn try_send_block_request_dont_have(
+        &self,
+        req: &yadorilink_sync_wire::BlockRequestFrame,
+    ) -> bool {
         self.try_send_frame(Self::block_request_dont_have_frame(req))
     }
 
     fn block_request_dont_have_frame(
         req: &yadorilink_sync_wire::BlockRequestFrame,
     ) -> yadorilink_sync_wire::OutboundFrame {
-        yadorilink_sync_wire::OutboundFrame::BlockReply(yadorilink_sync_wire::BlockReplyOutboundFrame {
-            block_hash: req.block_hash.clone(),
-            outcome: yadorilink_sync_wire::BlockReplyOutboundOutcome::DontHave,
-            request_id: req.request_id,
-        })
+        yadorilink_sync_wire::OutboundFrame::BlockReply(
+            yadorilink_sync_wire::BlockReplyOutboundFrame {
+                block_hash: req.block_hash.clone(),
+                outcome: yadorilink_sync_wire::BlockReplyOutboundOutcome::DontHave,
+                request_id: req.request_id,
+            },
+        )
     }
 
     async fn handle_block_request(
@@ -5817,14 +5879,16 @@ impl PeerSyncSession {
         req: &yadorilink_sync_wire::BlockRequestFrame,
         busy: crate::block_serve::ServeBusy,
     ) -> yadorilink_sync_wire::OutboundFrame {
-        yadorilink_sync_wire::OutboundFrame::BlockReply(yadorilink_sync_wire::BlockReplyOutboundFrame {
-            block_hash: req.block_hash.clone(),
-            outcome: yadorilink_sync_wire::BlockReplyOutboundOutcome::Busy {
-                retry_after_ms: busy.retry_after_ms,
-                queue_depth: busy.queue_depth,
+        yadorilink_sync_wire::OutboundFrame::BlockReply(
+            yadorilink_sync_wire::BlockReplyOutboundFrame {
+                block_hash: req.block_hash.clone(),
+                outcome: yadorilink_sync_wire::BlockReplyOutboundOutcome::Busy {
+                    retry_after_ms: busy.retry_after_ms,
+                    queue_depth: busy.queue_depth,
+                },
+                request_id: req.request_id,
             },
-            request_id: req.request_id,
-        })
+        )
     }
 
     /// The block's own declared size, from the live `FileRecord`'s block
@@ -5835,7 +5899,10 @@ impl PeerSyncSession {
     /// after the version this hash belongs to was last live), which
     /// exposes no size without a real read; the caller falls back to a
     /// pessimistic estimate in that case.
-    fn block_request_declared_size(&self, req: &yadorilink_sync_wire::BlockRequestFrame) -> Option<u32> {
+    fn block_request_declared_size(
+        &self,
+        req: &yadorilink_sync_wire::BlockRequestFrame,
+    ) -> Option<u32> {
         let record = self.state.get_file(&req.folder_group_id, &req.file_path).ok().flatten()?;
         if record.deleted {
             return None;
@@ -5843,7 +5910,10 @@ impl PeerSyncSession {
         record.blocks.iter().find(|block| block.hash == req.block_hash).map(|block| block.size)
     }
 
-    fn block_request_is_referenced(&self, req: &yadorilink_sync_wire::BlockRequestFrame) -> Result<bool, PeerSessionError> {
+    fn block_request_is_referenced(
+        &self,
+        req: &yadorilink_sync_wire::BlockRequestFrame,
+    ) -> Result<bool, PeerSessionError> {
         if let Some(record) = self.state.get_file(&req.folder_group_id, &req.file_path)? {
             if !record.deleted && record.blocks.iter().any(|block| block.hash == req.block_hash) {
                 return Ok(true);
@@ -6402,7 +6472,8 @@ impl PeerSyncSession {
                 snapshot_bytes: Vec::new(),
             },
         };
-        self.send_frame(yadorilink_sync_wire::OutboundFrame::RebootstrapSnapshotResponse(reply)).await
+        self.send_frame(yadorilink_sync_wire::OutboundFrame::RebootstrapSnapshotResponse(reply))
+            .await
     }
 
     /// Resolves the pending `request_rebootstrap_snapshot_from_peer`
@@ -7454,14 +7525,16 @@ impl PeerSyncSession {
                                 let windows_opt_in =
                                     self.state.windows_symlink_opt_in_for_group(group_id)?;
                                 materialize_symlink_at(
-                                    self.state.as_ref(),
-                                    &self.sync_root(group_id)?,
-                                    group_id,
+                                    SymlinkMaterialization {
+                                        state: self.state.as_ref(),
+                                        root: &self.sync_root(group_id)?,
+                                        group_id,
+                                        windows_opt_in,
+                                        origin_device_id: &incoming_origin,
+                                        authoring_change_hash: Some(incoming_author),
+                                        permit: &root_commit_permit,
+                                    },
                                     &local,
-                                    windows_opt_in,
-                                    &incoming_origin,
-                                    Some(incoming_author),
-                                    &root_commit_permit,
                                 )?;
                             }
                             // Nothing physical to reapply for a
@@ -7906,7 +7979,6 @@ impl PeerSyncSession {
             ),
             None => self.state.upsert_file_with_origin(group_id, record, origin_device_id, &permit),
         }
-        .map_err(PeerSessionError::from)
     }
 
     pub async fn materialize(
@@ -7971,9 +8043,11 @@ impl PeerSyncSession {
         // materialization just created at the same path — two processes each
         // believing they exclusively own this sync root, exactly the state
         // `sync_root_lock` exists to make unreachable.
-        if yadorilink_root_authority::reserved_namespace::path_has_artefact_component_in_wire_path(&record.path)
-            || yadorilink_root_authority::sync_root_lock::wire_path_names_sync_root_lock(&record.path)
-        {
+        if yadorilink_root_authority::reserved_namespace::path_has_artefact_component_in_wire_path(
+            &record.path,
+        ) || yadorilink_root_authority::sync_root_lock::wire_path_names_sync_root_lock(
+            &record.path,
+        ) {
             return Err(PeerSessionError::ReservedNamespaceCollision(record.path.clone()));
         }
         // Same defense-in-depth reasoning as the reserved-artefact/lock
@@ -7987,7 +8061,9 @@ impl PeerSyncSession {
         // must not get a second chance to reach disk here — writing it
         // would let this path silently alias a different on-disk name than
         // the one this device's own index believes it just materialized.
-        if yadorilink_root_authority::reserved_namespace::path_has_non_portable_wire_component(&record.path) {
+        if yadorilink_root_authority::reserved_namespace::path_has_non_portable_wire_component(
+            &record.path,
+        ) {
             return Err(PeerSessionError::NonPortablePath(record.path.clone()));
         }
         // Computed once, ahead of every
@@ -8235,14 +8311,16 @@ impl PeerSyncSession {
             self.state.clear_held(group_id, &record.path)?;
             let windows_opt_in = self.state.windows_symlink_opt_in_for_group(group_id)?;
             materialize_symlink_at(
-                self.state.as_ref(),
-                &self.sync_root(group_id)?,
-                group_id,
+                SymlinkMaterialization {
+                    state: self.state.as_ref(),
+                    root: &self.sync_root(group_id)?,
+                    group_id,
+                    windows_opt_in,
+                    origin_device_id,
+                    authoring_change_hash,
+                    permit: &root_commit_permit,
+                },
                 record,
-                windows_opt_in,
-                origin_device_id,
-                authoring_change_hash,
-                &root_commit_permit,
             )?;
             return Ok(MaterializeResult::Settled);
         }
@@ -8637,8 +8715,12 @@ impl PeerSyncSession {
             const MAX_RECONSTRUCT_RETRIES: u32 = 20;
             const RECONSTRUCT_RETRY_BACKOFF: std::time::Duration =
                 std::time::Duration::from_millis(50);
-            let mut recon =
-                reconstruct_file(self.store.as_ref(), &out_path, &record.blocks, record.mtime_unix_nanos);
+            let mut recon = reconstruct_file(
+                self.store.as_ref(),
+                &out_path,
+                &record.blocks,
+                record.mtime_unix_nanos,
+            );
             let mut attempts = 0u32;
             while recon.is_err() && attempts < MAX_RECONSTRUCT_RETRIES {
                 attempts += 1;
@@ -8656,8 +8738,12 @@ impl PeerSyncSession {
                 // (not a demotion to `Placeholder`) since a replaced root
                 // is not a transient, retriable condition.
                 self.verify_write_target(group_id, &out_path)?;
-                recon =
-                    reconstruct_file(self.store.as_ref(), &out_path, &record.blocks, record.mtime_unix_nanos);
+                recon = reconstruct_file(
+                    self.store.as_ref(),
+                    &out_path,
+                    &record.blocks,
+                    record.mtime_unix_nanos,
+                );
             }
             if let Err(e) = recon {
                 tracing::warn!(
@@ -8792,7 +8878,11 @@ impl PeerSyncSession {
     /// device no longer has is not harmless: a later relink's startup scan
     /// would find an index entry with no file on disk and read that as a local
     /// deletion to propagate to the peers that still have it.
-    fn may_apply_incoming_change(&self, group_id: &str, what: &str) -> Result<bool, PeerSessionError> {
+    fn may_apply_incoming_change(
+        &self,
+        group_id: &str,
+        what: &str,
+    ) -> Result<bool, PeerSessionError> {
         match self.state.link_gate_for_group(group_id)? {
             LinkGate::Live { .. } => Ok(true),
             LinkGate::Paused { .. } => {
@@ -8905,7 +8995,11 @@ impl PeerSyncSession {
     /// callers, in one place — cheap enough to run unconditionally: one
     /// canonicalize, one lock, and one marker-file read, not a directory
     /// walk.
-    pub fn verify_write_target(&self, group_id: &str, out_path: &Path) -> Result<(), PeerSessionError> {
+    pub fn verify_write_target(
+        &self,
+        group_id: &str,
+        out_path: &Path,
+    ) -> Result<(), PeerSessionError> {
         // Resolve the root first and fail closed on an unknown group: with the
         // old empty-path default, `out_path` was a bare relative filename whose
         // parent is `""` -- exactly the empty root -- so the fast path below
@@ -8948,7 +9042,11 @@ impl PeerSyncSession {
     /// write version. Also re-runs `VerifiedRoot::verify` for the same
     /// reason `verify_write_target` does — see that function's own doc
     /// comment.
-    fn verify_delete_target(&self, group_id: &str, out_path: &Path) -> Result<(), PeerSessionError> {
+    fn verify_delete_target(
+        &self,
+        group_id: &str,
+        out_path: &Path,
+    ) -> Result<(), PeerSessionError> {
         let raw_root = self.sync_root(group_id)?;
         let raw_root = raw_root.as_path();
         self.state.verify_root(raw_root, group_id)?;
@@ -9382,6 +9480,7 @@ mod eager_admission_tests {
 mod symlink_and_metadata_only_update_tests {
     use super::{
         materialize_symlink_at, try_apply_metadata_only_update, BlockInfo, FileRecord, RecordKind,
+        SymlinkMaterialization,
     };
     use crate::ports::PeerReplicaStatePort;
     use crate::test_support::FakeReplicaState;
@@ -9417,11 +9516,29 @@ mod symlink_and_metadata_only_update_tests {
         state.add_link(Some(root.path()), "group-1");
         let record = symlink_record("link.txt");
         state.seed_file("group-1", &record);
-        state.set_record_kind("group-1", "link.txt", RecordKind::Symlink, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+        state
+            .set_record_kind(
+                "group-1",
+                "link.txt",
+                RecordKind::Symlink,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
         state.set_symlink_target("group-1", "link.txt", Some(b"target.txt")).unwrap();
 
-        materialize_symlink_at(&state, root.path(), "group-1", &record, false, "device-a", None, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests())
-            .unwrap();
+        materialize_symlink_at(
+            SymlinkMaterialization {
+                state: &state,
+                root: root.path(),
+                group_id: "group-1",
+                windows_opt_in: false,
+                origin_device_id: "device-a",
+                authoring_change_hash: None,
+                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            },
+            &record,
+        )
+        .unwrap();
 
         let out_path = root.path().join("link.txt");
         assert!(
@@ -9445,21 +9562,32 @@ mod symlink_and_metadata_only_update_tests {
         state.add_link(Some(root.path()), "group-1");
         let record = symlink_record("link.txt");
         state.seed_file("group-1", &record);
-        state.set_record_kind("group-1", "link.txt", RecordKind::Symlink, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+        state
+            .set_record_kind(
+                "group-1",
+                "link.txt",
+                RecordKind::Symlink,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
         state.set_symlink_target("group-1", "link.txt", Some(b"target.txt")).unwrap();
 
-        std::fs::remove_file(root.path().join(yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME))
-            .unwrap();
+        std::fs::remove_file(
+            root.path().join(yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME),
+        )
+        .unwrap();
 
         let result = materialize_symlink_at(
-            &state,
-            root.path(),
-            "group-1",
+            SymlinkMaterialization {
+                state: &state,
+                root: root.path(),
+                group_id: "group-1",
+                windows_opt_in: false,
+                origin_device_id: "device-a",
+                authoring_change_hash: None,
+                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            },
             &record,
-            false,
-            "device-a",
-            None,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         );
         assert!(
             result.is_err(),
@@ -9487,21 +9615,32 @@ mod symlink_and_metadata_only_update_tests {
         state.add_link(Some(root.path()), "group-1");
         let record = symlink_record("sub/nested/link.txt");
         state.seed_file("group-1", &record);
-        state.set_record_kind("group-1", "sub/nested/link.txt", RecordKind::Symlink, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+        state
+            .set_record_kind(
+                "group-1",
+                "sub/nested/link.txt",
+                RecordKind::Symlink,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
         state.set_symlink_target("group-1", "sub/nested/link.txt", Some(b"target.txt")).unwrap();
 
-        std::fs::remove_file(root.path().join(yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME))
-            .unwrap();
+        std::fs::remove_file(
+            root.path().join(yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME),
+        )
+        .unwrap();
 
         let result = materialize_symlink_at(
-            &state,
-            root.path(),
-            "group-1",
+            SymlinkMaterialization {
+                state: &state,
+                root: root.path(),
+                group_id: "group-1",
+                windows_opt_in: false,
+                origin_device_id: "device-a",
+                authoring_change_hash: None,
+                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            },
             &record,
-            false,
-            "device-a",
-            None,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         );
         assert!(
             result.is_err(),
@@ -9525,11 +9664,29 @@ mod symlink_and_metadata_only_update_tests {
         state.add_link(Some(root.path()), "group-1");
         let record = symlink_record("mystery-link");
         state.seed_file("group-1", &record);
-        state.set_record_kind("group-1", "mystery-link", RecordKind::Symlink, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+        state
+            .set_record_kind(
+                "group-1",
+                "mystery-link",
+                RecordKind::Symlink,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
         // symlink_target deliberately left unset.
 
-        materialize_symlink_at(&state, root.path(), "group-1", &record, false, "device-a", None, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests())
-            .unwrap();
+        materialize_symlink_at(
+            SymlinkMaterialization {
+                state: &state,
+                root: root.path(),
+                group_id: "group-1",
+                windows_opt_in: false,
+                origin_device_id: "device-a",
+                authoring_change_hash: None,
+                permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            },
+            &record,
+        )
+        .unwrap();
 
         assert!(
             !root.path().join("mystery-link").exists(),
@@ -9565,7 +9722,14 @@ mod symlink_and_metadata_only_update_tests {
         // Simulates this device's own index already knowing the target
         // exec bit for this path — see `try_apply_metadata_only_update`'s
         // doc comment on the wire-schema gap this stands in for.
-        state.set_exec_bit("group-1", "script.sh", true, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+        state
+            .set_exec_bit(
+                "group-1",
+                "script.sh",
+                true,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
 
         let mut incoming = local.clone();
         incoming.mtime_unix_nanos = 999;
@@ -9607,10 +9771,19 @@ mod symlink_and_metadata_only_update_tests {
 
         let out_path = root.path().join("script.sh");
         std::fs::write(&out_path, b"hello").unwrap();
-        state.set_exec_bit("group-1", "script.sh", true, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
-
-        std::fs::remove_file(root.path().join(yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME))
+        state
+            .set_exec_bit(
+                "group-1",
+                "script.sh",
+                true,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
             .unwrap();
+
+        std::fs::remove_file(
+            root.path().join(yadorilink_replica_domain::reserved_paths::ROOT_MARKER_FILE_NAME),
+        )
+        .unwrap();
 
         let mut incoming = local.clone();
         incoming.mtime_unix_nanos = 999;
@@ -9943,7 +10116,16 @@ mod hazard_reason_tests {
             hazard_reason_for_policy(&state, root.path(), "group-1", &incoming, NamePolicy::Posix)
                 .unwrap()
                 .expect("case-fold collision must be detected");
-        hold_record(&state, "group-1", &incoming, &reason, "device-a", None, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+        hold_record(
+            &state,
+            "group-1",
+            &incoming,
+            &reason,
+            "device-a",
+            None,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
         let mut entries: Vec<String> = std::fs::read_dir(root.path())
             .unwrap()
@@ -10039,7 +10221,11 @@ mod compression_codec_tests {
     fn compress_then_decompress_round_trips_exactly() {
         let data = "abcdefgh".repeat(20_000);
         let (out, compression) = compress_block(data.as_bytes());
-        assert_eq!(compression, yadorilink_sync_wire::COMPRESSION_ZSTD, "sanity: this input must compress");
+        assert_eq!(
+            compression,
+            yadorilink_sync_wire::COMPRESSION_ZSTD,
+            "sanity: this input must compress"
+        );
 
         let recovered = decompress_block(&out, compression, 10 * 1024 * 1024).unwrap();
         assert_eq!(recovered, data.as_bytes());
@@ -10098,7 +10284,8 @@ mod compression_codec_tests {
     #[test]
     fn corrupt_non_zstd_payload_is_rejected() {
         let garbage = vec![0xFFu8; 128];
-        let result = decompress_block(&garbage, yadorilink_sync_wire::COMPRESSION_ZSTD, 1024 * 1024);
+        let result =
+            decompress_block(&garbage, yadorilink_sync_wire::COMPRESSION_ZSTD, 1024 * 1024);
         assert!(result.is_err());
     }
 
@@ -10110,7 +10297,8 @@ mod compression_codec_tests {
     fn decompressed_size_exactly_at_the_bound_is_accepted() {
         let data = vec![0x7Au8; 1024];
         let compressed = zstd::stream::encode_all(data.as_slice(), 3).unwrap();
-        let recovered = decompress_block(&compressed, yadorilink_sync_wire::COMPRESSION_ZSTD, 1024).unwrap();
+        let recovered =
+            decompress_block(&compressed, yadorilink_sync_wire::COMPRESSION_ZSTD, 1024).unwrap();
         assert_eq!(recovered, data);
     }
 }
@@ -10188,7 +10376,9 @@ mod compression_benchmark {
 
 #[cfg(test)]
 mod dag_resolution_tests {
-    use yadorilink_replica_engine::conflict::{resolve_path_heads, ConflictCopy, PathHead, PathHeadContent, PathResolution};
+    use yadorilink_replica_engine::conflict::{
+        resolve_path_heads, ConflictCopy, PathHead, PathHeadContent, PathResolution,
+    };
 
     fn content_head(hash_byte: u8, lamport: u64, device: &str, mtime: i64) -> PathHead {
         PathHead {
@@ -10352,8 +10542,7 @@ mod dag_resolution_tests {
 /// arrival of its parent — in the SAME batch — both applies the parent and
 /// promotes the child, so both changes' paths must materialize in that one
 /// call rather than waiting for the periodic reprojection audit.
-
-
+///
 /// Deterministic regression coverage for the flush-before-reconcile guard on
 /// the DAG `ChangeBatch` admission/projection path — the counterpart to the
 /// wire-driven `tests/dst_peer_reconcile_race.rs`, but exercising
@@ -10376,8 +10565,7 @@ mod dag_resolution_tests {
 ///   ahead of the Absent (tombstone) resolution in `reconcile_group_paths`
 ///   can capture P's pending edit before the delete — without it, P is
 ///   silently deleted.
-
-
+///
 /// `ClusterConfig.supports_version_hash_exact` negotiation and the
 /// `holds_version_durably` responder behavior it exists to let a querier
 /// reason about — a peer's advertised capability must default to
@@ -10387,8 +10575,7 @@ mod dag_resolution_tests {
 /// stay exactly as strict as before: this capability bit only changes which
 /// peers a whole-group durability-handoff QUERIER trusts, never how the
 /// RESPONDER itself verifies a query.
-
-
+///
 /// The `HandoffLeaseRequest`/`HandoffLeaseGrant` peer-to-peer wire exchange:
 /// a real requester session talking to a real responder session over a live
 /// (loopback) `PeerChannel` pair, mirroring `yadorilink-daemon`'s own
@@ -10400,7 +10587,9 @@ mod dag_resolution_tests {
 /// authorization/no-responder-installed fail-closed defaults.
 #[cfg(test)]
 mod handoff_lease_wire_tests {
-    use super::{HandoffLeaseResponder, PeerHandoffLeaseGrant, PeerSyncSession, PeerSyncSessionOneTimeDeps};
+    use super::{
+        HandoffLeaseResponder, PeerHandoffLeaseGrant, PeerSyncSession, PeerSyncSessionOneTimeDeps,
+    };
 
     use crate::test_support::FakeReplicaState;
     use std::collections::HashMap;
@@ -10561,17 +10750,16 @@ mod handoff_lease_wire_tests {
     #[tokio::test]
     async fn requester_receives_the_responders_real_grant() {
         let expected_digest = [42u8; 32];
-        let (session_a, _session_b) = connected_pair_with_session_b_deps(
-            PeerSyncSessionOneTimeDeps {
+        let (session_a, _session_b) =
+            connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
                 handoff_lease_responder: Arc::new(FixedResponder(Some(PeerHandoffLeaseGrant {
                     lease_id: "lease-1".to_string(),
                     root_digest: expected_digest,
                     expires_at_unix: 999,
                 }))),
                 ..PeerSyncSessionOneTimeDeps::test_permissive()
-            },
-        )
-        .await;
+            })
+            .await;
 
         let grant = session_a
             .request_handoff_lease_from_peer(GROUP)
@@ -10585,11 +10773,12 @@ mod handoff_lease_wire_tests {
     #[tokio::test]
     async fn requester_can_release_a_granted_lease_by_id() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (session_a, _session_b) = connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
-            handoff_lease_responder: Arc::new(ReleaseRecordingResponder(tx)),
-            ..PeerSyncSessionOneTimeDeps::test_permissive()
-        })
-        .await;
+        let (session_a, _session_b) =
+            connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
+                handoff_lease_responder: Arc::new(ReleaseRecordingResponder(tx)),
+                ..PeerSyncSessionOneTimeDeps::test_permissive()
+            })
+            .await;
 
         session_a.release_handoff_lease_to_peer(GROUP, "lease-mismatch").await.unwrap();
 
@@ -10605,11 +10794,12 @@ mod handoff_lease_wire_tests {
     /// the requester, not a falsely-successful grant.
     #[tokio::test]
     async fn requester_gets_none_when_the_responder_declines() {
-        let (session_a, _session_b) = connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
-            handoff_lease_responder: Arc::new(FixedResponder(None)),
-            ..PeerSyncSessionOneTimeDeps::test_permissive()
-        })
-        .await;
+        let (session_a, _session_b) =
+            connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
+                handoff_lease_responder: Arc::new(FixedResponder(None)),
+                ..PeerSyncSessionOneTimeDeps::test_permissive()
+            })
+            .await;
 
         assert!(
             session_a.request_handoff_lease_from_peer(GROUP).await.is_none(),
@@ -10639,15 +10829,16 @@ mod handoff_lease_wire_tests {
     /// were skipped, this would spuriously succeed.
     #[tokio::test]
     async fn requester_gets_none_for_an_unshared_group_even_if_the_responder_would_grant() {
-        let (session_a, _session_b) = connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
-            handoff_lease_responder: Arc::new(FixedResponder(Some(PeerHandoffLeaseGrant {
-                lease_id: "lease-should-never-be-seen".to_string(),
-                root_digest: [1u8; 32],
-                expires_at_unix: 999,
-            }))),
-            ..PeerSyncSessionOneTimeDeps::test_permissive()
-        })
-        .await;
+        let (session_a, _session_b) =
+            connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
+                handoff_lease_responder: Arc::new(FixedResponder(Some(PeerHandoffLeaseGrant {
+                    lease_id: "lease-should-never-be-seen".to_string(),
+                    root_digest: [1u8; 32],
+                    expires_at_unix: 999,
+                }))),
+                ..PeerSyncSessionOneTimeDeps::test_permissive()
+            })
+            .await;
 
         assert!(
             session_a.request_handoff_lease_from_peer("some-other-group").await.is_none(),
@@ -10690,7 +10881,9 @@ mod handoff_lease_wire_tests {
 /// `handoff_lease` counterparts.
 #[cfg(test)]
 mod handoff_ticket_wire_tests {
-    use super::{HandoffTicketResponder, PeerHandoffTicketGrant, PeerSyncSession, PeerSyncSessionOneTimeDeps};
+    use super::{
+        HandoffTicketResponder, PeerHandoffTicketGrant, PeerSyncSession, PeerSyncSessionOneTimeDeps,
+    };
 
     use crate::test_support::FakeReplicaState;
     use std::collections::HashMap;
@@ -10839,15 +11032,16 @@ mod handoff_ticket_wire_tests {
     /// one, and X receives exactly that lease id and expiry back.
     #[tokio::test]
     async fn requester_receives_the_responders_real_grant() {
-        let (session_a, _session_b) = connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
-            handoff_ticket_responder: Arc::new(FixedResponder(Some(PeerHandoffTicketGrant {
-                lease_id: Some("ticket-lease-1".to_string()),
-                target_device_id: Some("device-c".to_string()),
-                expires_at_unix: 999,
-            }))),
-            ..PeerSyncSessionOneTimeDeps::test_permissive()
-        })
-        .await;
+        let (session_a, _session_b) =
+            connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
+                handoff_ticket_responder: Arc::new(FixedResponder(Some(PeerHandoffTicketGrant {
+                    lease_id: Some("ticket-lease-1".to_string()),
+                    target_device_id: Some("device-c".to_string()),
+                    expires_at_unix: 999,
+                }))),
+                ..PeerSyncSessionOneTimeDeps::test_permissive()
+            })
+            .await;
 
         let grant = session_a
             .request_handoff_ticket_from_peer(GROUP)
@@ -10861,11 +11055,12 @@ mod handoff_ticket_wire_tests {
     #[tokio::test]
     async fn requester_can_release_an_unconsumed_ticket_by_ids() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (session_a, _session_b) = connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
-            handoff_ticket_responder: Arc::new(ReleaseRecordingResponder(tx)),
-            ..PeerSyncSessionOneTimeDeps::test_permissive()
-        })
-        .await;
+        let (session_a, _session_b) =
+            connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
+                handoff_ticket_responder: Arc::new(ReleaseRecordingResponder(tx)),
+                ..PeerSyncSessionOneTimeDeps::test_permissive()
+            })
+            .await;
 
         session_a.release_handoff_ticket_to_peer(GROUP, "device-c", "lease-partial").await.unwrap();
 
@@ -10884,15 +11079,16 @@ mod handoff_ticket_wire_tests {
     /// `lease_id = None`, not collapse to "not granted".
     #[tokio::test]
     async fn a_grant_with_no_lease_id_still_relays_as_granted() {
-        let (session_a, _session_b) = connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
-            handoff_ticket_responder: Arc::new(FixedResponder(Some(PeerHandoffTicketGrant {
-                lease_id: None,
-                target_device_id: None,
-                expires_at_unix: 0,
-            }))),
-            ..PeerSyncSessionOneTimeDeps::test_permissive()
-        })
-        .await;
+        let (session_a, _session_b) =
+            connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
+                handoff_ticket_responder: Arc::new(FixedResponder(Some(PeerHandoffTicketGrant {
+                    lease_id: None,
+                    target_device_id: None,
+                    expires_at_unix: 0,
+                }))),
+                ..PeerSyncSessionOneTimeDeps::test_permissive()
+            })
+            .await;
 
         let grant = session_a
             .request_handoff_ticket_from_peer(GROUP)
@@ -10907,11 +11103,12 @@ mod handoff_ticket_wire_tests {
     /// falsely-successful grant.
     #[tokio::test]
     async fn requester_gets_none_when_the_responder_declines() {
-        let (session_a, _session_b) = connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
-            handoff_ticket_responder: Arc::new(FixedResponder(None)),
-            ..PeerSyncSessionOneTimeDeps::test_permissive()
-        })
-        .await;
+        let (session_a, _session_b) =
+            connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
+                handoff_ticket_responder: Arc::new(FixedResponder(None)),
+                ..PeerSyncSessionOneTimeDeps::test_permissive()
+            })
+            .await;
 
         assert!(
             session_a.request_handoff_ticket_from_peer(GROUP).await.is_none(),
@@ -10940,15 +11137,16 @@ mod handoff_ticket_wire_tests {
     /// lease_request`'s own unauthorized-group check.
     #[tokio::test]
     async fn requester_gets_none_for_an_unshared_group_even_if_the_responder_would_grant() {
-        let (session_a, _session_b) = connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
-            handoff_ticket_responder: Arc::new(FixedResponder(Some(PeerHandoffTicketGrant {
-                lease_id: Some("ticket-should-never-be-seen".to_string()),
-                target_device_id: Some("device-c".to_string()),
-                expires_at_unix: 999,
-            }))),
-            ..PeerSyncSessionOneTimeDeps::test_permissive()
-        })
-        .await;
+        let (session_a, _session_b) =
+            connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
+                handoff_ticket_responder: Arc::new(FixedResponder(Some(PeerHandoffTicketGrant {
+                    lease_id: Some("ticket-should-never-be-seen".to_string()),
+                    target_device_id: Some("device-c".to_string()),
+                    expires_at_unix: 999,
+                }))),
+                ..PeerSyncSessionOneTimeDeps::test_permissive()
+            })
+            .await;
 
         assert!(
             session_a.request_handoff_ticket_from_peer("some-other-group").await.is_none(),
@@ -10980,7 +11178,9 @@ mod rebootstrap_wire_tests {
     use ed25519_dalek::SigningKey;
     use yadorilink_local_storage::FsBlockStore;
 
-    use super::{PeerSyncSession, PeerSyncSessionOneTimeDeps, PreparedRebootstrap, RebootstrapHandler};
+    use super::{
+        PeerSyncSession, PeerSyncSessionOneTimeDeps, PreparedRebootstrap, RebootstrapHandler,
+    };
     use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId};
     use yadorilink_replica_domain::rebootstrap::Checkpoint;
 
@@ -11130,11 +11330,12 @@ mod rebootstrap_wire_tests {
         // mismatch case covered separately below.
         let prepared = prepared_signed_by("device-b", &key);
         let expected_required = prepared.required.clone();
-        let (session_a, _session_b) = connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
-            rebootstrap_handler: Arc::new(FixedHandler(Some(prepared))),
-            ..PeerSyncSessionOneTimeDeps::test_permissive()
-        })
-        .await;
+        let (session_a, _session_b) =
+            connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
+                rebootstrap_handler: Arc::new(FixedHandler(Some(prepared))),
+                ..PeerSyncSessionOneTimeDeps::test_permissive()
+            })
+            .await;
 
         let received = session_a
             .request_rebootstrap_snapshot_from_peer(GROUP, ChangeHash([3u8; 32]))
@@ -11163,11 +11364,14 @@ mod rebootstrap_wire_tests {
     #[tokio::test]
     async fn requester_gets_none_for_an_unshared_group_even_if_the_handler_would_grant() {
         let key = SigningKey::from_bytes(&[11u8; 32]);
-        let (session_a, _session_b) = connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
-            rebootstrap_handler: Arc::new(FixedHandler(Some(prepared_signed_by("device-b", &key)))),
-            ..PeerSyncSessionOneTimeDeps::test_permissive()
-        })
-        .await;
+        let (session_a, _session_b) =
+            connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
+                rebootstrap_handler: Arc::new(FixedHandler(Some(prepared_signed_by(
+                    "device-b", &key,
+                )))),
+                ..PeerSyncSessionOneTimeDeps::test_permissive()
+            })
+            .await;
 
         assert!(
             session_a
@@ -11191,11 +11395,12 @@ mod rebootstrap_wire_tests {
     async fn session_identity_mismatch_is_rejected_even_with_a_valid_signature() {
         let other_device_key = SigningKey::from_bytes(&[12u8; 32]);
         let impersonating_prepared = prepared_signed_by("device-c", &other_device_key);
-        let (session_a, _session_b) = connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
-            rebootstrap_handler: Arc::new(FixedHandler(Some(impersonating_prepared))),
-            ..PeerSyncSessionOneTimeDeps::test_permissive()
-        })
-        .await;
+        let (session_a, _session_b) =
+            connected_pair_with_session_b_deps(PeerSyncSessionOneTimeDeps {
+                rebootstrap_handler: Arc::new(FixedHandler(Some(impersonating_prepared))),
+                ..PeerSyncSessionOneTimeDeps::test_permissive()
+            })
+            .await;
 
         assert!(
             session_a
@@ -11229,8 +11434,7 @@ mod rebootstrap_wire_tests {
 /// and requesting exactly those — so an announce carrying only already-known
 /// heads is observable proof the peer was never told about the edit,
 /// without depending on any live send/receive timing.
-
-
+///
 /// Convergence coverage for the single-authority property the DAG engine now
 /// holds outright: a concurrent edit resolves to the same winner regardless of
 /// arrival order, and the materialization-audit backstop keeps repairing
@@ -11238,8 +11442,7 @@ mod rebootstrap_wire_tests {
 /// and deterministic: the sessions run over a live-but-unreachable loopback
 /// channel and are driven by direct `handle_message` / `handle_change_batch`
 /// calls, never real datagram delivery, so nothing depends on network timing.
-
-
+///
 /// Admission-time enforcement that a change's pinned authorization coordinate
 /// is non-decreasing along causal order. Without it, a device revoked at
 /// policy seq N (still holding its signing key) could craft a new change,
@@ -11250,8 +11453,7 @@ mod rebootstrap_wire_tests {
 /// auth_seq)` at admission closes that: to be causally newer than its own
 /// revoke the attacker must build on post-revoke heads (which pin seq >= N),
 /// and the older stamp then loses to the parent floor.
-
-
+///
 #[cfg(all(test, unix))]
 mod disk_race_fingerprint_tests {
     use super::disk_race_fingerprint;

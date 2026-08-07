@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::sync_error::SyncError;
 use yadorilink_peer_session::ports::PeerReplicaStatePort;
 use yadorilink_peer_session::PeerSessionError;
 use yadorilink_replica_domain::admission::{AdmitResult, ChangeOrdering};
@@ -28,7 +29,6 @@ use yadorilink_replica_domain::session_state::{
     StartupFailed,
 };
 use yadorilink_root_authority::root_commit::RootCommitPermit;
-use crate::sync_error::SyncError;
 
 use super::ReplicaCoordinator;
 
@@ -67,7 +67,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
     }
 
     fn get_file(&self, group_id: &str, path: &str) -> Result<Option<FileRecord>, PeerSessionError> {
-        self.file_index_repository().get_file(group_id, path).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .get_file(group_id, path)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn get_files_by_paths(
@@ -75,27 +78,57 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         group_id: &str,
         paths: &[String],
     ) -> Result<HashMap<String, FileRecord>, PeerSessionError> {
-        self.file_index_repository().get_files_by_paths(group_id, paths).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .get_files_by_paths(group_id, paths)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn has_real_current_row(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
-        self.file_index_repository().has_real_current_row(group_id, path).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .has_real_current_row(group_id, path)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
-    fn get_record_kind(&self, group_id: &str, path: &str) -> Result<Option<RecordKind>, PeerSessionError> {
-        self.file_index_repository().get_record_kind(group_id, path).map_err(SyncError::from).map_err(PeerSessionError::from)
+    fn get_record_kind(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<RecordKind>, PeerSessionError> {
+        self.file_index_repository()
+            .get_record_kind(group_id, path)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
-    fn get_symlink_target(&self, group_id: &str, path: &str) -> Result<Option<Vec<u8>>, PeerSessionError> {
-        self.file_index_repository().get_symlink_target(group_id, path).map_err(SyncError::from).map_err(PeerSessionError::from)
+    fn get_symlink_target(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, PeerSessionError> {
+        self.file_index_repository()
+            .get_symlink_target(group_id, path)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
-    fn get_symlink_out_of_root(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
-        self.file_index_repository().get_symlink_out_of_root(group_id, path).map_err(SyncError::from).map_err(PeerSessionError::from)
+    fn get_symlink_out_of_root(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, PeerSessionError> {
+        self.file_index_repository()
+            .get_symlink_out_of_root(group_id, path)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn get_exec_bit(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
-        self.file_index_repository().get_exec_bit(group_id, path).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .get_exec_bit(group_id, path)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn get_origin_device_id(
@@ -103,7 +136,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         group_id: &str,
         path: &str,
     ) -> Result<Option<String>, PeerSessionError> {
-        self.file_index_repository().get_origin_device_id(group_id, path).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .get_origin_device_id(group_id, path)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn get_authoring_change_hash(
@@ -111,7 +147,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         group_id: &str,
         path: &str,
     ) -> Result<Option<ChangeHash>, PeerSessionError> {
-        self.file_index_repository().get_authoring_change_hash(group_id, path).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .get_authoring_change_hash(group_id, path)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn set_authoring_change_hash(
@@ -120,7 +159,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         path: &str,
         hash: &ChangeHash,
     ) -> Result<(), PeerSessionError> {
-        self.file_index_repository().set_authoring_change_hash(group_id, path, hash).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .set_authoring_change_hash(group_id, path, hash)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn get_materialization_state(
@@ -128,7 +170,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         group_id: &str,
         path: &str,
     ) -> Result<Option<MaterializationState>, PeerSessionError> {
-        self.materialization_state_repository().get_materialization_state(group_id, path).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.materialization_state_repository()
+            .get_materialization_state(group_id, path)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn set_materialization_state(
@@ -165,11 +210,17 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
     }
 
     fn is_pinned(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
-        self.file_index_repository().is_pinned(group_id, path).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .is_pinned(group_id, path)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn set_pinned(&self, group_id: &str, path: &str, pinned: bool) -> Result<(), PeerSessionError> {
-        self.file_index_repository().set_pinned(group_id, path, pinned).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .set_pinned(group_id, path, pinned)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn touch_last_accessed(
@@ -178,11 +229,17 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         path: &str,
         unix_ts: i64,
     ) -> Result<(), PeerSessionError> {
-        self.file_index_repository().touch_last_accessed(group_id, path, unix_ts).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .touch_last_accessed(group_id, path, unix_ts)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn clear_held(&self, group_id: &str, path: &str) -> Result<(), PeerSessionError> {
-        self.materialization_state_repository().clear_held(group_id, path).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.materialization_state_repository()
+            .clear_held(group_id, path)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn set_held(
@@ -192,10 +249,17 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         reason: &str,
         since_unix_nanos: i64,
     ) -> Result<(), PeerSessionError> {
-        self.materialization_state_repository().set_held(group_id, path, reason, since_unix_nanos).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.materialization_state_repository()
+            .set_held(group_id, path, reason, since_unix_nanos)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
-    fn has_materialization_intent(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
+    fn has_materialization_intent(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, PeerSessionError> {
         self.materialization_job_repository()
             .has_materialization_intent(group_id, path)
             .map_err(SyncError::from)
@@ -206,7 +270,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         &self,
         group_id: &str,
     ) -> Result<Vec<String>, PeerSessionError> {
-        self.materialization_state_repository().list_materialization_repair_candidates(group_id).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.materialization_state_repository()
+            .list_materialization_repair_candidates(group_id)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn materialization_enqueue_pending(
@@ -238,7 +305,8 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         &self,
         group_id: &str,
         path: &str,
-    ) -> Result<Vec<yadorilink_replica_domain::session_state::VersionRecord>, PeerSessionError> {
+    ) -> Result<Vec<yadorilink_replica_domain::session_state::VersionRecord>, PeerSessionError>
+    {
         self.sqlite()
             .dag_list_versions(group_id, path)
             .map_err(SyncError::from)
@@ -252,7 +320,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         origin_device_id: &str,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), PeerSessionError> {
-        self.file_index_repository().upsert_file_with_origin(group_id, record, origin_device_id, permit).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .upsert_file_with_origin(group_id, record, origin_device_id, permit)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn upsert_file_with_origin_and_author(
@@ -291,7 +362,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         group_id: &str,
         block_hashes: &[Vec<u8>],
     ) -> Result<(), PeerSessionError> {
-        self.change_history_repository().record_group_block_provenance(group_id, block_hashes).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.change_history_repository()
+            .record_group_block_provenance(group_id, block_hashes)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn dag_group_heads(&self, group_id: &str) -> Result<Vec<ChangeHash>, PeerSessionError> {
@@ -302,11 +376,17 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
     }
 
     fn dag_group_history_paths(&self, group_id: &str) -> Result<HashSet<String>, PeerSessionError> {
-        self.change_history_repository().dag_group_history_paths(group_id).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.change_history_repository()
+            .dag_group_history_paths(group_id)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn dag_list_unapplied_changes(&self, group_id: &str) -> Result<Vec<Change>, PeerSessionError> {
-        self.change_history_repository().dag_list_unapplied_changes(group_id).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.change_history_repository()
+            .dag_list_unapplied_changes(group_id)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn dag_has_change_or_pruned(
@@ -314,7 +394,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         group_id: &str,
         hash: &ChangeHash,
     ) -> Result<bool, PeerSessionError> {
-        self.change_history_repository().dag_has_change_or_pruned(group_id, hash).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.change_history_repository()
+            .dag_has_change_or_pruned(group_id, hash)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn current_authoring_relation(
@@ -323,7 +406,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         path: &str,
         incoming: &ChangeHash,
     ) -> Result<Option<ChangeOrdering>, PeerSessionError> {
-        self.change_history_repository().current_authoring_relation(group_id, path, incoming).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.change_history_repository()
+            .current_authoring_relation(group_id, path, incoming)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn dag_missing_ancestor_frontier(
@@ -341,10 +427,7 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
     }
 
     fn dag_get_encoded(&self, hash: &ChangeHash) -> Result<Option<Vec<u8>>, PeerSessionError> {
-        self.sqlite()
-            .dag_get_encoded(hash)
-            .map_err(SyncError::from)
-            .map_err(PeerSessionError::from)
+        self.sqlite().dag_get_encoded(hash).map_err(SyncError::from).map_err(PeerSessionError::from)
     }
 
     fn dag_has_file_version(
@@ -378,7 +461,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         ancestor: &ChangeHash,
         descendant: &ChangeHash,
     ) -> Result<bool, PeerSessionError> {
-        self.change_history_repository().dag_is_ancestor(ancestor, descendant).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.change_history_repository()
+            .dag_is_ancestor(ancestor, descendant)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn dag_admit_change_with_versions(
@@ -387,11 +473,17 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         versions: &[FileVersion],
         applied: bool,
     ) -> Result<AdmitResult, PeerSessionError> {
-        self.change_history_repository().dag_admit_change_with_versions(change, versions, applied).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.change_history_repository()
+            .dag_admit_change_with_versions(change, versions, applied)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn dag_mark_applied(&self, hash: &ChangeHash) -> Result<(), PeerSessionError> {
-        self.change_history_repository().dag_mark_applied(hash).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.change_history_repository()
+            .dag_mark_applied(hash)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn dag_get_device_frontier(
@@ -399,7 +491,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         group_id: &str,
         device_id: &str,
     ) -> Result<Option<ChangeHash>, PeerSessionError> {
-        self.change_history_repository().dag_get_device_frontier(group_id, device_id).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.change_history_repository()
+            .dag_get_device_frontier(group_id, device_id)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn open_materialization_intent_guard<'a>(
@@ -408,8 +503,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         path: &'a str,
         target_version_hash: &[u8],
         permit: &'a RootCommitPermit<'a>,
-    ) -> Result<Box<dyn yadorilink_peer_session::ports::OpenMaterializationIntent + Send + 'a>, PeerSessionError>
-    {
+    ) -> Result<
+        Box<dyn yadorilink_peer_session::ports::OpenMaterializationIntent + Send + 'a>,
+        PeerSessionError,
+    > {
         let guard = crate::materialization_intent::MaterializationIntentGuard::open(
             self,
             group_id,
@@ -429,7 +526,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
     }
 
     fn list_files(&self, group_id: &str) -> Result<Vec<FileRecord>, PeerSessionError> {
-        self.file_index_repository().list_files(group_id).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .list_files(group_id)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn dag_compare_authoring(
@@ -438,7 +538,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         local: &ChangeHash,
         incoming: &ChangeHash,
     ) -> Result<Option<ChangeOrdering>, PeerSessionError> {
-        self.change_history_repository().dag_compare_authoring(group_id, local, incoming).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.change_history_repository()
+            .dag_compare_authoring(group_id, local, incoming)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn dag_group_file_version_references_block(
@@ -446,7 +549,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         group_id: &str,
         block_hash: &[u8],
     ) -> Result<bool, PeerSessionError> {
-        self.change_history_repository().dag_group_file_version_references_block(group_id, block_hash).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.change_history_repository()
+            .dag_group_file_version_references_block(group_id, block_hash)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn group_retained_version_references_block(
@@ -454,7 +560,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         group_id: &str,
         block_hash: &[u8],
     ) -> Result<bool, PeerSessionError> {
-        self.file_index_repository().group_retained_version_references_block(group_id, block_hash).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .group_retained_version_references_block(group_id, block_hash)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn get_current_version_record(
@@ -468,8 +577,15 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
-    fn get_held_state(&self, group_id: &str, path: &str) -> Result<Option<HeldState>, PeerSessionError> {
-        self.materialization_state_repository().get_held_state(group_id, path).map_err(SyncError::from).map_err(PeerSessionError::from)
+    fn get_held_state(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<HeldState>, PeerSessionError> {
+        self.materialization_state_repository()
+            .get_held_state(group_id, path)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn record_acknowledged_frontier(
@@ -478,8 +594,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         device: &yadorilink_replica_domain::ids::DeviceId,
         frontier: &[ChangeHash],
     ) -> Result<(), PeerSessionError> {
-        yadorilink_replica_engine::compaction::record_acknowledged_frontier(self, group, device, frontier)
-            .map_err(PeerSessionError::from)
+        yadorilink_replica_engine::compaction::record_acknowledged_frontier(
+            self, group, device, frontier,
+        )
+        .map_err(PeerSessionError::from)
     }
 
     fn ensure_bootstrap_row_for_metadata(
@@ -487,7 +605,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         group_id: &str,
         path: &str,
     ) -> Result<(), PeerSessionError> {
-        self.file_index_repository().ensure_bootstrap_row_for_metadata(group_id, path).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .ensure_bootstrap_row_for_metadata(group_id, path)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn set_record_kind(
@@ -497,7 +618,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         kind: RecordKind,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), PeerSessionError> {
-        self.file_index_repository().set_record_kind(group_id, path, kind, permit).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .set_record_kind(group_id, path, kind, permit)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn set_symlink_target(
@@ -506,7 +630,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         path: &str,
         target: Option<&[u8]>,
     ) -> Result<(), PeerSessionError> {
-        self.file_index_repository().set_symlink_target(group_id, path, target).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .set_symlink_target(group_id, path, target)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn set_symlink_out_of_root(
@@ -515,7 +642,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         path: &str,
         out_of_root: bool,
     ) -> Result<(), PeerSessionError> {
-        self.file_index_repository().set_symlink_out_of_root(group_id, path, out_of_root).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .set_symlink_out_of_root(group_id, path, out_of_root)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 
     fn set_exec_bit(
@@ -525,7 +655,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         exec_bit: bool,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), PeerSessionError> {
-        self.file_index_repository().set_exec_bit(group_id, path, exec_bit, permit).map_err(SyncError::from).map_err(PeerSessionError::from)
+        self.file_index_repository()
+            .set_exec_bit(group_id, path, exec_bit, permit)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
     }
 }
 

@@ -61,12 +61,13 @@
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
-use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
 use crate::dag_store::intern_causal_basis;
 use crate::error::SyncSqliteError;
 use crate::file_identity_codec::{
-    decode_file_identity, encode_file_identity, GenerationId, MATERIALIZED_GENERATION_ENCODING_VERSION,
+    decode_file_identity, encode_file_identity, GenerationId,
+    MATERIALIZED_GENERATION_ENCODING_VERSION,
 };
+use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
 use yadorilink_root_authority::fs_identity::FileIdentity;
 
 /// `pub`, not `pub(crate)`: exposed to `yadorilink-sync-core` (this crate's
@@ -344,7 +345,9 @@ pub fn lookup_materialized_generation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yadorilink_root_authority::fs_identity::{ObjectKind, PlatformObjectId, Timestamp, VolumeIdentity};
+    use yadorilink_root_authority::fs_identity::{
+        ObjectKind, PlatformObjectId, Timestamp, VolumeIdentity,
+    };
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

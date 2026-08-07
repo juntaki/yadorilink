@@ -23,7 +23,9 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use sha2::{Digest, Sha256};
 
-use yadorilink_replica_engine::conflict::{resolve_path_heads, PathHead, PathHeadContent, PathResolution};
+use yadorilink_replica_engine::conflict::{
+    resolve_path_heads, PathHead, PathHeadContent, PathResolution,
+};
 
 /// A content identity — two changes carrying the same `Version` for a path
 /// mean the byte-identical file; different versions mean different bytes.

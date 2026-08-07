@@ -12,12 +12,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use yadorilink_peer_session::peer_session::ChangeAuthenticator;
+use yadorilink_replica_domain::change::ChangeAuth;
 use yadorilink_replica_engine::authenticated_history::{
     validate_retained_group, AuthenticatedHistoryError, AuthenticatedHistoryReport,
     AuthenticatedHistoryTrust,
 };
-use yadorilink_replica_domain::change::ChangeAuth;
-use yadorilink_peer_session::peer_session::ChangeAuthenticator;
 
 use crate::daemon_state::{DaemonState, GroupPolicyResolution};
 
@@ -45,7 +45,9 @@ impl<'a, T: ChangeAuthenticator + ?Sized> ChangeAuthenticatorTrust<'a, T> {
     }
 }
 
-impl<T: ChangeAuthenticator + ?Sized> AuthenticatedHistoryTrust for ChangeAuthenticatorTrust<'_, T> {
+impl<T: ChangeAuthenticator + ?Sized> AuthenticatedHistoryTrust
+    for ChangeAuthenticatorTrust<'_, T>
+{
     fn signing_key(&self, device_id: &str) -> Option<[u8; 32]> {
         self.inner.signing_key(device_id)
     }
@@ -324,9 +326,9 @@ impl ChangeAuthenticator for NetmapChangeAuthenticator {
 mod tests {
     use std::sync::Arc;
 
+    use crate::replica_coordinator::ReplicaCoordinator;
     use ed25519_dalek::SigningKey;
     use yadorilink_local_storage::FsBlockStore;
-    use crate::replica_coordinator::ReplicaCoordinator;
 
     use super::*;
 

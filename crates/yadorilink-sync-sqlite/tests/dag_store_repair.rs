@@ -1,13 +1,13 @@
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
+use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::file::{FileMeta, FileVersion};
 use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
 use yadorilink_sync_sqlite::dag_store::{
     admit_change, emit_local_change, get_file_version, init_dag_schema, promote_orphans,
     put_file_version, AdmitOutcome, ChangeEmitter,
 };
-use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_sync_sqlite::SyncSqliteError as SyncError;
 
 fn conn() -> Connection {

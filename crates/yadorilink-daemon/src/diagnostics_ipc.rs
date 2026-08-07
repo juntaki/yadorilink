@@ -267,8 +267,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use yadorilink_local_storage::FsBlockStore;
     use crate::replica_coordinator::ReplicaCoordinator;
+    use yadorilink_local_storage::FsBlockStore;
 
     use super::*;
     use crate::daemon_state::DaemonState;
@@ -295,7 +295,8 @@ mod tests {
         let state = test_state();
         state
             .replica_coordinator
-            .link_repository().add_link(
+            .link_repository()
+            .add_link(
                 "/Users/alice/Documents/secret-project",
                 "11111111-2222-3333-4444-555555555555",
             )

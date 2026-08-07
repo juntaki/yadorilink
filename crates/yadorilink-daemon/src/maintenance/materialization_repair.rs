@@ -52,7 +52,8 @@ impl MaterializationRepairJob {
 
     pub(crate) async fn run_once(&self, _trigger: MaintenanceTrigger) {
         let state = &self.state;
-        let groups: HashSet<String> = match state.replica_coordinator.link_repository().list_links() {
+        let groups: HashSet<String> = match state.replica_coordinator.link_repository().list_links()
+        {
             // An orphaned link's coordination-side authorization is
             // confirmed gone, so there is no valid peer edge left to
             // request a repair from -- skip it the same way a paused

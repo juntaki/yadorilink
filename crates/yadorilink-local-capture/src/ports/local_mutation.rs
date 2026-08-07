@@ -28,6 +28,12 @@ use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 use yadorilink_sync_sqlite::SyncSqliteError;
 
+#[derive(Clone, Copy)]
+pub struct LocalChangeEmission<'a, 'permit> {
+    pub emitter: &'a ChangeEmitter,
+    pub permit: &'a RootCommitPermit<'permit>,
+}
+
 /// Capability surface `LocalChangeProcessor` needs to turn a detected local
 /// filesystem event into a committed index row plus DAG change, and to
 /// journal the attempt durably across the read/blockify/put/index+DAG step
@@ -119,8 +125,7 @@ pub trait LocalMutationStore: Send + Sync {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         meta: Option<&LocalFileMetaColumns>,
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
+        emission: LocalChangeEmission<'_, '_>,
     ) -> Result<ChangeHash, SyncSqliteError>;
 
     /// Plain (non-emitting) upsert, used for local writes that do not need
@@ -153,8 +158,7 @@ pub trait LocalMutationStore: Send + Sync {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         metas: &[Option<LocalFileMetaColumns>],
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
+        emission: LocalChangeEmission<'_, '_>,
     ) -> Result<Option<ChangeHash>, SyncSqliteError>;
 
     /// Tombstones a path with "now" as the observed time — the plain local

@@ -1974,10 +1974,10 @@ fn spawn_direct_peer_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replica_coordinator::ReplicaCoordinator;
     use boringtun::x25519::{PublicKey as X25519PublicKey, StaticSecret};
     use std::net::SocketAddr as StdSocketAddr;
     use yadorilink_local_storage::FsBlockStore;
-    use crate::replica_coordinator::ReplicaCoordinator;
 
     #[test]
     fn peer_key_pinning_detects_key_changes() {
@@ -2099,12 +2099,21 @@ mod tests {
     #[tokio::test]
     async fn sync_roots_for_groups_omits_an_ambiguous_group() {
         let state = test_state();
-        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
         state
             .replica_coordinator
-            .link_repository().force_second_live_link_for_test("/home/alice/PhotosCopy", "group-1")
+            .link_repository()
+            .add_link("/home/alice/Photos", "group-1")
             .unwrap();
-        state.replica_coordinator.link_repository().add_link("/home/alice/Docs", "group-2").unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .force_second_live_link_for_test("/home/alice/PhotosCopy", "group-1")
+            .unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link("/home/alice/Docs", "group-2")
+            .unwrap();
 
         let roots = sync_roots_for_groups(&state, &["group-1".to_string(), "group-2".to_string()]);
 
@@ -2122,9 +2131,21 @@ mod tests {
     #[tokio::test]
     async fn sync_roots_for_groups_excludes_an_orphaned_link() {
         let state = test_state();
-        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
-        state.replica_coordinator.link_repository().add_link("/home/alice/Docs", "group-2").unwrap();
-        state.replica_coordinator.link_repository().mark_link_orphaned("/home/alice/Photos").unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link("/home/alice/Photos", "group-1")
+            .unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link("/home/alice/Docs", "group-2")
+            .unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .mark_link_orphaned("/home/alice/Photos")
+            .unwrap();
 
         let roots = sync_roots_for_groups(&state, &["group-1".to_string(), "group-2".to_string()]);
 

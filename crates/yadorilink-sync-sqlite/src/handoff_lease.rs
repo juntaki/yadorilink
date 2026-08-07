@@ -191,8 +191,10 @@ impl HandoffLeaseRepository {
         // Fails closed, writing no pin row, before this transaction is even
         // opened -- see `compute_pin_deadline`'s own doc comment for why a
         // non-positive TTL must never produce a pin.
-        let expires_at_unix =
-            yadorilink_replica_engine::handoff_lease::compute_pin_deadline(created_at_unix, ttl_seconds)?;
+        let expires_at_unix = yadorilink_replica_engine::handoff_lease::compute_pin_deadline(
+            created_at_unix,
+            ttl_seconds,
+        )?;
         // IMMEDIATE takes SQLite's write lock at BEGIN, so the
         // re-enumeration and the pin INSERT below observe one snapshot
         // that no concurrent write transaction (in particular a
@@ -329,7 +331,8 @@ pub fn row_to_handoff_lease(r: &rusqlite::Row<'_>) -> rusqlite::Result<HandoffLe
         root_digest.copy_from_slice(&root_digest_vec);
     }
     let pinned_json: String = r.get(4)?;
-    let pinned_versions: Vec<PinnedVersion> = serde_json::from_str(&pinned_json).unwrap_or_default();
+    let pinned_versions: Vec<PinnedVersion> =
+        serde_json::from_str(&pinned_json).unwrap_or_default();
     Ok(HandoffLease {
         lease_id: r.get(0)?,
         group_id: r.get(1)?,

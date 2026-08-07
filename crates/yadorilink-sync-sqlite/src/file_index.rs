@@ -35,19 +35,30 @@ use std::sync::Arc;
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
-use yadorilink_replica_domain::change::{ChangeAuth, Op};
-use yadorilink_replica_domain::file::FileVersion;
-use yadorilink_replica_domain::ids::{ChangeHash, SyncPath};
 use crate::dag_store::{self, ChangeEmitter};
 use crate::error::SyncSqliteError;
 use crate::materialized_generation::MaterializedObjectKind;
-use yadorilink_root_authority::root_commit::RootCommitPermit;
+use yadorilink_replica_domain::change::{ChangeAuth, Op};
+use yadorilink_replica_domain::file::FileVersion;
+use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
+use yadorilink_replica_domain::ids::{ChangeHash, SyncPath};
 use yadorilink_replica_domain::session_state::{
     ChangeContent, DurabilityRoot, DurabilityRoots, LocalFileMetaColumns,
     MaterializedGenerationBackfillReport, TrashedFile, VersionRecord, VersionState,
 };
+use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_sqlite_runtime::SyncDatabase;
-use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
+
+/// Capabilities and authorization shared by every local change emission.
+/// Keeping them together prevents repository callers from accidentally
+/// pairing an emitter with a permit or authorization stamp from another
+/// operation while keeping mutation-specific data explicit.
+#[derive(Clone, Copy)]
+pub struct ChangeEmissionContext<'a, 'permit> {
+    pub emitter: &'a ChangeEmitter,
+    pub permit: &'a RootCommitPermit<'permit>,
+    pub auth: ChangeAuth,
+}
 
 /// Current wall-clock time in nanoseconds since the Unix epoch, clamped to
 /// `0` if the clock reads before the epoch. Deliberately duplicated here
@@ -181,13 +192,16 @@ impl FileIndexRepository {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         meta: Option<&LocalFileMetaColumns>,
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
-        auth: ChangeAuth,
+        emission: ChangeEmissionContext<'_, '_>,
     ) -> Result<ChangeHash, SyncSqliteError> {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            let change =
-                dag_store::emit_local_change(tx, group_id, content.ops.clone(), auth, emitter)?;
+            let change = dag_store::emit_local_change(
+                tx,
+                group_id,
+                content.ops.clone(),
+                emission.auth,
+                emission.emitter,
+            )?;
             for version in content.versions {
                 dag_store::put_file_version(tx, group_id, version)?;
             }
@@ -201,7 +215,7 @@ impl FileIndexRepository {
             // during the work above (chunking/hashing already happened
             // in the caller before this call, but `emit_local_change`'s
             // own DB work takes real time too).
-            permit.verify()?;
+            emission.permit.verify()?;
             Ok(change_hash)
         })
     }
@@ -234,9 +248,7 @@ impl FileIndexRepository {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         metas: &[Option<LocalFileMetaColumns>],
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
-        auth: ChangeAuth,
+        emission: ChangeEmissionContext<'_, '_>,
     ) -> Result<Option<ChangeHash>, SyncSqliteError> {
         if records.is_empty() {
             return Ok(None);
@@ -262,8 +274,13 @@ impl FileIndexRepository {
             )));
         }
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            let change =
-                dag_store::emit_local_change(tx, group_id, content.ops.clone(), auth, emitter)?;
+            let change = dag_store::emit_local_change(
+                tx,
+                group_id,
+                content.ops.clone(),
+                emission.auth,
+                emission.emitter,
+            )?;
             let change_hash = change.compute_hash();
             for version in content.versions {
                 dag_store::put_file_version(tx, group_id, version)?;
@@ -274,7 +291,7 @@ impl FileIndexRepository {
                     apply_local_meta_columns_in_tx(tx, group_id, &record.path, meta)?;
                 }
             }
-            permit.verify()?;
+            emission.permit.verify()?;
             Ok(Some(change_hash))
         })
     }
@@ -366,9 +383,7 @@ impl FileIndexRepository {
         path: &str,
         device_id: &str,
         observed_at_unix_nanos: i64,
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
-        auth: ChangeAuth,
+        emission: ChangeEmissionContext<'_, '_>,
     ) -> Result<ChangeHash, SyncSqliteError> {
         let mut record = self.get_file(group_id, path)?.unwrap_or(FileRecord {
             path: path.to_string(),
@@ -381,10 +396,16 @@ impl FileIndexRepository {
         record.mtime_unix_nanos = observed_at_unix_nanos;
         let ops = vec![Op::Delete { path: SyncPath(path.to_string()) }];
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
-            let change = dag_store::emit_local_change(tx, group_id, ops.clone(), auth, emitter)?;
+            let change = dag_store::emit_local_change(
+                tx,
+                group_id,
+                ops.clone(),
+                emission.auth,
+                emission.emitter,
+            )?;
             let change_hash = change.compute_hash();
             upsert_file_in_tx(tx, group_id, &record, device_id, Some(&change_hash))?;
-            permit.verify()?;
+            emission.permit.verify()?;
             Ok(change_hash)
         })
     }
@@ -404,7 +425,11 @@ impl FileIndexRepository {
         })
     }
 
-    pub fn get_file(&self, group_id: &str, path: &str) -> Result<Option<FileRecord>, SyncSqliteError> {
+    pub fn get_file(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<FileRecord>, SyncSqliteError> {
         // Retried like every writer below: a shared-cache in-memory database
         // (every test's `open_in_memory`) can hand a plain read `DatabaseLocked`
         // (or, under sustained contention past `busy_timeout`'s window,
@@ -655,7 +680,11 @@ impl FileIndexRepository {
     /// EVERY never-before-seen incoming record including a tombstone, so
     /// a caller that only checks `is_some()` to decide "is there real
     /// content here to protect" sees the scaffold and wrongly answers yes.
-    pub fn has_real_current_row(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError> {
+    pub fn has_real_current_row(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             conn.query_row(
                 "SELECT 1 FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current' \
@@ -995,7 +1024,11 @@ impl FileIndexRepository {
     /// `held_reason`/`held_since_unix_nanos` — see the migration comment
     /// in `init` for why this flag doesn't gate materialization the way
     /// held state does.
-    pub fn get_symlink_out_of_root(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError> {
+    pub fn get_symlink_out_of_root(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let flag: Option<i64> = conn
                 .query_row(
@@ -1164,7 +1197,12 @@ impl FileIndexRepository {
         })
     }
 
-    pub fn set_pinned(&self, group_id: &str, path: &str, pinned: bool) -> Result<(), SyncSqliteError> {
+    pub fn set_pinned(
+        &self,
+        group_id: &str,
+        path: &str,
+        pinned: bool,
+    ) -> Result<(), SyncSqliteError> {
         let affected = self.database.write::<_, SyncSqliteError>(|conn| {
             Ok(conn.execute(
                 "UPDATE files SET pinned = ?1 WHERE group_id = ?2 AND path = ?3 AND state = 'current'",
@@ -1219,7 +1257,9 @@ impl FileIndexRepository {
                         // absent referent — classify it as `CorruptState`, not
                         // `NotFound`, so the whole "stored block list is malformed"
                         // fault is reported one consistent way.
-                        SyncSqliteError::CorruptState(format!("stored block list is corrupt: {error}"))
+                        SyncSqliteError::CorruptState(format!(
+                            "stored block list is corrupt: {error}"
+                        ))
                     })?;
                 if blocks.iter().any(|block| block.hash.as_slice() == block_hash) {
                     return Ok(true);
@@ -1294,7 +1334,9 @@ impl FileIndexRepository {
         &self,
         group_id: &str,
     ) -> Result<DurabilityRoots, SyncSqliteError> {
-        self.database.read::<_, SyncSqliteError>(|conn| enumerate_group_durability_roots_on_conn(conn, group_id))
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            enumerate_group_durability_roots_on_conn(conn, group_id)
+        })
     }
 
     /// The `(path, version_seq)` identity of every row
@@ -1665,7 +1707,9 @@ pub fn enumerate_group_durability_roots_on_conn(
         // than letting the bare `?` classify it as a generic `Json`/protocol
         // error.
         let blocks: Vec<BlockInfo> = serde_json::from_str(&blocks_json).map_err(|error| {
-            SyncSqliteError::CorruptState(format!("stored block list for {path} is corrupt: {error}"))
+            SyncSqliteError::CorruptState(format!(
+                "stored block list for {path} is corrupt: {error}"
+            ))
         })?;
         // Reconstruct the exact `FileVersion` this row describes and derive
         // its `version_hash` via the SAME `compute_hash()` the change-DAG

@@ -46,8 +46,8 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_daemon::sync_error::SyncError;
+use yadorilink_replica_domain::file::FileRecord;
 
 /// The index operation classes a DST scenario drives through the wrapper.
 /// A fault schedule is keyed by op class so a fault on one op (e.g. the

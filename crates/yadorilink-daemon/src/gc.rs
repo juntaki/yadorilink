@@ -179,7 +179,8 @@ fn run_sweep_sync(
     // scope of this sweep (one block store shared by every group).
     let live = state
         .replica_coordinator
-        .materialization_state_repository().live_block_hashes_including_all_dag_retention_roots()
+        .materialization_state_repository()
+        .live_block_hashes_including_all_dag_retention_roots()
         .map_err(|e| GcTriggerError::Failed(e.to_string()))?;
     // `DaemonState::block_store` is already an erased `Arc<dyn BlockStore +
     // Send + Sync>`, which does not itself unsize-coerce to `&dyn
@@ -346,8 +347,8 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::{Condvar, Mutex};
 
-    use yadorilink_local_storage::{BlockStore, ContentHash, FsBlockStore, StorageError};
     use crate::replica_coordinator::ReplicaCoordinator;
+    use yadorilink_local_storage::{BlockStore, ContentHash, FsBlockStore, StorageError};
     use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 
     use super::*;
@@ -419,9 +420,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn eviction_without_remote_lease_never_reaches_physical_reclaim() {
+        use yadorilink_filesystem_sync::materialization_eviction::{
+            evict_file, MaterializationContext,
+        };
         use yadorilink_replica_domain::file::VersionBlock;
         use yadorilink_replica_domain::ids::VersionHash;
-        use yadorilink_filesystem_sync::materialization_eviction::{evict_file, MaterializationContext};
 
         let store_dir = tempfile::tempdir().unwrap();
         let (reclaim_started_tx, reclaim_started_rx) = std::sync::mpsc::sync_channel(1);
@@ -437,7 +440,10 @@ mod tests {
         // actually persists (see `materialization.rs`'s own `adopt_root`
         // test helper doc for why -- `set_link_root_token_for_group` is a
         // no-op `UPDATE` without one).
-        sync_state.link_repository().add_link(&materialized_root.path().to_string_lossy(), "group-a").unwrap();
+        sync_state
+            .link_repository()
+            .add_link(&materialized_root.path().to_string_lossy(), "group-a")
+            .unwrap();
         yadorilink_root_authority::root_identity::VerifiedRoot::open(
             materialized_root.path(),
             "group-a",
@@ -458,10 +464,15 @@ mod tests {
             deleted: false,
         };
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-        state.replica_coordinator.file_index_repository().upsert_file("group-a", &target, &permit).unwrap();
         state
             .replica_coordinator
-            .materialization_state_repository().set_materialization_state(
+            .file_index_repository()
+            .upsert_file("group-a", &target, &permit)
+            .unwrap();
+        state
+            .replica_coordinator
+            .materialization_state_repository()
+            .set_materialization_state(
                 "group-a",
                 "evicted.txt",
                 yadorilink_replica_domain::session_state::MaterializationState::Hydrated,
@@ -544,7 +555,8 @@ mod tests {
             let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
             writer_state
                 .replica_coordinator
-                .file_index_repository().upsert_file(
+                .file_index_repository()
+                .upsert_file(
                     "group-a",
                     &FileRecord {
                         path: "adopted.txt".into(),
@@ -633,8 +645,16 @@ mod tests {
         });
         let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         let state = DaemonState::new("device-a".into(), sync_state, store);
-        state.replica_coordinator.link_repository().add_link("/tmp/yadorilink-gc-test-a", "group-a").unwrap();
-        state.replica_coordinator.link_repository().add_link("/tmp/yadorilink-gc-test-b", "group-b").unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link("/tmp/yadorilink-gc-test-a", "group-a")
+            .unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link("/tmp/yadorilink-gc-test-b", "group-b")
+            .unwrap();
 
         let first_state = state.clone();
         let first = tokio::spawn(run_sweep(first_state, false));

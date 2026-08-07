@@ -13,12 +13,15 @@
 //! a `ConfirmedAbsent`/`Mismatch` result here should block automatic
 //! recovery is Phase 2.1-C2-B2's classifier, layered on top.
 
-use yadorilink_replica_domain::session_state::{EnrollmentOperation, EnrollmentOperationState, MembershipOperation, RoleLossAction, RoleLossOperation};
 use crate::recovery::{
     EnrollmentLocalEvidence, LocalLinkEvidence, LocalObservation, MembershipLocalEvidence,
     PendingEnrollmentEvidence, RoleLossLocalEvidence,
 };
 use yadorilink_replica_domain::session_state::MaterializationPolicy;
+use yadorilink_replica_domain::session_state::{
+    EnrollmentOperation, EnrollmentOperationState, MembershipOperation, RoleLossAction,
+    RoleLossOperation,
+};
 
 use crate::coordination_client::{
     EnrollmentOperationRecord, EnrollmentRemoteRequest, EnrollmentRemoteStatus,
@@ -463,8 +466,11 @@ pub fn qualify_role_loss(
 
 #[cfg(test)]
 mod tests {
-    use yadorilink_replica_domain::session_state::{MembershipCommitMode, MembershipDurabilityScope, MembershipOperationAction, MembershipOperationState};
     use yadorilink_replica_domain::session_state::EnrollmentKind;
+    use yadorilink_replica_domain::session_state::{
+        MembershipCommitMode, MembershipDurabilityScope, MembershipOperationAction,
+        MembershipOperationState,
+    };
 
     use super::*;
     use crate::coordination_client::{
@@ -1386,7 +1392,8 @@ mod tests {
             lease_id: Some("lease-1".to_string()),
             worker_membership_generation: None,
             action,
-            state: yadorilink_replica_domain::session_state::RoleLossOperationState::WorkerCommitted,
+            state:
+                yadorilink_replica_domain::session_state::RoleLossOperationState::WorkerCommitted,
             local_path: local_path.map(str::to_string),
             attempts: 0,
             created_at_unix: 1,

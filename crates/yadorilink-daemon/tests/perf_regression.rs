@@ -29,11 +29,11 @@ use std::time::{Duration, Instant};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::hydration;
-use yadorilink_local_storage::{chunk_file, FsBlockStore};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+use yadorilink_local_storage::{chunk_file, FsBlockStore};
 use yadorilink_peer_session::peer_session::PeerSyncSession;
-use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_replica_domain::file::FileRecord;
+use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_transport::{PeerChannel, TransportHub};
 
 const GROUP: &str = "perf-group";
@@ -159,7 +159,8 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
     )
     .unwrap();
     dest_sync_state
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &FileRecord {
                 path: "large.bin".into(),
@@ -172,7 +173,8 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
         )
         .unwrap();
     dest_sync_state
-        .materialization_state_repository().set_materialization_state(
+        .materialization_state_repository()
+        .set_materialization_state(
             GROUP,
             "large.bin",
             MaterializationState::Placeholder,
@@ -219,10 +221,15 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
     // cannot produce -- and the peer-apply path refuses it, which here would
     // stop this side ever learning (and so serving) the blocks under test.
     let source_sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-    source_sync_state.link_repository().add_link(&source_dir.path().to_string_lossy(), GROUP).unwrap();
-    let source_record = dest_sync_state.file_index_repository().get_file(GROUP, "large.bin").unwrap().unwrap();
     source_sync_state
-        .file_index_repository().upsert_file(
+        .link_repository()
+        .add_link(&source_dir.path().to_string_lossy(), GROUP)
+        .unwrap();
+    let source_record =
+        dest_sync_state.file_index_repository().get_file(GROUP, "large.bin").unwrap().unwrap();
+    source_sync_state
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &source_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -237,7 +244,10 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
     // not_found, and hydration would exhaust its retries and time out
     // instead of exercising the concurrent-async-work property under test.
     let block_hashes: Vec<Vec<u8>> = blocks.iter().map(|block| block.hash.clone()).collect();
-    source_sync_state.change_history_repository().record_group_block_provenance(GROUP, &block_hashes).unwrap();
+    source_sync_state
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, &block_hashes)
+        .unwrap();
     let generation = source_sync_state.startup_readiness().begin_group_startup(GROUP);
     source_sync_state.startup_readiness().mark_group_ready(GROUP, generation);
     let session_source = PeerSyncSession::new(

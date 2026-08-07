@@ -1041,11 +1041,11 @@ mod probe_artefact_ownership_tests {
         case_insensitivity_within, normalization_insensitivity_within, probe_in_named_dir,
         CASE_PROBE_LEAF_NAME, NORMALIZATION_PROBE_LEAF_NAME,
     };
+    use std::ffi::OsStr;
+    use std::path::Path;
     use yadorilink_root_authority::reserved_namespace::{
         artefact_component_name, is_reserved_component, path_has_reserved_component, ArtefactKind,
     };
-    use std::ffi::OsStr;
-    use std::path::Path;
 
     /// Every name either probe puts on disk sits under a component the
     /// engine's own exclusion predicate recognizes, so the watcher, the
@@ -1070,7 +1070,8 @@ mod probe_artefact_ownership_tests {
     /// every leaf under it, in every spelling.
     #[test]
     fn every_leaf_spelling_either_probe_uses_is_excluded_under_its_reserved_parent() {
-        let parent = yadorilink_root_authority::fs_capabilities::probe_artefact_name("case").unwrap();
+        let parent =
+            yadorilink_root_authority::fs_capabilities::probe_artefact_name("case").unwrap();
         let decomposed: String = {
             use unicode_normalization::UnicodeNormalization;
             NORMALIZATION_PROBE_LEAF_NAME.nfd().collect()

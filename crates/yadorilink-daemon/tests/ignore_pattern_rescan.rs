@@ -18,8 +18,8 @@ use std::time::Duration;
 use support::wait_until;
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::FsBlockStore;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+use yadorilink_local_storage::FsBlockStore;
 use yadorilink_transport::DeviceKeyPair;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -83,7 +83,12 @@ async fn editing_yadorilinkignore_rescans_and_reconverges_without_daemon_restart
 
     wait_until(|| root_b.path().join("build.log").exists(), Duration::from_secs(15)).await;
     wait_until(|| root_b.path().join("keep.txt").exists(), Duration::from_secs(15)).await;
-    assert!(state_a.replica_coordinator.file_index_repository().get_file(&group_id, "build.log").unwrap().is_some());
+    assert!(state_a
+        .replica_coordinator
+        .file_index_repository()
+        .get_file(&group_id, "build.log")
+        .unwrap()
+        .is_some());
 
     // Edit `.yadorilinkignore` on device A only — device-local, unsynced.
     // No restart: `start_link_watch`'s executor task is still the same
@@ -96,7 +101,14 @@ async fn editing_yadorilinkignore_rescans_and_reconverges_without_daemon_restart
     // index (dropped, not deleted — the on-disk file is untouched) —
     // this is the observable signal that the rescan actually ran.
     wait_until(
-        || state_a.replica_coordinator.file_index_repository().get_file(&group_id, "build.log").unwrap().is_none(),
+        || {
+            state_a
+                .replica_coordinator
+                .file_index_repository()
+                .get_file(&group_id, "build.log")
+                .unwrap()
+                .is_none()
+        },
         Duration::from_secs(15),
     )
     .await;
@@ -110,7 +122,12 @@ async fn editing_yadorilinkignore_rescans_and_reconverges_without_daemon_restart
     // both sides remain internally consistent after the rescan.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(root_b.path().join("build.log").exists());
-    let record_b = state_b.replica_coordinator.file_index_repository().get_file(&group_id, "build.log").unwrap().unwrap();
+    let record_b = state_b
+        .replica_coordinator
+        .file_index_repository()
+        .get_file(&group_id, "build.log")
+        .unwrap()
+        .unwrap();
     assert!(!record_b.deleted, "no tombstone must reach the peer for a newly-ignored file");
 
     // removing the pattern (editing the ignore file again, still
@@ -125,5 +142,10 @@ async fn editing_yadorilinkignore_rescans_and_reconverges_without_daemon_restart
         std::fs::read(root_b.path().join("release-notes.log")).unwrap(),
         b"now wanted again"
     );
-    assert!(state_a.replica_coordinator.file_index_repository().get_file(&group_id, "release-notes.log").unwrap().is_some());
+    assert!(state_a
+        .replica_coordinator
+        .file_index_repository()
+        .get_file(&group_id, "release-notes.log")
+        .unwrap()
+        .is_some());
 }

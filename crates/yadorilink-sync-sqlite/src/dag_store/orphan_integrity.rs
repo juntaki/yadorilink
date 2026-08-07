@@ -7,9 +7,9 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
+use crate::error::SyncSqliteError;
 use yadorilink_replica_domain::change::Change;
 use yadorilink_replica_domain::ids::ChangeHash;
-use crate::error::SyncSqliteError;
 
 /// Upper bound on the orphan buffer. A change whose parents never arrive
 /// cannot grow the store without limit: once this many orphans are held, the
@@ -232,7 +232,9 @@ pub fn promote_orphans(
 /// calls this once so restart self-heals any such gap; it is not used on the
 /// hot admission path, where the seed is already known from the change that
 /// was just admitted.
-pub(crate) fn already_satisfied_parents(conn: &Connection) -> Result<Vec<ChangeHash>, SyncSqliteError> {
+pub(crate) fn already_satisfied_parents(
+    conn: &Connection,
+) -> Result<Vec<ChangeHash>, SyncSqliteError> {
     let mut stmt = conn.prepare(
         "SELECT DISTINCT cp.parent_hash FROM change_parents cp \
          JOIN changes c ON c.change_hash = cp.parent_hash \

@@ -118,15 +118,15 @@ use dst_support::clock::HarnessClock;
 use dst_support::oracle::GlobalOracle;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
-use yadorilink_local_storage::FsBlockStore;
-use yadorilink_replica_domain::ids::ChangeHash;
-use yadorilink_filesystem_sync::debounce::{self, DebounceConfig, FlushPathRequest};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
-use yadorilink_peer_session::peer_session::{PeerSyncSession, PendingLocalChangeFlush};
+use yadorilink_filesystem_sync::debounce::{self, DebounceConfig, FlushPathRequest};
 use yadorilink_filesystem_sync::watcher::{
     FolderWatchSource, FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
 };
+use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
+use yadorilink_local_storage::FsBlockStore;
+use yadorilink_peer_session::peer_session::{PeerSyncSession, PendingLocalChangeFlush};
+use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_transport::PeerChannel;
 
 const GROUP_ID: &str = "dst-dir-chaos-group";
@@ -158,7 +158,7 @@ struct ChaosDevice {
 
 impl ChaosDevice {
     /// Harness twin of
-    /// `link_manager::LinkFlushHandle::capture_undiscovered_local_change`.
+    /// `link_runtime::LinkFlushHandle::capture_undiscovered_local_change`.
     ///
     /// Production does *not* read a `None` reply from the debounce
     /// accumulator as "nothing local to protect" — it falls back to a
@@ -1840,7 +1840,7 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
     // PF (fidelity/artifact-reduction) F.2, agmsg investigation 2026-07-09:
     // a real daemon runs `repair_interrupted_materializations` +
     // `cleanup_stale_temp_files` at startup and periodically
-    // (`link_manager.rs`) -- this bare-`PeerSyncSession` harness never
+    // (`link_runtime`) -- this bare-`PeerSyncSession` harness never
     // called either, so an interrupted eager materialize's window left a
     // live-but-fileless index row + an orphaned `.yadorilink-tmp.*` file
     // permanently, surfacing as `StructuralIndexDiskMismatch`/`Corruption`

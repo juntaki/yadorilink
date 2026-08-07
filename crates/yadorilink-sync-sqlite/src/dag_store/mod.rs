@@ -1859,11 +1859,12 @@ mod tests {
         for name in ["CON", "com1", "LPT9.log"] {
             let c = conn();
             let em = emitter();
-            let err = emit_local_change(&c, "g", vec![create_op(name)], ChangeAuth::PLACEHOLDER, &em)
-                .expect_err(
-                    "a reserved Windows device name must be refused before it is ever signed \
+            let err =
+                emit_local_change(&c, "g", vec![create_op(name)], ChangeAuth::PLACEHOLDER, &em)
+                    .expect_err(
+                        "a reserved Windows device name must be refused before it is ever signed \
                      and appended",
-                );
+                    );
             assert!(
                 matches!(err, SyncSqliteError::NonPortablePath(ref p) if p == name),
                 "{name:?}: expected NonPortablePath, got {err:?}"
@@ -2735,8 +2736,10 @@ mod tests {
                 "device-A",
                 ChangeContent { ops: vec![create_op("a.txt")], versions: &[] },
                 None,
-                &em,
-                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+                yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
+                    emitter: &em,
+                    permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+                },
             )
             .unwrap();
 

@@ -49,7 +49,11 @@ fn new_daemon(device_id: &str) -> Daemon {
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
     let root = tempfile::tempdir().unwrap();
-    state.replica_coordinator.link_repository().add_link(&root.path().to_string_lossy(), GROUP).unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&root.path().to_string_lossy(), GROUP)
+        .unwrap();
     Daemon { state, _store_dir: store_dir, _index_dir: index_dir, root }
 }
 
@@ -104,10 +108,20 @@ fn give_file(daemon: &Daemon, file_name: &str, content: &[u8], author: &str) {
     daemon
         .state
         .replica_coordinator
-        .change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&bytes))
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&bytes))
         .unwrap();
     let record = record_referencing(file_name, author, bytes, content.len() as u64);
-    daemon.state.replica_coordinator.file_index_repository().upsert_file(GROUP, &record, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+    daemon
+        .state
+        .replica_coordinator
+        .file_index_repository()
+        .upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 }
 
 // --- happy path: B online, produces a real ticket ------------------------

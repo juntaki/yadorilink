@@ -13,7 +13,9 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use support::{connect_two_daemons, ensure_device_signing_key, open_file_backed_replica_coordinator};
+use support::{
+    connect_two_daemons, ensure_device_signing_key, open_file_backed_replica_coordinator,
+};
 use tokio::net::UnixStream;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -26,8 +28,8 @@ use yadorilink_ipc_proto::daemonctl::{
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_replica_domain::session_state::RoleLossOperationState;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
+use yadorilink_replica_domain::session_state::RoleLossOperationState;
 
 const GROUP: &str = "durability-group";
 
@@ -45,7 +47,11 @@ fn new_daemon(device_id: &str) -> Daemon {
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
     let root = tempfile::tempdir().unwrap();
-    state.replica_coordinator.link_repository().add_link(&root.path().to_string_lossy(), GROUP).unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&root.path().to_string_lossy(), GROUP)
+        .unwrap();
     Daemon { state, _store_dir: store_dir, _index_dir: index_dir, root }
 }
 
@@ -88,7 +94,8 @@ async fn unlink_refused_when_no_other_replica_is_ready() {
     let record = record_referencing("solo.bin", vec![1u8; 32], 4);
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -192,11 +199,16 @@ async fn exclude_target_readiness_false_when_only_ready_replica_is_the_excluded_
     // (`record_group_block_provenance`'s doc comment): without this, the
     // real peer-to-peer readiness confirmation this file exercises refuses
     // the block as never having been obtained through the group.
-    a.state.replica_coordinator.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&bytes)).unwrap();
+    a.state
+        .replica_coordinator
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&bytes))
+        .unwrap();
     let record = record_referencing("held.bin", bytes, content.len() as u64);
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -204,7 +216,8 @@ async fn exclude_target_readiness_false_when_only_ready_replica_is_the_excluded_
         .unwrap();
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -242,7 +255,8 @@ async fn exclude_target_readiness_true_when_a_different_replica_is_ready() {
     for d in [&a, &b, &c] {
         d.state
             .replica_coordinator
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &record,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -255,10 +269,15 @@ async fn exclude_target_readiness_true_when_a_different_replica_is_ready() {
     a.state.block_store.put(content).unwrap();
     a.state
         .replica_coordinator
-        .change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&block_hash))
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&block_hash))
         .unwrap();
     c.state.block_store.put(content).unwrap();
-    c.state.replica_coordinator.change_history_repository().record_group_block_provenance(GROUP, &[block_hash]).unwrap();
+    c.state
+        .replica_coordinator
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, &[block_hash])
+        .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
     connect_two_daemons(&c.state, "device-c", &b.state, "device-b", &[GROUP.to_string()]).await;
@@ -306,16 +325,25 @@ async fn unlink_setup(
     // (`record_group_block_provenance`'s doc comment): without this, the
     // real peer-to-peer readiness confirmation this file exercises refuses
     // the block as never having been obtained through the group.
-    a.state.replica_coordinator.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&bytes)).unwrap();
+    a.state
+        .replica_coordinator
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&bytes))
+        .unwrap();
     // Device-b needs the same provenance record as device-a: device-a's own
     // mandatory lease issuance re-verifies ITS OWN readiness by querying
     // device-b to confirm device-b durably holds this file, which requires
     // group block provenance on the ANSWERING side too.
-    b.state.replica_coordinator.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&bytes)).unwrap();
+    b.state
+        .replica_coordinator
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&bytes))
+        .unwrap();
     let record = record_referencing("only.bin", bytes, content.len() as u64);
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -323,7 +351,8 @@ async fn unlink_setup(
         .unwrap();
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -452,7 +481,8 @@ async fn ambiguous_unlink_keeps_prepared_journal() {
     let rows = b
         .state
         .replica_coordinator
-        .role_loss_operation_repository().list_role_loss_operations_in_states(&[
+        .role_loss_operation_repository()
+        .list_role_loss_operations_in_states(&[
             RoleLossOperationState::Prepared,
             RoleLossOperationState::Compensating,
         ])

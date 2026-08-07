@@ -19,12 +19,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use yadorilink_local_storage::BlockStore;
+use crate::sync_error::SyncError;
 use yadorilink_filesystem_sync::materialization_repair::{
     MaterializationRepairReport, RestoreRecoveryReport,
 };
+use yadorilink_local_storage::BlockStore;
 use yadorilink_root_authority::root_commit::RootLease;
-use crate::sync_error::SyncError;
 
 use crate::replica_coordinator::ReplicaCoordinator;
 
@@ -50,13 +50,13 @@ pub(crate) fn reconcile_restore_operations(
     // earlier move in this sub-phase) -- mapped at this one boundary via the
     // same `impl From<MaterializationExecutionError> for SyncError` bridge
     // `hydration.rs::evict` already uses.
-    Ok(yadorilink_filesystem_sync::materialization_repair::reconcile_restore_operations(
+    yadorilink_filesystem_sync::materialization_repair::reconcile_restore_operations(
         replica_coordinator.as_ref(),
         root,
         group_id,
         &op.permit(),
     )
-    .map_err(SyncError::from)?)
+    .map_err(SyncError::from)
 }
 
 /// Repairs any `Hydrated`-but-disk-inconsistent row this link's index has --
@@ -96,12 +96,12 @@ pub(crate) fn repair_interrupted_materializations(
 ) -> Result<MaterializationRepairReport, SyncError> {
     let op = root_lease.begin_operation()?;
     // See `reconcile_restore_operations` above for the same error-type note.
-    Ok(yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations(
+    yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations(
         replica_coordinator.as_ref(),
         &crate::adapters::block_store_ports::BlockStorePortsAdapter::new(block_store.clone()),
         root,
         group_id,
         &op.permit(),
     )
-    .map_err(SyncError::from)?)
+    .map_err(SyncError::from)
 }

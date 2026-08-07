@@ -10,7 +10,7 @@ port/module fan-out analysis that drove this shape.
 
 Checked here:
 
-- `yadorilink-peer-session`'s `Cargo.toml` names no `yadorilink-sync-core`,
+- `yadorilink-peer-session`'s production dependencies name no `yadorilink-sync-core`,
   `rusqlite`/`r2d2`, or `notify`/`walkdir` dependency.
 - No source file in `yadorilink-peer-session/src/` references
   `yadorilink_sync_core::` or `rusqlite::`/`r2d2::`/`notify::`/`walkdir::`.
@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import re
 import tempfile
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -125,13 +126,14 @@ def _non_comment_lines(path: Path) -> list[tuple[int, str]]:
 def cargo_toml_violations(cargo_toml: Path) -> list[str]:
     if not cargo_toml.is_file():
         return [f"{cargo_toml} does not exist"]
-    text = cargo_toml.read_text(encoding="utf-8")
+    manifest = tomllib.loads(cargo_toml.read_text(encoding="utf-8"))
     failures = []
+    production_dependencies = dict(manifest.get("dependencies", {}))
+    for target in manifest.get("target", {}).values():
+        production_dependencies.update(target.get("dependencies", {}))
     for dep in PEER_SESSION_FORBIDDEN_CARGO_DEPS:
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith(f"{dep} ") or stripped.startswith(f"{dep}="):
-                failures.append(f"{cargo_toml} depends on forbidden crate/package {dep!r}")
+        if dep in production_dependencies:
+            failures.append(f"{cargo_toml} depends on forbidden crate/package {dep!r}")
     return failures
 
 
@@ -341,6 +343,17 @@ def self_test() -> None:
             ), f"failed to detect Cargo.toml dep {dep!r}"
         reset()
         assert not violations(crate_dir, sync_core_src, crates_dir)
+
+        # A raw SQLite fixture may be a dev-dependency without putting
+        # SQLite into the peer-session library's production graph.
+        (crate_dir / "Cargo.toml").write_text(
+            '[package]\nname = "yadorilink-peer-session"\n\n'
+            "[dependencies]\nyadorilink-sync-wire.workspace = true\n"
+            "[dev-dependencies]\nrusqlite = \"1\"\n",
+            encoding="utf-8",
+        )
+        assert not violations(crate_dir, sync_core_src, crates_dir)
+        reset()
 
         for token in PEER_SESSION_FORBIDDEN_SOURCE_TOKENS:
             (crate_dir / "src" / "peer_session.rs").write_text(

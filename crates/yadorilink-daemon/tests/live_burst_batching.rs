@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use support::{real_entry_names, wait_until_with_context};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::FsBlockStore;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+use yadorilink_local_storage::FsBlockStore;
 use yadorilink_transport::DeviceKeyPair;
 
 const BURST_FILE_COUNT: usize = 300;
@@ -154,8 +154,14 @@ async fn live_burst_of_many_small_files_converges_via_debounced_batching() {
     // The device that made the burst also holds a fully-indexed, correct
     // local view — the debounced/batched local pipeline didn't lose or
     // duplicate anything on its own side either.
-    assert_eq!(state_a.replica_coordinator.file_index_repository().list_files(&group_id).unwrap().len(), BURST_FILE_COUNT);
-    assert_eq!(state_b.replica_coordinator.file_index_repository().list_files(&group_id).unwrap().len(), BURST_FILE_COUNT);
+    assert_eq!(
+        state_a.replica_coordinator.file_index_repository().list_files(&group_id).unwrap().len(),
+        BURST_FILE_COUNT
+    );
+    assert_eq!(
+        state_b.replica_coordinator.file_index_repository().list_files(&group_id).unwrap().len(),
+        BURST_FILE_COUNT
+    );
 
     // Settling: nothing keeps re-triggering after convergence (a runaway
     // self-echo loop would show up as an ever-growing file count).

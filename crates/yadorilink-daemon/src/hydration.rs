@@ -15,19 +15,19 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use crate::sync_error::SyncError;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use sha2::{Digest, Sha256};
-use yadorilink_local_storage::{disk_bytes_match_indexed_blocks, BlockStore, StorageError};
-#[cfg(test)]
-use yadorilink_replica_domain::file::VersionBlock;
-use yadorilink_local_storage::{apply_exec_bit, reconstruct_file};
 use yadorilink_filesystem_sync::materialization_eviction::{
     evict_file, run_disk_pressure_eviction_sweep, MaterializationContext,
 };
+use yadorilink_local_storage::{apply_exec_bit, reconstruct_file};
+use yadorilink_local_storage::{disk_bytes_match_indexed_blocks, BlockStore, StorageError};
 use yadorilink_peer_session::peer_session::PeerSyncSession;
-use yadorilink_replica_domain::session_state::{MaterializationPolicy, MaterializationState};
 use yadorilink_replica_domain::file::BlockInfo;
-use crate::sync_error::SyncError;
+#[cfg(test)]
+use yadorilink_replica_domain::file::VersionBlock;
+use yadorilink_replica_domain::session_state::{MaterializationPolicy, MaterializationState};
 
 use crate::daemon_state::DaemonState;
 
@@ -107,7 +107,8 @@ fn hydration_commit_decision(
     out_path: &std::path::Path,
     expected_disk_identity: DiskIdentity,
 ) -> Result<HydrationCommitDecision, SyncError> {
-    if state.replica_coordinator.file_index_repository().get_file(group_id, path)?.as_ref() != Some(expected_record)
+    if state.replica_coordinator.file_index_repository().get_file(group_id, path)?.as_ref()
+        != Some(expected_record)
         || state.replica_coordinator.dirty_path_repository().is_path_dirty(group_id, path)?
     {
         return Ok(HydrationCommitDecision::Stale);
@@ -125,7 +126,11 @@ fn hydration_commit_decision(
     if local_root_for_group(state, group_id).ok().as_deref() != Some(expected_root) {
         return Ok(HydrationCommitDecision::Stale);
     }
-    match state.replica_coordinator.materialization_state_repository().get_materialization_state(group_id, path)? {
+    match state
+        .replica_coordinator
+        .materialization_state_repository()
+        .get_materialization_state(group_id, path)?
+    {
         Some(MaterializationState::Hydrated)
             if disk_bytes_match_indexed_blocks(out_path, &expected_record.blocks)? =>
         {
@@ -153,11 +158,15 @@ fn hydration_commit_decision(
 /// fixtures, already goes through `ReplicaCoordinator`) and was removed
 /// rather than kept as an unused compatibility shim.
 trait MaterializationStateAccess {
-    fn materialization_state_repository(&self) -> &yadorilink_sync_sqlite::MaterializationStateRepository;
+    fn materialization_state_repository(
+        &self,
+    ) -> &yadorilink_sync_sqlite::MaterializationStateRepository;
 }
 
 impl MaterializationStateAccess for crate::replica_coordinator::ReplicaCoordinator {
-    fn materialization_state_repository(&self) -> &yadorilink_sync_sqlite::MaterializationStateRepository {
+    fn materialization_state_repository(
+        &self,
+    ) -> &yadorilink_sync_sqlite::MaterializationStateRepository {
         crate::replica_coordinator::ReplicaCoordinator::materialization_state_repository(self)
     }
 }
@@ -206,13 +215,16 @@ impl<T: MaterializationStateAccess> Drop for HydrationStateGuard<'_, T> {
             // firing from an unlocked `Drop` could still, in principle,
             // race a differently-authored row it has no way to
             // distinguish from its own.
-            let _ = self.state.materialization_state_repository().transition_materialization_state_if_same_authoring(
-                self.group_id,
-                self.path,
-                MaterializationState::Hydrating,
-                self.authoring_change_hash.as_ref(),
-                MaterializationState::Placeholder,
-            );
+            let _ = self
+                .state
+                .materialization_state_repository()
+                .transition_materialization_state_if_same_authoring(
+                    self.group_id,
+                    self.path,
+                    MaterializationState::Hydrating,
+                    self.authoring_change_hash.as_ref(),
+                    MaterializationState::Placeholder,
+                );
         }
     }
 }
@@ -899,7 +911,9 @@ async fn hydrate_inner(
     // `reconstruct_file` disk write) — held for this whole function's
     // duration so an update install never starts mid-hydration.
     let _write_activity = state.begin_write_activity();
-    let Some(initial_record) = state.replica_coordinator.file_index_repository().get_file(group_id, path)? else {
+    let Some(initial_record) =
+        state.replica_coordinator.file_index_repository().get_file(group_id, path)?
+    else {
         return Err(SyncError::NotFound(format!("file {group_id}/{path}")));
     };
     if initial_record.deleted {
@@ -960,7 +974,9 @@ async fn hydrate_inner(
     // sync-core's own `hydrate_file_with_timeout`) that already holds
     // its equivalent lock for its whole attempt, not just its commit.
     let _path_guard = path_lock.lock().await;
-    let Some(current) = state.replica_coordinator.file_index_repository().get_file(group_id, path)? else {
+    let Some(current) =
+        state.replica_coordinator.file_index_repository().get_file(group_id, path)?
+    else {
         return Err(SyncError::NotFound(format!("file {group_id}/{path}")));
     };
     if current.deleted || current != initial_record {
@@ -981,7 +997,11 @@ async fn hydrate_inner(
     // target is never chunked) and clobber the real on-disk symlink/
     // directory at `out_path` with an empty regular file. Nothing to
     // hydrate for a kind that is never a placeholder in the first place.
-    if state.replica_coordinator.file_index_repository().get_record_kind(group_id, path)?.unwrap_or_default()
+    if state
+        .replica_coordinator
+        .file_index_repository()
+        .get_record_kind(group_id, path)?
+        .unwrap_or_default()
         != yadorilink_replica_domain::file::RecordKind::File
     {
         return Ok(());
@@ -1001,7 +1021,10 @@ async fn hydrate_inner(
     // content is not re-derived here; an already-`Hydrated` row is this
     // function's signal that there is nothing left for it to do, exactly
     // as `pin`'s own `already_hydrated` short-circuit already treats it).
-    if state.replica_coordinator.materialization_state_repository().get_materialization_state(group_id, path)?
+    if state
+        .replica_coordinator
+        .materialization_state_repository()
+        .get_materialization_state(group_id, path)?
         == Some(MaterializationState::Hydrated)
     {
         return Ok(());
@@ -1010,7 +1033,10 @@ async fn hydrate_inner(
     // is this exact version -- see `HydrationStateGuard`'s own doc
     // comment for why its revert-on-drop must bind to this instead of
     // just the `Hydrating` state value.
-    let authoring_change_hash = state.replica_coordinator.file_index_repository().get_authoring_change_hash(group_id, path)?;
+    let authoring_change_hash = state
+        .replica_coordinator
+        .file_index_repository()
+        .get_authoring_change_hash(group_id, path)?;
     let initial_disk_identity = disk_identity(&out_path)?;
     state.replica_coordinator.materialization_state_repository().set_materialization_state(
         group_id,
@@ -1019,8 +1045,12 @@ async fn hydrate_inner(
         &root_commit_permit,
     )?;
     let record = current;
-    let mut hydration_state =
-        HydrationStateGuard::new(state.replica_coordinator.as_ref(), group_id, path, authoring_change_hash);
+    let mut hydration_state = HydrationStateGuard::new(
+        state.replica_coordinator.as_ref(),
+        group_id,
+        path,
+        authoring_change_hash,
+    );
 
     // Local-present-first resolution (shared with `restore_to_version_inner`
     // via `resolve_blocks_local_first`): blocks already cached locally are
@@ -1092,7 +1122,10 @@ async fn hydrate_inner(
             // file's exec bit was silently lost on every daemon-side
             // on-demand hydration: the index kept the correct bit, but
             // disk never got it applied after `reconstruct_file`.
-            apply_exec_bit(&out_path, state.replica_coordinator.file_index_repository().get_exec_bit(group_id, path)?)?;
+            apply_exec_bit(
+                &out_path,
+                state.replica_coordinator.file_index_repository().get_exec_bit(group_id, path)?,
+            )?;
             // Author-bound, not a blind `set_materialization_state`, for
             // the identical reason `HydrationStateGuard`'s own
             // revert-on-drop is: `hydration_commit_decision` proved the
@@ -1104,13 +1137,17 @@ async fn hydrate_inner(
             // bytes on disk are stale for whatever version is now
             // current -- do not claim `Hydrated` for a version this
             // attempt never actually materialized.
-            if !state.replica_coordinator.materialization_state_repository().transition_materialization_state_if_same_authoring(
-                group_id,
-                path,
-                MaterializationState::Hydrating,
-                authoring_change_hash.as_ref(),
-                MaterializationState::Hydrated,
-            )? {
+            if !state
+                .replica_coordinator
+                .materialization_state_repository()
+                .transition_materialization_state_if_same_authoring(
+                    group_id,
+                    path,
+                    MaterializationState::Hydrating,
+                    authoring_change_hash.as_ref(),
+                    MaterializationState::Hydrated,
+                )?
+            {
                 return Err(SyncError::HydrationFailed(path.to_string()));
             }
         }
@@ -1160,7 +1197,8 @@ fn preflight_disk_pressure(
     // distinction to evict from.
     let is_on_demand = state
         .replica_coordinator
-        .link_repository().list_links()?
+        .link_repository()
+        .list_links()?
         .into_iter()
         .find(|l| l.group_id == group_id)
         .is_some_and(|l| l.materialization_policy == MaterializationPolicy::OnDemand);
@@ -1277,7 +1315,10 @@ pub async fn pin(state: &Arc<DaemonState>, group_id: &str, path: &str) -> Result
     let path_lock = state.replica_coordinator.path_lock_registry().path_lock(group_id, path);
     {
         let _path_guard = path_lock.lock().await;
-        let already_hydrated = state.replica_coordinator.materialization_state_repository().get_materialization_state(group_id, path)?
+        let already_hydrated = state
+            .replica_coordinator
+            .materialization_state_repository()
+            .get_materialization_state(group_id, path)?
             == Some(MaterializationState::Hydrated);
         state.replica_coordinator.file_index_repository().set_pinned(group_id, path, true)?;
         if already_hydrated {
@@ -1411,7 +1452,12 @@ async fn restore_to_version_inner(
     let path_lock = state.replica_coordinator.path_lock_registry().path_lock(group_id, path);
     let _guard = path_lock.lock().await;
 
-    let Some(version) = state.replica_coordinator.file_index_repository().get_version(group_id, path, version_seq)? else {
+    let Some(version) = state.replica_coordinator.file_index_repository().get_version(
+        group_id,
+        path,
+        version_seq,
+    )?
+    else {
         return Err(SyncError::NotFound(format!("version {version_seq} of {group_id}/{path}")));
     };
     if version.deleted {
@@ -1441,9 +1487,12 @@ async fn restore_to_version_inner(
 
     let expected_current_version_seq = state
         .replica_coordinator
-        .sqlite().dag_list_versions(group_id, path)?
+        .sqlite()
+        .dag_list_versions(group_id, path)?
         .into_iter()
-        .find(|candidate| candidate.state == yadorilink_replica_domain::session_state::VersionState::Current)
+        .find(|candidate| {
+            candidate.state == yadorilink_replica_domain::session_state::VersionState::Current
+        })
         .map(|candidate| candidate.version_seq);
     let now_unix_nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1480,7 +1529,8 @@ async fn restore_to_version_inner(
             path: path.to_string(),
             target_version_seq: version_seq,
             expected_current_version_seq,
-            state: yadorilink_filesystem_sync::materialization_types::RestoreOperationState::Prepared,
+            state:
+                yadorilink_filesystem_sync::materialization_types::RestoreOperationState::Prepared,
             record: new_record.clone(),
             origin_device_id: state.device_id.clone(),
             authoring_change_hash: None,
@@ -1542,7 +1592,11 @@ async fn restore_to_version_inner(
     // caught this exact ordering bug) -- calling it first would create
     // directories on a possibly-wrong replacement volume before its
     // identity had even been confirmed.
-    yadorilink_root_authority::root_identity::VerifiedRoot::verify(&root, group_id, state.replica_coordinator.as_ref())?;
+    yadorilink_root_authority::root_identity::VerifiedRoot::verify(
+        &root,
+        group_id,
+        state.replica_coordinator.as_ref(),
+    )?;
     yadorilink_local_storage::verify_write_target_within_root(&out_path, &root)?;
     // A restored version carries its own `record_kind`/`exec_bit`/
     // `symlink_target` (captured per-row, not just for the `current` row
@@ -1579,10 +1633,12 @@ async fn restore_to_version_inner(
                 }
                 #[cfg(windows)]
                 {
-                    if state.replica_coordinator.windows_symlink_opt_in_for_group(group_id)? {
-                        yadorilink_local_storage::materialize_symlink_windows(
-                            &out_path, target,
-                        )?;
+                    if state
+                        .replica_coordinator
+                        .link_repository()
+                        .windows_symlink_opt_in_for_group(group_id)?
+                    {
+                        yadorilink_local_storage::materialize_symlink_windows(&out_path, target)?;
                     }
                 }
                 #[cfg(not(any(unix, windows)))]
@@ -1609,7 +1665,9 @@ async fn restore_to_version_inner(
         .restore_operation_repository()
         .commit_restore_operation(&operation_id)?
     {
-        yadorilink_filesystem_sync::materialization_types::RestoreCommitOutcome::Committed(record) => record,
+        yadorilink_filesystem_sync::materialization_types::RestoreCommitOutcome::Committed(
+            record,
+        ) => record,
         yadorilink_filesystem_sync::materialization_types::RestoreCommitOutcome::Missing => {
             return Err(SyncError::CorruptState(format!(
                 "restore operation disappeared before index commit: {operation_id}"
@@ -1661,7 +1719,8 @@ pub fn most_recent_superseded_version_seq(
 ) -> Result<Option<i64>, SyncError> {
     Ok(state
         .replica_coordinator
-        .sqlite().dag_list_versions(group_id, path)?
+        .sqlite()
+        .dag_list_versions(group_id, path)?
         .into_iter()
         .find(|v| v.state == yadorilink_replica_domain::session_state::VersionState::Superseded)
         .map(|v| v.version_seq))
@@ -1712,8 +1771,10 @@ async fn resolve_blocks_local_first(
 
     let mut missing = Vec::new();
     for ((block, hash), already_present) in blocks.iter().zip(hashes.iter()).zip(present) {
-        let has_group_provenance =
-            state.replica_coordinator.sqlite().dag_group_has_block_provenance(group_id, &block.hash)?;
+        let has_group_provenance = state
+            .replica_coordinator
+            .sqlite()
+            .dag_group_has_block_provenance(group_id, &block.hash)?;
         if !already_present || !has_group_provenance {
             missing.push(block.clone());
             continue;
@@ -1763,7 +1824,10 @@ async fn resolve_blocks_local_first(
         .filter(|block| !unresolved_hashes.contains(block.hash.as_slice()))
         .map(|block| block.hash.clone())
         .collect();
-    state.replica_coordinator.change_history_repository().record_group_block_provenance(group_id, &fetched_hashes)?;
+    state
+        .replica_coordinator
+        .change_history_repository()
+        .record_group_block_provenance(group_id, &fetched_hashes)?;
     Ok(unresolved)
 }
 
@@ -1780,7 +1844,8 @@ fn local_root_for_group(
     // live sync target.
     state
         .replica_coordinator
-        .link_repository().live_link_local_path_for_group(group_id)?
+        .link_repository()
+        .live_link_local_path_for_group(group_id)?
         .map(std::path::PathBuf::from)
         .ok_or_else(|| SyncError::NotFound(format!("no link registered for group {group_id}")))
 }
@@ -1796,9 +1861,9 @@ fn block_data_matches(block: &BlockInfo, data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replica_coordinator::ReplicaCoordinator;
     use sha2::{Digest, Sha256};
     use yadorilink_local_storage::FsBlockStore;
-    use crate::replica_coordinator::ReplicaCoordinator;
 
     fn block(hash_byte: u8) -> BlockInfo {
         BlockInfo { hash: vec![hash_byte; 32], offset: 0, size: 100 }
@@ -1825,7 +1890,11 @@ mod tests {
             std::path::PathBuf::from("/home/alice/Photos")
         );
 
-        state.replica_coordinator.link_repository().mark_link_orphaned("/home/alice/Photos").unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .mark_link_orphaned("/home/alice/Photos")
+            .unwrap();
 
         assert!(
             local_root_for_group(&state, "group-1").is_err(),
@@ -1852,7 +1921,8 @@ mod tests {
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
 
         sync_state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 "group-1",
                 &yadorilink_replica_domain::file::FileRecord {
                     path: "doc.txt".into(),
@@ -1865,9 +1935,13 @@ mod tests {
             )
             .unwrap();
         let old_hash = yadorilink_replica_domain::ids::ChangeHash([1u8; 32]);
-        sync_state.file_index_repository().set_authoring_change_hash("group-1", "doc.txt", &old_hash).unwrap();
         sync_state
-            .materialization_state_repository().set_materialization_state(
+            .file_index_repository()
+            .set_authoring_change_hash("group-1", "doc.txt", &old_hash)
+            .unwrap();
+        sync_state
+            .materialization_state_repository()
+            .set_materialization_state(
                 "group-1",
                 "doc.txt",
                 MaterializationState::Hydrating,
@@ -1877,15 +1951,20 @@ mod tests {
 
         // This (stale) attempt's own guard, capturing the OLD identity --
         // as `hydrate_inner` does before marking the row `Hydrating`.
-        let guard = HydrationStateGuard::new(sync_state.as_ref(), "group-1", "doc.txt", Some(old_hash));
+        let guard =
+            HydrationStateGuard::new(sync_state.as_ref(), "group-1", "doc.txt", Some(old_hash));
 
         // A different, concurrent attempt supersedes the row with a
         // genuinely newer version and starts its OWN hydration --
         // landing back at `Hydrating`, but for a different identity.
         let new_hash = yadorilink_replica_domain::ids::ChangeHash([2u8; 32]);
-        sync_state.file_index_repository().set_authoring_change_hash("group-1", "doc.txt", &new_hash).unwrap();
         sync_state
-            .materialization_state_repository().set_materialization_state(
+            .file_index_repository()
+            .set_authoring_change_hash("group-1", "doc.txt", &new_hash)
+            .unwrap();
+        sync_state
+            .materialization_state_repository()
+            .set_materialization_state(
                 "group-1",
                 "doc.txt",
                 MaterializationState::Hydrating,
@@ -1899,13 +1978,19 @@ mod tests {
         drop(guard);
 
         assert_eq!(
-            sync_state.materialization_state_repository().get_materialization_state("group-1", "doc.txt").unwrap(),
+            sync_state
+                .materialization_state_repository()
+                .get_materialization_state("group-1", "doc.txt")
+                .unwrap(),
             Some(MaterializationState::Hydrating),
             "a stale attempt's guard must not touch a newer version's own in-flight hydration \
              just because the state value happens to match"
         );
         assert_eq!(
-            sync_state.file_index_repository().get_authoring_change_hash("group-1", "doc.txt").unwrap(),
+            sync_state
+                .file_index_repository()
+                .get_authoring_change_hash("group-1", "doc.txt")
+                .unwrap(),
             Some(new_hash),
             "the newer version's identity must be untouched"
         );
@@ -1944,7 +2029,10 @@ mod tests {
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
         let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         let root_dir = tempfile::tempdir().unwrap();
-        sync_state.link_repository().add_link(&root_dir.path().to_string_lossy(), "group-1").unwrap();
+        sync_state
+            .link_repository()
+            .add_link(&root_dir.path().to_string_lossy(), "group-1")
+            .unwrap();
         yadorilink_root_authority::root_identity::VerifiedRoot::open(
             root_dir.path(),
             "group-1",
@@ -1955,11 +2043,15 @@ mod tests {
         let content = b"concurrent hydration content";
         let hash = Sha256::digest(content).to_vec();
         store.put(content).unwrap();
-        sync_state.change_history_repository().record_group_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
+        sync_state
+            .change_history_repository()
+            .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
+            .unwrap();
 
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         sync_state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 "group-1",
                 &yadorilink_replica_domain::file::FileRecord {
                     path: "doc.txt".into(),
@@ -1972,7 +2064,8 @@ mod tests {
             )
             .unwrap();
         sync_state
-            .materialization_state_repository().set_materialization_state(
+            .materialization_state_repository()
+            .set_materialization_state(
                 "group-1",
                 "doc.txt",
                 MaterializationState::Placeholder,
@@ -1995,7 +2088,10 @@ mod tests {
         assert!(result_a.unwrap().is_ok(), "concurrent attempt A must succeed");
         assert!(result_b.unwrap().is_ok(), "concurrent attempt B must succeed");
         assert_eq!(
-            sync_state.materialization_state_repository().get_materialization_state("group-1", "doc.txt").unwrap(),
+            sync_state
+                .materialization_state_repository()
+                .get_materialization_state("group-1", "doc.txt")
+                .unwrap(),
             Some(MaterializationState::Hydrated),
             "the row must end up genuinely Hydrated, not stuck at Placeholder despite correct \
              disk content"
@@ -2024,7 +2120,10 @@ mod tests {
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
         let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         let root_dir = tempfile::tempdir().unwrap();
-        sync_state.link_repository().add_link(&root_dir.path().to_string_lossy(), "group-1").unwrap();
+        sync_state
+            .link_repository()
+            .add_link(&root_dir.path().to_string_lossy(), "group-1")
+            .unwrap();
         yadorilink_root_authority::root_identity::VerifiedRoot::open(
             root_dir.path(),
             "group-1",
@@ -2035,10 +2134,14 @@ mod tests {
         let indexed_content = b"indexed content from the last real hydration";
         let hash = Sha256::digest(indexed_content).to_vec();
         store.put(indexed_content).unwrap();
-        sync_state.change_history_repository().record_group_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
+        sync_state
+            .change_history_repository()
+            .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
+            .unwrap();
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         sync_state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 "group-1",
                 &yadorilink_replica_domain::file::FileRecord {
                     path: "doc.txt".into(),
@@ -2051,7 +2154,8 @@ mod tests {
             )
             .unwrap();
         sync_state
-            .materialization_state_repository().set_materialization_state(
+            .materialization_state_repository()
+            .set_materialization_state(
                 "group-1",
                 "doc.txt",
                 MaterializationState::Hydrated,
@@ -2076,7 +2180,10 @@ mod tests {
             "an already-Hydrated row must never be reconstructed from its indexed blocks"
         );
         assert_eq!(
-            sync_state.materialization_state_repository().get_materialization_state("group-1", "doc.txt").unwrap(),
+            sync_state
+                .materialization_state_repository()
+                .get_materialization_state("group-1", "doc.txt")
+                .unwrap(),
             Some(MaterializationState::Hydrated),
             "the row's state must be left exactly as it was"
         );
@@ -2093,7 +2200,10 @@ mod tests {
     async fn hydrate_of_a_symlink_path_never_replaces_it_with_a_regular_file() {
         let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         let root_dir = tempfile::tempdir().unwrap();
-        sync_state.link_repository().add_link(&root_dir.path().to_string_lossy(), "group-1").unwrap();
+        sync_state
+            .link_repository()
+            .add_link(&root_dir.path().to_string_lossy(), "group-1")
+            .unwrap();
         yadorilink_root_authority::root_identity::VerifiedRoot::open(
             root_dir.path(),
             "group-1",
@@ -2103,7 +2213,8 @@ mod tests {
 
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         sync_state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 "group-1",
                 &yadorilink_replica_domain::file::FileRecord {
                     path: "link.txt".into(),
@@ -2116,14 +2227,18 @@ mod tests {
             )
             .unwrap();
         sync_state
-            .file_index_repository().set_record_kind(
+            .file_index_repository()
+            .set_record_kind(
                 "group-1",
                 "link.txt",
                 yadorilink_replica_domain::file::RecordKind::Symlink,
                 &permit,
             )
             .unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink("target.txt", root_dir.path().join("link.txt")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file("target.txt", root_dir.path().join("link.txt")).unwrap();
 
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
@@ -2153,7 +2268,10 @@ mod tests {
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
         let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         let root_dir = tempfile::tempdir().unwrap();
-        sync_state.link_repository().add_link(&root_dir.path().to_string_lossy(), "group-1").unwrap();
+        sync_state
+            .link_repository()
+            .add_link(&root_dir.path().to_string_lossy(), "group-1")
+            .unwrap();
         yadorilink_root_authority::root_identity::VerifiedRoot::open(
             root_dir.path(),
             "group-1",
@@ -2164,10 +2282,14 @@ mod tests {
         let content = b"nested placeholder content";
         let hash = Sha256::digest(content).to_vec();
         store.put(content).unwrap();
-        sync_state.change_history_repository().record_group_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
+        sync_state
+            .change_history_repository()
+            .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
+            .unwrap();
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         sync_state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 "group-1",
                 &yadorilink_replica_domain::file::FileRecord {
                     path: "sub/nested/doc.txt".into(),
@@ -2180,7 +2302,8 @@ mod tests {
             )
             .unwrap();
         sync_state
-            .materialization_state_repository().set_materialization_state(
+            .materialization_state_repository()
+            .set_materialization_state(
                 "group-1",
                 "sub/nested/doc.txt",
                 MaterializationState::Placeholder,
@@ -2221,7 +2344,10 @@ mod tests {
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
         let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
         let root_dir = tempfile::tempdir().unwrap();
-        sync_state.link_repository().add_link(&root_dir.path().to_string_lossy(), "group-1").unwrap();
+        sync_state
+            .link_repository()
+            .add_link(&root_dir.path().to_string_lossy(), "group-1")
+            .unwrap();
         yadorilink_root_authority::root_identity::VerifiedRoot::open(
             root_dir.path(),
             "group-1",
@@ -2232,10 +2358,14 @@ mod tests {
         let content = b"#!/bin/sh\necho hi\n";
         let hash = Sha256::digest(content).to_vec();
         store.put(content).unwrap();
-        sync_state.change_history_repository().record_group_block_provenance("group-1", std::slice::from_ref(&hash)).unwrap();
+        sync_state
+            .change_history_repository()
+            .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
+            .unwrap();
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         sync_state
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 "group-1",
                 &yadorilink_replica_domain::file::FileRecord {
                     path: "run.sh".into(),
@@ -2247,9 +2377,13 @@ mod tests {
                 &permit,
             )
             .unwrap();
-        sync_state.file_index_repository().set_exec_bit("group-1", "run.sh", true, &permit).unwrap();
         sync_state
-            .materialization_state_repository().set_materialization_state(
+            .file_index_repository()
+            .set_exec_bit("group-1", "run.sh", true, &permit)
+            .unwrap();
+        sync_state
+            .materialization_state_repository()
+            .set_materialization_state(
                 "group-1",
                 "run.sh",
                 MaterializationState::Placeholder,
@@ -2533,12 +2667,17 @@ mod tests {
         // preflight_disk_pressure(...)`), leaving the file materialized
         // and masking the actual eviction-path assertions this fixture
         // exists to exercise.
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(root, GROUP, state.replica_coordinator.as_ref())
-            .unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            root,
+            GROUP,
+            state.replica_coordinator.as_ref(),
+        )
+        .unwrap();
         if on_demand {
             state
                 .replica_coordinator
-                .link_repository().set_materialization_policy(
+                .link_repository()
+                .set_materialization_policy(
                     &local_path,
                     yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand,
                 )
@@ -2556,7 +2695,11 @@ mod tests {
         // cache reclamation only confirms custody for peer-origin content, so
         // eviction-path tests need a real peer origin here.
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-        state.replica_coordinator.file_index_repository().upsert_file_with_origin(GROUP, &record, "device-seed", &permit).unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &record, "device-seed", &permit)
+            .unwrap();
         record
     }
 
@@ -2594,7 +2737,11 @@ mod tests {
         let out_path = root.path().join(PATH);
         let initial_identity = disk_identity(&out_path).unwrap();
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-        state.replica_coordinator.dirty_path_repository().record_dirty_path(GROUP, PATH, "created_or_modified", 1, &permit).unwrap();
+        state
+            .replica_coordinator
+            .dirty_path_repository()
+            .record_dirty_path(GROUP, PATH, "created_or_modified", 1, &permit)
+            .unwrap();
 
         assert!(
             hydration_commit_decision(
@@ -2628,6 +2775,7 @@ mod tests {
         (meta.ctime(), meta.ctime_nsec())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn hydration_commit_rejects_a_same_size_same_mtime_edit_ctime_permitting() {
         let (state, _store_dir) = test_state();
@@ -2639,11 +2787,11 @@ mod tests {
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         state
             .replica_coordinator
-            .materialization_state_repository().set_materialization_state(GROUP, PATH, MaterializationState::Hydrating, &permit)
+            .materialization_state_repository()
+            .set_materialization_state(GROUP, PATH, MaterializationState::Hydrating, &permit)
             .unwrap();
         let initial_identity = disk_identity(&out_path).unwrap();
         let original_mtime = std::fs::symlink_metadata(&out_path).unwrap().modified().unwrap();
-        #[cfg(unix)]
         let ctime_before = raw_ctime(&out_path);
 
         std::fs::write(&out_path, b"BBBB").unwrap();
@@ -2665,7 +2813,6 @@ mod tests {
         // pair -- comparing two `disk_identity()` calls here for the skip
         // condition would make it tautological with the assertion below and
         // silently stop testing anything the moment the fix regressed.
-        #[cfg(unix)]
         if raw_ctime(&out_path) == ctime_before {
             eprintln!(
                 "skipping: this filesystem's ctime granularity could not distinguish a \
@@ -2673,12 +2820,6 @@ mod tests {
             );
             return;
         }
-        #[cfg(not(unix))]
-        {
-            eprintln!("skipping: ctime is unix-only, this fix has no residual coverage here");
-            return;
-        }
-
         assert_eq!(
             hydration_commit_decision(
                 &state,
@@ -2713,13 +2854,22 @@ mod tests {
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         state
             .replica_coordinator
-            .materialization_state_repository().set_materialization_state(GROUP, PATH, MaterializationState::Hydrating, &permit)
+            .materialization_state_repository()
+            .set_materialization_state(GROUP, PATH, MaterializationState::Hydrating, &permit)
             .unwrap();
         let initial_identity = disk_identity(&out_path).unwrap();
 
-        state.replica_coordinator.link_repository().remove_link(&root.path().to_string_lossy()).unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .remove_link(&root.path().to_string_lossy())
+            .unwrap();
         let new_root = tempfile::tempdir().unwrap();
-        state.replica_coordinator.link_repository().add_link(&new_root.path().to_string_lossy(), GROUP).unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link(&new_root.path().to_string_lossy(), GROUP)
+            .unwrap();
 
         assert_eq!(
             hydration_commit_decision(
@@ -2790,9 +2940,14 @@ mod tests {
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         state
             .replica_coordinator
-            .materialization_state_repository().set_materialization_state(GROUP, PATH, MaterializationState::Hydrated, &permit)
+            .materialization_state_repository()
+            .set_materialization_state(GROUP, PATH, MaterializationState::Hydrated, &permit)
             .unwrap();
-        state.replica_coordinator.file_index_repository().touch_last_accessed(GROUP, PATH, 100).unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .touch_last_accessed(GROUP, PATH, 100)
+            .unwrap();
         // An instantaneous peer confirmation is deliberately insufficient for
         // physical CAS deletion until durable remote custody leases exist.
         state.set_custody_confirmer(std::sync::Arc::new(
@@ -2812,7 +2967,11 @@ mod tests {
         );
 
         assert_eq!(
-            state.replica_coordinator.materialization_state_repository().get_materialization_state(GROUP, PATH).unwrap(),
+            state
+                .replica_coordinator
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, PATH)
+                .unwrap(),
             Some(MaterializationState::Placeholder),
             "the disk-pressure-triggered eviction sweep should have evicted the only candidate"
         );
@@ -2841,7 +3000,8 @@ mod tests {
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         state
             .replica_coordinator
-            .materialization_state_repository().set_materialization_state(GROUP, PATH, MaterializationState::Hydrated, &permit)
+            .materialization_state_repository()
+            .set_materialization_state(GROUP, PATH, MaterializationState::Hydrated, &permit)
             .unwrap();
         state.replica_coordinator.file_index_repository().set_pinned(GROUP, PATH, true).unwrap();
 
@@ -2855,7 +3015,11 @@ mod tests {
         );
 
         assert_eq!(
-            state.replica_coordinator.materialization_state_repository().get_materialization_state(GROUP, PATH).unwrap(),
+            state
+                .replica_coordinator
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, PATH)
+                .unwrap(),
             Some(MaterializationState::Hydrated),
             "a pinned file must never be evicted by the disk-pressure trigger"
         );
@@ -2903,7 +3067,11 @@ mod tests {
         let root_a = tempfile::tempdir().unwrap();
         seed_link(&state, root_a.path(), false, 1000);
         let root_b = tempfile::tempdir().unwrap();
-        state.replica_coordinator.link_repository().add_link(&root_b.path().to_string_lossy(), "group-2").unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link(&root_b.path().to_string_lossy(), "group-2")
+            .unwrap();
         let record_b = yadorilink_replica_domain::file::FileRecord {
             path: "other.bin".to_string(),
             size: 500,
@@ -2912,7 +3080,11 @@ mod tests {
             deleted: false,
         };
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-        state.replica_coordinator.file_index_repository().upsert_file("group-2", &record_b, &permit).unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file("group-2", &record_b, &permit)
+            .unwrap();
 
         let err_a =
             preflight_disk_pressure(&state, GROUP, PATH, root_a.path(), 1000, Some(u64::MAX / 2))
@@ -2943,7 +3115,8 @@ mod tests {
         let hash_bytes = hex::decode(&hash).unwrap();
         state
             .replica_coordinator
-            .change_history_repository().record_group_block_provenance(group_id, std::slice::from_ref(&hash_bytes))
+            .change_history_repository()
+            .record_group_block_provenance(group_id, std::slice::from_ref(&hash_bytes))
             .unwrap();
         BlockInfo { hash: hash_bytes, offset: 0, size: data.len() as u32 }
     }
@@ -2987,6 +3160,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let local_path = root.path().to_string_lossy().to_string();
         state.replica_coordinator.link_repository().add_link(&local_path, GROUP).unwrap();
+        #[cfg(windows)]
+        state
+            .replica_coordinator
+            .link_repository()
+            .set_windows_symlink_opt_in(&local_path, true)
+            .unwrap();
         yadorilink_root_authority::root_identity::VerifiedRoot::open(
             root.path(),
             GROUP,
@@ -2997,11 +3176,19 @@ mod tests {
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         let v1_block = put_block(&state, GROUP, b"version one content");
         let v1 = record_with_blocks(PATH, vec![v1_block.clone()], 19);
-        state.replica_coordinator.file_index_repository().upsert_file_with_origin(GROUP, &v1, "device-a", &permit).unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &v1, "device-a", &permit)
+            .unwrap();
 
         let v2_block = put_block(&state, GROUP, b"version two content!!");
         let v2 = record_with_blocks(PATH, vec![v2_block], 21);
-        state.replica_coordinator.file_index_repository().upsert_file_with_origin(GROUP, &v2, "device-a", &permit).unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &v2, "device-a", &permit)
+            .unwrap();
 
         // Restore back to version 1's content.
         restore_to_version(&state, GROUP, PATH, 1).await.unwrap();
@@ -3012,10 +3199,21 @@ mod tests {
         assert_eq!(versions.len(), 3, "restore must add a new version, not rewrite an old one");
         assert_eq!(versions[0].version_seq, 3, "the restored content is the newest version");
         assert_eq!(versions[0].blocks, vec![v1_block]);
-        assert_eq!(versions[0].state, yadorilink_replica_domain::session_state::VersionState::Current);
-        let author = state.replica_coordinator.file_index_repository().get_authoring_change_hash(GROUP, PATH).unwrap();
+        assert_eq!(
+            versions[0].state,
+            yadorilink_replica_domain::session_state::VersionState::Current
+        );
+        let author = state
+            .replica_coordinator
+            .file_index_repository()
+            .get_authoring_change_hash(GROUP, PATH)
+            .unwrap();
         assert!(author.is_some(), "restore must publish its own DAG author identity");
-        assert!(state.replica_coordinator.change_history_repository().dag_has_change_or_pruned(GROUP, &author.unwrap()).unwrap());
+        assert!(state
+            .replica_coordinator
+            .change_history_repository()
+            .dag_has_change_or_pruned(GROUP, &author.unwrap())
+            .unwrap());
         // Version 1 itself is completely untouched.
         let original_v1 = versions.iter().find(|v| v.version_seq == 1).unwrap();
         assert_eq!(original_v1.size, 19);
@@ -3057,20 +3255,44 @@ mod tests {
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         // Version 1: a symlink.
         let v1 = record_with_blocks(PATH, vec![], 0);
-        state.replica_coordinator.file_index_repository().upsert_file_with_origin(GROUP, &v1, "device-a", &permit).unwrap();
         state
             .replica_coordinator
-            .file_index_repository().set_record_kind(GROUP, PATH, yadorilink_replica_domain::file::RecordKind::Symlink, &permit)
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &v1, "device-a", &permit)
             .unwrap();
-        state.replica_coordinator.file_index_repository().set_symlink_target(GROUP, PATH, Some(b"v1-target")).unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .set_record_kind(
+                GROUP,
+                PATH,
+                yadorilink_replica_domain::file::RecordKind::Symlink,
+                &permit,
+            )
+            .unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .set_symlink_target(GROUP, PATH, Some(b"v1-target"))
+            .unwrap();
 
         // Version 2: an ordinary regular file, superseding the symlink.
         let v2_block = put_block(&state, GROUP, b"version two content");
         let v2 = record_with_blocks(PATH, vec![v2_block], 20);
-        state.replica_coordinator.file_index_repository().upsert_file_with_origin(GROUP, &v2, "device-a", &permit).unwrap();
         state
             .replica_coordinator
-            .file_index_repository().set_record_kind(GROUP, PATH, yadorilink_replica_domain::file::RecordKind::File, &permit)
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &v2, "device-a", &permit)
+            .unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .set_record_kind(
+                GROUP,
+                PATH,
+                yadorilink_replica_domain::file::RecordKind::File,
+                &permit,
+            )
             .unwrap();
 
         // Restore back to the symlink version.
@@ -3096,7 +3318,11 @@ mod tests {
             "the current row's record_kind must be updated to match the restored version"
         );
         assert_eq!(
-            state.replica_coordinator.file_index_repository().get_symlink_target(GROUP, PATH).unwrap(),
+            state
+                .replica_coordinator
+                .file_index_repository()
+                .get_symlink_target(GROUP, PATH)
+                .unwrap(),
             Some(b"v1-target".to_vec()),
             "the current row's symlink_target must be updated to match the restored version"
         );
@@ -3126,6 +3352,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let local_path = root.path().to_string_lossy().to_string();
         state.replica_coordinator.link_repository().add_link(&local_path, GROUP).unwrap();
+        #[cfg(windows)]
+        state
+            .replica_coordinator
+            .link_repository()
+            .set_windows_symlink_opt_in(&local_path, true)
+            .unwrap();
         state.install_test_root_commit_authority(GROUP);
         yadorilink_root_authority::root_identity::VerifiedRoot::open(
             root.path(),
@@ -3136,19 +3368,43 @@ mod tests {
 
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         let v1 = record_with_blocks(PATH, vec![], 0);
-        state.replica_coordinator.file_index_repository().upsert_file_with_origin(GROUP, &v1, "device-a", &permit).unwrap();
         state
             .replica_coordinator
-            .file_index_repository().set_record_kind(GROUP, PATH, yadorilink_replica_domain::file::RecordKind::Symlink, &permit)
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &v1, "device-a", &permit)
             .unwrap();
-        state.replica_coordinator.file_index_repository().set_symlink_target(GROUP, PATH, Some(b"v1-target")).unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .set_record_kind(
+                GROUP,
+                PATH,
+                yadorilink_replica_domain::file::RecordKind::Symlink,
+                &permit,
+            )
+            .unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .set_symlink_target(GROUP, PATH, Some(b"v1-target"))
+            .unwrap();
 
         let v2_block = put_block(&state, GROUP, b"version two content");
         let v2 = record_with_blocks(PATH, vec![v2_block], 20);
-        state.replica_coordinator.file_index_repository().upsert_file_with_origin(GROUP, &v2, "device-a", &permit).unwrap();
         state
             .replica_coordinator
-            .file_index_repository().set_record_kind(GROUP, PATH, yadorilink_replica_domain::file::RecordKind::File, &permit)
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &v2, "device-a", &permit)
+            .unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .set_record_kind(
+                GROUP,
+                PATH,
+                yadorilink_replica_domain::file::RecordKind::File,
+                &permit,
+            )
             .unwrap();
 
         restore_to_version(&state, GROUP, PATH, 1).await.unwrap();
@@ -3161,7 +3417,8 @@ mod tests {
         // block list, destroying it.
         state
             .replica_coordinator
-            .materialization_state_repository().set_materialization_state(GROUP, PATH, MaterializationState::Placeholder, &permit)
+            .materialization_state_repository()
+            .set_materialization_state(GROUP, PATH, MaterializationState::Placeholder, &permit)
             .unwrap();
 
         hydrate_inner(&state, GROUP, PATH).await.unwrap();
@@ -3217,10 +3474,18 @@ mod tests {
         let escaping_path = "external/victim.txt";
         let v1_block = put_block(&state, GROUP, b"version one content");
         let v1 = record_with_blocks(escaping_path, vec![v1_block.clone()], 19);
-        state.replica_coordinator.file_index_repository().upsert_file_with_origin(GROUP, &v1, "device-a", &permit).unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &v1, "device-a", &permit)
+            .unwrap();
         let v2_block = put_block(&state, GROUP, b"version two content!!");
         let v2 = record_with_blocks(escaping_path, vec![v2_block], 21);
-        state.replica_coordinator.file_index_repository().upsert_file_with_origin(GROUP, &v2, "device-a", &permit).unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &v2, "device-a", &permit)
+            .unwrap();
 
         let result = restore_to_version(&state, GROUP, escaping_path, 1).await;
         assert!(result.is_err(), "a restore through an intermediate symlink must be refused");
@@ -3252,7 +3517,11 @@ mod tests {
             BlockInfo { hash: Sha256::digest(b"never fetched").to_vec(), offset: 0, size: 13 };
         let v1 = record_with_blocks(PATH, vec![phantom_block], 13);
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
-        state.replica_coordinator.file_index_repository().upsert_file_with_origin(GROUP, &v1, "device-a", &permit).unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &v1, "device-a", &permit)
+            .unwrap();
 
         let err = restore_to_version_with_timeout(
             &state,
@@ -3310,16 +3579,40 @@ mod tests {
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         let block = put_block(&state, GROUP, b"about to be deleted");
         let v1 = record_with_blocks(PATH, vec![block], 19);
-        state.replica_coordinator.file_index_repository().upsert_file_with_origin(GROUP, &v1, "device-a", &permit).unwrap();
-        state.replica_coordinator.file_index_repository().mark_deleted(GROUP, PATH, "device-a", &permit).unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &v1, "device-a", &permit)
+            .unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .mark_deleted(GROUP, PATH, "device-a", &permit)
+            .unwrap();
 
-        assert!(state.replica_coordinator.file_index_repository().get_file(GROUP, PATH).unwrap().unwrap().deleted);
-        assert_eq!(state.replica_coordinator.file_index_repository().list_trashed(GROUP).unwrap().len(), 1);
+        assert!(
+            state
+                .replica_coordinator
+                .file_index_repository()
+                .get_file(GROUP, PATH)
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+        assert_eq!(
+            state.replica_coordinator.file_index_repository().list_trashed(GROUP).unwrap().len(),
+            1
+        );
 
         restore_trashed(&state, GROUP, PATH).await.unwrap();
 
         assert_eq!(std::fs::read(root.path().join(PATH)).unwrap(), b"about to be deleted");
-        let current = state.replica_coordinator.file_index_repository().get_file(GROUP, PATH).unwrap().unwrap();
+        let current = state
+            .replica_coordinator
+            .file_index_repository()
+            .get_file(GROUP, PATH)
+            .unwrap()
+            .unwrap();
         assert!(!current.deleted, "the file must be live again after a trash restore");
     }
 
@@ -3339,7 +3632,11 @@ mod tests {
 
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         let v1 = record_with_blocks(PATH, vec![], 0);
-        state.replica_coordinator.file_index_repository().upsert_file_with_origin(GROUP, &v1, "device-a", &permit).unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &v1, "device-a", &permit)
+            .unwrap();
         assert_eq!(
             most_recent_superseded_version_seq(&state, GROUP, PATH).unwrap(),
             None,
@@ -3347,9 +3644,17 @@ mod tests {
         );
 
         let v2 = record_with_blocks(PATH, vec![], 0);
-        state.replica_coordinator.file_index_repository().upsert_file_with_origin(GROUP, &v2, "device-a", &permit).unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &v2, "device-a", &permit)
+            .unwrap();
         let v3 = record_with_blocks(PATH, vec![], 0);
-        state.replica_coordinator.file_index_repository().upsert_file_with_origin(GROUP, &v3, "device-a", &permit).unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &v3, "device-a", &permit)
+            .unwrap();
 
         assert_eq!(most_recent_superseded_version_seq(&state, GROUP, PATH).unwrap(), Some(2));
     }
