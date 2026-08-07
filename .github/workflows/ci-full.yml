@@ -35,9 +35,19 @@ jobs:
           key: linux-full
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Full workspace
-        run: cargo test --workspace --exclude yadorilink-desktop-app
+        # Daemon integration tests own real watcher/SQLite/network runtimes and
+        # run in the single-threaded lane below. Running them here as well makes
+        # several independent multi-daemon scenarios contend in parallel.
+        run: cargo test --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
       - name: Daemon E2E
-        run: cargo test -p yadorilink-daemon --tests -- --test-threads=1
+        # The two monkey-chaos cases are private seed/soak coverage. They run
+        # in private beta-heat, while every ordinary daemon integration test
+        # remains in this public, serial correctness lane.
+        run: >-
+          cargo test -p yadorilink-daemon --tests --
+          --test-threads=1
+          --skip random_concurrent_operations_converge_to_an_identical_file_set
+          --skip replay_known_failing_seeds
       - name: Wire integration
         run: |
           cargo test -p yadorilink-peer-session --test peer_session --test crash_recovery --test dag_two_device_wire_convergence -- --test-threads=1
@@ -67,7 +77,11 @@ jobs:
         with:
           toolchain: stable
       - name: Daemon E2E
-        run: cargo test -p yadorilink-daemon -- --test-threads=1
+        run: >-
+          cargo test -p yadorilink-daemon --tests --
+          --test-threads=1
+          --skip random_concurrent_operations_converge_to_an_identical_file_set
+          --skip replay_known_failing_seeds
 
   supply-chain:
     runs-on: ubuntu-latest
