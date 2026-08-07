@@ -1,4 +1,38 @@
+# cargo-deny configuration.
+# Run locally with: cargo deny check advisories bans licenses sources
+
+[advisories]
+version = 2
+# Security vulnerabilities and yanked crates are hard failures.
+yanked = "deny"
+# Only flag *unmaintained* advisories for crates the workspace depends on
+# directly. Deep transitive UI dependencies are frequently unmaintained with no
+# safe upgrade, and gating on them would block CI on issues we cannot fix.
+# Known transitive unmaintained deps are deliberately NOT added to `ignore`
+# (so newly-unmaintained direct deps still fail); their source and replacement
+# options are tracked in docs/third-party-unmaintained.md.
+unmaintained = "workspace"
+# Triaged, tracked vulnerability exceptions. The advisories check stays blocking
+# for every other (and future) advisory; only these specific IDs are ignored,
+# each with a documented rationale. See docs/third-party-unmaintained.md for the
+# dependency path, impact assessment, and the condition for removing them.
+ignore = [
+    # quick-xml DoS advisories. Both vulnerable versions (0.30.0, 0.39.4) are
+    # pulled in only through the Linux desktop UI (yadorilink-desktop-app ->
+    # eframe/egui): 0.39.4 via wayland-scanner as a BUILD-time proc-macro that
+    # parses the wayland protocol XML shipped with the crate, and 0.30.0 via
+    # zbus_xml/atspi for D-Bus accessibility introspection. Neither parses
+    # untrusted network input, so the DoS impact here is low. The fix requires
+    # quick-xml >= 0.41.0, which needs an upstream egui/winit/wayland/accesskit
+    # bump that cannot be done via the lockfile alone. Remove once that bump
+    # lands.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml DoS; Linux-desktop-only, build-time/local XML; fix needs egui/winit ecosystem bump" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml DoS; Linux-desktop-only, build-time/local XML; fix needs egui/winit ecosystem bump" },
+]
+
 [licenses]
+version = 2
+# Globally-accepted permissive licenses.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -9,3 +43,51 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.8
+
+# Per-crate exceptions: these licenses are accepted ONLY for the specific crate
+# that carries them, rather than being added to the global allow-list above.
+# All are permissive or weak (file-level) copyleft and acceptable as
+# dependencies of an MIT/Apache-2.0 project; none impose copyleft on our code.
+exceptions = [
+    # Weak, file-level copyleft (MPL-2.0) — only the crate's own files are
+    # copyleft; using it as a dependency does not affect our source.
+    { crate = "attohttpc", allow = ["MPL-2.0"] },
+    { crate = "option-ext", allow = ["MPL-2.0"] },
+    # Boost Software License — permissive, BSD-like.
+    { crate = "clipboard-win", allow = ["BSL-1.0"] },
+    { crate = "error-code", allow = ["BSL-1.0"] },
+    # CC0-1.0 — public-domain dedication.
+    { crate = "notify", allow = ["CC0-1.0"] },
+    # Apache-2.0 with the LLVM exception — strictly more permissive than
+    # plain Apache-2.0.
+    { crate = "target-lexicon", allow = ["Apache-2.0 WITH LLVM-exception"] },
+    # Bundled default fonts for the egui/eframe desktop UI. OFL-1.1 (SIL Open
+    # Font License) and the Ubuntu Font License (non-SPDX LicenseRef) cover the
+    # font assets, not code.
+    { crate = "epaint_default_fonts", allow = [
+        "OFL-1.1",
+        "LicenseRef-UFL-1.0",
+    ] },
+    # Community Data License Agreement – Permissive 2.0. Covers the bundled
+    # Mozilla root-certificate data set, which is permissively licensed.
+    { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+]
+
+[bans]
+# Duplicate versions of the same crate are reported but not blocking: they are
+# common in a large dependency tree and rarely actionable on their own.
+multiple-versions = "warn"
+# Wildcard dependencies. Every wildcard currently in the tree is an intra-
+# workspace `{ path = "..." }` dependency with no explicit version (implicitly
+# `*`). `allow-wildcard-paths` does not exempt them because these crates are not
+# marked `publish = false`. Reported as a warning rather than denied so CI is not
+# blocked on manifest changes; the durable fix (versioned path deps or
+# `publish = false`) is left to the crate owners.
+wildcards = "warn"
+allow-wildcard-paths = true
+
+[sources]
+# Only crates.io and other explicitly-allowed sources are permitted; unknown
+# registries or git sources fail.
+unknown-registry = "deny"
+unknown-git = "deny"
