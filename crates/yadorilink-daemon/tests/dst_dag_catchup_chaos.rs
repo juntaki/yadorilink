@@ -202,8 +202,13 @@ fn setup_device(
     store: Arc<FsBlockStore>,
 ) -> Arc<Device> {
     let processor = Arc::new(
-        LocalChangeProcessor::new(state.clone(), store, device_id.to_string())
-            .with_change_emitter(dst_dag_migrate_b2::emitter_for(device_id)),
+        LocalChangeProcessor::new(
+            state.clone(),
+            store,
+            device_id.to_string(),
+            Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+        )
+        .with_change_emitter(dst_dag_migrate_b2::emitter_for(device_id)),
     );
     Arc::new(Device {
         device_id: device_id.to_string(),
@@ -327,9 +332,16 @@ async fn connect(
         .unwrap(),
     );
 
+    // Pin both devices' verifying keys -- computed ahead of session
+    // construction since `ChangeAuthenticator` is now a construction-only
+    // `PeerSyncSessionDeps` field, not a post-hoc setter (`wire_dag_session`
+    // below no longer installs it).
+    let ids = [laptop.device_id.as_str(), always_on.device_id.as_str()];
+    let authenticator = dst_dag_migrate_b2::PinnedAuthenticator::new(ids);
+
     let mut roots_l = HashMap::new();
     roots_l.insert(GROUP_ID.to_string(), laptop.root.clone());
-    let session_l = PeerSyncSession::new(
+    let session_l = PeerSyncSession::new_with_dependencies(
         channel_l,
         laptop.device_id.clone(),
         always_on.device_id.clone(),
@@ -337,10 +349,15 @@ async fn connect(
         store_l,
         vec![GROUP_ID.to_string()],
         roots_l,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            change_authenticator: authenticator.clone(),
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
     let mut roots_a = HashMap::new();
     roots_a.insert(GROUP_ID.to_string(), always_on.root.clone());
-    let session_a = PeerSyncSession::new(
+    let session_a = PeerSyncSession::new_with_dependencies(
         channel_a,
         always_on.device_id.clone(),
         laptop.device_id.clone(),
@@ -348,11 +365,15 @@ async fn connect(
         store_a,
         vec![GROUP_ID.to_string()],
         roots_a,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            change_authenticator: authenticator,
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
 
     laptop.session.set(session_l.clone()).ok();
     always_on.session.set(session_a.clone()).ok();
-    let ids = [laptop.device_id.as_str(), always_on.device_id.as_str()];
     let group_ids = [GROUP_ID];
     dst_dag_migrate_b2::wire_dag_session(&session_l, laptop.state.clone(), &ids, &group_ids);
     dst_dag_migrate_b2::wire_dag_session(&session_a, always_on.state.clone(), &ids, &group_ids);
@@ -469,6 +490,7 @@ async fn run_scenario(seed: u64) -> Result<(), String> {
         // bugs with different owners. Cheap to report and painful to re-derive.
         let live_rows_missing_bytes: Vec<String> = laptop
             .state
+            .file_index_repository()
             .list_files(GROUP_ID)
             .map(|f| {
                 f.iter()

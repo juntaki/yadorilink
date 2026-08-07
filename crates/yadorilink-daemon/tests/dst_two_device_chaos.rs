@@ -109,7 +109,12 @@ async fn authoring_of(
     path: &str,
 ) -> Option<yadorilink_replica_domain::ids::ChangeHash> {
     device.flush_pending_local_change(GROUP_ID, path).await;
-    device.state.dag_last_authored_change_for_path(GROUP_ID, &device.device_id, path).ok().flatten()
+    device
+        .state
+        .change_history_repository()
+        .dag_last_authored_change_for_path(GROUP_ID, &device.device_id, path)
+        .ok()
+        .flatten()
 }
 
 const GROUP_ID: &str = "dst-chaos-group";
@@ -380,8 +385,13 @@ fn setup_device(
     store: Arc<FsBlockStore>,
 ) -> Arc<ChaosDevice> {
     let processor = Arc::new(
-        LocalChangeProcessor::new(sync_state.clone(), store, device_id.to_string())
-            .with_change_emitter(dst_dag_migrate_b2::emitter_for(device_id)),
+        LocalChangeProcessor::new(
+            sync_state.clone(),
+            store,
+            device_id.to_string(),
+            Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+        )
+        .with_change_emitter(dst_dag_migrate_b2::emitter_for(device_id)),
     );
     let (flush_request_tx, flush_request_rx) = tokio::sync::mpsc::channel(4);
     let (watch_source, events_tx) = SimulatedFolderWatchSource::new(32);
@@ -591,9 +601,16 @@ async fn connect_sessions(
     // forwarding channel (`new_with_forwarding` + a re-`send_index_update`
     // loop) is dropped. Both devices run the plain session and converge by
     // pulling each other's announced heads.
+    // Pin both devices' verifying keys (each admits the other's signed changes)
+    // -- moved ahead of session construction since `ChangeAuthenticator`/
+    // `PendingLocalChangeFlush` are now construction-only
+    // `PeerSyncSessionDeps` fields, not post-hoc setters.
+    let device_ids = [device_a.device_id.as_str(), device_b.device_id.as_str()];
+    let authenticator = dst_dag_migrate_b2::PinnedAuthenticator::new(device_ids);
+
     let mut sync_roots_a = HashMap::new();
     sync_roots_a.insert(GROUP_ID.to_string(), device_a.root.clone());
-    let session_a = PeerSyncSession::new(
+    let session_a = PeerSyncSession::new_with_dependencies(
         channel_a,
         device_a.device_id.clone(),
         device_b.device_id.clone(),
@@ -601,11 +618,17 @@ async fn connect_sessions(
         store_a,
         vec![GROUP_ID.to_string()],
         sync_roots_a,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            pending_local_change_flush: device_a.clone(),
+            change_authenticator: authenticator.clone(),
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
 
     let mut sync_roots_b = HashMap::new();
     sync_roots_b.insert(GROUP_ID.to_string(), device_b.root.clone());
-    let session_b = PeerSyncSession::new(
+    let session_b = PeerSyncSession::new_with_dependencies(
         channel_b,
         device_b.device_id.clone(),
         device_a.device_id.clone(),
@@ -613,16 +636,18 @@ async fn connect_sessions(
         store_b,
         vec![GROUP_ID.to_string()],
         sync_roots_b,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            pending_local_change_flush: device_b.clone(),
+            change_authenticator: authenticator,
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
 
     device_a.session.set(session_a.clone()).ok();
     device_b.session.set(session_b.clone()).ok();
-    session_a.set_pending_local_change_flush(device_a.clone());
-    session_b.set_pending_local_change_flush(device_b.clone());
 
-    // Pin both devices' verifying keys (each admits the other's signed changes)
-    // and shorten the heads-announce cadence so DAG catch-up re-drives promptly.
-    let device_ids = [device_a.device_id.as_str(), device_b.device_id.as_str()];
+    // Shorten the heads-announce cadence so DAG catch-up re-drives promptly.
     let group_ids = [GROUP_ID];
     dst_dag_migrate_b2::wire_dag_session(
         &session_a,
@@ -642,7 +667,14 @@ async fn connect_sessions(
 }
 
 fn device_has_live_record(device: &ChaosDevice, path: &str) -> bool {
-    device.state.get_file(GROUP_ID, path).ok().flatten().map(|r| !r.deleted).unwrap_or(false)
+    device
+        .state
+        .file_index_repository()
+        .get_file(GROUP_ID, path)
+        .ok()
+        .flatten()
+        .map(|r| !r.deleted)
+        .unwrap_or(false)
 }
 
 async fn deliver_local_write(

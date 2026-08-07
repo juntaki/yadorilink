@@ -25,6 +25,7 @@ use yadorilink_filesystem_sync::stale_temp_files::cleanup_stale_temp_files;
 use yadorilink_filesystem_sync::watcher::{
     FolderWatchSource, FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
 };
+use yadorilink_local_capture::ports::LocalMutationStore;
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
 use yadorilink_local_storage::{
     BlockStore, ContentHash, FsBlockStore, GcReport, StorageError, StorageUsage,
@@ -381,9 +382,18 @@ fn setup_device(
     // DAG change, propagated over the change-history path instead of the
     // legacy index wire.
     let processor = Arc::new(
-        LocalChangeProcessor::new(state.clone(), store, device_id.to_string()).with_change_emitter(
-            Arc::new(ChangeEmitter::new(device_id, device_signing_key(device_id))),
-        ),
+        LocalChangeProcessor::new(
+            state.clone(),
+            Arc::new(yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                store,
+            )),
+            device_id.to_string(),
+            Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+        )
+        .with_change_emitter(Arc::new(ChangeEmitter::new(
+            device_id,
+            device_signing_key(device_id),
+        ))),
     );
     let (flush_request_tx, flush_request_rx) = tokio::sync::mpsc::channel(4);
     let (watch_source, _events_tx) = SimulatedFolderWatchSource::new(32);
@@ -489,42 +499,55 @@ async fn connect_sessions(
         .unwrap(),
     );
 
+    // Both sessions must pin both authors' keys before `run()` handshakes, or
+    // received changes are dropped unverified -- moved ahead of session
+    // construction since `ChangeAuthenticator`/`PendingLocalChangeFlush` are
+    // now construction-only `PeerSyncSessionDeps` fields, not post-hoc
+    // setters.
+    let authenticator = pinned_authenticator(&["device-a", "device-b"]);
+
     let mut roots_a = HashMap::new();
     roots_a.insert(GROUP_ID.to_string(), device_a.root.clone());
     let (forward_tx_a, mut forward_rx_a) = tokio::sync::mpsc::unbounded_channel();
-    let session_a = PeerSyncSession::new_with_forwarding(
+    let session_a = PeerSyncSession::new_with_dependencies(
         channel_a,
         device_a.device_id.clone(),
         device_b.device_id.clone(),
         device_a.state.clone(),
-        store_a,
+        Arc::new(yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            store_a,
+        )),
         vec![GROUP_ID.to_string()],
         roots_a,
         Some(forward_tx_a),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            pending_local_change_flush: device_a.clone(),
+            change_authenticator: authenticator.clone(),
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
     let mut roots_b = HashMap::new();
     roots_b.insert(GROUP_ID.to_string(), device_b.root.clone());
     let (forward_tx_b, mut forward_rx_b) = tokio::sync::mpsc::unbounded_channel();
-    let session_b = PeerSyncSession::new_with_forwarding(
+    let session_b = PeerSyncSession::new_with_dependencies(
         channel_b,
         device_b.device_id.clone(),
         device_a.device_id.clone(),
         device_b.state.clone(),
-        store_b,
+        Arc::new(yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            store_b,
+        )),
         vec![GROUP_ID.to_string()],
         roots_b,
         Some(forward_tx_b),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            pending_local_change_flush: device_b.clone(),
+            change_authenticator: authenticator,
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
     *device_a.session.lock().unwrap_or_else(|p| p.into_inner()) = Some(session_a.clone());
     *device_b.session.lock().unwrap_or_else(|p| p.into_inner()) = Some(session_b.clone());
-    session_a.set_pending_local_change_flush(device_a.clone());
-    session_b.set_pending_local_change_flush(device_b.clone());
-
-    // Both sessions must pin both authors' keys before `run()` handshakes, or
-    // received changes are dropped unverified.
-    let authenticator = pinned_authenticator(&["device-a", "device-b"]);
-    session_a.set_change_authenticator(authenticator.clone());
-    session_b.set_change_authenticator(authenticator);
     // Every real (`DaemonState`-backed) session always has a block-serve
     // engine installed; without one here, any post-crash block re-fetch from
     // the peer fails closed ("no BlockServeEngine installed") regardless of
@@ -639,15 +662,29 @@ fn restart_recovery(
     // wait_group_ready defers every peer change for it. The symptom is not an
     // error: the two devices simply never exchange anything and each ends the
     // run holding only its own writes.
-    let generation = state.begin_group_startup(GROUP_ID);
-    state.reset_stale_hydrating_to_placeholder().map_err(|e| e.to_string())?;
-    repair_interrupted_materializations(state.as_ref(), store.as_ref(), root, GROUP_ID)
+    let generation = state.startup_readiness().begin_group_startup(GROUP_ID);
+    state
+        .materialization_state_repository()
+        .reset_stale_hydrating_to_placeholder()
         .map_err(|e| e.to_string())?;
+    repair_interrupted_materializations(
+        state.as_ref(),
+        store.as_ref(),
+        root,
+        GROUP_ID,
+        &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+    )
+    .map_err(|e| e.to_string())?;
     cleanup_stale_temp_files(root);
     cleanup_stale_temp_files(&store.root);
-    let processor = LocalChangeProcessor::new(state.clone(), store.clone(), device_id.to_string());
+    let processor = LocalChangeProcessor::new(
+        state.clone(),
+        store.clone(),
+        device_id.to_string(),
+        Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+    );
     processor.reconcile_added_files(GROUP_ID, root).map_err(|e| e.to_string())?;
-    state.mark_group_ready(GROUP_ID, generation);
+    state.startup_readiness().mark_group_ready(GROUP_ID, generation);
     Ok(state)
 }
 
@@ -681,9 +718,22 @@ fn seed_interrupted_materialization(
         }],
         deleted: false,
     };
-    state.upsert_file(GROUP_ID, &record).map_err(|e| e.to_string())?;
     state
-        .set_materialization_state(GROUP_ID, "pre-crash.bin", MaterializationState::Hydrated)
+        .file_index_repository()
+        .upsert_file(
+            GROUP_ID,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .map_err(|e| e.to_string())?;
+    state
+        .materialization_state_repository()
+        .set_materialization_state(
+            GROUP_ID,
+            "pre-crash.bin",
+            MaterializationState::Hydrated,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
         .map_err(|e| e.to_string())?;
     std::fs::write(root.join("pre-crash.bin"), &content[..content.len() / 3])
         .map_err(|e| e.to_string())?;
@@ -757,7 +807,11 @@ async fn run_scenario(seed: u64) -> Result<(Vec<String>, Vec<String>), String> {
         "pre-crash.bin",
         0,
         next_content_id,
-        state_a.get_authoring_change_hash(GROUP_ID, "pre-crash.bin").ok().flatten(),
+        state_a
+            .file_index_repository()
+            .get_authoring_change_hash(GROUP_ID, "pre-crash.bin")
+            .ok()
+            .flatten(),
     );
     next_content_id += 1;
     // `seed_interrupted_materialization` deliberately writes this prefix to
@@ -785,7 +839,12 @@ async fn run_scenario(seed: u64) -> Result<(Vec<String>, Vec<String>), String> {
                 &path,
                 device_idx,
                 content_id,
-                device.state.get_authoring_change_hash(GROUP_ID, &path).ok().flatten(),
+                device
+                    .state
+                    .file_index_repository()
+                    .get_authoring_change_hash(GROUP_ID, &path)
+                    .ok()
+                    .flatten(),
             );
         }
         if round == OPS_PER_RUN / 2 {

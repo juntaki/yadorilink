@@ -302,8 +302,13 @@ fn setup_device(
     store: Arc<FsBlockStore>,
 ) -> Arc<ChaosDevice> {
     let processor = Arc::new(
-        LocalChangeProcessor::new(sync_state.clone(), store, device_id.to_string())
-            .with_change_emitter(dst_dag_migrate_b2::emitter_for(device_id)),
+        LocalChangeProcessor::new(
+            sync_state.clone(),
+            store,
+            device_id.to_string(),
+            Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+        )
+        .with_change_emitter(dst_dag_migrate_b2::emitter_for(device_id)),
     );
     let (flush_request_tx, flush_request_rx) = tokio::sync::mpsc::channel(4);
     let (watch_source, events_tx) = SimulatedFolderWatchSource::new(32);
@@ -480,9 +485,17 @@ async fn connect_sessions(
     // for the same reason: each device materializes a conflict copy locally
     // from the shared change set, so the legacy `broadcast_change`-shaped
     // forwarding channel has nothing left to carry and is dropped.
+    // Pin both devices' verifying keys (each admits the other's signed changes)
+    // -- moved ahead of session construction so the authenticator (now a
+    // construction-only `PeerSyncSessionDeps` field, not a post-hoc setter)
+    // can be supplied directly to `new_with_dependencies` below.
+    let device_ids = [device_a.device_id.as_str(), device_b.device_id.as_str()];
+    let authenticator: Arc<dyn yadorilink_peer_session::peer_session::ChangeAuthenticator> =
+        dst_dag_migrate_b2::PinnedAuthenticator::new(device_ids.iter().copied());
+
     let mut sync_roots_a = HashMap::new();
     sync_roots_a.insert(GROUP_ID.to_string(), device_a.root.clone());
-    let session_a = PeerSyncSession::new(
+    let session_a = PeerSyncSession::new_with_dependencies(
         channel_a,
         device_a.device_id.clone(),
         device_b.device_id.clone(),
@@ -490,11 +503,17 @@ async fn connect_sessions(
         store_a,
         vec![GROUP_ID.to_string()],
         sync_roots_a,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            pending_local_change_flush: device_a.clone(),
+            change_authenticator: authenticator.clone(),
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
 
     let mut sync_roots_b = HashMap::new();
     sync_roots_b.insert(GROUP_ID.to_string(), device_b.root.clone());
-    let session_b = PeerSyncSession::new(
+    let session_b = PeerSyncSession::new_with_dependencies(
         channel_b,
         device_b.device_id.clone(),
         device_a.device_id.clone(),
@@ -502,16 +521,19 @@ async fn connect_sessions(
         store_b,
         vec![GROUP_ID.to_string()],
         sync_roots_b,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            pending_local_change_flush: device_b.clone(),
+            change_authenticator: authenticator,
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
 
     device_a.session.set(session_a.clone()).ok();
     device_b.session.set(session_b.clone()).ok();
-    session_a.set_pending_local_change_flush(device_a.clone());
-    session_b.set_pending_local_change_flush(device_b.clone());
 
-    // Pin both devices' verifying keys (each admits the other's signed changes)
-    // and shorten the heads-announce cadence so DAG catch-up re-drives promptly.
-    let device_ids = [device_a.device_id.as_str(), device_b.device_id.as_str()];
+    // Shorten the heads-announce cadence so DAG catch-up re-drives promptly
+    // (the authenticator above is now already wired at construction).
     let group_ids = [GROUP_ID];
     dst_dag_migrate_b2::wire_dag_session(
         &session_a,
@@ -835,7 +857,12 @@ fn register_content(content_table: &mut ContentTable, next_id: &mut u64, bytes: 
 /// yet) makes the entry un-superseded, which fails loud rather than quietly
 /// excusing a disappearance.
 fn authoring_of(device: &ChaosDevice, path: &str) -> Option<ChangeHash> {
-    device.state.dag_last_authored_change_for_path(GROUP_ID, &device.device_id, path).ok().flatten()
+    device
+        .state
+        .change_history_repository()
+        .dag_last_authored_change_for_path(GROUP_ID, &device.device_id, path)
+        .ok()
+        .flatten()
 }
 
 fn record_write_at(
@@ -1223,11 +1250,10 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
                 // false-positive reproduction: seed 3509503762, content 5).
                 let modeled_sibling_paths: Vec<&str> =
                     siblings.iter().map(|(path, _)| path.as_str()).collect();
-                let possible_extra_cascade_deletes: Vec<String> = path_baseline
+                let possible_extra_cascade_deletes: Vec<String> = all_files
                     .keys()
                     .filter(|path| {
-                        parent_dir(path) == old_dir
-                            && !modeled_sibling_paths.contains(&path.as_str())
+                        parent_dir(path) == old_dir && !modeled_sibling_paths.contains(&&path[..])
                     })
                     .cloned()
                     .collect();
@@ -1236,16 +1262,17 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
                 for old_path in possible_extra_cascade_deletes {
                     if device
                         .state
+                        .file_index_repository()
                         .get_file(GROUP_ID, &old_path)
                         .map_err(|e| e.to_string())?
                         .is_some_and(|record| record.deleted)
                     {
                         record_delete_at(
                             &mut oracle,
-                            &mut path_baseline,
+                            &mut touched_paths,
                             &old_path,
+                            device,
                             device_idx_of(device),
-                            &device.device_id,
                         );
                     }
                 }

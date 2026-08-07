@@ -222,8 +222,13 @@ fn setup_device_a(
     store: Arc<FsBlockStore>,
 ) -> DeviceA {
     let processor = Arc::new(
-        LocalChangeProcessor::new(sync_state, store, "device-a".to_string())
-            .with_change_emitter(dst_dag_migrate_b2::emitter_for("device-a")),
+        LocalChangeProcessor::new(
+            sync_state,
+            store,
+            "device-a".to_string(),
+            Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+        )
+        .with_change_emitter(dst_dag_migrate_b2::emitter_for("device-a")),
     );
     let (flush_request_tx, flush_request_rx) = tokio::sync::mpsc::channel(4);
     let sim = Arc::new(SimDevice {
@@ -296,6 +301,7 @@ async fn connect_sessions(
     state_b: Arc<ReplicaCoordinator>,
     store_b: Arc<FsBlockStore>,
     root_b: PathBuf,
+    pending_local_change_flush_a: Arc<dyn PendingLocalChangeFlush>,
 ) -> (Arc<PeerSyncSession>, Arc<PeerSyncSession>) {
     let (secret_a, public_a) = gen_keypair(rng);
     let (secret_b, public_b) = gen_keypair(rng);
@@ -327,9 +333,22 @@ async fn connect_sessions(
         .unwrap(),
     );
 
+    // Pin both devices' verifying keys on both sessions so each admits the
+    // other's signed changes. Deliberately NOT `wire_dag_session`: that also
+    // shortens the heads-announce cadence to 50ms, which would let the periodic
+    // frontier audit publish B's edit on its own schedule and destroy this
+    // scenario's ordering control (see the module doc). The default 90s
+    // interval outlives the 60s per-seed time limit, so every announce here is
+    // an explicit one made at a moment the test chose. Computed ahead of
+    // session construction since `ChangeAuthenticator`/`PendingLocalChangeFlush`
+    // are now construction-only `PeerSyncSessionDeps` fields, not post-hoc
+    // setters.
+    let device_ids = ["device-a", "device-b"];
+    let authenticator = dst_dag_migrate_b2::PinnedAuthenticator::new(device_ids);
+
     let mut sync_roots_a = std::collections::HashMap::new();
     sync_roots_a.insert(GROUP_ID.to_string(), root_a);
-    let session_a = PeerSyncSession::new(
+    let session_a = PeerSyncSession::new_with_dependencies(
         channel_a,
         "device-a".to_string(),
         "device-b".to_string(),
@@ -337,11 +356,17 @@ async fn connect_sessions(
         store_a,
         vec![GROUP_ID.to_string()],
         sync_roots_a,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            pending_local_change_flush: pending_local_change_flush_a,
+            change_authenticator: authenticator.clone(),
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
 
     let mut sync_roots_b = std::collections::HashMap::new();
     sync_roots_b.insert(GROUP_ID.to_string(), root_b);
-    let session_b = PeerSyncSession::new(
+    let session_b = PeerSyncSession::new_with_dependencies(
         channel_b,
         "device-b".to_string(),
         "device-a".to_string(),
@@ -349,19 +374,13 @@ async fn connect_sessions(
         store_b,
         vec![GROUP_ID.to_string()],
         sync_roots_b,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            change_authenticator: authenticator,
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
 
-    // Pin both devices' verifying keys on both sessions so each admits the
-    // other's signed changes. Deliberately NOT `wire_dag_session`: that also
-    // shortens the heads-announce cadence to 50ms, which would let the periodic
-    // frontier audit publish B's edit on its own schedule and destroy this
-    // scenario's ordering control (see the module doc). The default 90s
-    // interval outlives the 60s per-seed time limit, so every announce here is
-    // an explicit one made at a moment the test chose.
-    let device_ids = ["device-a", "device-b"];
-    let authenticator = dst_dag_migrate_b2::PinnedAuthenticator::new(device_ids);
-    session_a.set_change_authenticator(authenticator.clone());
-    session_b.set_change_authenticator(authenticator);
     // Every real (`DaemonState`-backed) session always has a block-serve
     // engine installed; without one here, B's baseline block fetch from A
     // fails closed on every seed regardless of the test's own convergence
@@ -394,9 +413,13 @@ async fn device_b_edit_child(
     // Same signed emitter identity B's session pins: the edit must land in B's
     // change DAG here, so announcing B's heads later publishes exactly this
     // change (and its ancestry) to A.
-    let processor =
-        LocalChangeProcessor::new(state_b.clone(), store_b.clone(), "device-b".to_string())
-            .with_change_emitter(dst_dag_migrate_b2::emitter_for("device-b"));
+    let processor = LocalChangeProcessor::new(
+        state_b.clone(),
+        store_b.clone(),
+        "device-b".to_string(),
+        Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+    )
+    .with_change_emitter(dst_dag_migrate_b2::emitter_for("device-b"));
     let outcome = processor
         .process_event(
             GROUP_ID,
@@ -459,11 +482,14 @@ fn conflict_copy_present(root: &Path) -> bool {
 /// folder was never scanned, so a bare `add_link` builds a device that silently
 /// receives nothing.
 fn link_and_start(state: &Arc<ReplicaCoordinator>, root: &Path) -> Result<(), String> {
-    state.add_link(&root.to_string_lossy(), GROUP_ID).map_err(|e| e.to_string())?;
-    yadorilink_root_authority::root_identity::VerifiedRoot::open(root, GROUP_ID, state)
+    state
+        .link_repository()
+        .add_link(&root.to_string_lossy(), GROUP_ID)
         .map_err(|e| e.to_string())?;
-    let generation = state.begin_group_startup(GROUP_ID);
-    state.mark_group_ready(GROUP_ID, generation);
+    yadorilink_root_authority::root_identity::VerifiedRoot::open(root, GROUP_ID, state.as_ref())
+        .map_err(|e| e.to_string())?;
+    let generation = state.startup_readiness().begin_group_startup(GROUP_ID);
+    state.startup_readiness().mark_group_ready(GROUP_ID, generation);
     Ok(())
 }
 
@@ -502,6 +528,8 @@ async fn run_scenario(seed: u64, ordering: Ordering) -> Result<(), String> {
         return Err(format!("baseline on A produced no record: {baseline_outcome:?}"));
     }
 
+    // The guard is always wired here: this scenario is about whether the
+    // *real* production defenses hold, not about reproducing a pre-guard bug.
     let (session_a, session_b) = connect_sessions(
         &mut rng,
         state_a.clone(),
@@ -510,12 +538,10 @@ async fn run_scenario(seed: u64, ordering: Ordering) -> Result<(), String> {
         state_b.clone(),
         store_b.clone(),
         root_b.clone(),
+        device_a.sim.clone(),
     )
     .await;
     device_a.sim.session.set(session_a.clone()).ok();
-    // The guard is always wired here: this scenario is about whether the
-    // *real* production defenses hold, not about reproducing a pre-guard bug.
-    session_a.set_pending_local_change_flush(device_a.sim.clone());
 
     // No daemon here, so no `ConvergenceEngine` materializes an admitted
     // change onto disk on its own; this scenario asserts real on-disk content
@@ -553,7 +579,7 @@ async fn run_scenario(seed: u64, ordering: Ordering) -> Result<(), String> {
         ));
     }
     if std::fs::read(root_b.join(CHILD_REL)).map(|c| c != BASELINE).unwrap_or(true) {
-        let indexed = state_b.get_file(GROUP_ID, CHILD_REL).ok().flatten();
+        let indexed = state_b.file_index_repository().get_file(GROUP_ID, CHILD_REL).ok().flatten();
         return Err(format!(
             "{BASELINE_TIMEOUT_MARKER}device B never adopted the baseline (index row: {indexed:?})"
         ));
@@ -602,7 +628,7 @@ async fn run_scenario(seed: u64, ordering: Ordering) -> Result<(), String> {
                 return Err(format!(
                     "{BASELINE_TIMEOUT_MARKER}A never materialized CB before dir dispatch \
                      (index: {:?})",
-                    state_a.get_file(GROUP_ID, CHILD_REL).ok().flatten()
+                    state_a.file_index_repository().get_file(GROUP_ID, CHILD_REL).ok().flatten()
                 ));
             }
             // Now dispatch A's pending `dir1` Removed. The pre-dispatch
@@ -648,7 +674,7 @@ async fn run_scenario(seed: u64, ordering: Ordering) -> Result<(), String> {
     // --- No-silent-loss invariant, checked identically for both orderings ---
     let live_child = std::fs::read(root_a.join(CHILD_REL)).map(|c| c == B_EDIT).unwrap_or(false);
     let present = content_present_anywhere(&root_a, B_EDIT);
-    let child_row = state_a.get_file(GROUP_ID, CHILD_REL).ok().flatten();
+    let child_row = state_a.file_index_repository().get_file(GROUP_ID, CHILD_REL).ok().flatten();
 
     if !present {
         let mut files = Vec::new();

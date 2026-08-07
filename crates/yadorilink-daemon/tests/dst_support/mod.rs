@@ -184,7 +184,7 @@ pub fn check_no_silent_data_loss(
     let mut violations = Vec::new();
 
     for (path, entry) in observed.iter() {
-        let record = match sync_state.get_file(group_id, path) {
+        let record = match sync_state.file_index_repository().get_file(group_id, path) {
             Ok(record) => record,
             Err(e) => {
                 violations.push(InvariantViolation {
@@ -281,7 +281,7 @@ mod tests {
     fn setup() -> (ReplicaCoordinator, tempfile::TempDir) {
         let root = tempfile::tempdir().unwrap();
         let state = ReplicaCoordinator::open_in_memory().unwrap();
-        state.add_link(&root.path().to_string_lossy(), group_id()).unwrap();
+        state.link_repository().add_link(&root.path().to_string_lossy(), group_id()).unwrap();
         (state, root)
     }
 
@@ -299,7 +299,14 @@ mod tests {
     fn no_violation_when_write_is_indexed_and_on_disk_matches() {
         let (state, root) = setup();
         std::fs::write(root.path().join("a.txt"), b"hello").unwrap();
-        state.upsert_file(group_id(), &record("a.txt", false)).unwrap();
+        state
+            .file_index_repository()
+            .upsert_file(
+                group_id(),
+                &record("a.txt", false),
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
 
         let oracle = WriteOracle::new();
         oracle.record_write("a.txt", b"hello");
@@ -332,7 +339,14 @@ mod tests {
         // Simulating the VV-fast-forward-deletion class of bug: the
         // write happened, but the index ended up recording a tombstone
         // for it instead.
-        state.upsert_file(group_id(), &record("a.txt", true)).unwrap();
+        state
+            .file_index_repository()
+            .upsert_file(
+                group_id(),
+                &record("a.txt", true),
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
 
         let oracle = WriteOracle::new();
         oracle.record_write("a.txt", b"hello");
@@ -349,7 +363,14 @@ mod tests {
         // than what this run's own write produced (e.g. a peer's write
         // clobbering it without going through conflict resolution).
         std::fs::write(root.path().join("a.txt"), b"someone else's content").unwrap();
-        state.upsert_file(group_id(), &record("a.txt", false)).unwrap();
+        state
+            .file_index_repository()
+            .upsert_file(
+                group_id(),
+                &record("a.txt", false),
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
 
         let oracle = WriteOracle::new();
         oracle.record_write("a.txt", b"hello");
@@ -362,7 +383,14 @@ mod tests {
     #[test]
     fn catches_a_delete_that_the_index_still_shows_as_live() {
         let (state, root) = setup();
-        state.upsert_file(group_id(), &record("a.txt", false)).unwrap();
+        state
+            .file_index_repository()
+            .upsert_file(
+                group_id(),
+                &record("a.txt", false),
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
 
         let oracle = WriteOracle::new();
         oracle.record_delete("a.txt");
@@ -376,7 +404,14 @@ mod tests {
     fn a_later_write_to_the_same_path_supersedes_an_earlier_one_in_the_oracle() {
         let (state, root) = setup();
         std::fs::write(root.path().join("a.txt"), b"second").unwrap();
-        state.upsert_file(group_id(), &record("a.txt", false)).unwrap();
+        state
+            .file_index_repository()
+            .upsert_file(
+                group_id(),
+                &record("a.txt", false),
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
 
         let oracle = WriteOracle::new();
         oracle.record_write("a.txt", b"first");

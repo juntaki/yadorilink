@@ -62,6 +62,7 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+use yadorilink_local_capture::ports::LocalMutationStore;
 use yadorilink_local_storage::{BlockStore, FsBlockStore};
 use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_replica_domain::change::{Change, ChangeAuth, Op as ChangeOp, PutOrigin};
@@ -294,13 +295,27 @@ fn seed_holder_file(dev: &Device, path: &str, content: &[u8]) -> Result<SeededFi
     // holder's whole head chain (a backfill change parenting on current
     // heads would orphan on the peer and fail identity verification).
     dev.state
+        .change_history_repository()
         .dag_admit_change_with_versions(&change, std::slice::from_ref(&version), true)
         .map_err(|e| e.to_string())?;
     dev.state
-        .upsert_file_with_origin_and_author(GROUP_ID, &record, &dev.id, &change.compute_hash())
+        .file_index_repository()
+        .upsert_file_with_origin_and_author(
+            GROUP_ID,
+            &record,
+            &dev.id,
+            &change.compute_hash(),
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
         .map_err(|e| e.to_string())?;
     dev.state
-        .set_materialization_state(GROUP_ID, path, MaterializationState::Hydrated)
+        .materialization_state_repository()
+        .set_materialization_state(
+            GROUP_ID,
+            path,
+            MaterializationState::Hydrated,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
         .map_err(|e| e.to_string())?;
     // The real local-write path (`local_change.rs`) always records group
     // block provenance alongside a local commit; `handle_block_request`'s
@@ -327,19 +342,28 @@ fn seed_holder_file(dev: &Device, path: &str, content: &[u8]) -> Result<SeededFi
 /// blocks in B's store — the content must be fetched to hydrate.
 fn seed_placeholder(dev: &Device, seeded: &SeededFile) -> Result<(), String> {
     dev.state
+        .change_history_repository()
         .dag_admit_change_with_versions(&seeded.change, std::slice::from_ref(&seeded.version), true)
         .map_err(|e| e.to_string())?;
     dev.state
+        .file_index_repository()
         .upsert_file_with_origin_and_author(
             GROUP_ID,
             &seeded.record,
             &seeded.change.device_id.0,
             &seeded.change.compute_hash(),
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .map_err(|e| e.to_string())?;
     let record = &seeded.record;
     dev.state
-        .set_materialization_state(GROUP_ID, &record.path, MaterializationState::Placeholder)
+        .materialization_state_repository()
+        .set_materialization_state(
+            GROUP_ID,
+            &record.path,
+            MaterializationState::Placeholder,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
         .map_err(|e| e.to_string())?;
     let full = dev.root.join(&record.path);
     if let Some(parent) = full.parent() {
@@ -431,14 +455,24 @@ async fn connect(rng: &mut StdRng, a: &Device, b: &Device) -> Result<(), String>
 async fn hydrate_with_retry(dev: &Device, path: &str) -> bool {
     let deadline = tokio::time::Instant::now() + HYDRATE_DEADLINE;
     loop {
-        if dev.state.get_materialization_state(GROUP_ID, path).ok().flatten()
+        if dev
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP_ID, path)
+            .ok()
+            .flatten()
             == Some(MaterializationState::Hydrated)
         {
             return true;
         }
         let _ =
             dev.session().hydrate_file_with_timeout(GROUP_ID, path, HYDRATE_ATTEMPT_TIMEOUT).await;
-        if dev.state.get_materialization_state(GROUP_ID, path).ok().flatten()
+        if dev
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP_ID, path)
+            .ok()
+            .flatten()
             == Some(MaterializationState::Hydrated)
         {
             return true;
@@ -503,13 +537,13 @@ async fn run_scenario(seed: u64, fault_profile: HydrationFaultProfile) -> Result
     // signed root change. Each root is authored + signed by its own device; the
     // peer verifies it against that device's key, pinned in `connect`.
     yadorilink_daemon::dag_import::ensure_initial_import(
-        &device_a.state,
+        device_a.state.as_ref(),
         GROUP_ID,
         &dst_dag_migrate_b2::emitter_for(&device_a.id),
     )
     .map_err(|e| e.to_string())?;
     yadorilink_daemon::dag_import::ensure_initial_import(
-        &device_b.state,
+        device_b.state.as_ref(),
         GROUP_ID,
         &dst_dag_migrate_b2::emitter_for(&device_b.id),
     )
@@ -660,13 +694,18 @@ async fn run_scenario(seed: u64, fault_profile: HydrationFaultProfile) -> Result
         for (label, dev) in [("A", &device_a), ("B", &device_b)] {
             let files: Vec<(String, Option<MaterializationState>)> = dev
                 .state
+                .file_index_repository()
                 .list_files(GROUP_ID)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|r| {
                     (
                         r.path.clone(),
-                        dev.state.get_materialization_state(GROUP_ID, &r.path).ok().flatten(),
+                        dev.state
+                            .materialization_state_repository()
+                            .get_materialization_state(GROUP_ID, &r.path)
+                            .ok()
+                            .flatten(),
                     )
                 })
                 .collect();
@@ -694,8 +733,10 @@ async fn run_scenario(seed: u64, fault_profile: HydrationFaultProfile) -> Result
 
     // Scenario 2: no row left mid-hydration.
     for path in PLACEHOLDER_PATHS.iter().chain([CANARY_PATH, CONFLICT_PATH].iter()) {
-        if let Ok(Some(MaterializationState::Hydrating)) =
-            device_b.state.get_materialization_state(GROUP_ID, path)
+        if let Ok(Some(MaterializationState::Hydrating)) = device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP_ID, path)
         {
             violations.push(dst_support::oracle::Violation {
                 kind: dst_support::oracle::ViolationKind::StructuralIndexDiskMismatch,
@@ -822,11 +863,16 @@ async fn run_scenario(seed: u64, fault_profile: HydrationFaultProfile) -> Result
     // either device. Placeholder rows legitimately have sparse, non-content
     // bytes on disk (on-demand), so only Hydrated files are content-checked.
     for dev in [&device_a, &device_b] {
-        for record in dev.state.list_files(GROUP_ID).unwrap_or_default() {
+        for record in dev.state.file_index_repository().list_files(GROUP_ID).unwrap_or_default() {
             if record.deleted {
                 continue;
             }
-            if dev.state.get_materialization_state(GROUP_ID, &record.path).ok().flatten()
+            if dev
+                .state
+                .materialization_state_repository()
+                .get_materialization_state(GROUP_ID, &record.path)
+                .ok()
+                .flatten()
                 != Some(MaterializationState::Hydrated)
             {
                 continue;

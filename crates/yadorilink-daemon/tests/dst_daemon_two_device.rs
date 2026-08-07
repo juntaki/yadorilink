@@ -126,6 +126,7 @@ async fn boot_daemon(
     // harness deliver synthetic events for local writes.
     state
         .replica_coordinator
+        .link_repository()
         .add_link(&root.to_string_lossy(), GROUP_ID)
         .map_err(|e| format!("add_link: {e}"))?;
     let (watch_source, events_tx) = SimulatedFolderWatchSource::new(64);

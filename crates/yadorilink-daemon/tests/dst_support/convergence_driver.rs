@@ -47,7 +47,7 @@ pub fn spawn_convergence_driver(
             }
             drop(session);
             tokio::select! {
-                _ = state.materialization_wake_notified() => {}
+                _ = state.materialization_wake().materialization_wake_notified() => {}
                 _ = tokio::time::sleep(MATERIALIZATION_FALLBACK) => {}
             }
         }

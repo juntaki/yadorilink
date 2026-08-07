@@ -42,7 +42,10 @@ pub fn link_and_start(
     root: &Path,
     group_id: &str,
 ) -> Result<(), String> {
-    state.add_link(&root.to_string_lossy(), group_id).map_err(|e| e.to_string())?;
+    state
+        .link_repository()
+        .add_link(&root.to_string_lossy(), group_id)
+        .map_err(|e| e.to_string())?;
     adopt_root(state, root, group_id)?;
     open_startup_gate(state, group_id);
     Ok(())
@@ -59,6 +62,6 @@ pub fn adopt_root(state: &ReplicaCoordinator, root: &Path, group_id: &str) -> Re
 /// Split out for scenarios that build their links by other means but still owe
 /// the group a startup.
 pub fn open_startup_gate(state: &ReplicaCoordinator, group_id: &str) {
-    let generation = state.begin_group_startup(group_id);
-    state.mark_group_ready(group_id, generation);
+    let generation = state.startup_readiness().begin_group_startup(group_id);
+    state.startup_readiness().mark_group_ready(group_id, generation);
 }
