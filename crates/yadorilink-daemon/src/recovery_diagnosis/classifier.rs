@@ -14,13 +14,16 @@
 //! producing a diagnosis that describes an evidence combination that never
 //! existed.
 
-use yadorilink_replica_domain::session_state::{EnrollmentOperationState, MembershipDurabilityScope, MembershipOperationAction, MembershipOperationState, RoleLossAction, RoleLossOperationState};
 use crate::recovery::{
-    EnrollmentLocalEvidence, LocalObservation, MembershipLocalEvidence,
-    RecoveryOperationKey, RoleLossLocalEvidence,
+    EnrollmentLocalEvidence, LocalObservation, MembershipLocalEvidence, RecoveryOperationKey,
+    RoleLossLocalEvidence,
 };
 use yadorilink_replica_domain::recovery::RecoveryDomain;
 use yadorilink_replica_domain::session_state::EnrollmentKind;
+use yadorilink_replica_domain::session_state::{
+    EnrollmentOperationState, MembershipDurabilityScope, MembershipOperationAction,
+    MembershipOperationState, RoleLossAction, RoleLossOperationState,
+};
 
 use crate::coordination_client::{
     EnrollmentOperationRecord, EnrollmentRemoteStatus, MembershipOperationRecord,

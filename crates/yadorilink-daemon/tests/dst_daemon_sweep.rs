@@ -43,9 +43,11 @@ use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeCo
 use yadorilink_daemon::app::{self, DaemonConfig};
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_orchestrator::{SimDiscovery, SimPeer};
-use yadorilink_filesystem_sync::debounce::DebounceConfig;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource};
+use yadorilink_filesystem_sync::debounce::DebounceConfig;
+use yadorilink_filesystem_sync::watcher::{
+    FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
+};
 use yadorilink_transport::DeviceKeyPair;
 
 // --------------------------------------------------------------------------
@@ -98,7 +100,7 @@ pub mod case_ir {
     }
 }
 
-#[path = "../../yadorilink-sync-core/tests/dst_support/oracle.rs"]
+#[path = "dst_support/oracle.rs"]
 pub mod oracle;
 
 use case_ir::ContentTable;

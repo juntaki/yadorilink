@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, HashMap};
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use yadorilink_replica_domain::change::ChangeAuth;
-use yadorilink_sync_sqlite::policy_watermark::PolicyWatermark;
 use yadorilink_replica_engine::repair_election::AuthorizedWriter;
+use yadorilink_sync_sqlite::policy_watermark::PolicyWatermark;
 
 /// A group's signed policy log as delivered by the coordination plane in a
 /// netmap update. Plain data the netmap client fills from the coordination
@@ -1258,12 +1258,12 @@ mod tests {
     #[tokio::test]
     async fn a_real_local_edit_through_replica_coordinator_gets_a_real_auth_stamp_a_policy_verified_peer_accepts(
     ) {
+        use crate::replica_coordinator::ReplicaCoordinator;
         use yadorilink_local_storage::FsBlockStore;
         use yadorilink_peer_session::peer_session::ChangeAuthenticator;
         use yadorilink_replica_domain::change::{Op, PutOrigin};
         use yadorilink_replica_domain::file::{FileMeta, FileRecord, FileVersion, RecordKind};
         use yadorilink_replica_domain::ids::SyncPath;
-        use crate::replica_coordinator::ReplicaCoordinator;
         use yadorilink_replica_domain::session_state::ChangeContent;
         use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
@@ -1337,8 +1337,10 @@ mod tests {
                     versions: &[version],
                 },
                 None,
-                &emitter,
-                &permit,
+                crate::replica_coordinator::ReplicaChangeEmission {
+                    emitter: &emitter,
+                    permit: &permit,
+                },
             )
             .expect(
                 "a local edit for a policy-verified group this device is a granted writer for \

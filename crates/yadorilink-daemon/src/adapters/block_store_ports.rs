@@ -94,12 +94,14 @@ mod tests {
         let store: Arc<dyn BlockStore + Send + Sync> =
             Arc::new(yadorilink_local_storage::FsBlockStore::new(dir.path()).unwrap());
 
-        let content: Arc<dyn BlockContentStore> = Arc::new(BlockStorePortsAdapter::new(store.clone()));
+        let content: Arc<dyn BlockContentStore> =
+            Arc::new(BlockStorePortsAdapter::new(store.clone()));
         let hash = content.put(b"adapter proof").unwrap();
         assert_eq!(content.get(&hash).unwrap(), b"adapter proof");
-        assert_eq!(content.present_blocks(&[hash.clone()]).unwrap(), vec![true]);
+        assert_eq!(content.present_blocks(std::slice::from_ref(&hash)).unwrap(), vec![true]);
 
-        let reclamation: Arc<dyn BlockReclamationStore> = Arc::new(BlockStorePortsAdapter::new(store));
+        let reclamation: Arc<dyn BlockReclamationStore> =
+            Arc::new(BlockStorePortsAdapter::new(store));
         let live = HashSet::new();
         // `grace_cutoff` at the Unix epoch means every block's mtime is
         // newer than the cutoff, so `FsBlockStore::sweep`'s grace-period

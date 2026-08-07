@@ -222,13 +222,15 @@
 use std::ffi::OsStr;
 use std::io;
 
+#[cfg(test)]
+use yadorilink_root_authority::fs_identity::TimestampGranularity;
 use yadorilink_root_authority::fs_identity::{
     classify_replacement_eligibility, BlockedObjectReason, FileIdentity, IdentityComparison,
     ObjectKind, ReplacementEligibility,
 };
-#[cfg(test)]
-use yadorilink_root_authority::fs_identity::TimestampGranularity;
-use yadorilink_root_authority::reserved_namespace::{artefact_component_name, ArtefactKind, ArtefactNameError};
+use yadorilink_root_authority::reserved_namespace::{
+    artefact_component_name, ArtefactKind, ArtefactNameError,
+};
 use yadorilink_root_authority::RootAuthorityError;
 
 use crate::fs_commit::{ParentDirHandle, RenameChildError};
@@ -740,11 +742,8 @@ mod tests {
         let expected = FileIdentity::observe_path(&source_path).unwrap();
 
         let displaced_elsewhere = dir.path().join("displaced-by-the-racer.bin");
-        let outcome = transfer_to_custody_with_pre_rename_hook(
-            &parent,
-            artefact_id,
-            Some(&expected),
-            || {
+        let outcome =
+            transfer_to_custody_with_pre_rename_hook(&parent, artefact_id, Some(&expected), || {
                 // The race: the real object is renamed away (by another
                 // local actor with filesystem access, standing in for a
                 // second process/thread here), and a different regular
@@ -752,9 +751,8 @@ mod tests {
                 // rename into custody.
                 fs::rename(&source_path, &displaced_elsewhere).unwrap();
                 fs::write(&source_path, b"a substitute the racer planted").unwrap();
-            },
-        )
-        .unwrap_err();
+            })
+            .unwrap_err();
 
         let retained_name = retained_custody_name(artefact_id);
         assert!(

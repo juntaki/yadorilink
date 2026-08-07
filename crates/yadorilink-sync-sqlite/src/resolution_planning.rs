@@ -252,13 +252,13 @@
 
 use rusqlite::Connection;
 
+use crate::filesystem_transaction::{self, EpochRecord, NewEpoch, TransactionPhase};
+use crate::SyncSqliteError;
 use yadorilink_replica_domain::filesystem_placement::EpochState;
 use yadorilink_replica_engine::resolution_planning::{
     epoch_is_pre_commit_leftover, epoch_is_provably_untouched_by_adapter,
     epoch_reflects_committed_placement, PlacementGroup, PlanSlice, PlannedPlacement,
 };
-use crate::SyncSqliteError;
-use crate::filesystem_transaction::{self, EpochRecord, NewEpoch, TransactionPhase};
 use yadorilink_root_authority::fs_capabilities::DurabilityLevel;
 use yadorilink_root_authority::fs_identity::DirectoryIdentity;
 
@@ -478,7 +478,6 @@ pub fn allocate_slice_epochs_unchecked(
         Ok(out)
     })
 }
-
 
 /// Returns the subset of `groups` not yet fully, durably placed — reused
 /// directly to build the next slice after a replan.
@@ -738,9 +737,7 @@ pub fn plan_is_stale(
         plan.execution_generation,
     ) {
         Ok(()) => Ok(false),
-        Err(SyncSqliteError::ExecutionGenerationFenced { .. }) => {
-            Ok(true)
-        }
+        Err(SyncSqliteError::ExecutionGenerationFenced { .. }) => Ok(true),
         Err(other) => Err(other),
     }
 }
@@ -959,15 +956,15 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::filesystem_transaction::{
+        EpochUpdate, FilesystemTransactionKind, NewFilesystemTransaction, TransactionCause,
+    };
     use yadorilink_replica_domain::filesystem_placement::{
         NewReservation, PlacementRole, ReservationRole, ReservationScope,
     };
     use yadorilink_replica_engine::conflict::{self, PathResolution};
     use yadorilink_replica_engine::resolution_planning::{
         resolution_to_group, slice_plan, slice_reservation_requests, SliceBounds,
-    };
-    use crate::filesystem_transaction::{
-        EpochUpdate, FilesystemTransactionKind, NewFilesystemTransaction, TransactionCause,
     };
     use yadorilink_root_authority::fs_identity::{PlatformObjectId, VolumeIdentity};
 

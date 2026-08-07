@@ -38,7 +38,9 @@ pub enum StorageError {
     /// locally or raced in) -- defense-in-depth, distinct from `InvalidPath`
     /// so callers can tell "this specific escape check refused it" apart
     /// from a generically malformed path.
-    #[error("materialization target {0:?} resolved outside its sync root (symlinked path component?)")]
+    #[error(
+        "materialization target {0:?} resolved outside its sync root (symlinked path component?)"
+    )]
     PathEscapesRoot(String),
 
     /// `chunker::chunk_file`/`chunk_file_content_defined` decode a

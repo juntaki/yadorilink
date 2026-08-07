@@ -22,8 +22,8 @@ use support::{daemon_status_summary, register_with_fake, wait_until, wait_until_
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_orchestrator;
-use yadorilink_local_storage::FsBlockStore;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+use yadorilink_local_storage::FsBlockStore;
 use yadorilink_transport::DeviceKeyPair;
 
 struct TestDaemon {
@@ -54,11 +54,16 @@ fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
 /// Mirrors `monkey_chaos.rs`'s `describe_index_state`.
 fn describe_index_state(state: &DaemonState, group_id: &str, path: &str) -> String {
     let record = state.replica_coordinator.file_index_repository().get_file(group_id, path);
-    let materialization = state.replica_coordinator.materialization_state_repository().get_materialization_state(group_id, path);
-    let held = state.replica_coordinator.materialization_state_repository().get_held_state(group_id, path);
+    let materialization = state
+        .replica_coordinator
+        .materialization_state_repository()
+        .get_materialization_state(group_id, path);
+    let held =
+        state.replica_coordinator.materialization_state_repository().get_held_state(group_id, path);
     let heads = state
         .replica_coordinator
-        .sqlite().dag_group_heads(group_id)
+        .sqlite()
+        .dag_group_heads(group_id)
         .map(|hs| hs.iter().map(|h| h.to_hex()).collect::<Vec<_>>());
     format!(
         "record={record:?} materialization={materialization:?} held={held:?} \

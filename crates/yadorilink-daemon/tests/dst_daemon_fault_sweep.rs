@@ -44,10 +44,12 @@ use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeCo
 use yadorilink_daemon::app::{self, DaemonConfig};
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_orchestrator::{SimDiscovery, SimPeer};
-use yadorilink_local_storage::{BlockStore, FsBlockStore};
-use yadorilink_filesystem_sync::debounce::DebounceConfig;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource};
+use yadorilink_filesystem_sync::debounce::DebounceConfig;
+use yadorilink_filesystem_sync::watcher::{
+    FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
+};
+use yadorilink_local_storage::{BlockStore, FsBlockStore};
 use yadorilink_transport::DeviceKeyPair;
 
 // --------------------------------------------------------------------------
@@ -97,13 +99,13 @@ pub mod case_ir {
     }
 }
 
-#[path = "../../yadorilink-sync-core/tests/dst_support/oracle.rs"]
+#[path = "dst_support/oracle.rs"]
 pub mod oracle;
 
 // The shared, reusable disk-fault decorator, included unchanged from
 // `yadorilink-sync-core`'s `dst_support` (its `super::content_hash` binds to
 // this crate root's SHA-256 `content_hash` above).
-#[path = "../../yadorilink-sync-core/tests/dst_support/fault_disk.rs"]
+#[path = "dst_support/fault_disk.rs"]
 pub mod fault_disk;
 
 use case_ir::ContentTable;

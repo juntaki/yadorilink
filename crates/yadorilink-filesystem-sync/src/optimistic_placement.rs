@@ -18,21 +18,21 @@
 //! in one SQLite transaction — genuinely SQL-interleaved, unlike everything
 //! here.
 
-use std::fs::{self, File};
 #[cfg(any(target_os = "macos", windows))]
 use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::Path;
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
-use yadorilink_root_authority::fs_identity::FileIdentity;
-use yadorilink_root_authority::reserved_namespace::{self, ArtefactKind, ArtefactNameError};
+use crate::fs_commit::{CreateArtefactError, ParentDirHandle};
 use yadorilink_replica_engine::optimistic_placement::{
     select_fast_path, CloneSource, FastPath, FastPathDecision, FastPathRejection, PlacementInputs,
 };
-use crate::fs_commit::{CreateArtefactError, ParentDirHandle};
+use yadorilink_root_authority::fs_identity::FileIdentity;
+use yadorilink_root_authority::reserved_namespace::{self, ArtefactKind, ArtefactNameError};
 
 // =====================================================================
 // Per-epoch performance counters (§18.2)
@@ -440,9 +440,7 @@ fn clone_whole_file(
     // path-based race (see the module doc's directory-relative discipline),
     // not a new one.
     if dst_path.symlink_metadata().is_ok() {
-        return Err(PrepareError::ReservedNamespaceCollision(
-            dst_path.display().to_string(),
-        ));
+        return Err(PrepareError::ReservedNamespaceCollision(dst_path.display().to_string()));
     }
     let source_len = fs::metadata(source).map_err(PrepareError::Io)?.len();
 
@@ -622,9 +620,7 @@ fn hardlink_immutable_source(
         .map_err(PrepareError::ArtefactName)?;
     let dst_path = parent_dir.path().join(&name);
     if dst_path.symlink_metadata().is_ok() {
-        return Err(PrepareError::ReservedNamespaceCollision(
-            dst_path.display().to_string(),
-        ));
+        return Err(PrepareError::ReservedNamespaceCollision(dst_path.display().to_string()));
     }
     fs::hard_link(source, &dst_path).map_err(PrepareError::Io)?;
     let identity = FileIdentity::observe_path(&dst_path).map_err(PrepareError::Io)?;
@@ -1046,5 +1042,4 @@ mod tests {
         let prepared = prepare_target(&request);
         assert!(prepared.is_ok());
     }
-
 }

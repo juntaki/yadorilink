@@ -262,22 +262,26 @@ impl RoleLossOperationRepository {
             while let Some(row) = rows.next()? {
                 let raw_state: Option<String> = row.get(7).ok();
                 let Some(operation_id) = read_inventory_operation_id(row, 0)? else {
-                    scan.invalid.push(yadorilink_replica_domain::recovery::InvalidRecoveryOperation {
-                        operation_id: None,
-                        domain: yadorilink_replica_domain::recovery::RecoveryDomain::RoleLoss,
-                        raw_state,
-                        detail: "operation_id is not valid TEXT".to_string(),
-                    });
+                    scan.invalid.push(
+                        yadorilink_replica_domain::recovery::InvalidRecoveryOperation {
+                            operation_id: None,
+                            domain: yadorilink_replica_domain::recovery::RecoveryDomain::RoleLoss,
+                            raw_state,
+                            detail: "operation_id is not valid TEXT".to_string(),
+                        },
+                    );
                     continue;
                 };
                 match row_to_role_loss_operation_strict(row) {
                     Ok(operation) => scan.valid.push(operation),
-                    Err(error) => scan.invalid.push(yadorilink_replica_domain::recovery::InvalidRecoveryOperation {
-                        operation_id: Some(operation_id),
-                        domain: yadorilink_replica_domain::recovery::RecoveryDomain::RoleLoss,
-                        raw_state,
-                        detail: error.to_string(),
-                    }),
+                    Err(error) => scan.invalid.push(
+                        yadorilink_replica_domain::recovery::InvalidRecoveryOperation {
+                            operation_id: Some(operation_id),
+                            domain: yadorilink_replica_domain::recovery::RecoveryDomain::RoleLoss,
+                            raw_state,
+                            detail: error.to_string(),
+                        },
+                    ),
                 }
             }
             Ok(scan)

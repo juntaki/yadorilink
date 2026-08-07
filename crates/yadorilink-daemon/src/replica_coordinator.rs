@@ -100,8 +100,14 @@ use yadorilink_root_authority::root_identity::RootVerificationStatePort;
 use yadorilink_sqlite_runtime::SyncDatabase;
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
-type LocalChangeAuthProvider =
+pub(crate) type LocalChangeAuthProvider =
     dyn Fn(&str) -> Result<ChangeAuth, PolicyUnavailable> + Send + Sync + 'static;
+
+#[derive(Clone, Copy)]
+pub struct ReplicaChangeEmission<'a, 'permit> {
+    pub emitter: &'a ChangeEmitter,
+    pub permit: &'a RootCommitPermit<'permit>,
+}
 /// Local copy of what was `yadorilink_sync_core::index::RepairElectionProvider`
 /// -- a plain type alias with no logic of its own (see that module's
 /// definition), so Phase 7D-10's final deletion pass redefines it here
@@ -522,8 +528,7 @@ impl ReplicaCoordinator {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         meta: Option<&LocalFileMetaColumns>,
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
+        emission: ReplicaChangeEmission<'_, '_>,
     ) -> Result<ChangeHash, SyncError> {
         let auth = self.local_emission_auth(group_id)?;
         Ok(self.file_index_repository.upsert_file_emitting_change(
@@ -532,9 +537,11 @@ impl ReplicaCoordinator {
             origin_device_id,
             content,
             meta,
-            emitter,
-            permit,
-            auth,
+            yadorilink_sync_sqlite::file_index::ChangeEmissionContext {
+                emitter: emission.emitter,
+                permit: emission.permit,
+                auth,
+            },
         )?)
     }
 
@@ -547,8 +554,7 @@ impl ReplicaCoordinator {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         metas: &[Option<LocalFileMetaColumns>],
-        emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
+        emission: ReplicaChangeEmission<'_, '_>,
     ) -> Result<Option<ChangeHash>, SyncError> {
         let auth = self.local_emission_auth(group_id)?;
         Ok(self.file_index_repository.upsert_files_batch_emitting_change(
@@ -557,9 +563,11 @@ impl ReplicaCoordinator {
             origin_device_id,
             content,
             metas,
-            emitter,
-            permit,
-            auth,
+            yadorilink_sync_sqlite::file_index::ChangeEmissionContext {
+                emitter: emission.emitter,
+                permit: emission.permit,
+                auth,
+            },
         )?)
     }
 
@@ -579,9 +587,7 @@ impl ReplicaCoordinator {
             path,
             device_id,
             observed_at_unix_nanos,
-            emitter,
-            permit,
-            auth,
+            yadorilink_sync_sqlite::file_index::ChangeEmissionContext { emitter, permit, auth },
         )?)
     }
 

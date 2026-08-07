@@ -80,6 +80,11 @@ pub(crate) trait LinkRepositoryPort: Send + Sync {
 }
 
 pub(crate) trait LinkWatcherPort: Send + Sync {
+    /// True only after the path's watcher/runtime has completed startup.
+    /// A `Starting` reservation is deliberately false so a concurrent retry
+    /// cannot report success before the first attempt's fallible work lands.
+    fn is_ready(&self, local_path: &str) -> bool;
+
     /// The fallible steps that run after the link (and marker) row(s) are
     /// already committed: on-demand materialization policy/size-cap
     /// configuration, then starting the OS watcher. Bundled as one port

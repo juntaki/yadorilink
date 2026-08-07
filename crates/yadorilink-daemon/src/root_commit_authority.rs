@@ -27,8 +27,8 @@
 
 use std::sync::Arc;
 
-use yadorilink_root_authority::root_commit::RootLease;
 use crate::sync_error::SyncError;
+use yadorilink_root_authority::root_commit::RootLease;
 
 use crate::daemon_state::DaemonState;
 

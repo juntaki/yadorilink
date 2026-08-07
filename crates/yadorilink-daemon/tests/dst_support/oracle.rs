@@ -49,11 +49,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use yadorilink_replica_domain::ids::ChangeHash;
-use yadorilink_sync_sqlite::dag_store::ChangeOrdering;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_replica_domain::file::RecordKind;
+use yadorilink_replica_domain::ids::ChangeHash;
+use yadorilink_replica_domain::session_state::MaterializationState;
+use yadorilink_sync_sqlite::dag_store::ChangeOrdering;
 
 use super::case_ir::ContentTable;
 use super::content_hash;
@@ -781,7 +781,10 @@ impl GlobalOracle {
     /// paths (`dir1/a.bin`) must call this variant instead: the flat one
     /// would only ever see top-level entries and silently ignore whole
     /// subtrees, false-passing a real divergence underneath a directory.
-    pub fn check_convergence_recursive(&self, devices: &[(&Path, &ReplicaCoordinator)]) -> Vec<Violation> {
+    pub fn check_convergence_recursive(
+        &self,
+        devices: &[(&Path, &ReplicaCoordinator)],
+    ) -> Vec<Violation> {
         if devices.len() < 2 {
             return Vec::new();
         }
@@ -1177,10 +1180,10 @@ mod tests {
     /// fabricated ordering.
     fn author_change(state: &ReplicaCoordinator, path: &str, mtime: i64) -> ChangeHash {
         use yadorilink_replica_domain::change::{Op, PutOrigin};
+        use yadorilink_replica_domain::file::RecordKind;
         use yadorilink_replica_domain::file::{FileMeta, FileVersion};
         use yadorilink_replica_domain::ids::SyncPath;
         use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
-        use yadorilink_replica_domain::file::RecordKind;
 
         let version = FileVersion::new(
             vec![],

@@ -19,14 +19,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
+use yadorilink_filesystem_sync::debounce::{self, DebounceFlush};
+use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
 use yadorilink_ipc_proto::shellipc::{
     MaterializationState as ShellMaterializationState, StatusPush, SyncState as ShellSyncState,
 };
-use yadorilink_filesystem_sync::debounce::{self, DebounceFlush};
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
-use yadorilink_root_authority::root_commit::RootLease;
 use yadorilink_replica_domain::file::FileRecord;
-use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
+use yadorilink_root_authority::root_commit::RootLease;
 
 use crate::link_runtime::dependencies::LinkRuntimeDependencies;
 use crate::replica_coordinator::ReplicaCoordinator;
@@ -469,11 +469,10 @@ pub(crate) fn link_should_propagate(
     group_id: &str,
 ) -> bool {
     match replica_coordinator.link_repository().link_gate_for_group(group_id) {
-        Ok(yadorilink_replica_domain::session_state::LinkGate::Live { local_path: live_path, .. })
-            if live_path == local_path =>
-        {
-            true
-        }
+        Ok(yadorilink_replica_domain::session_state::LinkGate::Live {
+            local_path: live_path,
+            ..
+        }) if live_path == local_path => true,
         Ok(_) => false,
         Err(e) => {
             tracing::warn!(
@@ -692,7 +691,13 @@ mod tests {
         deps.replica_coordinator.link_repository().mark_link_orphaned(&local_path).unwrap();
 
         assert_eq!(std::fs::read(&file_path).unwrap(), b"never delete me");
-        assert!(deps.replica_coordinator.link_repository().list_links().unwrap().iter().any(|l| l.orphaned));
+        assert!(deps
+            .replica_coordinator
+            .link_repository()
+            .list_links()
+            .unwrap()
+            .iter()
+            .any(|l| l.orphaned));
 
         // And sync propagation for this now-orphaned link is suppressed,
         // the same guarantee `link_should_propagate_excludes_paused_and_

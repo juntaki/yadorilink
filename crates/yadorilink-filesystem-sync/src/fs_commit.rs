@@ -36,9 +36,9 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use yadorilink_root_authority::RootAuthorityError;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use yadorilink_root_authority::fs_capabilities::classify_errno;
+use yadorilink_root_authority::RootAuthorityError;
 // `Capability` is read by the Unix errno classification and by tests, and is
 // named by doc links on both platforms -- so it stays imported everywhere
 // rather than being `cfg`-gated out of scope, which would break those links
@@ -50,7 +50,9 @@ use yadorilink_root_authority::fs_identity::{
     classify_replacement_eligibility, BlockedObjectReason, DirectoryIdentity, FileIdentity,
     IdentityComparison, ReplacementEligibility, TimestampGranularity,
 };
-use yadorilink_root_authority::reserved_namespace::{artefact_component_name, ArtefactKind, ArtefactNameError};
+use yadorilink_root_authority::reserved_namespace::{
+    artefact_component_name, ArtefactKind, ArtefactNameError,
+};
 
 /// The `Committed` payload — see [`FilesystemCommitOutcome`]'s doc. A
 /// separate, boxed struct (rather than inline enum fields) purely so this
@@ -418,11 +420,11 @@ impl ParentDirHandle {
         if fd < 0 {
             let err = io::Error::last_os_error();
             return match err.raw_os_error() {
-                Some(libc::EEXIST) => {
-                    Err(CreateArtefactError::Collision(RootAuthorityError::ReservedNamespaceCollision(
+                Some(libc::EEXIST) => Err(CreateArtefactError::Collision(
+                    RootAuthorityError::ReservedNamespaceCollision(
                         self.join(OsStr::new(&name)).display().to_string(),
-                    )))
-                }
+                    ),
+                )),
                 _ => Err(CreateArtefactError::Io(err)),
             };
         }
@@ -1375,8 +1377,9 @@ mod platform {
         // to fix (every existing test constructing one hardcoded `Fine`).
         // Probing here makes it structurally impossible to reach this
         // comparison with a wrong or assumed value.
-        let granularity =
-            yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(request.parent_dir.path());
+        let granularity = yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(
+            request.parent_dir.path(),
+        );
         if let Err(reason) = check_stage_identity_matches_expected(
             &stage,
             request.expected_stage_identity,
@@ -1794,8 +1797,9 @@ mod platform {
         // granularity is measured here rather than accepted from
         // `request` — UNVERIFIED ON REAL WINDOWS beyond this, same caveat
         // as the rest of this module (no Windows host was available).
-        let granularity =
-            yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(request.parent_dir.path());
+        let granularity = yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(
+            request.parent_dir.path(),
+        );
         if let Err(reason) = check_stage_identity_matches_expected(
             &stage,
             request.expected_stage_identity,
@@ -3113,7 +3117,9 @@ mod tests {
         // reserved artefact components.
         for name in &on_disk {
             assert!(
-                !yadorilink_root_authority::reserved_namespace::is_reserved_component(OsStr::new(name)),
+                !yadorilink_root_authority::reserved_namespace::is_reserved_component(OsStr::new(
+                    name
+                )),
                 "{name:?} is an ordinary stripped filename, not a reserved artefact component"
             );
         }
@@ -3132,6 +3138,8 @@ mod tests {
             .find(|n| n.starts_with(".yadorilink"))
             .unwrap();
         assert_eq!(actual_on_disk, artefact_name, "our own artefact name must survive untouched");
-        assert!(yadorilink_root_authority::reserved_namespace::is_reserved_component(OsStr::new(&actual_on_disk)));
+        assert!(yadorilink_root_authority::reserved_namespace::is_reserved_component(OsStr::new(
+            &actual_on_disk
+        )));
     }
 }

@@ -9,17 +9,17 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use yadorilink_replica_domain::change::Change;
-use yadorilink_replica_domain::file::FileVersion;
-use yadorilink_replica_domain::ids::ChangeHash;
 use crate::error::PeerSessionError;
 use yadorilink_replica_domain::admission::{AdmitResult, ChangeOrdering};
+use yadorilink_replica_domain::change::Change;
+use yadorilink_replica_domain::file::FileVersion;
+use yadorilink_replica_domain::file::{FileRecord, RecordKind};
+use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::session_state::{
     CurrentVersionRecord, HeldState, LinkGate, MaterializationPolicy, MaterializationState,
     StartupFailed,
 };
 use yadorilink_root_authority::root_commit::RootCommitPermit;
-use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 
 /// An open, durably-recorded materialization intent for one path, returned
 /// by [`PeerReplicaStatePort::open_materialization_intent_guard`]. Opaque
@@ -88,18 +88,30 @@ pub trait PeerReplicaStatePort: Send + Sync {
     /// a tombstone" while applying incoming wire metadata.
     fn has_real_current_row(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError>;
 
-    fn get_record_kind(&self, group_id: &str, path: &str) -> Result<Option<RecordKind>, PeerSessionError>;
+    fn get_record_kind(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<RecordKind>, PeerSessionError>;
 
-    fn get_symlink_target(&self, group_id: &str, path: &str) -> Result<Option<Vec<u8>>, PeerSessionError>;
+    fn get_symlink_target(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, PeerSessionError>;
 
-    fn get_symlink_out_of_root(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError>;
+    fn get_symlink_out_of_root(&self, group_id: &str, path: &str)
+        -> Result<bool, PeerSessionError>;
 
     fn get_exec_bit(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError>;
 
     /// The device that produced `path`'s current content, consulted when
     /// deciding whether an incoming record actually changes anything.
-    fn get_origin_device_id(&self, group_id: &str, path: &str)
-        -> Result<Option<String>, PeerSessionError>;
+    fn get_origin_device_id(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<String>, PeerSessionError>;
 
     fn get_authoring_change_hash(
         &self,
@@ -163,7 +175,11 @@ pub trait PeerReplicaStatePort: Send + Sync {
         since_unix_nanos: i64,
     ) -> Result<(), PeerSessionError>;
 
-    fn has_materialization_intent(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError>;
+    fn has_materialization_intent(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, PeerSessionError>;
 
     /// Paths whose index row already admits it has no bytes — reconcile's
     /// on-demand-sync repair audit re-drives exactly these through an
@@ -390,7 +406,11 @@ pub trait PeerReplicaStatePort: Send + Sync {
     ) -> Result<Option<CurrentVersionRecord>, PeerSessionError>;
 
     /// The current held-state row for `(group_id, path)`, if any.
-    fn get_held_state(&self, group_id: &str, path: &str) -> Result<Option<HeldState>, PeerSessionError>;
+    fn get_held_state(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<HeldState>, PeerSessionError>;
 
     /// Creates the `version_seq = 0` scaffold row a never-before-seen path
     /// needs before wire-only metadata (kind/symlink-target/exec-bit) can

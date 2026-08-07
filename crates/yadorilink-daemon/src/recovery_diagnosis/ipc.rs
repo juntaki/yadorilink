@@ -7,6 +7,9 @@
 //! file. `format!("{value:?}")` is never used for a wire value: a Debug
 //! representation is not a stable contract.
 
+use crate::recovery::{
+    RecoveryOperationKey, RecoveryOperationSummary, RecoverySeverity, RecoverySnapshotRevision,
+};
 use yadorilink_ipc_proto::daemonctl::{
     show_recovery_operation_response, InvalidRecoveryOperation as InvalidRecoveryOperationProto,
     RecoveryDiagnosis as RecoveryDiagnosisProto,
@@ -19,10 +22,6 @@ use yadorilink_ipc_proto::daemonctl::{
     RecoveryRemoteState as RecoveryRemoteStateProto,
     RecoverySnapshotAfterLookup as RecoverySnapshotAfterLookupProto,
     RecoverySnapshotRevision as RecoverySnapshotRevisionProto, ShowRecoveryOperationResponse,
-};
-use crate::recovery::{
-    RecoveryOperationKey, RecoveryOperationSummary, RecoverySeverity,
-    RecoverySnapshotRevision,
 };
 use yadorilink_replica_domain::recovery::InvalidRecoveryOperation;
 

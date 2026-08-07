@@ -48,16 +48,16 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
+use crate::error::SyncSqliteError;
+use crate::file_identity_codec::{self as materialized_generation, GenerationId};
 use yadorilink_replica_domain::filesystem_placement::{
     EpochState, NewReservation, PlacementRole, ReservationRole, ReservationScope,
 };
 use yadorilink_replica_domain::ids::ChangeHash;
-use crate::error::SyncSqliteError;
 use yadorilink_root_authority::fs_capabilities::DurabilityLevel;
 use yadorilink_root_authority::fs_identity::{
     DirectoryIdentity, FileIdentity, PlatformObjectId, Timestamp, VolumeIdentity, WindowsObjectId,
 };
-use crate::file_identity_codec::{self as materialized_generation, GenerationId};
 
 /// Whether the filesystem transaction engine is permitted to execute at
 /// all. `false` for the whole of this phase — see the module doc.
@@ -303,7 +303,7 @@ pub enum FilesystemTransactionKind {
 }
 
 impl FilesystemTransactionKind {
-    fn as_db_str(self) -> &'static str {
+    fn db_str(self) -> &'static str {
         match self {
             FilesystemTransactionKind::ObjectResolution => "object_resolution",
             FilesystemTransactionKind::SubtreeReplacement => "subtree_replacement",
@@ -334,7 +334,7 @@ pub enum TransactionCause {
 }
 
 impl TransactionCause {
-    fn as_db_str(self) -> &'static str {
+    fn db_str(self) -> &'static str {
         match self {
             TransactionCause::PeerProjection => "peer_projection",
             TransactionCause::Hydration => "hydration",
@@ -386,7 +386,7 @@ pub enum TransactionPhase {
 }
 
 impl TransactionPhase {
-    fn as_db_str(self) -> &'static str {
+    fn db_str(self) -> &'static str {
         match self {
             TransactionPhase::Planning => "planning",
             TransactionPhase::Committing => "committing",
@@ -649,11 +649,11 @@ pub fn begin_transaction_unchecked(
             transaction_id,
             new.group_id,
             new.source_path,
-            new.kind.as_db_str(),
-            new.cause.as_db_str(),
+            new.kind.db_str(),
+            new.cause.db_str(),
             new.trigger_change_hash.map(|h| &h.0[..]),
             &new.desired_frontier_hash[..],
-            TransactionPhase::Planning.as_db_str(),
+            TransactionPhase::Planning.db_str(),
             now_unix_nanos,
         ],
     )?;
@@ -814,7 +814,7 @@ pub fn list_incomplete_transactions(
          FROM filesystem_transactions WHERE phase != ?1 ORDER BY transaction_id",
     )?;
     let rows = stmt
-        .query_map([TransactionPhase::Completed.as_db_str()], |r| {
+        .query_map([TransactionPhase::Completed.db_str()], |r| {
             Ok((
                 r.get(0)?,
                 r.get(1)?,
@@ -853,7 +853,9 @@ pub fn check_execution_generation(
             |r| r.get(0),
         )
         .optional()?
-        .ok_or_else(|| SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}")))?;
+        .ok_or_else(|| {
+            SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}"))
+        })?;
     if current != expected {
         return Err(SyncSqliteError::ExecutionGenerationFenced {
             transaction_id: transaction_id.to_string(),
@@ -886,7 +888,9 @@ pub fn increment_execution_generation_unchecked(
             |r| r.get(0),
         )
         .optional()?;
-    next.ok_or_else(|| SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}")))
+    next.ok_or_else(|| {
+        SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}"))
+    })
 }
 
 /// Sets `transaction_id`'s `plan_revision` to `new_plan_revision`, but only
@@ -951,7 +955,9 @@ pub fn set_plan_revision_unchecked(
             )
             .optional()?;
         return match current {
-            None => Err(SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}"))),
+            None => {
+                Err(SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}")))
+            }
             Some(current_plan_revision) => Err(SyncSqliteError::TransitionRaced {
                 subject: format!("filesystem transaction {transaction_id} plan_revision"),
                 expected_state: format!("plan_revision {expected_plan_revision}"),
@@ -1053,18 +1059,24 @@ pub fn set_desired_frontier_hash_unchecked(
             )
             .optional()?;
         return match current {
-            None => Err(SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}"))),
-            Some((current_generation, current_plan_revision)) => Err(SyncSqliteError::TransitionRaced {
-                subject: format!("filesystem transaction {transaction_id} desired_frontier_hash"),
-                expected_state: format!(
-                    "execution_generation {expected_execution_generation}, plan_revision \
+            None => {
+                Err(SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}")))
+            }
+            Some((current_generation, current_plan_revision)) => {
+                Err(SyncSqliteError::TransitionRaced {
+                    subject: format!(
+                        "filesystem transaction {transaction_id} desired_frontier_hash"
+                    ),
+                    expected_state: format!(
+                        "execution_generation {expected_execution_generation}, plan_revision \
                      {expected_plan_revision}"
-                ),
-                current_state: format!(
-                    "execution_generation {current_generation}, plan_revision \
+                    ),
+                    current_state: format!(
+                        "execution_generation {current_generation}, plan_revision \
                      {current_plan_revision}"
-                ),
-            }),
+                    ),
+                })
+            }
         };
     }
     Ok(())
@@ -1101,8 +1113,9 @@ pub fn set_transaction_phase_unchecked(
     now_unix_nanos: i64,
 ) -> Result<(), SyncSqliteError> {
     check_execution_generation(conn, transaction_id, expected_execution_generation)?;
-    let record = lookup_transaction(conn, transaction_id)?
-        .ok_or_else(|| SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}")))?;
+    let record = lookup_transaction(conn, transaction_id)?.ok_or_else(|| {
+        SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}"))
+    })?;
     if !record.phase.can_transition_to(to) {
         return Err(SyncSqliteError::InvalidInput(format!(
             "filesystem transaction {transaction_id}: {:?} -> {to:?} is not a legal phase transition",
@@ -1217,12 +1230,12 @@ pub fn set_transaction_phase_unchecked(
              updated_at_unix_nanos = ?3 WHERE transaction_id = ?4 AND execution_generation = ?5 \
              AND phase = ?6 AND epoch_watermark = ?7",
             rusqlite::params![
-                to.as_db_str(),
+                to.db_str(),
                 blocked_reason,
                 now_unix_nanos,
                 transaction_id,
                 expected_execution_generation,
-                record.phase.as_db_str(),
+                record.phase.db_str(),
                 record.epoch_watermark,
             ],
         )?
@@ -1232,12 +1245,12 @@ pub fn set_transaction_phase_unchecked(
              updated_at_unix_nanos = ?3 WHERE transaction_id = ?4 AND execution_generation = ?5 \
              AND phase = ?6",
             rusqlite::params![
-                to.as_db_str(),
+                to.db_str(),
                 blocked_reason,
                 now_unix_nanos,
                 transaction_id,
                 expected_execution_generation,
-                record.phase.as_db_str(),
+                record.phase.db_str(),
             ],
         )?
     };
@@ -1258,8 +1271,8 @@ pub fn set_transaction_phase_unchecked(
         if current.phase != record.phase {
             return Err(SyncSqliteError::TransitionRaced {
                 subject: format!("filesystem transaction {transaction_id}"),
-                expected_state: record.phase.as_db_str().to_string(),
-                current_state: current.phase.as_db_str().to_string(),
+                expected_state: record.phase.db_str().to_string(),
+                current_state: current.phase.db_str().to_string(),
             });
         }
         if to == TransactionPhase::Completed && current.epoch_watermark != record.epoch_watermark {
@@ -1292,12 +1305,12 @@ pub fn set_transaction_phase_unchecked(
 // crate to own the type, which it no longer does) so the exact
 // `Result<_, SyncSqliteError>` corrupt-row error path is unchanged.
 trait EpochStateDbCodec {
-    fn as_db_str(self) -> &'static str;
+    fn db_str(self) -> &'static str;
     fn from_db_str(value: &str) -> Result<EpochState, SyncSqliteError>;
 }
 
 impl EpochStateDbCodec for EpochState {
-    fn as_db_str(self) -> &'static str {
+    fn db_str(self) -> &'static str {
         match self {
             EpochState::Allocated => "allocated",
             EpochState::Preparing => "preparing",
@@ -1357,12 +1370,12 @@ impl EpochStateDbCodec for EpochState {
 // alongside `EpochState` (Phase 7D-9D) -- see that module's own doc. Same
 // local-trait codec pattern as `EpochStateDbCodec` above.
 trait PlacementRoleDbCodec {
-    fn as_db_str(self) -> &'static str;
+    fn db_str(self) -> &'static str;
     fn from_db_str(value: &str) -> Result<PlacementRole, SyncSqliteError>;
 }
 
 impl PlacementRoleDbCodec for PlacementRole {
-    fn as_db_str(self) -> &'static str {
+    fn db_str(self) -> &'static str {
         match self {
             PlacementRole::CanonicalPath => "canonical_path",
             PlacementRole::ConflictCopy => "conflict_copy",
@@ -1750,7 +1763,7 @@ pub fn bump_epoch_watermark_if_not_completed(
     let legal_phases: Vec<&'static str> = TransactionPhase::ALL
         .into_iter()
         .filter(|phase| phase.may_receive_new_epochs())
-        .map(TransactionPhase::as_db_str)
+        .map(TransactionPhase::db_str)
         .collect();
     // `by` and `transaction_id` occupy ?1 and ?2; the legal-phase list fills
     // ?3 onward, however many there turn out to be.
@@ -1869,8 +1882,8 @@ pub fn insert_epoch_row_unchecked(
             new.epoch,
             new.plan_revision,
             new.target_path,
-            new.placement_role.as_db_str(),
-            EpochState::Allocated.as_db_str(),
+            new.placement_role.db_str(),
+            EpochState::Allocated.db_str(),
             new.target_generation,
             parent_directory_identity_blob,
             new.capability_snapshot,
@@ -2230,7 +2243,7 @@ pub fn transition_epoch_unchecked(
                       WHERE transaction_id = ?13) \
            AND phase = ?16",
         rusqlite::params![
-            to.as_db_str(),
+            to.db_str(),
             update.displaced_generation_id.map(|g| g.0.clone()),
             update.displaced_snapshot,
             update.stage_path,
@@ -2245,7 +2258,7 @@ pub fn transition_epoch_unchecked(
             transaction_id,
             epoch,
             expected_execution_generation,
-            current.phase.as_db_str(),
+            current.phase.db_str(),
         ],
     )?;
     if rows_changed == 0 {
@@ -2265,8 +2278,8 @@ pub fn transition_epoch_unchecked(
         if current_epoch.phase != current.phase {
             return Err(SyncSqliteError::TransitionRaced {
                 subject: format!("epoch {transaction_id}/{epoch}"),
-                expected_state: current.phase.as_db_str().to_string(),
-                current_state: current_epoch.phase.as_db_str().to_string(),
+                expected_state: current.phase.db_str().to_string(),
+                current_state: current_epoch.phase.db_str().to_string(),
             });
         }
         return Err(SyncSqliteError::ExecutionGenerationFenced {
@@ -2288,12 +2301,12 @@ pub fn transition_epoch_unchecked(
 // alongside `EpochState`/`PlacementRole` (Phase 7D-9D) -- see that module's
 // own doc. Same local-trait codec pattern as `EpochStateDbCodec` above.
 trait ReservationScopeDbCodec {
-    fn as_db_str(self) -> &'static str;
+    fn db_str(self) -> &'static str;
     fn from_db_str(value: &str) -> Result<ReservationScope, SyncSqliteError>;
 }
 
 impl ReservationScopeDbCodec for ReservationScope {
-    fn as_db_str(self) -> &'static str {
+    fn db_str(self) -> &'static str {
         match self {
             ReservationScope::Exact => "exact",
             ReservationScope::SubtreeIntent => "subtree_intent",
@@ -2314,12 +2327,12 @@ impl ReservationScopeDbCodec for ReservationScope {
 }
 
 trait ReservationRoleDbCodec {
-    fn as_db_str(self) -> &'static str;
+    fn db_str(self) -> &'static str;
     fn from_db_str(value: &str) -> Result<ReservationRole, SyncSqliteError>;
 }
 
 impl ReservationRoleDbCodec for ReservationRole {
-    fn as_db_str(self) -> &'static str {
+    fn db_str(self) -> &'static str {
         match self {
             ReservationRole::CanonicalPath => "canonical_path",
             ReservationRole::ConflictCopy => "conflict_copy",
@@ -2679,11 +2692,11 @@ pub fn acquire_reservations_in_open_transaction(
                 reservation_id,
                 request.group_id,
                 request.transaction_id,
-                request.scope.as_db_str(),
+                request.scope.db_str(),
                 request.path,
                 start,
                 end,
-                request.role.as_db_str(),
+                request.role.db_str(),
                 now_unix_nanos,
             ],
         )?;
@@ -2744,7 +2757,10 @@ pub fn list_reservations(
 
 /// Releases every reservation `transaction_id` holds — canonical locks and
 /// reservations are released immediately after a commit. Gated.
-pub fn release_reservations(conn: &Connection, transaction_id: &str) -> Result<(), SyncSqliteError> {
+pub fn release_reservations(
+    conn: &Connection,
+    transaction_id: &str,
+) -> Result<(), SyncSqliteError> {
     require_execution_enabled()?;
     release_reservations_unchecked(conn, transaction_id)
 }
@@ -3024,7 +3040,10 @@ mod tests {
         let conn = open();
         let hash = ChangeHash([1; 32]);
         let new_tx = sample_new_transaction(Some(&hash));
-        assert!(matches!(begin_transaction(&conn, &new_tx, 0), Err(SyncSqliteError::NotImplemented(_))));
+        assert!(matches!(
+            begin_transaction(&conn, &new_tx, 0),
+            Err(SyncSqliteError::NotImplemented(_))
+        ));
         assert!(matches!(
             increment_execution_generation(&conn, "whatever"),
             Err(SyncSqliteError::NotImplemented(_))
@@ -3045,7 +3064,10 @@ mod tests {
             capability_snapshot: b"opaque",
             durability_level: DurabilityLevel::PowerLossSafe,
         };
-        assert!(matches!(insert_epoch(&conn, &new_epoch, 0, 0), Err(SyncSqliteError::NotImplemented(_))));
+        assert!(matches!(
+            insert_epoch(&conn, &new_epoch, 0, 0),
+            Err(SyncSqliteError::NotImplemented(_))
+        ));
         assert!(matches!(
             transition_epoch(
                 &conn,
@@ -3387,8 +3409,8 @@ mod tests {
                     1_i64,
                     0_i64,
                     "b.txt",
-                    PlacementRole::CanonicalPath.as_db_str(),
-                    EpochState::Allocated.as_db_str(),
+                    PlacementRole::CanonicalPath.db_str(),
+                    EpochState::Allocated.db_str(),
                     b"opaque".to_vec(),
                     encode_directory_identity(&sample_directory_identity()),
                     b"opaque".to_vec(),
@@ -4364,10 +4386,10 @@ mod tests {
                 "UPDATE filesystem_transaction_epochs SET phase = ?1, updated_at_unix_nanos = ?2 \
                  WHERE transaction_id = ?3 AND epoch = 0 AND phase = ?4",
                 rusqlite::params![
-                    EpochState::RequiresPhysicalRecovery.as_db_str(),
+                    EpochState::RequiresPhysicalRecovery.db_str(),
                     6i64,
                     &transaction_id,
-                    EpochState::Committing.as_db_str(),
+                    EpochState::Committing.db_str(),
                 ],
             )
             .unwrap();
@@ -4402,9 +4424,10 @@ mod tests {
             matches!(result, Err(SyncSqliteError::TransitionRaced { .. })),
             "the UPDATE must re-check the source phase itself once unblocked, got {result:?}"
         );
-        if let Err(SyncSqliteError::TransitionRaced { expected_state, current_state, .. }) = &result {
-            assert_eq!(expected_state, EpochState::Committing.as_db_str());
-            assert_eq!(current_state, EpochState::RequiresPhysicalRecovery.as_db_str());
+        if let Err(SyncSqliteError::TransitionRaced { expected_state, current_state, .. }) = &result
+        {
+            assert_eq!(expected_state, EpochState::Committing.db_str());
+            assert_eq!(current_state, EpochState::RequiresPhysicalRecovery.db_str());
         }
 
         let final_conn = open_file_backed(&db_path);
@@ -4450,10 +4473,10 @@ mod tests {
                 "UPDATE filesystem_transactions SET phase = ?1, updated_at_unix_nanos = ?2 \
                  WHERE transaction_id = ?3 AND phase = ?4",
                 rusqlite::params![
-                    TransactionPhase::Planning.as_db_str(),
+                    TransactionPhase::Planning.db_str(),
                     2i64,
                     &transaction_id,
-                    TransactionPhase::Committing.as_db_str(),
+                    TransactionPhase::Committing.db_str(),
                 ],
             )
             .unwrap();
@@ -5185,7 +5208,10 @@ mod tests {
         // rather than silently resolved into a possibly-wrong key.
         for alias in ["a/./b", "a/x/../b"] {
             let result = path_key(alias);
-            assert!(matches!(result, Err(SyncSqliteError::InvalidInput(_))), "{alias:?} -> {result:?}");
+            assert!(
+                matches!(result, Err(SyncSqliteError::InvalidInput(_))),
+                "{alias:?} -> {result:?}"
+            );
         }
     }
 

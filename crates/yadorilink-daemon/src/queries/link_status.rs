@@ -78,9 +78,7 @@ impl LinkStatusQueryService {
         Self { reader }
     }
 
-    pub(crate) fn list_links(
-        &self,
-    ) -> Result<Vec<LinkStatusView>, crate::sync_error::SyncError> {
+    pub(crate) fn list_links(&self) -> Result<Vec<LinkStatusView>, crate::sync_error::SyncError> {
         self.reader.list_links()
     }
 }

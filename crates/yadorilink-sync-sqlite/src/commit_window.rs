@@ -80,21 +80,21 @@ use std::time::Instant;
 use rusqlite::Connection;
 
 use crate::error::SyncSqliteError;
-use yadorilink_replica_domain::filesystem_placement::EpochState;
-use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
 use crate::filesystem_transaction::{self, EpochRecord, EpochUpdate, TransactionPhase};
-use yadorilink_filesystem_sync::fs_commit::{
-    CommitRequest, FilesystemCommitAdapter, FilesystemCommitOutcome,
-    RecoveryObservation, RecoverySnapshot, RetryReason,
-};
+use crate::materialized_generation::{self, DiskGenerationBasis, MaterializedObjectKind};
 #[cfg(test)]
 use yadorilink_filesystem_sync::fs_commit::ParentDirHandle;
+use yadorilink_filesystem_sync::fs_commit::{
+    CommitRequest, FilesystemCommitAdapter, FilesystemCommitOutcome, RecoveryObservation,
+    RecoverySnapshot, RetryReason,
+};
+use yadorilink_replica_domain::filesystem_placement::EpochState;
+use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
 #[cfg(test)]
 use yadorilink_root_authority::fs_identity::DirectoryIdentity;
 #[cfg(test)]
 use yadorilink_root_authority::fs_identity::FileIdentity;
 use yadorilink_root_authority::fs_identity::IdentityComparison;
-use crate::materialized_generation::{self, DiskGenerationBasis, MaterializedObjectKind};
 use yadorilink_root_authority::reserved_namespace::{self, ArtefactKind};
 // Preparation (`prepare_target` and everything it calls -- fast-path
 // selection was already pure and moved to `yadorilink-replica-engine`, but
@@ -105,7 +105,9 @@ use yadorilink_root_authority::reserved_namespace::{self, ArtefactKind};
 // one); `durable_flush_directory` moved with it too, and this module's own
 // commit window still calls it (once, inside the same SQLite transaction as
 // the commit's own database write) via the path below.
-use yadorilink_filesystem_sync::optimistic_placement::{durable_flush_directory, PreparationCounters};
+use yadorilink_filesystem_sync::optimistic_placement::{
+    durable_flush_directory, PreparationCounters,
+};
 
 // =====================================================================
 // The short commit window (§6.2) — single-path regular files only
@@ -202,7 +204,7 @@ pub fn execute_short_commit_window(
     request: &CommitWindowRequest,
     now_unix_nanos: i64,
 ) -> Result<CommitWindowOutcome, CommitWindowError> {
-    filesystem_transaction::require_execution_enabled().map_err(|e| CommitWindowError::Sync(SyncSqliteError::from(e)))?;
+    filesystem_transaction::require_execution_enabled().map_err(CommitWindowError::Sync)?;
     execute_short_commit_window_unchecked(conn, adapter, request, now_unix_nanos)
 }
 
@@ -230,7 +232,7 @@ pub fn execute_short_commit_window_keeping_reservations(
     request: &CommitWindowRequest,
     now_unix_nanos: i64,
 ) -> Result<CommitWindowOutcome, CommitWindowError> {
-    filesystem_transaction::require_execution_enabled().map_err(|e| CommitWindowError::Sync(SyncSqliteError::from(e)))?;
+    filesystem_transaction::require_execution_enabled().map_err(CommitWindowError::Sync)?;
     execute_short_commit_window_unchecked_keeping_reservations(
         conn,
         adapter,
@@ -277,7 +279,8 @@ fn execute_short_commit_window_core(
     release_on_commit: bool,
 ) -> Result<CommitWindowOutcome, CommitWindowError> {
     {
-        let tx = conn.transaction().map_err(|e| CommitWindowError::Sync(SyncSqliteError::Sqlite(e)))?;
+        let tx =
+            conn.transaction().map_err(|e| CommitWindowError::Sync(SyncSqliteError::Sqlite(e)))?;
 
         // The bookkeeping this window is about to publish must actually
         // describe the object the adapter is about to mutate, not merely
@@ -304,7 +307,7 @@ fn execute_short_commit_window_core(
         // race-sensitive and gains nothing from running later.
         let prepared_epoch =
             filesystem_transaction::lookup_epoch(&tx, request.transaction_id, request.epoch)
-                .map_err(|e| CommitWindowError::Sync(SyncSqliteError::from(e)))?
+                .map_err(CommitWindowError::Sync)?
                 .ok_or_else(|| {
                     CommitWindowError::Sync(SyncSqliteError::NotFound(format!(
                         "epoch {}/{}",
@@ -322,7 +325,7 @@ fn execute_short_commit_window_core(
             &EpochUpdate::default(),
             now_unix_nanos,
         )
-        .map_err(|e| CommitWindowError::Sync(SyncSqliteError::from(e)))?;
+        .map_err(CommitWindowError::Sync)?;
         tx.commit().map_err(|e| CommitWindowError::Sync(SyncSqliteError::Sqlite(e)))?;
     }
 
@@ -367,7 +370,7 @@ fn execute_short_commit_window_core(
         request.expected_execution_generation,
     ) {
         block_fenced_epoch(conn, request, now_unix_nanos);
-        return Err(CommitWindowError::Sync(SyncSqliteError::from(fence_error)));
+        return Err(CommitWindowError::Sync(fence_error));
     }
 
     // The one mutating filesystem call this window makes.
@@ -383,7 +386,9 @@ fn execute_short_commit_window_core(
             // recovery" case that edge exists to avoid for a genuinely
             // known-safe no-op. See `is_notstarted_reason_retryable`'s doc
             // for the retryable/non-retryable classification.
-            let tx = conn.transaction().map_err(|e| CommitWindowError::Sync(SyncSqliteError::Sqlite(e)))?;
+            let tx = conn
+                .transaction()
+                .map_err(|e| CommitWindowError::Sync(SyncSqliteError::Sqlite(e)))?;
             if is_notstarted_reason_retryable(&reason) {
                 filesystem_transaction::transition_epoch_unchecked(
                     &tx,
@@ -394,7 +399,7 @@ fn execute_short_commit_window_core(
                     &EpochUpdate::default(),
                     now_unix_nanos,
                 )
-                .map_err(|e| CommitWindowError::Sync(SyncSqliteError::from(e)))?;
+                .map_err(CommitWindowError::Sync)?;
             } else {
                 // Retrying the identical plan would just fail again --
                 // take the pre-existing `(Committing, Blocked)` edge
@@ -410,7 +415,7 @@ fn execute_short_commit_window_core(
                     &EpochUpdate::default(),
                     now_unix_nanos,
                 )
-                .map_err(|e| CommitWindowError::Sync(SyncSqliteError::from(e)))?;
+                .map_err(CommitWindowError::Sync)?;
                 filesystem_transaction::set_transaction_phase_unchecked(
                     &tx,
                     request.transaction_id,
@@ -419,7 +424,7 @@ fn execute_short_commit_window_core(
                     Some(&format!("commit not started: {reason:?}")),
                     now_unix_nanos,
                 )
-                .map_err(|e| CommitWindowError::Sync(SyncSqliteError::from(e)))?;
+                .map_err(CommitWindowError::Sync)?;
             }
             tx.commit().map_err(|e| CommitWindowError::Sync(SyncSqliteError::Sqlite(e)))?;
             Err(CommitWindowError::NotStarted(reason))
@@ -539,7 +544,8 @@ fn execute_short_commit_window_core(
                 }
                 tx.commit()?;
                 Ok((epoch, generation))
-            })();
+            })(
+            );
 
             let (epoch, generation) = match journaled {
                 Ok(journaled) => journaled,
@@ -697,7 +703,9 @@ fn require_commit_matches_epoch(
     // rather than silently assumed away.
     let parent_verdict = observed_parent_identity.compare(
         &epoch.parent_directory_identity,
-        yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(request.commit.parent_dir.path()),
+        yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(
+            request.commit.parent_dir.path(),
+        ),
     );
     if !matches!(parent_verdict, IdentityComparison::SameObject) {
         return Err(commit_mismatch(format!(
@@ -775,7 +783,9 @@ fn require_commit_matches_epoch(
     // the identical shape of ambiguity.
     let stage_identity_verdict = recorded_staged_identity.compare(
         request.commit.expected_stage_identity,
-        yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(request.commit.parent_dir.path()),
+        yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(
+            request.commit.parent_dir.path(),
+        ),
     );
     if !matches!(stage_identity_verdict, IdentityComparison::SameObject) {
         return Err(commit_mismatch(format!(
@@ -894,10 +904,15 @@ fn is_notstarted_reason_retryable(reason: &RetryReason) -> bool {
 /// the epoch's *source phase*, so a correction still only applies if the
 /// epoch is exactly where this window left it, and both corrections record
 /// strictly less claim than leaving the row as it stands.
-fn current_execution_generation(conn: &Connection, transaction_id: &str) -> Result<i64, SyncSqliteError> {
+fn current_execution_generation(
+    conn: &Connection,
+    transaction_id: &str,
+) -> Result<i64, SyncSqliteError> {
     filesystem_transaction::lookup_transaction(conn, transaction_id)?
         .map(|t| t.execution_generation)
-        .ok_or_else(|| SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}")))
+        .ok_or_else(|| {
+            SyncSqliteError::NotFound(format!("filesystem transaction {transaction_id}"))
+        })
 }
 
 /// Blocks an epoch whose pre-mutation execution-generation fence failed.
@@ -925,7 +940,10 @@ fn block_fenced_epoch(conn: &mut Connection, request: &CommitWindowRequest, now_
         )?;
         let transaction = filesystem_transaction::lookup_transaction(&tx, request.transaction_id)?
             .ok_or_else(|| {
-                SyncSqliteError::NotFound(format!("filesystem transaction {}", request.transaction_id))
+                SyncSqliteError::NotFound(format!(
+                    "filesystem transaction {}",
+                    request.transaction_id
+                ))
             })?;
         if transaction.phase != TransactionPhase::Blocked {
             filesystem_transaction::set_transaction_phase_unchecked(
@@ -1065,12 +1083,14 @@ fn fire_pre_mutation_fence_recheck_hook_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yadorilink_replica_domain::filesystem_placement::PlacementRole;
     use crate::filesystem_transaction::{
         FilesystemTransactionKind, NewEpoch, NewFilesystemTransaction, TransactionCause,
     };
-    use yadorilink_root_authority::fs_capabilities::{Capability, DurabilityLevel, FilesystemSafetyCapabilities};
     use yadorilink_filesystem_sync::fs_commit::FakeCommitAdapter;
+    use yadorilink_replica_domain::filesystem_placement::PlacementRole;
+    use yadorilink_root_authority::fs_capabilities::{
+        Capability, DurabilityLevel, FilesystemSafetyCapabilities,
+    };
 
     // ---- Short commit window (§6.2) -------------------------------------
 
@@ -1288,8 +1308,12 @@ mod tests {
 
     fn sample_sync_root_identity() -> DirectoryIdentity {
         DirectoryIdentity {
-            volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity::Unix { device_id: 999 },
-            object_id: yadorilink_root_authority::fs_identity::PlatformObjectId::Unix { inode: 999 },
+            volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity::Unix {
+                device_id: 999,
+            },
+            object_id: yadorilink_root_authority::fs_identity::PlatformObjectId::Unix {
+                inode: 999,
+            },
             generation_or_usn: None,
             birth_or_creation_time: None,
         }
@@ -1318,7 +1342,9 @@ mod tests {
     /// capability a given test happens to pass.
     fn sample_stage_identity() -> FileIdentity {
         FileIdentity {
-            volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity::Unix { device_id: 1 },
+            volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity::Unix {
+                device_id: 1,
+            },
             object_id: yadorilink_root_authority::fs_identity::PlatformObjectId::Unix { inode: 7 },
             object_kind: yadorilink_root_authority::fs_identity::ObjectKind::RegularFile,
             generation_or_usn: Some(1),
@@ -1510,7 +1536,9 @@ mod tests {
         };
 
         let identity = FileIdentity {
-            volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity::Unix { device_id: 1 },
+            volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity::Unix {
+                device_id: 1,
+            },
             object_id: yadorilink_root_authority::fs_identity::PlatformObjectId::Unix { inode: 42 },
             object_kind: yadorilink_root_authority::fs_identity::ObjectKind::RegularFile,
             generation_or_usn: None,
@@ -1561,8 +1589,12 @@ mod tests {
         // A real, different object's identity -- not the one this epoch's
         // own `Prepared` transition recorded.
         let substituted_identity = FileIdentity {
-            volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity::Unix { device_id: 1 },
-            object_id: yadorilink_root_authority::fs_identity::PlatformObjectId::Unix { inode: 999 },
+            volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity::Unix {
+                device_id: 1,
+            },
+            object_id: yadorilink_root_authority::fs_identity::PlatformObjectId::Unix {
+                inode: 999,
+            },
             object_kind: yadorilink_root_authority::fs_identity::ObjectKind::RegularFile,
             generation_or_usn: None,
             birth_or_creation_time: None,
@@ -1721,7 +1753,9 @@ mod tests {
         };
 
         let identity = FileIdentity {
-            volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity::Unix { device_id: 1 },
+            volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity::Unix {
+                device_id: 1,
+            },
             object_id: yadorilink_root_authority::fs_identity::PlatformObjectId::Unix { inode: 42 },
             object_kind: yadorilink_root_authority::fs_identity::ObjectKind::Symlink,
             generation_or_usn: None,
@@ -1830,7 +1864,9 @@ mod tests {
         };
 
         let identity = FileIdentity {
-            volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity::Unix { device_id: 1 },
+            volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity::Unix {
+                device_id: 1,
+            },
             object_id: yadorilink_root_authority::fs_identity::PlatformObjectId::Unix { inode: 42 },
             object_kind: yadorilink_root_authority::fs_identity::ObjectKind::RegularFile,
             generation_or_usn: None,
@@ -2263,20 +2299,29 @@ mod tests {
                     &self.transaction_id,
                 )
                 .unwrap();
-                FilesystemCommitOutcome::Committed(Box::new(yadorilink_filesystem_sync::fs_commit::CommittedSnapshot {
-                    live_identity: FileIdentity {
-                        volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity::Unix { device_id: 1 },
-                        object_id: yadorilink_root_authority::fs_identity::PlatformObjectId::Unix { inode: 42 },
-                        object_kind: yadorilink_root_authority::fs_identity::ObjectKind::RegularFile,
-                        generation_or_usn: None,
-                        birth_or_creation_time: None,
-                        observed_size: 0,
-                        metadata_fingerprint: [0; 32],
-                        link_count: Some(1),
-                        symlink_target_digest: None,
+                FilesystemCommitOutcome::Committed(Box::new(
+                    yadorilink_filesystem_sync::fs_commit::CommittedSnapshot {
+                        live_identity: FileIdentity {
+                            volume_identity:
+                                yadorilink_root_authority::fs_identity::VolumeIdentity::Unix {
+                                    device_id: 1,
+                                },
+                            object_id:
+                                yadorilink_root_authority::fs_identity::PlatformObjectId::Unix {
+                                    inode: 42,
+                                },
+                            object_kind:
+                                yadorilink_root_authority::fs_identity::ObjectKind::RegularFile,
+                            generation_or_usn: None,
+                            birth_or_creation_time: None,
+                            observed_size: 0,
+                            metadata_fingerprint: [0; 32],
+                            link_count: Some(1),
+                            symlink_target_digest: None,
+                        },
+                        preimage_identity: None,
                     },
-                    preimage_identity: None,
-                }))
+                ))
             }
             fn observe_identity(&self, _path: &Path) -> io::Result<Option<FileIdentity>> {
                 Ok(None)
@@ -2373,7 +2418,9 @@ mod tests {
         };
 
         let identity = FileIdentity {
-            volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity::Unix { device_id: 1 },
+            volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity::Unix {
+                device_id: 1,
+            },
             object_id: yadorilink_root_authority::fs_identity::PlatformObjectId::Unix { inode: 42 },
             object_kind: yadorilink_root_authority::fs_identity::ObjectKind::RegularFile,
             generation_or_usn: None,
@@ -2568,7 +2615,9 @@ mod tests {
         // A non-absent identity the adapter reports anyway (see the test's
         // doc above) -- must not leak into the recorded generation.
         let reported_identity = FileIdentity {
-            volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity::Unix { device_id: 1 },
+            volume_identity: yadorilink_root_authority::fs_identity::VolumeIdentity::Unix {
+                device_id: 1,
+            },
             object_id: yadorilink_root_authority::fs_identity::PlatformObjectId::Unix { inode: 42 },
             object_kind: yadorilink_root_authority::fs_identity::ObjectKind::RegularFile,
             generation_or_usn: None,

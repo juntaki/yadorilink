@@ -156,11 +156,11 @@ use boringtun::x25519::{PublicKey, StaticSecret};
 use dst_support::clock::HarnessClock;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
-use yadorilink_local_storage::FsBlockStore;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
-use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
+use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
+use yadorilink_local_storage::FsBlockStore;
+use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_transport::PeerChannel;
 
 const GROUP_ID: &str = "dst-dag-catchup-group";

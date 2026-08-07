@@ -95,7 +95,8 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
     match msg.payload {
         Some(Payload::StatusQuery(q)) => {
             let sync_state = resolve_status(&state.replica_coordinator, &q.path);
-            let materialization_state = resolve_materialization_state(&state.replica_coordinator, &q.path);
+            let materialization_state =
+                resolve_materialization_state(&state.replica_coordinator, &q.path);
             Some(ShellIpcMessage {
                 payload: Some(Payload::StatusResponse(StatusResponse {
                     path: q.path,
@@ -185,7 +186,8 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
         Some(Payload::ListOnDemandFoldersRequest(_)) => {
             let folders = state
                 .replica_coordinator
-                .link_repository().list_links()
+                .link_repository()
+                .list_links()
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|l| {
@@ -208,7 +210,8 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
         Some(Payload::ListFolderFilesRequest(req)) => {
             let entries = state
                 .replica_coordinator
-                .link_repository().list_links()
+                .link_repository()
+                .list_links()
                 .unwrap_or_default()
                 .into_iter()
                 // An orphaned link is no longer a live sync target -- treat
@@ -218,7 +221,8 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
                 .map(|l| {
                     state
                         .replica_coordinator
-                        .file_index_repository().list_files(&l.group_id)
+                        .file_index_repository()
+                        .list_files(&l.group_id)
                         .unwrap_or_default()
                         .into_iter()
                         .filter(|f| !f.deleted)
@@ -226,7 +230,8 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
                             let materialization_state = to_shell_materialization_state(
                                 state
                                     .replica_coordinator
-                                    .materialization_state_repository().get_materialization_state(&l.group_id, &f.path)
+                                    .materialization_state_repository()
+                                    .get_materialization_state(&l.group_id, &f.path)
                                     .ok()
                                     .flatten(),
                             );

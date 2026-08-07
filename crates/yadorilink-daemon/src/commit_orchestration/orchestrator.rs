@@ -356,35 +356,43 @@ use std::time::Instant;
 
 use rusqlite::Connection;
 
+use super::commit_path_locks::{self, SlicePathLocks};
+use crate::sync_error::SyncError;
 use yadorilink_filesystem_sync::block_liveness::BlockLivenessGate;
+use yadorilink_filesystem_sync::custody_transfer::{
+    self, CustodyTransferError, CustodyTransferOutcome,
+};
+use yadorilink_filesystem_sync::fs_commit::{
+    CommitRequest, FilesystemCommitAdapter, ParentDirHandle,
+};
+use yadorilink_filesystem_sync::optimistic_placement::{PrepareError, PrepareRequest};
+use yadorilink_filesystem_sync::single_pass_capture::SinglePassCaptureError;
+use yadorilink_replica_domain::filesystem_placement::EpochState;
+use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
+use yadorilink_replica_engine::optimistic_placement::PlacementInputs;
+use yadorilink_replica_engine::resolution_planning::{
+    desired_frontier_hash, slice_reservation_requests, PathFrontier, PlanSlice,
+};
+use yadorilink_root_authority::fs_capabilities::DurabilityLevel;
+use yadorilink_root_authority::fs_identity::DirectoryIdentity;
+use yadorilink_root_authority::reserved_namespace::{artefact_component_name, ArtefactKind};
 use yadorilink_sync_sqlite::captured_authoring::{
     self, CandidateAuthorizationCoordinate, CapturedAuthoringError, CapturedAuthoringRequest,
     DisplacedBasis, PrepareOutcome,
 };
-use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
-use super::commit_path_locks::{self, SlicePathLocks};
-use yadorilink_filesystem_sync::custody_transfer::{self, CustodyTransferError, CustodyTransferOutcome};
-use yadorilink_sync_sqlite::dag_store::{self, ChangeEmitter};
-use crate::sync_error::SyncError;
-use yadorilink_replica_domain::filesystem_placement::EpochState;
-use yadorilink_sync_sqlite::filesystem_transaction::{self, EpochRecord, EpochUpdate, TransactionPhase};
-use yadorilink_root_authority::fs_capabilities::DurabilityLevel;
-use yadorilink_filesystem_sync::fs_commit::{CommitRequest, FilesystemCommitAdapter, ParentDirHandle};
-use yadorilink_root_authority::fs_identity::DirectoryIdentity;
-use yadorilink_sync_sqlite::file_identity_codec::GenerationId;
-use yadorilink_sync_sqlite::materialized_generation::{self, MaterializedObjectKind};
-use yadorilink_sync_sqlite::commit_window::{self, CommitWindowError, CommitWindowOutcome, CommitWindowRequest};
-use yadorilink_filesystem_sync::optimistic_placement::{PrepareError, PrepareRequest};
-use yadorilink_replica_engine::optimistic_placement::PlacementInputs;
-use yadorilink_root_authority::reserved_namespace::{artefact_component_name, ArtefactKind};
-use yadorilink_sync_sqlite::resolution_planning::{self, FilesystemResolutionPlan};
-use yadorilink_replica_engine::resolution_planning::{
-    desired_frontier_hash, slice_reservation_requests, PathFrontier, PlanSlice,
+use yadorilink_sync_sqlite::commit_window::{
+    self, CommitWindowError, CommitWindowOutcome, CommitWindowRequest,
 };
+use yadorilink_sync_sqlite::dag_store::{self, ChangeEmitter};
+use yadorilink_sync_sqlite::file_identity_codec::GenerationId;
+use yadorilink_sync_sqlite::filesystem_transaction::{
+    self, EpochRecord, EpochUpdate, TransactionPhase,
+};
+use yadorilink_sync_sqlite::materialized_generation::{self, MaterializedObjectKind};
+use yadorilink_sync_sqlite::resolution_planning::{self, FilesystemResolutionPlan};
 use yadorilink_sync_sqlite::retained_obligation::{
     self, NewObligation, RetainedObligation, RetainedObligationError,
 };
-use yadorilink_filesystem_sync::single_pass_capture::SinglePassCaptureError;
 
 use yadorilink_local_storage::BlockStore;
 
@@ -995,7 +1003,8 @@ pub(crate) fn run_slice_unchecked(
             expected_content_hash: io.expected_content_hash,
             exec_bit: io.exec_bit,
         };
-        let prepare_result = yadorilink_filesystem_sync::optimistic_placement::prepare_target(&prepare_request);
+        let prepare_result =
+            yadorilink_filesystem_sync::optimistic_placement::prepare_target(&prepare_request);
 
         let artefact = match prepare_result {
             Ok(artefact) => artefact,
@@ -1149,11 +1158,8 @@ pub(crate) fn run_slice_unchecked(
     // makes them atomic *with each other*, it does not make any one of them
     // safe against a sibling that raced to the same source phase, which is
     // what those predicates are for.
-    let reservation_requests = slice_reservation_requests(
-        request.group_id,
-        request.transaction_id,
-        request.slice,
-    );
+    let reservation_requests =
+        slice_reservation_requests(request.group_id, request.transaction_id, request.slice);
     let slice_paths: Vec<String> = prepared.iter().map(|p| p.epoch.target_path.clone()).collect();
 
     #[allow(clippy::type_complexity)]
@@ -1634,7 +1640,9 @@ fn drive_captured_placement(
             let displaced_causal_basis_id = displaced_causal_basis_id
                 .expect("a transferred preimage's causal basis was proven before custody rename");
             let custody_identity =
-                yadorilink_sync_sqlite::file_identity_codec::encode_file_identity(custody_identity.as_ref());
+                yadorilink_sync_sqlite::file_identity_codec::encode_file_identity(
+                    custody_identity.as_ref(),
+                );
 
             let parent_directory_identity =
                 filesystem_transaction::encode_directory_identity(&io.directory_identity);
@@ -1863,24 +1871,26 @@ fn drive_captured_placement(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yadorilink_replica_domain::change::{ChangeAuth, Op, PutOrigin};
-    use yadorilink_replica_domain::ids::{ChangeHash as CH, SyncPath};
-    use yadorilink_sync_sqlite::dag_store;
-    use yadorilink_root_authority::fs_capabilities::{Capability, FilesystemSafetyCapabilities};
-    use yadorilink_filesystem_sync::fs_commit::{
-        CommittedSnapshot, FilesystemCommitOutcome, NativeCommitAdapter, RecoverySnapshot,
-    };
-    use yadorilink_root_authority::fs_identity::{FileIdentity, ObjectKind, PlatformObjectId, VolumeIdentity};
-    use yadorilink_sync_sqlite::materialized_generation;
-    use yadorilink_replica_engine::optimistic_placement::CloneSource;
-    use yadorilink_sync_sqlite::resolution_planning::{self};
-    use yadorilink_replica_engine::resolution_planning::{
-        slice_plan, PlacementGroup, PlannedPlacement, SliceBounds,
-    };
     use ed25519_dalek::SigningKey;
     use std::io;
     use std::path::Path;
+    use yadorilink_filesystem_sync::fs_commit::{
+        CommittedSnapshot, FilesystemCommitOutcome, NativeCommitAdapter, RecoverySnapshot,
+    };
     use yadorilink_local_storage::FsBlockStore;
+    use yadorilink_replica_domain::change::{ChangeAuth, Op, PutOrigin};
+    use yadorilink_replica_domain::ids::{ChangeHash as CH, SyncPath};
+    use yadorilink_replica_engine::optimistic_placement::CloneSource;
+    use yadorilink_replica_engine::resolution_planning::{
+        slice_plan, PlacementGroup, PlannedPlacement, SliceBounds,
+    };
+    use yadorilink_root_authority::fs_capabilities::{Capability, FilesystemSafetyCapabilities};
+    use yadorilink_root_authority::fs_identity::{
+        FileIdentity, ObjectKind, PlatformObjectId, VolumeIdentity,
+    };
+    use yadorilink_sync_sqlite::dag_store;
+    use yadorilink_sync_sqlite::materialized_generation;
+    use yadorilink_sync_sqlite::resolution_planning::{self};
 
     /// A real (non-placeholder) coordinate the ordinary tests below author
     /// under. It has to be a real one now: `captured_authoring` refuses the
@@ -2090,8 +2100,7 @@ mod tests {
     ) -> Result<Vec<PlacementOutcome>, OrchestratorError> {
         let (group, version, _target) = placement(group_id, path, content);
         let bounds = SliceBounds::default();
-        let slices =
-            slice_plan(0, &[group], &bounds, |_g| content.len() as u64);
+        let slices = slice_plan(0, &[group], &bounds, |_g| content.len() as u64);
         assert_eq!(slices.len(), 1);
         let slice = &slices[0];
 
@@ -2107,7 +2116,8 @@ mod tests {
             slice,
             io: &io_map,
             capability_snapshot: b"caps-v1",
-            durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+            durability_level:
+                yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             adapter: &NativeCommitAdapter,
             store,
             gate,
@@ -2284,9 +2294,7 @@ mod tests {
 
             let (group, version, _target) = placement(group_id, "target.txt", b"new content");
             let bounds = SliceBounds::default();
-            let slices = slice_plan(0, &[group], &bounds, |_g| {
-                "new content".len() as u64
-            });
+            let slices = slice_plan(0, &[group], &bounds, |_g| "new content".len() as u64);
             assert_eq!(slices.len(), 1);
             let slice = &slices[0];
             let io =
@@ -2302,7 +2310,8 @@ mod tests {
                 slice,
                 io: &io_map,
                 capability_snapshot: b"caps-v1",
-                durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+                durability_level:
+                    yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
                 adapter: &NativeCommitAdapter,
                 store: &store,
                 gate: &gate,
@@ -2427,8 +2436,7 @@ mod tests {
 
         let (group, version, _target) = placement(group_id, "target.txt", b"new content");
         let bounds = SliceBounds::default();
-        let slices =
-            slice_plan(0, &[group], &bounds, |_g| "new content".len() as u64);
+        let slices = slice_plan(0, &[group], &bounds, |_g| "new content".len() as u64);
         let slice = &slices[0];
         let io = io_for(dir.path(), &parent, "target.txt", &capabilities, b"new content", version);
         let mut io_map = HashMap::new();
@@ -2447,7 +2455,8 @@ mod tests {
             slice,
             io: &io_map,
             capability_snapshot: b"caps-v1",
-            durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+            durability_level:
+                yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             adapter: &NativeCommitAdapter,
             store: &store,
             gate: &gate,
@@ -2560,8 +2569,7 @@ mod tests {
 
         let (group, version, _target) = placement(group_id, "target.txt", b"new content");
         let bounds = SliceBounds::default();
-        let slices =
-            slice_plan(0, &[group], &bounds, |_g| "new content".len() as u64);
+        let slices = slice_plan(0, &[group], &bounds, |_g| "new content".len() as u64);
         let slice = &slices[0];
         let io = io_for(dir.path(), &parent, "target.txt", &capabilities, b"new content", version);
         let mut io_map = HashMap::new();
@@ -2575,7 +2583,8 @@ mod tests {
             slice,
             io: &io_map,
             capability_snapshot: b"caps-v1",
-            durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+            durability_level:
+                yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             adapter: &NativeCommitAdapter,
             store: &store,
             gate: &gate,
@@ -2632,9 +2641,11 @@ mod tests {
         struct AlwaysNotStarted;
         impl FilesystemCommitAdapter for AlwaysNotStarted {
             fn commit_placement(&self, _request: &CommitRequest) -> FilesystemCommitOutcome {
-                FilesystemCommitOutcome::NotStarted(yadorilink_filesystem_sync::fs_commit::RetryReason::Io(
-                    io::ErrorKind::PermissionDenied,
-                ))
+                FilesystemCommitOutcome::NotStarted(
+                    yadorilink_filesystem_sync::fs_commit::RetryReason::Io(
+                        io::ErrorKind::PermissionDenied,
+                    ),
+                )
             }
             fn observe_identity(&self, _path: &Path) -> io::Result<Option<FileIdentity>> {
                 Ok(None)
@@ -2658,7 +2669,8 @@ mod tests {
             slice,
             io: &io_map,
             capability_snapshot: b"caps-v1",
-            durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+            durability_level:
+                yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             adapter: &AlwaysNotStarted,
             store: &store,
             gate: &gate,
@@ -2729,7 +2741,8 @@ mod tests {
             slice,
             io: &io_map,
             capability_snapshot: b"caps-v1",
-            durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+            durability_level:
+                yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             adapter: &NativeCommitAdapter,
             store: &store,
             gate: &gate,
@@ -2808,9 +2821,11 @@ mod tests {
         impl FilesystemCommitAdapter for FailOneName {
             fn commit_placement(&self, request: &CommitRequest) -> FilesystemCommitOutcome {
                 if request.live_name == self.0.as_os_str() {
-                    FilesystemCommitOutcome::NotStarted(yadorilink_filesystem_sync::fs_commit::RetryReason::Io(
-                        io::ErrorKind::PermissionDenied,
-                    ))
+                    FilesystemCommitOutcome::NotStarted(
+                        yadorilink_filesystem_sync::fs_commit::RetryReason::Io(
+                            io::ErrorKind::PermissionDenied,
+                        ),
+                    )
                 } else {
                     NativeCommitAdapter.commit_placement(request)
                 }
@@ -2842,7 +2857,8 @@ mod tests {
             slice,
             io: &io_map,
             capability_snapshot: b"caps-v1",
-            durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+            durability_level:
+                yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             adapter: &adapter,
             store: &store,
             gate: &gate,
@@ -2990,7 +3006,8 @@ mod tests {
             slice,
             io: &io_map,
             capability_snapshot: b"caps-v1",
-            durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+            durability_level:
+                yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             adapter: &NativeCommitAdapter,
             store: &store,
             gate: &gate,
@@ -3119,7 +3136,8 @@ mod tests {
             slice,
             io: &io_map,
             capability_snapshot: b"caps-v1",
-            durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+            durability_level:
+                yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             adapter: &adapter,
             store: &store,
             gate: &gate,
@@ -3240,7 +3258,8 @@ mod tests {
             slice,
             io: &io_map,
             capability_snapshot: b"caps-v1",
-            durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+            durability_level:
+                yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             adapter: &NativeCommitAdapter,
             store: &store,
             gate: &gate,
@@ -3321,7 +3340,8 @@ mod tests {
             slice,
             io: &io_map,
             capability_snapshot: b"caps-v1",
-            durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+            durability_level:
+                yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             adapter: &NativeCommitAdapter,
             store: &store,
             gate: &gate,
@@ -3423,7 +3443,9 @@ mod tests {
             db_path: std::path::PathBuf,
             transaction_id: String,
         }
-        impl yadorilink_filesystem_sync::fs_commit::FilesystemCommitAdapter for BumpsTheGenerationThenCommits {
+        impl yadorilink_filesystem_sync::fs_commit::FilesystemCommitAdapter
+            for BumpsTheGenerationThenCommits
+        {
             fn commit_placement(
                 &self,
                 request: &yadorilink_filesystem_sync::fs_commit::CommitRequest,
@@ -3439,7 +3461,8 @@ mod tests {
             fn observe_identity(
                 &self,
                 path: &Path,
-            ) -> std::io::Result<Option<yadorilink_root_authority::fs_identity::FileIdentity>> {
+            ) -> std::io::Result<Option<yadorilink_root_authority::fs_identity::FileIdentity>>
+            {
                 NativeCommitAdapter.observe_identity(path)
             }
         }
@@ -3456,7 +3479,8 @@ mod tests {
             slice,
             io: &io_map,
             capability_snapshot: b"caps-v1",
-            durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+            durability_level:
+                yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             adapter: &adapter,
             store: &store,
             gate: &gate,
@@ -3534,7 +3558,8 @@ mod tests {
             slice,
             io: &io_map,
             capability_snapshot: b"caps-v1",
-            durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+            durability_level:
+                yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             adapter: &NativeCommitAdapter,
             store: &store,
             gate: &gate,
@@ -3619,8 +3644,7 @@ mod tests {
         let (group_a, version_a, _) = placement(group_id, "a.txt", b"content-a");
         let (group_b, version_b, _) = placement(group_id, "b.txt", b"content-b");
         let bounds = SliceBounds::default();
-        let slices =
-            slice_plan(0, &[group_a.clone(), group_b.clone()], &bounds, |_| 9);
+        let slices = slice_plan(0, &[group_a.clone(), group_b.clone()], &bounds, |_| 9);
         assert_eq!(slices.len(), 1);
         let slice = &slices[0];
 
@@ -3642,7 +3666,8 @@ mod tests {
             slice,
             io: &io_map,
             capability_snapshot: b"caps-v1",
-            durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+            durability_level:
+                yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             adapter: &NativeCommitAdapter,
             store: &store,
             gate: &gate,
@@ -3694,12 +3719,7 @@ mod tests {
 
         // Redo both placements, this time with correct content, under the
         // replanned generation and a fresh pair of epoch numbers.
-        let redo_slices = slice_plan(
-            replanned.plan_revision,
-            &[group_a, group_b],
-            &bounds,
-            |_| 9,
-        );
+        let redo_slices = slice_plan(replanned.plan_revision, &[group_a, group_b], &bounds, |_| 9);
         assert_eq!(redo_slices.len(), 1);
         let redo_slice = &redo_slices[0];
         let io_a2 = io_for(
@@ -3729,7 +3749,8 @@ mod tests {
             slice: redo_slice,
             io: &redo_io_map,
             capability_snapshot: b"caps-v1",
-            durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+            durability_level:
+                yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             adapter: &NativeCommitAdapter,
             store: &store,
             gate: &gate,
@@ -3810,10 +3831,7 @@ mod tests {
                 io_for(dir, parent, path, capabilities, content, version),
             );
         }
-        let bounds = SliceBounds {
-            max_paths_per_slice: paths.len(),
-            ..SliceBounds::default()
-        };
+        let bounds = SliceBounds { max_paths_per_slice: paths.len(), ..SliceBounds::default() };
         let slices = slice_plan(0, &groups, &bounds, |_g| 1);
         assert_eq!(slices.len(), 1, "the whole set must slice into exactly one slice");
 
@@ -3825,7 +3843,8 @@ mod tests {
             slice: &slices[0],
             io: &io_map,
             capability_snapshot: b"caps-v1",
-            durability_level: yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
+            durability_level:
+                yadorilink_root_authority::fs_capabilities::DurabilityLevel::ProcessCrashSafe,
             adapter: &NativeCommitAdapter,
             store,
             gate,

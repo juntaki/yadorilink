@@ -49,7 +49,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SCAN_DIRS = [
     ROOT / "crates/yadorilink-daemon/src",
     ROOT / "crates/yadorilink-cli/src",
-    ROOT / "crates/yadorilink-sync-core/src",
+    ROOT / "crates/yadorilink-sync-sqlite/src",
 ]
 
 # `list_links()` followed by any of the silent-collapse tails.

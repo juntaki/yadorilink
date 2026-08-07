@@ -164,6 +164,7 @@ pub fn spawn_periodic(state: Arc<DaemonState>) {
 mod tests {
     use std::sync::Arc;
 
+    use crate::replica_coordinator::ReplicaCoordinator;
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -171,7 +172,6 @@ mod tests {
     use yadorilink_reporting::builder::{build_usage_envelope, ReportEnvironment};
     use yadorilink_reporting::schema::{OsFamily, UsagePayload};
     use yadorilink_reporting::submission::{SubmissionClient, SubmissionConfig};
-    use crate::replica_coordinator::ReplicaCoordinator;
 
     use super::*;
 
@@ -187,7 +187,8 @@ mod tests {
     async fn test_state() -> (tempfile::TempDir, Arc<DaemonState>) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(dir.path().join("blocks")).unwrap());
-        let sync_state = Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
+        let sync_state =
+            Arc::new(ReplicaCoordinator::open(dir.path().join("sync.sqlite3")).unwrap());
         std::env::set_var("YADORILINK_CONFIG_DIR", dir.path());
         let state = DaemonState::new("device-under-test".into(), sync_state, store);
         (dir, state)

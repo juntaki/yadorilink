@@ -260,7 +260,10 @@ pub fn decode_file_identity(blob: &[u8]) -> Result<FileIdentity, SyncSqliteError
     let birth_or_creation_time = if r.bool_flag()? {
         let seconds_since_unix_epoch = r.i64()?;
         let subsec_nanos = r.u32()?;
-        Some(yadorilink_root_authority::fs_identity::Timestamp { seconds_since_unix_epoch, subsec_nanos })
+        Some(yadorilink_root_authority::fs_identity::Timestamp {
+            seconds_since_unix_epoch,
+            subsec_nanos,
+        })
     } else {
         None
     };

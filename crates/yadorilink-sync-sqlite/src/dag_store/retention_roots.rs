@@ -15,9 +15,9 @@ use std::collections::HashSet;
 
 use rusqlite::{Connection, OptionalExtension};
 
+use crate::error::SyncSqliteError;
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::ids::ChangeHash;
-use crate::error::SyncSqliteError;
 
 /// Why a registered change hash must not be evicted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,12 +205,13 @@ fn resolve_full_payload_root_blocks(
             change_hash.to_hex(),
         )));
     };
-    let change = yadorilink_replica_domain::change::Change::from_wire_bytes(&encoded).map_err(|error| {
-        SyncSqliteError::CorruptState(format!(
-            "dag retention root {} for group {group_id} no longer decodes: {error}",
-            change_hash.to_hex(),
-        ))
-    })?;
+    let change =
+        yadorilink_replica_domain::change::Change::from_wire_bytes(&encoded).map_err(|error| {
+            SyncSqliteError::CorruptState(format!(
+                "dag retention root {} for group {group_id} no longer decodes: {error}",
+                change_hash.to_hex(),
+            ))
+        })?;
     for op in &change.ops {
         let Some(version_hash) = op_version_hash(op) else { continue };
         let Some(version) =
@@ -296,11 +297,12 @@ pub fn full_payload_retained_block_hashes_all_groups(
     Ok(live)
 }
 
-fn op_version_hash(op: &yadorilink_replica_domain::change::Op) -> Option<&yadorilink_replica_domain::ids::VersionHash> {
+fn op_version_hash(
+    op: &yadorilink_replica_domain::change::Op,
+) -> Option<&yadorilink_replica_domain::ids::VersionHash> {
     match op {
-        yadorilink_replica_domain::change::Op::Put { version, .. } | yadorilink_replica_domain::change::Op::Move { version, .. } => {
-            Some(version)
-        }
+        yadorilink_replica_domain::change::Op::Put { version, .. }
+        | yadorilink_replica_domain::change::Op::Move { version, .. } => Some(version),
         yadorilink_replica_domain::change::Op::Delete { .. } => None,
     }
 }
@@ -312,11 +314,11 @@ fn block_hashes_of(version: &FileVersion) -> impl Iterator<Item = String> + '_ {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
+    use yadorilink_replica_domain::file::RecordKind;
     use yadorilink_replica_domain::file::{FileMeta, VersionBlock};
     use yadorilink_replica_domain::ids::{BlockHash, DeviceId, FolderGroupId, SyncPath};
-    use yadorilink_replica_domain::file::RecordKind;
-    use ed25519_dalek::SigningKey;
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -494,8 +496,11 @@ mod tests {
         // The real plan a compactor would compute: `b` is the maximal
         // (surviving) frontier, `a` sits strictly below it and would
         // ordinarily be pruned.
-        let checkpoint =
-            yadorilink_replica_domain::rebootstrap::Checkpoint::new(FolderGroupId("g".into()), vec![b_hash], [0u8; 32]);
+        let checkpoint = yadorilink_replica_domain::rebootstrap::Checkpoint::new(
+            FolderGroupId("g".into()),
+            vec![b_hash],
+            [0u8; 32],
+        );
         crate::dag_store::commit_prune(&conn, &checkpoint, &[a_hash]).unwrap();
 
         assert!(
@@ -555,8 +560,11 @@ mod tests {
             RetentionClass::FullPayload,
         )
         .unwrap();
-        let checkpoint_1 =
-            yadorilink_replica_domain::rebootstrap::Checkpoint::new(FolderGroupId("g".into()), vec![b_hash], [0u8; 32]);
+        let checkpoint_1 = yadorilink_replica_domain::rebootstrap::Checkpoint::new(
+            FolderGroupId("g".into()),
+            vec![b_hash],
+            [0u8; 32],
+        );
         crate::dag_store::commit_prune(&conn, &checkpoint_1, &[a_hash]).unwrap();
         assert!(
             crate::dag_store::has_change(&conn, &a_hash).unwrap(),
@@ -572,8 +580,11 @@ mod tests {
             RetentionClass::FullPayload,
         )
         .unwrap();
-        let checkpoint_2 =
-            yadorilink_replica_domain::rebootstrap::Checkpoint::new(FolderGroupId("g".into()), vec![b_hash], [1u8; 32]);
+        let checkpoint_2 = yadorilink_replica_domain::rebootstrap::Checkpoint::new(
+            FolderGroupId("g".into()),
+            vec![b_hash],
+            [1u8; 32],
+        );
         crate::dag_store::commit_prune(&conn, &checkpoint_2, &[a_hash]).unwrap();
 
         assert!(!crate::dag_store::has_change(&conn, &a_hash).unwrap(), "must now prune");

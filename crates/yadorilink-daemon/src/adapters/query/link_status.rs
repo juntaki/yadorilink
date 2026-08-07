@@ -10,12 +10,14 @@ use std::sync::Arc;
 
 #[cfg(windows)]
 use yadorilink_replica_domain::file::RecordKind;
+#[cfg(windows)]
+use yadorilink_sync_sqlite::MaterializationStatePort;
 
 use crate::daemon_state::DaemonState;
-use crate::replica_coordinator::ReplicaCoordinator;
 use crate::queries::link_status::{
     DegradedLinkView, HeldFileView, LinkStatusReadPort, LinkStatusView, LinkTransferView,
 };
+use crate::replica_coordinator::ReplicaCoordinator;
 
 pub(crate) struct DaemonLinkStatusReader {
     state: Arc<DaemonState>,
@@ -33,10 +35,14 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
         let links = state.replica_coordinator.link_repository().list_links()?;
         let mut out = Vec::with_capacity(links.len());
         for link in links {
-            let files = state.replica_coordinator.file_index_repository().list_files(&link.group_id)?;
+            let files =
+                state.replica_coordinator.file_index_repository().list_files(&link.group_id)?;
             let conflict_count =
                 files.iter().filter(|f| f.path.contains("(conflicted copy")).count() as u64;
-            let materialization = state.replica_coordinator.materialization_state_repository().materialization_counts(&link.group_id)?;
+            let materialization = state
+                .replica_coordinator
+                .materialization_state_repository()
+                .materialization_counts(&link.group_id)?;
             // NOT `?`: this resolver refuses an ambiguous group, and propagating
             // that would fail the ENTIRE status listing -- for every group on the
             // device, not just the offending one. Status is the surface that MAKES
@@ -52,7 +58,8 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
             // wrong about.
             let windows_symlink_opt_in = state
                 .replica_coordinator
-                .link_repository().windows_symlink_opt_in_for_group(&link.group_id)
+                .link_repository()
+                .windows_symlink_opt_in_for_group(&link.group_id)
                 .unwrap_or_else(|e| {
                     tracing::warn!(
                         group_id = %link.group_id,
@@ -64,7 +71,11 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
             let mut held_files = Vec::new();
             let mut skipped_symlink_count = 0u64;
             for file in files.iter().filter(|f| !f.deleted) {
-                if let Some(held) = state.replica_coordinator.materialization_state_repository().get_held_state(&link.group_id, &file.path)? {
+                if let Some(held) = state
+                    .replica_coordinator
+                    .materialization_state_repository()
+                    .get_held_state(&link.group_id, &file.path)?
+                {
                     held_files.push(HeldFileView {
                         path: file.path.clone(),
                         reason: held.reason,
@@ -101,8 +112,11 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
             // path. An unreadable link table surfaces as "not ambiguous" rather than
             // failing the whole status listing: status must keep rendering, and the
             // group is already refusing to sync on the paths that matter.
-            let ambiguous_local_paths =
-                state.replica_coordinator.link_repository().live_link_paths_for_group(&link.group_id).unwrap_or_else(|e| {
+            let ambiguous_local_paths = state
+                .replica_coordinator
+                .link_repository()
+                .live_link_paths_for_group(&link.group_id)
+                .unwrap_or_else(|e| {
                     tracing::warn!(
                         group_id = %link.group_id,
                         error = %e,

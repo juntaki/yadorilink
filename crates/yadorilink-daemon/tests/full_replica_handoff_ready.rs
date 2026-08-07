@@ -10,12 +10,14 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use support::{connect_two_daemons, ensure_device_signing_key, open_file_backed_replica_coordinator};
+use support::{
+    connect_two_daemons, ensure_device_signing_key, open_file_backed_replica_coordinator,
+};
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::FsBlockStore;
 use yadorilink_peer_session::peer_session::PeerSyncSession;
-use yadorilink_replica_domain::session_state::MaterializationPolicy;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
+use yadorilink_replica_domain::session_state::MaterializationPolicy;
 
 const GROUP: &str = "handoff-group";
 
@@ -33,7 +35,11 @@ fn new_daemon(device_id: &str) -> Daemon {
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
     let root = tempfile::tempdir().unwrap();
-    state.replica_coordinator.link_repository().add_link(&root.path().to_string_lossy(), GROUP).unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&root.path().to_string_lossy(), GROUP)
+        .unwrap();
     Daemon { state, _store_dir: store_dir, _index_dir: index_dir, _root: root }
 }
 
@@ -60,7 +66,8 @@ fn put_and_record(daemon: &Daemon, data: &[u8]) -> Vec<u8> {
     daemon
         .state
         .replica_coordinator
-        .change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&hash_bytes))
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash_bytes))
         .unwrap();
     hash_bytes
 }
@@ -87,7 +94,8 @@ async fn no_connected_full_replica_peer_is_not_ready() {
     let record = record_referencing("solo.bin", vec![1u8; 32], 4);
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -114,7 +122,8 @@ async fn ready_when_another_replica_holds_every_file() {
     let first_record = record_referencing("first.bin", first_bytes, first.len() as u64);
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &first_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -122,7 +131,8 @@ async fn ready_when_another_replica_holds_every_file() {
         .unwrap();
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &first_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -134,7 +144,8 @@ async fn ready_when_another_replica_holds_every_file() {
     let second_record = record_referencing("second.bin", second_bytes, second.len() as u64);
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &second_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -142,7 +153,8 @@ async fn ready_when_another_replica_holds_every_file() {
         .unwrap();
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &second_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -179,11 +191,19 @@ async fn not_ready_when_no_single_peer_holds_every_file() {
     // replica and defeating the "no single peer holds both" scenario. An
     // on-demand B holds and relays nothing, so C stays file1-only and D
     // file2-only, deterministically.
-    let b_link =
-        b.state.replica_coordinator.link_repository().list_links().unwrap().into_iter().find(|l| l.group_id == GROUP).unwrap();
+    let b_link = b
+        .state
+        .replica_coordinator
+        .link_repository()
+        .list_links()
+        .unwrap()
+        .into_iter()
+        .find(|l| l.group_id == GROUP)
+        .unwrap();
     b.state
         .replica_coordinator
-        .link_repository().set_materialization_policy(&b_link.local_path, MaterializationPolicy::OnDemand)
+        .link_repository()
+        .set_materialization_policy(&b_link.local_path, MaterializationPolicy::OnDemand)
         .unwrap();
 
     // file1: held (indexed + stored) by C, and indexed by B. D never indexes
@@ -193,7 +213,8 @@ async fn not_ready_when_no_single_peer_holds_every_file() {
     let file1_record = record_referencing("file1.bin", file1_bytes, file1.len() as u64);
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &file1_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -201,7 +222,8 @@ async fn not_ready_when_no_single_peer_holds_every_file() {
         .unwrap();
     c.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &file1_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -215,7 +237,8 @@ async fn not_ready_when_no_single_peer_holds_every_file() {
     let file2_record = record_referencing("file2.bin", file2_bytes, file2.len() as u64);
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &file2_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -223,7 +246,8 @@ async fn not_ready_when_no_single_peer_holds_every_file() {
         .unwrap();
     d.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &file2_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -257,7 +281,8 @@ async fn not_ready_when_another_replica_is_missing_one_files_blocks() {
     let held_record = record_referencing("held.bin", held_bytes, held.len() as u64);
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &held_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -265,7 +290,8 @@ async fn not_ready_when_another_replica_is_missing_one_files_blocks() {
         .unwrap();
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &held_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -277,7 +303,8 @@ async fn not_ready_when_another_replica_is_missing_one_files_blocks() {
     let missing_record = record_referencing("missing.bin", vec![9u8; 32], 4);
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &missing_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -285,7 +312,8 @@ async fn not_ready_when_another_replica_is_missing_one_files_blocks() {
         .unwrap();
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &missing_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -333,7 +361,8 @@ async fn not_ready_when_peer_holds_current_but_not_a_retained_version() {
     };
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &superseded_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -341,7 +370,8 @@ async fn not_ready_when_peer_holds_current_but_not_a_retained_version() {
         .unwrap();
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &current_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -352,7 +382,8 @@ async fn not_ready_when_peer_holds_current_but_not_a_retained_version() {
     // held the superseded one at all.
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &current_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -394,7 +425,8 @@ async fn ready_when_another_replica_holds_current_and_retained_history() {
     for state in [&a.state, &b.state] {
         state
             .replica_coordinator
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &old_record,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -402,7 +434,8 @@ async fn ready_when_another_replica_holds_current_and_retained_history() {
             .unwrap();
         state
             .replica_coordinator
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 GROUP,
                 &new_record,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -443,7 +476,8 @@ async fn full_replica_handoff_ready_digest_detects_a_root_set_change_before_comm
     let record = record_referencing("a.bin", bytes, content.len() as u64);
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -451,7 +485,8 @@ async fn full_replica_handoff_ready_digest_detects_a_root_set_change_before_comm
         .unwrap();
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -485,7 +520,8 @@ async fn full_replica_handoff_ready_digest_detects_a_root_set_change_before_comm
     let second_record = record_referencing("second.bin", vec![9u8; 32], 4);
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &second_record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -520,7 +556,8 @@ async fn handoff_skips_a_peer_that_never_advertised_version_hash_exact() {
     let record = record_referencing("solo.bin", vec![9u8; 32], 4);
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -537,9 +574,11 @@ async fn handoff_skips_a_peer_that_never_advertised_version_hash_exact() {
         "device-b".to_string(),
         "device-a".to_string(),
         b.state.replica_coordinator.clone(),
-        std::sync::Arc::new(yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
-            b.state.block_store.clone(),
-        )),
+        std::sync::Arc::new(
+            yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                b.state.block_store.clone(),
+            ),
+        ),
         vec![GROUP.to_string()],
         std::collections::HashMap::new(),
     );
@@ -583,7 +622,8 @@ async fn handoff_uses_a_peer_that_advertised_version_hash_exact() {
     let record = record_referencing("a.bin", bytes, content.len() as u64);
     a.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -591,7 +631,8 @@ async fn handoff_uses_a_peer_that_advertised_version_hash_exact() {
         .unwrap();
     b.state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),

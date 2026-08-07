@@ -533,7 +533,7 @@ fn decode_row(row: RawRow) -> Result<RetainedObligation, SyncSqliteError> {
         updated_at_unix_nanos,
     ) = row;
 
-    let state = ObligationState::from_str(&state)?;
+    let state = ObligationState::parse(&state)?;
     let last_captured_change_hash = last_captured_change_hash
         .map(|bytes| hash_from_blob(&retained_id, "last_captured_change_hash", bytes))
         .transpose()?;
@@ -1102,9 +1102,10 @@ pub fn evaluate_deletion(
         obligation.last_captured_version_hash,
     )? {
         PreDurabilityOutcome::Decided(decision) => return Ok(decision),
-        PreDurabilityOutcome::NeedsDurabilityProof { captured_change_hash, captured_version_hash } => {
-            (captured_change_hash, captured_version_hash)
-        }
+        PreDurabilityOutcome::NeedsDurabilityProof {
+            captured_change_hash,
+            captured_version_hash,
+        } => (captured_change_hash, captured_version_hash),
     };
     if !dag_store::has_change_or_pruned(conn, &obligation.group_id, &captured_change_hash)? {
         return Ok(DeletionDecision::Retain(RetentionReason::DagRepresentationUnproven));
@@ -1117,7 +1118,11 @@ pub fn evaluate_deletion(
     )? {
         return Ok(DeletionDecision::Retain(RetentionReason::ConflictCopyUnproven));
     }
-    Ok(evaluate_deletion_final_step(&obligation.group_id, &obligation.retained_id, writer_exclusion))
+    Ok(evaluate_deletion_final_step(
+        &obligation.group_id,
+        &obligation.retained_id,
+        writer_exclusion,
+    ))
 }
 
 /// One `retained_preimage_deletion_intents` row, decoded. Public so
@@ -1219,7 +1224,9 @@ fn decode_retention_class(retained_id: &str, s: &str) -> Result<RetentionClass, 
 /// Every `dag_retention_roots` row currently registered under
 /// [`CAPTURED_AUTHORING_RETENTION_OWNER_KIND`], across every group — the
 /// candidate set [`sweep_orphaned_captured_authoring_roots_unchecked`] walks.
-fn captured_authoring_roots(conn: &Connection) -> Result<Vec<CapturedAuthoringRoot>, SyncSqliteError> {
+fn captured_authoring_roots(
+    conn: &Connection,
+) -> Result<Vec<CapturedAuthoringRoot>, SyncSqliteError> {
     let mut stmt = conn.prepare(
         "SELECT owner_id, group_id, change_hash, retention_class, registered_at_unix_nanos \
          FROM dag_retention_roots WHERE owner_kind = ?1",

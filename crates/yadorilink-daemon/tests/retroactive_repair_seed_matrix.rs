@@ -14,14 +14,14 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_replica_domain::change::{Change, ChangeAuth, ChangePurpose, Op, PutOrigin};
+use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::file::{FileMeta, FileVersion};
 use yadorilink_replica_domain::ids::{ChangeHash, SyncPath, VersionHash};
-use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
-use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_replica_domain::session_state::RetroactiveRepairOutcome;
 use yadorilink_replica_engine::repair_election::{AuthorizedWriter, RepairElectionContext};
-use yadorilink_replica_domain::file::RecordKind;
+use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
 const GROUP: &str = "retroactive-seed-matrix";
 const SEEDS: u64 = 32;
@@ -72,7 +72,12 @@ fn versions_for(change: &Change, versions: &VersionTable) -> Vec<FileVersion> {
         .collect()
 }
 
-fn emit_put(state: &ReplicaCoordinator, emitter: &ChangeEmitter, path: &str, value: &FileVersion) -> Change {
+fn emit_put(
+    state: &ReplicaCoordinator,
+    emitter: &ChangeEmitter,
+    path: &str,
+    value: &FileVersion,
+) -> Change {
     state
         .append_history_backfill(
             GROUP,
@@ -92,7 +97,10 @@ fn emit_put(state: &ReplicaCoordinator, emitter: &ChangeEmitter, path: &str, val
 
 fn admit(state: &ReplicaCoordinator, change: &Change, versions: &VersionTable) {
     let needed = versions_for(change, versions);
-    state.change_history_repository().dag_admit_change_with_versions(change, &needed, false).unwrap();
+    state
+        .change_history_repository()
+        .dag_admit_change_with_versions(change, &needed, false)
+        .unwrap();
 }
 
 fn shuffle<T>(rng: &mut StdRng, values: &mut [T]) {
@@ -203,7 +211,8 @@ fn seeded_delivery_order_and_rank_failover_converge_on_one_carrier() {
                 admit(&replica, change, &scenario.versions);
             }
 
-            let diagnostics = replica.change_history_repository().dag_group_diagnostics(GROUP).unwrap();
+            let diagnostics =
+                replica.change_history_repository().dag_group_diagnostics(GROUP).unwrap();
             assert_eq!(
                 diagnostics.orphan_total, 0,
                 "seed {seed} permutation {permutation}: full change set left buffered orphans"

@@ -2,8 +2,11 @@
 
 use std::sync::Arc;
 
-use yadorilink_replica_domain::session_state::{EnrollmentOperation, EnrollmentOperationScan, EnrollmentOperationState, FolderLink, PendingEnrollment, PendingEnrollmentScan};
 use crate::sync_error::SyncError;
+use yadorilink_replica_domain::session_state::{
+    EnrollmentOperation, EnrollmentOperationScan, EnrollmentOperationState, FolderLink,
+    PendingEnrollment, PendingEnrollmentScan,
+};
 
 use crate::application::ports::EnrollmentRepository;
 use crate::replica_coordinator::ReplicaCoordinator;

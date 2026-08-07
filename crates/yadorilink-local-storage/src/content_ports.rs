@@ -193,7 +193,7 @@ mod tests {
         let content: Arc<dyn BlockContentStore> = Arc::new(FsBlockStore::new(dir.path()).unwrap());
         let hash = content.put(b"port coercion proof").unwrap();
         assert_eq!(content.get(&hash).unwrap(), b"port coercion proof");
-        assert_eq!(content.present_blocks(&[hash.clone()]).unwrap(), vec![true]);
+        assert_eq!(content.present_blocks(std::slice::from_ref(&hash)).unwrap(), vec![true]);
 
         let reclamation: Arc<dyn BlockReclamationStore> =
             Arc::new(FsBlockStore::new(dir.path()).unwrap());
@@ -220,7 +220,8 @@ mod tests {
     #[test]
     fn erased_dyn_block_store_needs_an_adapter_not_a_coercion() {
         let dir = tempfile::tempdir().unwrap();
-        let store: Arc<dyn BlockStore + Send + Sync> = Arc::new(FsBlockStore::new(dir.path()).unwrap());
+        let store: Arc<dyn BlockStore + Send + Sync> =
+            Arc::new(FsBlockStore::new(dir.path()).unwrap());
         // `let _content: Arc<dyn BlockContentStore> = store.clone();` does not
         // compile here (verified manually while writing this commit) --
         // this test instead documents and exercises the fallback: calling

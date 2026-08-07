@@ -54,7 +54,9 @@ pub use enrollment::EnrollmentRepository;
 pub use error::SyncSqliteError;
 pub use handoff_lease::HandoffLeaseRepository;
 pub use materialization_job_repository::MaterializationJobRepository;
-pub use materialization_state::{ContentHash, MaterializationCounts, MaterializationStateRepository};
+pub use materialization_state::{
+    ContentHash, MaterializationCounts, MaterializationStateRepository,
+};
 pub use materialization_state_port::{
     EvictionEligibilitySnapshot, EvictionRevalidationSnapshot, MaterializationStatePort,
     OpenMaterializationIntent, RepairRowSnapshot,
@@ -86,9 +88,8 @@ pub(crate) fn read_inventory_operation_id(
 }
 pub use materialization_jobs::{
     claim_runnable_jobs, enqueue_pending, get_job, init_materialization_jobs_schema,
-    list_unfinished_jobs, mark_backoff, mark_superseded_if_version_matches,
-    recover_after_restart, reschedule_after_skip, transition, MaterializationJob,
-    MaterializationJobState,
+    list_unfinished_jobs, mark_backoff, mark_superseded_if_version_matches, recover_after_restart,
+    reschedule_after_skip, transition, MaterializationJob, MaterializationJobState,
 };
 pub use store::SqliteSyncStore;
 pub use types::{CurrentVersionSnapshot, RetainedVersion, RetainedVersionState};

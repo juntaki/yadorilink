@@ -49,7 +49,9 @@ use crate::sync_error::SyncError;
 /// doc comment (this crate's module doc comment above) for why this is an
 /// independent copy of that trait, not the same one.
 pub trait MaterializationIntentJournal: Sync {
-    fn materialization_job_repository(&self) -> &yadorilink_sync_sqlite::MaterializationJobRepository;
+    fn materialization_job_repository(
+        &self,
+    ) -> &yadorilink_sync_sqlite::MaterializationJobRepository;
 }
 
 /// See `yadorilink_sync_core::materialization::MaterializationIntentGuard`'s
@@ -79,18 +81,23 @@ impl<'a, T: MaterializationIntentJournal> MaterializationIntentGuard<'a, T> {
         target_version_hash: &[u8],
         permit: &'a RootCommitPermit<'a>,
     ) -> Result<Self, yadorilink_sync_sqlite::SyncSqliteError> {
-        state
-            .materialization_job_repository()
-            .begin_materialization_intent(group_id, path, target_version_hash, permit)?;
+        state.materialization_job_repository().begin_materialization_intent(
+            group_id,
+            path,
+            target_version_hash,
+            permit,
+        )?;
         Ok(Self { state, group_id, path, permit })
     }
 
     /// Clears the intent. Call ONLY after the temp-write-then-rename is
     /// durable, or when the write has been abandoned to a `Placeholder`.
     pub fn clear(self) -> Result<(), yadorilink_sync_sqlite::SyncSqliteError> {
-        self.state
-            .materialization_job_repository()
-            .clear_materialization_intent(self.group_id, self.path, self.permit)
+        self.state.materialization_job_repository().clear_materialization_intent(
+            self.group_id,
+            self.path,
+            self.permit,
+        )
     }
 }
 
@@ -110,8 +117,10 @@ impl<'a, T: MaterializationIntentJournal>
 {
     fn clear(
         self: Box<Self>,
-    ) -> Result<(), yadorilink_filesystem_sync::materialization_execution::MaterializationExecutionError>
-    {
+    ) -> Result<
+        (),
+        yadorilink_filesystem_sync::materialization_execution::MaterializationExecutionError,
+    > {
         MaterializationIntentGuard::clear(*self).map_err(SyncError::from).map_err(Into::into)
     }
 }

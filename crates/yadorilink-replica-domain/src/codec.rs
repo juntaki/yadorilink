@@ -102,7 +102,11 @@ impl<'a> Reader<'a> {
     /// remaining bytes could possibly encode (each entry is at least
     /// `min_entry_size` bytes). This makes a following `with_capacity(count)`
     /// safe against a hostile length prefix.
-    pub fn bounded_count(&mut self, min_entry_size: usize, max: usize) -> Result<usize, ChangeError> {
+    pub fn bounded_count(
+        &mut self,
+        min_entry_size: usize,
+        max: usize,
+    ) -> Result<usize, ChangeError> {
         let count = self.u32()? as usize;
         if count > max {
             return Err(ChangeError::Malformed(format!("count {count} exceeds bound {max}")));

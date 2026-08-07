@@ -220,11 +220,12 @@ impl SqliteSyncStore {
                     symlink_target,
                     exec_bit,
                 ) = row?;
-                let blocks: Vec<BlockInfo> = serde_json::from_str(&blocks_json).map_err(|error| {
-                    SyncSqliteError::CorruptState(format!(
-                        "stored block list for {path} is corrupt: {error}"
-                    ))
-                })?;
+                let blocks: Vec<BlockInfo> =
+                    serde_json::from_str(&blocks_json).map_err(|error| {
+                        SyncSqliteError::CorruptState(format!(
+                            "stored block list for {path} is corrupt: {error}"
+                        ))
+                    })?;
                 out.push(RetainedVersion {
                     path: path.to_string(),
                     version_seq,
@@ -271,11 +272,12 @@ impl SqliteSyncStore {
                 )
                 .optional()?;
             row.map(|(size, mtime, blocks_json, deleted, record_kind, symlink_target, exec_bit)| {
-                let blocks: Vec<BlockInfo> = serde_json::from_str(&blocks_json).map_err(|error| {
-                    SyncSqliteError::CorruptState(format!(
-                        "stored block list for current version of {path} is corrupt: {error}"
-                    ))
-                })?;
+                let blocks: Vec<BlockInfo> =
+                    serde_json::from_str(&blocks_json).map_err(|error| {
+                        SyncSqliteError::CorruptState(format!(
+                            "stored block list for current version of {path} is corrupt: {error}"
+                        ))
+                    })?;
                 Ok(CurrentVersionSnapshot {
                     blocks,
                     size,
@@ -363,8 +365,10 @@ impl SqliteSyncStore {
         &self,
         group_id: &str,
         path: &str,
-    ) -> Result<Option<yadorilink_replica_domain::session_state::CurrentVersionRecord>, SyncSqliteError>
-    {
+    ) -> Result<
+        Option<yadorilink_replica_domain::session_state::CurrentVersionRecord>,
+        SyncSqliteError,
+    > {
         Ok(self
             .get_current_version_record(&FolderGroupId(group_id.to_string()), path)?
             .map(Into::into))
@@ -513,9 +517,7 @@ fn retained_version_state_from_db_str(s: &str) -> Result<RetainedVersionState, S
         "current" => Ok(RetainedVersionState::Current),
         "superseded" => Ok(RetainedVersionState::Superseded),
         "trashed" => Ok(RetainedVersionState::Trashed),
-        other => Err(SyncSqliteError::CorruptState(format!(
-            "unknown files.state value {other:?}"
-        ))),
+        other => Err(SyncSqliteError::CorruptState(format!("unknown files.state value {other:?}"))),
     }
 }
 
@@ -650,7 +652,8 @@ mod tests {
     #[test]
     fn missing_ancestor_frontier_of_an_unknown_hash_is_itself() {
         let store = open_test_store();
-        let missing = store.missing_ancestor_frontier(&[hash(1)]).expect("missing_ancestor_frontier");
+        let missing =
+            store.missing_ancestor_frontier(&[hash(1)]).expect("missing_ancestor_frontier");
         assert_eq!(missing, vec![hash(1)]);
     }
 
@@ -668,7 +671,8 @@ mod tests {
             })
             .expect("insert rejected change");
 
-        let missing = store.missing_ancestor_frontier(&[hash(1)]).expect("missing_ancestor_frontier");
+        let missing =
+            store.missing_ancestor_frontier(&[hash(1)]).expect("missing_ancestor_frontier");
         assert!(missing.is_empty(), "a permanently-rejected hash must not be reported as missing");
     }
 
@@ -690,7 +694,8 @@ mod tests {
             .expect("insert orphan");
         insert_parent_edge(&store, hash(1), hash(2));
 
-        let missing = store.missing_ancestor_frontier(&[hash(1)]).expect("missing_ancestor_frontier");
+        let missing =
+            store.missing_ancestor_frontier(&[hash(1)]).expect("missing_ancestor_frontier");
         assert_eq!(missing, vec![hash(2)]);
     }
 
@@ -727,8 +732,7 @@ mod tests {
             .expect("insert long orphan chain");
         let root = hash_for(0);
 
-        let missing =
-            store.missing_ancestor_frontier(&[root]).expect("missing_ancestor_frontier");
+        let missing = store.missing_ancestor_frontier(&[root]).expect("missing_ancestor_frontier");
         assert_eq!(
             missing,
             vec![root],
@@ -758,9 +762,8 @@ mod tests {
             })
             .expect("insert version rows");
 
-        let versions = store
-            .list_versions(&FolderGroupId("group-1".into()), "a.txt")
-            .expect("list_versions");
+        let versions =
+            store.list_versions(&FolderGroupId("group-1".into()), "a.txt").expect("list_versions");
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[0].version_seq, 2, "newest (highest version_seq) must come first");
         assert_eq!(versions[0].state, RetainedVersionState::Current);
@@ -792,7 +795,10 @@ mod tests {
             })
             .expect("insert corrupt row");
         let result = store.get_current_version_record(&group, "corrupt.txt");
-        assert!(result.is_err(), "an unparseable blocks_json column must fail closed, not default to empty");
+        assert!(
+            result.is_err(),
+            "an unparseable blocks_json column must fail closed, not default to empty"
+        );
     }
 
     #[test]
@@ -803,9 +809,7 @@ mod tests {
 
         assert!(store.get_device_frontier(&group, &device).expect("read").is_empty());
 
-        store
-            .set_device_frontier(&group, &device, &[hash(2), hash(1)])
-            .expect("set frontier");
+        store.set_device_frontier(&group, &device, &[hash(2), hash(1)]).expect("set frontier");
         assert_eq!(
             store.get_device_frontier(&group, &device).expect("read"),
             vec![hash(1), hash(2)],

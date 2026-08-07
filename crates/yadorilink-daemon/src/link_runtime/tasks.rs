@@ -26,8 +26,10 @@ use std::sync::Arc;
 
 use tokio::task::JoinHandle;
 use yadorilink_filesystem_sync::debounce::{self, DebounceFlush};
-use yadorilink_root_authority::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
 use yadorilink_local_capture::LocalChangeProcessor;
+use yadorilink_root_authority::ignore_patterns::{
+    is_ignore_file_relative_path, EffectiveIgnoreSet,
+};
 use yadorilink_root_authority::root_identity::RootVerificationStatePort;
 
 use crate::link_runtime::dependencies::LinkRuntimeDependencies;
@@ -197,7 +199,11 @@ pub(crate) fn spawn_executor_task(
                     // deletion gate armed until every live indexed path is
                     // present; otherwise the next authoritative scan would
                     // tombstone precisely the rows recovery preserved.
-                    if let Ok(rows) = executor_deps.replica_coordinator.file_index_repository().list_files(&executor_group_id) {
+                    if let Ok(rows) = executor_deps
+                        .replica_coordinator
+                        .file_index_repository()
+                        .list_files(&executor_group_id)
+                    {
                         for row in rows.into_iter().filter(|row| !row.deleted) {
                             if matches!(
                                 executor_deps.replica_coordinator.indexed_path_is_corroborated(
@@ -209,7 +215,8 @@ pub(crate) fn spawn_executor_task(
                             ) {
                                 if let Err(error) = executor_deps
                                     .replica_coordinator
-                                    .link_repository().resolve_duplicate_recovery_path(&executor_group_id, &row.path)
+                                    .link_repository()
+                                    .resolve_duplicate_recovery_path(&executor_group_id, &row.path)
                                 {
                                     tracing::warn!(group_id = %executor_group_id, path = %row.path, error = %error, "could not persist duplicate-recovery path progress");
                                 }
@@ -217,13 +224,17 @@ pub(crate) fn spawn_executor_task(
                         }
                     }
                     let recovery_complete = matches!(
-                        executor_deps.replica_coordinator.link_repository().duplicate_recovery_pending(&executor_group_id),
+                        executor_deps
+                            .replica_coordinator
+                            .link_repository()
+                            .duplicate_recovery_pending(&executor_group_id),
                         Ok(false)
                     );
                     if recovery_complete {
                         if let Err(e) = executor_deps
                             .replica_coordinator
-                            .link_repository().set_suppress_tombstones(&executor_local_path, false)
+                            .link_repository()
+                            .set_suppress_tombstones(&executor_local_path, false)
                         {
                             tracing::warn!(
                                 local_path = %executor_local_path,

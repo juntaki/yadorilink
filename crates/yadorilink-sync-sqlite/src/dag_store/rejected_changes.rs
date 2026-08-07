@@ -51,8 +51,8 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use yadorilink_replica_domain::ids::ChangeHash;
 use crate::error::SyncSqliteError;
+use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_root_authority::reserved_namespace;
 
 /// Records that `hash` was permanently rejected at admission, under the
@@ -99,7 +99,10 @@ pub(crate) fn record_rejected_change(
 /// exactly as if the hash had never been rejected at all: the caller's
 /// normal "still missing" handling then naturally drives a fresh
 /// re-request and re-evaluation under the current rules.
-pub(crate) fn is_change_rejected(conn: &Connection, hash: &ChangeHash) -> Result<bool, SyncSqliteError> {
+pub(crate) fn is_change_rejected(
+    conn: &Connection,
+    hash: &ChangeHash,
+) -> Result<bool, SyncSqliteError> {
     let stamped_version: Option<u32> = conn
         .query_row(
             "SELECT rules_version FROM rejected_changes WHERE change_hash = ?1",

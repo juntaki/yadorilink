@@ -71,7 +71,10 @@ impl DaemonRuntimeDiagnostics {
 
 impl RuntimeDiagnosticsPort for DaemonRuntimeDiagnostics {
     fn snapshot(&self) -> RuntimeDiagnosticsSnapshot {
-        let links = self.link_status.list_links().unwrap_or_default();
+        let links = self.link_status.list_links().unwrap_or_else(|error| {
+            tracing::warn!(%error, "diagnostics snapshot could not enumerate links");
+            Vec::new()
+        });
         let volumes = self.runtime_status.volumes_free_space(&links);
         let disk_state = worst_volume_state(volumes.iter().map(|v| v.state.as_str()));
 

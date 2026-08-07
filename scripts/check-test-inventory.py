@@ -15,6 +15,8 @@ CI_FILES = [
         ROOT / ".github/workflows/ci.yml",
         ROOT / ".github/workflows/ci-fast.yml",
         ROOT / ".github/workflows/ci-full.yml",
+        ROOT / "oss-public/.github/workflows/ci-fast.yml",
+        ROOT / "oss-public/.github/workflows/ci-full.yml",
     )
     if path.exists()
 ]
@@ -134,7 +136,12 @@ def reliable_lane_failures(ci: str) -> list[str]:
     # lane0 covers the `cfg(not(madsim))` lint scenarios that lane1's madsim
     # build compiles to zero tests. Requiring both keeps every dst_*.rs covered.
     daemon_lane = (
-        "cargo test -p yadorilink-daemon --tests -- --test-threads=1" in ci
+        "cargo test -p yadorilink-daemon --tests --" in ci
+        and "--test-threads=1" in ci
+    )
+    private_monkey_lane = (
+        "cargo test -p yadorilink-daemon --test monkey_chaos -- --test-threads=1"
+        in BETA_HEAT.read_text(encoding="utf-8")
     )
     dst_lane = (
         "cargo run -p xtask -- dst-lane0" in ci
@@ -145,6 +152,12 @@ def reliable_lane_failures(ci: str) -> list[str]:
         failures.append(
             "ci.yml must run the whole daemon crate single-threaded: "
             "`cargo test -p yadorilink-daemon --tests -- --test-threads=1`"
+        )
+    if not private_monkey_lane:
+        failures.append(
+            "beta-heat.yml must run the private monkey-chaos seed lane: "
+            "`cargo test -p yadorilink-daemon --test monkey_chaos -- "
+            "--test-threads=1`"
         )
     if not dst_lane:
         failures.append(

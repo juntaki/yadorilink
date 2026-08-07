@@ -44,7 +44,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use support::{
-    open_file_backed_replica_coordinator, real_entry_names, wait_until, wait_until_with_context, TestAccount,
+    open_file_backed_replica_coordinator, real_entry_names, wait_until, wait_until_with_context,
+    TestAccount,
 };
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
@@ -65,7 +66,9 @@ fn indexed_exec_bit(device: &TestDevice, group_id: &str, path: &str) -> bool {
         .replica_coordinator
         .file_index_repository()
         .get_exec_bit(group_id, path)
-        .unwrap_or_else(|error| panic!("{}: failed to read indexed exec bit for {path}: {error}", device.device_id))
+        .unwrap_or_else(|error| {
+            panic!("{}: failed to read indexed exec bit for {path}: {error}", device.device_id)
+        })
 }
 
 struct TestDevice {
@@ -147,7 +150,9 @@ async fn two_synced_devices(test_name: &str) -> (TestDevice, TestDevice, String)
 /// `support::connect_two_daemons_with_channels`'s doc comment for why
 /// `revoke()`, not `JoinHandle::abort()`, is the correct disconnect
 /// primitive here.
-async fn two_synced_devices_with_channels(test_name: &str) -> (TestDevice, TestDevice, String, [Arc<PeerChannel>; 2]) {
+async fn two_synced_devices_with_channels(
+    test_name: &str,
+) -> (TestDevice, TestDevice, String, [Arc<PeerChannel>; 2]) {
     let coordination_addr = support::start_coordination_server().await;
     let account =
         support::register_and_login(&coordination_addr, &format!("{test_name}@example.com")).await;
@@ -810,10 +815,16 @@ async fn shared_history_exec_bit_only_divergence_converges_after_reconnect() {
         )
         .await;
         wait_until_with_context(
-            || device_b.state.replica_coordinator.file_index_repository().get_file(&group_id, "shared.txt")
-                .ok()
-                .flatten()
-                .is_some(),
+            || {
+                device_b
+                    .state
+                    .replica_coordinator
+                    .file_index_repository()
+                    .get_file(&group_id, "shared.txt")
+                    .ok()
+                    .flatten()
+                    .is_some()
+            },
             Duration::from_secs(20),
             || "device-b never indexed shared.txt at all before divergence".to_string(),
         )
@@ -874,7 +885,10 @@ async fn shared_history_exec_bit_only_divergence_converges_after_reconnect() {
         wait_until_with_context(
             || dag_heads(&device_b, &group_id) != common_heads_b,
             Duration::from_secs(20),
-            || "device-b's first chmod (false->true) was never captured into its own DAG".to_string(),
+            || {
+                "device-b's first chmod (false->true) was never captured into its own DAG"
+                    .to_string()
+            },
         )
         .await;
         assert!(
@@ -887,7 +901,10 @@ async fn shared_history_exec_bit_only_divergence_converges_after_reconnect() {
         wait_until_with_context(
             || dag_heads(&device_b, &group_id) != heads_b_after_first,
             Duration::from_secs(20),
-            || "device-b's second chmod (true->false) was never captured into its own DAG".to_string(),
+            || {
+                "device-b's second chmod (true->false) was never captured into its own DAG"
+                    .to_string()
+            },
         )
         .await;
         assert!(
@@ -956,8 +973,11 @@ async fn shared_history_exec_bit_only_divergence_converges_after_reconnect() {
              device-a={snapshot_a:?} device-b={snapshot_b:?}"
         );
         for (name, (content, _exec)) in &snapshot_a {
-            assert_eq!(content, "common content", "{name}: {snapshot_a:?} (content must be \
-                unaffected by this purely metadata conflict)");
+            assert_eq!(
+                content, "common content",
+                "{name}: {snapshot_a:?} (content must be \
+                unaffected by this purely metadata conflict)"
+            );
         }
 
         // The specific claim this scenario exists to catch, same as

@@ -88,6 +88,16 @@ pub enum EnrollmentCancelOutcome {
     Ambiguous(String),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RoleLossCommitRequest<'a> {
+    pub group_id: &'a str,
+    pub source_device_id: &'a str,
+    pub target_device_id: &'a str,
+    pub lease_id: Option<&'a str>,
+    pub action: &'a str,
+    pub operation_id: &'a str,
+}
+
 pub use imp::{
     activate_create, activate_join, cancel_create, cancel_create_classified, cancel_join,
     cancel_join_classified, commit_handoff_role_loss, compensate_handoff_role_loss,
@@ -303,8 +313,8 @@ mod imp {
         EnrollmentRemoteStatus, HandoffCommitResult, HandoffLeaseGrant, MembershipOperationLookup,
         MembershipOperationRecord, MembershipRemoteRequest, MembershipRemoteRequestGroup,
         MembershipRemoteResult, MembershipRemoteStatus, RemoteEvidenceErrorCategory,
-        RemoteQueryError, RoleLossCommitOutcome, RoleLossCompensationOutcome,
-        RoleLossOperationRecord,
+        RemoteQueryError, RoleLossCommitOutcome, RoleLossCommitRequest,
+        RoleLossCompensationOutcome, RoleLossOperationRecord,
     };
 
     #[derive(Serialize)]
@@ -897,12 +907,7 @@ mod imp {
     pub async fn commit_handoff_role_loss(
         addr: &str,
         access_token: &str,
-        group_id: &str,
-        source_device_id: &str,
-        target_device_id: &str,
-        lease_id: Option<&str>,
-        action: &str,
-        operation_id: &str,
+        request: RoleLossCommitRequest<'_>,
     ) -> RoleLossCommitOutcome {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
@@ -921,8 +926,14 @@ mod imp {
             membership_generation: i64,
             lease_id: Option<String>,
         }
-        let url = format!("{addr}/shares/groups/{group_id}/handoff/commit");
-        let body = Body { source_device_id, target_device_id, lease_id, action, operation_id };
+        let url = format!("{addr}/shares/groups/{}/handoff/commit", request.group_id);
+        let body = Body {
+            source_device_id: request.source_device_id,
+            target_device_id: request.target_device_id,
+            lease_id: request.lease_id,
+            action: request.action,
+            operation_id: request.operation_id,
+        };
         let resp = match reqwest::Client::new()
             .post(&url)
             .bearer_auth(access_token)

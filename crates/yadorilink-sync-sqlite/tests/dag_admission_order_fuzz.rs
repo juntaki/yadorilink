@@ -34,7 +34,7 @@ use yadorilink_replica_domain::file::{FileMeta, FileVersion};
 use yadorilink_replica_domain::ids::SyncPath;
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
-const GROUP: &str = "order-fuzz-group";
+const GROUP_PREFIX: &str = "order-fuzz-group";
 const PATHS: [&str; 3] = ["p0.bin", "p1.bin", "sub/p2.bin"];
 const SEEDS: u64 = 120;
 const OPS_PER_SEED: usize = 14;
@@ -72,12 +72,13 @@ fn fresh_version(counter: &mut i64) -> FileVersion {
 /// Admits every change of `from` that `to` lacks, in shuffled order, so the
 /// orphan buffer's out-of-order admission path runs during construction too.
 fn sync_authors(
+    group: &str,
     rng: &mut StdRng,
     to: &ReplicaCoordinator,
     from: &ReplicaCoordinator,
     versions: &VersionTable,
 ) {
-    let mut changes = from.change_history_repository().dag_list_group_changes(GROUP).unwrap();
+    let mut changes = from.change_history_repository().dag_list_group_changes(group).unwrap();
     for i in (1..changes.len()).rev() {
         changes.swap(i, rng.random_range(0..=i));
     }
@@ -107,10 +108,14 @@ fn versions_for(change: &Change, versions: &VersionTable) -> Vec<FileVersion> {
         .collect()
 }
 
-fn run_seed(seed: u64) {
+fn run_seed(
+    seed: u64,
+    authors: &[ReplicaCoordinator],
+    emitters: &[ChangeEmitter],
+    fresh_states: &[ReplicaCoordinator],
+) {
+    let group = format!("{GROUP_PREFIX}-{seed}");
     let mut rng = StdRng::seed_from_u64(seed);
-    let authors: Vec<ReplicaCoordinator> = (0..3).map(|_| author_state()).collect();
-    let emitters: Vec<ChangeEmitter> = (0..3).map(emitter).collect();
     let mut versions: VersionTable = HashMap::new();
     let mut version_counter: i64 = 0;
 
@@ -121,7 +126,7 @@ fn run_seed(seed: u64) {
         // chains.
         if rng.random_bool(0.5) {
             let from = (author + 1 + rng.random_range(0..2)) % 3;
-            sync_authors(&mut rng, &authors[author], &authors[from], &versions);
+            sync_authors(&group, &mut rng, &authors[author], &authors[from], &versions);
         }
         let path = PATHS[rng.random_range(0..PATHS.len())];
         let op = if rng.random_bool(0.2) {
@@ -138,7 +143,7 @@ fn run_seed(seed: u64) {
         };
         authors[author]
             .append_history_backfill(
-                GROUP,
+                &group,
                 vec![op],
                 &versions_for_ops(&versions),
                 &emitters[author],
@@ -148,8 +153,8 @@ fn run_seed(seed: u64) {
 
     // The union of every change any author produced or holds.
     let mut union: HashMap<[u8; 32], Change> = HashMap::new();
-    for state in &authors {
-        for change in state.change_history_repository().dag_list_group_changes(GROUP).unwrap() {
+    for state in authors {
+        for change in state.change_history_repository().dag_list_group_changes(&group).unwrap() {
             union.insert(change.compute_hash().0, change);
         }
     }
@@ -157,8 +162,7 @@ fn run_seed(seed: u64) {
     all_changes.sort_by_key(|c| (c.lamport, c.compute_hash().0));
 
     let mut reference_heads: Option<Vec<String>> = None;
-    for perm in 0..PERMUTATIONS_PER_SEED {
-        let fresh = author_state();
+    for (perm, fresh) in fresh_states.iter().enumerate().take(PERMUTATIONS_PER_SEED) {
         let mut order = all_changes.clone();
         for i in (1..order.len()).rev() {
             order.swap(i, rng.random_range(0..=i));
@@ -170,7 +174,7 @@ fn run_seed(seed: u64) {
                 .dag_admit_change_with_versions(change, &needed, false)
                 .unwrap();
         }
-        let diag = fresh.change_history_repository().dag_group_diagnostics(GROUP).unwrap();
+        let diag = fresh.change_history_repository().dag_group_diagnostics(&group).unwrap();
         assert_eq!(
             diag.orphan_total, 0,
             "seed {seed} perm {perm}: {} change(s) stuck in the orphan buffer after every \
@@ -189,7 +193,7 @@ fn run_seed(seed: u64) {
             "seed {seed} perm {perm}: admitted count diverged from the union size"
         );
         let mut heads: Vec<String> =
-            fresh.sqlite().dag_group_heads(GROUP).unwrap().iter().map(|h| h.to_hex()).collect();
+            fresh.sqlite().dag_group_heads(&group).unwrap().iter().map(|h| h.to_hex()).collect();
         heads.sort();
         match &reference_heads {
             None => reference_heads = Some(heads),
@@ -210,7 +214,16 @@ fn versions_for_ops(versions: &VersionTable) -> Vec<FileVersion> {
 
 #[test]
 fn admission_order_never_changes_the_final_dag() {
+    // Reuse a fixed number of independent databases across seeds. Each
+    // seed has a unique group id, so its DAG remains isolated without
+    // repeatedly constructing r2d2 maintenance thread pools (which can
+    // temporarily exhaust macOS's per-process thread limit before dropped
+    // pools finish shutting down).
+    let authors: Vec<ReplicaCoordinator> = (0..3).map(|_| author_state()).collect();
+    let emitters: Vec<ChangeEmitter> = (0..3).map(emitter).collect();
+    let fresh_states: Vec<ReplicaCoordinator> =
+        (0..PERMUTATIONS_PER_SEED).map(|_| author_state()).collect();
     for seed in 0..SEEDS {
-        run_seed(seed);
+        run_seed(seed, &authors, &emitters, &fresh_states);
     }
 }

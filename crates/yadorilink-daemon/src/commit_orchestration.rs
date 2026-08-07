@@ -15,11 +15,12 @@
 //! a real commit path, matching the composition every one of these modules'
 //! own doc comments already described as its intended home
 //! (`daemon/src/application` or equivalent) once every module it depends on
-//! had a stable location outside `sync-core`. Wiring a real caller is future
-//! work, not part of this move.
+//! had a stable location outside `sync-core`. The engine is exported as a
+//! library API so callers can supply those application-owned capabilities;
+//! the daemon executable does not claim that the execution gate is enabled.
 pub(crate) mod commit_path_locks;
-pub(crate) mod orchestrator;
-pub(crate) mod plan_driver;
+pub mod orchestrator;
+pub mod plan_driver;
 /// Identity-checked physical unlink for retained preimages (moved from
 /// `yadorilink-sync-core`, see this module's own doc comment).
-pub(crate) mod retained_obligation;
+pub mod retained_obligation;

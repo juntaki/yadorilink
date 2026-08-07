@@ -1,0 +1,74 @@
+# Phase 7D-5 legacy persistence exceptions.
+#
+# During Phase 7's migration, "DDL owner = write-SQL owner = row-mapping
+# owner" is a target, not a per-phase requirement. Where a table's DDL/write
+# ownership temporarily stays behind a crate boundary this phase does not
+# cross, but a moved read/write operation legitimately needs to touch that
+# table, the exception is recorded here rather than left implicit. The
+# boundary gate (scripts/check-phase7d5-sync-sqlite-boundary.py) allows only
+# the exact (symbol, table) pairs listed below; any other cross-boundary
+# table reference fails the gate.
+
+[[exception]]
+symbol = "SqliteSyncStore::list_versions"
+table = "files"
+access = "read-only"
+current_owner = "yadorilink-sync-core (schema DDL + write path)"
+final_owner = "yadorilink-sync-sqlite"
+reason = """
+list_versions is a shared read needed by yadorilink-replica-engine's
+DurabilityEvidencePort::retained_roots (via SyncState delegation) and by
+sync-core's own MaterializationStatePort. The `files` table also carries
+daemon/materialization-specific columns (materialization_state, pinned,
+held_reason, ...) and is written by upsert_file_emitting_change's atomic
+local-authoring transaction, which Phase 7D-5 deliberately leaves in
+sync-core (see docs/design/phase7d5-local-authoring-transaction.md) rather
+than fracture across a runtime hook seam. Moving this one read early, ahead
+of that table's full DDL/write ownership, avoids duplicating the read SQL
+in both crates while write ownership catches up.
+"""
+removal_phase = "7D-7"
+
+[[exception]]
+symbol = "SqliteSyncStore::get_current_version_record"
+table = "files"
+access = "read-only"
+current_owner = "yadorilink-sync-core (schema DDL + write path)"
+final_owner = "yadorilink-sync-sqlite"
+reason = """
+Same reasoning as list_versions above -- needed by
+DurabilityEvidencePort::current_root (via SyncState delegation), reads the
+same files table whose DDL/write path stays in sync-core until 7D-7.
+"""
+removal_phase = "7D-7"
+
+[[exception]]
+symbol = "dag_store::admit_change (ChangeAdmissionPort::admit_unprojected_change's backing implementation)"
+table = "changes, change_parents, orphan_changes, conflict_copy_provenance, filesystem_transaction_epochs"
+access = "read-write, whole function"
+current_owner = "yadorilink-sync-core (crate::dag_store)"
+final_owner = "yadorilink-sync-sqlite (after decision/persistence split)"
+reason = """
+Investigated for this phase's ChangeAdmissionPort move and found NOT a
+thin persistence wrapper: admit_change calls
+serving_authorization_index::validate_no_reserved_paths,
+serving_authorization_index::validate_referenced_versions,
+retained_history_integrity::validate_present_parent_shape,
+conflict_authoring::validate_carrier_conflict_copy_ops (all genuine
+business-decision validation, not just row reads/writes), before it ever
+writes retained_history_integrity::append_change,
+conflict_authoring::record_conflict_copy_ops_provenance,
+bump_execution_fence_for_change (touches filesystem_transaction_epochs),
+and orphan_integrity::promote_orphans/insert_orphan. This is the same
+"decision and SQL persistence mixed in one module" shape the
+local-authoring transaction ledger already identified for
+upsert_file_emitting_change -- moving it now would mean moving most of
+dag_store's admission-side validation logic too, not a bounded
+persistence-only slice. Deferred to 7D-7, when dag_store itself is
+decomposed into pure decision (-> replica-engine) and SQL persistence
+(-> sync-sqlite) halves. ChangeAdmissionPort's production implementation
+stays in yadorilink-sync-core (crate::replica_engine_ports::
+PeerReplicaStateAdapter, delegating to SyncState::dag_admit_change_with_versions
+as it does today) for the remainder of Phase 7D-5.
+"""
+removal_phase = "7D-7"

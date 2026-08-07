@@ -31,13 +31,13 @@ pub mod fs_capabilities;
 pub mod fs_identity;
 pub mod ignore_patterns;
 pub mod reserved_namespace;
+pub mod root_commit;
 /// Sync-root identity: proves the directory a scan is about to treat as
 /// authoritative is really this link's folder, and not the bare mountpoint an
 /// unmounted volume leaves behind. Moved from `yadorilink-sync-core` in
 /// Phase 7D-9B -- see its own module doc for the `RootVerificationStatePort`
 /// split this move required.
 pub mod root_identity;
-pub mod root_commit;
 pub mod sync_root_lock;
 
 pub use error::RootAuthorityError;

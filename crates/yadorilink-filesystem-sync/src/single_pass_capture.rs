@@ -230,13 +230,13 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 use yadorilink_local_storage::BlockStore;
 
-use yadorilink_replica_domain::file::FileVersion;
-use yadorilink_root_authority::fs_identity::{FileIdentity, ObjectKind};
 use yadorilink_local_storage::{
     block_size_for, owner_exec_bit_from_metadata, StorageError, CDC_AVG_SIZE, CDC_MAX_SIZE,
     CDC_MIN_SIZE, CDC_SIZE_THRESHOLD,
 };
+use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::file::{BlockInfo, RecordKind};
+use yadorilink_root_authority::fs_identity::{FileIdentity, ObjectKind};
 
 /// A duplicate of `yadorilink_local_storage::chunker`'s own private
 /// short-read-retry loop (see the module doc's "move note") — retries on a
@@ -557,12 +557,7 @@ fn run_content_defined_pass(
     store: &dyn BlockStore,
     file: fs::File,
 ) -> Result<(Vec<BlockInfo>, u64, StabilityFingerprint), SinglePassCaptureError> {
-    let chunks = fastcdc::v2020::StreamCDC::new(
-        file,
-        CDC_MIN_SIZE,
-        CDC_AVG_SIZE,
-        CDC_MAX_SIZE,
-    );
+    let chunks = fastcdc::v2020::StreamCDC::new(file, CDC_MIN_SIZE, CDC_AVG_SIZE, CDC_MAX_SIZE);
 
     let mut hasher = Sha256::new();
     let mut blocks: Vec<BlockInfo> = Vec::new();
@@ -585,7 +580,9 @@ fn run_content_defined_pass(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yadorilink_local_storage::{chunk_file, chunk_file_content_defined, DEFAULT_BLOCK_SIZE, FsBlockStore};
+    use yadorilink_local_storage::{
+        chunk_file, chunk_file_content_defined, FsBlockStore, DEFAULT_BLOCK_SIZE,
+    };
 
     fn pseudo_random_content(size: usize, seed: u64) -> Vec<u8> {
         use rand::{Rng, SeedableRng};
@@ -903,8 +900,9 @@ mod tests {
         // `FileVersion`: raw `read_link` target bytes, no blocks, `size`
         // equal to the target bytes' own length.
         let lstat = fs::symlink_metadata(&link_path).unwrap();
-        let expected_target =
-            yadorilink_root_authority::fs_identity::target_to_bytes(&fs::read_link(&link_path).unwrap());
+        let expected_target = yadorilink_root_authority::fs_identity::target_to_bytes(
+            &fs::read_link(&link_path).unwrap(),
+        );
         let expected_mtime =
             lstat.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
                 as i64;

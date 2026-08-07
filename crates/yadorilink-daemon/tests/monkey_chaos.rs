@@ -343,8 +343,12 @@ fn snapshot(root: &std::path::Path) -> HashMap<String, String> {
 /// stuck `Hydrating`/`Placeholder`, or held due to a hazard).
 fn describe_index_state(state: &DaemonState, group_id: &str, path: &str) -> String {
     let record = state.replica_coordinator.file_index_repository().get_file(group_id, path);
-    let materialization = state.replica_coordinator.materialization_state_repository().get_materialization_state(group_id, path);
-    let held = state.replica_coordinator.materialization_state_repository().get_held_state(group_id, path);
+    let materialization = state
+        .replica_coordinator
+        .materialization_state_repository()
+        .get_materialization_state(group_id, path);
+    let held =
+        state.replica_coordinator.materialization_state_repository().get_held_state(group_id, path);
     format!("record={record:?} materialization={materialization:?} held={held:?}")
 }
 
@@ -397,7 +401,12 @@ fn diff_diagnostics(
         // kept only by devices that passed through a transient frontier —
         // a retroactivity gap) from "a change carries it but one device's
         // projection skipped it" (a projection bug).
-        match devices[0].state.replica_coordinator.change_history_repository().dag_list_group_changes(group_id) {
+        match devices[0]
+            .state
+            .replica_coordinator
+            .change_history_repository()
+            .dag_list_group_changes(group_id)
+        {
             Err(e) => out.push_str(&format!("  history[{name:?}]: <error: {e}>\n")),
             Ok(changes) => {
                 let mut touched = false;
@@ -495,7 +504,10 @@ fn dag_progress_report(devices: &[TestDevice], group_id: &str, elapsed: Duration
                     Ok(v) => v.len().to_string(),
                     Err(e) => format!("<error: {e}>"),
                 };
-                let mat = match sync.materialization_state_repository().materialization_counts(group_id) {
+                let mat = match sync
+                    .materialization_state_repository()
+                    .materialization_counts(group_id)
+                {
                     Ok(m) => format!("{}/{}/{}", m.hydrated, m.placeholder, m.hydrating),
                     Err(e) => format!("<error: {e}>"),
                 };
@@ -532,7 +544,9 @@ fn dag_progress_report(devices: &[TestDevice], group_id: &str, elapsed: Duration
 fn divergent_head_report(devices: &[TestDevice], group_id: &str) -> String {
     let per_device_heads: Vec<Vec<ChangeHash>> = devices
         .iter()
-        .map(|device| device.state.replica_coordinator.sqlite().dag_group_heads(group_id).unwrap_or_default())
+        .map(|device| {
+            device.state.replica_coordinator.sqlite().dag_group_heads(group_id).unwrap_or_default()
+        })
         .collect();
     let all_agree = per_device_heads[1..].iter().all(|hs| {
         let (a, b): (std::collections::BTreeSet<String>, std::collections::BTreeSet<String>) = (
@@ -563,7 +577,8 @@ fn divergent_head_report(devices: &[TestDevice], group_id: &str) -> String {
                 }
                 Ok(DagHashDisposition::Orphaned { received_seq, change }) => {
                     let waiting: Vec<String> = sync
-                        .sqlite().dag_missing_ancestor_frontier([*hash])
+                        .sqlite()
+                        .dag_missing_ancestor_frontier([*hash])
                         .map(|f| f.iter().map(short_hash).collect())
                         .unwrap_or_else(|e| vec![format!("<error: {e}>")]);
                     states.push(format!(

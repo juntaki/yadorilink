@@ -33,12 +33,12 @@ use std::collections::BTreeSet;
 
 use sha2::{Digest, Sha256};
 
-use yadorilink_replica_domain::change::Change;
-use yadorilink_replica_domain::file::FileVersion;
-use yadorilink_replica_domain::ids::{ChangeHash, FolderGroupId, VersionHash};
 use crate::compaction::Checkpoint;
 use crate::error::ReplicaEngineError;
+use yadorilink_replica_domain::change::Change;
+use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
+use yadorilink_replica_domain::ids::{ChangeHash, FolderGroupId, VersionHash};
 
 const SNAPSHOT_DOMAIN: &[u8; 8] = b"YLNKsnp\x03";
 const MAX_SNAPSHOT_FILES: usize = 1_000_000;
@@ -376,7 +376,10 @@ impl RebootstrapSnapshot {
         Self::new(group_id, files, frontier_changes, file_versions, boundary_parent_auth)
     }
 
-    pub fn validate_against_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), ReplicaEngineError> {
+    pub fn validate_against_checkpoint(
+        &self,
+        checkpoint: &Checkpoint,
+    ) -> Result<(), ReplicaEngineError> {
         if self.group_id != checkpoint.group_id {
             return Err(ReplicaEngineError::CorruptState(
                 "re-bootstrap snapshot group does not match checkpoint".into(),
@@ -556,7 +559,9 @@ impl<'a> Reader<'a> {
     fn bytes(&mut self, max: usize) -> Result<Vec<u8>, ReplicaEngineError> {
         let len = self.u32()? as usize;
         if len > max {
-            return Err(ReplicaEngineError::CorruptState("re-bootstrap snapshot item exceeds bound".into()));
+            return Err(ReplicaEngineError::CorruptState(
+                "re-bootstrap snapshot item exceeds bound".into(),
+            ));
         }
         Ok(self.take(len)?.to_vec())
     }
@@ -595,7 +600,9 @@ impl<'a> Reader<'a> {
 
     fn finish(self) -> Result<(), ReplicaEngineError> {
         if self.pos != self.bytes.len() {
-            return Err(ReplicaEngineError::CorruptState("re-bootstrap snapshot has trailing bytes".into()));
+            return Err(ReplicaEngineError::CorruptState(
+                "re-bootstrap snapshot has trailing bytes".into(),
+            ));
         }
         Ok(())
     }
@@ -614,7 +621,10 @@ mod tests {
     fn v2_snapshot_round_trips_without_version_vector_payload() {
         let group = FolderGroupId("g".into());
         let version = FileVersion::new(
-            vec![VersionBlock { hash: yadorilink_replica_domain::ids::BlockHash(vec![7; 32]), size: 3 }],
+            vec![VersionBlock {
+                hash: yadorilink_replica_domain::ids::BlockHash(vec![7; 32]),
+                size: 3,
+            }],
             3,
             FileMeta {
                 mtime_unix_nanos: 11,

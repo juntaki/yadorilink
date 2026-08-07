@@ -89,9 +89,9 @@ pub fn content_already_preserved_at_target(
     target_heads: &[PathHead],
     losing_content_version_hash: &[u8; 32],
 ) -> bool {
-    target_heads.iter().any(|h| {
-        h.content.as_ref().is_some_and(|c| c.version_hash == *losing_content_version_hash)
-    })
+    target_heads
+        .iter()
+        .any(|h| h.content.as_ref().is_some_and(|c| c.version_hash == *losing_content_version_hash))
 }
 
 /// Builds the deterministic `ConflictCopy` `Put` op for one required
@@ -397,8 +397,7 @@ mod tests {
 
     #[test]
     fn validate_claimed_matches_required_rejects_an_unrequired_claim() {
-        let claimed =
-            BTreeSet::from([("src.txt".to_string(), ChangeHash([2; 32]))]);
+        let claimed = BTreeSet::from([("src.txt".to_string(), ChangeHash([2; 32]))]);
         assert!(matches!(
             validate_claimed_matches_required(&[], &claimed),
             Err(ConflictCopyClaimSetError::Unrequired { .. })

@@ -804,7 +804,9 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
 /// history to backfill, which is honest — this change's retention only
 /// starts accruing from the first edit/delete after upgrade), then drops
 /// the old table and renames the new one into place.
-pub(crate) fn migrate_files_table_widen_primary_key(conn: &Connection) -> Result<(), DatabaseError> {
+pub(crate) fn migrate_files_table_widen_primary_key(
+    conn: &Connection,
+) -> Result<(), DatabaseError> {
     if !table_exists(conn, "files")? {
         return Ok(());
     }

@@ -534,7 +534,8 @@ fn install_bootstrap_policies(state: &DaemonState, group_ids: &[String]) {
     // starting from an empty map.
     let mut policies: HashMap<String, GroupPolicyState> = state
         .replica_coordinator
-        .link_repository().list_links()
+        .link_repository()
+        .list_links()
         .map(|links| {
             links
                 .into_iter()
@@ -748,9 +749,11 @@ fn spawn_paired_session(
         local_device_id.to_string(),
         peer_device_id.to_string(),
         state.replica_coordinator.clone(),
-        std::sync::Arc::new(yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
-            state.block_store.clone(),
-        )),
+        std::sync::Arc::new(
+            yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                state.block_store.clone(),
+            ),
+        ),
         shared_group_ids.to_vec(),
         sync_roots,
         Some(state.forward_tx.clone()),

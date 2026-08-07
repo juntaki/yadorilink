@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use yadorilink_replica_domain::reserved_paths::IGNORE_FILE_NAME;
-use yadorilink_root_authority::ignore_patterns::{EffectiveIgnoreSet, IgnorePattern, IgnorePatternSource};
+use yadorilink_root_authority::ignore_patterns::{
+    EffectiveIgnoreSet, IgnorePattern, IgnorePatternSource,
+};
 
 use crate::error::CliError;
 

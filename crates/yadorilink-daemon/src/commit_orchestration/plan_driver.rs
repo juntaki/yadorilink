@@ -128,16 +128,16 @@
 
 use rusqlite::Connection;
 
-use crate::sync_error::SyncError;
-use yadorilink_sync_sqlite::filesystem_transaction;
-use yadorilink_sync_sqlite::commit_window::CommitWindowError;
 use super::orchestrator::{
     OrchestratorError, PlacementOutcome, SliceFrontierSource, SliceRevalidation,
 };
-use yadorilink_sync_sqlite::resolution_planning::{self, FilesystemResolutionPlan};
+use crate::sync_error::SyncError;
 use yadorilink_replica_engine::resolution_planning::{
     desired_frontier_hash, slice_plan, PathFrontier, PlacementGroup, PlanSlice, SliceBounds,
 };
+use yadorilink_sync_sqlite::commit_window::CommitWindowError;
+use yadorilink_sync_sqlite::filesystem_transaction;
+use yadorilink_sync_sqlite::resolution_planning::{self, FilesystemResolutionPlan};
 
 /// What [`PlanEnvironment::build_plan`] returns: the placements a plan
 /// wants, together with the frontier they were resolved from.
@@ -541,12 +541,9 @@ pub(crate) fn drive_plan_unchecked(
         }
         plan_attempts += 1;
 
-        let slices = slice_plan(
-            plan.plan_revision,
-            &remaining,
-            &bounds.slice_bounds,
-            |group| env.group_bytes(group),
-        );
+        let slices = slice_plan(plan.plan_revision, &remaining, &bounds.slice_bounds, |group| {
+            env.group_bytes(group)
+        });
 
         let mut stale = false;
         for slice in &slices {
@@ -771,31 +768,34 @@ pub(crate) fn next_epoch_for_transaction(
 
 #[cfg(test)]
 mod tests {
+    use super::super::orchestrator::CustodyOutcome;
     use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+    use yadorilink_filesystem_sync::optimistic_placement::PreparationCounters;
     use yadorilink_replica_domain::filesystem_placement::{EpochState, PlacementRole};
     use yadorilink_replica_domain::ids::ChangeHash;
+    use yadorilink_replica_engine::resolution_planning::PlannedPlacement;
+    use yadorilink_root_authority::fs_capabilities::DurabilityLevel;
+    use yadorilink_root_authority::fs_identity::{
+        DirectoryIdentity, PlatformObjectId, VolumeIdentity,
+    };
+    use yadorilink_sync_sqlite::commit_window::CommitWindowOutcome;
+    use yadorilink_sync_sqlite::file_identity_codec::GenerationId;
     use yadorilink_sync_sqlite::filesystem_transaction::{
         EpochRecord, EpochUpdate, FilesystemTransactionKind, NewEpoch, NewFilesystemTransaction,
         TransactionCause, TransactionPhase,
     };
-    use yadorilink_root_authority::fs_capabilities::DurabilityLevel;
-    use yadorilink_root_authority::fs_identity::{DirectoryIdentity, PlatformObjectId, VolumeIdentity};
-    use yadorilink_sync_sqlite::file_identity_codec::GenerationId;
     use yadorilink_sync_sqlite::materialized_generation::{
         CausalBasisId, DiskGenerationBasis, MaterializedObjectKind,
     };
-    use yadorilink_sync_sqlite::commit_window::CommitWindowOutcome;
-    use yadorilink_filesystem_sync::optimistic_placement::PreparationCounters;
-    use super::super::orchestrator::CustodyOutcome;
-    use yadorilink_replica_engine::resolution_planning::PlannedPlacement;
-    use std::cell::{Cell, RefCell};
-    use std::collections::BTreeMap;
-    use std::rc::Rc;
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         yadorilink_sync_sqlite::dag_store::init_dag_schema(&conn).unwrap();
-        yadorilink_sync_sqlite::materialized_generation::init_materialized_generation_schema(&conn).unwrap();
+        yadorilink_sync_sqlite::materialized_generation::init_materialized_generation_schema(&conn)
+            .unwrap();
         filesystem_transaction::init_filesystem_transaction_schema(&conn).unwrap();
         conn
     }

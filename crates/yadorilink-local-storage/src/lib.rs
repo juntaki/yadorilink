@@ -31,15 +31,15 @@ pub use disk_verification::{
     intent_target_hash, DiskContentComparison,
 };
 pub use error::StorageError;
+pub use free_space::{FreeSpaceState, VolumeFreeSpace};
+pub use fs_backend::FsBlockStore;
+#[cfg(unix)]
+pub use materialize_write::materialize_symlink;
+#[cfg(windows)]
+pub use materialize_write::materialize_symlink_windows;
 pub use materialize_write::{
     apply_exec_bit, reconstruct_file, verify_delete_target_within_canonical_root,
     verify_delete_target_within_root, verify_write_target_within_canonical_root,
     verify_write_target_within_root, write_placeholder,
 };
-#[cfg(unix)]
-pub use materialize_write::materialize_symlink;
-#[cfg(windows)]
-pub use materialize_write::materialize_symlink_windows;
-pub use free_space::{FreeSpaceState, VolumeFreeSpace};
-pub use fs_backend::FsBlockStore;
 pub use traits::{BlockStore, ContentHash, GcReport, StorageUsage};

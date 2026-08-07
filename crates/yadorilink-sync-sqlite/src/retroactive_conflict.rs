@@ -18,12 +18,16 @@ use std::collections::HashSet;
 
 use rusqlite::Connection;
 
-use yadorilink_replica_domain::change::{Change, MAX_CHANGE_OP_BYTES, Op, PutOrigin, RepairObligation, encoded_op_len};
-use yadorilink_replica_domain::ids::{ChangeHash, SyncPath, VersionHash};
-use yadorilink_replica_domain::limits::MAX_OPS;
-use yadorilink_replica_engine::conflict::{change_touches_path, path_head_from_change, resolve_path_heads, PathHead, PathResolution};
 use crate::dag_store;
 use crate::SyncSqliteError;
+use yadorilink_replica_domain::change::{
+    encoded_op_len, Change, Op, PutOrigin, RepairObligation, MAX_CHANGE_OP_BYTES,
+};
+use yadorilink_replica_domain::ids::{ChangeHash, SyncPath, VersionHash};
+use yadorilink_replica_domain::limits::MAX_OPS;
+use yadorilink_replica_engine::conflict::{
+    change_touches_path, path_head_from_change, resolve_path_heads, PathHead, PathResolution,
+};
 
 /// The final signed change can contain more operations than `direct_ops`,
 /// because ordinary authoring adds one conflict-copy operation per unresolved
@@ -277,11 +281,11 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
+    use crate::dag_store::{AdmitOutcome, ChangeEmitter};
     use yadorilink_replica_domain::change::{ChangeAuth, ChangePurpose};
+    use yadorilink_replica_domain::file::RecordKind;
     use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
     use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId};
-    use crate::dag_store::{AdmitOutcome, ChangeEmitter};
-    use yadorilink_replica_domain::file::RecordKind;
 
     const GROUP: &str = "group";
     const PATH: &str = "shared.bin";

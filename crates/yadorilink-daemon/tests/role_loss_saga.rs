@@ -33,7 +33,9 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use support::{connect_two_daemons, ensure_device_signing_key, open_file_backed_replica_coordinator};
+use support::{
+    connect_two_daemons, ensure_device_signing_key, open_file_backed_replica_coordinator,
+};
 use tokio::net::UnixStream;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -45,9 +47,11 @@ use yadorilink_ipc_proto::daemonctl::{
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_replica_domain::session_state::{RoleLossAction, RoleLossOperationParams, RoleLossOperationState};
-use yadorilink_replica_domain::session_state::MaterializationPolicy;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
+use yadorilink_replica_domain::session_state::MaterializationPolicy;
+use yadorilink_replica_domain::session_state::{
+    RoleLossAction, RoleLossOperationParams, RoleLossOperationState,
+};
 
 const GROUP: &str = "role-loss-saga-group";
 
@@ -75,7 +79,11 @@ fn new_daemon(device_id: &str) -> Daemon {
     let state = DaemonState::new(device_id.to_string(), Arc::new(sync_state), store);
     ensure_device_signing_key(&state);
     let root = tempfile::tempdir().unwrap();
-    state.replica_coordinator.link_repository().add_link(&root.path().to_string_lossy(), GROUP).unwrap();
+    state
+        .replica_coordinator
+        .link_repository()
+        .add_link(&root.path().to_string_lossy(), GROUP)
+        .unwrap();
     Daemon { state, _store_dir: store_dir, index_dir, root }
 }
 
@@ -123,7 +131,12 @@ async fn serve(state: Arc<DaemonState>, root: &std::path::Path) -> std::path::Pa
 }
 
 fn policy_of(state: &DaemonState, group_id: &str) -> MaterializationPolicy {
-    state.replica_coordinator.link_repository().materialization_policy_for_group(group_id).unwrap().unwrap()
+    state
+        .replica_coordinator
+        .link_repository()
+        .materialization_policy_for_group(group_id)
+        .unwrap()
+        .unwrap()
 }
 
 async fn request_count(server: &MockServer, method_name: &str, suffix: &str) -> usize {
@@ -180,7 +193,8 @@ async fn demoting_setup(server: &MockServer) -> (Daemon, Daemon, std::path::Path
     let hash = a.state.block_store.put(content).unwrap();
     a.state
         .replica_coordinator
-        .change_history_repository().record_group_block_provenance(GROUP, &[hex::decode(hash.as_str()).unwrap()])
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, &[hex::decode(hash.as_str()).unwrap()])
         .unwrap();
     b.state.block_store.put(content).unwrap();
     let bytes = hex::decode(hash.as_str()).unwrap();
@@ -191,10 +205,30 @@ async fn demoting_setup(server: &MockServer) -> (Daemon, Daemon, std::path::Path
     // requires group block provenance on the ANSWERING side, not just the
     // asker's) -- without this, device-a's own readiness check fails and no
     // lease is ever issued, regardless of the mocked Worker endpoint below.
-    b.state.replica_coordinator.change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&bytes)).unwrap();
+    b.state
+        .replica_coordinator
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&bytes))
+        .unwrap();
     let record = record_referencing("only.bin", "device-b", bytes, content.len() as u64);
-    a.state.replica_coordinator.file_index_repository().upsert_file(GROUP, &record, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
-    b.state.replica_coordinator.file_index_repository().upsert_file(GROUP, &record, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+    a.state
+        .replica_coordinator
+        .file_index_repository()
+        .upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    b.state
+        .replica_coordinator
+        .file_index_repository()
+        .upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     connect_two_daemons(&a.state, "device-a", &b.state, "device-b", &[GROUP.to_string()]).await;
     b.state.set_peer_group_full_replica("device-a", GROUP, true);
@@ -215,7 +249,8 @@ fn all_role_loss_operations(
 ) -> Vec<yadorilink_replica_domain::session_state::RoleLossOperation> {
     state
         .replica_coordinator
-        .role_loss_operation_repository().list_role_loss_operations_in_states(&[
+        .role_loss_operation_repository()
+        .list_role_loss_operations_in_states(&[
             RoleLossOperationState::Prepared,
             RoleLossOperationState::WorkerCommitted,
             RoleLossOperationState::LocalCommitted,
@@ -457,7 +492,15 @@ async fn demote_local_failure_after_worker_commit_is_compensated_and_rolled_back
     let racer = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let record = record_referencing("concurrent-edit.bin", "device-b", vec![0xAB; 32], 4);
-        racer_state.replica_coordinator.file_index_repository().upsert_file(GROUP, &record, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests()).unwrap();
+        racer_state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file(
+                GROUP,
+                &record,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
     });
 
     let resp = send_over_socket(
@@ -542,7 +585,8 @@ async fn prepared_reconcile_restores_worker_eager_after_response_loss() {
         as i64;
     b.state
         .replica_coordinator
-        .role_loss_operation_repository().insert_role_loss_operation(
+        .role_loss_operation_repository()
+        .insert_role_loss_operation(
             "op-ambiguous-prepared",
             GROUP,
             RoleLossOperationParams {
@@ -590,7 +634,8 @@ async fn worker_committed_row_found_at_startup_is_compensated_by_the_sweep() {
         as i64;
     b.state
         .replica_coordinator
-        .role_loss_operation_repository().insert_role_loss_operation(
+        .role_loss_operation_repository()
+        .insert_role_loss_operation(
             "op-crash-1",
             GROUP,
             RoleLossOperationParams {
@@ -605,7 +650,8 @@ async fn worker_committed_row_found_at_startup_is_compensated_by_the_sweep() {
         .unwrap();
     b.state
         .replica_coordinator
-        .role_loss_operation_repository().advance_role_loss_operation("op-crash-1", RoleLossOperationState::WorkerCommitted, now)
+        .role_loss_operation_repository()
+        .advance_role_loss_operation("op-crash-1", RoleLossOperationState::WorkerCommitted, now)
         .unwrap();
 
     run_role_loss_reconciliation_sweep(&b.state).await;
@@ -647,7 +693,8 @@ async fn compensation_unreachable_leaves_the_row_compensating_and_retries() {
         as i64;
     b.state
         .replica_coordinator
-        .role_loss_operation_repository().insert_role_loss_operation(
+        .role_loss_operation_repository()
+        .insert_role_loss_operation(
             "op-crash-2",
             GROUP,
             RoleLossOperationParams {
@@ -662,11 +709,17 @@ async fn compensation_unreachable_leaves_the_row_compensating_and_retries() {
         .unwrap();
     b.state
         .replica_coordinator
-        .role_loss_operation_repository().advance_role_loss_operation("op-crash-2", RoleLossOperationState::WorkerCommitted, now)
+        .role_loss_operation_repository()
+        .advance_role_loss_operation("op-crash-2", RoleLossOperationState::WorkerCommitted, now)
         .unwrap();
 
     run_role_loss_reconciliation_sweep(&b.state).await;
-    let after_first = b.state.replica_coordinator.role_loss_operation_repository().get_role_loss_operation("op-crash-2").unwrap();
+    let after_first = b
+        .state
+        .replica_coordinator
+        .role_loss_operation_repository()
+        .get_role_loss_operation("op-crash-2")
+        .unwrap();
     let after_first = after_first.expect("an unreachable-compensation row must NOT be lost");
     assert_eq!(after_first.state, RoleLossOperationState::Compensating);
     // `>= 1`, not `== 1`: the auto-sweep spawned by `DaemonState::new` may also
@@ -684,7 +737,8 @@ async fn compensation_unreachable_leaves_the_row_compensating_and_retries() {
     let after_second = b
         .state
         .replica_coordinator
-        .role_loss_operation_repository().get_role_loss_operation("op-crash-2")
+        .role_loss_operation_repository()
+        .get_role_loss_operation("op-crash-2")
         .unwrap()
         .expect("the row must still survive a second failed compensation attempt");
     assert_eq!(after_second.state, RoleLossOperationState::Compensating);

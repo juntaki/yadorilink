@@ -46,7 +46,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use support::{
-    open_file_backed_replica_coordinator, real_entry_names, wait_until, wait_until_with_context, TestAccount,
+    open_file_backed_replica_coordinator, real_entry_names, wait_until, wait_until_with_context,
+    TestAccount,
 };
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
@@ -166,7 +167,12 @@ async fn wait_for_convergence(a: &TestDevice, b: &TestDevice, timeout: Duration)
 }
 
 fn pause(device: &TestDevice) {
-    device.state.replica_coordinator.link_repository().set_paused(device.root.path().to_str().unwrap(), true).unwrap();
+    device
+        .state
+        .replica_coordinator
+        .link_repository()
+        .set_paused(device.root.path().to_str().unwrap(), true)
+        .unwrap();
 }
 
 /// Reconnects both devices — see this file's header doc comment for why
@@ -196,7 +202,8 @@ async fn wait_for_local_edit_indexed(device: &TestDevice, group_id: &str, path: 
             device
                 .state
                 .replica_coordinator
-                .file_index_repository().get_file(group_id, path)
+                .file_index_repository()
+                .get_file(group_id, path)
                 .ok()
                 .flatten()
                 .map(|r| !r.deleted)
@@ -217,7 +224,8 @@ async fn wait_for_local_delete_indexed(device: &TestDevice, group_id: &str, path
             device
                 .state
                 .replica_coordinator
-                .file_index_repository().get_file(group_id, path)
+                .file_index_repository()
+                .get_file(group_id, path)
                 .ok()
                 .flatten()
                 .map(|r| r.deleted)
@@ -235,7 +243,8 @@ fn current_version_seq(device: &TestDevice, group_id: &str, path: &str) -> i64 {
     device
         .state
         .replica_coordinator
-        .sqlite().dag_list_versions(group_id, path)
+        .sqlite()
+        .dag_list_versions(group_id, path)
         .ok()
         .and_then(|versions| versions.first().map(|v| v.version_seq))
         .unwrap_or(0)
@@ -270,7 +279,8 @@ async fn wait_for_local_edit_indexed_past(
             device
                 .state
                 .replica_coordinator
-                .file_index_repository().get_file(group_id, path)
+                .file_index_repository()
+                .get_file(group_id, path)
                 .ok()
                 .flatten()
                 .map(|r| !r.deleted)

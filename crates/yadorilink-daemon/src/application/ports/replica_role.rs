@@ -5,9 +5,9 @@
 //! split: each has an independent reason to vary (a fake lease port for
 //! readiness-gate tests never needs a fake link-watcher runtime too).
 
-use yadorilink_replica_domain::session_state::{FolderLink, RoleLossAction};
-use yadorilink_replica_domain::session_state::MaterializationPolicy;
 use crate::sync_error::SyncError;
+use yadorilink_replica_domain::session_state::MaterializationPolicy;
+use yadorilink_replica_domain::session_state::{FolderLink, RoleLossAction};
 
 use super::common::BoxFuture;
 use crate::application::model::RoleLossCommitOutcome;

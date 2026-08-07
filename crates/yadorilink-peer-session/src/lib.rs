@@ -15,6 +15,8 @@ pub(crate) mod replica_engine_ports;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+#[path = "peer_session_public.rs"]
+pub mod peer_session;
 /// The session implementation. Kept `#[doc(hidden)]` and re-exported through
 /// [`peer_session`] (`peer_session_public.rs`), which prevents a partially
 /// wired session from escaping its constructor -- same split as this file
@@ -22,8 +24,6 @@ pub(crate) mod test_support;
 #[doc(hidden)]
 #[path = "peer_session.rs"]
 pub mod peer_session_impl;
-#[path = "peer_session_public.rs"]
-pub mod peer_session;
 
 pub use error::PeerSessionError;
 

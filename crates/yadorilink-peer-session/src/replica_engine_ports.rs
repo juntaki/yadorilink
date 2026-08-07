@@ -21,8 +21,8 @@ use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::ids::{BlockHash, ChangeHash, DeviceId, FolderGroupId, VersionHash};
 use yadorilink_replica_engine::error::{AdmissionStoreError, ReplicaEngineError};
 use yadorilink_replica_engine::ports::{
-    AdmissionStoreOutcome, AdmissionStoreResult, ChangeAdmissionPort, DurabilityRoot,
-    DurabilityEvidencePort, FrontierStorePort, ReplicaHistoryPort, ReplicaRetentionPolicy,
+    AdmissionStoreOutcome, AdmissionStoreResult, ChangeAdmissionPort, DurabilityEvidencePort,
+    DurabilityRoot, FrontierStorePort, ReplicaHistoryPort, ReplicaRetentionPolicy,
 };
 
 use crate::ports::PeerReplicaStatePort;
@@ -132,14 +132,12 @@ impl DurabilityEvidencePort for DurabilityEvidenceAdapter {
         &self,
         group: &FolderGroupId,
     ) -> Result<Option<ReplicaRetentionPolicy>, ReplicaEngineError> {
-        Ok(self
-            .state
-            .materialization_policy_for_group(group.as_str())
-            .map_err(storage_err)?
-            .map(|policy| match policy {
+        Ok(self.state.materialization_policy_for_group(group.as_str()).map_err(storage_err)?.map(
+            |policy| match policy {
                 MaterializationPolicy::Eager => ReplicaRetentionPolicy::Eager,
                 MaterializationPolicy::OnDemand => ReplicaRetentionPolicy::OnDemand,
-            }))
+            },
+        ))
     }
 
     fn current_root(
@@ -151,7 +149,10 @@ impl DurabilityEvidencePort for DurabilityEvidenceAdapter {
             .state
             .get_current_version_record(group.as_str(), path.as_str())
             .map_err(storage_err)?
-            .map(|record| DurabilityRoot { deleted: record.deleted, version: record.to_file_version() }))
+            .map(|record| DurabilityRoot {
+                deleted: record.deleted,
+                version: record.to_file_version(),
+            }))
     }
 
     fn retained_roots(

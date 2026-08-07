@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use ed25519_dalek::SigningKey;
 
 use super::*;
-use yadorilink_replica_domain::ids::DeviceId;
 use crate::compaction::{CheckpointStore, CompactionDagStore, DeviceFrontierStore};
+use yadorilink_replica_domain::ids::DeviceId;
 
 fn h(byte: u8) -> ChangeHash {
     ChangeHash([byte; 32])
@@ -41,7 +41,11 @@ impl CompactionDagStore for FakeStore {
         Ok(self.parents.contains_key(change) && !self.pruned.contains(change))
     }
 
-    fn was_pruned(&self, _group: &FolderGroupId, change: &ChangeHash) -> Result<bool, ReplicaEngineError> {
+    fn was_pruned(
+        &self,
+        _group: &FolderGroupId,
+        change: &ChangeHash,
+    ) -> Result<bool, ReplicaEngineError> {
         Ok(self.pruned.contains(change))
     }
 }
@@ -74,7 +78,10 @@ impl DeviceFrontierStore for FakeStore {
 }
 
 impl CheckpointStore for FakeStore {
-    fn latest_checkpoint(&self, _group: &FolderGroupId) -> Result<Option<Checkpoint>, ReplicaEngineError> {
+    fn latest_checkpoint(
+        &self,
+        _group: &FolderGroupId,
+    ) -> Result<Option<Checkpoint>, ReplicaEngineError> {
         Ok(self.checkpoint.borrow().clone())
     }
 

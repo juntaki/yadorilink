@@ -4,8 +4,8 @@ use yadorilink_replica_domain::session_state::MaterializationPolicy;
 
 use super::model::{HandoffCommitResult, RoleLossCommitOutcome};
 use super::ports::{
-    HandoffReadinessPort, LinkRuntimePort, PlaceholderPipelineCapabilityPort, ReplicaRoleRepository,
-    RoleLossCoordination, RoleLossJournal,
+    HandoffReadinessPort, LinkRuntimePort, PlaceholderPipelineCapabilityPort,
+    ReplicaRoleRepository, RoleLossCoordination, RoleLossJournal,
 };
 
 pub(crate) fn demotion_handoff_lease_failure_message() -> String {
@@ -1102,9 +1102,11 @@ mod tests {
     #[derive(Default)]
     struct FakeReadiness {
         full_replica: AtomicBool,
-        digest_and_peer: Mutex<VecDeque<Option<([u8; 32], Option<String>)>>>,
+        digest_and_peer: Mutex<DigestAndPeerResults>,
         lease: Mutex<VecDeque<Option<String>>>,
     }
+
+    type DigestAndPeerResults = VecDeque<Option<([u8; 32], Option<String>)>>;
 
     impl HandoffReadinessPort for FakeReadiness {
         fn is_local_full_replica(&self, _group_id: &str) -> bool {

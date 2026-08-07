@@ -33,7 +33,9 @@ pub mod retained_obligation;
 use std::sync::Arc;
 
 pub use engine::{DurableVersionQuery, PeerReplicaEngine};
-pub use ports::{ChangeAdmissionPort, DurabilityEvidencePort, FrontierStorePort, ReplicaHistoryPort};
+pub use ports::{
+    ChangeAdmissionPort, DurabilityEvidencePort, FrontierStorePort, ReplicaHistoryPort,
+};
 
 /// `PeerReplicaEngine`'s 4 port dependencies, held as one bundle so its own
 /// constructor takes a single argument rather than 4 positional `Arc`s.

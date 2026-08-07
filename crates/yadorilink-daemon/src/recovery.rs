@@ -212,8 +212,8 @@ fn enrollment_operation_summary(op: &EnrollmentOperation) -> RecoveryOperationSu
 }
 
 fn membership_operation_summary(op: &MembershipOperation) -> RecoveryOperationSummary {
-    let durability_unknown =
-        op.durability_scope == yadorilink_replica_domain::session_state::MembershipDurabilityScope::Unknown;
+    let durability_unknown = op.durability_scope
+        == yadorilink_replica_domain::session_state::MembershipDurabilityScope::Unknown;
     RecoveryOperationSummary {
         operation_id: op.operation_id.clone(),
         domain: RecoveryDomain::Membership,
@@ -512,7 +512,8 @@ pub(crate) mod tests {
 
     pub(crate) fn insert_valid_enrollment_op(state: &ReplicaCoordinator, operation_id: &str) {
         state
-            .enrollment_repository().try_insert_enrollment_operation(&EnrollmentOperation {
+            .enrollment_repository()
+            .try_insert_enrollment_operation(&EnrollmentOperation {
                 operation_id: operation_id.to_string(),
                 kind: EnrollmentKind::Create,
                 group_id: Some("group-1".to_string()),
@@ -531,7 +532,8 @@ pub(crate) mod tests {
 
     pub(crate) fn insert_valid_membership_op(state: &ReplicaCoordinator, operation_id: &str) {
         state
-            .membership_operation_repository().try_insert_membership_operation(
+            .membership_operation_repository()
+            .try_insert_membership_operation(
                 operation_id,
                 MembershipOperationAction::Revoke,
                 MembershipCommitMode::PlainRevoke,
@@ -550,7 +552,8 @@ pub(crate) mod tests {
 
     pub(crate) fn insert_valid_role_loss_op(state: &ReplicaCoordinator, operation_id: &str) {
         state
-            .role_loss_operation_repository().insert_role_loss_operation(
+            .role_loss_operation_repository()
+            .insert_role_loss_operation(
                 operation_id,
                 "group-1",
                 RoleLossOperationParams {
@@ -586,7 +589,8 @@ pub(crate) mod tests {
     fn recovery_inventory_shows_recovery_blocked_rows_that_the_open_scan_excludes() {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
         state
-            .enrollment_repository().try_insert_enrollment_operation(&EnrollmentOperation {
+            .enrollment_repository()
+            .try_insert_enrollment_operation(&EnrollmentOperation {
                 operation_id: "op-blocked".to_string(),
                 kind: EnrollmentKind::Create,
                 group_id: None,
@@ -810,15 +814,21 @@ pub(crate) mod tests {
         insert_valid_membership_op(&state, "op-membership");
         insert_valid_role_loss_op(&state, "op-role-loss");
 
-        let before_enrollment = state.enrollment_repository().scan_all_enrollment_operations().unwrap().valid;
-        let before_membership = state.membership_operation_repository().scan_all_membership_operations().unwrap().valid;
-        let before_role_loss = state.role_loss_operation_repository().scan_all_role_loss_operations().unwrap().valid;
+        let before_enrollment =
+            state.enrollment_repository().scan_all_enrollment_operations().unwrap().valid;
+        let before_membership =
+            state.membership_operation_repository().scan_all_membership_operations().unwrap().valid;
+        let before_role_loss =
+            state.role_loss_operation_repository().scan_all_role_loss_operations().unwrap().valid;
 
         let _ = crate::recovery::inventory(&state).unwrap();
 
-        let after_enrollment = state.enrollment_repository().scan_all_enrollment_operations().unwrap().valid;
-        let after_membership = state.membership_operation_repository().scan_all_membership_operations().unwrap().valid;
-        let after_role_loss = state.role_loss_operation_repository().scan_all_role_loss_operations().unwrap().valid;
+        let after_enrollment =
+            state.enrollment_repository().scan_all_enrollment_operations().unwrap().valid;
+        let after_membership =
+            state.membership_operation_repository().scan_all_membership_operations().unwrap().valid;
+        let after_role_loss =
+            state.role_loss_operation_repository().scan_all_role_loss_operations().unwrap().valid;
 
         assert_eq!(before_enrollment, after_enrollment);
         assert_eq!(before_membership, after_membership);

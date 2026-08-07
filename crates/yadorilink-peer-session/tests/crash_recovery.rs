@@ -51,8 +51,8 @@ use std::sync::Arc;
 use boringtun::x25519::{PublicKey, StaticSecret};
 use ed25519_dalek::SigningKey;
 use tokio::net::TcpListener;
-use yadorilink_local_storage::FsBlockStore;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+use yadorilink_local_storage::FsBlockStore;
 use yadorilink_peer_session::peer_session::{PeerSyncSession, PeerSyncSessionDeps};
 use yadorilink_transport::PeerChannel;
 
@@ -105,8 +105,12 @@ impl Device {
         // daemon's link manager supplies both; these tests have no link
         // manager, so stand in for it.
         state.link_repository().add_link(&root.path().to_string_lossy(), GROUP).unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(root.path(), GROUP, state.as_ref())
-            .unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            root.path(),
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
         let generation = state.startup_readiness().begin_group_startup(GROUP);
         state.startup_readiness().mark_group_ready(GROUP, generation);
         Device {
@@ -292,7 +296,8 @@ async fn local_change_committed_before_a_crash_is_reoffered_and_admitted_on_reco
     )
     .await;
 
-    let committed_head = device_a.state.sqlite().dag_group_heads(GROUP).unwrap().into_iter().next().unwrap();
+    let committed_head =
+        device_a.state.sqlite().dag_group_heads(GROUP).unwrap().into_iter().next().unwrap();
 
     session_a2.announce_local_commit(GROUP).await.unwrap();
 
@@ -319,7 +324,8 @@ async fn local_change_committed_before_a_crash_is_reoffered_and_admitted_on_reco
 
     let received_change = device_b
         .state
-        .sqlite().dag_get_change(&committed_head)
+        .sqlite()
+        .dag_get_change(&committed_head)
         .unwrap()
         .expect("pre-crash local change must be re-delivered after reconnect");
     assert_eq!(received_change.compute_hash(), committed_head);

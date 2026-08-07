@@ -16,25 +16,25 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 
 use crate::block_serve::BlockServeEngine;
-use yadorilink_replica_domain::change::ChangeAuth;
-use yadorilink_replica_domain::file::VersionBlock;
-use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
-use yadorilink_replica_engine::conflict::PathHead;
-use yadorilink_sync_wire::PeerWireCodec;
 use crate::error::PeerSessionError;
 use crate::rate_limiter::RateLimiters;
-use yadorilink_replica_domain::rebootstrap::RebootstrapRequired;
+use yadorilink_replica_domain::change::ChangeAuth;
 use yadorilink_replica_domain::file::FileRecord;
+use yadorilink_replica_domain::file::VersionBlock;
+use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
+use yadorilink_replica_domain::rebootstrap::RebootstrapRequired;
+use yadorilink_replica_engine::conflict::PathHead;
+use yadorilink_sync_wire::PeerWireCodec;
 
 #[cfg(madsim)]
 pub use crate::peer_session_impl::set_test_clock_override;
+use crate::peer_session_impl::PeerSyncSessionOneTimeDeps;
 pub use crate::peer_session_impl::{
     disk_race_fingerprint, BlockWriteActivityProvider, ChangeAuthenticator, HandoffLeaseResponder,
     HandoffTicketResponder, HydrationOutcome, PeerHandoffLeaseGrant, PeerHandoffTicketGrant,
     PendingLocalChangeFlush, PreparedRebootstrap, ProjectionAttempt, RebootstrapHandler,
     RootCommitAuthorityProvider, DEFAULT_HYDRATION_TIMEOUT, DEFAULT_MAINTENANCE_RECONCILE_INTERVAL,
 };
-use crate::peer_session_impl::PeerSyncSessionOneTimeDeps;
 
 use crate::peer_session_impl::PeerSyncSession as InnerPeerSyncSession;
 
@@ -646,7 +646,10 @@ impl BlockWriteActivityProvider for NoopBlockWriteActivityProvider {
 struct DenyRootCommitAuthorityProvider;
 
 impl RootCommitAuthorityProvider for DenyRootCommitAuthorityProvider {
-    fn root_lease_for(&self, _group_id: &str) -> Option<Arc<yadorilink_root_authority::root_commit::RootLease>> {
+    fn root_lease_for(
+        &self,
+        _group_id: &str,
+    ) -> Option<Arc<yadorilink_root_authority::root_commit::RootLease>> {
         None
     }
 }

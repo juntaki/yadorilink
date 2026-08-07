@@ -1,0 +1,4 @@
+# False positive: ordinary design prose beginning "causal-auth monotonicity"
+# in the historical 7D-3 exit report. This fingerprint is scoped to the exact
+# rule, commit, path, and line; all other generic-api-key findings still fail.
+ac7ae95189368470232914965ec95ff2aa7f25d7:docs/design/phase7d3-replica-engine-exit-report.md:generic-api-key:222

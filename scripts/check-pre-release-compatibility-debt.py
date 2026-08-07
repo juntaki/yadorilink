@@ -54,13 +54,10 @@ FORBIDDEN = {
         "UnsupportedSchemaDowngradeError",
         "row.version >",
     ),
-    "crates/yadorilink-sync-core/src/lib.rs": (
-        '#[path = "peer_session.rs"]\npub mod peer_session;',
-    ),
     # `version_vector.rs` itself was fully deleted (not just emptied) once the
     # authoring-identity migration to change-hash/DAG ancestry completed; see
     # the `RETIRED_FILES_MUST_NOT_EXIST` check below for its replacement.
-    "crates/yadorilink-sync-core/src/rebootstrap_snapshot.rs": (
+    "crates/yadorilink-replica-engine/src/rebootstrap_snapshot.rs": (
         "MAX_VERSION_COUNTERS",
         "counter_count",
         "version.counters()",
@@ -73,6 +70,7 @@ FORBIDDEN = {
 # script exists to catch, so their reappearance is itself the forbidden
 # marker rather than any string inside them.
 RETIRED_FILES_MUST_NOT_EXIST = (
+    "crates/yadorilink-sync-core",
     "crates/yadorilink-sync-core/src/version_vector.rs",
 )
 
@@ -81,7 +79,7 @@ REQUIRED = {
         "assertCurrentSchema",
         "row.version !== CURRENT_SCHEMA_VERSION",
     ),
-    "crates/yadorilink-sync-core/src/peer_session_public.rs": (
+    "crates/yadorilink-peer-session/src/peer_session_public.rs": (
         "pub struct PeerSyncSessionDeps",
         "pub fn new_with_dependencies",
         # Not a pinned literal: an earlier attempt hard-coded this generation
@@ -97,14 +95,16 @@ REQUIRED = {
         "dependencies are immutable after run() starts",
         "config.protocol_version == Self::PROTOCOL_VERSION",
     ),
-    "crates/yadorilink-sync-core/src/types.rs": (
+    "crates/yadorilink-replica-domain/src/file.rs": (
         # `CurrentFileRecord` was renamed to `FileRecord` once the legacy
         # version-vector-carrying `FileRecord` it disambiguated against was
         # deleted outright, freeing the shorter name.
         "pub struct FileRecord",
         "pub struct FileProjection",
-        "impl TryFrom<proto::FileInfo> for FileProjection",
-        "missing origin_device_id",
+        "pub origin_device_id: String",
+        "pub authoring_change_hash: ChangeHash",
+    ),
+    "crates/yadorilink-sync-sqlite/src/file_index.rs": (
         "invalid authoring_change_hash",
     ),
     # `rebootstrap_snapshot_v2.rs` was folded back into `rebootstrap_snapshot.rs`
@@ -117,7 +117,7 @@ REQUIRED = {
     # below for the same lesson learned the hard way). `check_snapshot_domain_tag`
     # verifies the *shape* of the tag and that it is the sole domain used for
     # both encode and decode instead.
-    "crates/yadorilink-sync-core/src/rebootstrap_snapshot.rs": (
+    "crates/yadorilink-replica-engine/src/rebootstrap_snapshot.rs": (
         "out.extend_from_slice(SNAPSHOT_DOMAIN)",
         "reader.expect(SNAPSHOT_DOMAIN)",
         "the retired version-vector section",
@@ -128,7 +128,7 @@ REQUIRED = {
     # module doc. Watch the mechanism that actually delivers it: both halves
     # of the exact match must stay, because dropping the `<` half alone would
     # silently readmit every database old enough to hold a retired payload.
-    "crates/yadorilink-sync-core/src/index.rs": (
+    "crates/yadorilink-sqlite-runtime/src/schema.rs": (
         "if on_disk_version > SCHEMA_VERSION {",
         "if on_disk_version != 0 && on_disk_version < SCHEMA_VERSION {",
     ),
@@ -150,7 +150,7 @@ def check_snapshot_domain_tag() -> list[str]:
     every legitimate advance -- the same mistake the `schema_meta` check used
     to make (see `check_schema_meta_initialization`).
     """
-    relative_path = "crates/yadorilink-sync-core/src/rebootstrap_snapshot.rs"
+    relative_path = "crates/yadorilink-replica-engine/src/rebootstrap_snapshot.rs"
     path = ROOT / relative_path
     if not path.exists():
         return [f"missing required exact-generation file: {relative_path}"]
@@ -222,6 +222,11 @@ def main() -> int:
     for relative_path, needles in FORBIDDEN.items():
         path = ROOT / relative_path
         if not path.exists():
+            # The coordination service is intentionally outside the OSS
+            # projection. Its copy of this same gate still validates these
+            # markers in the private source tree.
+            if relative_path.startswith("coordination-worker/"):
+                continue
             failures.append(f"missing guarded file: {relative_path}")
             continue
         text = path.read_text(encoding="utf-8")
@@ -234,6 +239,8 @@ def main() -> int:
     for relative_path, needles in REQUIRED.items():
         path = ROOT / relative_path
         if not path.exists():
+            if relative_path.startswith("coordination-worker/"):
+                continue
             failures.append(f"missing required exact-generation file: {relative_path}")
             continue
         text = path.read_text(encoding="utf-8")
@@ -249,13 +256,15 @@ def main() -> int:
 
     failures.extend(check_snapshot_domain_tag())
 
-    migrations = sorted((ROOT / "coordination-worker/migrations").glob("*.sql"))
-    migration_names = [path.name for path in migrations]
-    if migration_names != ["0001_initial.sql"]:
-        failures.append(
-            "coordination-worker/migrations: expected only canonical 0001_initial.sql, "
-            f"found {migration_names!r}"
-        )
+    coordination_root = ROOT / "coordination-worker"
+    if coordination_root.exists():
+        migrations = sorted((coordination_root / "migrations").glob("*.sql"))
+        migration_names = [path.name for path in migrations]
+        if migration_names != ["0001_initial.sql"]:
+            failures.append(
+                "coordination-worker/migrations: expected only canonical 0001_initial.sql, "
+                f"found {migration_names!r}"
+            )
 
     failures.extend(check_schema_meta_initialization())
 

@@ -78,7 +78,11 @@ impl CompactionDagStore for MockStore {
         Ok(self.present(change))
     }
 
-    fn was_pruned(&self, _group: &FolderGroupId, change: &ChangeHash) -> Result<bool, ReplicaEngineError> {
+    fn was_pruned(
+        &self,
+        _group: &FolderGroupId,
+        change: &ChangeHash,
+    ) -> Result<bool, ReplicaEngineError> {
         Ok(self.deleted.borrow().contains(change))
     }
 }
@@ -120,7 +124,10 @@ impl DeviceFrontierStore for MockStore {
 }
 
 impl CheckpointStore for MockStore {
-    fn latest_checkpoint(&self, group: &FolderGroupId) -> Result<Option<Checkpoint>, ReplicaEngineError> {
+    fn latest_checkpoint(
+        &self,
+        group: &FolderGroupId,
+    ) -> Result<Option<Checkpoint>, ReplicaEngineError> {
         Ok(self
             .checkpoints
             .borrow()

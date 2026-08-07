@@ -24,10 +24,10 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::task::JoinSet;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::{BlockStore, ContentHash, FsBlockStore, GcReport, StorageError};
-use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
-use yadorilink_replica_domain::ids::{BlockHash, VersionHash};
 use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
+use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
+use yadorilink_replica_domain::ids::{BlockHash, VersionHash};
 
 const GROUP_A: &str = "stage2-group-a";
 const GROUP_B: &str = "stage2-group-b";
@@ -209,7 +209,11 @@ fn new_device(
     let mut roots = Vec::new();
     for group in groups {
         let root = tempfile::tempdir().unwrap();
-        state.replica_coordinator.link_repository().add_link(&root.path().to_string_lossy(), group).unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link(&root.path().to_string_lossy(), group)
+            .unwrap();
         roots.push(root);
     }
     Device {
@@ -241,7 +245,8 @@ fn seed_block(device: &Device, group: &str, path: &str, data: Vec<u8>) -> Seeded
     device
         .state
         .replica_coordinator
-        .change_history_repository().record_group_block_provenance(group, std::slice::from_ref(&hash))
+        .change_history_repository()
+        .record_group_block_provenance(group, std::slice::from_ref(&hash))
         .unwrap();
 
     let record = FileRecord {
@@ -254,7 +259,8 @@ fn seed_block(device: &Device, group: &str, path: &str, data: Vec<u8>) -> Seeded
     device
         .state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             group,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -407,7 +413,8 @@ async fn concurrent_requests_for_the_same_hash_across_groups_never_cross_wire_th
     source
         .state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP_B,
             &FileRecord {
                 path: group_b_path.to_string(),

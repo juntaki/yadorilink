@@ -5,9 +5,9 @@ Every LOCAL current-row mutation must append its signed change to the history
 DAG in the same transaction — the job of the `*_emitting_change` family in
 `index.rs`. This guard forbids the raw, non-emitting current-row writers
 (`upsert_file`, `upsert_files_batch`, `set_exec_bit`, `set_record_kind`,
-`mark_deleted_at`) from being called in production sync-core / daemon code
-outside `index.rs` (which owns the primitives and the emitting wrappers), so a
-new DAG-silent local write cannot quietly reappear.
+`mark_deleted_at`) from being called in production local-capture, peer-session,
+or daemon code outside the SQLite repository and its narrow port adapters, so
+a new DAG-silent local write cannot quietly reappear.
 
 Allowed unconditionally:
   - the `*_emitting_change` family (an emitting local write), and
@@ -19,8 +19,8 @@ immediately after the bare name, so `upsert_file_emitting_change(`,
 match.
 
 A small allowlist pins the handful of known-legit raw calls that remain:
-index-only Projected metadata application in `peer_session.rs`, and the two
-sanctioned non-emitting local paths in `local_change.rs` (a group whose change
+index-only Projected metadata application in peer-session, and the two
+sanctioned non-emitting local-capture paths (a group whose change
 DAG has not been seeded yet, and the standalone no-emitter build). The total
 allowed-hit count is pinned so a new raw call — even one that happens to share
 an allowlisted snippet — trips the guard for review.
@@ -32,16 +32,32 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOTS = [
-    ROOT / "crates/yadorilink-sync-core/src",
+    ROOT / "crates/yadorilink-local-capture/src",
+    ROOT / "crates/yadorilink-peer-session/src",
     ROOT / "crates/yadorilink-daemon/src",
 ]
 
-# `index.rs` defines the raw primitives, the `*_emitting_change` family, and
-# `upsert_file_with_origin`; it is the mutation module the boundary is drawn
-# around, so it is exempt in full (mirrors check-block-deletion-boundary.py's
-# COORDINATOR exemption).
+# The SQLite file-index module defines both raw primitives and the emitting
+# wrappers; it is the repository boundary this check protects.
 EXEMPT_FILES = {
-    "crates/yadorilink-sync-core/src/index.rs",
+    "crates/yadorilink-sync-sqlite/src/file_index.rs",
+}
+
+# Composition-root implementations of narrow capability ports. These files
+# are not exempt: a raw writer is accepted only inside the identically named
+# trait method, i.e. as the one direct repository delegation the port exists
+# to provide.
+PORT_ADAPTER_FILES = {
+    "crates/yadorilink-daemon/src/replica_coordinator/local_mutation.rs",
+    "crates/yadorilink-daemon/src/replica_coordinator/materialization_state.rs",
+    "crates/yadorilink-daemon/src/replica_coordinator/peer_replica_state.rs",
+}
+
+# Entire modules compiled only behind `#[cfg(test)]` in their parent. The
+# per-file scanner cannot see that parent attribute, so record that structural
+# fact explicitly instead of treating test fixtures as production adapters.
+TEST_ONLY_FILES = {
+    "crates/yadorilink-local-capture/src/test_support.rs",
 }
 
 # The non-emitting current-row writers. Each needs a `(` right after the bare
@@ -64,21 +80,20 @@ FORBIDDEN = (
 #     initial import right after the scan) and the standalone no-emitter build,
 #     neither of which has a DAG to diverge from.
 ALLOWLIST = {
-    "crates/yadorilink-sync-core/src/peer_session.rs": [
+    "crates/yadorilink-peer-session/src/peer_session.rs": [
         # Projected: apply a peer's advertised metadata (index-only).
-        "set_record_kind(group_id, &record.path, meta.record_kind)",
-        "set_exec_bit(group_id, &record.path, meta.exec_bit)",
+        "state.set_record_kind(",
+        "state.set_exec_bit(",
     ],
-    "crates/yadorilink-sync-core/src/local_change.rs": [
+    "crates/yadorilink-local-capture/src/local_change.rs": [
         # No change DAG yet: the initial import seeds these rows into history.
-        "upsert_files_batch(group_id, &records",
+        "self.state.upsert_files_batch(",
         # Standalone (no change emitter) delete path.
-        "mark_deleted_at(",
+        "self.state.mark_deleted_at(",
         # Local-column bookkeeping applied right after the emitting write that
         # already carried the same exec bit / symlink kind in its FileVersion.
-        "set_exec_bit(group_id, path, *exec_bit)",
-        "set_exec_bit(group_id, &rel_path, exec_bit)",
-        "set_record_kind(group_id, rel_path, RecordKind::Symlink)",
+        "self.state.set_exec_bit(",
+        "self.state.set_record_kind(",
     ],
 }
 
@@ -140,16 +155,28 @@ def production_lines(path: Path) -> list[tuple[int, str]]:
     return out
 
 
+def in_matching_port_method(
+    lines: list[tuple[int, str]], index: int, method: str
+) -> bool:
+    """Recognize only a port method's delegation to its same-named writer."""
+    for _, candidate in reversed(lines[: index + 1]):
+        stripped = candidate.strip()
+        if stripped.startswith("fn "):
+            return stripped.startswith(f"fn {method}(")
+    return False
+
+
 def main() -> int:
     violations: list[str] = []
     allowed_hits = 0
     for source_root in SOURCE_ROOTS:
         for path in sorted(source_root.rglob("*.rs")):
             rel = str(path.relative_to(ROOT))
-            if rel in EXEMPT_FILES:
+            if rel in EXEMPT_FILES or rel in TEST_ONLY_FILES:
                 continue
             allowed_snippets = ALLOWLIST.get(rel, [])
-            for lineno, line in production_lines(path):
+            lines = production_lines(path)
+            for index, (lineno, line) in enumerate(lines):
                 stripped = line.strip()
                 if stripped.startswith("//"):
                     continue
@@ -157,6 +184,13 @@ def main() -> int:
                     if token not in line:
                         continue
                     if ("fn " + token[:-1]) in line:
+                        continue
+                    method = token[:-1]
+                    adapter_delegation = (
+                        rel in PORT_ADAPTER_FILES
+                        and in_matching_port_method(lines, index, method)
+                    )
+                    if adapter_delegation:
                         continue
                     if any(snippet in line for snippet in allowed_snippets):
                         allowed_hits += 1

@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::content_ports::BlockContentStore;
 use crate::error::StorageError;
+use crate::fs_backend::{remove_path, rename_path};
 use yadorilink_replica_domain::file::BlockInfo;
 
 fn unique_tmp_path(path: &Path) -> PathBuf {
@@ -249,11 +250,11 @@ pub fn reconstruct_file(
         // `out` is dropped (closed) here, before the rename below.
     };
     if let Err(e) = assemble().and_then(|()| {
-        fs::rename(&tmp_path, out_path)?;
+        rename_path(&tmp_path, out_path)?;
         sync_parent_directory(out_path)?;
         Ok(())
     }) {
-        let _ = fs::remove_file(&tmp_path);
+        let _ = remove_path(&tmp_path);
         return Err(e);
     }
     Ok(())
@@ -303,9 +304,10 @@ pub fn write_placeholder(
         file.sync_all()?;
         Ok(())
     };
-    if let Err(error) = prepare().and_then(|()| fs::rename(&tmp_path, out_path).map_err(Into::into))
+    if let Err(error) =
+        prepare().and_then(|()| rename_path(&tmp_path, out_path).map_err(Into::into))
     {
-        let _ = fs::remove_file(&tmp_path);
+        let _ = remove_path(&tmp_path);
         return Err(error);
     }
     // Once rename succeeds, callers must advance their index state to
@@ -366,8 +368,11 @@ pub fn materialize_symlink(out_path: &Path, target: &[u8]) -> Result<(), Storage
         fs::create_dir_all(parent)?;
     }
     let tmp_path = unique_tmp_path(out_path);
-    std::os::unix::fs::symlink(yadorilink_root_authority::fs_identity::bytes_to_target(target), &tmp_path)?;
-    fs::rename(&tmp_path, out_path)?;
+    std::os::unix::fs::symlink(
+        yadorilink_root_authority::fs_identity::bytes_to_target(target),
+        &tmp_path,
+    )?;
+    rename_path(&tmp_path, out_path)?;
     Ok(())
 }
 
@@ -423,7 +428,7 @@ pub fn materialize_symlink_windows(out_path: &Path, target: &[u8]) -> Result<(),
         std::os::windows::fs::symlink_file(&target, &tmp_path)
     };
     if let Err(e) = create_result {
-        let _ = fs::remove_file(&tmp_path);
+        let _ = remove_path(&tmp_path);
         return Err(StorageError::from(std::io::Error::new(
             e.kind(),
             format!(
@@ -433,7 +438,7 @@ pub fn materialize_symlink_windows(out_path: &Path, target: &[u8]) -> Result<(),
             ),
         )));
     }
-    fs::rename(&tmp_path, out_path)?;
+    rename_path(&tmp_path, out_path)?;
     Ok(())
 }
 

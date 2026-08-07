@@ -944,8 +944,10 @@ impl LocalChangeProcessor {
                     &self.device_id,
                     ChangeContent { ops: chunk_ops, versions: &chunk_versions },
                     chunk_metas,
-                    emitter,
-                    &self.begin_operation()?.permit(),
+                    crate::ports::LocalChangeEmission {
+                        emitter,
+                        permit: &self.begin_operation()?.permit(),
+                    },
                 ) {
                     Ok(_) => committed.extend_from_slice(chunk_records),
                     // The group's policy is stale or has not loaded yet this
@@ -1321,8 +1323,10 @@ impl LocalChangeProcessor {
                                     versions: std::slice::from_ref(&version),
                                 },
                                 Some(&meta),
-                                emitter,
-                                &self.begin_operation()?.permit(),
+                                crate::ports::LocalChangeEmission {
+                                    emitter,
+                                    permit: &self.begin_operation()?.permit(),
+                                },
                             )?;
                         }
                         None => {
@@ -2925,11 +2929,20 @@ mod tests {
         };
         state
             .file_index_repository()
-            .upsert_file("group-1", &record, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests())
+            .upsert_file(
+                "group-1",
+                &record,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
             .unwrap();
         state
             .file_index_repository()
-            .set_exec_bit("group-1", "received.sh", false, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests())
+            .set_exec_bit(
+                "group-1",
+                "received.sh",
+                false,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
             .unwrap();
 
         // Sanity: the on-disk mtime really was stamped to match the index
@@ -3041,7 +3054,11 @@ mod tests {
         desynced.mtime_unix_nanos += 1;
         state
             .file_index_repository()
-            .upsert_file("group-1", &desynced, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests())
+            .upsert_file(
+                "group-1",
+                &desynced,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
             .unwrap();
 
         // The genuine local edit: chmod +x, content untouched.
@@ -3101,11 +3118,20 @@ mod tests {
         };
         state
             .file_index_repository()
-            .upsert_file("group-1", &record, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests())
+            .upsert_file(
+                "group-1",
+                &record,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
             .unwrap();
         state
             .file_index_repository()
-            .set_exec_bit("group-1", "mirrored.txt", true, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests())
+            .set_exec_bit(
+                "group-1",
+                "mirrored.txt",
+                true,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
             .unwrap();
 
         let calls_before = store.put_call_count();

@@ -8,8 +8,11 @@
 
 use std::sync::Arc;
 
-use yadorilink_replica_domain::session_state::{FolderLink, MembershipCommitMode, MembershipDurabilityScope, MembershipOperationAction, MembershipOperationScan};
 use crate::sync_error::SyncError;
+use yadorilink_replica_domain::session_state::{
+    FolderLink, MembershipCommitMode, MembershipDurabilityScope, MembershipOperationAction,
+    MembershipOperationScan,
+};
 
 use crate::application::ports::MembershipRepository;
 use crate::daemon_state::DaemonState;

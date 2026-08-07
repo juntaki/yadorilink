@@ -15,8 +15,8 @@
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
-use yadorilink_replica_domain::ids::ChangeHash;
 use crate::error::SyncSqliteError;
+use yadorilink_replica_domain::ids::ChangeHash;
 
 const CAUSAL_BASIS_DOMAIN_TAG: &[u8; 8] = b"YLNKbas\x01";
 

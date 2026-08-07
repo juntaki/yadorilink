@@ -9,8 +9,8 @@
 use rusqlite::Connection;
 
 use super::retained_history_integrity::{hash_from_blob, lamport_of, pruned_lamport};
-use yadorilink_replica_domain::ids::ChangeHash;
 use crate::error::SyncSqliteError;
+use yadorilink_replica_domain::ids::ChangeHash;
 
 /// The largest logical clock among those of `parents` that are present,
 /// counting both live and pruned parents. A live parent's clock comes from

@@ -1640,7 +1640,12 @@ mod migration_safety_tests {
             "the link must be rolled back, not left behind"
         );
         assert!(
-            state.replica_coordinator.enrollment_repository().list_pending_enrollments().unwrap().is_empty(),
+            state
+                .replica_coordinator
+                .enrollment_repository()
+                .list_pending_enrollments()
+                .unwrap()
+                .is_empty(),
             "the pending-enrollment marker must be rolled back too -- otherwise nothing ever \
              resolves it, since the link it names doesn't exist"
         );
@@ -1655,7 +1660,8 @@ mod migration_safety_tests {
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         state
             .replica_coordinator
-            .file_index_repository().upsert_file(
+            .file_index_repository()
+            .upsert_file(
                 group_id,
                 &FileRecord {
                     path: "solo.bin".into(),
@@ -1691,9 +1697,13 @@ mod migration_safety_tests {
     /// other device known to store everything, unlinking would leave the group
     /// with no complete copy, so the guard refuses fail-closed.
     #[tokio::test]
-    async fn last_full_replica_cannot_unlink() {
+    async fn control_socket_last_full_replica_cannot_unlink() {
         let state = test_state();
-        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link("/home/alice/Photos", "group-1")
+            .unwrap();
         // A real file to hand off -- an empty group would be vacuously ready
         // regardless of any peer.
         upsert_solo_file(&state, "group-1");
@@ -1717,7 +1727,11 @@ mod migration_safety_tests {
     #[tokio::test]
     async fn recorded_peer_without_a_confirmed_ready_session_still_refused() {
         let state = test_state();
-        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link("/home/alice/Photos", "group-1")
+            .unwrap();
         upsert_solo_file(&state, "group-1");
         state.set_peer_group_full_replica("device-b", "group-1", true);
 
@@ -1739,7 +1753,11 @@ mod migration_safety_tests {
     #[tokio::test]
     async fn full_replica_can_unlink_when_group_has_no_files() {
         let state = test_state();
-        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link("/home/alice/Photos", "group-1")
+            .unwrap();
 
         crate::adapters::build_application_services(state.clone())
             .replica_role
@@ -1754,7 +1772,11 @@ mod migration_safety_tests {
     #[tokio::test]
     async fn forced_unlink_bypasses_the_readiness_gate() {
         let state = test_state();
-        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link("/home/alice/Photos", "group-1")
+            .unwrap();
         upsert_solo_file(&state, "group-1");
 
         crate::adapters::build_application_services(state.clone())
@@ -1771,7 +1793,11 @@ mod migration_safety_tests {
     #[tokio::test]
     async fn forced_unlink_latches_group_durability_unknown() {
         let state = test_state();
-        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link("/home/alice/Photos", "group-1")
+            .unwrap();
         upsert_solo_file(&state, "group-1");
 
         crate::adapters::build_application_services(state.clone())
@@ -1795,7 +1821,11 @@ mod migration_safety_tests {
     #[tokio::test]
     async fn non_forced_unlink_does_not_latch_durability_unknown() {
         let state = test_state();
-        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link("/home/alice/Photos", "group-1")
+            .unwrap();
         // Nothing to hand off, so this succeeds vacuously without needing
         // --force at all.
 
@@ -1818,10 +1848,15 @@ mod migration_safety_tests {
     async fn on_demand_device_can_always_unlink() {
         use yadorilink_replica_domain::session_state::MaterializationPolicy;
         let state = test_state();
-        state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
         state
             .replica_coordinator
-            .link_repository().set_materialization_policy("/home/alice/Photos", MaterializationPolicy::OnDemand)
+            .link_repository()
+            .add_link("/home/alice/Photos", "group-1")
+            .unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .set_materialization_policy("/home/alice/Photos", MaterializationPolicy::OnDemand)
             .unwrap();
 
         crate::adapters::build_application_services(state.clone())
@@ -1848,10 +1883,18 @@ mod migration_safety_tests {
     #[tokio::test]
     async fn policy_invalid_group_id_surfaces_in_status() {
         let healthy_state = test_state();
-        healthy_state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
+        healthy_state
+            .replica_coordinator
+            .link_repository()
+            .add_link("/home/alice/Photos", "group-1")
+            .unwrap();
 
         let policy_invalid_state = test_state();
-        policy_invalid_state.replica_coordinator.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
+        policy_invalid_state
+            .replica_coordinator
+            .link_repository()
+            .add_link("/home/alice/Photos", "group-1")
+            .unwrap();
         // The closest real "policy invalid" signal the daemon can produce
         // today -- a real `policyInvalidGroupIds` entry never reaches this
         // call (that is exactly the gap), but this is the one state
@@ -1923,13 +1966,16 @@ mod migration_safety_tests {
     /// resolves the same way `list` does.
     #[tokio::test]
     async fn list_recovery_operations_reports_a_valid_row() {
-        use yadorilink_replica_domain::session_state::{EnrollmentOperation, EnrollmentOperationState};
         use yadorilink_replica_domain::session_state::EnrollmentKind;
+        use yadorilink_replica_domain::session_state::{
+            EnrollmentOperation, EnrollmentOperationState,
+        };
 
         let state = test_state();
         state
             .replica_coordinator
-            .enrollment_repository().try_insert_enrollment_operation(&EnrollmentOperation {
+            .enrollment_repository()
+            .try_insert_enrollment_operation(&EnrollmentOperation {
                 operation_id: "op-1".to_string(),
                 kind: EnrollmentKind::Create,
                 group_id: Some("group-1".to_string()),
@@ -2115,8 +2161,10 @@ mod migration_safety_tests {
     async fn show_recovery_operation_returns_a_stable_diagnosis() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use yadorilink_replica_domain::session_state::{EnrollmentOperation, EnrollmentOperationState};
         use yadorilink_replica_domain::session_state::EnrollmentKind;
+        use yadorilink_replica_domain::session_state::{
+            EnrollmentOperation, EnrollmentOperationState,
+        };
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -2129,7 +2177,8 @@ mod migration_safety_tests {
         state.set_coordination_client_config(server.uri(), "t".to_string());
         state
             .replica_coordinator
-            .enrollment_repository().try_insert_enrollment_operation(&EnrollmentOperation {
+            .enrollment_repository()
+            .try_insert_enrollment_operation(&EnrollmentOperation {
                 operation_id: "op-1".to_string(),
                 kind: EnrollmentKind::Create,
                 group_id: Some("group-1".to_string()),
@@ -2360,17 +2409,20 @@ mod migration_safety_tests {
     mod recovery_crash_tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        use crate::recovery::{LocalRecoveryEvidence, RecoveryLocalSnapshot, RecoveryOperationKey};
         use crate::replica_coordinator::ReplicaCoordinator;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
         use tokio::sync::Notify;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use yadorilink_replica_domain::session_state::{EnrollmentOperation, EnrollmentOperationState, MembershipCommitMode, MembershipDurabilityScope, MembershipOperation, MembershipOperationAction, MembershipOperationState, PendingEnrollment, RoleLossAction, RoleLossOperationParams, RoleLossOperationState};
-        use crate::recovery::{
-            LocalRecoveryEvidence, RecoveryLocalSnapshot, RecoveryOperationKey,
-        };
         use yadorilink_replica_domain::recovery::RecoveryDomain;
+        use yadorilink_replica_domain::session_state::{
+            EnrollmentOperation, EnrollmentOperationState, MembershipCommitMode,
+            MembershipDurabilityScope, MembershipOperation, MembershipOperationAction,
+            MembershipOperationState, PendingEnrollment, RoleLossAction, RoleLossOperationParams,
+            RoleLossOperationState,
+        };
 
         use super::*;
 
@@ -2459,7 +2511,10 @@ mod migration_safety_tests {
         /// SAME file -- the actual crash-and-restart this module qualifies
         /// against, not an in-memory stand-in that never round-trips through
         /// disk at all.
-        fn reopen(db_path: &std::path::Path, sync_state: Arc<ReplicaCoordinator>) -> Arc<ReplicaCoordinator> {
+        fn reopen(
+            db_path: &std::path::Path,
+            sync_state: Arc<ReplicaCoordinator>,
+        ) -> Arc<ReplicaCoordinator> {
             drop(sync_state);
             Arc::new(ReplicaCoordinator::open(db_path).unwrap())
         }
@@ -2577,7 +2632,8 @@ mod migration_safety_tests {
             // 1. Build a persisted journal state.
             let sync_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
             sync_state
-                .enrollment_repository().try_insert_enrollment_operation(&base_operation(
+                .enrollment_repository()
+                .try_insert_enrollment_operation(&base_operation(
                     case.kind,
                     case.state,
                     case.group_id,
@@ -2587,7 +2643,8 @@ mod migration_safety_tests {
                 .unwrap();
             if case.with_link_and_marker {
                 sync_state
-                    .enrollment_repository().add_link_with_pending_enrollment(LOCAL_PATH, GROUP_ID, &marker(case.kind))
+                    .enrollment_repository()
+                    .add_link_with_pending_enrollment(LOCAL_PATH, GROUP_ID, &marker(case.kind))
                     .unwrap();
             }
 
@@ -3174,7 +3231,8 @@ mod migration_safety_tests {
 
             let sync_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
             sync_state
-                .enrollment_repository().try_insert_enrollment_operation(&base_operation(
+                .enrollment_repository()
+                .try_insert_enrollment_operation(&base_operation(
                     EnrollmentKind::Create,
                     EnrollmentOperationState::ActivationPending,
                     Some(GROUP_ID),
@@ -3183,7 +3241,8 @@ mod migration_safety_tests {
                 ))
                 .unwrap();
             sync_state
-                .enrollment_repository().add_link_with_pending_enrollment(
+                .enrollment_repository()
+                .add_link_with_pending_enrollment(
                     LOCAL_PATH,
                     GROUP_ID,
                     &marker(EnrollmentKind::Create),
@@ -3229,7 +3288,8 @@ mod migration_safety_tests {
             // long the mutation below takes.
             server.request_received.notified().await;
             mutator_state
-                .enrollment_repository().mark_enrollment_operation_state(
+                .enrollment_repository()
+                .mark_enrollment_operation_state(
                     "op-1",
                     EnrollmentOperationState::CancelPending,
                     None,
@@ -3295,7 +3355,8 @@ mod migration_safety_tests {
             let latch_group_ids: Vec<String> =
                 fixture.latch_group_ids.iter().map(|s| s.to_string()).collect();
             sync_state
-                .membership_operation_repository().try_insert_membership_operation(
+                .membership_operation_repository()
+                .try_insert_membership_operation(
                     "op-1",
                     fixture.action,
                     fixture.commit_mode,
@@ -3310,7 +3371,11 @@ mod migration_safety_tests {
                     1,
                 )
                 .unwrap();
-            sync_state.membership_operation_repository().get_membership_operation("op-1").unwrap().unwrap()
+            sync_state
+                .membership_operation_repository()
+                .get_membership_operation("op-1")
+                .unwrap()
+                .unwrap()
         }
 
         fn membership_result_json(affected_group_ids: Option<&[&str]>) -> serde_json::Value {
@@ -3900,7 +3965,8 @@ mod migration_safety_tests {
 
             server.request_received.notified().await;
             mutator_state
-                .membership_operation_repository().mark_membership_operation_state(
+                .membership_operation_repository()
+                .mark_membership_operation_state(
                     "op-1",
                     MembershipOperationState::LocalSettlementPending,
                     None,
@@ -3953,7 +4019,8 @@ mod migration_safety_tests {
             fixture: &RoleLossFixture,
         ) -> yadorilink_replica_domain::session_state::RoleLossOperation {
             sync_state
-                .role_loss_operation_repository().insert_role_loss_operation(
+                .role_loss_operation_repository()
+                .insert_role_loss_operation(
                     "op-1",
                     ROLE_LOSS_GROUP_ID,
                     RoleLossOperationParams {
@@ -3968,17 +4035,25 @@ mod migration_safety_tests {
                 .unwrap();
             if fixture.state != RoleLossOperationState::Prepared {
                 sync_state
-                    .role_loss_operation_repository().mark_role_loss_worker_committed(
+                    .role_loss_operation_repository()
+                    .mark_role_loss_worker_committed(
                         "op-1",
                         fixture.worker_membership_generation.unwrap_or(4),
                         1,
                     )
                     .unwrap();
                 if fixture.state != RoleLossOperationState::WorkerCommitted {
-                    sync_state.role_loss_operation_repository().advance_role_loss_operation("op-1", fixture.state, 1).unwrap();
+                    sync_state
+                        .role_loss_operation_repository()
+                        .advance_role_loss_operation("op-1", fixture.state, 1)
+                        .unwrap();
                 }
             }
-            sync_state.role_loss_operation_repository().get_role_loss_operation("op-1").unwrap().unwrap()
+            sync_state
+                .role_loss_operation_repository()
+                .get_role_loss_operation("op-1")
+                .unwrap()
+                .unwrap()
         }
 
         enum RoleLossRemote {
@@ -4568,7 +4643,8 @@ mod migration_safety_tests {
 
             server.request_received.notified().await;
             mutator_state
-                .role_loss_operation_repository().advance_role_loss_operation("op-1", RoleLossOperationState::Compensating, 2)
+                .role_loss_operation_repository()
+                .advance_role_loss_operation("op-1", RoleLossOperationState::Compensating, 2)
                 .unwrap();
             server.release_response.notify_one();
 

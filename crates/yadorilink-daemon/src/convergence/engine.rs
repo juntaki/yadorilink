@@ -22,10 +22,10 @@ use std::time::Duration;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
+use crate::sync_error::SyncError;
 use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_sync_sqlite::dag_store::DagHashDisposition;
 use yadorilink_sync_sqlite::{MaterializationJob, MaterializationJobState};
-use crate::sync_error::SyncError;
 
 use crate::daemon_state::DaemonState;
 
@@ -173,7 +173,11 @@ fn origin_candidate_index<S>(
         if bytes == [0u8; 32] {
             return None;
         }
-        match state.replica_coordinator.change_history_repository().dag_describe_hash(&ChangeHash(bytes)) {
+        match state
+            .replica_coordinator
+            .change_history_repository()
+            .dag_describe_hash(&ChangeHash(bytes))
+        {
             Ok(DagHashDisposition::Admitted { change, .. }) => Some(change.device_id.0),
             _ => None,
         }
@@ -243,7 +247,10 @@ pub async fn run(state: Arc<DaemonState>) {
 /// unconditional bulk re-arm with no such version guard.
 fn resume_after_restart(state: &Arc<DaemonState>) -> Result<(), SyncError> {
     let now = now_unix_nanos();
-    let recovered = state.replica_coordinator.materialization_job_repository().materialization_recover_after_restart(now)?;
+    let recovered = state
+        .replica_coordinator
+        .materialization_job_repository()
+        .materialization_recover_after_restart(now)?;
     if recovered > 0 {
         tracing::info!(count = recovered, "resumed unfinished materialization jobs after restart");
     }
@@ -258,12 +265,15 @@ fn resume_after_restart(state: &Arc<DaemonState>) -> Result<(), SyncError> {
 async fn run_once(state: &Arc<DaemonState>) {
     let now = now_unix_nanos();
     let stale_active_before = now - STALE_ACTIVE_PROCESSING_THRESHOLD.as_nanos() as i64;
-    let runnable = match state.replica_coordinator.materialization_job_repository().materialization_claim_runnable_jobs(
-        now,
-        stale_active_before,
-        MAX_JOBS_PER_TICK_PER_GROUP,
-        MAX_JOBS_PER_TICK,
-    ) {
+    let runnable = match state
+        .replica_coordinator
+        .materialization_job_repository()
+        .materialization_claim_runnable_jobs(
+            now,
+            stale_active_before,
+            MAX_JOBS_PER_TICK_PER_GROUP,
+            MAX_JOBS_PER_TICK,
+        ) {
         Ok(jobs) => jobs,
         Err(e) => {
             tracing::warn!(error = %e, "convergence engine failed to claim runnable jobs");
@@ -369,16 +379,17 @@ async fn process_group(
     // will not match), leaving it exactly where it already was for a future
     // tick to pick up — never silently wrong, only silently deferred.
     for job in &jobs_in_group {
-        let _ = state.replica_coordinator.materialization_job_repository().materialization_transition(
-            &job.group_id,
-            &job.path,
-            &job.version_hash,
-            job.state,
-            MaterializationJobState::Planning,
-            None,
-            None,
-            now,
-        );
+        let _ =
+            state.replica_coordinator.materialization_job_repository().materialization_transition(
+                &job.group_id,
+                &job.path,
+                &job.version_hash,
+                job.state,
+                MaterializationJobState::Planning,
+                None,
+                None,
+                now,
+            );
     }
 
     // Read-only here — advanced by however many candidates this call
@@ -608,7 +619,8 @@ async fn process_group(
     // logs emitted deeper in `reconcile_local_materialization_audit`.
     let dag_heads_digest = state
         .replica_coordinator
-        .sqlite().dag_group_heads(&group_id)
+        .sqlite()
+        .dag_group_heads(&group_id)
         .ok()
         .map(|heads| heads.iter().map(|h| hex::encode(h.0)).collect::<Vec<_>>().join(","));
     for job in &jobs_in_group {
@@ -628,14 +640,17 @@ async fn process_group(
                 job_state_after = "rescheduled (no penalty)",
                 "job rescheduled without penalty: no trustworthy audit this tick"
             );
-            let _ = state.replica_coordinator.materialization_job_repository().materialization_reschedule_after_skip(
-                &job.group_id,
-                &job.path,
-                &job.version_hash,
-                MaterializationJobState::Planning,
-                next_retry_at,
-                now,
-            );
+            let _ = state
+                .replica_coordinator
+                .materialization_job_repository()
+                .materialization_reschedule_after_skip(
+                    &job.group_id,
+                    &job.path,
+                    &job.version_hash,
+                    MaterializationJobState::Planning,
+                    next_retry_at,
+                    now,
+                );
         } else if !considered.contains(&job.path) {
             // This path was never attempted this tick at all (excluded by
             // `MAX_PATHS_PER_RECONCILE_ATTEMPT`'s budget) — not a failure,
@@ -654,14 +669,17 @@ async fn process_group(
                 job_state_after = "rescheduled (no penalty)",
                 "job rescheduled without penalty: excluded by this tick's path budget"
             );
-            let _ = state.replica_coordinator.materialization_job_repository().materialization_reschedule_after_skip(
-                &job.group_id,
-                &job.path,
-                &job.version_hash,
-                MaterializationJobState::Planning,
-                next_retry_at,
-                now,
-            );
+            let _ = state
+                .replica_coordinator
+                .materialization_job_repository()
+                .materialization_reschedule_after_skip(
+                    &job.group_id,
+                    &job.path,
+                    &job.version_hash,
+                    MaterializationJobState::Planning,
+                    next_retry_at,
+                    now,
+                );
         } else if remaining.contains(&job.path) {
             let next_retry_at = now + next_backoff(job.attempt + 1).as_nanos() as i64;
             tracing::debug!(
@@ -675,16 +693,19 @@ async fn process_group(
                 projection_status = "retry",
                 "job marked Backoff: direct projection reported this path as needing retry"
             );
-            let _ = state.replica_coordinator.materialization_job_repository().materialization_mark_backoff(
-                &job.group_id,
-                &job.path,
-                &job.version_hash,
-                MaterializationJobState::Planning,
-                "materialization attempt did not complete against any reachable peer; see \
+            let _ = state
+                .replica_coordinator
+                .materialization_job_repository()
+                .materialization_mark_backoff(
+                    &job.group_id,
+                    &job.path,
+                    &job.version_hash,
+                    MaterializationJobState::Planning,
+                    "materialization attempt did not complete against any reachable peer; see \
                  daemon logs for the specific fetch/disk error",
-                next_retry_at,
-                now,
-            );
+                    next_retry_at,
+                    now,
+                );
         } else {
             tracing::debug!(
                 local_device_id = %state.device_id,
@@ -697,16 +718,19 @@ async fn process_group(
                 projection_status = "settled",
                 "job marked Completed after direct projection verification"
             );
-            let _ = state.replica_coordinator.materialization_job_repository().materialization_transition(
-                &job.group_id,
-                &job.path,
-                &job.version_hash,
-                MaterializationJobState::Planning,
-                MaterializationJobState::Completed,
-                None,
-                None,
-                now,
-            );
+            let _ = state
+                .replica_coordinator
+                .materialization_job_repository()
+                .materialization_transition(
+                    &job.group_id,
+                    &job.path,
+                    &job.version_hash,
+                    MaterializationJobState::Planning,
+                    MaterializationJobState::Completed,
+                    None,
+                    None,
+                    now,
+                );
         }
     }
     let elapsed = process_group_started.elapsed();
@@ -735,15 +759,18 @@ fn back_off_group(state: &Arc<DaemonState>, jobs: &[MaterializationJob], waiting
     let now = now_unix_nanos();
     for job in jobs {
         let next_retry_at = now + next_backoff(job.attempt + 1).as_nanos() as i64;
-        let _ = state.replica_coordinator.materialization_job_repository().materialization_mark_backoff(
-            &job.group_id,
-            &job.path,
-            &job.version_hash,
-            job.state,
-            waiting_reason,
-            next_retry_at,
-            now,
-        );
+        let _ = state
+            .replica_coordinator
+            .materialization_job_repository()
+            .materialization_mark_backoff(
+                &job.group_id,
+                &job.path,
+                &job.version_hash,
+                job.state,
+                waiting_reason,
+                next_retry_at,
+                now,
+            );
     }
 }
 

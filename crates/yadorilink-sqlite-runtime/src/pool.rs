@@ -31,9 +31,7 @@ pub type ConnectionPool = Pool<SqliteConnectionManager>;
 /// Checks out a connection from `pool`, converting whichever concrete
 /// error type the real `r2d2::Pool` or the madsim inline pool produces
 /// into the caller's own error type `E`.
-pub(crate) fn checkout<E: SqlOperationError>(
-    pool: &ConnectionPool,
-) -> Result<PooledConnection, E> {
+pub(crate) fn checkout<E: SqlOperationError>(pool: &ConnectionPool) -> Result<PooledConnection, E> {
     pool.get().map(PooledConnection).map_err(E::from)
 }
 

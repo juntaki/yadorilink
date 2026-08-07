@@ -50,6 +50,12 @@ impl LinkLifecycleService {
                 live_for_group.join(", ")
             )));
         }
+        if command.pending_enrollment.is_none()
+            && live_for_group.iter().any(|path| path == &command.local_path)
+            && self.watcher.is_ready(&command.local_path)
+        {
+            return Ok(());
+        }
 
         let existing_paths = self.repository.list_link_paths()?;
         let preflight = yadorilink_local_storage::link_preflight::run_preflight(

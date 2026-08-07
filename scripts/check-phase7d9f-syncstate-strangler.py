@@ -160,6 +160,11 @@ def syncstate_method_counts(entries: list[dict]) -> tuple[int, int]:
 
 def index_rs_production_lines(path: Path) -> int:
     if not path.is_file():
+        # Phase 7D-10 completed the strangler by deleting sync-core. The
+        # terminal metric is therefore zero, but a missing index.rs remains
+        # an error if the retired crate itself has reappeared partially.
+        if not path.parent.parent.exists():
+            return 0
         raise GateError(f"{path} does not exist")
     lines = path.read_text(encoding="utf-8").splitlines()
     excluded = _cfg_test_line_ranges(lines)

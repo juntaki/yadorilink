@@ -1,12 +1,12 @@
 use rusqlite::Connection;
 use yadorilink_replica_domain::change::{ChangeAuth, Op};
+use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
 use yadorilink_replica_domain::ids::{BlockHash, SyncPath};
 use yadorilink_sync_sqlite::dag_store::{
     emit_local_change, group_file_version_references_block, init_dag_schema, put_file_version,
     ChangeEmitter,
 };
-use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_sync_sqlite::SyncSqliteError as SyncError;
 
 fn conn() -> Connection {

@@ -32,10 +32,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use sha2::{Digest, Sha256};
-
-use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId};
 use crate::error::ReplicaEngineError;
+use yadorilink_replica_domain::ids::{ChangeHash, DeviceId, FolderGroupId};
 
 // --- Store trait surface ----------------------------------------------------
 
@@ -62,7 +60,11 @@ pub trait CompactionDagStore {
     /// wired their prune-proof store must fail closed. Treating an unknown hash
     /// as pruned is unsafe because it may be a legitimate offline-created head
     /// this replica has never observed.
-    fn was_pruned(&self, _group: &FolderGroupId, _change: &ChangeHash) -> Result<bool, ReplicaEngineError> {
+    fn was_pruned(
+        &self,
+        _group: &FolderGroupId,
+        _change: &ChangeHash,
+    ) -> Result<bool, ReplicaEngineError> {
         Ok(false)
     }
 }
@@ -91,10 +93,16 @@ pub trait DeviceFrontierStore {
 
 /// Persistence for checkpoints and atomic prefix deletion.
 pub trait CheckpointStore {
-    fn latest_checkpoint(&self, group: &FolderGroupId) -> Result<Option<Checkpoint>, ReplicaEngineError>;
+    fn latest_checkpoint(
+        &self,
+        group: &FolderGroupId,
+    ) -> Result<Option<Checkpoint>, ReplicaEngineError>;
 
-    fn commit_prune(&self, checkpoint: &Checkpoint, pruned: &[ChangeHash])
-        -> Result<(), ReplicaEngineError>;
+    fn commit_prune(
+        &self,
+        checkpoint: &Checkpoint,
+        pruned: &[ChangeHash],
+    ) -> Result<(), ReplicaEngineError>;
 
     /// The checkpoint hash that immediately preceded this store's own
     /// *current* HistoryBase for `group` — `None` if this store has never
@@ -415,88 +423,6 @@ pub fn plan_rebootstrap<S: CompactionStore>(
         None => Err(ReplicaEngineError::CorruptState(
             "local prune attestation exists but no checkpoint is retained".into(),
         )),
-    }
-}
-
-// --- Canonical encoding primitives ----------------------------------------
-
-fn put_u32(buf: &mut Vec<u8>, value: u32) {
-    buf.extend_from_slice(&value.to_be_bytes());
-}
-
-fn put_len_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
-    put_u32(buf, bytes.len() as u32);
-    buf.extend_from_slice(bytes);
-}
-
-fn put_str(buf: &mut Vec<u8>, value: &str) {
-    put_len_bytes(buf, value.as_bytes());
-}
-
-fn decode_err(message: &str) -> ReplicaEngineError {
-    // `ReplicaEngineError` has no `Chunking` variant (that was
-    // `SyncError`'s own, unused by anything else in this module) --
-    // `CorruptState` is the correct fit: this always signals malformed
-    // persisted checkpoint bytes, not an I/O-layer chunking failure.
-    ReplicaEngineError::CorruptState(format!("checkpoint decode: {message}"))
-}
-
-struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
-    }
-
-    fn remaining(&self) -> usize {
-        self.buf.len() - self.pos
-    }
-
-    fn take(&mut self, count: usize) -> Result<&'a [u8], ReplicaEngineError> {
-        if self.remaining() < count {
-            return Err(decode_err("unexpected end of input"));
-        }
-        let out = &self.buf[self.pos..self.pos + count];
-        self.pos += count;
-        Ok(out)
-    }
-
-    fn u32(&mut self) -> Result<u32, ReplicaEngineError> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
-    }
-
-    fn array32(&mut self) -> Result<[u8; 32], ReplicaEngineError> {
-        Ok(self.take(32)?.try_into().unwrap())
-    }
-
-    fn bounded_count(&mut self, min_entry_size: usize, max: usize) -> Result<usize, ReplicaEngineError> {
-        let count = self.u32()? as usize;
-        if count > max {
-            return Err(decode_err(&format!("count {count} exceeds bound {max}")));
-        }
-        if min_entry_size > 0 && count > self.remaining() / min_entry_size {
-            return Err(decode_err(&format!(
-                "count {count} exceeds the {} entries the remaining bytes can hold",
-                self.remaining() / min_entry_size
-            )));
-        }
-        Ok(count)
-    }
-
-    fn string(&mut self) -> Result<String, ReplicaEngineError> {
-        let count = self.u32()? as usize;
-        let bytes = self.take(count)?.to_vec();
-        String::from_utf8(bytes).map_err(|_| decode_err("group id is not valid utf-8"))
-    }
-
-    fn expect_end(&self) -> Result<(), ReplicaEngineError> {
-        if self.remaining() != 0 {
-            return Err(decode_err("trailing bytes"));
-        }
-        Ok(())
     }
 }
 

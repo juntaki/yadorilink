@@ -125,7 +125,9 @@ mod http {
         match response.payload {
             Some(RespPayload::RemoveDeviceCommand(response)) => match response.result {
                 Some(remove_device_command_response::Result::Outcome(outcome)) => {
-                    crate::commands::membership_render::render_membership_outcome("remove", &outcome);
+                    crate::commands::membership_render::render_membership_outcome(
+                        "remove", &outcome,
+                    );
                 }
                 Some(remove_device_command_response::Result::Error(error)) => {
                     return Err(CliError::Other(error.message));

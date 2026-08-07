@@ -20,7 +20,9 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use support::{open_file_backed_replica_coordinator, real_entry_names, wait_until_or_stalled, TestAccount};
+use support::{
+    open_file_backed_replica_coordinator, real_entry_names, wait_until_or_stalled, TestAccount,
+};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::FsBlockStore;
@@ -393,7 +395,12 @@ async fn run_taguchi_row(
                         .iter()
                         .enumerate()
                         .map(|(i, d)| {
-                            match d.state.replica_coordinator.materialization_job_repository().materialization_get_job(&group_id, path) {
+                            match d
+                                .state
+                                .replica_coordinator
+                                .materialization_job_repository()
+                                .materialization_get_job(&group_id, path)
+                            {
                                 Ok(Some(job)) => format!(
                                     "device-{i}=(state={:?}, attempt={}, next_retry_at={:?}, \
                                      updated_at={}, waiting_reason={:?}, version_hash={})",

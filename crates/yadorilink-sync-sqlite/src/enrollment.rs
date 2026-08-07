@@ -25,7 +25,9 @@ use rusqlite::OptionalExtension;
 
 use crate::error::SyncSqliteError;
 use crate::read_inventory_operation_id;
-use yadorilink_replica_domain::recovery::{InvalidRecoveryOperation, InventoryScanResult, RecoveryDomain};
+use yadorilink_replica_domain::recovery::{
+    InvalidRecoveryOperation, InventoryScanResult, RecoveryDomain,
+};
 use yadorilink_replica_domain::session_state::{
     EnrollmentKind, EnrollmentOperation, EnrollmentOperationScan, EnrollmentOperationState,
     InvalidEnrollmentOperation, InvalidPendingEnrollment, PendingEnrollment, PendingEnrollmentScan,
@@ -147,7 +149,10 @@ impl EnrollmentRepository {
     /// `add_link_with_pending_enrollment` is the atomic version used when
     /// the link itself is being created in the same step; this standalone
     /// form exists for callers (and tests) that only need the marker.
-    pub fn record_pending_enrollment(&self, marker: &PendingEnrollment) -> Result<(), SyncSqliteError> {
+    pub fn record_pending_enrollment(
+        &self,
+        marker: &PendingEnrollment,
+    ) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO pending_enrollments \
@@ -291,7 +296,9 @@ impl EnrollmentRepository {
     /// [`Self::scan_open_membership_operations`]'s own doc comment for why
     /// this is a deny-list: an unrecognized `state` string still surfaces
     /// here instead of silently sitting outside every future sweep.
-    pub fn scan_open_enrollment_operations(&self) -> Result<EnrollmentOperationScan, SyncSqliteError> {
+    pub fn scan_open_enrollment_operations(
+        &self,
+    ) -> Result<EnrollmentOperationScan, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT operation_id, kind, group_id, group_name, device_id, local_path, \
@@ -693,9 +700,7 @@ impl EnrollmentRepository {
 // `validate_enrollment_operation`'s rules a second time -- same precedent as
 // `row_to_membership_operation`/`row_to_role_loss_operation_strict`'s own
 // `pub` bump (Phase 7D-9F, eighth pass).
-pub fn row_to_pending_enrollment(
-    r: &rusqlite::Row<'_>,
-) -> rusqlite::Result<PendingEnrollment> {
+pub fn row_to_pending_enrollment(r: &rusqlite::Row<'_>) -> rusqlite::Result<PendingEnrollment> {
     let kind_raw: String = r.get(1)?;
     let kind = EnrollmentKind::try_from_db_str(&kind_raw)
         .map_err(|error| enrollment_decode_error(1, error))?;
@@ -772,9 +777,7 @@ pub(crate) fn validate_enrollment_operation(operation: &EnrollmentOperation) -> 
 
 // `pub` for the same cross-crate `RecoverySnapshotReader` reason as
 // [`row_to_pending_enrollment`] above.
-pub fn row_to_enrollment_operation(
-    r: &rusqlite::Row<'_>,
-) -> rusqlite::Result<EnrollmentOperation> {
+pub fn row_to_enrollment_operation(r: &rusqlite::Row<'_>) -> rusqlite::Result<EnrollmentOperation> {
     let kind_raw: String = r.get(1)?;
     let state_raw: String = r.get(7)?;
     let kind = EnrollmentKind::try_from_db_str(&kind_raw)

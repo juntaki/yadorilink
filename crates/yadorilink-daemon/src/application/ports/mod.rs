@@ -43,8 +43,8 @@ pub(crate) use membership::{
 };
 #[allow(unused_imports)]
 pub(crate) use replica_role::{
-    HandoffReadinessPort, LinkRuntimePort, PlaceholderPipelineCapabilityPort, ReplicaRoleRepository,
-    RoleLossCoordination, RoleLossJournal,
+    HandoffReadinessPort, LinkRuntimePort, PlaceholderPipelineCapabilityPort,
+    ReplicaRoleRepository, RoleLossCoordination, RoleLossJournal,
 };
 #[allow(unused_imports)]
 pub(crate) use reporting::{

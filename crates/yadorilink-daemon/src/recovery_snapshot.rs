@@ -380,7 +380,7 @@ pub(crate) fn row_to_local_link_evidence(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+
     use crate::recovery::tests::{
         insert_valid_enrollment_op, insert_valid_membership_op, insert_valid_role_loss_op,
     };
@@ -395,7 +395,8 @@ mod tests {
     fn recovery_local_snapshot_enrollment_found_with_exact_link_and_marker() {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
         state
-            .enrollment_repository().try_insert_enrollment_operation(&EnrollmentOperation {
+            .enrollment_repository()
+            .try_insert_enrollment_operation(&EnrollmentOperation {
                 operation_id: "op-1".to_string(),
                 kind: EnrollmentKind::Create,
                 group_id: Some("group-1".to_string()),
@@ -411,7 +412,8 @@ mod tests {
             })
             .unwrap();
         state
-            .enrollment_repository().add_link_with_pending_enrollment(
+            .enrollment_repository()
+            .add_link_with_pending_enrollment(
                 "/home/alice/Photos",
                 "group-1",
                 &PendingEnrollment {
@@ -517,7 +519,8 @@ mod tests {
     fn recovery_local_snapshot_membership_reports_only_actually_present_latches() {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
         state
-            .membership_operation_repository().try_insert_membership_operation(
+            .membership_operation_repository()
+            .try_insert_membership_operation(
                 "op-1",
                 MembershipOperationAction::RemoveDevice,
                 MembershipCommitMode::HandoffRemoveDevice,
@@ -556,7 +559,8 @@ mod tests {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
         state.link_repository().add_link("/home/alice/Photos", "group-1").unwrap();
         state
-            .role_loss_operation_repository().insert_role_loss_operation(
+            .role_loss_operation_repository()
+            .insert_role_loss_operation(
                 "op-1",
                 "group-1",
                 RoleLossOperationParams {
@@ -639,7 +643,8 @@ mod tests {
     fn recovery_local_snapshot_accepts_an_on_demand_create_row_as_valid() {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
         state
-            .enrollment_repository().try_insert_enrollment_operation(&EnrollmentOperation {
+            .enrollment_repository()
+            .try_insert_enrollment_operation(&EnrollmentOperation {
                 operation_id: "op-1".to_string(),
                 kind: EnrollmentKind::Create,
                 group_id: None,
@@ -734,7 +739,8 @@ mod tests {
     fn recovery_local_snapshot_keeps_a_marker_whose_operation_id_matches_but_other_fields_dont() {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
         state
-            .enrollment_repository().try_insert_enrollment_operation(&EnrollmentOperation {
+            .enrollment_repository()
+            .try_insert_enrollment_operation(&EnrollmentOperation {
                 operation_id: "op-1".to_string(),
                 kind: EnrollmentKind::Create,
                 group_id: Some("group-1".to_string()),
@@ -795,7 +801,8 @@ mod tests {
         // needs to see.
         state.link_repository().add_link("/home/alice/Photos", "group-CONFLICTING").unwrap();
         state
-            .enrollment_repository().try_insert_enrollment_operation(&EnrollmentOperation {
+            .enrollment_repository()
+            .try_insert_enrollment_operation(&EnrollmentOperation {
                 operation_id: "op-1".to_string(),
                 kind: EnrollmentKind::Create,
                 group_id: Some("group-1".to_string()),
@@ -850,7 +857,8 @@ mod tests {
             .unwrap();
         state.link_repository().add_link("/home/alice/Photos-new", "group-1").unwrap();
         state
-            .role_loss_operation_repository().insert_role_loss_operation(
+            .role_loss_operation_repository()
+            .insert_role_loss_operation(
                 "op-1",
                 "group-1",
                 RoleLossOperationParams {
@@ -883,7 +891,8 @@ mod tests {
     fn recovery_local_snapshot_reports_invalid_for_a_malformed_pending_marker() {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
         state
-            .enrollment_repository().try_insert_enrollment_operation(&EnrollmentOperation {
+            .enrollment_repository()
+            .try_insert_enrollment_operation(&EnrollmentOperation {
                 operation_id: "op-1".to_string(),
                 kind: EnrollmentKind::Create,
                 group_id: Some("group-1".to_string()),
@@ -963,7 +972,8 @@ mod tests {
         // still None.
         state.link_repository().add_link("/data/photos", "group-existing").unwrap();
         state
-            .enrollment_repository().try_insert_enrollment_operation(&EnrollmentOperation {
+            .enrollment_repository()
+            .try_insert_enrollment_operation(&EnrollmentOperation {
                 operation_id: "op-1".to_string(),
                 kind: EnrollmentKind::Create,
                 group_id: None,
@@ -1002,7 +1012,8 @@ mod tests {
     ) {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
         state
-            .enrollment_repository().try_insert_enrollment_operation(&EnrollmentOperation {
+            .enrollment_repository()
+            .try_insert_enrollment_operation(&EnrollmentOperation {
                 operation_id: "op-1".to_string(),
                 kind: EnrollmentKind::Create,
                 group_id: None,
@@ -1086,7 +1097,8 @@ mod tests {
     fn recovery_local_snapshot_role_loss_group_link_lookup_propagates_a_genuine_db_read_failure() {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
         state
-            .role_loss_operation_repository().insert_role_loss_operation(
+            .role_loss_operation_repository()
+            .insert_role_loss_operation(
                 "op-1",
                 "group-1",
                 RoleLossOperationParams {
@@ -1118,7 +1130,8 @@ mod tests {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
         insert_valid_enrollment_op(&state, "op-1");
         state
-            .enrollment_repository().add_link_with_pending_enrollment(
+            .enrollment_repository()
+            .add_link_with_pending_enrollment(
                 "/home/alice/Photos",
                 "group-1",
                 &PendingEnrollment {
@@ -1141,9 +1154,15 @@ mod tests {
         };
         let _ = state.recovery_snapshot_reader().recovery_local_snapshot(&key).unwrap();
 
-        assert_eq!(before_op, state.enrollment_repository().get_enrollment_operation("op-1").unwrap());
+        assert_eq!(
+            before_op,
+            state.enrollment_repository().get_enrollment_operation("op-1").unwrap()
+        );
         assert_eq!(before_links, state.link_repository().list_links().unwrap());
-        assert_eq!(before_markers, state.enrollment_repository().list_pending_enrollments().unwrap());
+        assert_eq!(
+            before_markers,
+            state.enrollment_repository().list_pending_enrollments().unwrap()
+        );
     }
 
     /// Proves the exact SQLite property `recovery_local_snapshot` depends on:

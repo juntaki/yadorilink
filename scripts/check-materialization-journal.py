@@ -11,7 +11,7 @@ tombstone). That disambiguation only works if EVERY path that commits a
 signal it can read back after a crash. Three such disciplines exist:
 
   * the materialization-intent journal (`MaterializationIntentGuard` in
-    `materialization.rs`): write a durable intent BEFORE the bytes, clear it
+    daemon `materialization_intent.rs`): write a durable intent BEFORE the bytes, clear it
     only AFTER the rename. Used by repair's own reconstruct and by the live peer
     materialize path.
   * the `Placeholder`/`Hydrating` -> `Hydrated` atomic flip: the row is only
@@ -25,8 +25,8 @@ This guard makes the class un-reintroducible in two ways:
 
 1. The materialization-intent WRITE primitives
    (`begin_materialization_intent`, `clear_materialization_intent`) may be
-   called only from the seam module (`materialization.rs`, which owns
-   `MaterializationIntentGuard` and repair) and `index.rs` (their definitions).
+   called only from the guard, startup repair, or an identically named method
+   on a narrow materialization port adapter.
    A new path may not hand-roll intent bookkeeping — it must go through the
    guard. (The `has_materialization_intent` READ is unrestricted: repair, the
    live invariant `debug_assert`, and tests all consult it.)
@@ -44,7 +44,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOTS = [
-    ROOT / "crates/yadorilink-sync-core/src",
+    ROOT / "crates/yadorilink-peer-session/src",
+    ROOT / "crates/yadorilink-filesystem-sync/src",
     ROOT / "crates/yadorilink-daemon/src",
 ]
 
@@ -55,11 +56,23 @@ INTENT_WRITE_TOKENS = (
     "clear_materialization_intent(",
 )
 
-# Files permitted to call the intent-write primitives: `index.rs` defines them,
-# `materialization.rs` owns the `MaterializationIntentGuard` seam and repair.
+# Files that own a complete crash-safe intent discipline rather than merely
+# forwarding a narrow port method.
 INTENT_WRITE_ALLOWED_FILES = {
-    "crates/yadorilink-sync-core/src/index.rs",
-    "crates/yadorilink-sync-core/src/materialization.rs",
+    # The guard owns the durable begin/clear pairing.
+    "crates/yadorilink-daemon/src/materialization_intent.rs",
+    # Startup repair is itself a journal seam: it clears a recovered intent
+    # only after reconstruction succeeds or the row is safely demoted.
+    "crates/yadorilink-filesystem-sync/src/materialization_repair.rs",
+}
+
+# These composition-root modules implement the two materialization ports. A
+# raw primitive is legal there only while implementing the identically named
+# port method; this preserves the capability seam without exempting either
+# file wholesale.
+INTENT_PORT_ADAPTER_FILES = {
+    "crates/yadorilink-daemon/src/replica_coordinator/materialization_execution.rs",
+    "crates/yadorilink-daemon/src/replica_coordinator/materialization_state.rs",
 }
 
 # The single low-level content-to-disk writer.
@@ -69,11 +82,11 @@ RECONSTRUCT_TOKEN = "reconstruct_file("
 # crash-safe disciplines described above). A `reconstruct_file(` call anywhere
 # else is a violation.
 RECONSTRUCT_ALLOWED_FILES = {
-    # Intent-journal seam (repair's own reconstruct).
-    "crates/yadorilink-sync-core/src/materialization.rs",
     # Intent-journal seam (live peer materialize) + Hydrating->Hydrated flip
     # (hydrate_file).
-    "crates/yadorilink-sync-core/src/peer_session.rs",
+    "crates/yadorilink-peer-session/src/peer_session.rs",
+    # Intent-journal seam (repair's own reconstruct).
+    "crates/yadorilink-filesystem-sync/src/materialization_repair.rs",
     # Hydrating->Hydrated flip (daemon hydrate) + restore_operations journal
     # (restore).
     "crates/yadorilink-daemon/src/hydration.rs",
@@ -83,8 +96,8 @@ RECONSTRUCT_ALLOWED_FILES = {
 # sanctioned files. Bump this ONLY when adding a reviewed, provably crash-safe
 # content-write site (and confirm it is bracketed by one of the three
 # disciplines). Current sites:
-#   materialization.rs: reconstruct_file_journaled                       (1)
-#   peer_session.rs:    hydrate_file + materialize's two retry attempts  (3)
+#   materialization_repair.rs: reconstruct_file_journaled                (1)
+#   peer_session.rs:           hydrate_file + two materialize attempts   (3)
 #   hydration.rs:       daemon hydrate + restore                         (2)
 EXPECTED_RECONSTRUCT_CALLS = 6
 
@@ -131,13 +144,25 @@ def production_lines(path: Path) -> list[tuple[int, str]]:
     return out
 
 
+def in_matching_port_method(
+    lines: list[tuple[int, str]], index: int, method: str
+) -> bool:
+    """Return whether a hit is inside the adapter's identically named method."""
+    for _, candidate in reversed(lines[: index + 1]):
+        stripped = candidate.strip()
+        if stripped.startswith("fn "):
+            return stripped.startswith(f"fn {method}(")
+    return False
+
+
 def main() -> int:
     violations: list[str] = []
     reconstruct_hits = 0
     for source_root in SOURCE_ROOTS:
         for path in sorted(source_root.rglob("*.rs")):
             rel = str(path.relative_to(ROOT))
-            for lineno, line in production_lines(path):
+            lines = production_lines(path)
+            for index, (lineno, line) in enumerate(lines):
                 stripped = line.strip()
                 if stripped.startswith("//"):
                     continue
@@ -148,7 +173,12 @@ def main() -> int:
                     # Skip the primitive's own definition.
                     if ("fn " + token[:-1]) in line:
                         continue
-                    if rel not in INTENT_WRITE_ALLOWED_FILES:
+                    method = token[:-1]
+                    adapter_delegation = (
+                        rel in INTENT_PORT_ADAPTER_FILES
+                        and in_matching_port_method(lines, index, method)
+                    )
+                    if rel not in INTENT_WRITE_ALLOWED_FILES and not adapter_delegation:
                         violations.append(
                             f"{rel}:{lineno}: raw `{token[:-1]}` outside the "
                             f"MaterializationIntentGuard seam — route intent "

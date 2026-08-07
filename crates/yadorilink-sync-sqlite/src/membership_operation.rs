@@ -211,22 +211,26 @@ impl MembershipOperationRepository {
             while let Some(row) = rows.next()? {
                 let raw_state: Option<String> = row.get(7).ok();
                 let Some(operation_id) = read_inventory_operation_id(row, 0)? else {
-                    scan.invalid.push(yadorilink_replica_domain::recovery::InvalidRecoveryOperation {
-                        operation_id: None,
-                        domain: yadorilink_replica_domain::recovery::RecoveryDomain::Membership,
-                        raw_state,
-                        detail: "operation_id is not valid TEXT".to_string(),
-                    });
+                    scan.invalid.push(
+                        yadorilink_replica_domain::recovery::InvalidRecoveryOperation {
+                            operation_id: None,
+                            domain: yadorilink_replica_domain::recovery::RecoveryDomain::Membership,
+                            raw_state,
+                            detail: "operation_id is not valid TEXT".to_string(),
+                        },
+                    );
                     continue;
                 };
                 match row_to_membership_operation(row) {
                     Ok(operation) => scan.valid.push(operation),
-                    Err(error) => scan.invalid.push(yadorilink_replica_domain::recovery::InvalidRecoveryOperation {
-                        operation_id: Some(operation_id),
-                        domain: yadorilink_replica_domain::recovery::RecoveryDomain::Membership,
-                        raw_state,
-                        detail: error.to_string(),
-                    }),
+                    Err(error) => scan.invalid.push(
+                        yadorilink_replica_domain::recovery::InvalidRecoveryOperation {
+                            operation_id: Some(operation_id),
+                            domain: yadorilink_replica_domain::recovery::RecoveryDomain::Membership,
+                            raw_state,
+                            detail: error.to_string(),
+                        },
+                    ),
                 }
             }
             Ok(scan)
@@ -243,7 +247,9 @@ impl MembershipOperationRepository {
     /// it and reports it in `invalid` for the caller to mark
     /// `RecoveryBlocked` explicitly rather than leaving it to rot
     /// unreachable.
-    pub fn scan_open_membership_operations(&self) -> Result<MembershipOperationScan, SyncSqliteError> {
+    pub fn scan_open_membership_operations(
+        &self,
+    ) -> Result<MembershipOperationScan, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT operation_id, action, commit_mode, removed_device_id, group_ids, \
@@ -406,9 +412,7 @@ fn validate_membership_operation_shape(
     Ok(())
 }
 
-pub fn row_to_membership_operation(
-    r: &rusqlite::Row<'_>,
-) -> rusqlite::Result<MembershipOperation> {
+pub fn row_to_membership_operation(r: &rusqlite::Row<'_>) -> rusqlite::Result<MembershipOperation> {
     let action_raw: String = r.get(1)?;
     let mode_raw: String = r.get(2)?;
     let group_ids_raw: String = r.get(4)?;

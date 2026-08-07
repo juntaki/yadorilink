@@ -163,7 +163,10 @@ async fn prove_pipeline_is_live_with_a_sentinel_file(
     let content = format!("sentinel content proving the pipeline is live: {sentinel_name}");
     std::fs::write(writer.root.path().join(sentinel_name), content.as_bytes()).unwrap();
     wait_until_with_context(
-        || std::fs::read(reader.root.path().join(sentinel_name)).ok().as_deref() == Some(content.as_bytes()),
+        || {
+            std::fs::read(reader.root.path().join(sentinel_name)).ok().as_deref()
+                == Some(content.as_bytes())
+        },
         Duration::from_secs(15),
         || {
             format!(

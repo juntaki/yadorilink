@@ -15,11 +15,11 @@ use std::time::Duration;
 use boringtun::x25519::{PublicKey, StaticSecret};
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::hydration;
-use yadorilink_local_storage::{BlockStore, DEFAULT_BLOCK_SIZE, FsBlockStore};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+use yadorilink_local_storage::{BlockStore, FsBlockStore, DEFAULT_BLOCK_SIZE};
 use yadorilink_peer_session::peer_session::PeerSyncSession;
-use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
+use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_transport::{PeerChannel, TransportHub};
 
 const GROUP: &str = "shared";
@@ -168,7 +168,8 @@ fn seed_placeholder(
     device
         .state
         .replica_coordinator
-        .file_index_repository().upsert_file(
+        .file_index_repository()
+        .upsert_file(
             GROUP,
             &record,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -177,7 +178,8 @@ fn seed_placeholder(
     device
         .state
         .replica_coordinator
-        .materialization_state_repository().set_materialization_state(
+        .materialization_state_repository()
+        .set_materialization_state(
             GROUP,
             PATH,
             MaterializationState::Placeholder,
@@ -187,7 +189,8 @@ fn seed_placeholder(
     device
         .state
         .replica_coordinator
-        .link_repository().set_materialization_policy(
+        .link_repository()
+        .set_materialization_policy(
             &local_path,
             yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand,
         )
@@ -202,7 +205,8 @@ fn seed_placeholder(
         device
             .state
             .replica_coordinator
-            .change_history_repository().record_group_block_provenance(GROUP, std::slice::from_ref(&block.hash))
+            .change_history_repository()
+            .record_group_block_provenance(GROUP, std::slice::from_ref(&block.hash))
             .unwrap();
     }
 }
@@ -285,7 +289,12 @@ async fn blocks_split_across_two_peers_each_holding_a_disjoint_subset() {
     hydration::hydrate(&device_d.state, GROUP, PATH).await.unwrap();
 
     assert_eq!(
-        device_d.state.replica_coordinator.materialization_state_repository().get_materialization_state(GROUP, PATH).unwrap(),
+        device_d
+            .state
+            .replica_coordinator
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, PATH)
+            .unwrap(),
         Some(MaterializationState::Hydrated)
     );
     let reconstructed = std::fs::read(device_d.root.path().join(PATH)).unwrap();
@@ -343,7 +352,12 @@ async fn a_block_missing_from_every_peer_fails_hydration_cleanly() {
     let result = hydration::hydrate(&device_d.state, GROUP, PATH).await;
     assert!(result.is_err(), "hydration must fail when a block is unavailable from every peer");
     assert_eq!(
-        device_d.state.replica_coordinator.materialization_state_repository().get_materialization_state(GROUP, PATH).unwrap(),
+        device_d
+            .state
+            .replica_coordinator
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, PATH)
+            .unwrap(),
         Some(MaterializationState::Placeholder),
         "file must remain a placeholder, not end up stuck Hydrating or falsely Hydrated"
     );
@@ -404,7 +418,12 @@ async fn ordinary_hydration_error_restores_placeholder_state() {
     let result = hydration::hydrate(&hydrating.state, GROUP, PATH).await;
     assert!(result.is_err(), "the invalid output root must fail hydration");
     assert_eq!(
-        hydrating.state.replica_coordinator.materialization_state_repository().get_materialization_state(GROUP, PATH).unwrap(),
+        hydrating
+            .state
+            .replica_coordinator
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, PATH)
+            .unwrap(),
         Some(MaterializationState::Placeholder),
         "ordinary hydration errors must not leave the file stuck Hydrating"
     );
@@ -433,7 +452,12 @@ async fn corrupt_local_block_restores_placeholder_state() {
     let result = hydration::hydrate(&hydrating.state, GROUP, PATH).await;
     assert!(result.is_err(), "an unrepairable checksum mismatch must fail hydration");
     assert_eq!(
-        hydrating.state.replica_coordinator.materialization_state_repository().get_materialization_state(GROUP, PATH).unwrap(),
+        hydrating
+            .state
+            .replica_coordinator
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, PATH)
+            .unwrap(),
         Some(MaterializationState::Placeholder),
         "corrupt-block hydration failure must restore Placeholder"
     );
@@ -463,10 +487,20 @@ async fn pin_hydrates_via_multiple_peers_and_sets_the_pin_flag() {
     hydration::pin(&device_d.state, GROUP, PATH).await.unwrap();
 
     assert_eq!(
-        device_d.state.replica_coordinator.materialization_state_repository().get_materialization_state(GROUP, PATH).unwrap(),
+        device_d
+            .state
+            .replica_coordinator
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, PATH)
+            .unwrap(),
         Some(MaterializationState::Hydrated)
     );
-    assert!(device_d.state.replica_coordinator.file_index_repository().is_pinned(GROUP, PATH).unwrap());
+    assert!(device_d
+        .state
+        .replica_coordinator
+        .file_index_repository()
+        .is_pinned(GROUP, PATH)
+        .unwrap());
     assert_eq!(std::fs::read(device_d.root.path().join(PATH)).unwrap(), content);
 }
 
@@ -527,7 +561,12 @@ async fn hydration_deadline_bounds_an_unresponsive_peer() {
         "the deadline must bound the whole operation; took {elapsed:?} for a {short_timeout:?} deadline"
     );
     assert_eq!(
-        device_d.state.replica_coordinator.materialization_state_repository().get_materialization_state(GROUP, PATH).unwrap(),
+        device_d
+            .state
+            .replica_coordinator
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, PATH)
+            .unwrap(),
         Some(MaterializationState::Placeholder)
     );
 }
@@ -566,7 +605,12 @@ async fn cancelled_hydration_restores_placeholder_state() {
     let task = tokio::spawn(async move { hydration::hydrate(&state, GROUP, PATH).await });
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if hydrating.state.replica_coordinator.materialization_state_repository().get_materialization_state(GROUP, PATH).unwrap()
+            if hydrating
+                .state
+                .replica_coordinator
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, PATH)
+                .unwrap()
                 == Some(MaterializationState::Hydrating)
             {
                 break;
@@ -580,7 +624,12 @@ async fn cancelled_hydration_restores_placeholder_state() {
     task.abort();
     let _ = task.await;
     assert_eq!(
-        hydrating.state.replica_coordinator.materialization_state_repository().get_materialization_state(GROUP, PATH).unwrap(),
+        hydrating
+            .state
+            .replica_coordinator
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, PATH)
+            .unwrap(),
         Some(MaterializationState::Placeholder),
         "cancelling hydration must not leave the file stuck Hydrating"
     );
@@ -666,7 +715,12 @@ async fn placeholder_with_all_local_blocks_hydrates_without_peers() {
         .expect("all needed blocks are already local; hydration must not require a peer");
 
     assert_eq!(
-        device.state.replica_coordinator.materialization_state_repository().get_materialization_state(GROUP, PATH).unwrap(),
+        device
+            .state
+            .replica_coordinator
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, PATH)
+            .unwrap(),
         Some(MaterializationState::Hydrated)
     );
     assert_eq!(std::fs::read(device.root.path().join(PATH)).unwrap(), content);
@@ -720,7 +774,8 @@ async fn retained_last_local_copy_remains_user_accessible_offline() {
     device
         .state
         .replica_coordinator
-        .materialization_state_repository().set_materialization_state(
+        .materialization_state_repository()
+        .set_materialization_state(
             GROUP,
             PATH,
             MaterializationState::Hydrated,
@@ -739,7 +794,12 @@ async fn retained_last_local_copy_remains_user_accessible_offline() {
     device.state.set_test_placeholder_pipeline_connected(true);
     hydration::evict(&device.state, GROUP, PATH).unwrap();
     assert_eq!(
-        device.state.replica_coordinator.materialization_state_repository().get_materialization_state(GROUP, PATH).unwrap(),
+        device
+            .state
+            .replica_coordinator
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, PATH)
+            .unwrap(),
         Some(MaterializationState::Placeholder),
         "eviction placeholders the on-disk file even when the blocks themselves are retained"
     );

@@ -252,7 +252,9 @@ mod http {
         match response.payload {
             Some(RespPayload::RevokeDeviceCommand(response)) => match response.result {
                 Some(revoke_device_command_response::Result::Outcome(outcome)) => {
-                    crate::commands::membership_render::render_membership_outcome("revoke", &outcome);
+                    crate::commands::membership_render::render_membership_outcome(
+                        "revoke", &outcome,
+                    );
                 }
                 Some(revoke_device_command_response::Result::Error(error)) => {
                     return Err(application_error(error));
@@ -284,7 +286,9 @@ mod http {
         match response.payload {
             Some(RespPayload::RevokeEdgeCommand(response)) => match response.result {
                 Some(revoke_edge_command_response::Result::Outcome(outcome)) => {
-                    crate::commands::membership_render::render_membership_outcome("revoke", &outcome);
+                    crate::commands::membership_render::render_membership_outcome(
+                        "revoke", &outcome,
+                    );
                 }
                 Some(revoke_edge_command_response::Result::Error(error)) => {
                     if ApplicationErrorCode::try_from(error.code)

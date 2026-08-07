@@ -110,7 +110,9 @@ pub(crate) enum EnrollmentKind {
 impl From<EnrollmentKind> for yadorilink_replica_domain::session_state::EnrollmentKind {
     fn from(kind: EnrollmentKind) -> Self {
         match kind {
-            EnrollmentKind::Create => yadorilink_replica_domain::session_state::EnrollmentKind::Create,
+            EnrollmentKind::Create => {
+                yadorilink_replica_domain::session_state::EnrollmentKind::Create
+            }
             EnrollmentKind::Join => yadorilink_replica_domain::session_state::EnrollmentKind::Join,
         }
     }
@@ -624,10 +626,7 @@ mod tests {
             Ok(true)
         }
 
-        fn delete_operation(
-            &self,
-            operation_id: &str,
-        ) -> Result<(), crate::sync_error::SyncError> {
+        fn delete_operation(&self, operation_id: &str) -> Result<(), crate::sync_error::SyncError> {
             self.operations.lock().unwrap().remove(operation_id);
             Ok(())
         }
@@ -663,8 +662,10 @@ mod tests {
 
         fn list_links(
             &self,
-        ) -> Result<Vec<yadorilink_replica_domain::session_state::FolderLink>, crate::sync_error::SyncError>
-        {
+        ) -> Result<
+            Vec<yadorilink_replica_domain::session_state::FolderLink>,
+            crate::sync_error::SyncError,
+        > {
             Ok(Vec::new())
         }
 

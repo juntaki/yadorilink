@@ -137,7 +137,6 @@ impl Drop for OverrideForTest {
     }
 }
 
-
 /// An opaque, provider-issued token identifying one placeholder's current
 /// "generation" — minted at `create` time and compared, not recomputed, at
 /// `inspect` time. Never derived from size/mtime: those are exactly the
@@ -208,7 +207,11 @@ pub trait PlaceholderBackend: Send + Sync {
     /// The provider must inject the bytes itself through its own
     /// platform-mediated write path instead of relying on a plain
     /// `std::fs` write succeeding.
-    fn hydrate(&self, path: &Path, content: &mut dyn std::io::Read) -> Result<(), RootAuthorityError>;
+    fn hydrate(
+        &self,
+        path: &Path,
+        content: &mut dyn std::io::Read,
+    ) -> Result<(), RootAuthorityError>;
 }
 
 #[cfg(test)]

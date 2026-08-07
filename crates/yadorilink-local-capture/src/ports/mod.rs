@@ -20,5 +20,5 @@
 
 mod local_mutation;
 
-pub use local_mutation::LocalMutationStore;
+pub use local_mutation::{LocalChangeEmission, LocalMutationStore};
 pub use yadorilink_local_storage::BlockContentStore;

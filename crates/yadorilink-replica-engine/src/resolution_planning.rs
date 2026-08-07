@@ -758,10 +758,9 @@ mod tests {
     #[test]
     fn resolution_to_group_absent_with_a_materialized_generation_plans_one_removal() {
         let resolution = PathResolution::Absent;
-        let group =
-            resolution_to_group("gone.txt", &resolution, &[], Some(b"tombstone".to_vec()))
-                .unwrap()
-                .unwrap();
+        let group = resolution_to_group("gone.txt", &resolution, &[], Some(b"tombstone".to_vec()))
+            .unwrap()
+            .unwrap();
         assert_eq!(group.placements().len(), 1);
         assert_eq!(group.placements()[0].role, PlacementRole::CanonicalPath);
         assert_eq!(group.placements()[0].target_generation, b"tombstone");
@@ -777,9 +776,8 @@ mod tests {
             }],
         };
         let head_targets = vec![b"winner".to_vec(), b"loser".to_vec()];
-        let group = resolution_to_group("f.txt", &resolution, &head_targets, None)
-            .unwrap()
-            .unwrap();
+        let group =
+            resolution_to_group("f.txt", &resolution, &head_targets, None).unwrap().unwrap();
         assert_eq!(group.placements().len(), 2);
         assert_eq!(group.placements()[0].role, PlacementRole::CanonicalPath);
         assert_eq!(group.placements()[0].target_generation, b"winner");

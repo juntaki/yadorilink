@@ -37,7 +37,11 @@ use yadorilink_root_authority::root_identity::VerifiedRoot;
 /// Links `root` for `group_id` and brings it to the post-first-scan state:
 /// claims the root and opens the group's startup gate. See this module's doc
 /// comment for why `add_link` on its own leaves a device that can never receive.
-pub fn link_and_start(state: &ReplicaCoordinator, root: &Path, group_id: &str) -> Result<(), String> {
+pub fn link_and_start(
+    state: &ReplicaCoordinator,
+    root: &Path,
+    group_id: &str,
+) -> Result<(), String> {
     state.add_link(&root.to_string_lossy(), group_id).map_err(|e| e.to_string())?;
     adopt_root(state, root, group_id)?;
     open_startup_gate(state, group_id);

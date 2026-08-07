@@ -18,11 +18,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use yadorilink_daemon::daemon_state::DaemonState;
+use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{GcRequest, StatusRequest};
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -41,11 +41,9 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>, std::path::Path
         yadorilink_daemon::control_context::ControlContext::from_state(state.clone()),
     );
     tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
-            &serve_path,
-            serve_context,
-        )
-            .await;
+        let _ =
+            yadorilink_daemon::control_socket::unix_transport::serve(&serve_path, serve_context)
+                .await;
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
     (dir, state, blocks_root)

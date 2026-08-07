@@ -21,9 +21,11 @@
 
 use std::sync::Arc;
 
-use yadorilink_replica_domain::session_state::{EnrollmentOperation, EnrollmentOperationState as OpState};
-use yadorilink_replica_domain::session_state::EnrollmentKind as WireEnrollmentKind;
 use crate::sync_error::SyncError;
+use yadorilink_replica_domain::session_state::EnrollmentKind as WireEnrollmentKind;
+use yadorilink_replica_domain::session_state::{
+    EnrollmentOperation, EnrollmentOperationState as OpState,
+};
 
 use super::model::{
     EnrollmentActivationResult, EnrollmentCancellationResult, EnrollmentPrepareResult,
@@ -625,8 +627,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
-    use yadorilink_replica_domain::session_state::{FolderLink, InvalidEnrollmentOperation, InvalidPendingEnrollment, PendingEnrollment};
     use yadorilink_replica_domain::session_state::MaterializationPolicy;
+    use yadorilink_replica_domain::session_state::{
+        FolderLink, InvalidEnrollmentOperation, InvalidPendingEnrollment, PendingEnrollment,
+    };
 
     use super::*;
     use crate::application::ports::EnrollmentLinkRequest;
@@ -680,10 +684,7 @@ mod tests {
             unimplemented!("not exercised by recovery-service tests")
         }
 
-        fn delete_operation(
-            &self,
-            operation_id: &str,
-        ) -> Result<(), crate::sync_error::SyncError> {
+        fn delete_operation(&self, operation_id: &str) -> Result<(), crate::sync_error::SyncError> {
             self.calls.lock().unwrap().push(RepoCall::DeleteOperation(operation_id.to_string()));
             self.operations.lock().unwrap().remove(operation_id);
             Ok(())

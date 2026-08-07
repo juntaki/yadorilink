@@ -16,8 +16,8 @@
 use std::sync::Arc;
 
 use yadorilink_daemon::daemon_state::DaemonState;
-use yadorilink_local_storage::FsBlockStore;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
+use yadorilink_local_storage::FsBlockStore;
 
 async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
@@ -38,11 +38,9 @@ async fn start_daemon() -> (tempfile::TempDir, Arc<DaemonState>) {
         yadorilink_daemon::control_context::ControlContext::from_state(state.clone()),
     );
     tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
-            &serve_path,
-            serve_context,
-        )
-            .await;
+        let _ =
+            yadorilink_daemon::control_socket::unix_transport::serve(&serve_path, serve_context)
+                .await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     (dir, state)
@@ -79,8 +77,14 @@ async fn empty_folder_previews_clean_and_links() {
 
     yadorilink_cli::commands::link::link_resolved(absolute, "group-1".into(), false).await.unwrap();
 
-    let linked: Vec<String> =
-        state.replica_coordinator.link_repository().list_links().unwrap().into_iter().map(|l| l.local_path).collect();
+    let linked: Vec<String> = state
+        .replica_coordinator
+        .link_repository()
+        .list_links()
+        .unwrap()
+        .into_iter()
+        .map(|l| l.local_path)
+        .collect();
     assert!(
         linked.iter().any(|p| p == &folder.canonicalize().unwrap().to_string_lossy()),
         "the linked folder should now be registered with the daemon, got {linked:?}"
@@ -154,8 +158,14 @@ async fn nested_link_is_refused_without_ack_and_allowed_with_ack() {
         .await
         .unwrap();
 
-    let linked: Vec<String> =
-        state.replica_coordinator.link_repository().list_links().unwrap().into_iter().map(|l| l.local_path).collect();
+    let linked: Vec<String> = state
+        .replica_coordinator
+        .link_repository()
+        .list_links()
+        .unwrap()
+        .into_iter()
+        .map(|l| l.local_path)
+        .collect();
     assert!(
         linked.iter().any(|p| p == &parent.canonicalize().unwrap().to_string_lossy()),
         "the acknowledged nested link should now be registered, got {linked:?}"

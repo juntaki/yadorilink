@@ -39,7 +39,7 @@ tracing-subscriber.workspace = true
 # only macOS and Windows are exercised/shipped here (spec's two target
 # platforms), matching this workspace's existing "no Linux desktop target"
 # scope (shell-ext/ is macOS+Windows only too).
-tray-icon = "0.24"
+tray-icon = "0.24.2"
 tao = "0.35"
 # Cross-platform "reveal this path in the native file manager" helper for
 # the Open Folder / reveal-diagnostics-bundle actions -- avoids
@@ -87,7 +87,7 @@ windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 # The per-user HKCU Run-key
 # launch-at-login toggle. `winreg` is the idiomatic Rust registry wrapper
 # (ergonomic create/set/delete over the raw Win32 Reg* calls); Windows-only.
-winreg = "0.52"
+winreg = "0.56"
 
 [dev-dependencies]
 tempfile = "3"

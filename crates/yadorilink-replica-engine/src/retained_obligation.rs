@@ -69,7 +69,7 @@ impl ObligationState {
     /// reads a row through `get`/`create`/the `record_*` functions, all of
     /// which propagate this as a hard error rather than falling back to
     /// treating an undecodable state as safe to delete.
-    pub fn from_str(s: &str) -> Result<Self, ReplicaEngineError> {
+    pub fn parse(s: &str) -> Result<Self, ReplicaEngineError> {
         match s {
             "known_old" => Ok(ObligationState::KnownOld),
             "divergent" => Ok(ObligationState::Divergent),
@@ -212,9 +212,9 @@ pub fn evaluate_deletion_pre_durability(
             captured_change_hash: change_hash,
             captured_version_hash: version_hash,
         }),
-        (None, None) => {
-            Ok(PreDurabilityOutcome::Decided(DeletionDecision::Retain(RetentionReason::NoCapturedChange)))
-        }
+        (None, None) => Ok(PreDurabilityOutcome::Decided(DeletionDecision::Retain(
+            RetentionReason::NoCapturedChange,
+        ))),
         _ => Err(ReplicaEngineError::CorruptState(format!(
             "retained obligation {retained_id} has last_captured_change_hash and \
              last_captured_version_hash set independently -- they must always be written \
@@ -264,14 +264,18 @@ mod tests {
 
     #[test]
     fn obligation_state_round_trips_through_its_string_encoding() {
-        for state in [ObligationState::KnownOld, ObligationState::Divergent, ObligationState::LocalRecoveryOnly] {
-            assert_eq!(ObligationState::from_str(state.as_str()).unwrap(), state);
+        for state in [
+            ObligationState::KnownOld,
+            ObligationState::Divergent,
+            ObligationState::LocalRecoveryOnly,
+        ] {
+            assert_eq!(ObligationState::parse(state.as_str()).unwrap(), state);
         }
     }
 
     #[test]
     fn obligation_state_from_str_rejects_an_unrecognized_value() {
-        assert!(ObligationState::from_str("not_a_real_state").is_err());
+        assert!(ObligationState::parse("not_a_real_state").is_err());
     }
 
     #[test]
@@ -288,7 +292,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             outcome,
-            PreDurabilityOutcome::Decided(DeletionDecision::Retain(RetentionReason::LocalRecoveryOnly))
+            PreDurabilityOutcome::Decided(DeletionDecision::Retain(
+                RetentionReason::LocalRecoveryOnly
+            ))
         );
     }
 
@@ -306,7 +312,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             outcome,
-            PreDurabilityOutcome::Decided(DeletionDecision::Retain(RetentionReason::GraceWindowNotExpired))
+            PreDurabilityOutcome::Decided(DeletionDecision::Retain(
+                RetentionReason::GraceWindowNotExpired
+            ))
         );
     }
 
@@ -324,18 +332,29 @@ mod tests {
         .unwrap();
         assert_eq!(
             outcome,
-            PreDurabilityOutcome::Decided(DeletionDecision::Retain(RetentionReason::FingerprintChanged))
+            PreDurabilityOutcome::Decided(DeletionDecision::Retain(
+                RetentionReason::FingerprintChanged
+            ))
         );
     }
 
     #[test]
     fn no_captured_change_is_retained_rather_than_treated_as_a_durability_failure() {
-        let outcome =
-            evaluate_deletion_pre_durability("r1", ObligationState::Divergent, 0, 1_000, true, None, None)
-                .unwrap();
+        let outcome = evaluate_deletion_pre_durability(
+            "r1",
+            ObligationState::Divergent,
+            0,
+            1_000,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             outcome,
-            PreDurabilityOutcome::Decided(DeletionDecision::Retain(RetentionReason::NoCapturedChange))
+            PreDurabilityOutcome::Decided(DeletionDecision::Retain(
+                RetentionReason::NoCapturedChange
+            ))
         );
     }
 
