@@ -3160,6 +3160,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let local_path = root.path().to_string_lossy().to_string();
         state.replica_coordinator.link_repository().add_link(&local_path, GROUP).unwrap();
+        #[cfg(windows)]
+        state
+            .replica_coordinator
+            .link_repository()
+            .set_windows_symlink_opt_in(&local_path, true)
+            .unwrap();
         yadorilink_root_authority::root_identity::VerifiedRoot::open(
             root.path(),
             GROUP,
@@ -3346,6 +3352,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let local_path = root.path().to_string_lossy().to_string();
         state.replica_coordinator.link_repository().add_link(&local_path, GROUP).unwrap();
+        #[cfg(windows)]
+        state
+            .replica_coordinator
+            .link_repository()
+            .set_windows_symlink_opt_in(&local_path, true)
+            .unwrap();
         state.install_test_root_commit_authority(GROUP);
         yadorilink_root_authority::root_identity::VerifiedRoot::open(
             root.path(),
