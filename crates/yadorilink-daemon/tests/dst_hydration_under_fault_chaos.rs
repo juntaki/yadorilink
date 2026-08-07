@@ -404,9 +404,12 @@ async fn connect(rng: &mut StdRng, a: &Device, b: &Device) -> Result<(), String>
         .map_err(|e| e.to_string())?,
     );
 
+    let device_ids_for_auth = [a.id.as_str(), b.id.as_str()];
+    let authenticator = dst_dag_migrate_b2::PinnedAuthenticator::new(device_ids_for_auth);
+
     let mut roots_a = HashMap::new();
     roots_a.insert(GROUP_ID.to_string(), a.root.clone());
-    let session_a = PeerSyncSession::new(
+    let session_a = PeerSyncSession::new_with_dependencies(
         channel_a,
         a.id.clone(),
         b.id.clone(),
@@ -414,11 +417,19 @@ async fn connect(rng: &mut StdRng, a: &Device, b: &Device) -> Result<(), String>
         a.store.clone(),
         vec![GROUP_ID.to_string()],
         roots_a,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            root_commit_authority_provider: std::sync::Arc::new(
+                dst_support::link::TestRootCommitAuthorityProvider,
+            ),
+            change_authenticator: authenticator.clone(),
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
 
     let mut roots_b = HashMap::new();
     roots_b.insert(GROUP_ID.to_string(), b.root.clone());
-    let session_b = PeerSyncSession::new(
+    let session_b = PeerSyncSession::new_with_dependencies(
         channel_b,
         b.id.clone(),
         a.id.clone(),
@@ -426,6 +437,14 @@ async fn connect(rng: &mut StdRng, a: &Device, b: &Device) -> Result<(), String>
         b.store.clone(),
         vec![GROUP_ID.to_string()],
         roots_b,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            root_commit_authority_provider: std::sync::Arc::new(
+                dst_support::link::TestRootCommitAuthorityProvider,
+            ),
+            change_authenticator: authenticator,
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
 
     a.session.set(session_a.clone()).ok();

@@ -358,6 +358,9 @@ async fn connect_sessions(
         sync_roots_a,
         None,
         yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            root_commit_authority_provider: std::sync::Arc::new(
+                dst_support::link::TestRootCommitAuthorityProvider,
+            ),
             pending_local_change_flush: pending_local_change_flush_a,
             change_authenticator: authenticator.clone(),
             ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
@@ -376,6 +379,9 @@ async fn connect_sessions(
         sync_roots_b,
         None,
         yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            root_commit_authority_provider: std::sync::Arc::new(
+                dst_support::link::TestRootCommitAuthorityProvider,
+            ),
             change_authenticator: authenticator,
             ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
         },

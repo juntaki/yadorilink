@@ -507,6 +507,9 @@ async fn connect_edge(
         sync_roots_a,
         Some(forward_tx_a),
         yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            root_commit_authority_provider: std::sync::Arc::new(
+                dst_support::link::TestRootCommitAuthorityProvider,
+            ),
             pending_local_change_flush: device_a.clone(),
             change_authenticator: authenticator.clone(),
             ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
@@ -525,6 +528,9 @@ async fn connect_edge(
         sync_roots_b,
         Some(forward_tx_b),
         yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            root_commit_authority_provider: std::sync::Arc::new(
+                dst_support::link::TestRootCommitAuthorityProvider,
+            ),
             pending_local_change_flush: device_b.clone(),
             change_authenticator: authenticator,
             ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
