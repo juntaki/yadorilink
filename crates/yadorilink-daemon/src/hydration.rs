@@ -3245,6 +3245,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let local_path = root.path().to_string_lossy().to_string();
         state.replica_coordinator.link_repository().add_link(&local_path, GROUP).unwrap();
+        #[cfg(windows)]
+        state
+            .replica_coordinator
+            .link_repository()
+            .set_windows_symlink_opt_in(&local_path, true)
+            .unwrap();
         yadorilink_root_authority::root_identity::VerifiedRoot::open(
             root.path(),
             GROUP,
@@ -3273,7 +3279,13 @@ mod tests {
         state
             .replica_coordinator
             .file_index_repository()
-            .set_symlink_target(GROUP, PATH, Some(b"v1-target"))
+            .set_symlink_target(
+                GROUP,
+                PATH,
+                Some(&yadorilink_root_authority::fs_identity::target_to_bytes(
+                    std::path::Path::new("v1-target"),
+                )),
+            )
             .unwrap();
 
         // Version 2: an ordinary regular file, superseding the symlink.
@@ -3386,7 +3398,13 @@ mod tests {
         state
             .replica_coordinator
             .file_index_repository()
-            .set_symlink_target(GROUP, PATH, Some(b"v1-target"))
+            .set_symlink_target(
+                GROUP,
+                PATH,
+                Some(&yadorilink_root_authority::fs_identity::target_to_bytes(
+                    std::path::Path::new("v1-target"),
+                )),
+            )
             .unwrap();
 
         let v2_block = put_block(&state, GROUP, b"version two content");
