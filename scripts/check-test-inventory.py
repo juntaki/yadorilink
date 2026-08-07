@@ -15,6 +15,8 @@ CI_FILES = [
         ROOT / ".github/workflows/ci.yml",
         ROOT / ".github/workflows/ci-fast.yml",
         ROOT / ".github/workflows/ci-full.yml",
+        ROOT / "oss-public/.github/workflows/ci-fast.yml",
+        ROOT / "oss-public/.github/workflows/ci-full.yml",
     )
     if path.exists()
 ]

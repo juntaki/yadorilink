@@ -115,6 +115,37 @@ fn held_root_identities() -> &'static Mutex<HashMap<PathBuf, FileIdentity>> {
     HELD_ROOT_IDENTITIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// On Unix, an inode cannot be recycled while this process still has the
+/// original inode open. Every `expected` passed by this module was captured
+/// from the live `_sidecar` handle and remains registered only for that
+/// handle's lifetime. Consequently, an equal `(device, inode, kind)` from a
+/// fresh path observation is conclusive in this narrower live-handle case,
+/// even when the filesystem exposes neither an inode-generation counter nor
+/// a fine birth-time clock (notably overlayfs).
+///
+/// This is intentionally local to `SyncRootLock`; general persisted identity
+/// comparisons must continue to treat a bare Unix inode match as ambiguous,
+/// because a closed/unlinked inode can be reused later.
+#[cfg(unix)]
+fn path_still_names_live_unix_handle(expected: FileIdentity, current: FileIdentity) -> bool {
+    matches!(
+        (
+            expected.volume_identity,
+            expected.object_id,
+            current.volume_identity,
+            current.object_id,
+        ),
+        (
+            crate::fs_identity::VolumeIdentity::Unix { device_id: expected_device },
+            crate::fs_identity::PlatformObjectId::Unix { inode: expected_inode },
+            crate::fs_identity::VolumeIdentity::Unix { device_id: current_device },
+            crate::fs_identity::PlatformObjectId::Unix { inode: current_inode },
+        ) if expected_device == current_device
+            && expected_inode == current_inode
+            && expected.object_kind == current.object_kind
+    )
+}
+
 fn verify_sidecar_identity(root: &Path, expected: FileIdentity) -> Result<(), RootAuthorityError> {
     let lock_path = root.join(SYNC_ROOT_LOCK_FILE_NAME);
     let current = FileIdentity::observe_path(&lock_path).map_err(|e| {
@@ -136,6 +167,10 @@ fn verify_sidecar_identity(root: &Path, expected: FileIdentity) -> Result<(), Ro
             ))))
         }
         crate::fs_identity::IdentityComparison::Ambiguous(reason) => {
+            #[cfg(unix)]
+            if path_still_names_live_unix_handle(expected, current) {
+                return Ok(());
+            }
             Err(RootAuthorityError::Io(io::Error::other(format!(
                 "sync-root lock sidecar {} cannot be conclusively re-verified ({reason:?})",
                 lock_path.display()
