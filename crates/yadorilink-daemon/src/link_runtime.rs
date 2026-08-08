@@ -125,15 +125,23 @@ impl LinkRuntime {
     /// see `LinkFlushHandle::flush_pending_local_change`'s own doc. Reached
     /// from the daemon-wide runtime state's own `PendingLocalChangeFlush`
     /// implementation, which a `PeerSyncSession` calls into.
-    pub(crate) async fn flush_pending_local_change(&self, group_id: &str, rel_path: &str) {
-        self.flush_handle.flush_pending_local_change(group_id, rel_path).await;
+    pub(crate) async fn flush_pending_local_change(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+    ) -> yadorilink_peer_session::peer_session::PendingLocalFlushOutcome {
+        self.flush_handle.flush_pending_local_change(group_id, rel_path).await
     }
 
     /// Same as [`Self::flush_pending_local_change`], for a case-fold
     /// sibling collision -- see `LinkFlushHandle::flush_case_fold_sibling`'s
     /// own doc.
-    pub(crate) async fn flush_case_fold_sibling(&self, group_id: &str, rel_path: &str) {
-        self.flush_handle.flush_case_fold_sibling(group_id, rel_path).await;
+    pub(crate) async fn flush_case_fold_sibling(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+    ) -> yadorilink_peer_session::peer_session::PendingLocalFlushOutcome {
+        self.flush_handle.flush_case_fold_sibling(group_id, rel_path).await
     }
 
     /// The one deliberate exception to this type's "no raw internal-type

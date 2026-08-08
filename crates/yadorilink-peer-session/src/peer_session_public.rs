@@ -33,8 +33,9 @@ pub use crate::peer_session_impl::RetirementAttempt;
 pub use crate::peer_session_impl::{
     disk_race_fingerprint, BlockWriteActivityProvider, ChangeAuthenticator, HandoffLeaseResponder,
     HandoffTicketResponder, HydrationOutcome, PeerHandoffLeaseGrant, PeerHandoffTicketGrant,
-    PendingLocalChangeFlush, PreparedRebootstrap, ProjectionAttempt, RebootstrapHandler,
-    RootCommitAuthorityProvider, DEFAULT_HYDRATION_TIMEOUT, DEFAULT_MAINTENANCE_RECONCILE_INTERVAL,
+    PendingLocalChangeFlush, PendingLocalFlushOutcome, PreparedRebootstrap, ProjectionAttempt,
+    RebootstrapHandler, RootCommitAuthorityProvider, DEFAULT_HYDRATION_TIMEOUT,
+    DEFAULT_MAINTENANCE_RECONCILE_INTERVAL,
 };
 
 use crate::peer_session_impl::PeerSyncSession as InnerPeerSyncSession;
@@ -543,16 +544,16 @@ impl PendingLocalChangeFlush for NoopPendingLocalChangeFlush {
         &'a self,
         _group_id: &'a str,
         _rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async {})
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
+        Box::pin(async { PendingLocalFlushOutcome::Settled })
     }
 
     fn flush_case_fold_sibling<'a>(
         &'a self,
         _group_id: &'a str,
         _rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async {})
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
+        Box::pin(async { PendingLocalFlushOutcome::Settled })
     }
 }
 

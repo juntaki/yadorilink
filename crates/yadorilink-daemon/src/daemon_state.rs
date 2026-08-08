@@ -726,10 +726,18 @@ impl yadorilink_peer_session::peer_session::PendingLocalChangeFlush for DaemonSt
         &'a self,
         group_id: &'a str,
         rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = yadorilink_peer_session::peer_session::PendingLocalFlushOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
-            if let Some(runtime) = self.link_runtime_for(group_id) {
-                runtime.flush_pending_local_change(group_id, rel_path).await;
+            match self.link_runtime_for(group_id) {
+                // `Starting` or absent: nothing to flush against yet either way.
+                Some(runtime) => runtime.flush_pending_local_change(group_id, rel_path).await,
+                None => yadorilink_peer_session::peer_session::PendingLocalFlushOutcome::Settled,
             }
         })
     }
@@ -738,10 +746,17 @@ impl yadorilink_peer_session::peer_session::PendingLocalChangeFlush for DaemonSt
         &'a self,
         group_id: &'a str,
         rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = yadorilink_peer_session::peer_session::PendingLocalFlushOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
-            if let Some(runtime) = self.link_runtime_for(group_id) {
-                runtime.flush_case_fold_sibling(group_id, rel_path).await;
+            match self.link_runtime_for(group_id) {
+                Some(runtime) => runtime.flush_case_fold_sibling(group_id, rel_path).await,
+                None => yadorilink_peer_session::peer_session::PendingLocalFlushOutcome::Settled,
             }
         })
     }

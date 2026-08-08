@@ -7940,6 +7940,7 @@ mod reconcile_group_paths_flush_tests {
     use yadorilink_local_storage::FsBlockStore;
     use yadorilink_peer_session::peer_session_impl::{
         ChangeAuthenticator, PeerSyncSession, PeerSyncSessionOneTimeDeps, PendingLocalChangeFlush,
+        PendingLocalFlushOutcome,
     };
     use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
     use yadorilink_replica_domain::file::RecordKind;
@@ -8071,6 +8072,12 @@ mod reconcile_group_paths_flush_tests {
         root: PathBuf,
         pending: Mutex<BTreeSet<String>>,
         calls: Mutex<Vec<String>>,
+        /// When set, every call returns `RetryRequired` immediately instead
+        /// of running its normal body -- simulates the targeted-flush
+        /// channel staying permanently saturated (see
+        /// `handle_change_batch_does_not_park_when_local_flush_is_saturated`),
+        /// without needing a real bounded mpsc channel in this harness.
+        force_retry: std::sync::atomic::AtomicBool,
     }
     impl RecordingFlush {
         fn new(processor: Arc<LocalChangeProcessor>, root: PathBuf) -> Self {
@@ -8079,6 +8086,7 @@ mod reconcile_group_paths_flush_tests {
                 root,
                 pending: Mutex::new(BTreeSet::new()),
                 calls: Mutex::new(vec![]),
+                force_retry: std::sync::atomic::AtomicBool::new(false),
             }
         }
         fn mark_pending(&self, rel: &str) {
@@ -8087,15 +8095,21 @@ mod reconcile_group_paths_flush_tests {
         fn take_calls(&self) -> Vec<String> {
             std::mem::take(&mut *self.calls.lock().unwrap())
         }
+        fn set_force_retry(&self, force: bool) {
+            self.force_retry.store(force, std::sync::atomic::Ordering::SeqCst);
+        }
     }
     impl PendingLocalChangeFlush for RecordingFlush {
         fn flush_pending_local_change<'a>(
             &'a self,
             group_id: &'a str,
             rel_path: &'a str,
-        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push(rel_path.to_string());
+                if self.force_retry.load(std::sync::atomic::Ordering::SeqCst) {
+                    return PendingLocalFlushOutcome::RetryRequired;
+                }
                 // Drop the guard before the await below.
                 let is_pending = self.pending.lock().unwrap().remove(rel_path);
                 if is_pending {
@@ -8105,18 +8119,23 @@ mod reconcile_group_paths_flush_tests {
                     };
                     let _ = self.processor.process_event(group_id, &self.root, &event).await;
                 }
+                PendingLocalFlushOutcome::Settled
             })
         }
         fn flush_case_fold_sibling<'a>(
             &'a self,
             _group_id: &'a str,
             rel_path: &'a str,
-        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
             // On a case-insensitive filesystem (e.g. the macOS test host) the
             // session also probes for a colliding sibling; this scenario stages
             // no case-fold sibling, so it is a recorded no-op.
             Box::pin(async move {
                 self.calls.lock().unwrap().push(format!("casefold:{rel_path}"));
+                if self.force_retry.load(std::sync::atomic::Ordering::SeqCst) {
+                    return PendingLocalFlushOutcome::RetryRequired;
+                }
+                PendingLocalFlushOutcome::Settled
             })
         }
     }
@@ -8440,6 +8459,51 @@ mod reconcile_group_paths_flush_tests {
             .change_emitter()
             .expect("must be Some for a session constructed with an emitter");
         assert_eq!(installed.device_id(), LOCAL, "the installed emitter must be this device's own");
+    }
+
+    /// When the local-flush infrastructure stays saturated (`RetryRequired`
+    /// on every call, modeling a permanently-full targeted-flush channel),
+    /// `handle_change_batch` must still return promptly rather than parking
+    /// -- this is the peer-session-level counterpart to
+    /// `capture_local_change.rs`'s `flush_pending_local_change_returns_
+    /// retry_required_when_the_channel_stays_full`: it proves the message
+    /// handler itself (and the in-flight-message permit it holds) is never
+    /// held hostage by local-flush backpressure. The deferred change must
+    /// not be admitted; once the flush handle recovers, a resend of the
+    /// identical batch must admit normally.
+    #[tokio::test]
+    async fn handle_change_batch_does_not_park_when_local_flush_is_saturated() {
+        let h = setup().await;
+        let version = empty_version();
+        let chain = emit_remote_chain(&version, vec![vec![create_op(P, &version)]]);
+        let change = &chain[0];
+        let batch = batch_of(&[change], &[&version]);
+
+        h.flush.set_force_retry(true);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            h.session.handle_change_batch(batch.clone()),
+        )
+        .await
+        .expect(
+            "handle_change_batch must return promptly even when local-flush stays saturated, \
+             not park indefinitely holding its message-handling permit",
+        );
+        outcome.unwrap();
+        assert!(
+            !h.state.change_history_repository().dag_has_change(&change.compute_hash()).unwrap(),
+            "a change deferred by saturated local-flush must not be admitted"
+        );
+
+        // Once the flush handle recovers, a resend must admit normally --
+        // this failure mode must be transient, not a permanent black hole
+        // for this path/change.
+        h.flush.set_force_retry(false);
+        h.session.handle_change_batch(batch).await.unwrap();
+        assert!(
+            h.state.change_history_repository().dag_has_change(&change.compute_hash()).unwrap(),
+            "the change must admit once local-flush is no longer saturated"
+        );
     }
 }
 
@@ -12002,6 +12066,107 @@ mod dag_convergence_authority_tests {
                 yadorilink_peer_session::peer_session_impl::RetirementAttempt::Settled { .. }
             ),
             "a follow-up pass against a stable frontier must settle, got {follow_up:?}"
+        );
+    }
+
+    /// Confirmed regression, NOT yet fixed: `changes_for_request`'s ancestor
+    /// closure is gathered oldest-first (`collect_ancestor_closure`) and then
+    /// `ordered.truncate(max_changes_per_batch)` keeps only the FIRST
+    /// `max_changes_per_batch` entries -- so once a requested head's own
+    /// ancestor closure exceeds the batch cap (1000, `MAX_CHANGES_PER_BATCH`),
+    /// the requested head itself (necessarily the newest entry in an
+    /// oldest-first ordering) is silently dropped from every response,
+    /// forever, no matter how many times it is re-requested: the same
+    /// oldest-N-entries prefix is deterministic given an unchanged store, so
+    /// two identical requests produce byte-identical unprogressing batches.
+    /// There is no cursor/have-frontier in the wire protocol for a caller to
+    /// ask for "the NEXT 1000 after what you already sent me", so nothing
+    /// downstream (`missing_ancestor_frontier`, the periodic frontier
+    /// re-announce) can ever complete this catch-up either -- seeing the
+    /// same unknown head re-announced every second just re-triggers the
+    /// identical stuck request.
+    ///
+    /// This test is deliberately independent of row14_strict_acceptance's
+    /// own scale (tens of changes, well under 1000) -- it exists to nail
+    /// down a distinct, confirmed-by-reading-the-code defect, not to explain
+    /// row14's own stall. Do not fold a fix for this into the same commit as
+    /// a row14 fix; verify each independently.
+    #[tokio::test]
+    async fn changes_for_request_never_delivers_a_head_whose_ancestor_closure_exceeds_the_batch_cap(
+    ) {
+        let h = harness("device-local", "device-p", /*dag*/ true).await;
+        let key_a = SigningKey::from_bytes(&[30u8; 32]);
+
+        // A linear chain of 1002 changes on "chain.bin", each one's own
+        // parent. 1002, not 1000 or 1001, so the requested (latest) head is
+        // unambiguously excluded by an off-by-one-safe margin once the
+        // batch cap (1000) truncates the oldest-first closure.
+        let mut parent: Vec<yadorilink_replica_domain::ids::ChangeHash> = vec![];
+        let mut parent_lamport = 0u64;
+        let mut latest_hash = None;
+        for i in 0..1002u32 {
+            let version = empty_version(i as i64);
+            let change = Change::create_signed(
+                parent.clone(),
+                parent_lamport,
+                ChangeAuth::PLACEHOLDER,
+                yadorilink_replica_domain::ids::DeviceId("device-a".into()),
+                yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+                vec![Op::Put {
+                    path: SyncPath("chain.bin".into()),
+                    version: version.version_hash,
+                    origin: PutOrigin::Direct,
+                }],
+                &key_a,
+            );
+            h.state
+                .change_history_repository()
+                .dag_admit_change_with_versions(&change, std::slice::from_ref(&version), true)
+                .unwrap();
+            let hash = change.compute_hash();
+            parent = vec![hash];
+            parent_lamport = change.lamport;
+            latest_hash = Some(hash);
+        }
+        let latest_hash = latest_hash.unwrap();
+
+        let (batch_1, _versions_1) = h
+            .session
+            .replica_engine
+            .changes_for_request(
+                &yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+                std::slice::from_ref(&latest_hash),
+                1000,
+            )
+            .unwrap();
+        assert_eq!(batch_1.len(), 1000, "the batch cap must still be honored");
+
+        let latest_encoded =
+            h.state.sqlite().dag_get_change(&latest_hash).unwrap().unwrap().to_wire_bytes();
+        assert!(
+            !batch_1.contains(&latest_encoded),
+            "CONFIRMED BUG: the oldest-first truncation drops the actually-requested head from \
+             its own response"
+        );
+
+        // Re-requesting the SAME head against an unchanged store must, per
+        // the current implementation, reproduce the identical batch --
+        // proving this is a permanent stall, not merely a slow multi-round
+        // catch-up: nothing in the request/response shape lets a second
+        // identical request make different progress than the first.
+        let (batch_2, _versions_2) = h
+            .session
+            .replica_engine
+            .changes_for_request(
+                &yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+                std::slice::from_ref(&latest_hash),
+                1000,
+            )
+            .unwrap();
+        assert_eq!(
+            batch_1, batch_2,
+            "CONFIRMED BUG: an identical re-request of the same never-delivered head returns the \
+             identical stuck batch -- no progress across repeated requests"
         );
     }
 

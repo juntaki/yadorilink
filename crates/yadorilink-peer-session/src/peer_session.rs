@@ -972,12 +972,32 @@ fn reconcile_retry_delay() -> std::time::Duration {
 /// `Arc<dyn PendingLocalChangeFlush>` — native `async fn` in traits isn't
 /// object-safe without this same boilerplate, and this crate has no
 /// `async_trait` dependency to hide it behind.
+/// Outcome of a targeted local-flush round trip
+/// (`PendingLocalChangeFlush::flush_pending_local_change` /
+/// `flush_case_fold_sibling`), through this link's debounce-accumulator
+/// channel. That channel is small and shared by every concurrent peer
+/// message handler reconciling a path against this link — under a
+/// duplicate-delivery storm it can back up, so the round trip is bounded
+/// rather than awaited unconditionally. `Settled` means the local side is
+/// safely accounted for (flushed, or genuinely nothing pending) and the
+/// peer change may proceed to DAG admission. `RetryRequired` means this
+/// round trip could not complete its bound (the enqueue or the reply timed
+/// out) — the local pending edit's state relative to the incoming peer
+/// change is unknown, so admitting the peer change now would risk silently
+/// clobbering it; the caller must defer this change instead (it will be
+/// re-requested by anti-entropy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingLocalFlushOutcome {
+    Settled,
+    RetryRequired,
+}
+
 pub trait PendingLocalChangeFlush: Send + Sync {
     fn flush_pending_local_change<'a>(
         &'a self,
         group_id: &'a str,
         rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>>;
 
     /// Like `flush_pending_local_change`, but for the *other* case-variant
     /// path that would collide with `rel_path` on a case-insensitive
@@ -988,7 +1008,7 @@ pub trait PendingLocalChangeFlush: Send + Sync {
         &'a self,
         group_id: &'a str,
         rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>>;
 }
 
 /// Mirrors `PendingLocalChangeFlush`'s injection shape exactly (see that
@@ -1068,16 +1088,16 @@ impl PendingLocalChangeFlush for DeniedPendingLocalChangeFlush {
         &'a self,
         _group_id: &'a str,
         _rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async {})
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
+        Box::pin(async { PendingLocalFlushOutcome::Settled })
     }
 
     fn flush_case_fold_sibling<'a>(
         &'a self,
         _group_id: &'a str,
         _rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async {})
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
+        Box::pin(async { PendingLocalFlushOutcome::Settled })
     }
 }
 
@@ -2735,7 +2755,11 @@ impl PeerSyncSession {
     /// "`reconcile_one_file`-side" serialization requirements: by the time
     /// any downstream `materialize` call writes to disk, a local change
     /// that was still pending here has already been indexed.
-    async fn flush_pending_local_change_before_reconcile(&self, group_id: &str, rel_path: &str) {
+    async fn flush_pending_local_change_before_reconcile(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+    ) -> PendingLocalFlushOutcome {
         let handle = self.pending_local_change_flush.clone();
         // Marks that the guard was reached for this path — the first fork
         // when a local write is lost despite this guard existing. A missing
@@ -2753,7 +2777,7 @@ impl PeerSyncSession {
             peer = %self.peer_device_id,
             "checking this link's debounce accumulator for a pending local change before reconciling this path against a peer update"
         );
-        handle.flush_pending_local_change(group_id, rel_path).await;
+        handle.flush_pending_local_change(group_id, rel_path).await
     }
 
     /// Like `flush_pending_local_change_before_reconcile` above, but for
@@ -2777,14 +2801,18 @@ impl PeerSyncSession {
     /// filesystem` is true for this group's root — on a case-sensitive
     /// filesystem, two differently-cased names are simply unrelated
     /// files, and this extra round trip would have nothing to find.
-    async fn flush_case_fold_sibling_before_reconcile(&self, group_id: &str, rel_path: &str) {
+    async fn flush_case_fold_sibling_before_reconcile(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+    ) -> PendingLocalFlushOutcome {
         // No root for this group means nothing of ours is on disk to collide
         // with, so there is no case-fold sibling to flush.
         let Ok(root) = self.sync_root(group_id) else {
-            return;
+            return PendingLocalFlushOutcome::Settled;
         };
         if !hazard::is_case_insensitive_filesystem(&root) {
-            return;
+            return PendingLocalFlushOutcome::Settled;
         }
         let handle = self.pending_local_change_flush.clone();
         tracing::debug!(
@@ -2793,7 +2821,7 @@ impl PeerSyncSession {
             peer = %self.peer_device_id,
             "checking this link's debounce accumulator for a pending case-fold sibling change before reconciling this path against a peer update"
         );
-        handle.flush_case_fold_sibling(group_id, rel_path).await;
+        handle.flush_case_fold_sibling(group_id, rel_path).await
     }
 
     /// Records this peer's advertised
@@ -4695,9 +4723,37 @@ impl PeerSyncSession {
             for op in &change.ops {
                 collect_op_paths(op, &mut incoming_paths);
             }
+            let mut flush_retry_required = false;
             for path in incoming_paths {
-                self.flush_pending_local_change_before_reconcile(&group_id, &path).await;
-                self.flush_case_fold_sibling_before_reconcile(&group_id, &path).await;
+                if self.flush_pending_local_change_before_reconcile(&group_id, &path).await
+                    == PendingLocalFlushOutcome::RetryRequired
+                {
+                    flush_retry_required = true;
+                }
+                if self.flush_case_fold_sibling_before_reconcile(&group_id, &path).await
+                    == PendingLocalFlushOutcome::RetryRequired
+                {
+                    flush_retry_required = true;
+                }
+            }
+            if flush_retry_required {
+                // The local-flush round trip above could not confirm this
+                // path's local state within its bound (the debounce
+                // accumulator's targeted-flush channel is backed up).
+                // Admitting the peer change now, without knowing whether a
+                // local edit for the same path is still unflushed, risks
+                // silently clobbering that local edit instead of producing
+                // a conflict copy for it. Defer: skip admission for this
+                // change and let anti-entropy re-deliver it once the local
+                // side has drained.
+                tracing::warn!(
+                    group_id,
+                    author = %change.device_id.as_str(),
+                    peer = %self.peer_device_id,
+                    "deferring a change at admission -- this link's debounce accumulator did \
+                     not confirm local-flush state within its bound; it will be re-requested"
+                );
+                continue;
             }
 
             match self.replica_engine.admit_authenticated_change(
