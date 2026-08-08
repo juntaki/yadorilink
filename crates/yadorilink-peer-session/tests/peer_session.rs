@@ -11869,6 +11869,142 @@ mod dag_convergence_authority_tests {
         );
     }
 
+    /// Commit 5's own regression: a DAG admission landing WHILE a
+    /// retirement pass is mid-flight must not let that pass's outcome be
+    /// treated as `Settled` for the frontier generation it targeted, even
+    /// when the mutation the pass made was itself a correct decision for
+    /// the frontier it started with. Deterministic, not timing-dependent:
+    /// the pass is blocked on the SAME `path_lock` `retire_unjustified_
+    /// ephemeral_conflict_copies` acquires right before its own
+    /// `materialize` call, held by this test until after the new
+    /// admission lands, so there is no race to get unlucky on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frontier_change_mid_pass_defers_completion_and_a_follow_up_settles_the_new_frontier() {
+        let h = harness("device-local", "device-p", /*dag*/ true).await;
+        let key_a = SigningKey::from_bytes(&[21u8; 32]);
+        let key_b = SigningKey::from_bytes(&[22u8; 32]);
+        let version_w = empty_version(OLD_MTIME);
+
+        // A single, uncontested winner for "shared.bin" -- no live loser,
+        // so any copy-shaped file under it is unjustified from the start.
+        let change_w = Change::create_signed(
+            vec![],
+            0,
+            ChangeAuth::PLACEHOLDER,
+            yadorilink_replica_domain::ids::DeviceId("device-a".into()),
+            yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+            vec![Op::Put {
+                path: SyncPath("shared.bin".into()),
+                version: version_w.version_hash,
+                origin: PutOrigin::Direct,
+            }],
+            &key_a,
+        );
+        h.state
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change_w, std::slice::from_ref(&version_w), true)
+            .unwrap();
+
+        let copy_path = yadorilink_replica_engine::conflict::conflict_copy_path_for_losing_change(
+            "shared.bin",
+            "device-l",
+            NEW_MTIME,
+            &[9u8; 32],
+        );
+        let copy_record = FileRecord {
+            path: copy_path.clone(),
+            size: 0,
+            mtime_unix_nanos: 0,
+            blocks: vec![],
+            deleted: false,
+        };
+        h.state
+            .file_index_repository()
+            .upsert_file_with_origin_and_author(
+                GROUP,
+                &copy_record,
+                "device-local",
+                &change_w.compute_hash(),
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        std::fs::write(h.root.join(&copy_path), b"").unwrap();
+
+        // Hold the exact path_lock retirement's own materialize call for
+        // `copy_path` will block on -- see `retire_unjustified_ephemeral_
+        // conflict_copies`'s own doc comment for why it acquires this
+        // before deleting.
+        let path_lock = {
+            use yadorilink_peer_session::ports::PeerReplicaStatePort;
+            h.state.path_lock(GROUP, &copy_path)
+        };
+        let held = path_lock.lock().await;
+
+        let session = h.session.clone();
+        let pass = tokio::spawn(async move { session.retire_conflict_copies_only(GROUP).await });
+
+        // Real wall-clock margin for the spawned pass to reach the blocked
+        // lock -- it has already read `frontier_before` and determined
+        // `copy_path` unjustified by the time it gets there.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // A genuinely new admission lands while the pass is blocked
+        // mid-flight, unrelated to "shared.bin" or `copy_path` -- the
+        // frontier change alone is what must matter, not what it touches.
+        let version_l = empty_version(NEW_MTIME);
+        let change_l = Change::create_signed(
+            vec![],
+            0,
+            ChangeAuth::PLACEHOLDER,
+            yadorilink_replica_domain::ids::DeviceId("device-b".into()),
+            yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+            vec![Op::Put {
+                path: SyncPath("other.bin".into()),
+                version: version_l.version_hash,
+                origin: PutOrigin::Direct,
+            }],
+            &key_b,
+        );
+        h.state
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change_l, std::slice::from_ref(&version_l), true)
+            .unwrap();
+
+        drop(held); // let the blocked pass proceed and finish
+
+        let outcome = pass.await.unwrap().unwrap();
+        assert_eq!(
+            outcome,
+            yadorilink_peer_session::peer_session_impl::RetirementAttempt::FrontierChanged,
+            "a frontier change while the pass was mid-flight must not be reported as Settled, \
+             even though the copy it examined was correctly retired under the frontier it \
+             started with"
+        );
+        // The old-frontier mutation is NOT undone -- it was a correct
+        // decision for the frontier that existed while the pass ran.
+        assert!(
+            h.state
+                .file_index_repository()
+                .get_file(GROUP, &copy_path)
+                .unwrap()
+                .is_none_or(|r| r.deleted),
+            "the copy was genuinely unjustified under the frontier the pass evaluated it \
+             against; FrontierChanged must not roll this back"
+        );
+
+        // A follow-up pass against the now-stable frontier must settle
+        // cleanly -- this is the "always converge against the CURRENT
+        // frontier" half of the guarantee, not just "never lose an event".
+        let follow_up = h.session.clone().retire_conflict_copies_only(GROUP).await.unwrap();
+        assert!(
+            matches!(
+                follow_up,
+                yadorilink_peer_session::peer_session_impl::RetirementAttempt::Settled { .. }
+            ),
+            "a follow-up pass against a stable frontier must settle, got {follow_up:?}"
+        );
+    }
+
     // ---- CORE: DAG-decided winner is order-independent and the gate keeps the
     // legacy mtime path from overriding it. ----
 

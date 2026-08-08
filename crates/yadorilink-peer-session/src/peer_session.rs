@@ -401,6 +401,19 @@ pub enum RetirementAttempt {
     /// copy's justification was never actually re-verified against the
     /// targeted frontier, so the pass as a whole did not settle it.
     RetryRequired,
+    /// The pass ran and every copy it examined resolved cleanly, but this
+    /// device's own admitted DAG frontier for the group was different
+    /// after the pass than before it started -- see
+    /// `retire_conflict_copies_only`'s own doc comment for exactly what is
+    /// compared and why. Every decision this pass made (justified/
+    /// unjustified, retire/retain) was made against SOME frontier that
+    /// existed during the pass, but not provably the one the caller's
+    /// generation was meant to verify, so it must not be treated as a
+    /// completion of that generation -- not "undo what this pass did"
+    /// (already-correct-for-some-real-frontier mutations are left as they
+    /// are), but "do not trust this pass's verdict as final; run again
+    /// against the CURRENT frontier."
+    FrontierChanged,
 }
 
 /// The outcome of one `reconcile_group_paths` call, split into two
@@ -1702,6 +1715,73 @@ static NEXT_AUDIT_ATTEMPT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::
 
 fn next_audit_attempt_id() -> u64 {
     NEXT_AUDIT_ATTEMPT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `retire_conflict_copies_only`'s whole-pass frontier freshness check --
+/// factored out to a pure function so its exact semantics (a plain slice
+/// comparison; any number of intermediate admissions during the pass
+/// collapses to the same before/after mismatch as a single one) can be
+/// tested without any async execution, DAG store, or session plumbing.
+/// `dag_group_heads`'s own `ORDER BY change_hash` makes two reads of an
+/// unchanged frontier compare equal regardless of admission order, so this
+/// never needs to sort its inputs itself.
+fn frontier_changed_during_pass(before: &[ChangeHash], after: &[ChangeHash]) -> bool {
+    before != after
+}
+
+#[cfg(test)]
+mod frontier_freshness_tests {
+    use super::*;
+
+    fn hash(byte: u8) -> ChangeHash {
+        ChangeHash([byte; 32])
+    }
+
+    /// Case 1: an unchanged frontier is the only shape
+    /// `retire_conflict_copies_only` may report its inner outcome as-is --
+    /// this is what lets a genuinely `Settled` pass complete its
+    /// generation.
+    #[test]
+    fn unchanged_frontier_is_not_reported_as_changed() {
+        let before = vec![hash(1), hash(2)];
+        let after = vec![hash(1), hash(2)];
+        assert!(!frontier_changed_during_pass(&before, &after));
+    }
+
+    /// Case 2: any admission during the pass -- growing the frontier, not
+    /// just replacing a head -- must be caught, since a caller that
+    /// completed the generation anyway would never re-evaluate the newly
+    /// admitted change's effect on justification.
+    #[test]
+    fn a_frontier_that_gained_a_head_during_the_pass_is_reported_as_changed() {
+        let before = vec![hash(1)];
+        let after = vec![hash(1), hash(2)];
+        assert!(frontier_changed_during_pass(&before, &after));
+    }
+
+    /// A head superseded mid-pass (frontier shrinks by one, gains a
+    /// different one) must equally be caught -- not just a pure growth.
+    #[test]
+    fn a_frontier_whose_heads_were_replaced_during_the_pass_is_reported_as_changed() {
+        let before = vec![hash(1), hash(2)];
+        let after = vec![hash(1), hash(3)];
+        assert!(frontier_changed_during_pass(&before, &after));
+    }
+
+    /// Case 4: multiple intermediate admissions during one pass (e.g. two
+    /// separate peer changes landing back to back) still collapse to a
+    /// single before/after mismatch -- there is no per-admission tracking
+    /// to lose count of; only the endpoints of the pass are ever compared,
+    /// so no intermediate change can be coalesced away and missed.
+    #[test]
+    fn multiple_intermediate_admissions_still_trip_the_check() {
+        let before = vec![hash(1)];
+        let mid = vec![hash(1), hash(2)];
+        let after = vec![hash(1), hash(2), hash(3)];
+        assert!(frontier_changed_during_pass(&before, &mid));
+        assert!(frontier_changed_during_pass(&before, &after));
+        assert!(frontier_changed_during_pass(&mid, &after));
+    }
 }
 
 struct MaterializationAuditGuard {
@@ -3841,6 +3921,27 @@ impl PeerSyncSession {
     /// group-wide sharing was never actually load-bearing for correctness,
     /// and `RetirementAttempt`'s own doc comment for what each variant
     /// means for a generation-tracked caller.
+    ///
+    /// Whole-pass frontier freshness: `frontier_before` is this device's
+    /// own admitted DAG heads for `group_id`, read right after the
+    /// `RetirementAuditGuard` is acquired (before any copy is examined);
+    /// `frontier_after` is the same read again right after the retirement
+    /// pass returns (after every mutation it made is durable). If they
+    /// differ, some OTHER admission (a peer's change arriving, or a local
+    /// edit) landed while this pass was evaluating justification against
+    /// whatever frontier was current when it started -- every individual
+    /// decision inside the pass was locally consistent with SOME real
+    /// frontier, but not provably the one current when the pass returns,
+    /// so the whole pass reports `RetirementAttempt::FrontierChanged`
+    /// instead of its own inner outcome, even if that inner outcome was
+    /// `Settled`. This deliberately does not attempt a per-copy freshness
+    /// recheck immediately before each delete (Commit 5's own scope is the
+    /// whole-pass guard only) -- see `retire_unjustified_ephemeral_
+    /// conflict_copies`'s own doc comment for why a copy this pass
+    /// mutated is never left in a worse state than before, only
+    /// potentially stale, and a caller that does not complete the
+    /// generation on `FrontierChanged` gets exactly the re-evaluation
+    /// against the CURRENT frontier that closes the gap.
     pub async fn retire_conflict_copies_only(
         self: Arc<Self>,
         group_id: &str,
@@ -3851,8 +3952,15 @@ impl PeerSyncSession {
         let Some(_guard) = RetirementAuditGuard::try_acquire(&self.state, group_id) else {
             return Ok(RetirementAttempt::Busy);
         };
+        let frontier_before = self.state.dag_group_heads(group_id)?;
         let audit_attempt_id = next_audit_attempt_id();
-        self.retire_unjustified_ephemeral_conflict_copies(group_id, audit_attempt_id).await
+        let outcome =
+            self.retire_unjustified_ephemeral_conflict_copies(group_id, audit_attempt_id).await?;
+        let frontier_after = self.state.dag_group_heads(group_id)?;
+        if frontier_changed_during_pass(&frontier_before, &frontier_after) {
+            return Ok(RetirementAttempt::FrontierChanged);
+        }
+        Ok(outcome)
     }
 
     /// Periodic DAG resync's local repair backstop. A heads announce keeps
