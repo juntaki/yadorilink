@@ -169,6 +169,14 @@ struct UnackedEntry {
     attempts: u32,
 }
 
+/// Result of one `ReliableSend::due_retransmits` call -- see that method's
+/// own doc comment for why `exhausted` means the caller must tear down the
+/// whole channel, not just skip the one seq.
+pub(crate) struct RetransmitOutcome {
+    pub(crate) due: Vec<Bytes>,
+    pub(crate) exhausted: bool,
+}
+
 /// How many times an unacked message is retransmitted before this layer
 /// gives up on it (the message is dropped from the buffer; existing
 /// liveness/backstop mechanisms — `DIRECT_LIVENESS_TIMEOUT`, the 30s/90s
@@ -250,10 +258,28 @@ impl ReliableSend {
     }
 
     /// Returns frames whose retransmit deadline has passed, bumping their
-    /// attempt count; entries that have exhausted `MAX_RETRANSMIT_ATTEMPTS`
-    /// are dropped instead (the peer is presumed unreachable — existing
-    /// liveness/backstop paths take over, not this layer's job to declare
-    /// that).
+    /// attempt count, PLUS whether any entry exhausted
+    /// `MAX_RETRANSMIT_ATTEMPTS` this call.
+    ///
+    /// An exhausted entry is NOT silently dropped-and-continued: this
+    /// layer is reliable-but-not-ordered, not reliable-but-partial. Once a
+    /// receiver's `highest_contiguous` frontier is stuck behind a seq that
+    /// truly never arrives, EVERY later seq is permanently unrepresentable
+    /// by the cumulative ack and, once enough later traffic accumulates,
+    /// eventually falls outside `SELECTIVE_ACK_WINDOW` too — an alive,
+    /// actively-receiving peer becomes indistinguishable from an
+    /// unreachable one for the rest of this ARQ epoch (see
+    /// `a_permanently_lost_seq_poisons_the_cumulative_ack_forever` and
+    /// `exhausted_retransmit_gives_up_while_receiver_is_still_alive_and_
+    /// receiving`, this module's own characterization tests). Dropping
+    /// only the one exhausted seq and continuing the same sequence space
+    /// -- the previous behavior -- left that poisoning permanent for the
+    /// rest of the connection's life. The caller (`peer_channel.rs`'s
+    /// `reliable_send_due`) must therefore treat `exhausted` as "this
+    /// channel's ARQ epoch is no longer trustworthy, tear it down" -- a
+    /// fresh reconnect starts a fresh sequence space, which existing
+    /// liveness/reachability machinery already re-establishes exactly like
+    /// any other channel failure.
     ///
     /// Each entry's deadline is `RttEstimator::retransmit_timeout`,
     /// doubled per retry attempt already made (exponential backoff — a
@@ -266,7 +292,7 @@ impl ReliableSend {
     /// lost together) — retransmitting every entry at an identical,
     /// deterministic offset from its send time would re-hit the same burst
     /// window on every attempt instead of de-correlating from it.
-    pub(crate) fn due_retransmits(&mut self) -> Vec<Bytes> {
+    pub(crate) fn due_retransmits(&mut self) -> RetransmitOutcome {
         let now = Instant::now();
         let mut due = Vec::new();
         let mut exhausted = Vec::new();
@@ -281,16 +307,17 @@ impl ReliableSend {
                 // exhausting every retransmit attempt — the same class of
                 // silent-loss failure mode this session spent considerable
                 // effort chasing elsewhere (lost block-fetches, lost
-                // index-updates). The 30s/90s per-message-type backstops
-                // still recover it at the application layer, but that
-                // recovery should never be invisible.
+                // index-updates). Unlike a plain per-message drop, this now
+                // also poisons the whole channel's ARQ epoch (see this
+                // method's own doc comment) -- the caller tears the channel
+                // down instead of continuing to trust it.
                 tracing::warn!(
                     seq,
                     attempts = entry.attempts,
                     frame_len = entry.frame.len(),
-                    "reliable-delivery giving up on an unacked message after exhausting every \
-                     retransmit attempt; falling back to the application layer's own recovery \
-                     (e.g. hydration timeout, full-index resync)"
+                    "reliable-delivery exhausted every retransmit attempt for a seq; tearing \
+                     down this channel's ARQ epoch rather than silently continuing with a \
+                     permanently-poisoned ack frontier"
                 );
                 exhausted.push(*seq);
             } else {
@@ -299,10 +326,11 @@ impl ReliableSend {
                 due.push(entry.frame.clone());
             }
         }
+        let any_exhausted = !exhausted.is_empty();
         for seq in exhausted {
             self.unacked.remove(&seq);
         }
-        due
+        RetransmitOutcome { due, exhausted: any_exhausted }
     }
 }
 
@@ -444,6 +472,99 @@ mod tests {
         assert_eq!(recv.current_ack(), (1, 0b10)); // seq 3 = ack_lo(1)+1+1, bit index 1
         assert!(recv.observe(2)); // fills the gap
         assert_eq!(recv.current_ack().0, 3); // now contiguous through 3
+    }
+
+    /// A single permanently-lost seq poisons `highest_contiguous` forever:
+    /// the receiver has no "give up and skip a gap" mechanism, so once a
+    /// seq is truly never going to arrive, every later seq is stuck
+    /// out-of-order and unackable via the cumulative low-water mark.
+    /// `SELECTIVE_ACK_WINDOW` only covers 32 slots above `ack_lo`, so once
+    /// enough later traffic arrives, even the selective ack can no longer
+    /// represent it -- from the sender's point of view, a peer that has
+    /// actually received (and delivered to its application) dozens of
+    /// later messages looks indistinguishable from one that received
+    /// nothing at all past seq 9.
+    #[test]
+    fn a_permanently_lost_seq_poisons_the_cumulative_ack_forever() {
+        let mut recv = ReliableRecv::new();
+        for seq in 1..=9u64 {
+            assert!(recv.observe(seq));
+        }
+        // seq 10 is never observed -- permanently lost.
+        for seq in 11..=50u64 {
+            recv.observe(seq);
+        }
+        let (ack_lo, ack_bits) = recv.current_ack();
+        assert_eq!(
+            ack_lo, 9,
+            "highest_contiguous is stuck at 9 despite 40 later messages (11..=50) having been \
+             delivered to the application"
+        );
+        // seq 42 = ack_lo + 1 + 32, one past the last representable
+        // selective-ack bit (index 31 covers ack_lo + 1 + 31 = 41).
+        assert_eq!(ack_bits & (1 << 31), 1 << 31, "seq 41 is still representable (last in-window)");
+        // Nothing beyond the window is representable at all -- there is no
+        // bit for seq 42, 43, ..., 50: `current_ack` structurally cannot
+        // report them regardless of how much later traffic keeps arriving.
+    }
+
+    /// The other half of the same poisoning, from the sender's side: once
+    /// `due_retransmits` gives up on a seq (its own doc comment: "the peer
+    /// is presumed unreachable"), that presumption is false whenever the
+    /// receiver is alive and receiving everything else -- the message is
+    /// simply dropped from `unacked` and never sent again, matching
+    /// `a_permanently_lost_seq_poisons_the_cumulative_ack_forever`'s
+    /// receive-side finding: the receiver was never actually unreachable,
+    /// it just can never report catching up on this one seq.
+    #[test]
+    fn exhausted_retransmit_gives_up_while_receiver_is_still_alive_and_receiving() {
+        let mut send = ReliableSend::new();
+        // Directly construct an already-exhausted, long-overdue entry
+        // (same crate/module -- `UnackedEntry`'s fields are private to
+        // `reliable.rs`) rather than waiting out real retransmit
+        // backoff/RTO delays (tens of real seconds) in a unit test.
+        send.unacked.insert(
+            10,
+            UnackedEntry {
+                frame: encode_data_frame(10, 0, 0, b"lost"),
+                sent_at: Instant::now() - Duration::from_secs(100),
+                attempts: MAX_RETRANSMIT_ATTEMPTS,
+            },
+        );
+        let outcome = send.due_retransmits();
+        assert!(
+            outcome.due.is_empty(),
+            "an already-exhausted entry produces no further retransmit"
+        );
+        assert!(
+            outcome.exhausted,
+            "the caller must be told this seq exhausted its retransmit budget, so it can tear \
+             the whole channel down instead of silently continuing"
+        );
+        assert!(
+            !send.unacked.contains_key(&10),
+            "the exhausted entry is removed from the unacked buffer (the channel is about to be \
+             torn down regardless, so nothing depends on retrying it further)"
+        );
+
+        // Meanwhile the receiver genuinely never got seq 10, but is very
+        // much alive: it keeps receiving and delivering everything after
+        // it.
+        let mut recv = ReliableRecv::new();
+        for seq in 1..=9u64 {
+            recv.observe(seq);
+        }
+        for seq in 11..=50u64 {
+            recv.observe(seq);
+        }
+        assert_eq!(
+            recv.current_ack().0,
+            9,
+            "the sender gave up believing the peer is unreachable, but the receiver's \
+             cumulative ack frontier is permanently stuck at 9 regardless -- this session's \
+             own ARQ state for this seq can never self-heal without a new epoch (a fresh \
+             PeerChannel/session), no matter how long both sides stay up"
+        );
     }
 
     #[test]
