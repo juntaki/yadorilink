@@ -5,7 +5,7 @@
 //! evolve independently. If either essential loop exits, this wrapper exits and
 //! `DaemonState`'s existing `spawn_restarting` supervision restarts both.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -116,12 +116,22 @@ async fn run_ephemeral_conflict_copy_retire_loop(state: Arc<DaemonState>) {
     loop {
         tokio::select! {
             _ = state.replica_coordinator.retirement_wake().retirement_wake_notified() => {
-                let dirty = state.replica_coordinator.retirement_wake().drain();
-                run_retirement_pass(&state, dirty).await;
+                let pending = state.replica_coordinator.retirement_wake().pending();
+                run_retirement_pass(&state, pending).await;
             }
             _ = tokio::time::sleep(RETIREMENT_BACKSTOP_INTERVAL) => {
                 if let Some(groups) = list_linked_groups_for_retirement(&state).await {
-                    run_retirement_pass(&state, groups).await;
+                    // Backstop recovery for a mark lost before this
+                    // generation-tracked state existed for the group at
+                    // all (e.g. linked after an earlier drop, or after a
+                    // crash) -- `mark_dirty` makes every linked group
+                    // reportable by `pending`, matching the old flat
+                    // poll's "just re-check everything" behavior.
+                    for group_id in &groups {
+                        state.replica_coordinator.retirement_wake().mark_dirty(group_id);
+                    }
+                    let pending = state.replica_coordinator.retirement_wake().pending();
+                    run_retirement_pass(&state, pending).await;
                 }
             }
         }
@@ -159,15 +169,20 @@ async fn list_linked_groups_for_retirement(state: &Arc<DaemonState>) -> Option<B
     }
 }
 
-/// Runs `PeerSyncSession::retire_conflict_copies_only` for each of `groups`,
-/// trying every candidate session in turn (matching the legacy sweep's own
-/// resilience to one stale/erroring session) and re-marking a group dirty
-/// if no session could actually run its audit this pass, so it is retried
-/// on the next wake or backstop rather than silently dropped -- see
-/// `RetirementWake::drain`'s own doc comment for why the caller carries
-/// this responsibility.
-async fn run_retirement_pass(state: &Arc<DaemonState>, groups: BTreeSet<String>) {
-    for group_id in groups {
+/// Runs `PeerSyncSession::retire_conflict_copies_only` for each group in
+/// `pending` (group id -> the generation `RetirementWake::pending` reported
+/// for it), trying every candidate session in turn (matching the legacy
+/// sweep's own resilience to one stale/erroring session). `RetirementWake::
+/// complete` is called for a group ONLY when a session genuinely ran the
+/// audit (`Ok(true)`) -- `Ok(false)` (a full `reconcile_local_
+/// materialization_audit` already holds the group's `MaterializationAuditGuard`)
+/// is a skip, not a completion, and must not be treated as one: that audit's
+/// own retire step evaluates the frontier as of whenever IT started, which
+/// may predate the event that made this pass's target generation pending.
+/// Not completing leaves the group in `pending` with no separate re-mark
+/// needed -- see `RetirementWake::pending`'s own doc comment.
+async fn run_retirement_pass(state: &Arc<DaemonState>, pending: BTreeMap<String, u64>) {
+    for (group_id, generation) in pending {
         // Any currently-connected peer session for this group can run the
         // audit -- it is driven by this device's own local DAG/file state,
         // not by which specific peer object it is invoked through.
@@ -177,26 +192,26 @@ async fn run_retirement_pass(state: &Arc<DaemonState>, groups: BTreeSet<String>)
             // peer has ever connected) -- nothing can run the audit
             // through yet. Not an error: a solo/offline group's ephemeral
             // conflict copies simply cannot retire until some session
-            // exists. Re-mark dirty so a future connect's own trigger, or
-            // the next backstop pass, tries again.
-            state.replica_coordinator.retirement_wake().mark_dirty(&group_id);
+            // exists. Left pending; a future connect's own trigger, or the
+            // next backstop pass, tries again.
             continue;
         }
         let mut last_error = None;
         let mut ran = false;
         for (peer_id, session) in &candidates {
             match session.clone().retire_conflict_copies_only(&group_id).await {
-                // `Ok(true)` actually ran the audit; `Ok(false)` means a
-                // full `reconcile_local_materialization_audit` was already
-                // in flight for this group through some session -- that
-                // audit's own retire step covers this same evaluation, so
-                // either way there is nothing further to try on another
-                // peer.
-                Ok(_) => {
+                Ok(true) => {
                     ran = true;
                     last_error = None;
                     break;
                 }
+                // A full audit already holds this group's guard -- that
+                // audit's own retire step covers SOME evaluation of this
+                // group, but not necessarily this pass's target
+                // generation, so this is a skip, not a completion. Try
+                // another candidate session rather than treating it as
+                // done.
+                Ok(false) => continue,
                 Err(error) => {
                     tracing::warn!(
                         %group_id,
@@ -215,8 +230,8 @@ async fn run_retirement_pass(state: &Arc<DaemonState>, groups: BTreeSet<String>)
                 "ephemeral conflict-copy retire audit failed for every connected peer this tick"
             );
         }
-        if !ran {
-            state.replica_coordinator.retirement_wake().mark_dirty(&group_id);
+        if ran {
+            state.replica_coordinator.retirement_wake().complete(&group_id, generation);
         }
     }
 }
