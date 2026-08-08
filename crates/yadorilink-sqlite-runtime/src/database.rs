@@ -49,23 +49,49 @@ impl SyncDatabase {
     /// `BUSY_TIMEOUT` so two of this process's own writers waiting on each
     /// other resolve by retrying, not erroring, and `synchronous = FULL`
     /// so a committed transaction survives an OS crash or power loss.
-    /// Runs schema bootstrap once, on one checked-out connection, before
-    /// returning -- the sole place schema initialization happens.
+    ///
+    /// Bootstraps on a single, unpooled connection BEFORE the pool exists
+    /// at all -- deliberately not the previous shape (build the pool, then
+    /// run the WAL pragma and schema bootstrap through `with_init` on
+    /// whichever pooled connections happen to get established). Switching
+    /// `journal_mode` to WAL is itself a mode change requiring SQLite's
+    /// exclusive lock, and `r2d2::Pool::new`/`Pool::builder().build(..)`'s
+    /// default `min_idle` eagerly establishes connections up to the pool's
+    /// max size at build time, in the background -- so the previous shape
+    /// let several of THIS PROCESS's OWN connections race each other to
+    /// switch journal mode on the same file concurrently, before
+    /// `writer_gate` (or anything else) existed to order them. Confirmed
+    /// as a real source of `database is locked` errors observed at
+    /// process-startup under load (multiple `SyncDatabase::open` calls in
+    /// the same process, e.g. one per simulated device in a multi-device
+    /// test). journal_mode is a property persisted in the database FILE
+    /// itself (survives connection close), so switching it once here,
+    /// before any pooled connection is ever established, means every
+    /// later pooled connection simply observes WAL mode already in
+    /// effect -- no per-connection WAL pragma is needed or issued by the
+    /// pool's own `with_init` any more, only the two purely
+    /// per-connection settings (`busy_timeout`, `synchronous`) that carry
+    /// no mode-switch race. Schema bootstrap also moves onto this same
+    /// bootstrap connection for the identical reason: it used to run on
+    /// whichever pooled connection `checkout` happened to hand back,
+    /// itself racing the same pool-startup fan-out.
     ///
     /// `schema_init` is the caller's complete schema-bootstrap step, run on
-    /// the one checked-out connection below before `open` returns -- the
-    /// sole place schema initialization happens. This crate does not
-    /// inspect or sequence it in any way; the caller (today,
-    /// `yadorilink-sync-core`'s composition root) owns what runs and in
-    /// what order, including whether/when it calls this crate's own
-    /// [`crate::schema::init_schema`] for the core DDL that crate doesn't
-    /// own. This crate knows no domain-specific name (DAG, filesystem
-    /// transaction, materialization job, ...) here or anywhere else.
+    /// the bootstrap connection before `open` returns -- the sole place
+    /// schema initialization happens. This crate does not inspect or
+    /// sequence it in any way; the caller (today, `yadorilink-sync-core`'s
+    /// composition root) owns what runs and in what order, including
+    /// whether/when it calls this crate's own [`crate::schema::init_schema`]
+    /// for the core DDL that crate doesn't own. This crate knows no
+    /// domain-specific name (DAG, filesystem transaction, materialization
+    /// job, ...) here or anywhere else.
     pub fn open(
         path: impl AsRef<Path>,
         schema_init: impl FnOnce(&Connection) -> Result<(), DatabaseError>,
     ) -> Result<Self, DatabaseError> {
-        let manager = SqliteConnectionManager::file(path.as_ref()).with_init(|conn| {
+        let path = path.as_ref();
+        {
+            let conn = Connection::open(path)?;
             conn.busy_timeout(BUSY_TIMEOUT)?;
             // journal_mode is itself a query (it returns the mode that
             // was actually applied), hence `pragma_update_and_check`
@@ -76,13 +102,23 @@ impl SyncDatabase {
             // compile-time default for `synchronous` (only NORMAL under
             // WAL). FULL fsyncs the WAL before reporting a commit,
             // closing the window where an OS crash or power loss could
-            // lose the last committed transaction. Set on every pooled
-            // connection (like `busy_timeout` above), since the pragma is
-            // per-connection, not stored in the database file.
+            // lose the last committed transaction. Set here too (not just
+            // in the pool's own per-connection init below), since this
+            // bootstrap connection is also the one `schema_init` runs on.
+            conn.pragma_update(None, "synchronous", "FULL")?;
+            schema_init(&conn)?;
+        }
+        let manager = SqliteConnectionManager::file(path).with_init(|conn| {
+            conn.busy_timeout(BUSY_TIMEOUT)?;
+            // No journal_mode pragma here -- see this method's own doc
+            // comment for why the bootstrap connection above already
+            // switched it once, durably, before this pool (or any pooled
+            // connection) existed.
             conn.pragma_update(None, "synchronous", "FULL")?;
             Ok(())
         });
-        Self::open_with_manager(manager, schema_init)
+        let pool = madsim_or_default_pool(manager)?;
+        Ok(Self { pool, writer_gate: Mutex::new(()) })
     }
 
     /// Opens an in-memory database, pooled just like the file-backed case.

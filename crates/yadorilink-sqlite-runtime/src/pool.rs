@@ -124,7 +124,20 @@ pub(crate) fn madsim_or_default_pool(
 pub(crate) fn madsim_or_default_pool(
     manager: SqliteConnectionManager,
 ) -> Result<ConnectionPool, crate::error::DatabaseError> {
-    Ok(Pool::new(manager)?)
+    // `Pool::new` (a bare `Pool::builder().build(..)`) defaults `min_idle`
+    // to `None`, which r2d2 documents as "maintain as many idle connections
+    // as `max_size`" -- i.e. it eagerly establishes connections up to the
+    // pool's max size at build time, on background threads, all racing
+    // each other against the same file. `SyncDatabase::open`'s own
+    // bootstrap connection (see its doc comment) has already put the file
+    // into WAL mode before this pool is ever built, so none of these
+    // connections' own per-connection init needs to perform a mode switch
+    // any more -- but capping the eager fill to 1 still cuts the number of
+    // connections concurrently opening the same file at startup, for
+    // exactly the same reason `open`'s bootstrap step exists: fewer
+    // concurrent openers is strictly safer than more, even once the
+    // specific WAL-switch race is closed.
+    Ok(Pool::builder().min_idle(Some(1)).build(manager)?)
 }
 
 /// The other half of the `SQLITE_LOCKED` fix (see
