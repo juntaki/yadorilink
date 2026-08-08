@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use yadorilink_peer_session::peer_session::RetirementAttempt;
 use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::session_state::RetroactiveRepairOutcome;
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
@@ -173,14 +174,12 @@ async fn list_linked_groups_for_retirement(state: &Arc<DaemonState>) -> Option<B
 /// `pending` (group id -> the generation `RetirementWake::pending` reported
 /// for it), trying every candidate session in turn (matching the legacy
 /// sweep's own resilience to one stale/erroring session). `RetirementWake::
-/// complete` is called for a group ONLY when a session genuinely ran the
-/// audit (`Ok(true)`) -- `Ok(false)` (a full `reconcile_local_
-/// materialization_audit` already holds the group's `MaterializationAuditGuard`)
-/// is a skip, not a completion, and must not be treated as one: that audit's
-/// own retire step evaluates the frontier as of whenever IT started, which
-/// may predate the event that made this pass's target generation pending.
-/// Not completing leaves the group in `pending` with no separate re-mark
-/// needed -- see `RetirementWake::pending`'s own doc comment.
+/// complete` is called for a group ONLY when `settles_generation` says the
+/// outcome was `RetirementAttempt::Settled` -- see that function's and
+/// `RetirementAttempt`'s own doc comments for why `Busy` and
+/// `RetryRequired` must not be treated as completions. Not completing
+/// leaves the group in `pending` with no separate re-mark needed -- see
+/// `RetirementWake::pending`'s own doc comment.
 async fn run_retirement_pass(state: &Arc<DaemonState>, pending: BTreeMap<String, u64>) {
     for (group_id, generation) in pending {
         // Any currently-connected peer session for this group can run the
@@ -197,21 +196,27 @@ async fn run_retirement_pass(state: &Arc<DaemonState>, pending: BTreeMap<String,
             continue;
         }
         let mut last_error = None;
-        let mut ran = false;
+        let mut settled = false;
         for (peer_id, session) in &candidates {
             match session.clone().retire_conflict_copies_only(&group_id).await {
-                Ok(true) => {
-                    ran = true;
+                Ok(attempt) if settles_generation(&attempt) => {
+                    settled = true;
                     last_error = None;
                     break;
                 }
-                // A full audit already holds this group's guard -- that
-                // audit's own retire step covers SOME evaluation of this
-                // group, but not necessarily this pass's target
-                // generation, so this is a skip, not a completion. Try
-                // another candidate session rather than treating it as
-                // done.
-                Ok(false) => continue,
+                // `Busy` (a full audit already holds this group's guard)
+                // or `RetryRequired` (ran, but at least one copy's
+                // evaluation was not verified against the targeted
+                // frontier) -- neither settles this pass's target
+                // generation. `Busy` is worth trying another candidate
+                // session for (a different session might not be
+                // contended); `RetryRequired` is a local-state outcome no
+                // other session would change, so trying another peer
+                // would just repeat the exact same audit -- but it costs
+                // nothing to fall through the loop rather than special-
+                // casing it, since no candidate can turn a local
+                // RetryRequired into Settled.
+                Ok(_) => continue,
                 Err(error) => {
                     tracing::warn!(
                         %group_id,
@@ -230,10 +235,19 @@ async fn run_retirement_pass(state: &Arc<DaemonState>, pending: BTreeMap<String,
                 "ephemeral conflict-copy retire audit failed for every connected peer this tick"
             );
         }
-        if ran {
+        if settled {
             state.replica_coordinator.retirement_wake().complete(&group_id, generation);
         }
     }
+}
+
+/// Whether `attempt` means the pass that produced it may be treated as
+/// having genuinely verified the frontier generation it targeted -- the
+/// single place the "only `Settled` completes a generation" contract is
+/// enforced, factored out so a test can exercise the decision without any
+/// `PeerSyncSession`/`DaemonState` plumbing.
+fn settles_generation(attempt: &RetirementAttempt) -> bool {
+    matches!(attempt, RetirementAttempt::Settled { .. })
 }
 
 /// Every direct `SyncState` call in this loop's body is wrapped in
@@ -426,5 +440,75 @@ mod tests {
         assert_eq!(eligible_rank_for_elapsed(Duration::from_secs(5)), 1);
         assert_eq!(eligible_rank_for_elapsed(Duration::from_millis(14_999)), 2);
         assert_eq!(eligible_rank_for_elapsed(Duration::from_secs(15)), 3);
+    }
+
+    #[test]
+    fn only_settled_settles_generation() {
+        assert!(settles_generation(&RetirementAttempt::Settled { retired: 0 }));
+        assert!(settles_generation(&RetirementAttempt::Settled { retired: 3 }));
+        assert!(!settles_generation(&RetirementAttempt::Busy));
+        assert!(!settles_generation(&RetirementAttempt::RetryRequired));
+    }
+
+    /// Guard-contention (`Busy`) failure injection: `RetirementWake::
+    /// complete` must not be called for the claimed generation, so the
+    /// group stays reported by `pending` for the next wake/backstop.
+    #[test]
+    fn busy_outcome_leaves_generation_pending() {
+        let wake = crate::sync_runtime::retirement_wake::RetirementWake::new();
+        wake.mark_dirty("g1");
+        let claimed = *wake.pending().get("g1").unwrap();
+        if settles_generation(&RetirementAttempt::Busy) {
+            wake.complete("g1", claimed);
+        }
+        assert_eq!(wake.pending().get("g1"), Some(&1));
+    }
+
+    /// Transient-retry failure injection: a `RetryRequired` outcome (a
+    /// copy's tombstone materialize hit a transient block/disk condition)
+    /// must equally not complete the claimed generation.
+    #[test]
+    fn retry_required_outcome_leaves_generation_pending() {
+        let wake = crate::sync_runtime::retirement_wake::RetirementWake::new();
+        wake.mark_dirty("g1");
+        let claimed = *wake.pending().get("g1").unwrap();
+        if settles_generation(&RetirementAttempt::RetryRequired) {
+            wake.complete("g1", claimed);
+        }
+        assert_eq!(wake.pending().get("g1"), Some(&1));
+    }
+
+    /// The core lost-wakeup regression test: an event landing WHILE a
+    /// pass is auditing generation 1 must not be swallowed by that pass's
+    /// own (successful) completion -- it must provoke exactly one
+    /// follow-up audit, which then settles cleanly with no event left
+    /// over.
+    #[test]
+    fn event_during_audit_provokes_exactly_one_follow_up_audit() {
+        let wake = crate::sync_runtime::retirement_wake::RetirementWake::new();
+        wake.mark_dirty("g1");
+        let claimed_generation_1 = *wake.pending().get("g1").unwrap();
+        assert_eq!(claimed_generation_1, 1);
+
+        // A DAG admission (or job completion) lands while the pass that
+        // claimed generation 1 is still auditing.
+        wake.mark_dirty("g1");
+
+        // That in-flight pass finishes and reports success for the
+        // generation it actually claimed, not the new one.
+        if settles_generation(&RetirementAttempt::Settled { retired: 1 }) {
+            wake.complete("g1", claimed_generation_1);
+        }
+
+        // Exactly one follow-up audit's worth of pending work remains --
+        // the mid-audit event was not lost.
+        let pending = wake.pending();
+        assert_eq!(pending.get("g1"), Some(&2));
+
+        let claimed_generation_2 = *pending.get("g1").unwrap();
+        if settles_generation(&RetirementAttempt::Settled { retired: 0 }) {
+            wake.complete("g1", claimed_generation_2);
+        }
+        assert!(wake.pending().is_empty());
     }
 }

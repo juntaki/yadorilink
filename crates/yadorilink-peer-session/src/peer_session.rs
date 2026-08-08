@@ -373,6 +373,36 @@ pub enum MaterializeResult {
     RetryRequired,
 }
 
+/// Outcome of one `retire_conflict_copies_only` attempt for a group.
+/// Exists so a generation-tracked caller (`engine_wrapper.rs`'s
+/// `RetirementWake`) can tell "this pass genuinely verified the frontier
+/// generation it targeted" from every way it might not have -- a plain
+/// `bool`/`Result<(), _>` return collapsed all three into "ran" vs
+/// "errored", which is exactly the shape that let a guard-busy skip get
+/// treated as a completed pass (see `RetirementWake`'s own doc comment for
+/// the resulting lost-wakeup bug this type closes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetirementAttempt {
+    /// Every copy-shaped file this pass examined was either justified by
+    /// the current frontier or successfully retired. Only this variant
+    /// means the caller may call `RetirementWake::complete` for the
+    /// generation this pass targeted. `retired` counts how many copies
+    /// were actually removed (informational only, not part of the
+    /// completion contract).
+    Settled { retired: usize },
+    /// `MaterializationAuditGuard` contention: a full audit already holds
+    /// this group's guard, so this pass did not run at all. Not an error
+    /// -- that other audit's own retire step covers SOME evaluation of
+    /// this group, but not necessarily the frontier generation this pass
+    /// was asked to verify.
+    Busy,
+    /// The pass ran, but at least one copy's tombstone `materialize`
+    /// returned `MaterializeResult::RetryRequired` or errored -- that
+    /// copy's justification was never actually re-verified against the
+    /// targeted frontier, so the pass as a whole did not settle it.
+    RetryRequired,
+}
+
 /// The outcome of one `reconcile_group_paths` call, split into two
 /// explicit, disjoint sets rather than a single "failed" set — a real,
 /// confirmed bug this shape exists to make structurally impossible (see
@@ -3693,24 +3723,22 @@ impl PeerSyncSession {
     /// on. Shares `reconcile_local_materialization_audit`'s own
     /// `MaterializationAuditGuard` key, so the two remain mutually
     /// exclusive per group: a group with a full audit already in flight
-    /// skips this call (`Ok(false)`) rather than running a second,
-    /// redundant retire pass concurrently against the same local state.
-    /// Returns `Ok(true)` if this call actually ran (whether or not it
-    /// retired anything), matching that method's own skip-vs-ran
-    /// distinction.
+    /// skips this call (`RetirementAttempt::Busy`) rather than running a
+    /// second, redundant retire pass concurrently against the same local
+    /// state. See `RetirementAttempt`'s own doc comment for what each
+    /// variant means for a generation-tracked caller.
     pub async fn retire_conflict_copies_only(
         self: Arc<Self>,
         group_id: &str,
-    ) -> Result<bool, PeerSessionError> {
+    ) -> Result<RetirementAttempt, PeerSessionError> {
         if !matches!(self.state.link_gate_for_group(group_id)?, LinkGate::Live { .. }) {
-            return Ok(true);
+            return Ok(RetirementAttempt::Settled { retired: 0 });
         }
         let Some(_guard) = MaterializationAuditGuard::try_acquire(&self.state, group_id) else {
-            return Ok(false);
+            return Ok(RetirementAttempt::Busy);
         };
         let audit_attempt_id = next_audit_attempt_id();
-        self.retire_unjustified_ephemeral_conflict_copies(group_id, audit_attempt_id).await?;
-        Ok(true)
+        self.retire_unjustified_ephemeral_conflict_copies(group_id, audit_attempt_id).await
     }
 
     /// Periodic DAG resync's local repair backstop. A heads announce keeps
@@ -3870,13 +3898,25 @@ impl PeerSyncSession {
     /// journal is skipped outright (its pending change is not yet
     /// re-driven), and the whole check-then-delete runs under the path
     /// lock, mirroring `reconcile_group_paths`' Absent-branch discipline.
+    ///
+    /// Returns `RetirementAttempt::Settled` only if every copy-shaped file
+    /// this pass examined was either justified or successfully retired.
+    /// One copy's tombstone `materialize` returning `MaterializeResult::
+    /// RetryRequired` (transient block/disk condition) makes the WHOLE
+    /// pass `RetirementAttempt::RetryRequired`, even if every other copy
+    /// settled cleanly: the caller uses this to decide whether it may
+    /// consider the frontier generation it targeted fully verified, and a
+    /// pass that skipped even one copy's re-evaluation has not verified
+    /// it. The operation is idempotent regardless -- a copy already
+    /// retired by an earlier pass this same call just does not appear in
+    /// `copy_shaped` on the next one.
     async fn retire_unjustified_ephemeral_conflict_copies(
         &self,
         group_id: &str,
         audit_attempt_id: u64,
-    ) -> Result<(), PeerSessionError> {
+    ) -> Result<RetirementAttempt, PeerSessionError> {
         let LinkGate::Live { policy, .. } = self.state.link_gate_for_group(group_id)? else {
-            return Ok(());
+            return Ok(RetirementAttempt::Settled { retired: 0 });
         };
         let copy_shaped: Vec<FileRecord> = self
             .state
@@ -3887,8 +3927,10 @@ impl PeerSyncSession {
             })
             .collect();
         if copy_shaped.is_empty() {
-            return Ok(());
+            return Ok(RetirementAttempt::Settled { retired: 0 });
         }
+        let mut retired = 0usize;
+        let mut retry_required = false;
         let history = self.state.dag_group_history_paths(group_id)?;
         for record in copy_shaped {
             if history.contains(&record.path) {
@@ -3929,32 +3971,53 @@ impl PeerSyncSession {
                 deleted: true,
             };
             match self.materialize(group_id, &tombstone, policy, &self.peer_device_id, None).await {
-                Ok(MaterializeResult::Settled) => tracing::info!(
-                    group_id,
-                    path = %record.path,
-                    audit_attempt_id,
-                    "retired an ephemeral conflict copy no longer justified by the current frontier"
-                ),
-                // `RetryRequired` is not a retirement, and logging it as one
-                // made this audit claim work it had not done. Nothing is lost
-                // — the copy is still live, so the next audit re-evaluates it
-                // — but the log has to say so, otherwise a copy that never
-                // retires reads as retiring cleanly every cycle.
-                Ok(MaterializeResult::RetryRequired) => tracing::debug!(
-                    group_id,
-                    path = %record.path,
-                    audit_attempt_id,
-                    "deferred retiring an ephemeral conflict copy; will re-evaluate next audit"
-                ),
-                Err(e) => tracing::warn!(
-                    group_id,
-                    path = %record.path,
-                    error = %e,
-                    "failed to retire an unjustified ephemeral conflict copy; will retry next audit"
-                ),
+                Ok(MaterializeResult::Settled) => {
+                    retired += 1;
+                    tracing::info!(
+                        group_id,
+                        path = %record.path,
+                        audit_attempt_id,
+                        "retired an ephemeral conflict copy no longer justified by the current frontier"
+                    )
+                }
+                // `RetryRequired` is not a retirement -- the copy is still
+                // live, so the next audit re-evaluates it -- but it also
+                // means THIS pass never verified this copy's justification
+                // against the frontier it targeted, so the whole pass must
+                // report `RetryRequired`, not `Settled`: a caller that
+                // completed its target generation on a pass that silently
+                // skipped a copy's re-evaluation would never re-examine it
+                // again unless some unrelated future event happened to
+                // re-mark the group dirty.
+                Ok(MaterializeResult::RetryRequired) => {
+                    retry_required = true;
+                    tracing::debug!(
+                        group_id,
+                        path = %record.path,
+                        audit_attempt_id,
+                        "deferred retiring an ephemeral conflict copy; will re-evaluate next audit"
+                    )
+                }
+                // Same reasoning as `RetryRequired` above: a transient
+                // per-copy failure must not let the pass as a whole report
+                // `Settled` for a generation whose frontier this copy was
+                // never actually re-verified against.
+                Err(e) => {
+                    retry_required = true;
+                    tracing::warn!(
+                        group_id,
+                        path = %record.path,
+                        error = %e,
+                        "failed to retire an unjustified ephemeral conflict copy; will retry next audit"
+                    )
+                }
             }
         }
-        Ok(())
+        Ok(if retry_required {
+            RetirementAttempt::RetryRequired
+        } else {
+            RetirementAttempt::Settled { retired }
+        })
     }
 
     /// Re-projects every admitted-but-not-yet-applied change for `group_id` —

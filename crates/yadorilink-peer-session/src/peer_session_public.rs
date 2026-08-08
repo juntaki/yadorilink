@@ -28,6 +28,7 @@ use yadorilink_sync_wire::PeerWireCodec;
 
 #[cfg(madsim)]
 pub use crate::peer_session_impl::set_test_clock_override;
+pub use crate::peer_session_impl::RetirementAttempt;
 use crate::peer_session_impl::PeerSyncSessionOneTimeDeps;
 pub use crate::peer_session_impl::{
     disk_race_fingerprint, BlockWriteActivityProvider, ChangeAuthenticator, HandoffLeaseResponder,
@@ -355,7 +356,7 @@ impl PeerSyncSession {
     pub async fn retire_conflict_copies_only(
         self: Arc<Self>,
         group_id: &str,
-    ) -> Result<bool, PeerSessionError> {
+    ) -> Result<RetirementAttempt, PeerSessionError> {
         self.inner.clone().retire_conflict_copies_only(group_id).await
     }
 
