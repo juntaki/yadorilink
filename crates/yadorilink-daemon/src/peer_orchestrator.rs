@@ -1466,65 +1466,7 @@ fn spawn_peer_session(
         tokio::spawn(poll_reachability(state.clone(), peer_device_id.clone(), channel.clone()));
 
         let sync_roots = sync_roots_for_groups(&state, &shared_group_ids);
-        let dependencies = PeerSyncSessionDeps {
-            // Every session shares this daemon's one global upload/download
-            // token-bucket pair (never an independent per-session copy).
-            rate_limiters: state.rate_limiters.clone(),
-            block_serve_engine: state.block_serve_engine.clone(),
-            // This session's own disk-headroom preflight is turned on only
-            // once `main.rs` has opted the whole daemon into enforcement
-            // (see `DaemonState::disk_headroom_enforcement_enabled`'s doc
-            // comment for why that's not just always-on here).
-            headroom_enforced: state.disk_headroom_enforcement_enabled(),
-            // Lets this session's `reconcile_one_file` force a racing local
-            // change out of this device's per-link debounce accumulators
-            // before comparing/applying a peer update — see
-            // `PendingLocalChangeFlush for DaemonState`'s doc comment
-            // (the daemon's own `LinkRuntimeController`).
-            pending_local_change_flush: state.clone(),
-            root_commit_authority_provider: state.clone(),
-            // Admit incoming change-history changes only when this device
-            // has pinned the author's signing key and the author is an
-            // authorized writer for the change's group — both mirrored from
-            // the netmap onto `DaemonState`. Without an authenticator a
-            // session announces heads and serves stored changes but never
-            // admits an incoming one.
-            change_authenticator: crate::change_auth::NetmapChangeAuthenticator::new(state.clone()),
-            // Lets this session author a captured change for content its
-            // own materialize path displaces during custody transfer (see
-            // `PeerSyncSession::set_change_emitter`'s doc comment). A device
-            // that has not yet been provisioned a signing key is left with
-            // no emitter -- the same fail-closed default the field itself
-            // documents -- so a future caller must retain rather than
-            // author in that case; it never falls back to an unsigned or
-            // wrong-identity write.
-            change_emitter: state.device_signing_key().map(|signing_key| {
-                Arc::new(yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
-                    state.device_id.clone(),
-                    signing_key,
-                ))
-            }),
-            // Lets this session answer an incoming peer `HandoffLeaseRequest`
-            // by running this device's own target-side lease flow — see
-            // `HandoffLeaseResponder for DaemonState`'s doc comment
-            // (`daemon_state.rs`).
-            handoff_lease_responder: state.clone(),
-            block_write_activity_provider: state.clone(),
-            // Lets this session answer an incoming peer `HandoffTicketRequest`
-            // (from a different device removing/revoking this one) by running
-            // this device's own removed-device-ticket flow — see
-            // `HandoffTicketResponder for DaemonState`'s doc comment
-            // (`daemon_state.rs`).
-            handoff_ticket_responder: state.clone(),
-            // Lets this session answer an incoming peer `RebootstrapSnapshotRequest`
-            // and process an incoming `RebootstrapSnapshotResponse` by running this
-            // device's own signing identity and pinned-key trust resolver — see
-            // `DaemonRebootstrapHandler`'s doc comment (`rebootstrap_handler.rs`).
-            rebootstrap_handler: crate::rebootstrap_handler::DaemonRebootstrapHandler::new(
-                state.clone(),
-            ),
-            ..PeerSyncSessionDeps::standalone()
-        };
+        let dependencies = peer_sync_session_deps(&state);
         let session = PeerSyncSession::new_with_dependencies(
             channel,
             local_device_id,
@@ -1705,7 +1647,80 @@ fn map_transport_category(
 /// is "the" root for one group, at the same moment. An orphaned link's
 /// coordination-side authorization is gone and must never be handed back as a
 /// valid write target; the primitive filters those out.
-fn sync_roots_for_groups(state: &DaemonState, group_ids: &[String]) -> HashMap<String, PathBuf> {
+/// Every `PeerSyncSessionDeps` field this device's own daemon state can
+/// supply, identical for every `PeerSyncSession` this device constructs --
+/// factored out of what used to be two independently-maintained inline
+/// literals (the outbound-connect and inbound-accept paths below) that had
+/// already drifted (one carried every field's doc comment, the other only
+/// some), and reused as-is by `DaemonState::local_retirement_session` for a
+/// session bound to no live peer at all (`LoopbackPeerMessageChannel`) --
+/// see that method's own doc comment for why retirement needs one.
+pub(crate) fn peer_sync_session_deps(state: &Arc<DaemonState>) -> PeerSyncSessionDeps {
+    PeerSyncSessionDeps {
+        // Every session shares this daemon's one global upload/download
+        // token-bucket pair (never an independent per-session copy).
+        rate_limiters: state.rate_limiters.clone(),
+        block_serve_engine: state.block_serve_engine.clone(),
+        // This session's own disk-headroom preflight is turned on only
+        // once `main.rs` has opted the whole daemon into enforcement
+        // (see `DaemonState::disk_headroom_enforcement_enabled`'s doc
+        // comment for why that's not just always-on here).
+        headroom_enforced: state.disk_headroom_enforcement_enabled(),
+        // Lets this session's `reconcile_one_file` force a racing local
+        // change out of this device's per-link debounce accumulators
+        // before comparing/applying a peer update — see
+        // `PendingLocalChangeFlush for DaemonState`'s doc comment
+        // (the daemon's own `LinkRuntimeController`).
+        pending_local_change_flush: state.clone(),
+        root_commit_authority_provider: state.clone(),
+        // Admit incoming change-history changes only when this device
+        // has pinned the author's signing key and the author is an
+        // authorized writer for the change's group — both mirrored from
+        // the netmap onto `DaemonState`. Without an authenticator a
+        // session announces heads and serves stored changes but never
+        // admits an incoming one.
+        change_authenticator: crate::change_auth::NetmapChangeAuthenticator::new(state.clone()),
+        // Lets this session author a captured change for content its
+        // own materialize path displaces during custody transfer (see
+        // `PeerSyncSession::set_change_emitter`'s doc comment). A device
+        // that has not yet been provisioned a signing key is left with
+        // no emitter -- the same fail-closed default the field itself
+        // documents -- so a future caller must retain rather than
+        // author in that case; it never falls back to an unsigned or
+        // wrong-identity write.
+        change_emitter: state.device_signing_key().map(|signing_key| {
+            Arc::new(yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
+                state.device_id.clone(),
+                signing_key,
+            ))
+        }),
+        // Lets this session answer an incoming peer `HandoffLeaseRequest`
+        // by running this device's own target-side lease flow — see
+        // `HandoffLeaseResponder for DaemonState`'s doc comment
+        // (`daemon_state.rs`).
+        handoff_lease_responder: state.clone(),
+        block_write_activity_provider: state.clone(),
+        // Lets this session answer an incoming peer `HandoffTicketRequest`
+        // (from a different device removing/revoking this one) by running
+        // this device's own removed-device-ticket flow — see
+        // `HandoffTicketResponder for DaemonState`'s doc comment
+        // (`daemon_state.rs`).
+        handoff_ticket_responder: state.clone(),
+        // Lets this session answer an incoming peer `RebootstrapSnapshotRequest`
+        // and process an incoming `RebootstrapSnapshotResponse` by running this
+        // device's own signing identity and pinned-key trust resolver — see
+        // `DaemonRebootstrapHandler`'s doc comment (`rebootstrap_handler.rs`).
+        rebootstrap_handler: crate::rebootstrap_handler::DaemonRebootstrapHandler::new(
+            state.clone(),
+        ),
+        ..PeerSyncSessionDeps::standalone()
+    }
+}
+
+pub(crate) fn sync_roots_for_groups(
+    state: &DaemonState,
+    group_ids: &[String],
+) -> HashMap<String, PathBuf> {
     let mut roots = HashMap::new();
     for group_id in group_ids {
         match state.replica_coordinator.link_repository().live_link_local_path_for_group(group_id) {
@@ -1899,54 +1914,7 @@ fn spawn_direct_peer_session(
             sync_roots = sync_roots_for_groups(&state, &shared_group_ids);
         }
 
-        let dependencies = PeerSyncSessionDeps {
-            rate_limiters: state.rate_limiters.clone(),
-            block_serve_engine: state.block_serve_engine.clone(),
-            headroom_enforced: state.disk_headroom_enforcement_enabled(),
-            pending_local_change_flush: state.clone(),
-            root_commit_authority_provider: state.clone(),
-            // Admit incoming change-history changes only when this device
-            // has pinned the author's signing key and the author is an
-            // authorized writer for the change's group — both mirrored from
-            // the netmap onto `DaemonState`. Without an authenticator a
-            // session announces heads and serves stored changes but never
-            // admits an incoming one.
-            change_authenticator: crate::change_auth::NetmapChangeAuthenticator::new(state.clone()),
-            // Lets this session author a captured change for content its
-            // own materialize path displaces during custody transfer (see
-            // `PeerSyncSession::set_change_emitter`'s doc comment). A device
-            // that has not yet been provisioned a signing key is left with
-            // no emitter -- the same fail-closed default the field itself
-            // documents -- so a future caller must retain rather than
-            // author in that case; it never falls back to an unsigned or
-            // wrong-identity write.
-            change_emitter: state.device_signing_key().map(|signing_key| {
-                Arc::new(yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
-                    state.device_id.clone(),
-                    signing_key,
-                ))
-            }),
-            // Lets this session answer an incoming peer `HandoffLeaseRequest`
-            // by running this device's own target-side lease flow — see
-            // `HandoffLeaseResponder for DaemonState`'s doc comment
-            // (`daemon_state.rs`).
-            handoff_lease_responder: state.clone(),
-            block_write_activity_provider: state.clone(),
-            // Lets this session answer an incoming peer `HandoffTicketRequest`
-            // (from a different device removing/revoking this one) by running
-            // this device's own removed-device-ticket flow — see
-            // `HandoffTicketResponder for DaemonState`'s doc comment
-            // (`daemon_state.rs`).
-            handoff_ticket_responder: state.clone(),
-            // Lets this session answer an incoming peer `RebootstrapSnapshotRequest`
-            // and process an incoming `RebootstrapSnapshotResponse` by running this
-            // device's own signing identity and pinned-key trust resolver — see
-            // `DaemonRebootstrapHandler`'s doc comment (`rebootstrap_handler.rs`).
-            rebootstrap_handler: crate::rebootstrap_handler::DaemonRebootstrapHandler::new(
-                state.clone(),
-            ),
-            ..PeerSyncSessionDeps::standalone()
-        };
+        let dependencies = peer_sync_session_deps(&state);
         let session = PeerSyncSession::new_with_dependencies(
             channel,
             local_device_id,

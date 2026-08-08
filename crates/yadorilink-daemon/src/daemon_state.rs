@@ -369,6 +369,16 @@ pub struct DaemonState {
     /// lets every path eventually get its turn without needing an
     /// unboundedly large single attempt.
     pub(crate) convergence_engine_path_budget_cursors: Mutex<HashMap<String, usize>>,
+    /// group_id -> cached `PeerSyncSession` bound to a `LoopbackPeerMessageChannel`
+    /// rather than a live peer connection -- see `local_retirement_session`'s
+    /// own doc comment for why retirement needs a session object at all,
+    /// and why one not requiring a connected peer. Built lazily on first
+    /// use per group and reused after that, matching a real peer session's
+    /// own long-lived-per-connection shape (rate limiters, block-serve
+    /// engine, and friends are shared `Arc`s either way, so nothing here
+    /// depends on reconstructing fresh per call).
+    local_retirement_sessions:
+        Mutex<HashMap<String, Arc<yadorilink_peer_session::peer_session::PeerSyncSession>>>,
     /// Overridable copy of `MATERIALIZATION_REPAIR_SWEEP_INTERVAL` — same
     /// mutable-after-construction shape as `PeerSyncSession::
     /// full_index_resync_interval` (`StdMutex`, opt-in override via
@@ -965,6 +975,7 @@ impl DaemonState {
             materialization_repair_cursors: Mutex::new(HashMap::new()),
             convergence_engine_cursors: Mutex::new(HashMap::new()),
             convergence_engine_path_budget_cursors: Mutex::new(HashMap::new()),
+            local_retirement_sessions: Mutex::new(HashMap::new()),
             materialization_repair_sweep_interval: Mutex::new(
                 default_materialization_repair_sweep_interval(),
             ),
@@ -3128,6 +3139,76 @@ impl DaemonState {
                 );
             }
         }
+    }
+
+    /// Lazily builds and caches, per group, a `PeerSyncSession` bound to a
+    /// `local_session_channel::LoopbackPeerMessageChannel` -- an inert
+    /// channel, never a live peer connection -- rather than one drawn from
+    /// `self.peers` (`peer_registry::PeerRegistry::sessions_for_group`).
+    /// `ConvergenceRetirementService` (`convergence::retirement_service`)
+    /// uses this instead of enumerating currently-connected peer sessions
+    /// so ephemeral-conflict-copy retirement no longer requires a live
+    /// peer to run at all: retirement's own decision (is a copy-shaped
+    /// file still justified by the CURRENT frontier?) is driven entirely
+    /// by this device's own local DAG/file-index/disk state -- see
+    /// `PeerSyncSession::retire_unjustified_ephemeral_conflict_copies`'s
+    /// own doc comment -- so which peer object (if any) happens to be
+    /// connected was never actually load-bearing for it. Before this, a
+    /// solo/newly-linked/currently-offline group's ephemeral conflict
+    /// copies could never retire at all: `run_retirement_pass`
+    /// (`convergence::engine`) found zero candidate sessions, re-marked
+    /// the group dirty, and repeated forever with nothing ever able to
+    /// claim it.
+    ///
+    /// `.run()` is never called on the returned session -- callers use
+    /// only its specific per-call methods (`retire_conflict_copies_only`
+    /// today), none of which read from or block on the channel for a
+    /// purely local tombstone materialize, so
+    /// `LoopbackPeerMessageChannel::recv` never resolving is never
+    /// observed. `local_device_id` doubles as `peer_device_id` here (this
+    /// session never actually talks to a peer named anything else): the
+    /// only place that value is visible afterward is the tombstone's
+    /// stored `origin_device_id` column (pure display/provenance
+    /// metadata -- `yadorilink-cli`'s `version_history` and
+    /// `control_socket`'s status API, never a resolver/hazard/conflict
+    /// decision input, confirmed by tracing every read site), so
+    /// attributing a retirement's tombstone to this device's own id is
+    /// strictly more accurate than the previous behavior of attributing
+    /// it to whichever connected peer's session happened to be selected
+    /// to run the audit.
+    pub(crate) fn local_retirement_session(
+        self: &Arc<Self>,
+        group_id: &str,
+    ) -> Arc<yadorilink_peer_session::peer_session::PeerSyncSession> {
+        if let Some(existing) = self
+            .local_retirement_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_id)
+        {
+            return existing.clone();
+        }
+        let group_ids = vec![group_id.to_string()];
+        let sync_roots = crate::peer_orchestrator::sync_roots_for_groups(self, &group_ids);
+        let dependencies = crate::peer_orchestrator::peer_sync_session_deps(self);
+        let session = yadorilink_peer_session::peer_session::PeerSyncSession::new_with_dependencies(
+            Arc::new(crate::local_session_channel::LoopbackPeerMessageChannel),
+            self.device_id.clone(),
+            self.device_id.clone(),
+            self.replica_coordinator.clone(),
+            Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                self.block_store.clone(),
+            )),
+            group_ids,
+            sync_roots,
+            None,
+            dependencies,
+        );
+        self.local_retirement_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(group_id.to_string(), session.clone());
+        session
     }
 }
 

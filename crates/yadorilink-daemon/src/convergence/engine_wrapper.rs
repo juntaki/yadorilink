@@ -170,73 +170,38 @@ async fn list_linked_groups_for_retirement(state: &Arc<DaemonState>) -> Option<B
     }
 }
 
-/// Runs `PeerSyncSession::retire_conflict_copies_only` for each group in
+/// Runs `ConvergenceRetirementService::reconcile_group` for each group in
 /// `pending` (group id -> the generation `RetirementWake::pending` reported
-/// for it), trying every candidate session in turn (matching the legacy
-/// sweep's own resilience to one stale/erroring session). `RetirementWake::
-/// complete` is called for a group ONLY when `settles_generation` says the
-/// outcome was `RetirementAttempt::Settled` -- see that function's and
+/// for it) -- no live peer session involved (see
+/// `DaemonState::local_retirement_session`'s own doc comment for why
+/// retirement's own decision was never actually dependent on which, or
+/// any, peer happened to be connected). `RetirementWake::complete` is
+/// called for a group ONLY when `settles_generation` says the outcome was
+/// `RetirementAttempt::Settled` -- see that function's and
 /// `RetirementAttempt`'s own doc comments for why `Busy` and
 /// `RetryRequired` must not be treated as completions. Not completing
 /// leaves the group in `pending` with no separate re-mark needed -- see
 /// `RetirementWake::pending`'s own doc comment.
 async fn run_retirement_pass(state: &Arc<DaemonState>, pending: BTreeMap<String, u64>) {
+    let service = super::retirement_service::ConvergenceRetirementService::new(state.clone());
     for (group_id, generation) in pending {
-        // Any currently-connected peer session for this group can run the
-        // audit -- it is driven by this device's own local DAG/file state,
-        // not by which specific peer object it is invoked through.
-        let candidates = crate::hydration::candidate_sessions(state, &group_id);
-        if candidates.is_empty() {
-            // No live session for this group at all right now (e.g. no
-            // peer has ever connected) -- nothing can run the audit
-            // through yet. Not an error: a solo/offline group's ephemeral
-            // conflict copies simply cannot retire until some session
-            // exists. Left pending; a future connect's own trigger, or the
-            // next backstop pass, tries again.
-            continue;
-        }
-        let mut last_error = None;
-        let mut settled = false;
-        for (peer_id, session) in &candidates {
-            match session.clone().retire_conflict_copies_only(&group_id).await {
-                Ok(attempt) if settles_generation(&attempt) => {
-                    settled = true;
-                    last_error = None;
-                    break;
-                }
-                // `Busy` (a full audit already holds this group's guard)
-                // or `RetryRequired` (ran, but at least one copy's
-                // evaluation was not verified against the targeted
-                // frontier) -- neither settles this pass's target
-                // generation. `Busy` is worth trying another candidate
-                // session for (a different session might not be
-                // contended); `RetryRequired` is a local-state outcome no
-                // other session would change, so trying another peer
-                // would just repeat the exact same audit -- but it costs
-                // nothing to fall through the loop rather than special-
-                // casing it, since no candidate can turn a local
-                // RetryRequired into Settled.
-                Ok(_) => continue,
-                Err(error) => {
-                    tracing::warn!(
-                        %group_id,
-                        peer = %peer_id,
-                        %error,
-                        "ephemeral conflict-copy retire audit peer failed; trying another peer"
-                    );
-                    last_error = Some(error);
-                }
+        match service.reconcile_group(&group_id).await {
+            Ok(attempt) if settles_generation(&attempt) => {
+                state.replica_coordinator.retirement_wake().complete(&group_id, generation);
             }
-        }
-        if let Some(error) = last_error {
-            tracing::warn!(
-                %group_id,
-                %error,
-                "ephemeral conflict-copy retire audit failed for every connected peer this tick"
-            );
-        }
-        if settled {
-            state.replica_coordinator.retirement_wake().complete(&group_id, generation);
+            // `Busy` (a full audit already holds this group's guard) or
+            // `RetryRequired` (ran, but at least one copy's evaluation was
+            // not verified against the targeted frontier) -- neither
+            // settles this pass's target generation. Left pending; the
+            // next wake or backstop tries again.
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %group_id,
+                    %error,
+                    "ephemeral conflict-copy retire audit failed"
+                );
+            }
         }
     }
 }
