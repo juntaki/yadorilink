@@ -4711,6 +4711,21 @@ impl PeerSyncSession {
                 continue;
             }
 
+            // A change already durably admitted (whether or not its own
+            // projection has succeeded yet -- `dag_list_unapplied_changes`'s
+            // durable retry backstop owns that separately) has nothing left
+            // for this receipt to do: re-running it through the local-flush
+            // barrier below cannot change DAG admission and only spends that
+            // barrier's bounded budget on gossip this device has already
+            // seen. Anti-entropy resends the same change on every heads
+            // announce until this device's frontier catches up, so under a
+            // duplicate-delivery storm this fast-path is what keeps the
+            // targeted-flush channel from staying saturated by re-flushing
+            // the same paths on every redundant redelivery.
+            if self.state.dag_has_change(&claimed_hash)? {
+                continue;
+            }
+
             // Capture any local disk edit that predates this received change
             // before admitting the change into the DAG.  Flushing only during
             // materialization is too late: local emission would then select

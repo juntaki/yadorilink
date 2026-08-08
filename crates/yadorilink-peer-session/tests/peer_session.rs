@@ -8505,6 +8505,107 @@ mod reconcile_group_paths_flush_tests {
             "the change must admit once local-flush is no longer saturated"
         );
     }
+
+    /// A change already durably admitted must skip the local-flush barrier
+    /// entirely on re-delivery -- the fast path this session's duplicate-
+    /// delivery storm (row14) needs to keep the targeted-flush channel from
+    /// staying saturated forever.
+    #[tokio::test]
+    async fn duplicate_of_an_already_admitted_change_skips_the_local_flush_barrier() {
+        let h = setup().await;
+        let version = empty_version();
+        let chain = emit_remote_chain(&version, vec![vec![create_op(P, &version)]]);
+        let change = &chain[0];
+        let batch = batch_of(&[change], &[&version]);
+
+        h.session.handle_change_batch(batch.clone()).await.unwrap();
+        assert!(h
+            .state
+            .change_history_repository()
+            .dag_has_change(&change.compute_hash())
+            .unwrap());
+        let heads_after_first = h.state.sqlite().dag_group_heads(GROUP).unwrap();
+        h.flush.take_calls(); // clear whatever the first admission triggered
+
+        // Redeliver the identical batch (anti-entropy resending gossip this
+        // device has already seen).
+        h.session.handle_change_batch(batch).await.unwrap();
+
+        assert!(
+            h.flush.take_calls().is_empty(),
+            "a duplicate of an already-admitted change must never reach the local-flush barrier"
+        );
+        assert_eq!(
+            h.state.sqlite().dag_group_heads(GROUP).unwrap(),
+            heads_after_first,
+            "a duplicate delivery must not change DAG state"
+        );
+    }
+
+    /// The ordinary path for a genuinely new change is unaffected by the
+    /// duplicate fast-path: local-flush still runs, and a `Settled` outcome
+    /// still lets the change admit.
+    #[tokio::test]
+    async fn a_genuinely_new_change_still_runs_local_flush_and_admits() {
+        let h = setup().await;
+        let version = empty_version();
+        let chain = emit_remote_chain(&version, vec![vec![create_op(P, &version)]]);
+        let change = &chain[0];
+        let batch = batch_of(&[change], &[&version]);
+
+        h.session.handle_change_batch(batch).await.unwrap();
+
+        assert!(
+            h.flush.take_calls().contains(&P.to_string()),
+            "a genuinely new change must still run the local-flush barrier"
+        );
+        assert!(
+            h.state.change_history_repository().dag_has_change(&change.compute_hash()).unwrap(),
+            "a genuinely new change must still admit once flush settles"
+        );
+    }
+
+    /// The fast-path must not paper over projection durability: an admitted-
+    /// but-not-yet-applied change must stay exactly that (present in
+    /// `dag_list_unapplied_changes`, not silently marked applied) across a
+    /// duplicate re-delivery, since duplicate detection is an admission-
+    /// layer shortcut, never a stand-in for real projection.
+    #[tokio::test]
+    async fn duplicate_of_an_admitted_but_unapplied_change_does_not_touch_applied_state() {
+        let h = setup().await;
+        let version = empty_version();
+        let chain = emit_remote_chain(&version, vec![vec![create_op(P, &version)]]);
+        let change = &chain[0];
+        let batch = batch_of(&[change], &[&version]);
+
+        // Admit without ever running `reconcile_local_materialization_audit`
+        // -- the change is durably admitted but its own projection has not
+        // run, exactly the `dag_list_unapplied_changes` retry-backstop state.
+        h.session.handle_change_batch(batch.clone()).await.unwrap();
+        assert!(h
+            .state
+            .change_history_repository()
+            .dag_has_change(&change.compute_hash())
+            .unwrap());
+        let still_unapplied_before =
+            h.state.change_history_repository().dag_list_unapplied_changes(GROUP).unwrap();
+        assert!(still_unapplied_before.iter().any(|c| c.compute_hash() == change.compute_hash()));
+        h.flush.take_calls();
+
+        h.session.handle_change_batch(batch).await.unwrap();
+
+        assert!(
+            h.flush.take_calls().is_empty(),
+            "a duplicate of an admitted-but-unapplied change must also skip local-flush"
+        );
+        let still_unapplied_after =
+            h.state.change_history_repository().dag_list_unapplied_changes(GROUP).unwrap();
+        assert!(
+            still_unapplied_after.iter().any(|c| c.compute_hash() == change.compute_hash()),
+            "the fast-path must never mark a change applied as a side effect -- only real \
+             projection (reconcile_local_materialization_audit) may do that"
+        );
+    }
 }
 
 #[cfg(test)]

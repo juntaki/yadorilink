@@ -393,6 +393,13 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
+    fn dag_has_change(&self, hash: &ChangeHash) -> Result<bool, PeerSessionError> {
+        self.change_history_repository()
+            .dag_has_change(hash)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
     fn dag_has_change_or_pruned(
         &self,
         group_id: &str,

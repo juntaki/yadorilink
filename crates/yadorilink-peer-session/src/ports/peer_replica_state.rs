@@ -272,6 +272,18 @@ pub trait PeerReplicaStatePort: Send + Sync {
 
     fn dag_list_unapplied_changes(&self, group_id: &str) -> Result<Vec<Change>, PeerSessionError>;
 
+    /// Whether `hash` is already durably admitted to the retained store
+    /// (applied or unapplied-but-admitted — see `dag_list_unapplied_changes`'s
+    /// own doc for that distinction). Deliberately narrower than
+    /// `dag_has_change_or_pruned`: this does not also treat a *pruned*
+    /// change as present, since a caller using this to short-circuit a
+    /// duplicate re-delivery must not conflate "already admitted" with
+    /// "was pruned, and receiving its full body again would re-trigger
+    /// rebootstrap/compaction semantics" — those are different situations
+    /// with different correct responses, and folding them together here
+    /// would silently change which one a duplicate-detection caller gets.
+    fn dag_has_change(&self, hash: &ChangeHash) -> Result<bool, PeerSessionError>;
+
     fn dag_has_change_or_pruned(
         &self,
         group_id: &str,

@@ -308,13 +308,6 @@ impl FakeReplicaState {
 
     pub fn mark_group_ready(&self, _group_id: &str, _generation: u64) {}
 
-    /// Mirrors `SyncState::dag_has_change` (distinct from the port's own
-    /// `dag_has_change_or_pruned`, which this fake -- never pruning --
-    /// answers identically anyway).
-    pub fn dag_has_change(&self, hash: &ChangeHash) -> Result<bool, PeerSessionError> {
-        Ok(self.lock().changes.contains_key(hash))
-    }
-
     /// Mirrors `SyncState::dag_has_change_or_buffered_orphan`.
     pub fn dag_has_change_or_buffered_orphan(
         &self,
@@ -826,6 +819,10 @@ impl PeerReplicaStatePort for FakeReplicaState {
             .filter(|(hash, c)| c.group_id.as_str() == group_id && !inner.applied.contains(*hash))
             .map(|(_, c)| c.clone())
             .collect())
+    }
+
+    fn dag_has_change(&self, hash: &ChangeHash) -> Result<bool, PeerSessionError> {
+        Ok(self.lock().changes.contains_key(hash))
     }
 
     fn dag_has_change_or_pruned(
