@@ -3627,6 +3627,10 @@ impl PeerSyncSession {
         ) {
             tracing::warn!(group_id, error = %e, "failed to record local frontier before announce");
         }
+        // A locally-authored commit advanced this device's own frontier the
+        // same way an admitted incoming batch does -- see the identical
+        // call in the incoming-batch path for why retirement needs to know.
+        self.state.notify_retirement_wake(group_id);
         self.send_heads_announce(group_id).await
     }
 
@@ -3677,6 +3681,36 @@ impl PeerSyncSession {
             return Ok(());
         }
         self.request_changes(&group_id, &missing).await
+    }
+
+    /// Standalone entry point for the retirement step alone -- see
+    /// `retire_unjustified_ephemeral_conflict_copies`'s own doc comment for
+    /// what it does and why. `engine_wrapper.rs`'s event-driven retirement
+    /// loop calls this directly instead of the full `reconcile_local_
+    /// materialization_audit` below, which also re-drives unapplied-change
+    /// reprojection and materialization-repair candidates -- heavier work
+    /// a frontier-changed/job-completed retirement trigger has no bearing
+    /// on. Shares `reconcile_local_materialization_audit`'s own
+    /// `MaterializationAuditGuard` key, so the two remain mutually
+    /// exclusive per group: a group with a full audit already in flight
+    /// skips this call (`Ok(false)`) rather than running a second,
+    /// redundant retire pass concurrently against the same local state.
+    /// Returns `Ok(true)` if this call actually ran (whether or not it
+    /// retired anything), matching that method's own skip-vs-ran
+    /// distinction.
+    pub async fn retire_conflict_copies_only(
+        self: Arc<Self>,
+        group_id: &str,
+    ) -> Result<bool, PeerSessionError> {
+        if !matches!(self.state.link_gate_for_group(group_id)?, LinkGate::Live { .. }) {
+            return Ok(true);
+        }
+        let Some(_guard) = MaterializationAuditGuard::try_acquire(&self.state, group_id) else {
+            return Ok(false);
+        };
+        let audit_attempt_id = next_audit_attempt_id();
+        self.retire_unjustified_ephemeral_conflict_copies(group_id, audit_attempt_id).await?;
+        Ok(true)
     }
 
     /// Periodic DAG resync's local repair backstop. A heads announce keeps
@@ -4502,6 +4536,13 @@ impl PeerSyncSession {
             ) {
                 tracing::warn!(group_id, error = %e, "failed to record local frontier after apply");
             }
+            // The frontier just advanced -- some previously-live conflict
+            // copy may have just lost its justification (its loser was
+            // just superseded) or some previously-unjustified copy may have
+            // just become required again. Either way the retirement loop
+            // needs to re-evaluate this group promptly rather than waiting
+            // for its own periodic backstop poll.
+            self.state.notify_retirement_wake(&group_id);
         }
 
         if !missing_parents.is_empty() {

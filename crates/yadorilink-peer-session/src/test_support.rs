@@ -125,6 +125,10 @@ struct Inner {
     /// wake-once-per-batch (not once-per-change) invariant `handle_change_
     /// batch`'s own `if !affected_paths.is_empty()` gate documents.
     notify_materialization_wake_count: usize,
+    /// Groups `notify_retirement_wake` has been called with, in call order
+    /// (duplicates kept) -- lets a test assert which groups an admission or
+    /// job-completion path actually marked dirty.
+    notify_retirement_wake_calls: Vec<String>,
 }
 
 /// The fake itself. `Arc`-wrapped by callers exactly like a real
@@ -188,6 +192,11 @@ impl FakeReplicaState {
     /// See `Inner::notify_materialization_wake_count`'s doc comment.
     pub fn notify_materialization_wake_count(&self) -> usize {
         self.lock().notify_materialization_wake_count
+    }
+
+    /// See `Inner::notify_retirement_wake_calls`'s doc comment.
+    pub fn notify_retirement_wake_calls(&self) -> Vec<String> {
+        self.lock().notify_retirement_wake_calls.clone()
     }
 
     pub fn set_link_gate(&self, group_id: &str, gate: LinkGate) {
@@ -703,6 +712,10 @@ impl PeerReplicaStatePort for FakeReplicaState {
 
     fn notify_materialization_wake(&self) {
         self.lock().notify_materialization_wake_count += 1;
+    }
+
+    fn notify_retirement_wake(&self, group_id: &str) {
+        self.lock().notify_retirement_wake_calls.push(group_id.to_string());
     }
 
     fn is_path_dirty(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {

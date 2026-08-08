@@ -205,6 +205,15 @@ pub trait PeerReplicaStatePort: Send + Sync {
     /// enqueuing a pending job, instead of waiting for its fallback poll.
     fn notify_materialization_wake(&self);
 
+    /// Marks `group_id` dirty for the ephemeral conflict-copy retirement
+    /// loop and wakes it promptly, instead of waiting for its own periodic
+    /// backstop poll. Callers: an admitted batch that actually advanced
+    /// this device's frontier, and a materialization job reaching
+    /// `Completed` -- see `RetirementWake`'s own doc comment for why those
+    /// two are exactly the events after which a conflict copy can become
+    /// unjustified.
+    fn notify_retirement_wake(&self, group_id: &str);
+
     fn is_path_dirty(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError>;
 
     /// Every retained version of `path`, newest-first — used by

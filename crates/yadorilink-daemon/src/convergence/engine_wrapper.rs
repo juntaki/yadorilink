@@ -16,6 +16,16 @@ use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 use crate::daemon_state::DaemonState;
 
 const REPAIR_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// The retirement loop's own backstop cadence, now that
+/// `RetirementWake`-driven events (DAG frontier advanced, materialization
+/// job completed) are its primary trigger -- see
+/// `run_ephemeral_conflict_copy_retire_loop`'s own doc comment. Kept far
+/// looser than a correctness-critical poll needs to be: this pass exists
+/// only to catch a group whose dirty mark was somehow lost (a crash between
+/// the state change and the `notify_retirement_wake` call, or a group
+/// linked after an earlier mark for it was already drained), not to carry
+/// ordinary retirement latency.
+const RETIREMENT_BACKSTOP_INTERVAL: Duration = Duration::from_secs(30);
 /// Each rank gets an exclusive window before the next deterministic fallback
 /// becomes eligible. This only suppresses duplicate work: after enough
 /// unchanged-frontier windows every authorized writer may act.
@@ -74,98 +84,140 @@ pub async fn run(state: Arc<DaemonState>) {
     }
 }
 
-/// Independent loop driving `PeerSyncSession::reconcile_local_materialization_
-/// audit` -- whose own body is what actually retires an ephemeral conflict
-/// copy once its losing branch is superseded -- for every linked group on
-/// its own interval, exactly like `run_retroactive_repair_loop` above.
+/// Retires ephemeral conflict copies -- ones whose losing branch has since
+/// been superseded with no cross-branch merge, so no admitted change ever
+/// carries them, and a device that already materialized one keeps it
+/// forever while a device that first reconciles after the window closed
+/// never derives it: byte-identical DAGs, permanently different file sets
+/// (see `PeerSyncSession::retire_unjustified_ephemeral_conflict_copies`'s
+/// own doc comment). Confirmed live: `row14_strict_acceptance` stalled with
+/// one device (out of six, all on an identical three-head DAG frontier)
+/// holding a conflict copy every device's own `resolve_path_heads` agreed
+/// was no longer required.
 ///
-/// Without this loop, that audit was reachable only through the legacy
-/// periodic materialization-repair sweep in `daemon_state.rs` (its sole
-/// caller before this loop existed). Stage 2's Convergence Engine
-/// (`engine.rs`) drives ordinary path reconciliation through
-/// `reconcile_paths_directly` instead, which never calls the audit or its
-/// retire step at all. A group whose sweep interval is long -- or, as
-/// `row14_strict_acceptance` sets for its own strict acceptance bar,
-/// disabled for the whole run, specifically to prove the Convergence
-/// Engine's own mechanism converges without the legacy sweep's help --
-/// then had no path left that ever retired a conflict copy the projection
-/// fixpoint materialized while its losing branch was transiently live: once
-/// that branch is superseded with no cross-branch merge (so no change ever
-/// carries the copy), a device that already materialized it keeps it
-/// forever, while a device that first reconciles after the window closed
-/// never derives it -- byte-identical DAGs, permanently different file
-/// sets. Confirmed live: `row14_strict_acceptance` stalled with one device
-/// (out of six, all on an identical three-head DAG frontier) holding a
-/// conflict copy every device's own `resolve_path_heads` agreed was no
-/// longer required (`conflict_copies=[]` everywhere) -- nothing had ever
-/// run the retire audit for it. This loop makes that audit, and therefore
-/// its retire step, a first-class, always-on part of the Convergence
-/// Engine's own machinery instead of only the legacy sweep's.
+/// Primarily event-driven, not polled: `RetirementWake::mark_dirty` fires
+/// after exactly the two events that can change a copy's justification --
+/// this device's own DAG frontier advancing (locally authored or admitted
+/// from a peer) and a materialization job reaching `Completed` -- so this
+/// loop reacts within one wake rather than waiting up to a whole poll
+/// interval. `RETIREMENT_BACKSTOP_INTERVAL` remains as a correctness
+/// backstop only, for a mark lost to a crash or a race with linking, not as
+/// the primary liveness path the way the old flat 1s poll was. Before this
+/// loop existed at all, this audit was reachable only through the legacy
+/// periodic materialization-repair sweep in `daemon_state.rs`; Stage 2's
+/// Convergence Engine (`engine.rs`) drives ordinary path reconciliation
+/// through `reconcile_paths_directly` instead, which never calls it. A
+/// group whose sweep interval is long -- or, as `row14_strict_acceptance`
+/// sets for its own strict acceptance bar, disabled for the whole run,
+/// specifically to prove the Convergence Engine's own mechanism converges
+/// without the legacy sweep's help -- then had no path left that ever
+/// retired a copy at all.
 async fn run_ephemeral_conflict_copy_retire_loop(state: Arc<DaemonState>) {
     loop {
-        let replica_coordinator_for_links = state.replica_coordinator.clone();
-        let groups = match tokio::task::spawn_blocking(move || {
-            replica_coordinator_for_links.link_repository().list_links()
-        })
-        .await
-        {
-            Ok(Ok(links)) => links
+        tokio::select! {
+            _ = state.replica_coordinator.retirement_wake().retirement_wake_notified() => {
+                let dirty = state.replica_coordinator.retirement_wake().drain();
+                run_retirement_pass(&state, dirty).await;
+            }
+            _ = tokio::time::sleep(RETIREMENT_BACKSTOP_INTERVAL) => {
+                if let Some(groups) = list_linked_groups_for_retirement(&state).await {
+                    run_retirement_pass(&state, groups).await;
+                }
+            }
+        }
+    }
+}
+
+/// Every currently linked, non-paused, non-orphaned group -- the backstop
+/// pass's own candidate set, since (unlike an event-driven wake) it has no
+/// narrower dirty set to go on.
+async fn list_linked_groups_for_retirement(state: &Arc<DaemonState>) -> Option<BTreeSet<String>> {
+    let replica_coordinator_for_links = state.replica_coordinator.clone();
+    match tokio::task::spawn_blocking(move || {
+        replica_coordinator_for_links.link_repository().list_links()
+    })
+    .await
+    {
+        Ok(Ok(links)) => Some(
+            links
                 .into_iter()
                 .filter(|link| !link.paused && !link.orphaned)
                 .map(|link| link.group_id)
-                .collect::<BTreeSet<_>>(),
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "ephemeral conflict-copy retire audit could not list links");
-                tokio::time::sleep(REPAIR_POLL_INTERVAL).await;
-                continue;
-            }
-            Err(error) => {
-                tracing::error!(
-                    %error,
-                    "ephemeral conflict-copy retire audit's list_links task panicked"
-                );
-                tokio::time::sleep(REPAIR_POLL_INTERVAL).await;
-                continue;
-            }
-        };
+                .collect(),
+        ),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "ephemeral conflict-copy retire audit could not list links");
+            None
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "ephemeral conflict-copy retire audit's list_links task panicked"
+            );
+            None
+        }
+    }
+}
 
-        for group_id in groups {
-            // Any currently-connected peer session for this group can run
-            // the audit -- it is driven by this device's own local DAG/file
-            // state (`self.state`), not by which specific peer object it is
-            // invoked through. Trying every candidate in turn (rather than
-            // just the first) matches the legacy sweep's own resilience to
-            // one stale/erroring session without giving up on the group for
-            // a whole poll interval.
-            let candidates = crate::hydration::candidate_sessions(&state, &group_id);
-            let mut last_error = None;
-            for (peer_id, session) in &candidates {
-                match session.clone().reconcile_local_materialization_audit(&group_id).await {
-                    Ok(_) => {
-                        last_error = None;
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            %group_id,
-                            peer = %peer_id,
-                            %error,
-                            "ephemeral conflict-copy retire audit peer failed; trying another peer"
-                        );
-                        last_error = Some(error);
-                    }
+/// Runs `PeerSyncSession::retire_conflict_copies_only` for each of `groups`,
+/// trying every candidate session in turn (matching the legacy sweep's own
+/// resilience to one stale/erroring session) and re-marking a group dirty
+/// if no session could actually run its audit this pass, so it is retried
+/// on the next wake or backstop rather than silently dropped -- see
+/// `RetirementWake::drain`'s own doc comment for why the caller carries
+/// this responsibility.
+async fn run_retirement_pass(state: &Arc<DaemonState>, groups: BTreeSet<String>) {
+    for group_id in groups {
+        // Any currently-connected peer session for this group can run the
+        // audit -- it is driven by this device's own local DAG/file state,
+        // not by which specific peer object it is invoked through.
+        let candidates = crate::hydration::candidate_sessions(state, &group_id);
+        if candidates.is_empty() {
+            // No live session for this group at all right now (e.g. no
+            // peer has ever connected) -- nothing can run the audit
+            // through yet. Not an error: a solo/offline group's ephemeral
+            // conflict copies simply cannot retire until some session
+            // exists. Re-mark dirty so a future connect's own trigger, or
+            // the next backstop pass, tries again.
+            state.replica_coordinator.retirement_wake().mark_dirty(&group_id);
+            continue;
+        }
+        let mut last_error = None;
+        let mut ran = false;
+        for (peer_id, session) in &candidates {
+            match session.clone().retire_conflict_copies_only(&group_id).await {
+                // `Ok(true)` actually ran the audit; `Ok(false)` means a
+                // full `reconcile_local_materialization_audit` was already
+                // in flight for this group through some session -- that
+                // audit's own retire step covers this same evaluation, so
+                // either way there is nothing further to try on another
+                // peer.
+                Ok(_) => {
+                    ran = true;
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %group_id,
+                        peer = %peer_id,
+                        %error,
+                        "ephemeral conflict-copy retire audit peer failed; trying another peer"
+                    );
+                    last_error = Some(error);
                 }
             }
-            if let Some(error) = last_error {
-                tracing::warn!(
-                    %group_id,
-                    %error,
-                    "ephemeral conflict-copy retire audit failed for every connected peer this tick"
-                );
-            }
         }
-
-        tokio::time::sleep(REPAIR_POLL_INTERVAL).await;
+        if let Some(error) = last_error {
+            tracing::warn!(
+                %group_id,
+                %error,
+                "ephemeral conflict-copy retire audit failed for every connected peer this tick"
+            );
+        }
+        if !ran {
+            state.replica_coordinator.retirement_wake().mark_dirty(&group_id);
+        }
     }
 }
 

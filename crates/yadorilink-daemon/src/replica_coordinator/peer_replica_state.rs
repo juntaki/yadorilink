@@ -294,6 +294,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         self.materialization_wake().notify_materialization_wake()
     }
 
+    fn notify_retirement_wake(&self, group_id: &str) {
+        self.retirement_wake().mark_dirty(group_id)
+    }
+
     fn is_path_dirty(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
         self.dirty_path_repository()
             .is_path_dirty(group_id, path)

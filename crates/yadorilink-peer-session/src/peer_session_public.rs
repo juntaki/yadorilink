@@ -350,6 +350,15 @@ impl PeerSyncSession {
         self.inner.clone().reconcile_local_materialization_audit(group_id).await
     }
 
+    /// See `peer_session_impl::PeerSyncSession::retire_conflict_copies_only`'s
+    /// own doc comment.
+    pub async fn retire_conflict_copies_only(
+        self: Arc<Self>,
+        group_id: &str,
+    ) -> Result<bool, PeerSessionError> {
+        self.inner.clone().retire_conflict_copies_only(group_id).await
+    }
+
     pub async fn reconcile_paths_directly(
         &self,
         group_id: &str,

@@ -79,6 +79,7 @@ use crate::recovery_snapshot::RecoverySnapshotReader;
 use crate::sync_error::SyncError;
 use crate::sync_runtime::materialization_wake::MaterializationWake;
 use crate::sync_runtime::path_locks::PathLockRegistry;
+use crate::sync_runtime::retirement_wake::RetirementWake;
 use crate::sync_runtime::schema::{post_dag_schema, pre_dag_schema};
 use crate::sync_runtime::startup_readiness::StartupReadinessRegistry;
 use yadorilink_filesystem_sync::materialization_types::RestoreOperation;
@@ -157,6 +158,7 @@ pub struct ReplicaCoordinator {
     repair_election_provider: Mutex<Option<Arc<RepairElectionProvider>>>,
     root_adoption_lock: Mutex<()>,
     materialization_wake: MaterializationWake,
+    retirement_wake: RetirementWake,
 }
 
 /// Same schema-bootstrap sequencing as `yadorilink_sync_core::index`'s
@@ -248,6 +250,7 @@ impl ReplicaCoordinator {
             repair_election_provider: Mutex::new(None),
             root_adoption_lock: Mutex::new(()),
             materialization_wake: MaterializationWake::new(),
+            retirement_wake: RetirementWake::new(),
         }
     }
 
@@ -459,6 +462,10 @@ impl ReplicaCoordinator {
 
     pub fn materialization_wake(&self) -> &MaterializationWake {
         &self.materialization_wake
+    }
+
+    pub fn retirement_wake(&self) -> &RetirementWake {
+        &self.retirement_wake
     }
 
     // --- The 17 permanently-remaining `SyncState` production methods,
