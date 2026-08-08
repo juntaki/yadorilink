@@ -390,11 +390,11 @@ pub enum RetirementAttempt {
     /// were actually removed (informational only, not part of the
     /// completion contract).
     Settled { retired: usize },
-    /// `MaterializationAuditGuard` contention: a full audit already holds
-    /// this group's guard, so this pass did not run at all. Not an error
-    /// -- that other audit's own retire step covers SOME evaluation of
-    /// this group, but not necessarily the frontier generation this pass
-    /// was asked to verify.
+    /// `RetirementAuditGuard` contention: another retirement pass for this
+    /// same group already holds it, so this pass did not run at all. Not
+    /// an error -- that other pass's own retire step covers SOME
+    /// evaluation of this group, but not necessarily the frontier
+    /// generation this pass was asked to verify.
     Busy,
     /// The pass ran, but at least one copy's tombstone `materialize`
     /// returned `MaterializeResult::RetryRequired` or errored -- that
@@ -1728,6 +1728,117 @@ impl Drop for MaterializationAuditGuard {
         if let Some(in_flight) = MATERIALIZATION_AUDITS_IN_FLIGHT.get() {
             in_flight.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.key);
         }
+    }
+}
+
+static RETIREMENT_AUDITS_IN_FLIGHT: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+
+/// `retire_conflict_copies_only`'s own single-flight, deliberately a
+/// SEPARATE key space from `MaterializationAuditGuard` rather than sharing
+/// its key. Before this, retirement contended with `reconcile_local_
+/// materialization_audit`/`reconcile_paths_directly` for the exact same
+/// per-group slot: a full audit or direct path reconciliation already in
+/// flight for a group made every retirement pass against it report `Busy`
+/// for that entire duration, even though retirement's own physical
+/// mutation is already independently serialized per-path by `state.
+/// path_lock` (see `retire_unjustified_ephemeral_conflict_copies`'s own
+/// path-lock acquisition, and `reconcile_group_paths`'/`apply_locked_
+/// record`'s matching ones) -- the group-wide guard was serializing far
+/// more than the one thing (two writers racing the SAME path) that
+/// actually needed serializing. Only retirement passes now contend with
+/// each other; a long-running full audit no longer blocks retirement's own
+/// progress, and vice versa.
+struct RetirementAuditGuard {
+    key: String,
+}
+
+impl RetirementAuditGuard {
+    fn try_acquire(
+        state: &Arc<dyn crate::ports::PeerReplicaStatePort>,
+        group_id: &str,
+    ) -> Option<Self> {
+        let key = format!("{:p}:{group_id}", Arc::as_ptr(state));
+        let in_flight = RETIREMENT_AUDITS_IN_FLIGHT.get_or_init(Default::default);
+        let mut in_flight = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        if !in_flight.insert(key.clone()) {
+            return None;
+        }
+        Some(Self { key })
+    }
+}
+
+impl Drop for RetirementAuditGuard {
+    fn drop(&mut self) {
+        if let Some(in_flight) = RETIREMENT_AUDITS_IN_FLIGHT.get() {
+            in_flight.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+mod retirement_audit_guard_tests {
+    use super::*;
+    use crate::test_support::FakeReplicaState;
+
+    /// The core Commit-4 regression: before `RetirementAuditGuard` existed,
+    /// `retire_conflict_copies_only` shared `MaterializationAuditGuard`'s
+    /// key, so a full audit already in flight for a group made every
+    /// retirement pass against it report `Busy` for the entire duration.
+    /// A held `MaterializationAuditGuard` must no longer block
+    /// `RetirementAuditGuard::try_acquire` for the SAME state+group.
+    #[test]
+    fn retirement_guard_is_independent_of_a_held_materialization_guard() {
+        let state: Arc<dyn crate::ports::PeerReplicaStatePort> = FakeReplicaState::new_arc();
+        let _materialization_guard = MaterializationAuditGuard::try_acquire(&state, "group-a")
+            .expect("materialization guard must be free at test start");
+        let retirement_guard = RetirementAuditGuard::try_acquire(&state, "group-a");
+        assert!(
+            retirement_guard.is_some(),
+            "a held MaterializationAuditGuard must not block RetirementAuditGuard"
+        );
+    }
+
+    /// The reverse must also hold: a held `RetirementAuditGuard` must not
+    /// block `MaterializationAuditGuard::try_acquire` for the same
+    /// state+group -- the two key spaces are fully independent, not just
+    /// independent in one direction.
+    #[test]
+    fn materialization_guard_is_independent_of_a_held_retirement_guard() {
+        let state: Arc<dyn crate::ports::PeerReplicaStatePort> = FakeReplicaState::new_arc();
+        let _retirement_guard = RetirementAuditGuard::try_acquire(&state, "group-a")
+            .expect("retirement guard must be free at test start");
+        let materialization_guard = MaterializationAuditGuard::try_acquire(&state, "group-a");
+        assert!(
+            materialization_guard.is_some(),
+            "a held RetirementAuditGuard must not block MaterializationAuditGuard"
+        );
+    }
+
+    /// `RetirementAuditGuard` must still single-flight against ITSELF per
+    /// group -- decoupling from `MaterializationAuditGuard` must not
+    /// accidentally drop retirement's own single-flight entirely.
+    #[test]
+    fn retirement_guard_still_excludes_a_second_retirement_pass_for_the_same_group() {
+        let state: Arc<dyn crate::ports::PeerReplicaStatePort> = FakeReplicaState::new_arc();
+        let _first = RetirementAuditGuard::try_acquire(&state, "group-a")
+            .expect("first retirement guard must be free at test start");
+        assert!(
+            RetirementAuditGuard::try_acquire(&state, "group-a").is_none(),
+            "two retirement passes for the same group must still contend"
+        );
+    }
+
+    /// A different group under the same state must never contend with
+    /// either guard -- the key is per-(state, group), not per-state alone.
+    #[test]
+    fn retirement_guard_does_not_contend_across_different_groups() {
+        let state: Arc<dyn crate::ports::PeerReplicaStatePort> = FakeReplicaState::new_arc();
+        let _guard_a = RetirementAuditGuard::try_acquire(&state, "group-a")
+            .expect("group-a's retirement guard must be free at test start");
+        assert!(
+            RetirementAuditGuard::try_acquire(&state, "group-b").is_some(),
+            "a held retirement guard for group-a must not block group-b"
+        );
     }
 }
 
@@ -3720,13 +3831,16 @@ impl PeerSyncSession {
     /// materialization_audit` below, which also re-drives unapplied-change
     /// reprojection and materialization-repair candidates -- heavier work
     /// a frontier-changed/job-completed retirement trigger has no bearing
-    /// on. Shares `reconcile_local_materialization_audit`'s own
-    /// `MaterializationAuditGuard` key, so the two remain mutually
-    /// exclusive per group: a group with a full audit already in flight
-    /// skips this call (`RetirementAttempt::Busy`) rather than running a
-    /// second, redundant retire pass concurrently against the same local
-    /// state. See `RetirementAttempt`'s own doc comment for what each
-    /// variant means for a generation-tracked caller.
+    /// on. Single-flights per group through its OWN `RetirementAuditGuard`
+    /// key -- a SEPARATE key space from `reconcile_local_materialization_
+    /// audit`/`reconcile_paths_directly`'s `MaterializationAuditGuard`, so
+    /// a full audit already in flight for a group no longer makes THIS
+    /// call report `RetirementAttempt::Busy`; only two retirement passes
+    /// for the same group ever contend with each other. See
+    /// `RetirementAuditGuard`'s own doc comment for why that coarser
+    /// group-wide sharing was never actually load-bearing for correctness,
+    /// and `RetirementAttempt`'s own doc comment for what each variant
+    /// means for a generation-tracked caller.
     pub async fn retire_conflict_copies_only(
         self: Arc<Self>,
         group_id: &str,
@@ -3734,7 +3848,7 @@ impl PeerSyncSession {
         if !matches!(self.state.link_gate_for_group(group_id)?, LinkGate::Live { .. }) {
             return Ok(RetirementAttempt::Settled { retired: 0 });
         }
-        let Some(_guard) = MaterializationAuditGuard::try_acquire(&self.state, group_id) else {
+        let Some(_guard) = RetirementAuditGuard::try_acquire(&self.state, group_id) else {
             return Ok(RetirementAttempt::Busy);
         };
         let audit_attempt_id = next_audit_attempt_id();
