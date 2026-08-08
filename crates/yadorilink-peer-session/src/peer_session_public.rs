@@ -28,8 +28,8 @@ use yadorilink_sync_wire::PeerWireCodec;
 
 #[cfg(madsim)]
 pub use crate::peer_session_impl::set_test_clock_override;
-pub use crate::peer_session_impl::RetirementAttempt;
 use crate::peer_session_impl::PeerSyncSessionOneTimeDeps;
+pub use crate::peer_session_impl::RetirementAttempt;
 pub use crate::peer_session_impl::{
     disk_race_fingerprint, BlockWriteActivityProvider, ChangeAuthenticator, HandoffLeaseResponder,
     HandoffTicketResponder, HydrationOutcome, PeerHandoffLeaseGrant, PeerHandoffTicketGrant,
