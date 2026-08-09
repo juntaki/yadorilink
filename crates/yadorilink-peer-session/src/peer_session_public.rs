@@ -113,6 +113,11 @@ pub struct PeerSyncSession {
     codec: yadorilink_sync_wire::ProtobufPeerWireCodec,
     exact_cluster_config: StdMutex<yadorilink_sync_wire::ClusterConfigOutboundFrame>,
     started: AtomicBool,
+    /// Kept alongside `inner`'s own copy purely for the handshake
+    /// preflight's own tracing (below) -- `inner`'s copy is private to
+    /// `peer_session_impl`, a sibling module this one has no field access
+    /// into.
+    peer_device_id: String,
 }
 
 impl PeerSyncSession {
@@ -197,6 +202,7 @@ impl PeerSyncSession {
             protocol_version: Self::PROTOCOL_VERSION,
         };
         let one_time_deps = dependencies.one_time_deps();
+        let peer_device_id_for_wrapper = peer_device_id.clone();
         let inner = InnerPeerSyncSession::new_with_forwarding(
             channel.clone(),
             local_device_id,
@@ -219,6 +225,7 @@ impl PeerSyncSession {
             codec: yadorilink_sync_wire::ProtobufPeerWireCodec,
             exact_cluster_config: StdMutex::new(exact_cluster_config),
             started: AtomicBool::new(false),
+            peer_device_id: peer_device_id_for_wrapper,
         })
     }
 
@@ -291,7 +298,37 @@ impl PeerSyncSession {
         )))
     }
 
+    /// Discriminant name only (never the payload -- an unexpected frame
+    /// here may carry another group's data) -- observability for the
+    /// "first peer message was not ClusterConfig" failure mode, which
+    /// otherwise gives no way to tell a stale message left over from a
+    /// prior connection attempt's channel apart from a genuine protocol
+    /// desync.
+    fn inbound_frame_kind_name(frame: &yadorilink_sync_wire::InboundFrame) -> &'static str {
+        use yadorilink_sync_wire::InboundFrame;
+        match frame {
+            InboundFrame::VersionPresentQuery(_) => "VersionPresentQuery",
+            InboundFrame::VersionPresentAck(_) => "VersionPresentAck",
+            InboundFrame::HeadsAnnounce(_) => "HeadsAnnounce",
+            InboundFrame::ChangeRequest(_) => "ChangeRequest",
+            InboundFrame::ChangeBatch(_) => "ChangeBatch",
+            InboundFrame::ClusterConfig(_) => "ClusterConfig",
+            InboundFrame::BlockRequest(_) => "BlockRequest",
+            InboundFrame::BlockReply(_) => "BlockReply",
+            InboundFrame::HandoffLeaseRequest(_) => "HandoffLeaseRequest",
+            InboundFrame::HandoffLeaseGrant(_) => "HandoffLeaseGrant",
+            InboundFrame::HandoffLeaseRelease(_) => "HandoffLeaseRelease",
+            InboundFrame::HandoffTicketRequest(_) => "HandoffTicketRequest",
+            InboundFrame::HandoffTicketGrant(_) => "HandoffTicketGrant",
+            InboundFrame::HandoffTicketRelease(_) => "HandoffTicketRelease",
+            InboundFrame::RebootstrapSnapshotRequest(_) => "RebootstrapSnapshotRequest",
+            InboundFrame::RebootstrapSnapshotResponse(_) => "RebootstrapSnapshotResponse",
+            InboundFrame::Unknown { .. } => "Unknown",
+        }
+    }
+
     async fn exact_generation_preflight(&self) -> Result<(), PeerSessionError> {
+        let preflight_started = std::time::Instant::now();
         for attempt in 0..EXACT_HANDSHAKE_ATTEMPTS {
             let config =
                 self.exact_cluster_config.lock().unwrap_or_else(|p| p.into_inner()).clone();
@@ -311,24 +348,59 @@ impl PeerSyncSession {
                         .map_err(|e| PeerSessionError::InvalidInput(e.to_string()))?;
                     let config = match frame {
                         yadorilink_sync_wire::InboundFrame::ClusterConfig(config) => config,
-                        _ => {
-                            return Err(PeerSessionError::InvalidInput(
-                                "first peer message was not ClusterConfig".to_string(),
-                            ));
+                        other => {
+                            let kind = Self::inbound_frame_kind_name(&other);
+                            tracing::warn!(
+                                peer = %self.peer_device_id,
+                                attempt,
+                                first_message_kind = kind,
+                                elapsed_ms = preflight_started.elapsed().as_millis(),
+                                "exact-generation handshake: first peer message was not \
+                                 ClusterConfig"
+                            );
+                            return Err(PeerSessionError::InvalidInput(format!(
+                                "first peer message was not ClusterConfig (got {kind})"
+                            )));
                         }
                     };
                     Self::validate_exact_peer_config(&config)?;
                     self.channel.enable_reliable_delivery();
+                    tracing::debug!(
+                        peer = %self.peer_device_id,
+                        attempt,
+                        elapsed_ms = preflight_started.elapsed().as_millis(),
+                        "exact-generation handshake completed"
+                    );
                     return Ok(());
                 }
                 Ok(None) => {
+                    tracing::warn!(
+                        peer = %self.peer_device_id,
+                        attempt,
+                        elapsed_ms = preflight_started.elapsed().as_millis(),
+                        "exact-generation handshake: peer channel closed before completion"
+                    );
                     return Err(PeerSessionError::InvalidInput(
                         "peer channel closed before the exact-generation handshake".to_string(),
                     ));
                 }
-                Err(_) => {}
+                Err(_) => {
+                    tracing::debug!(
+                        peer = %self.peer_device_id,
+                        attempt,
+                        timeout_ms = timeout.as_millis(),
+                        elapsed_ms = preflight_started.elapsed().as_millis(),
+                        "exact-generation handshake: attempt timed out waiting for peer reply"
+                    );
+                }
             }
         }
+        tracing::warn!(
+            peer = %self.peer_device_id,
+            attempts = EXACT_HANDSHAKE_ATTEMPTS,
+            elapsed_ms = preflight_started.elapsed().as_millis(),
+            "exact-generation handshake: exhausted bounded retries"
+        );
         Err(PeerSessionError::InvalidInput(
             "peer did not complete the exact-generation handshake after bounded retries"
                 .to_string(),
