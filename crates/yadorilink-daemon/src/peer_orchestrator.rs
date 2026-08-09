@@ -2926,6 +2926,70 @@ mod tests {
             .contains_key("device-b"));
     }
 
+    /// The end-to-end reconnect contract `spawn_peer_session`'s doc comment
+    /// promises: a session that ends NATURALLY (here, the exact-generation
+    /// handshake's own bounded retries all timing out against a peer that
+    /// never answers -- not a `teardown_peer` revoke) must be followed by a
+    /// second connect attempt, not silence. `session_index` incrementing
+    /// past its first value is the observable proof a second
+    /// `PeerChannel::connect` actually happened; a paused clock advanced in
+    /// steps makes the real ~11s handshake-timeout budget plus reconnect
+    /// backoff resolve without the test taking anywhere near that long in
+    /// wall-clock time.
+    #[tokio::test(start_paused = true)]
+    async fn spawn_peer_session_reconnects_after_the_session_ends_naturally() {
+        let state = test_state();
+        let diff_state = NetmapDiffState::new();
+        let keypair = Arc::new(DeviceKeyPair::generate());
+        let (_peer_secret, peer_public) = gen_keypair();
+        // Never answers -- so the exact-generation handshake preflight
+        // exhausts its own bounded retries and the session ends on its
+        // own, exactly the "natural end" case this reconnect loop exists
+        // for (as opposed to a revoke, which a different test already
+        // covers via `teardown_peer_aborts_the_session_task`).
+        let candidate: StdSocketAddr = "127.0.0.1:9".parse().unwrap();
+        diff_state.desired_peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(
+            "device-b".to_string(),
+            PeerConnectSpec {
+                peer_public,
+                candidates: vec![candidate],
+                effective_group_ids: vec![],
+            },
+        );
+        let session_index = Arc::new(AtomicU32::new(0));
+        let _handle = spawn_peer_session(
+            state.clone(),
+            keypair,
+            "local-device".to_string(),
+            "device-b".to_string(),
+            diff_state.clone(),
+            session_index.clone(),
+        );
+
+        // Advance in bounded steps (not one giant jump) so every timer this
+        // loop sets along the way -- each of the 4 handshake-attempt
+        // timeouts, then the reconnect backoff sleep -- actually gets to
+        // fire and let the supervisor task re-poll and set its next timer,
+        // rather than the paused clock racing past several of them before
+        // the task has had a chance to observe any of them elapsing.
+        let mut observed_second_attempt = false;
+        for _ in 0..80 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            if session_index.load(Ordering::Relaxed) >= 2 {
+                observed_second_attempt = true;
+                break;
+            }
+        }
+
+        assert!(
+            observed_second_attempt,
+            "the supervisor must start a second connect attempt after the first session ends \
+             naturally (handshake timeout, not a revoke) -- got session_index={}",
+            session_index.load(Ordering::Relaxed)
+        );
+    }
+
     #[tokio::test]
     async fn pinned_peer_key_mismatch_tears_down_session_and_authorization() {
         let state = test_state();
