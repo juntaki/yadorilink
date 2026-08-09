@@ -1,4 +1,4 @@
-//! Connection-layer LIFECYCLE regression test for the production peer-session
+//! Connection-layer acceptance signal for the production peer-session
 //! reconnect supervisor (`peer_orchestrator::spawn_peer_session`), isolated
 //! from `row14_strict_acceptance.rs` on purpose: row14 exercises DAG/
 //! materialization/retirement correctness under its OWN simplified
@@ -12,21 +12,33 @@
 //! `chaos_coordination_unreachable.rs`'s own real-stack pattern), then
 //! exercised by round-robin single-device reconnect churn.
 //!
-//! **What this file guarantees:** after a session ends and its peer channel
-//! tears down, that peer can reconnect under bounded, ordinary churn (one
+//! **What this file guarantees:** after a peer is revoked from the netmap
+//! and returns (`FakeCoordination::revoke` + re-register, `teardown_peer`'s
+//! own real path), it can reconnect under bounded, ordinary churn (one
 //! device's membership dropping and returning at a time, not the whole mesh
-//! simultaneously). It exists to pin down a real, confirmed regression: a
-//! session ending on its own (handshake failure, ARQ exhaustion, any natural
-//! end -- not just an explicit netmap-driven `teardown_peer`) used to leave
-//! its `PeerChannel` un-revoked. `PeerChannel` has no `Drop` impl, so the
-//! channel's actor task and its transport-hub demux registration lived on
-//! indefinitely, still answering handshake initiations for that peer under
-//! its own stale session index -- racing every subsequent reconnect
-//! generation for that peer with a second, zombie responder (`WrongKey`/
-//! `UnexpectedPacket` decapsulate errors, the reconnecting side's
-//! exact-generation handshake reliably exhausting its bounded retries).
-//! Fixed by calling `PeerChannel::revoke()` on natural session end, not just
-//! dropping the `Arc` (see `run_one_peer_session_attempt`'s own comment).
+//! simultaneously).
+//!
+//! **This file does NOT pin the zombie-channel natural-session-end fix.**
+//! An earlier version of this file's own doc comment claimed it did; that
+//! was wrong, caught in review. `FakeCoordination::revoke` drives
+//! `teardown_peer`, which calls `channel.revoke()` and aborts the
+//! supervisor task itself (see `teardown_peer`'s own code) -- a completely
+//! different, pre-existing code path from the one this session's fix
+//! touches (`run_one_peer_session_attempt`'s cleanup after `session.run()`
+//! returns on its OWN, e.g. a handshake timeout, with the supervisor task
+//! and netmap membership both still intact). Churning via netmap
+//! revoke/re-register never reaches that cleanup path at all, so this file
+//! would very likely stay green even with the natural-end fix reverted.
+//! The actual regression pin for that fix is
+//! `peer_orchestrator::tests::natural_session_end_revokes_the_stale_channel`
+//! (a deterministic, paused-clock unit test: a peer that never answers
+//! forces a genuine handshake-timeout natural end, without the test ever
+//! calling `revoke()` itself, then asserts the dead generation's own
+//! `PeerChannel::is_revoked()` became true) -- confirmed via mutation
+//! testing to actually fail red when the fix is reverted. What THIS file
+//! is genuinely useful for: it drives the real `peer_orchestrator` stack
+//! end-to-end and is how the receiving-side fan-in gap below was
+//! discovered in the first place.
 //!
 //! **What this file deliberately does NOT guarantee:** inbound handshake
 //! admission when MANY peers initiate a handshake toward one device at
@@ -41,13 +53,13 @@
 //! recv_loop having no bound on simultaneous inbound handshake processing
 //! -- a device on the receiving end of several peers reconnecting at once
 //! has no control over how many arrive together. That is a distinct,
-//! unresolved problem, intentionally out of scope for this lifecycle
-//! regression test (see its own follow-up: a dedicated `TransportHub`-level
-//! test reproducing 5-peers-simultaneously-into-1-device, then tracing
-//! exactly where `recv_loop`/`DemuxRegistry` stalls, drops, or times out
-//! before designing inbound admission control). This file's own churn is
-//! deliberately kept small (see `DEVICE_COUNT`'s own doc comment) so its
-//! green/red signal stays about session lifecycle, not fan-in capacity.
+//! unresolved problem, intentionally out of scope for this file (see its own
+//! follow-up: a dedicated `TransportHub`-level test reproducing
+//! 5-peers-simultaneously-into-1-device, then tracing exactly where
+//! `recv_loop`/`DemuxRegistry` stalls, drops, or times out before designing
+//! inbound admission control). This file's own churn is deliberately kept
+//! small (see `DEVICE_COUNT`'s own doc comment) so its green/red signal
+//! stays about bounded netmap-driven reconnect, not fan-in capacity.
 //!
 //! Exit criteria this file makes checkable (not merely "the test passed"):
 //! zero `exact-generation handshake: exhausted bounded retries` events, zero

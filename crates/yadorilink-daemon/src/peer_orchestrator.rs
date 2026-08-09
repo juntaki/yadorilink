@@ -1687,12 +1687,15 @@ async fn run_one_peer_session_attempt(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(peer_device_id);
-    // `revoke()` (not just dropping the `Arc`) is what actually stops the
-    // channel's actor task and frees its transport-hub demux registration
-    // -- `PeerChannel` has no `Drop` impl, so a channel whose owner just
-    // stops holding it keeps running forever: still registered under this
-    // peer's static key, still answering every future handshake
-    // initiation for this same peer with its OWN (stale) session index.
+    // `revoke()` (not just dropping the `Arc`) is what's needed here --
+    // `PeerChannel` has no `Drop` impl, so a channel whose owner just stops
+    // holding it keeps running forever: still registered under this peer's
+    // static key, still answering every future handshake initiation for
+    // this same peer with its OWN (stale) session index. `revoke()` itself
+    // (see its own doc comment) only sets a flag synchronously and wakes
+    // the actor loop to exit -- the actor's own unregistration of its
+    // transport-hub demux slot happens once that loop actually observes
+    // the flag and exits, not synchronously before this call returns.
     // Confirmed via `reconnect_handshake_stress.rs`: the shared transport
     // hub broadcasts a handshake initiation to every channel registered
     // for a matching key, so this zombie channel and the NEXT generation's
@@ -3049,6 +3052,101 @@ mod tests {
             "the supervisor must start a second connect attempt after the first session ends \
              naturally (handshake timeout, not a revoke) -- got session_index={}",
             session_index.load(Ordering::Relaxed)
+        );
+    }
+
+    /// Pins the actual bug this session's fix closes, directly and
+    /// deterministically: a channel whose session ends naturally (same
+    /// never-answering-peer handshake-timeout setup as the sibling test
+    /// above) must be `revoke()`d, not merely dropped from bookkeeping.
+    /// Without the fix, `PeerChannel` has no `Drop` impl, so this exact
+    /// channel object would stay live and un-revoked forever -- still
+    /// registered in the transport hub's demux under its own stale session
+    /// index, still able to answer a handshake initiation for this same
+    /// peer and race the next reconnect generation with a second responder
+    /// (confirmed via `reconnect_handshake_stress.rs`'s own real-daemon
+    /// mesh: `WrongKey`/`UnexpectedPacket` decapsulate errors, the
+    /// reconnecting side's exact-generation handshake reliably exhausting
+    /// its bounded retries). This test deliberately never calls
+    /// `channel.revoke()` itself -- doing so would pre-empt the very
+    /// cleanup path under test -- it only observes whether the fix's own
+    /// call happened, via `PeerChannel::is_revoked()`.
+    #[tokio::test(start_paused = true)]
+    async fn natural_session_end_revokes_the_stale_channel() {
+        let state = test_state();
+        let diff_state = NetmapDiffState::new();
+        let keypair = Arc::new(DeviceKeyPair::generate());
+        let (_peer_secret, peer_public) = gen_keypair();
+        let candidate: StdSocketAddr = "127.0.0.1:9".parse().unwrap();
+        diff_state.desired_peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(
+            "device-b".to_string(),
+            PeerConnectSpec {
+                peer_public,
+                candidates: vec![candidate],
+                effective_group_ids: vec![],
+            },
+        );
+        let session_index = Arc::new(AtomicU32::new(0));
+        let _handle = spawn_peer_session(
+            state.clone(),
+            keypair,
+            "local-device".to_string(),
+            "device-b".to_string(),
+            diff_state.clone(),
+            session_index.clone(),
+        );
+
+        // Capture generation 1's own channel before its handshake preflight
+        // times out and natural-end cleanup would remove it from
+        // `diff_state.channels` -- by generation 2, that map holds a
+        // DIFFERENT channel object, so this must be grabbed early.
+        let mut first_generation_channel = None;
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+            if let Some(channel) = diff_state
+                .channels
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get("device-b")
+                .cloned()
+            {
+                first_generation_channel = Some(channel);
+                break;
+            }
+        }
+        let first_generation_channel =
+            first_generation_channel.expect("generation 1 should register a channel promptly");
+        assert!(
+            !first_generation_channel.is_revoked(),
+            "sanity: a freshly connected channel must not start out revoked"
+        );
+
+        // Advance through the handshake preflight's own bounded retries
+        // (~11s) plus reconnect backoff until a second generation starts --
+        // identical to the sibling test's own wait loop.
+        let mut observed_second_attempt = false;
+        for _ in 0..80 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            if session_index.load(Ordering::Relaxed) >= 2 {
+                observed_second_attempt = true;
+                break;
+            }
+        }
+        assert!(
+            observed_second_attempt,
+            "the supervisor must reach a second generation for this assertion to be meaningful \
+             -- got session_index={}",
+            session_index.load(Ordering::Relaxed)
+        );
+
+        assert!(
+            first_generation_channel.is_revoked(),
+            "generation 1's channel must be revoked once its session ends naturally -- \
+             otherwise it stays registered in the transport hub's demux forever, still able to \
+             answer a handshake initiation for this peer under its own stale session index and \
+             race the next reconnect generation (the exact bug this fix closes)"
         );
     }
 
