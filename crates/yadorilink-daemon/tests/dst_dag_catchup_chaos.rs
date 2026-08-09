@@ -149,7 +149,7 @@ mod dst_support;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use boringtun::x25519::{PublicKey, StaticSecret};
@@ -192,7 +192,14 @@ struct Device {
     root: PathBuf,
     state: Arc<ReplicaCoordinator>,
     processor: Arc<LocalChangeProcessor>,
-    session: OnceLock<Arc<PeerSyncSession>>,
+    /// The current generation's live session, if any -- swapped, not
+    /// set-once: `connect`'s reconnect supervisor replaces this every time
+    /// a natural session end (not a test-driven partition) triggers a
+    /// fresh generation, mirroring `peer_orchestrator::spawn_peer_session`'s
+    /// production reconnect contract now that a `PeerChannel` actor can end
+    /// cleanly on its own (ARQ exhaustion tearing a genuinely-partitioned
+    /// channel down) rather than only via an explicit revoke.
+    session: StdMutex<Option<Arc<PeerSyncSession>>>,
 }
 
 fn setup_device(
@@ -215,7 +222,7 @@ fn setup_device(
         root,
         state,
         processor,
-        session: OnceLock::new(),
+        session: StdMutex::new(None),
     })
 }
 
@@ -253,7 +260,9 @@ async fn commit_local(
         .await
         .map_err(|e| e.to_string())?;
     if let LocalChangeOutcome::FileChanged(_) = &outcome {
-        if let Some(session) = device.session.get() {
+        let current =
+            device.session.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        if let Some(session) = current {
             // The emitter appended the signed change during `process_event`;
             // announce the heads. Announcing while partitioned is intentional:
             // production does not know it is partitioned either, and getting the
@@ -295,12 +304,20 @@ fn snapshot(root: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
     out
 }
 
-async fn connect(
+/// One connect-then-run cycle for both sides of the laptop/always-on pair.
+/// Returns each side's `PeerSyncSession::run` `JoinHandle` so [`connect`]'s
+/// reconnect supervisor can wait for either to end and start a fresh
+/// generation, rather than firing-and-forgetting them (the previous,
+/// single-generation-only shape).
+async fn connect_once(
     rng: &mut StdRng,
     laptop: &Arc<Device>,
     store_l: Arc<FsBlockStore>,
     always_on: &Arc<Device>,
     store_a: Arc<FsBlockStore>,
+) -> (
+    tokio::task::JoinHandle<Result<(), yadorilink_peer_session::PeerSessionError>>,
+    tokio::task::JoinHandle<Result<(), yadorilink_peer_session::PeerSessionError>>,
 ) {
     let (secret_l, public_l) = gen_keypair(rng);
     let (secret_a, public_a) = gen_keypair(rng);
@@ -378,13 +395,80 @@ async fn connect(
         },
     );
 
-    laptop.session.set(session_l.clone()).ok();
-    always_on.session.set(session_a.clone()).ok();
+    *laptop.session.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some(session_l.clone());
+    *always_on.session.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some(session_a.clone());
     let group_ids = [GROUP_ID];
     dst_dag_migrate_b2::wire_dag_session(&session_l, laptop.state.clone(), &ids, &group_ids);
     dst_dag_migrate_b2::wire_dag_session(&session_a, always_on.state.clone(), &ids, &group_ids);
-    tokio::spawn(session_l.run());
-    tokio::spawn(session_a.run());
+    (tokio::spawn(session_l.run()), tokio::spawn(session_a.run()))
+}
+
+/// How long to wait before starting a fresh generation once either side's
+/// session ends -- deliberately short: the whole point is that a natural
+/// end (no revoke, no test-driven partition) must not leave the pair
+/// silently disconnected until some unrelated event happens to notice.
+const RECONNECT_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Establishes the laptop/always-on pair and keeps them connected for the
+/// rest of the scenario: a background supervisor watches both sides'
+/// `PeerSyncSession::run` handles and starts a fresh generation (new
+/// sockets, new `PeerChannel`s, new sessions, swapped into
+/// `Device::session`) whenever either ends on its own. Before this existed,
+/// a natural session end (e.g. `yadorilink-transport`'s ARQ layer tearing a
+/// channel down after exhausting retransmits against a genuinely
+/// partitioned peer) permanently silenced that side of the pair for the
+/// rest of the scenario -- indistinguishable, from this harness's point of
+/// view, from the test's own intentional `set_partitioned` packet-loss
+/// gate, except that a real partition heals (packet loss returns to 0) while
+/// a torn-down-and-never-reconnected channel does not. This mirrors
+/// `peer_orchestrator::spawn_peer_session`'s production reconnect contract
+/// (see that function's own doc comment for the identical reasoning).
+async fn connect(
+    rng: &mut StdRng,
+    laptop: &Arc<Device>,
+    store_l: Arc<FsBlockStore>,
+    always_on: &Arc<Device>,
+    store_a: Arc<FsBlockStore>,
+) {
+    let (mut h_l, mut h_a) =
+        connect_once(rng, laptop, store_l.clone(), always_on, store_a.clone()).await;
+
+    // A fresh, independently-seeded RNG for the background supervisor's own
+    // reconnect key generation -- derived from the caller's rng (so the
+    // whole scenario stays deterministic per its own base seed) rather than
+    // trying to move the caller's `&mut StdRng` across the 'static task
+    // boundary.
+    let mut seed_bytes = [0u8; 8];
+    rng.fill(&mut seed_bytes);
+    let reconnect_seed = u64::from_le_bytes(seed_bytes);
+
+    let laptop = laptop.clone();
+    let always_on = always_on.clone();
+    tokio::spawn(async move {
+        let mut rng = StdRng::seed_from_u64(reconnect_seed);
+        loop {
+            // Cancel-safe: `select!` on `&mut JoinHandle` only consumes
+            // whichever side actually resolved first; the other side's
+            // handle is still valid to await (or select on again) later.
+            // Both sides reconnect together regardless of which one ended
+            // -- simpler than independently reconnecting one side while
+            // exchanging its fresh candidate address with the other, and
+            // just as correct for this harness's purposes (a lingering
+            // live handle is dropped, which tears its own channel down via
+            // the same `PeerChannel` Drop path a revoke would).
+            tokio::select! {
+                _ = &mut h_l => {}
+                _ = &mut h_a => {}
+            }
+            tokio::time::sleep(RECONNECT_BACKOFF).await;
+            let (new_h_l, new_h_a) =
+                connect_once(&mut rng, &laptop, store_l.clone(), &always_on, store_a.clone()).await;
+            h_l = new_h_l;
+            h_a = new_h_a;
+        }
+    });
 }
 
 fn content_for(seed: u64, cycle: usize, seq: usize, tag: &str) -> Vec<u8> {
