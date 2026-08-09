@@ -90,10 +90,62 @@ async fn start_watching(device: &TestDevice, group_id: &str) {
         .unwrap();
 }
 
+/// How long to wait before re-establishing a pair once either side's
+/// session ends -- deliberately short, mirroring `peer_orchestrator::
+/// spawn_peer_session`'s own reconnect backoff floor. The whole point of
+/// `spawn_pair_reconnect_supervisor` is that a natural session end must
+/// not leave a pair silently disconnected for the rest of this strict
+/// acceptance run.
+const PAIR_RECONNECT_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Keeps one device pair connected for the rest of the run: whenever
+/// either side's `PeerSyncSession::run` task ends on its own (not driven
+/// by this test -- e.g. `yadorilink-transport`'s ARQ layer tearing a
+/// channel down after exhausting retransmits against a peer this run's
+/// own chaos made transiently unreachable), reconnects both sides fresh.
+///
+/// `support::connect_two_daemons*` itself is deliberately NOT changed to
+/// do this: its own doc comment is explicit that its one-shot,
+/// discard-the-handles shape is the right default for the many other
+/// callers that pair a small, fixed device set once and let the process
+/// exit. This strict acceptance run is the one caller that specifically
+/// needs reconnect resilience (see `yadorilink-transport`'s ARQ hardening
+/// and `peer_orchestrator::spawn_peer_session`'s own doc comment for the
+/// production-side version of the identical reasoning), so the
+/// supervision lives here instead.
+fn spawn_pair_reconnect_supervisor(
+    state_i: Arc<DaemonState>,
+    device_i: String,
+    state_j: Arc<DaemonState>,
+    device_j: String,
+    group_ids: Vec<String>,
+    initial_handles: [tokio::task::JoinHandle<()>; 2],
+) {
+    tokio::spawn(async move {
+        let [mut h_i, mut h_j] = initial_handles;
+        loop {
+            // Cancel-safe: only whichever side actually resolved is
+            // consumed; the other handle is still valid to select on
+            // again after reconnecting (its own task tears itself down on
+            // the fresh generation, same as a revoke would).
+            tokio::select! {
+                _ = &mut h_i => {}
+                _ = &mut h_j => {}
+            }
+            tokio::time::sleep(PAIR_RECONNECT_BACKOFF).await;
+            let handles = support::connect_two_daemons_with_handles(
+                &state_i, &device_i, &state_j, &device_j, &group_ids,
+            )
+            .await;
+            [h_i, h_j] = handles;
+        }
+    });
+}
+
 async fn connect_all_pairs(devices: &[TestDevice], group_ids: &[String]) {
     for i in 0..devices.len() {
         for j in (i + 1)..devices.len() {
-            support::connect_two_daemons(
+            let handles = support::connect_two_daemons_with_handles(
                 &devices[i].state,
                 &devices[i].device_id,
                 &devices[j].state,
@@ -101,6 +153,14 @@ async fn connect_all_pairs(devices: &[TestDevice], group_ids: &[String]) {
                 group_ids,
             )
             .await;
+            spawn_pair_reconnect_supervisor(
+                devices[i].state.clone(),
+                devices[i].device_id.clone(),
+                devices[j].state.clone(),
+                devices[j].device_id.clone(),
+                group_ids.to_vec(),
+                handles,
+            );
         }
     }
 }
