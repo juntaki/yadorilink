@@ -84,7 +84,9 @@ use yadorilink_filesystem_sync::watcher::{
 };
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_peer_session::peer_session::{PeerSyncSession, PendingLocalChangeFlush};
+use yadorilink_peer_session::peer_session::{
+    PeerSyncSession, PendingLocalChangeFlush, PendingLocalFlushOutcome,
+};
 use yadorilink_transport::PeerChannel;
 
 const GROUP_ID: &str = "dst-generated-sweep-group";
@@ -181,7 +183,7 @@ impl PendingLocalChangeFlush for ChaosDevice {
         &'a self,
         group_id: &'a str,
         rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
         Box::pin(async move {
             let path = self.root.join(rel_path);
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -195,7 +197,7 @@ impl PendingLocalChangeFlush for ChaosDevice {
                 .await
                 .is_err()
             {
-                return;
+                return PendingLocalFlushOutcome::Settled;
             }
             let found = match tokio::time::timeout(Duration::from_millis(500), reply_rx).await {
                 Ok(Ok(found)) => found,
@@ -206,7 +208,7 @@ impl PendingLocalChangeFlush for ChaosDevice {
             // `return` here is silently lossy.
             let Some((found_path, kind, observed_at)) = found else {
                 self.capture_undiscovered_local_change(group_id, &path).await;
-                return;
+                return PendingLocalFlushOutcome::Settled;
             };
             if let Ok(outcome) = self
                 .processor
@@ -226,6 +228,7 @@ impl PendingLocalChangeFlush for ChaosDevice {
                     }
                 }
             }
+            PendingLocalFlushOutcome::Settled
         })
     }
 
@@ -233,7 +236,7 @@ impl PendingLocalChangeFlush for ChaosDevice {
         &'a self,
         group_id: &'a str,
         rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
         Box::pin(async move {
             let path = self.root.join(rel_path);
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -247,13 +250,15 @@ impl PendingLocalChangeFlush for ChaosDevice {
                 .await
                 .is_err()
             {
-                return;
+                return PendingLocalFlushOutcome::Settled;
             }
             let found = match tokio::time::timeout(Duration::from_millis(500), reply_rx).await {
                 Ok(Ok(found)) => found,
                 _ => None,
             };
-            let Some((sibling_path, kind, observed_at)) = found else { return };
+            let Some((sibling_path, kind, observed_at)) = found else {
+                return PendingLocalFlushOutcome::Settled;
+            };
             if let Ok(outcome) = self
                 .processor
                 .process_flush(
@@ -271,6 +276,7 @@ impl PendingLocalChangeFlush for ChaosDevice {
                     }
                 }
             }
+            PendingLocalFlushOutcome::Settled
         })
     }
 }

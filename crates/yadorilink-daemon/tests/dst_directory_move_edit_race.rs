@@ -92,7 +92,9 @@ use yadorilink_filesystem_sync::watcher::{
 };
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_peer_session::peer_session::{PeerSyncSession, PendingLocalChangeFlush};
+use yadorilink_peer_session::peer_session::{
+    PeerSyncSession, PendingLocalChangeFlush, PendingLocalFlushOutcome,
+};
 use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_transport::PeerChannel;
 
@@ -192,10 +194,11 @@ impl PendingLocalChangeFlush for SimDevice {
         &'a self,
         group_id: &'a str,
         rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
         Box::pin(async move {
             let path = self.root.join(rel_path);
             let _ = self.drain_and_dispatch(group_id, &path).await;
+            PendingLocalFlushOutcome::Settled
         })
     }
 
@@ -203,10 +206,10 @@ impl PendingLocalChangeFlush for SimDevice {
         &'a self,
         _group_id: &'a str,
         _rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
         // Case-fold siblings are irrelevant to this directory-rename race;
         // a no-op matches "nothing pending under that case-variant".
-        Box::pin(async move {})
+        Box::pin(async move { PendingLocalFlushOutcome::Settled })
     }
 }
 
