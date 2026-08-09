@@ -29,11 +29,13 @@ use yadorilink_sync_wire::PeerWireCodec;
 #[cfg(madsim)]
 pub use crate::peer_session_impl::set_test_clock_override;
 use crate::peer_session_impl::PeerSyncSessionOneTimeDeps;
+pub use crate::peer_session_impl::RetirementAttempt;
 pub use crate::peer_session_impl::{
     disk_race_fingerprint, BlockWriteActivityProvider, ChangeAuthenticator, HandoffLeaseResponder,
     HandoffTicketResponder, HydrationOutcome, PeerHandoffLeaseGrant, PeerHandoffTicketGrant,
-    PendingLocalChangeFlush, PreparedRebootstrap, ProjectionAttempt, RebootstrapHandler,
-    RootCommitAuthorityProvider, DEFAULT_HYDRATION_TIMEOUT, DEFAULT_MAINTENANCE_RECONCILE_INTERVAL,
+    PendingLocalChangeFlush, PendingLocalFlushOutcome, PreparedRebootstrap, ProjectionAttempt,
+    RebootstrapHandler, RootCommitAuthorityProvider, DEFAULT_HYDRATION_TIMEOUT,
+    DEFAULT_MAINTENANCE_RECONCILE_INTERVAL,
 };
 
 use crate::peer_session_impl::PeerSyncSession as InnerPeerSyncSession;
@@ -350,6 +352,15 @@ impl PeerSyncSession {
         self.inner.clone().reconcile_local_materialization_audit(group_id).await
     }
 
+    /// See `peer_session_impl::PeerSyncSession::retire_conflict_copies_only`'s
+    /// own doc comment.
+    pub async fn retire_conflict_copies_only(
+        self: Arc<Self>,
+        group_id: &str,
+    ) -> Result<RetirementAttempt, PeerSessionError> {
+        self.inner.clone().retire_conflict_copies_only(group_id).await
+    }
+
     pub async fn reconcile_paths_directly(
         &self,
         group_id: &str,
@@ -533,16 +544,16 @@ impl PendingLocalChangeFlush for NoopPendingLocalChangeFlush {
         &'a self,
         _group_id: &'a str,
         _rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async {})
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
+        Box::pin(async { PendingLocalFlushOutcome::Settled })
     }
 
     fn flush_case_fold_sibling<'a>(
         &'a self,
         _group_id: &'a str,
         _rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async {})
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
+        Box::pin(async { PendingLocalFlushOutcome::Settled })
     }
 }
 

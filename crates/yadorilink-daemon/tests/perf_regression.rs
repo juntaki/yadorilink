@@ -182,6 +182,12 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
         )
         .unwrap();
     let dest_state = DaemonState::new("device-dest".into(), dest_sync_state.clone(), dest_store);
+    // `hydrate` fails closed via `root_lease_for` unless the daemon is
+    // actively linked/watching the group -- this test builds `dest_state`
+    // directly rather than through full daemon startup, so it never pays
+    // for a real `start_link_watch`. Same reasoning as every other
+    // hydration test's `install_test_root_commit_authority` call.
+    dest_state.install_test_root_commit_authority(GROUP);
 
     let secret_source = boringtun::x25519::StaticSecret::from([61u8; 32]);
     let secret_dest = boringtun::x25519::StaticSecret::from([62u8; 32]);

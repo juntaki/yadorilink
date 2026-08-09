@@ -294,6 +294,10 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         self.materialization_wake().notify_materialization_wake()
     }
 
+    fn notify_retirement_wake(&self, group_id: &str) {
+        self.retirement_wake().mark_dirty(group_id)
+    }
+
     fn is_path_dirty(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
         self.dirty_path_repository()
             .is_path_dirty(group_id, path)
@@ -385,6 +389,13 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
     fn dag_list_unapplied_changes(&self, group_id: &str) -> Result<Vec<Change>, PeerSessionError> {
         self.change_history_repository()
             .dag_list_unapplied_changes(group_id)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
+    fn dag_has_change(&self, hash: &ChangeHash) -> Result<bool, PeerSessionError> {
+        self.change_history_repository()
+            .dag_has_change(hash)
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)
     }

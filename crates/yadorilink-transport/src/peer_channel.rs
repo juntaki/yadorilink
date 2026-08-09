@@ -550,20 +550,48 @@ struct ActorState {
     reliable_recv: ReliableRecv,
 }
 
+/// Whether one `run_one_io_turn` call decided the actor loop must end.
+enum IoTurnOutcome {
+    Continue,
+    Break,
+}
+
 async fn run_actor(mut state: ActorState) {
     let mut tick = tokio::time::interval(TICK_INTERVAL);
     let mut direct_probe = tokio::time::interval(DIRECT_PROBE_INTERVAL);
     let mut reliable_tick = tokio::time::interval(RELIABLE_CHECK_INTERVAL);
+    // Cloned so the outer select's shutdown branch does not hold an
+    // immutable borrow of `state` for the whole `select!` (which would
+    // conflict with `run_one_io_turn`'s `&mut state` in the sibling
+    // branch) -- `Notify` is designed to be shared this way (`Arc<Notify>`
+    // clone is cheap, `notified()` observes the same underlying state).
+    let shutdown = state.shutdown.clone();
 
     loop {
+        // Outer select is deliberately `biased` for exactly one reason:
+        // shutdown must win over any I/O that happens to be ready in the
+        // same poll, so the actor exits without waiting out `TICK_INTERVAL`.
+        // Every OTHER branch used to live in this same `biased` select,
+        // textually first-to-last in the order `inbound, outbound,
+        // candidate, tick, reliable_tick, direct_probe` -- `biased` means
+        // literally that fixed order, every single poll, not just a
+        // tie-break: under sustained inbound traffic (a burst/storm, or
+        // just enough steady load), `inbound` being ready is enough to
+        // starve every branch below it indefinitely, including
+        // `reliable_tick` -- the ACK/retransmit timer this same investigation
+        // just made load-bearing for the whole ARQ layer's correctness (see
+        // `ReliableSend::due_retransmits`'s own doc comment). A starved ACK
+        // timer means fewer acks go out, which the sender reads as loss and
+        // retransmits more, which produces more inbound traffic -- a
+        // positive feedback loop entirely constructed by scheduling order,
+        // not by any real network condition. `run_one_io_turn`'s own
+        // (unbiased, default-fairness) `select!` is where those five
+        // branches now live -- randomized order per poll, so no branch can
+        // starve another under load.
         tokio::select! {
             biased;
 
-            // Checked first (this `select!` is `biased`) so a revocation
-            // wins over any datagram/tick that happens to be ready in
-            // the same poll, and the actor exits without waiting out
-            // `TICK_INTERVAL`.
-            _ = state.shutdown.notified() => {
+            _ = shutdown.notified() => {
                 tracing::info!(
                     peer = %hex::encode(state.peer_public_bytes),
                     "peer channel revoked; tearing down"
@@ -571,70 +599,115 @@ async fn run_actor(mut state: ActorState) {
                 break;
             }
 
-            Some(inbound) = state.inbound_demux_rx.recv() => {
-                handle_inbound(&mut state, inbound).await;
-                drain_ready_direct_datagrams(&mut state).await;
-            }
-
-            Some(payload) = state.outbound_rx.recv() => {
-                handle_outbound_batch(&mut state, payload).await;
-            }
-
-            Some(update) = state.candidate_rx.recv() => {
-                match update {
-                    CandidateUpdate::Learned(addr) => learn_candidate(&mut state, addr),
-                    CandidateUpdate::CoordinationSnapshot(candidates) => {
-                        replace_coordination_candidates(&mut state, candidates)
-                    }
+            outcome = run_one_io_turn(&mut state, &mut tick, &mut direct_probe, &mut reliable_tick) => {
+                if matches!(outcome, IoTurnOutcome::Break) {
+                    break;
                 }
             }
-
-            _ = tick.tick() => {
-                if let Some(dgram) = state.tunn.tick() {
-                    send_batch_direct(&state, vec![dgram]).await;
-                }
-                evaluate_reachability(&mut state);
-            }
-
-            // Gated so a connection that never negotiates reliable
-            // delivery (an un-upgraded peer, or — as found investigating
-            // seed 3298840590 — a lost/never-completed `ClusterConfig`
-            // handshake) pays zero recurring
-            // scheduling cost from this timer, keeping its behavior
-            // identical to before this layer existed. `has_pending_ack`
-            // (not `reliable_enabled` alone) covers the asymmetric window
-            // where this device hasn't enabled its own sends yet but has
-            // already received a reliable-framed DATA frame from a peer
-            // that has — that ack must still go out (see `reliable_send_
-            // due`'s own doc comment).
-            _ = reliable_tick.tick(), if state.reliable_enabled.load(Ordering::Relaxed) || state.reliable_recv.has_pending_ack() => {
-                reliable_send_due(&mut state).await;
-            }
-
-            _ = direct_probe.tick(), if should_probe(&state) => {
-                // race every unconfirmed candidate
-                // concurrently; once confirmed, this just keeps that one
-                // path alive and still re-probes the others in case a
-                // better (e.g. newly-reachable local) one appears. Gated
-                // off while unreachable so a peer in backoff isn't probed
-                // until its next scheduled race.
-                if let Some(probe) = state.tunn.probe() {
-                    for candidate in &state.direct_candidates {
-                        let _ = state
-                            .shared
-                            .send_batch(std::slice::from_ref(&probe), candidate.addr)
-                            .await;
-                    }
-                }
-            }
-
-            else => break,
         }
     }
 
     // Free the demux registration so the shared socket stops routing to a
     // torn-down channel and the session index can be reused.
     state.shared.unregister_channel(state.session_index);
+}
+
+/// One turn of every non-shutdown branch `run_actor`'s outer select used to
+/// contain directly, now behind its own unbiased `select!` so none of the
+/// five can starve another under sustained load from one of them (see
+/// `run_actor`'s own doc comment for why `inbound` specifically starving
+/// `reliable_tick` was a real, self-reinforcing correctness bug, not just a
+/// fairness nicety).
+async fn run_one_io_turn(
+    state: &mut ActorState,
+    tick: &mut tokio::time::Interval,
+    direct_probe: &mut tokio::time::Interval,
+    reliable_tick: &mut tokio::time::Interval,
+) -> IoTurnOutcome {
+    tokio::select! {
+        Some(inbound) = state.inbound_demux_rx.recv() => {
+            handle_inbound(state, inbound).await;
+            drain_ready_direct_datagrams(state).await;
+        }
+
+        // Gated so a reliable-negotiated channel whose unacked buffer
+        // is already full stops pulling MORE outbound payloads
+        // entirely, backpressuring via the existing bounded
+        // `outbound_tx` (capacity 64) rather than sending an
+        // over-capacity payload unreliably -- see
+        // `handle_outbound_batch`'s own doc comment for why a silent
+        // unreliable fallback is the one thing this layer must never
+        // do once reliable delivery is negotiated.
+        Some(payload) = state.outbound_rx.recv(),
+            if !state.reliable_enabled.load(Ordering::Relaxed) || !state.reliable_send.is_full()
+        => {
+            handle_outbound_batch(state, payload).await;
+        }
+
+        Some(update) = state.candidate_rx.recv() => {
+            match update {
+                CandidateUpdate::Learned(addr) => learn_candidate(state, addr),
+                CandidateUpdate::CoordinationSnapshot(candidates) => {
+                    replace_coordination_candidates(state, candidates)
+                }
+            }
+        }
+
+        _ = tick.tick() => {
+            if let Some(dgram) = state.tunn.tick() {
+                send_batch_direct(state, vec![dgram]).await;
+            }
+            evaluate_reachability(state);
+        }
+
+        // Gated so a connection that never negotiates reliable
+        // delivery (an un-upgraded peer, or — as found investigating
+        // seed 3298840590 — a lost/never-completed `ClusterConfig`
+        // handshake) pays zero recurring
+        // scheduling cost from this timer, keeping its behavior
+        // identical to before this layer existed. `has_pending_ack`
+        // (not `reliable_enabled` alone) covers the asymmetric window
+        // where this device hasn't enabled its own sends yet but has
+        // already received a reliable-framed DATA frame from a peer
+        // that has — that ack must still go out (see `reliable_send_
+        // due`'s own doc comment).
+        _ = reliable_tick.tick(), if state.reliable_enabled.load(Ordering::Relaxed) || state.reliable_recv.has_pending_ack() => {
+            if reliable_send_due(state).await {
+                // A retransmit exhausted its budget -- this channel's
+                // ARQ epoch is permanently poisoned (see
+                // `ReliableSend::due_retransmits`'s own doc comment).
+                // Tear it down exactly like a revoke: existing
+                // liveness/reachability machinery re-establishes a
+                // fresh connection with a fresh sequence space.
+                tracing::warn!(
+                    peer = %hex::encode(state.peer_public_bytes),
+                    "reliable-delivery ARQ epoch exhausted; tearing down this channel for a \
+                     fresh reconnect"
+                );
+                return IoTurnOutcome::Break;
+            }
+        }
+
+        _ = direct_probe.tick(), if should_probe(state) => {
+            // race every unconfirmed candidate
+            // concurrently; once confirmed, this just keeps that one
+            // path alive and still re-probes the others in case a
+            // better (e.g. newly-reachable local) one appears. Gated
+            // off while unreachable so a peer in backoff isn't probed
+            // until its next scheduled race.
+            if let Some(probe) = state.tunn.probe() {
+                for candidate in &state.direct_candidates {
+                    let _ = state
+                        .shared
+                        .send_batch(std::slice::from_ref(&probe), candidate.addr)
+                        .await;
+                }
+            }
+        }
+
+        else => return IoTurnOutcome::Break,
+    }
+    IoTurnOutcome::Continue
 }
 
 /// Handles one demultiplexed inbound datagram, updating direct-path liveness.
@@ -652,10 +725,39 @@ async fn handle_inbound(state: &mut ActorState, inbound: InboundDatagram) {
     }
 }
 
+/// Once a peer has negotiated reliable delivery, EVERY application payload
+/// sent to it must be reliable-framed -- never silently sent unwrapped
+/// because the unacked buffer happens to be full. A channel that falls
+/// back to unreliable "just this once" under load reintroduces exactly the
+/// silent-loss failure mode this whole layer exists to close, at exactly
+/// the moment (sustained loss/overload) it matters most. The `select!`
+/// branch that calls this function is itself gated on `!is_full()` for
+/// this same reason (`run_actor`'s own doc comment on that branch) --
+/// `first_payload` is therefore never framed while full.
+///
+/// The rest of the batch reserves its `unacked` credit UP FRONT via
+/// `remaining_capacity()`, once, before dequeueing anything else --
+/// deliberately NOT a per-iteration `is_full()` re-check. `unacked` only
+/// grows inside `wrap_and_track`, later in this same function, so a
+/// re-check against `is_full()` between `try_recv()` calls would keep
+/// reading the same stale (not-yet-full) value for the whole batch: with
+/// `MAX_UNACKED - 1` already tracked, that let a single `MAX_OUTBOUND_
+/// BATCH`-sized batch overcommit the window straight past its bound in one
+/// call (see `handle_outbound_batch_never_overcommits_the_unacked_window`).
+/// Whatever doesn't fit in this call's reserved credit stays queued in the
+/// bounded `outbound_tx` (capacity 64) for a later turn once acks free up
+/// room. Capacity is irrelevant, not consulted, for a peer that never
+/// negotiated reliable delivery at all -- every payload for it stays
+/// unwrapped exactly like before this layer existed.
 async fn handle_outbound_batch(state: &mut ActorState, first_payload: Bytes) {
-    let mut payloads = Vec::with_capacity(MAX_OUTBOUND_BATCH);
+    let batch_limit = if state.reliable_enabled.load(Ordering::Relaxed) {
+        MAX_OUTBOUND_BATCH.min(state.reliable_send.remaining_capacity())
+    } else {
+        MAX_OUTBOUND_BATCH
+    };
+    let mut payloads = Vec::with_capacity(batch_limit.max(1));
     payloads.push(first_payload);
-    while payloads.len() < MAX_OUTBOUND_BATCH {
+    while payloads.len() < batch_limit {
         match state.outbound_rx.try_recv() {
             Ok(payload) => payloads.push(payload),
             Err(mpsc::error::TryRecvError::Empty) => break,
@@ -665,24 +767,13 @@ async fn handle_outbound_batch(state: &mut ActorState, first_payload: Bytes) {
 
     let mut datagrams = Vec::new();
     for payload in payloads {
-        // Wrap with the seq/ack framing once this device has confirmed
-        // the peer supports it (`reliable_enabled`, flipped by
-        // `PeerChannel::enable_reliable_delivery`).
-        // If the unacked buffer is already at `ReliableSend::MAX_UNACKED`
-        // (a sustained-loss/overload edge case, not the common path),
-        // this one message is sent unwrapped rather than blocking the
-        // whole actor loop waiting for space — a documented, deliberate
-        // simplification: true cross-task backpressure would need a
-        // permit shared back to `PeerChannel::send`'s callers, follow-up
-        // if the sweep shows this firing in practice.
-        let framed: Bytes =
-            if state.reliable_enabled.load(Ordering::Relaxed) && !state.reliable_send.is_full() {
-                let (ack_lo, ack_bits) = state.reliable_recv.current_ack();
-                state.reliable_recv.take_ack_dirty();
-                state.reliable_send.wrap_and_track(&payload, ack_lo, ack_bits)
-            } else {
-                payload
-            };
+        let framed: Bytes = if state.reliable_enabled.load(Ordering::Relaxed) {
+            let (ack_lo, ack_bits) = state.reliable_recv.current_ack();
+            state.reliable_recv.take_ack_dirty();
+            state.reliable_send.wrap_and_track(&payload, ack_lo, ack_bits)
+        } else {
+            payload
+        };
         match state.tunn.encrypt_message(&framed) {
             Ok(encrypted) => {
                 datagrams.extend(encrypted);
@@ -704,15 +795,22 @@ async fn handle_outbound_batch(state: &mut ActorState, first_payload: Bytes) {
 /// and that peer still needs its acks regardless of which direction has
 /// switched to sending wrapped frames first. Also retransmits any unacked
 /// outbound frame past its RTT-adaptive deadline.
-async fn reliable_send_due(state: &mut ActorState) {
+///
+/// Returns `true` if this call observed a retransmit exhaust its budget --
+/// see `ReliableSend::due_retransmits`'s own doc comment for why the
+/// caller (`run_actor`'s `reliable_tick` branch) must tear this channel
+/// down in that case rather than keep running with a permanently-poisoned
+/// ARQ epoch.
+async fn reliable_send_due(state: &mut ActorState) -> bool {
     let mut frames: Vec<Bytes> = Vec::new();
     if state.reliable_recv.take_ack_dirty() {
         let (ack_lo, ack_bits) = state.reliable_recv.current_ack();
         frames.push(encode_ack_frame(ack_lo, ack_bits));
     }
-    frames.extend(state.reliable_send.due_retransmits());
+    let outcome = state.reliable_send.due_retransmits();
+    frames.extend(outcome.due);
     if frames.is_empty() {
-        return;
+        return outcome.exhausted;
     }
 
     let mut datagrams = Vec::new();
@@ -723,6 +821,7 @@ async fn reliable_send_due(state: &mut ActorState) {
         }
     }
     send_batch_direct(state, datagrams).await;
+    outcome.exhausted
 }
 
 /// Drains any datagrams the demultiplexer has already queued for this channel
@@ -1165,6 +1264,173 @@ mod tests {
 
     fn coordination_candidate(addr: SocketAddr) -> DirectCandidate {
         DirectCandidate { addr, source: CandidateSource::Coordination, added_at: Instant::now() }
+    }
+
+    /// The `run_actor`/`run_one_io_turn` split's own regression test:
+    /// before that split, ALL branches (including `reliable_tick`) lived in
+    /// one `biased` select, so sustained inbound readiness could starve the
+    /// ACK/retransmit timer indefinitely -- see `run_actor`'s own doc
+    /// comment for why that is a real, self-reinforcing correctness bug
+    /// (a starved ACK looks like loss to the sender, which retransmits
+    /// more, which produces more inbound traffic) and not just a fairness
+    /// nicety. Feeds a deliberately-garbage-but-always-available inbound
+    /// datagram stream (bypassing `TransportHub::register_channel`
+    /// entirely -- this test owns the demux channel's sender directly, so
+    /// it needs no real WireGuard-routed traffic to keep `inbound` ready
+    /// every poll) while a due `reliable_tick` competes for the same
+    /// unbiased inner `select!`, and asserts the pending ack this test
+    /// primed gets sent within a bounded number of turns.
+    #[tokio::test(start_paused = true)]
+    async fn reliable_tick_is_not_starved_by_sustained_inbound_traffic() {
+        let local_secret = StaticSecret::from([1u8; 32]);
+        let peer_secret = StaticSecret::from([2u8; 32]);
+        let peer_public = PublicKey::from(&peer_secret);
+        let tunn = WgTunnel::new(local_secret, peer_public, 0);
+        let (_outbound_tx, outbound_rx) = mpsc::channel::<Bytes>(1);
+        let (_candidate_tx, candidate_rx) = mpsc::channel::<CandidateUpdate>(1);
+        let (inbound_tx, _inbound_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (reachability_tx, _reachability_rx) =
+            watch::channel(PeerReachability::Connected { path: CandidateClass::Lan });
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let shared = TransportHub::from_socket(socket, None);
+
+        // This test's own demux channel -- it keeps the sender, unlike
+        // `make_state`'s use of `shared.register_channel`, so it can push
+        // inbound datagrams directly with no real peer/socket traffic.
+        let (demux_tx, inbound_demux_rx) = mpsc::channel::<InboundDatagram>(1024);
+
+        let mut state = ActorState {
+            tunn,
+            peer_public_bytes: peer_public.to_bytes(),
+            shared,
+            session_index: 0,
+            inbound_demux_rx,
+            direct_candidates: Vec::new(),
+            confirmed_direct_addr: None,
+            last_direct_rx: None,
+            outbound_rx,
+            candidate_rx,
+            inbound_tx,
+            reachability: PeerReachability::Connected { path: CandidateClass::Lan },
+            reachability_tx,
+            backoff: BackoffConfig::RECONNECT,
+            attempt: 0,
+            race_started_at: None,
+            revoked: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(Notify::new()),
+            reliable_enabled: Arc::new(AtomicBool::new(true)),
+            reliable_send: ReliableSend::new(),
+            reliable_recv: ReliableRecv::new(),
+        };
+        // Prime a pending ack so `reliable_tick`'s guard is satisfied and
+        // `reliable_send_due` has something concrete to send -- observed
+        // via `has_pending_ack()` flipping false once it actually goes
+        // out.
+        state.reliable_recv.observe(1);
+        assert!(state.reliable_recv.has_pending_ack());
+
+        // Keep the inbound branch always ready -- content is irrelevant
+        // (it will fail to decrypt as WireGuard traffic, which is fine;
+        // `handle_inbound` handles that already), only readiness matters.
+        tokio::spawn(async move {
+            loop {
+                let datagram = InboundDatagram {
+                    data: vec![0u8; 32],
+                    from: peer_addr(),
+                    kind: DatagramKind::Direct,
+                };
+                if demux_tx.send(datagram).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut tick = tokio::time::interval(TICK_INTERVAL);
+        let mut direct_probe = tokio::time::interval(DIRECT_PROBE_INTERVAL);
+        let mut reliable_tick = tokio::time::interval(RELIABLE_CHECK_INTERVAL);
+        // Under a paused clock, `Interval::tick()` only becomes ready once
+        // virtual time has actually elapsed past its deadline -- advance
+        // past it once so `reliable_tick` is genuinely competing with
+        // `inbound` on every subsequent turn, not just waiting for a timer
+        // that will never fire on its own while inbound keeps the executor
+        // busy (paused-clock auto-advance only kicks in when nothing else
+        // is ready to poll).
+        tokio::time::advance(RELIABLE_CHECK_INTERVAL + Duration::from_millis(1)).await;
+
+        let mut settled = false;
+        for _ in 0..2000 {
+            let outcome =
+                run_one_io_turn(&mut state, &mut tick, &mut direct_probe, &mut reliable_tick).await;
+            if matches!(outcome, IoTurnOutcome::Break) {
+                break;
+            }
+            if !state.reliable_recv.has_pending_ack() {
+                settled = true;
+                break;
+            }
+        }
+        assert!(
+            settled,
+            "reliable_tick was starved by sustained inbound traffic for 2000 turns -- the \
+             primed pending ack never went out"
+        );
+    }
+
+    /// `handle_outbound_batch`'s backpressure gate checks `is_full()` once
+    /// before batching and again between each `try_recv()` -- but `unacked`
+    /// only grows afterward, in the `wrap_and_track` loop, so `is_full()`
+    /// reads the SAME (not-yet-full) value for the whole batch. Starting
+    /// one below the cap, a single `MAX_OUTBOUND_BATCH`-sized batch can
+    /// overcommit `unacked` past `MAX_UNACKED` entirely within one call --
+    /// the exact mechanism that let the `fairness` (unbiased scheduling)
+    /// and `backpressure` (`is_full()` gating) changes combine into a real
+    /// regression (DST seed 229034608) even though each passed alone: the
+    /// old `biased` order reliably drained acks (shrinking `unacked`)
+    /// before outbound ran on the same poll, masking exactly this gap.
+    #[tokio::test]
+    async fn handle_outbound_batch_never_overcommits_the_unacked_window() {
+        let mut state =
+            make_state(PeerReachability::Connected { path: CandidateClass::Lan }, vec![], None)
+                .await;
+        state.reliable_enabled.store(true, Ordering::Relaxed);
+        // One below the cap -- exactly the near-full window this
+        // regression needs.
+        for _ in 0..ReliableSend::MAX_UNACKED - 1 {
+            state.reliable_send.wrap_and_track(b"already in flight", 0, 0);
+        }
+        assert_eq!(state.reliable_send.unacked_len(), ReliableSend::MAX_UNACKED - 1);
+
+        let (outbound_tx, outbound_rx) = mpsc::channel::<Bytes>(MAX_OUTBOUND_BATCH + 4);
+        for i in 0..MAX_OUTBOUND_BATCH {
+            outbound_tx.try_send(Bytes::from(format!("payload-{i}"))).unwrap();
+        }
+        state.outbound_rx = outbound_rx;
+        let first_payload = state.outbound_rx.try_recv().unwrap();
+
+        handle_outbound_batch(&mut state, first_payload).await;
+
+        assert!(
+            state.reliable_send.unacked_len() <= ReliableSend::MAX_UNACKED,
+            "unacked window overcommitted: {} > MAX_UNACKED ({})",
+            state.reliable_send.unacked_len(),
+            ReliableSend::MAX_UNACKED
+        );
+        assert_eq!(
+            state.reliable_send.unacked_len(),
+            ReliableSend::MAX_UNACKED,
+            "exactly one more payload should have fit in the one remaining slot"
+        );
+        // The rest of the batch must stay queued for a later turn, not be
+        // dequeued-and-then-silently-dropped-or-overcommitted.
+        let mut remaining = 0;
+        while state.outbound_rx.try_recv().is_ok() {
+            remaining += 1;
+        }
+        assert_eq!(
+            remaining,
+            MAX_OUTBOUND_BATCH - 1,
+            "only one payload should have been dequeued -- the rest must remain queued"
+        );
     }
 
     #[tokio::test]

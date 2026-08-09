@@ -149,7 +149,7 @@ mod dst_support;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use boringtun::x25519::{PublicKey, StaticSecret};
@@ -192,7 +192,14 @@ struct Device {
     root: PathBuf,
     state: Arc<ReplicaCoordinator>,
     processor: Arc<LocalChangeProcessor>,
-    session: OnceLock<Arc<PeerSyncSession>>,
+    /// The current generation's live session, if any -- swapped, not
+    /// set-once: `connect`'s reconnect supervisor replaces this every time
+    /// a natural session end (not a test-driven partition) triggers a
+    /// fresh generation, mirroring `peer_orchestrator::spawn_peer_session`'s
+    /// production reconnect contract now that a `PeerChannel` actor can end
+    /// cleanly on its own (ARQ exhaustion tearing a genuinely-partitioned
+    /// channel down) rather than only via an explicit revoke.
+    session: StdMutex<Option<Arc<PeerSyncSession>>>,
 }
 
 fn setup_device(
@@ -202,15 +209,20 @@ fn setup_device(
     store: Arc<FsBlockStore>,
 ) -> Arc<Device> {
     let processor = Arc::new(
-        LocalChangeProcessor::new(state.clone(), store, device_id.to_string())
-            .with_change_emitter(dst_dag_migrate_b2::emitter_for(device_id)),
+        LocalChangeProcessor::new(
+            state.clone(),
+            store,
+            device_id.to_string(),
+            Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+        )
+        .with_change_emitter(dst_dag_migrate_b2::emitter_for(device_id)),
     );
     Arc::new(Device {
         device_id: device_id.to_string(),
         root,
         state,
         processor,
-        session: OnceLock::new(),
+        session: StdMutex::new(None),
     })
 }
 
@@ -248,7 +260,9 @@ async fn commit_local(
         .await
         .map_err(|e| e.to_string())?;
     if let LocalChangeOutcome::FileChanged(_) = &outcome {
-        if let Some(session) = device.session.get() {
+        let current =
+            device.session.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        if let Some(session) = current {
             // The emitter appended the signed change during `process_event`;
             // announce the heads. Announcing while partitioned is intentional:
             // production does not know it is partitioned either, and getting the
@@ -290,12 +304,20 @@ fn snapshot(root: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
     out
 }
 
-async fn connect(
+/// One connect-then-run cycle for both sides of the laptop/always-on pair.
+/// Returns each side's `PeerSyncSession::run` `JoinHandle` so [`connect`]'s
+/// reconnect supervisor can wait for either to end and start a fresh
+/// generation, rather than firing-and-forgetting them (the previous,
+/// single-generation-only shape).
+async fn connect_once(
     rng: &mut StdRng,
     laptop: &Arc<Device>,
     store_l: Arc<FsBlockStore>,
     always_on: &Arc<Device>,
     store_a: Arc<FsBlockStore>,
+) -> (
+    tokio::task::JoinHandle<Result<(), yadorilink_peer_session::PeerSessionError>>,
+    tokio::task::JoinHandle<Result<(), yadorilink_peer_session::PeerSessionError>>,
 ) {
     let (secret_l, public_l) = gen_keypair(rng);
     let (secret_a, public_a) = gen_keypair(rng);
@@ -327,9 +349,16 @@ async fn connect(
         .unwrap(),
     );
 
+    // Pin both devices' verifying keys -- computed ahead of session
+    // construction since `ChangeAuthenticator` is now a construction-only
+    // `PeerSyncSessionDeps` field, not a post-hoc setter (`wire_dag_session`
+    // below no longer installs it).
+    let ids = [laptop.device_id.as_str(), always_on.device_id.as_str()];
+    let authenticator = dst_dag_migrate_b2::PinnedAuthenticator::new(ids);
+
     let mut roots_l = HashMap::new();
     roots_l.insert(GROUP_ID.to_string(), laptop.root.clone());
-    let session_l = PeerSyncSession::new(
+    let session_l = PeerSyncSession::new_with_dependencies(
         channel_l,
         laptop.device_id.clone(),
         always_on.device_id.clone(),
@@ -337,10 +366,18 @@ async fn connect(
         store_l,
         vec![GROUP_ID.to_string()],
         roots_l,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            root_commit_authority_provider: std::sync::Arc::new(
+                dst_support::link::TestRootCommitAuthorityProvider,
+            ),
+            change_authenticator: authenticator.clone(),
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
     let mut roots_a = HashMap::new();
     roots_a.insert(GROUP_ID.to_string(), always_on.root.clone());
-    let session_a = PeerSyncSession::new(
+    let session_a = PeerSyncSession::new_with_dependencies(
         channel_a,
         always_on.device_id.clone(),
         laptop.device_id.clone(),
@@ -348,16 +385,114 @@ async fn connect(
         store_a,
         vec![GROUP_ID.to_string()],
         roots_a,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            root_commit_authority_provider: std::sync::Arc::new(
+                dst_support::link::TestRootCommitAuthorityProvider,
+            ),
+            change_authenticator: authenticator,
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
 
-    laptop.session.set(session_l.clone()).ok();
-    always_on.session.set(session_a.clone()).ok();
-    let ids = [laptop.device_id.as_str(), always_on.device_id.as_str()];
+    *laptop.session.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some(session_l.clone());
+    *always_on.session.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some(session_a.clone());
     let group_ids = [GROUP_ID];
     dst_dag_migrate_b2::wire_dag_session(&session_l, laptop.state.clone(), &ids, &group_ids);
     dst_dag_migrate_b2::wire_dag_session(&session_a, always_on.state.clone(), &ids, &group_ids);
-    tokio::spawn(session_l.run());
-    tokio::spawn(session_a.run());
+    (tokio::spawn(session_l.run()), tokio::spawn(session_a.run()))
+}
+
+/// Exponential backoff between reconnect attempts -- matches
+/// `peer_orchestrator::spawn_peer_session`'s own production schedule
+/// (`supervise::BackoffConfig::RECONNECT`: 1s doubling, capped at 45s)
+/// rather than a fixed short delay. A fixed short delay is actively
+/// dangerous under real CI-runner load: if a handshake is failing because
+/// the runner is too contended to complete it in time (not because the
+/// peer is genuinely gone), retrying every ~200ms just adds MORE
+/// concurrent connect/handshake attempts on top of the contention that
+/// caused the failure -- guaranteeing it never recovers. Confirmed for the
+/// identical shape of supervisor in `row14_strict_acceptance.rs`'s own CI
+/// run: 26 consecutive handshake failures over 321s with a fixed-delay
+/// retry.
+const RECONNECT_BACKOFF: yadorilink_daemon::supervise::BackoffConfig =
+    yadorilink_daemon::supervise::BackoffConfig::RECONNECT;
+
+/// Establishes the laptop/always-on pair and keeps them connected for the
+/// rest of the scenario: a background supervisor watches both sides'
+/// `PeerSyncSession::run` handles and starts a fresh generation (new
+/// sockets, new `PeerChannel`s, new sessions, swapped into
+/// `Device::session`) whenever either ends on its own. Before this existed,
+/// a natural session end (e.g. `yadorilink-transport`'s ARQ layer tearing a
+/// channel down after exhausting retransmits against a genuinely
+/// partitioned peer) permanently silenced that side of the pair for the
+/// rest of the scenario -- indistinguishable, from this harness's point of
+/// view, from the test's own intentional `set_partitioned` packet-loss
+/// gate, except that a real partition heals (packet loss returns to 0) while
+/// a torn-down-and-never-reconnected channel does not. This mirrors
+/// `peer_orchestrator::spawn_peer_session`'s production reconnect contract
+/// (see that function's own doc comment for the identical reasoning).
+async fn connect(
+    rng: &mut StdRng,
+    laptop: &Arc<Device>,
+    store_l: Arc<FsBlockStore>,
+    always_on: &Arc<Device>,
+    store_a: Arc<FsBlockStore>,
+) {
+    let (mut h_l, mut h_a) =
+        connect_once(rng, laptop, store_l.clone(), always_on, store_a.clone()).await;
+
+    // A fresh, independently-seeded RNG for the background supervisor's own
+    // reconnect key generation -- derived from the caller's rng (so the
+    // whole scenario stays deterministic per its own base seed) rather than
+    // trying to move the caller's `&mut StdRng` across the 'static task
+    // boundary.
+    let mut seed_bytes = [0u8; 8];
+    rng.fill(&mut seed_bytes);
+    let reconnect_seed = u64::from_le_bytes(seed_bytes);
+
+    let laptop = laptop.clone();
+    let always_on = always_on.clone();
+    tokio::spawn(async move {
+        let mut rng = StdRng::seed_from_u64(reconnect_seed);
+        let mut attempt: u32 = 0;
+        let mut generation_started = tokio::time::Instant::now();
+        loop {
+            // Cancel-safe: `select!` on `&mut JoinHandle` only consumes
+            // whichever side actually resolved first; the other side's
+            // handle is still valid to await (or select on again) later.
+            // Both sides reconnect together regardless of which one ended
+            // -- simpler than independently reconnecting one side while
+            // exchanging its fresh candidate address with the other, and
+            // just as correct for this harness's purposes (a lingering
+            // live handle is dropped, which tears its own channel down via
+            // the same `PeerChannel` Drop path a revoke would).
+            tokio::select! {
+                _ = &mut h_l => {}
+                _ = &mut h_a => {}
+            }
+            // A generation that stayed up for a while was a genuine
+            // success (this scenario's own partition/heal cycles are the
+            // expected, healthy source of many reconnects over one run) --
+            // reset the backoff instead of letting it ratchet toward its
+            // 45s cap and stay there for the rest of the run. Only a
+            // generation that dies almost immediately (handshake never
+            // completing -- CI contention, or a peer that is not coming
+            // back) escalates.
+            if generation_started.elapsed() > Duration::from_secs(3) {
+                attempt = 0;
+            }
+            tokio::time::sleep(RECONNECT_BACKOFF.next(attempt)).await;
+            let (new_h_l, new_h_a) =
+                connect_once(&mut rng, &laptop, store_l.clone(), &always_on, store_a.clone()).await;
+            h_l = new_h_l;
+            h_a = new_h_a;
+            attempt = attempt.saturating_add(1);
+            generation_started = tokio::time::Instant::now();
+        }
+    });
 }
 
 fn content_for(seed: u64, cycle: usize, seq: usize, tag: &str) -> Vec<u8> {
@@ -469,6 +604,7 @@ async fn run_scenario(seed: u64) -> Result<(), String> {
         // bugs with different owners. Cheap to report and painful to re-derive.
         let live_rows_missing_bytes: Vec<String> = laptop
             .state
+            .file_index_repository()
             .list_files(GROUP_ID)
             .map(|f| {
                 f.iter()

@@ -205,6 +205,15 @@ pub trait PeerReplicaStatePort: Send + Sync {
     /// enqueuing a pending job, instead of waiting for its fallback poll.
     fn notify_materialization_wake(&self);
 
+    /// Marks `group_id` dirty for the ephemeral conflict-copy retirement
+    /// loop and wakes it promptly, instead of waiting for its own periodic
+    /// backstop poll. Callers: an admitted batch that actually advanced
+    /// this device's frontier, and a materialization job reaching
+    /// `Completed` -- see `RetirementWake`'s own doc comment for why those
+    /// two are exactly the events after which a conflict copy can become
+    /// unjustified.
+    fn notify_retirement_wake(&self, group_id: &str);
+
     fn is_path_dirty(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError>;
 
     /// Every retained version of `path`, newest-first — used by
@@ -262,6 +271,18 @@ pub trait PeerReplicaStatePort: Send + Sync {
     fn dag_group_history_paths(&self, group_id: &str) -> Result<HashSet<String>, PeerSessionError>;
 
     fn dag_list_unapplied_changes(&self, group_id: &str) -> Result<Vec<Change>, PeerSessionError>;
+
+    /// Whether `hash` is already durably admitted to the retained store
+    /// (applied or unapplied-but-admitted — see `dag_list_unapplied_changes`'s
+    /// own doc for that distinction). Deliberately narrower than
+    /// `dag_has_change_or_pruned`: this does not also treat a *pruned*
+    /// change as present, since a caller using this to short-circuit a
+    /// duplicate re-delivery must not conflate "already admitted" with
+    /// "was pruned, and receiving its full body again would re-trigger
+    /// rebootstrap/compaction semantics" — those are different situations
+    /// with different correct responses, and folding them together here
+    /// would silently change which one a duplicate-detection caller gets.
+    fn dag_has_change(&self, hash: &ChangeHash) -> Result<bool, PeerSessionError>;
 
     fn dag_has_change_or_pruned(
         &self,

@@ -25,6 +25,7 @@ use yadorilink_ipc_proto::shellipc::{
     MaterializationState as ShellMaterializationState, StatusPush, SyncState as ShellSyncState,
 };
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
+use yadorilink_peer_session::peer_session::PendingLocalFlushOutcome;
 use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_root_authority::root_commit::RootLease;
 
@@ -114,20 +115,41 @@ impl LinkFlushHandle {
 const FORCE_FLUSH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl LinkFlushHandle {
-    pub(crate) async fn flush_pending_local_change(&self, group_id: &str, rel_path: &str) {
+    pub(crate) async fn flush_pending_local_change(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+    ) -> PendingLocalFlushOutcome {
         let path = self.canonical_root.join(rel_path);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        if self
-            .flush_request_tx
-            .send(debounce::FlushPathRequest {
+        // Bounded like the reply wait below: this channel (capacity 4) is
+        // shared by every concurrent peer message handler reconciling a
+        // path against this link, and can back up under a duplicate-
+        // delivery storm. An unbounded `.send().await` here would then park
+        // the calling message handler -- and the peer-session slot it
+        // holds -- indefinitely, with no log and no error, which is
+        // exactly the failure this bound closes.
+        let send_result = tokio::time::timeout(
+            FORCE_FLUSH_REQUEST_TIMEOUT,
+            self.flush_request_tx.send(debounce::FlushPathRequest {
                 path: path.clone(),
                 mode: debounce::FlushMode::ExactPath,
                 reply: reply_tx,
-            })
-            .await
-            .is_err()
-        {
-            return; // this link's accumulator task is gone
+            }),
+        )
+        .await;
+        match send_result {
+            Err(_) => {
+                tracing::warn!(
+                    group_id,
+                    path = %path.display(),
+                    "timed out enqueueing a targeted flush request to this link's debounce \
+                     accumulator; deferring this reconciliation"
+                );
+                return PendingLocalFlushOutcome::RetryRequired;
+            }
+            Ok(Err(_)) => return PendingLocalFlushOutcome::Settled, // accumulator task is gone
+            Ok(Ok(())) => {}
         }
         let found = match tokio::time::timeout(FORCE_FLUSH_REQUEST_TIMEOUT, reply_rx).await {
             Ok(Ok(found)) => found,
@@ -137,9 +159,9 @@ impl LinkFlushHandle {
                     group_id,
                     path = %path.display(),
                     "timed out waiting for this link's debounce accumulator to answer a targeted \
-                     flush request; proceeding without one"
+                     flush request; deferring this reconciliation"
                 );
-                None
+                return PendingLocalFlushOutcome::RetryRequired;
             }
         };
         // Scope widened during scenario 5's investigation: a `None` reply
@@ -154,7 +176,7 @@ impl LinkFlushHandle {
         // treating "nothing queued" as "nothing to do".
         let Some((found_path, kind, observed_at)) = found else {
             self.capture_undiscovered_local_change(group_id, &path).await;
-            return;
+            return PendingLocalFlushOutcome::Settled;
         };
         tracing::info!(
             group_id,
@@ -162,8 +184,10 @@ impl LinkFlushHandle {
             "forcing a pending local change to flush and index before a racing peer update for \
              the same path is applied"
         );
-        let Some(deps) = self.deps.upgrade() else { return };
-        let Ok(_op) = self.root_lease.begin_operation() else { return };
+        let Some(deps) = self.deps.upgrade() else { return PendingLocalFlushOutcome::Settled };
+        let Ok(_op) = self.root_lease.begin_operation() else {
+            return PendingLocalFlushOutcome::Settled;
+        };
         let _write_activity = deps.begin_write_activity();
         match self
             .processor
@@ -183,6 +207,7 @@ impl LinkFlushHandle {
                 "failed to force-flush a pending local change ahead of a racing peer update"
             ),
         }
+        PendingLocalFlushOutcome::Settled
     }
 
     /// Like `flush_pending_local_change` above, but looks for a *different*
@@ -212,20 +237,36 @@ impl LinkFlushHandle {
     /// nothing is pending, there is nothing more to flush ahead of the
     /// hazard check than what `SyncState` (about to be read) already
     /// reflects.
-    pub(crate) async fn flush_case_fold_sibling(&self, group_id: &str, rel_path: &str) {
+    pub(crate) async fn flush_case_fold_sibling(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+    ) -> PendingLocalFlushOutcome {
         let path = self.canonical_root.join(rel_path);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        if self
-            .flush_request_tx
-            .send(debounce::FlushPathRequest {
+        // Bounded for the same reason as `flush_pending_local_change`'s
+        // enqueue above -- see that call's comment.
+        let send_result = tokio::time::timeout(
+            FORCE_FLUSH_REQUEST_TIMEOUT,
+            self.flush_request_tx.send(debounce::FlushPathRequest {
                 path,
                 mode: debounce::FlushMode::CaseFoldSibling,
                 reply: reply_tx,
-            })
-            .await
-            .is_err()
-        {
-            return; // this link's accumulator task is gone
+            }),
+        )
+        .await;
+        match send_result {
+            Err(_) => {
+                tracing::warn!(
+                    group_id,
+                    rel_path,
+                    "timed out enqueueing a case-fold sibling flush request to this link's \
+                     debounce accumulator; deferring this reconciliation"
+                );
+                return PendingLocalFlushOutcome::RetryRequired;
+            }
+            Ok(Err(_)) => return PendingLocalFlushOutcome::Settled, // accumulator task is gone
+            Ok(Ok(())) => {}
         }
         let found = match tokio::time::timeout(FORCE_FLUSH_REQUEST_TIMEOUT, reply_rx).await {
             Ok(Ok(found)) => found,
@@ -235,12 +276,14 @@ impl LinkFlushHandle {
                     group_id,
                     rel_path,
                     "timed out waiting for this link's debounce accumulator to answer a \
-                     case-fold sibling flush request; proceeding without one"
+                     case-fold sibling flush request; deferring this reconciliation"
                 );
-                None
+                return PendingLocalFlushOutcome::RetryRequired;
             }
         };
-        let Some((sibling_path, kind, observed_at)) = found else { return };
+        let Some((sibling_path, kind, observed_at)) = found else {
+            return PendingLocalFlushOutcome::Settled;
+        };
         tracing::info!(
             group_id,
             rel_path,
@@ -248,8 +291,10 @@ impl LinkFlushHandle {
             "forcing a case-fold sibling's pending local change to flush and index before a \
              racing peer update for the colliding name is applied"
         );
-        let Some(deps) = self.deps.upgrade() else { return };
-        let Ok(_op) = self.root_lease.begin_operation() else { return };
+        let Some(deps) = self.deps.upgrade() else { return PendingLocalFlushOutcome::Settled };
+        let Ok(_op) = self.root_lease.begin_operation() else {
+            return PendingLocalFlushOutcome::Settled;
+        };
         let _write_activity = deps.begin_write_activity();
         match self
             .processor
@@ -270,6 +315,7 @@ impl LinkFlushHandle {
                  racing peer update"
             ),
         }
+        PendingLocalFlushOutcome::Settled
     }
 
     /// Drains and indexes
@@ -713,5 +759,105 @@ mod tests {
         assert!(tokio::time::timeout(std::time::Duration::from_millis(200), push_rx.recv())
             .await
             .is_ok());
+    }
+
+    fn test_link_flush_handle(
+        deps: &Arc<LinkRuntimeDependencies>,
+        root: &Path,
+        flush_request_tx: tokio::sync::mpsc::Sender<debounce::FlushPathRequest>,
+    ) -> LinkFlushHandle {
+        let root_lock =
+            yadorilink_root_authority::sync_root_lock::SyncRootLock::acquire(root).unwrap();
+        let root_lease = Arc::new(yadorilink_root_authority::root_commit::RootLease::new(
+            root_lock,
+            "group-1".to_string(),
+            1,
+        ));
+        let processor = Arc::new(LocalChangeProcessor::new(
+            deps.replica_coordinator.clone(),
+            Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                deps.block_store.clone(),
+            )),
+            deps.device_id.clone(),
+            root_lease.clone(),
+        ));
+        let (flush_all_request_tx, _flush_all_request_rx) = tokio::sync::mpsc::channel(1);
+        LinkFlushHandle::new(
+            deps,
+            flush_request_tx,
+            flush_all_request_tx,
+            processor,
+            root.to_path_buf(),
+            root.display().to_string(),
+            root_lease,
+        )
+    }
+
+    /// The targeted-flush channel (`flush_request_tx`, capacity 4 in
+    /// production) is shared by every concurrent peer message handler
+    /// reconciling a path against this link. Under a duplicate-delivery
+    /// storm it can stay permanently full -- this proves a message handler
+    /// calling `flush_pending_local_change` against a full, never-drained
+    /// channel gets a `RetryRequired` back within its bound (never parks
+    /// indefinitely holding its caller's message-handling permit), rather
+    /// than the previous unbounded `.send().await`.
+    #[tokio::test(start_paused = true)]
+    async fn flush_pending_local_change_returns_retry_required_when_the_channel_stays_full() {
+        let deps = test_deps();
+        let root_dir = tempfile::tempdir().unwrap();
+        let (flush_request_tx, _flush_request_rx) = tokio::sync::mpsc::channel(1);
+        // Occupy the channel's one slot and never drain it -- simulates the
+        // accumulator task being backlogged/stalled behind other requests.
+        let (occupy_reply_tx, _occupy_reply_rx) = tokio::sync::oneshot::channel();
+        flush_request_tx
+            .try_send(debounce::FlushPathRequest {
+                path: root_dir.path().join("occupied"),
+                mode: debounce::FlushMode::ExactPath,
+                reply: occupy_reply_tx,
+            })
+            .unwrap();
+
+        let handle = test_link_flush_handle(&deps, root_dir.path(), flush_request_tx);
+
+        let flush_task = tokio::spawn(async move {
+            handle.flush_pending_local_change("group-1", "shared.bin").await
+        });
+        tokio::time::advance(FORCE_FLUSH_REQUEST_TIMEOUT + std::time::Duration::from_millis(1))
+            .await;
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), flush_task)
+            .await
+            .expect("flush_pending_local_change must return promptly once its enqueue bound elapses, not park indefinitely")
+            .unwrap();
+        assert_eq!(outcome, PendingLocalFlushOutcome::RetryRequired);
+    }
+
+    /// Mirrors the exact-path case above for the case-fold-sibling flush.
+    #[tokio::test(start_paused = true)]
+    async fn flush_case_fold_sibling_returns_retry_required_when_the_channel_stays_full() {
+        let deps = test_deps();
+        let root_dir = tempfile::tempdir().unwrap();
+        let (flush_request_tx, _flush_request_rx) = tokio::sync::mpsc::channel(1);
+        let (occupy_reply_tx, _occupy_reply_rx) = tokio::sync::oneshot::channel();
+        flush_request_tx
+            .try_send(debounce::FlushPathRequest {
+                path: root_dir.path().join("occupied"),
+                mode: debounce::FlushMode::ExactPath,
+                reply: occupy_reply_tx,
+            })
+            .unwrap();
+
+        let handle = test_link_flush_handle(&deps, root_dir.path(), flush_request_tx);
+
+        let flush_task =
+            tokio::spawn(
+                async move { handle.flush_case_fold_sibling("group-1", "shared.bin").await },
+            );
+        tokio::time::advance(FORCE_FLUSH_REQUEST_TIMEOUT + std::time::Duration::from_millis(1))
+            .await;
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), flush_task)
+            .await
+            .expect("flush_case_fold_sibling must return promptly once its enqueue bound elapses, not park indefinitely")
+            .unwrap();
+        assert_eq!(outcome, PendingLocalFlushOutcome::RetryRequired);
     }
 }

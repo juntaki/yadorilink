@@ -15,6 +15,7 @@ pub mod backoff;
 pub mod engine;
 #[path = "engine.rs"]
 mod engine_impl;
+pub mod retirement_service;
 
 // `planner`/`job_store` are deliberately NOT separate modules here: the
 // pure path-resolution logic they'd contain already exists, unchanged, as

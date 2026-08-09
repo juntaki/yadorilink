@@ -28,7 +28,7 @@ use std::path::Path;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations;
 use yadorilink_filesystem_sync::stale_temp_files::cleanup_stale_temp_files;
-use yadorilink_local_storage::BlockStore;
+use yadorilink_local_storage::BlockContentStore;
 
 use super::oracle::{Violation, ViolationKind};
 
@@ -45,13 +45,19 @@ use super::oracle::{Violation, ViolationKind};
 /// oracles run afterward.
 pub fn run_self_healing(
     state: &ReplicaCoordinator,
-    store: &dyn BlockStore,
+    store: &dyn BlockContentStore,
     root: &Path,
     group_id: &str,
 ) -> Vec<Violation> {
     let mut findings = Vec::new();
 
-    if let Ok(report) = repair_interrupted_materializations(state, store, root, group_id) {
+    if let Ok(report) = repair_interrupted_materializations(
+        state,
+        store,
+        root,
+        group_id,
+        &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+    ) {
         for path in report.reconstructed {
             findings.push(repaired(path, "reconstructed an interrupted eager materialize"));
         }
@@ -100,7 +106,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store_dir = tempfile::tempdir().unwrap();
         let state = ReplicaCoordinator::open_in_memory().unwrap();
-        state.add_link(&root.path().to_string_lossy(), GROUP_ID).unwrap();
+        state.link_repository().add_link(&root.path().to_string_lossy(), GROUP_ID).unwrap();
         let store = FsBlockStore::new(store_dir.path().to_path_buf()).unwrap();
         (state, root, store, store_dir)
     }
@@ -142,9 +148,22 @@ mod tests {
             }],
             deleted: false,
         };
-        state.upsert_file(GROUP_ID, &record).unwrap();
         state
-            .set_materialization_state(GROUP_ID, "pre-crash.bin", MaterializationState::Hydrated)
+            .file_index_repository()
+            .upsert_file(
+                GROUP_ID,
+                &record,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(
+                GROUP_ID,
+                "pre-crash.bin",
+                MaterializationState::Hydrated,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
             .unwrap();
         // Only a partial file on disk + an orphaned temp file: the
         // interrupted-materialize window. The orphan is left by a *previous*
@@ -199,6 +218,7 @@ mod tests {
     fn sweep_does_not_mask_a_genuinely_inconsistent_row() {
         let (state, root, store, _store_dir) = setup();
         state
+            .file_index_repository()
             .upsert_file(
                 GROUP_ID,
                 &FileRecord {
@@ -208,6 +228,7 @@ mod tests {
                     blocks: Vec::new(), // nothing to reconstruct from
                     deleted: false,
                 },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
 

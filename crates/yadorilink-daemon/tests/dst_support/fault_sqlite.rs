@@ -164,13 +164,13 @@ impl SqliteFaultPlan {
 /// the plan itself never changes, so a fault decision depends solely on
 /// how many times each op has been driven — never on timing.
 pub struct FaultingSyncState<'a> {
-    inner: &'a SyncState,
+    inner: &'a ReplicaCoordinator,
     plan: SqliteFaultPlan,
     seqs: Mutex<HashMap<SqliteOp, u64>>,
 }
 
 impl<'a> FaultingSyncState<'a> {
-    pub fn new(inner: &'a SyncState, plan: SqliteFaultPlan) -> Self {
+    pub fn new(inner: &'a ReplicaCoordinator, plan: SqliteFaultPlan) -> Self {
         Self { inner, plan, seqs: Mutex::new(HashMap::new()) }
     }
 
@@ -208,22 +208,26 @@ impl<'a> FaultingSyncState<'a> {
 
     pub fn upsert_file(&self, group_id: &str, record: &FileRecord) -> Result<(), SyncError> {
         self.guard(SqliteOp::UpsertFile)?;
-        self.inner.upsert_file(group_id, record)
+        Ok(self.inner.file_index_repository().upsert_file(
+            group_id,
+            record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )?)
     }
 
     pub fn get_file(&self, group_id: &str, path: &str) -> Result<Option<FileRecord>, SyncError> {
         self.guard(SqliteOp::GetFile)?;
-        self.inner.get_file(group_id, path)
+        Ok(self.inner.file_index_repository().get_file(group_id, path)?)
     }
 
     pub fn list_files(&self, group_id: &str) -> Result<Vec<FileRecord>, SyncError> {
         self.guard(SqliteOp::ListFiles)?;
-        self.inner.list_files(group_id)
+        Ok(self.inner.file_index_repository().list_files(group_id)?)
     }
 
     pub fn get_exec_bit(&self, group_id: &str, path: &str) -> Result<bool, SyncError> {
         self.guard(SqliteOp::GetExecBit)?;
-        self.inner.get_exec_bit(group_id, path)
+        Ok(self.inner.file_index_repository().get_exec_bit(group_id, path)?)
     }
 }
 
@@ -274,7 +278,7 @@ mod tests {
     fn setup() -> (ReplicaCoordinator, tempfile::TempDir) {
         let root = tempfile::tempdir().unwrap();
         let state = ReplicaCoordinator::open_in_memory().unwrap();
-        state.add_link(&root.path().to_string_lossy(), GROUP).unwrap();
+        state.link_repository().add_link(&root.path().to_string_lossy(), GROUP).unwrap();
         (state, root)
     }
 
@@ -352,7 +356,7 @@ mod tests {
             other => panic!("unexpected error shape: {other:?}"),
         }
         // The faulted write genuinely did not land: ground truth is empty.
-        assert!(state.get_file(GROUP, "a.txt").unwrap().is_none());
+        assert!(state.file_index_repository().get_file(GROUP, "a.txt").unwrap().is_none());
     }
 
     #[test]
@@ -369,7 +373,7 @@ mod tests {
         retry_transient(4, || faulting.upsert_file(GROUP, &record("a.txt"))).unwrap();
 
         // The write is not silently lost: it is present in the real index.
-        let got = state.get_file(GROUP, "a.txt").unwrap();
+        let got = state.file_index_repository().get_file(GROUP, "a.txt").unwrap();
         assert!(got.is_some(), "retried write must reach the index");
     }
 
@@ -384,7 +388,7 @@ mod tests {
         // must propagate rather than be silently swallowed.
         let result = retry_transient(3, || faulting.upsert_file(GROUP, &record("a.txt")));
         assert!(matches!(result, Err(ref e) if is_transient_sqlite_error(e)));
-        assert!(state.get_file(GROUP, "a.txt").unwrap().is_none());
+        assert!(state.file_index_repository().get_file(GROUP, "a.txt").unwrap().is_none());
     }
 
     #[test]

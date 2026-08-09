@@ -118,19 +118,29 @@ pub fn spawn_test_convergence_driver(
 }
 
 /// Installs the session-side pieces every migrated scenario needs after
-/// construction and before `run()`: the all-device pinned authenticator (so
-/// incoming signed changes verify), the short heads-announce cadence (so the
+/// construction and before `run()`: the short heads-announce cadence (so the
 /// periodic frontier audit re-drives catch-up promptly under fault), a
 /// generous block-serve engine (every real, `DaemonState`-backed session
 /// always has one installed; without it an incoming `BlockRequest` fails
 /// closed), and the test convergence driver described above.
+///
+/// The all-device pinned authenticator this used to install here too is now
+/// a `PeerSyncSessionDeps::change_authenticator` construction-only field
+/// (`ChangeAuthenticator` is no longer settable after a session exists) --
+/// every caller must build its session via `PeerSyncSession::
+/// new_with_dependencies` with `PinnedAuthenticator::new(device_ids)`
+/// already supplied, before calling this. `device_ids` is kept as a
+/// parameter (unused here) so call sites don't need to change their own
+/// signature/argument list, and so a future caller relying on this
+/// function's doc comment for "which device IDs does wiring need" still
+/// finds the answer here.
 pub fn wire_dag_session(
     session: &Arc<PeerSyncSession>,
     state: Arc<ReplicaCoordinator>,
     device_ids: &[&str],
     group_ids: &[&str],
 ) {
-    session.set_change_authenticator(PinnedAuthenticator::new(device_ids.iter().copied()));
+    let _ = device_ids;
     // Shorten the periodic frontier audit far below the 90s production default:
     // the run() loop re-announces an idempotent HeadsAnnounce every interval, so
     // a committed edit (announced once via `announce_local_commit` at the call

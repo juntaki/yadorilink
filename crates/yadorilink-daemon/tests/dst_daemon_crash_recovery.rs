@@ -98,8 +98,11 @@ type IndexSnapshot = Vec<(String, Vec<String>)>;
 /// Reads the linked group's live records out of `DaemonState` and folds
 /// them into a deterministic, order-independent [`IndexSnapshot`].
 fn capture_index(state: &DaemonState) -> Result<IndexSnapshot, String> {
-    let files =
-        state.replica_coordinator.list_files(GROUP_ID).map_err(|e| format!("list_files: {e}"))?;
+    let files = state
+        .replica_coordinator
+        .file_index_repository()
+        .list_files(GROUP_ID)
+        .map_err(|e| format!("list_files: {e}"))?;
     let mut snapshot: IndexSnapshot = files
         .iter()
         .filter(|r| !r.deleted)
@@ -244,7 +247,13 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
     daemon1
         .state
         .replica_coordinator
-        .set_materialization_state(GROUP_ID, &indexed_path, MaterializationState::Hydrating)
+        .materialization_state_repository()
+        .set_materialization_state(
+            GROUP_ID,
+            &indexed_path,
+            MaterializationState::Hydrating,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
         .map_err(|e| format!("set Hydrating: {e}"))?;
     // (b) An orphaned temp file in the block-store root — as if the crash
     //     hit between an `FsBlockStore::put` writing its temp and the final
@@ -317,6 +326,7 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
     let still_stale = daemon2
         .state
         .replica_coordinator
+        .materialization_state_repository()
         .reset_stale_hydrating_to_placeholder()
         .map_err(|e| format!("reset_stale_hydrating (post-check): {e}"))?;
     if still_stale != 0 {

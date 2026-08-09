@@ -731,6 +731,11 @@ async fn process_group(
                     None,
                     now,
                 );
+            // A completed job is exactly when a copy this job just made
+            // durable could have superseded some OTHER, still-live ephemeral
+            // conflict copy's justification -- wake the retirement loop
+            // instead of leaving it to its own periodic backstop poll.
+            state.replica_coordinator.retirement_wake().mark_dirty(&job.group_id);
         }
     }
     let elapsed = process_group_started.elapsed();

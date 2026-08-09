@@ -62,8 +62,9 @@ use yadorilink_filesystem_sync::debounce::{self, DebounceConfig, FlushPathReques
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
 use yadorilink_local_storage::FsBlockStore;
 use yadorilink_peer_session::peer_session::{
-    ChangeAuthenticator, PeerSyncSession, PendingLocalChangeFlush,
+    ChangeAuthenticator, PeerSyncSession, PendingLocalChangeFlush, PendingLocalFlushOutcome,
 };
+use yadorilink_peer_session::ports::PeerReplicaStatePort;
 use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
@@ -250,7 +251,7 @@ impl PendingLocalChangeFlush for MeshDevice {
         &'a self,
         group_id: &'a str,
         rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
         Box::pin(async move {
             let path = self.root.join(rel_path);
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -264,7 +265,7 @@ impl PendingLocalChangeFlush for MeshDevice {
                 .await
                 .is_err()
             {
-                return;
+                return PendingLocalFlushOutcome::Settled;
             }
             let found = match tokio::time::timeout(Duration::from_millis(500), reply_rx).await {
                 Ok(Ok(found)) => found,
@@ -275,7 +276,7 @@ impl PendingLocalChangeFlush for MeshDevice {
             // `return` here is silently lossy.
             let Some((found_path, kind, observed_at)) = found else {
                 self.capture_undiscovered_local_change(group_id, &path).await;
-                return;
+                return PendingLocalFlushOutcome::Settled;
             };
             if let Ok(outcome) = self
                 .processor
@@ -288,6 +289,7 @@ impl PendingLocalChangeFlush for MeshDevice {
             {
                 self.broadcast(group_id, outcome.records).await;
             }
+            PendingLocalFlushOutcome::Settled
         })
     }
 
@@ -295,7 +297,7 @@ impl PendingLocalChangeFlush for MeshDevice {
         &'a self,
         group_id: &'a str,
         rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
         Box::pin(async move {
             let path = self.root.join(rel_path);
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -309,13 +311,15 @@ impl PendingLocalChangeFlush for MeshDevice {
                 .await
                 .is_err()
             {
-                return;
+                return PendingLocalFlushOutcome::Settled;
             }
             let found = match tokio::time::timeout(Duration::from_millis(500), reply_rx).await {
                 Ok(Ok(found)) => found,
                 _ => None,
             };
-            let Some((sibling_path, kind, observed_at)) = found else { return };
+            let Some((sibling_path, kind, observed_at)) = found else {
+                return PendingLocalFlushOutcome::Settled;
+            };
             if let Ok(outcome) = self
                 .processor
                 .process_flush(
@@ -327,6 +331,7 @@ impl PendingLocalChangeFlush for MeshDevice {
             {
                 self.broadcast(group_id, outcome.records).await;
             }
+            PendingLocalFlushOutcome::Settled
         })
     }
 }
@@ -347,8 +352,13 @@ fn setup_device(
     // into the group's change-history DAG (the first create forms the root),
     // which is what its neighbor sessions negotiate against.
     let processor = Arc::new(
-        LocalChangeProcessor::new(sync_state.clone(), store, device_id.to_string())
-            .with_change_emitter(Arc::new(ChangeEmitter::new(device_id, signing_key))),
+        LocalChangeProcessor::new(
+            sync_state.clone(),
+            store,
+            device_id.to_string(),
+            Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+        )
+        .with_change_emitter(Arc::new(ChangeEmitter::new(device_id, signing_key))),
     );
     let (flush_request_tx, flush_request_rx) = tokio::sync::mpsc::channel(4);
     let (watch_source, events_tx) = SimulatedFolderWatchSource::new(32);
@@ -457,6 +467,7 @@ async fn connect_edge(
         String,
         yadorilink_replica_domain::file::FileRecord,
     )>,
+    authenticator: Arc<PinnedAuthenticator>,
 ) -> (Arc<PeerSyncSession>, Arc<PeerSyncSession>) {
     let (secret_a, public_a) = gen_keypair(rng);
     let (secret_b, public_b) = gen_keypair(rng);
@@ -490,7 +501,7 @@ async fn connect_edge(
 
     let mut sync_roots_a = HashMap::new();
     sync_roots_a.insert(GROUP_ID.to_string(), device_a.root.clone());
-    let session_a = PeerSyncSession::new_with_forwarding(
+    let session_a = PeerSyncSession::new_with_dependencies(
         channel_a,
         device_a.device_id.clone(),
         device_b.device_id.clone(),
@@ -499,11 +510,19 @@ async fn connect_edge(
         vec![GROUP_ID.to_string()],
         sync_roots_a,
         Some(forward_tx_a),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            root_commit_authority_provider: std::sync::Arc::new(
+                dst_support::link::TestRootCommitAuthorityProvider,
+            ),
+            pending_local_change_flush: device_a.clone(),
+            change_authenticator: authenticator.clone(),
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
 
     let mut sync_roots_b = HashMap::new();
     sync_roots_b.insert(GROUP_ID.to_string(), device_b.root.clone());
-    let session_b = PeerSyncSession::new_with_forwarding(
+    let session_b = PeerSyncSession::new_with_dependencies(
         channel_b,
         device_b.device_id.clone(),
         device_a.device_id.clone(),
@@ -512,6 +531,14 @@ async fn connect_edge(
         vec![GROUP_ID.to_string()],
         sync_roots_b,
         Some(forward_tx_b),
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            root_commit_authority_provider: std::sync::Arc::new(
+                dst_support::link::TestRootCommitAuthorityProvider,
+            ),
+            pending_local_change_flush: device_b.clone(),
+            change_authenticator: authenticator,
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
     // Every real (`DaemonState`-backed) session always has a block-serve
     // engine installed; without one here, any block fetch across this edge
@@ -577,6 +604,7 @@ async fn connect_mesh(
         state_b.clone(),
         store_b.clone(),
         fwd_tx_b.clone(),
+        authenticator.clone(),
     )
     .await;
     let (session_bc_b, session_bc_c) = connect_edge(
@@ -589,26 +617,26 @@ async fn connect_mesh(
         state_c.clone(),
         store_c.clone(),
         fwd_tx_c.clone(),
+        authenticator.clone(),
     )
     .await;
     let (session_ac_a, session_ac_c) = connect_edge(
-        rng, device_a, state_a, store_a, fwd_tx_a, device_c, state_c, store_c, fwd_tx_c,
+        rng,
+        device_a,
+        state_a,
+        store_a,
+        fwd_tx_a,
+        device_c,
+        state_c,
+        store_c,
+        fwd_tx_c,
+        authenticator.clone(),
     )
     .await;
 
     device_a.sessions.set(vec![session_ab_a.clone(), session_ac_a.clone()]).ok();
     device_b.sessions.set(vec![session_ab_b.clone(), session_bc_b.clone()]).ok();
     device_c.sessions.set(vec![session_bc_c.clone(), session_ac_c.clone()]).ok();
-
-    for session in [&session_ab_a, &session_ac_a] {
-        session.set_pending_local_change_flush(device_a.clone());
-    }
-    for session in [&session_ab_b, &session_bc_b] {
-        session.set_pending_local_change_flush(device_b.clone());
-    }
-    for session in [&session_bc_c, &session_ac_c] {
-        session.set_pending_local_change_flush(device_c.clone());
-    }
 
     let fwd_device_a = device_a.clone();
     tokio::spawn(async move {
@@ -637,11 +665,11 @@ async fn connect_mesh(
         session_ac_a.clone(),
         session_ac_c.clone(),
     ] {
-        // Pin all three devices' verifying keys so a signed change from any
-        // author authenticates on arrival, and dial the periodic frontier
-        // audit down to a test-fast cadence so propagation tracks each round's
-        // settle window rather than the 90s production interval.
-        session.set_change_authenticator(authenticator.clone());
+        // All three devices' verifying keys are already pinned at
+        // construction (`connect_edge`'s `PeerSyncSessionDeps`); dial the
+        // periodic frontier audit down to a test-fast cadence so propagation
+        // tracks each round's settle window rather than the 90s production
+        // interval.
         session.set_full_index_resync_interval(DAG_AUDIT_INTERVAL);
         tokio::spawn(session.run());
     }
@@ -706,11 +734,23 @@ async fn connect_mesh(
 /// item 3, "Reading x's evidence too early in a race. Was a real bug."
 async fn authoring_of(device: &MeshDevice, path: &str) -> Option<ChangeHash> {
     device.flush_pending_local_change(GROUP_ID, path).await;
-    device.state.dag_last_authored_change_for_path(GROUP_ID, &device.device_id, path).ok().flatten()
+    device
+        .state
+        .change_history_repository()
+        .dag_last_authored_change_for_path(GROUP_ID, &device.device_id, path)
+        .ok()
+        .flatten()
 }
 
 fn device_has_live_record(device: &MeshDevice, path: &str) -> bool {
-    device.state.get_file(GROUP_ID, path).ok().flatten().map(|r| !r.deleted).unwrap_or(false)
+    device
+        .state
+        .file_index_repository()
+        .get_file(GROUP_ID, path)
+        .ok()
+        .flatten()
+        .map(|r| !r.deleted)
+        .unwrap_or(false)
 }
 
 async fn deliver_local_write(
@@ -811,6 +851,7 @@ async fn converge_path_all3(devices: [&MeshDevice; 3], path: &str) -> (bool, Dur
         for (i, d) in devices.iter().enumerate() {
             let heads = d
                 .state
+                .sqlite()
                 .dag_group_heads(GROUP_ID)
                 .map(|hs| {
                     hs.iter().map(|h| h.to_hex()[..8].to_string()).collect::<Vec<_>>().join(",")
@@ -818,6 +859,7 @@ async fn converge_path_all3(devices: [&MeshDevice; 3], path: &str) -> (bool, Dur
                 .unwrap_or_else(|e| format!("<error: {e}>"));
             let record = d
                 .state
+                .file_index_repository()
                 .get_file(GROUP_ID, path)
                 .map(|r| {
                     r.map(|r| format!("deleted={} blocks={}", r.deleted, r.blocks.len()))
@@ -1439,6 +1481,7 @@ async fn run_scenario(seed: u64, ops_per_run: usize) -> Result<(), String> {
         // state, i.e. the slow-convergence class wearing a scarier name).
         for (i, (_, state)) in devices.iter().enumerate() {
             let heads = state
+                .sqlite()
                 .dag_group_heads(GROUP_ID)
                 .map(|hs| {
                     hs.iter().map(|h| h.to_hex()[..8].to_string()).collect::<Vec<_>>().join(",")
