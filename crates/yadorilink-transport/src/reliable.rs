@@ -221,13 +221,43 @@ impl ReliableSend {
         self.unacked.len() >= Self::MAX_UNACKED
     }
 
+    /// How many more entries can be tracked before hitting `MAX_UNACKED`.
+    /// The caller-side credit `handle_outbound_batch` must reserve BEFORE
+    /// dequeueing a batch, not re-check via `is_full()` mid-batch: `unacked`
+    /// only grows inside `wrap_and_track`, so a stale `is_full()` read taken
+    /// once before a multi-payload batch can't see the batch's own,
+    /// still-in-progress growth -- see `wrap_and_track`'s own doc comment
+    /// and `handle_outbound_batch_never_overcommits_the_unacked_window`.
+    pub(crate) fn remaining_capacity(&self) -> usize {
+        Self::MAX_UNACKED.saturating_sub(self.unacked.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unacked_len(&self) -> usize {
+        self.unacked.len()
+    }
+
     /// Assigns the next sequence number and wraps `payload` into a DATA
     /// frame carrying `ack_lo`/`ack_bits` (the current receive-side ack
     /// state, piggybacked so a standalone ack frame is only needed when
     /// there is no outbound traffic to ride along with), tracking it in
     /// the unacked buffer for retransmission. Returns the encoded frame
     /// ready to hand to `WgTunnel::encrypt_message`.
+    ///
+    /// Deliberately unbounded here -- capping `MAX_UNACKED` is the
+    /// CALLER's job (reserve capacity via `remaining_capacity` before
+    /// dequeueing a batch to wrap; see that method's own doc comment for
+    /// why an in-loop `is_full()` re-check is not equivalent). This method
+    /// only asserts the invariant its caller is supposed to already be
+    /// upholding, so a violation fails loudly at the call site that broke
+    /// it rather than silently growing the window past its bound.
     pub(crate) fn wrap_and_track(&mut self, payload: &[u8], ack_lo: u64, ack_bits: u32) -> Bytes {
+        debug_assert!(
+            self.unacked.len() < Self::MAX_UNACKED,
+            "reliable send window overcommitted: {} entries already tracked at MAX_UNACKED={}",
+            self.unacked.len(),
+            Self::MAX_UNACKED
+        );
         let seq = self.next_seq;
         self.next_seq += 1;
         let frame = encode_data_frame(seq, ack_lo, ack_bits, payload);

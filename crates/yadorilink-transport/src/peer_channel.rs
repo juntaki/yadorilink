@@ -733,20 +733,31 @@ async fn handle_inbound(state: &mut ActorState, inbound: InboundDatagram) {
 /// the moment (sustained loss/overload) it matters most. The `select!`
 /// branch that calls this function is itself gated on `!is_full()` for
 /// this same reason (`run_actor`'s own doc comment on that branch) --
-/// `first_payload` is therefore never framed while full, and this
-/// function's own drain loop stops pulling MORE payloads the moment the
-/// buffer fills mid-batch, leaving them queued in the bounded `outbound_tx`
-/// (capacity 64) for a later turn once acks free up room. `is_full()` is
-/// irrelevant, not consulted, for a peer that never negotiated reliable
-/// delivery at all -- every payload for it stays unwrapped exactly like
-/// before this layer existed.
+/// `first_payload` is therefore never framed while full.
+///
+/// The rest of the batch reserves its `unacked` credit UP FRONT via
+/// `remaining_capacity()`, once, before dequeueing anything else --
+/// deliberately NOT a per-iteration `is_full()` re-check. `unacked` only
+/// grows inside `wrap_and_track`, later in this same function, so a
+/// re-check against `is_full()` between `try_recv()` calls would keep
+/// reading the same stale (not-yet-full) value for the whole batch: with
+/// `MAX_UNACKED - 1` already tracked, that let a single `MAX_OUTBOUND_
+/// BATCH`-sized batch overcommit the window straight past its bound in one
+/// call (see `handle_outbound_batch_never_overcommits_the_unacked_window`).
+/// Whatever doesn't fit in this call's reserved credit stays queued in the
+/// bounded `outbound_tx` (capacity 64) for a later turn once acks free up
+/// room. Capacity is irrelevant, not consulted, for a peer that never
+/// negotiated reliable delivery at all -- every payload for it stays
+/// unwrapped exactly like before this layer existed.
 async fn handle_outbound_batch(state: &mut ActorState, first_payload: Bytes) {
-    let mut payloads = Vec::with_capacity(MAX_OUTBOUND_BATCH);
+    let batch_limit = if state.reliable_enabled.load(Ordering::Relaxed) {
+        MAX_OUTBOUND_BATCH.min(state.reliable_send.remaining_capacity())
+    } else {
+        MAX_OUTBOUND_BATCH
+    };
+    let mut payloads = Vec::with_capacity(batch_limit.max(1));
     payloads.push(first_payload);
-    while payloads.len() < MAX_OUTBOUND_BATCH {
-        if state.reliable_enabled.load(Ordering::Relaxed) && state.reliable_send.is_full() {
-            break;
-        }
+    while payloads.len() < batch_limit {
         match state.outbound_rx.try_recv() {
             Ok(payload) => payloads.push(payload),
             Err(mpsc::error::TryRecvError::Empty) => break,
@@ -1362,6 +1373,63 @@ mod tests {
             settled,
             "reliable_tick was starved by sustained inbound traffic for 2000 turns -- the \
              primed pending ack never went out"
+        );
+    }
+
+    /// `handle_outbound_batch`'s backpressure gate checks `is_full()` once
+    /// before batching and again between each `try_recv()` -- but `unacked`
+    /// only grows afterward, in the `wrap_and_track` loop, so `is_full()`
+    /// reads the SAME (not-yet-full) value for the whole batch. Starting
+    /// one below the cap, a single `MAX_OUTBOUND_BATCH`-sized batch can
+    /// overcommit `unacked` past `MAX_UNACKED` entirely within one call --
+    /// the exact mechanism that let the `fairness` (unbiased scheduling)
+    /// and `backpressure` (`is_full()` gating) changes combine into a real
+    /// regression (DST seed 229034608) even though each passed alone: the
+    /// old `biased` order reliably drained acks (shrinking `unacked`)
+    /// before outbound ran on the same poll, masking exactly this gap.
+    #[tokio::test]
+    async fn handle_outbound_batch_never_overcommits_the_unacked_window() {
+        let mut state =
+            make_state(PeerReachability::Connected { path: CandidateClass::Lan }, vec![], None)
+                .await;
+        state.reliable_enabled.store(true, Ordering::Relaxed);
+        // One below the cap -- exactly the near-full window this
+        // regression needs.
+        for _ in 0..ReliableSend::MAX_UNACKED - 1 {
+            state.reliable_send.wrap_and_track(b"already in flight", 0, 0);
+        }
+        assert_eq!(state.reliable_send.unacked_len(), ReliableSend::MAX_UNACKED - 1);
+
+        let (outbound_tx, outbound_rx) = mpsc::channel::<Bytes>(MAX_OUTBOUND_BATCH + 4);
+        for i in 0..MAX_OUTBOUND_BATCH {
+            outbound_tx.try_send(Bytes::from(format!("payload-{i}"))).unwrap();
+        }
+        state.outbound_rx = outbound_rx;
+        let first_payload = state.outbound_rx.try_recv().unwrap();
+
+        handle_outbound_batch(&mut state, first_payload).await;
+
+        assert!(
+            state.reliable_send.unacked_len() <= ReliableSend::MAX_UNACKED,
+            "unacked window overcommitted: {} > MAX_UNACKED ({})",
+            state.reliable_send.unacked_len(),
+            ReliableSend::MAX_UNACKED
+        );
+        assert_eq!(
+            state.reliable_send.unacked_len(),
+            ReliableSend::MAX_UNACKED,
+            "exactly one more payload should have fit in the one remaining slot"
+        );
+        // The rest of the batch must stay queued for a later turn, not be
+        // dequeued-and-then-silently-dropped-or-overcommitted.
+        let mut remaining = 0;
+        while state.outbound_rx.try_recv().is_ok() {
+            remaining += 1;
+        }
+        assert_eq!(
+            remaining,
+            MAX_OUTBOUND_BATCH - 1,
+            "only one payload should have been dequeued -- the rest must remain queued"
         );
     }
 
