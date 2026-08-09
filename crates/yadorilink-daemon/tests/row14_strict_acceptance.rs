@@ -163,26 +163,126 @@ fn spawn_pair_reconnect_supervisor(
     });
 }
 
-async fn connect_all_pairs(devices: &[TestDevice], group_ids: &[String]) {
-    for i in 0..devices.len() {
-        for j in (i + 1)..devices.len() {
-            let handles = support::connect_two_daemons_with_handles(
-                &devices[i].state,
-                &devices[i].device_id,
-                &devices[j].state,
-                &devices[j].device_id,
-                group_ids,
-            )
-            .await;
-            spawn_pair_reconnect_supervisor(
-                devices[i].state.clone(),
-                devices[i].device_id.clone(),
-                devices[j].state.clone(),
-                devices[j].device_id.clone(),
-                group_ids.to_vec(),
-                handles,
-            );
+/// A round-robin 1-factorization of the complete graph on `n` vertices (the
+/// "circle method"): `n-1` rounds, each a set of `n/2` vertex-disjoint pairs
+/// -- every vertex appears in exactly one pair per round. `n` must be even.
+///
+/// This is what bounds row14's initial full-mesh connection burst to a
+/// production-plausible per-device concurrency: a real device's `netmap`
+/// growing to `n-1` peers arrives incrementally over real time (netmap
+/// pushes, existing sessions already up), never as an instantaneous
+/// simultaneous handshake against every peer at once. Connecting all
+/// `n*(n-1)/2` pairs together -- 15 for row14's 6 devices -- means every
+/// device races `n-1` (5) concurrent WireGuard handshakes from the first
+/// instant, all competing for the same process's CPU. Under a debug build
+/// on a resource-constrained CI runner, that CPU contention alone can push
+/// genuine handshake completion past its own bounded timeout -- confirmed:
+/// this exact shape, 26 consecutive handshake failures over a 321s CI run,
+/// independent of anything about reconnect-supervisor behavior (which
+/// only governs what happens once a *connected* pair later drops).
+/// Bounding round concurrency to `n/2` (3 for row14) caps every device at
+/// exactly one concurrent handshake at a time.
+fn one_factorization(n: usize) -> Vec<Vec<(usize, usize)>> {
+    assert!(
+        n >= 2 && n.is_multiple_of(2),
+        "one_factorization requires an even vertex count, got {n}"
+    );
+    let fixed = n - 1;
+    let mut rotating: Vec<usize> = (0..n - 1).collect();
+    let mut rounds = Vec::with_capacity(n - 1);
+    for _ in 0..n - 1 {
+        let mut round = Vec::with_capacity(n / 2);
+        round.push((fixed.min(rotating[0]), fixed.max(rotating[0])));
+        for k in 1..n / 2 {
+            let a = rotating[k];
+            let b = rotating[rotating.len() - k];
+            round.push((a.min(b), a.max(b)));
         }
+        rounds.push(round);
+        rotating.rotate_right(1);
+    }
+    rounds
+}
+
+/// How long one pair's handshake + change-DAG negotiation may take before
+/// [`wait_pair_ready`] gives up. Generous relative to the exact-generation
+/// handshake's own bounded retry budget (~11s worst case) since this is a
+/// hard failure (test setup itself is broken), not a tuning knob to shave
+/// close -- initial connection speed is not what row14 exists to evaluate.
+const TEST_PAIR_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Blocks until both sides of a pair report a genuinely established
+/// session -- handshake received AND the change-DAG negotiated, on BOTH
+/// sides -- rather than a fixed sleep. A fixed delay is exactly the wrong
+/// tool here: too short under load and the next round's connects race an
+/// unfinished handshake (defeating the whole point of bounding per-round
+/// concurrency); too long and a slow-but-healthy run pays the cost even
+/// when nothing is wrong. Polling this session-state barrier instead scales
+/// with however long the current environment actually needs.
+async fn wait_pair_ready(a: &TestDevice, b: &TestDevice) {
+    tokio::time::timeout(TEST_PAIR_READY_TIMEOUT, async {
+        loop {
+            let a_session = a.state.peers.session(&b.device_id);
+            let b_session = b.state.peers.session(&a.device_id);
+            if let (Some(a_session), Some(b_session)) = (&a_session, &b_session) {
+                if a_session.peer_handshake_received()
+                    && b_session.peer_handshake_received()
+                    && a_session.change_dag_negotiated()
+                    && b_session.change_dag_negotiated()
+                {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "pair {}<->{} did not become ready within {TEST_PAIR_READY_TIMEOUT:?}",
+            a.device_id, b.device_id
+        )
+    });
+}
+
+/// Builds the full mesh via [`one_factorization`]'s bounded-concurrency
+/// rounds: within a round, every pair connects concurrently (still real
+/// production-shaped parallelism, just capped at one handshake per device
+/// instead of `n-1`), then this round's pairs must all report ready
+/// ([`wait_pair_ready`]) before the next round's connects begin -- a state
+/// barrier, not a fixed delay, so this scales correctly on a slower runner
+/// instead of racing ahead of an unfinished handshake or wasting time
+/// waiting past a fast one. Every pair still goes through
+/// [`spawn_pair_reconnect_supervisor`], so nothing about post-connection
+/// convergence/reconnect semantics changes -- only the initial burst shape.
+async fn connect_all_pairs(devices: &[TestDevice], group_ids: &[String]) {
+    for round in one_factorization(devices.len()) {
+        let round_pairs: Vec<(usize, usize)> =
+            futures_util::future::join_all(round.into_iter().map(|(i, j)| async move {
+                let handles = support::connect_two_daemons_with_handles(
+                    &devices[i].state,
+                    &devices[i].device_id,
+                    &devices[j].state,
+                    &devices[j].device_id,
+                    group_ids,
+                )
+                .await;
+                spawn_pair_reconnect_supervisor(
+                    devices[i].state.clone(),
+                    devices[i].device_id.clone(),
+                    devices[j].state.clone(),
+                    devices[j].device_id.clone(),
+                    group_ids.to_vec(),
+                    handles,
+                );
+                (i, j)
+            }))
+            .await;
+
+        futures_util::future::join_all(
+            round_pairs.into_iter().map(|(i, j)| wait_pair_ready(&devices[i], &devices[j])),
+        )
+        .await;
     }
 }
 
@@ -627,5 +727,57 @@ async fn row14_strict_acceptance() {
             unfinished.len(),
             unfinished
         );
+    }
+}
+
+#[cfg(test)]
+mod one_factorization_tests {
+    use super::one_factorization;
+    use std::collections::HashSet;
+
+    /// Every pair of the `n` vertices appears exactly once across all
+    /// rounds combined, and within any single round no vertex appears
+    /// twice -- the two properties `connect_all_pairs` actually depends
+    /// on: full coverage (every pair eventually connects) and bounded
+    /// per-round concurrency (no device races two handshakes at once).
+    fn assert_valid_one_factorization(n: usize) {
+        let rounds = one_factorization(n);
+        assert_eq!(rounds.len(), n - 1, "n={n} must produce exactly n-1 rounds");
+
+        let mut all_pairs = HashSet::new();
+        for round in &rounds {
+            assert_eq!(round.len(), n / 2, "n={n}: every round must have exactly n/2 pairs");
+            let mut seen_this_round = HashSet::new();
+            for &(a, b) in round {
+                assert!(a < b, "pairs must be stored in canonical (a < b) order: got ({a}, {b})");
+                assert!(seen_this_round.insert(a), "vertex {a} appears twice in one round");
+                assert!(seen_this_round.insert(b), "vertex {b} appears twice in one round");
+                assert!(all_pairs.insert((a, b)), "pair ({a}, {b}) connected more than once");
+            }
+        }
+        let expected_pair_count = n * (n - 1) / 2;
+        assert_eq!(
+            all_pairs.len(),
+            expected_pair_count,
+            "n={n}: expected every one of the {expected_pair_count} pairs to appear exactly once"
+        );
+    }
+
+    #[test]
+    fn covers_every_pair_exactly_once_with_bounded_round_concurrency_for_row14() {
+        assert_valid_one_factorization(6);
+    }
+
+    #[test]
+    fn holds_for_other_even_vertex_counts_too() {
+        for n in [2, 4, 8, 10] {
+            assert_valid_one_factorization(n);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "even vertex count")]
+    fn refuses_an_odd_vertex_count() {
+        one_factorization(5);
     }
 }
