@@ -719,9 +719,44 @@ async fn row14_strict_acceptance() {
                             if name.contains("(conflicted copy") { "shared.bin" } else { &name };
                         dump_conflict_diagnostic_snapshot(&devices, &group_id, source_path, &name)
                     })
+                    .or_else(|| {
+                        // No asymmetric name -- fall back to the pure
+                        // content-hash-mismatch case: every device has the
+                        // same name, but at least one disagrees with
+                        // device-0 on its sha256. Same three-layer dump as
+                        // the asymmetric branch, just keyed off whichever
+                        // mismatched name we find first.
+                        let reference = &current[0];
+                        let mut mismatched: Vec<String> = reference
+                            .iter()
+                            .filter(|(name, hash)| {
+                                current[1..].iter().any(|snap| snap.get(*name) != Some(*hash))
+                            })
+                            .map(|(name, _)| name.clone())
+                            .collect();
+                        mismatched.sort_by_key(|n| !n.contains("(conflicted copy"));
+                        mismatched.into_iter().next().map(|name| {
+                            let source_path = if name.contains("(conflicted copy") {
+                                "shared.bin".to_string()
+                            } else {
+                                name.clone()
+                            };
+                            format!(
+                                "content-hash mismatch on {name:?} (every device agrees on the \
+                                 name, not the bytes)\n{}",
+                                dump_conflict_diagnostic_snapshot(
+                                    &devices,
+                                    &group_id,
+                                    &source_path,
+                                    &name
+                                )
+                            )
+                        })
+                    })
                     .unwrap_or_else(|| {
-                        "no asymmetric path found (all devices agree on names; divergence must \
-                         be pure content-hash mismatch)"
+                        "no asymmetric path and no content-hash mismatch found among current \
+                         entries (the stall must have resolved between the comparison above and \
+                         this diagnostic pass)"
                             .to_string()
                     });
                 panic!(
