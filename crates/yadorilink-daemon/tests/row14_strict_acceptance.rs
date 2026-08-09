@@ -107,6 +107,49 @@ async fn start_watching(device: &TestDevice, group_id: &str) {
 const PAIR_RECONNECT_BACKOFF: yadorilink_daemon::supervise::BackoffConfig =
     yadorilink_daemon::supervise::BackoffConfig::RECONNECT;
 
+/// Global cap on concurrent in-flight connect+handshake attempts across
+/// EVERY pair in this run -- both the initial full-mesh formation
+/// ([`connect_all_pairs`]) and every later reconnect
+/// ([`spawn_pair_reconnect_supervisor`]). `one_factorization`'s round
+/// batching alone only bounds the *initial* burst: each pair's reconnect
+/// supervisor otherwise reconnects independently, so a burst of
+/// chaos-triggered ARQ teardowns hitting several pairs around the same
+/// moment can still recreate an unbounded concurrent-handshake burst
+/// during the run's steady state, well after the initial mesh formed
+/// cleanly -- confirmed in CI: the *first* handshake failure landed
+/// ~1m50s into a run whose initial mesh (round-batched) had already
+/// formed successfully, with every failure after that point coming from
+/// independent reconnect attempts racing each other. One shared
+/// `tokio::sync::Semaphore`, permit held for the full connect+ready
+/// duration (not just the cheap initial `PeerChannel::connect` call --
+/// the actual CPU cost is the handshake retries running inside the
+/// spawned `PeerSyncSession::run` tasks afterward), is the single source
+/// of truth for that bound regardless of which phase is calling.
+/// Matches `one_factorization`'s own per-round concurrency (`n/2` = 3 for
+/// row14's 6 devices), which is already proven to let the initial mesh
+/// form cleanly.
+const MAX_CONCURRENT_HANDSHAKES: usize = 3;
+
+/// Connects one pair and blocks until it is genuinely ready
+/// ([`wait_pair_ready`]), holding `handshake_semaphore` for the whole
+/// duration -- see [`MAX_CONCURRENT_HANDSHAKES`]'s own doc comment for
+/// why the permit must span the wait, not just the initial connect call.
+async fn connect_pair_with_bounded_concurrency(
+    handshake_semaphore: &tokio::sync::Semaphore,
+    state_i: &Arc<DaemonState>,
+    device_i: &str,
+    state_j: &Arc<DaemonState>,
+    device_j: &str,
+    group_ids: &[String],
+) -> [tokio::task::JoinHandle<()>; 2] {
+    let _permit = handshake_semaphore.acquire().await.unwrap();
+    let handles =
+        support::connect_two_daemons_with_handles(state_i, device_i, state_j, device_j, group_ids)
+            .await;
+    wait_pair_ready(state_i, device_i, state_j, device_j).await;
+    handles
+}
+
 /// Keeps one device pair connected for the rest of the run: whenever
 /// either side's `PeerSyncSession::run` task ends on its own (not driven
 /// by this test -- e.g. `yadorilink-transport`'s ARQ layer tearing a
@@ -129,6 +172,7 @@ fn spawn_pair_reconnect_supervisor(
     device_j: String,
     group_ids: Vec<String>,
     initial_handles: [tokio::task::JoinHandle<()>; 2],
+    handshake_semaphore: Arc<tokio::sync::Semaphore>,
 ) {
     tokio::spawn(async move {
         let [mut h_i, mut h_j] = initial_handles;
@@ -152,8 +196,13 @@ fn spawn_pair_reconnect_supervisor(
                 attempt = 0;
             }
             tokio::time::sleep(PAIR_RECONNECT_BACKOFF.next(attempt)).await;
-            let handles = support::connect_two_daemons_with_handles(
-                &state_i, &device_i, &state_j, &device_j, &group_ids,
+            let handles = connect_pair_with_bounded_concurrency(
+                &handshake_semaphore,
+                &state_i,
+                &device_i,
+                &state_j,
+                &device_j,
+                &group_ids,
             )
             .await;
             [h_i, h_j] = handles;
@@ -218,12 +267,23 @@ const TEST_PAIR_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// unfinished handshake (defeating the whole point of bounding per-round
 /// concurrency); too long and a slow-but-healthy run pays the cost even
 /// when nothing is wrong. Polling this session-state barrier instead scales
-/// with however long the current environment actually needs.
-async fn wait_pair_ready(a: &TestDevice, b: &TestDevice) {
+/// with however long the current environment actually needs. Takes
+/// `(state, device_id)` pairs rather than `&TestDevice` so it can be
+/// called both from `connect_all_pairs` (borrowing from `TestDevice`) and
+/// from [`connect_pair_with_bounded_concurrency`] (which only has owned
+/// `Arc<DaemonState>`/`String` inside a 'static reconnect-supervisor
+/// task, not a `TestDevice` reference -- `TestDevice` owns a `TempDir`,
+/// not `Clone`).
+async fn wait_pair_ready(
+    state_a: &Arc<DaemonState>,
+    device_a_id: &str,
+    state_b: &Arc<DaemonState>,
+    device_b_id: &str,
+) {
     tokio::time::timeout(TEST_PAIR_READY_TIMEOUT, async {
         loop {
-            let a_session = a.state.peers.session(&b.device_id);
-            let b_session = b.state.peers.session(&a.device_id);
+            let a_session = state_a.peers.session(device_b_id);
+            let b_session = state_b.peers.session(device_a_id);
             if let (Some(a_session), Some(b_session)) = (&a_session, &b_session) {
                 if a_session.peer_handshake_received()
                     && b_session.peer_handshake_received()
@@ -238,10 +298,7 @@ async fn wait_pair_ready(a: &TestDevice, b: &TestDevice) {
     })
     .await
     .unwrap_or_else(|_| {
-        panic!(
-            "pair {}<->{} did not become ready within {TEST_PAIR_READY_TIMEOUT:?}",
-            a.device_id, b.device_id
-        )
+        panic!("pair {device_a_id}<->{device_b_id} did not become ready within {TEST_PAIR_READY_TIMEOUT:?}")
     });
 }
 
@@ -249,17 +306,23 @@ async fn wait_pair_ready(a: &TestDevice, b: &TestDevice) {
 /// rounds: within a round, every pair connects concurrently (still real
 /// production-shaped parallelism, just capped at one handshake per device
 /// instead of `n-1`), then this round's pairs must all report ready
-/// ([`wait_pair_ready`]) before the next round's connects begin -- a state
-/// barrier, not a fixed delay, so this scales correctly on a slower runner
-/// instead of racing ahead of an unfinished handshake or wasting time
-/// waiting past a fast one. Every pair still goes through
-/// [`spawn_pair_reconnect_supervisor`], so nothing about post-connection
-/// convergence/reconnect semantics changes -- only the initial burst shape.
+/// ([`wait_pair_ready`], via [`connect_pair_with_bounded_concurrency`])
+/// before the next round's connects begin -- a state barrier, not a fixed
+/// delay, so this scales correctly on a slower runner instead of racing
+/// ahead of an unfinished handshake or wasting time waiting past a fast
+/// one. Every pair still goes through [`spawn_pair_reconnect_supervisor`],
+/// sharing the same [`MAX_CONCURRENT_HANDSHAKES`] semaphore this function
+/// seeds, so nothing about post-connection convergence/reconnect
+/// semantics changes -- only the connection concurrency shape, uniformly
+/// across the whole run's lifetime.
 async fn connect_all_pairs(devices: &[TestDevice], group_ids: &[String]) {
+    let handshake_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
     for round in one_factorization(devices.len()) {
-        let round_pairs: Vec<(usize, usize)> =
-            futures_util::future::join_all(round.into_iter().map(|(i, j)| async move {
-                let handles = support::connect_two_daemons_with_handles(
+        futures_util::future::join_all(round.into_iter().map(|(i, j)| {
+            let handshake_semaphore = handshake_semaphore.clone();
+            async move {
+                let handles = connect_pair_with_bounded_concurrency(
+                    &handshake_semaphore,
                     &devices[i].state,
                     &devices[i].device_id,
                     &devices[j].state,
@@ -274,14 +337,10 @@ async fn connect_all_pairs(devices: &[TestDevice], group_ids: &[String]) {
                     devices[j].device_id.clone(),
                     group_ids.to_vec(),
                     handles,
+                    handshake_semaphore.clone(),
                 );
-                (i, j)
-            }))
-            .await;
-
-        futures_util::future::join_all(
-            round_pairs.into_iter().map(|(i, j)| wait_pair_ready(&devices[i], &devices[j])),
-        )
+            }
+        }))
         .await;
     }
 }
