@@ -4645,6 +4645,15 @@ impl PeerSyncSession {
         // disk-full / a missing block / an I/O error leaves the change
         // unapplied so the reprojection backstop keeps retrying it.
         let mut admitted: Vec<yadorilink_replica_engine::outcomes::AdmittedChange> = Vec::new();
+        // Already-known changes redelivered by anti-entropy that are worth
+        // re-planning materialization for even though they add nothing to
+        // `admitted` itself -- see the `dag_has_change` fast-path's own doc
+        // comment below for why. Kept separate from `admitted` because
+        // `admitted.is_empty()` also gates frontier recording and the
+        // retirement wake, which must stay scoped to genuinely new
+        // admissions from this receipt.
+        let mut redelivered_known: Vec<yadorilink_replica_engine::outcomes::AdmittedChange> =
+            Vec::new();
         for encoded in &batch.changes {
             let Some(change) = self.authenticate_incoming_change(&group_id, encoded) else {
                 continue;
@@ -4714,15 +4723,51 @@ impl PeerSyncSession {
             // A change already durably admitted (whether or not its own
             // projection has succeeded yet -- `dag_list_unapplied_changes`'s
             // durable retry backstop owns that separately) has nothing left
-            // for this receipt to do: re-running it through the local-flush
-            // barrier below cannot change DAG admission and only spends that
-            // barrier's bounded budget on gossip this device has already
-            // seen. Anti-entropy resends the same change on every heads
-            // announce until this device's frontier catches up, so under a
-            // duplicate-delivery storm this fast-path is what keeps the
-            // targeted-flush channel from staying saturated by re-flushing
-            // the same paths on every redundant redelivery.
+            // for this receipt to do as far as DAG admission goes:
+            // re-running it through the local-flush barrier below cannot
+            // change DAG admission and only spends that barrier's bounded
+            // budget on gossip this device has already seen. Anti-entropy
+            // resends the same change on every heads announce until this
+            // device's frontier catches up, so under a duplicate-delivery
+            // storm this fast-path is what keeps the targeted-flush channel
+            // from staying saturated by re-flushing the same paths on every
+            // redundant redelivery.
+            //
+            // It must NOT also skip materialization re-triggering, though.
+            // A path's materialization job can reach `Completed`/
+            // `Superseded` against whatever was the live winner at THAT
+            // moment, then later be overtaken by a still-newer head this
+            // device already admitted -- but `materialization_claim_
+            // runnable_jobs` and the periodic repair sweep both structurally
+            // skip a job/file already in a terminal state, so nothing else
+            // ever re-examines it. Confirmed via `row14_strict_acceptance`
+            // (`fix/conflict-copy-convergence-obligation-20260723`): CI's
+            // slower daemon-e2e runner reliably reproduced two devices stuck
+            // forever with stale-but-`Completed` `shared.bin` jobs, despite
+            // their own DAG already holding the true winner and every
+            // device otherwise agreeing on the DAG. Redelivery of an
+            // already-known change is exactly the recurring signal that
+            // should re-arm a stale terminal job -- skip the (expensive)
+            // per-path local-flush barrier below, but still let this
+            // change's touched paths go through the same enqueue call as a
+            // freshly-admitted one. `materialization_enqueue_pending`'s own
+            // `ON CONFLICT` clause is a cheap, idempotent no-op when nothing
+            // has actually changed, so this does not reopen the flush-
+            // channel-saturation hazard the skip above still guards
+            // against.
             if self.state.dag_has_change(&claimed_hash)? {
+                let mut touched_paths = std::collections::BTreeSet::new();
+                for op in &change.ops {
+                    collect_op_paths(op, &mut touched_paths);
+                }
+                if !touched_paths.is_empty() {
+                    affected_paths.extend(touched_paths.iter().cloned());
+                    redelivered_known.push(yadorilink_replica_engine::outcomes::AdmittedChange {
+                        hash: claimed_hash,
+                        lamport: change.lamport,
+                        touched_paths,
+                    });
+                }
                 continue;
             }
 
@@ -4828,8 +4873,18 @@ impl PeerSyncSession {
             }
         }
 
+        // `redelivered_known` first, `admitted` last -- `plan_batch_
+        // materialization` picks whichever entry touches a given path LAST
+        // by plain iteration order, not by lamport (see its own doc
+        // comment), so a genuinely fresh admission from THIS receipt must
+        // always be the one that wins for any path it also touches. Putting
+        // `admitted` last preserves that existing invariant exactly;
+        // `redelivered_known` only ever supplies a path's trigger when
+        // nothing newly admitted this batch also touched it.
+        let plan_input: Vec<yadorilink_replica_engine::outcomes::AdmittedChange> =
+            redelivered_known.iter().cloned().chain(admitted.iter().cloned()).collect();
         let plans = yadorilink_replica_engine::materialization_plan::plan_batch_materialization(
-            &admitted,
+            &plan_input,
             &affected_paths,
         );
         // Deliberately the real (non-deterministic-clock-override) wall

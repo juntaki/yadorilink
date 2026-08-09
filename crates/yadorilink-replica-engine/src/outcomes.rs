@@ -43,6 +43,7 @@ pub enum CausalAuthOutcome {
 
 /// One change that became durable as a result of an admission call --
 /// `change` itself, or an orphan its arrival promoted.
+#[derive(Clone)]
 pub struct AdmittedChange {
     pub hash: ChangeHash,
     pub lamport: u64,
