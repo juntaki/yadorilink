@@ -125,10 +125,16 @@ const PAIR_RECONNECT_BACKOFF: yadorilink_daemon::supervise::BackoffConfig =
 /// the actual CPU cost is the handshake retries running inside the
 /// spawned `PeerSyncSession::run` tasks afterward), is the single source
 /// of truth for that bound regardless of which phase is calling.
-/// Matches `one_factorization`'s own per-round concurrency (`n/2` = 3 for
-/// row14's 6 devices), which is already proven to let the initial mesh
-/// form cleanly.
-const MAX_CONCURRENT_HANDSHAKES: usize = 3;
+/// Started at `n/2` = 3 (matching `one_factorization`'s own per-round
+/// concurrency, which is proven to let the initial mesh form cleanly), but
+/// CI's debug-build daemon-e2e job still exhausted the production
+/// exact-generation handshake retry budget under that much concurrency
+/// during the run's steady state -- every device pair failed at some point
+/// over a 6-minute run, not merely the odd straggler. Serialized to 1
+/// (fully sequential handshakes, never more than one in flight at a time)
+/// rather than extending timeouts, since initial-connection speed is not
+/// what row14 is evaluating.
+const MAX_CONCURRENT_HANDSHAKES: usize = 1;
 
 /// Connects one pair and blocks until it is genuinely ready
 /// ([`wait_pair_ready`]), holding `handshake_semaphore` for the whole
