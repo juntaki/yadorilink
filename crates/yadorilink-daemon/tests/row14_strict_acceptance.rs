@@ -90,13 +90,22 @@ async fn start_watching(device: &TestDevice, group_id: &str) {
         .unwrap();
 }
 
-/// How long to wait before re-establishing a pair once either side's
-/// session ends -- deliberately short, mirroring `peer_orchestrator::
-/// spawn_peer_session`'s own reconnect backoff floor. The whole point of
-/// `spawn_pair_reconnect_supervisor` is that a natural session end must
-/// not leave a pair silently disconnected for the rest of this strict
-/// acceptance run.
-const PAIR_RECONNECT_BACKOFF: Duration = Duration::from_millis(200);
+/// Exponential backoff between reconnect attempts, matching
+/// `peer_orchestrator::spawn_peer_session`'s own production schedule
+/// exactly (`supervise::BackoffConfig::RECONNECT`) rather than a fixed
+/// short delay. This matters here specifically: on a resource-constrained
+/// CI runner, a handshake can fail not because the peer is gone but
+/// because the runner is too loaded to complete it within the bounded
+/// handshake timeout. A fixed ~200ms retry then hammers reconnects in a
+/// tight loop, adding MORE concurrent connect/handshake attempts to an
+/// already-contended runner -- worsening the exact contention causing the
+/// failures, with no way to ever recover. Confirmed in CI (this file's own
+/// run): 26 consecutive handshake failures over 321s with a fixed-delay
+/// retry, several pairs never establishing a session for the whole run.
+/// Backing off (1s, doubling, capped at 45s) gives transient load a real
+/// chance to subside between attempts instead of adding to it.
+const PAIR_RECONNECT_BACKOFF: yadorilink_daemon::supervise::BackoffConfig =
+    yadorilink_daemon::supervise::BackoffConfig::RECONNECT;
 
 /// Keeps one device pair connected for the rest of the run: whenever
 /// either side's `PeerSyncSession::run` task ends on its own (not driven
@@ -123,6 +132,8 @@ fn spawn_pair_reconnect_supervisor(
 ) {
     tokio::spawn(async move {
         let [mut h_i, mut h_j] = initial_handles;
+        let mut attempt: u32 = 0;
+        let mut generation_started = tokio::time::Instant::now();
         loop {
             // Cancel-safe: only whichever side actually resolved is
             // consumed; the other handle is still valid to select on
@@ -132,12 +143,22 @@ fn spawn_pair_reconnect_supervisor(
                 _ = &mut h_i => {}
                 _ = &mut h_j => {}
             }
-            tokio::time::sleep(PAIR_RECONNECT_BACKOFF).await;
+            // A generation that stayed up for a while was a genuine
+            // success -- reset the backoff instead of letting it ratchet
+            // toward its 45s cap and stay there for the rest of this run.
+            // Only a generation that dies almost immediately (handshake
+            // never completing) escalates.
+            if generation_started.elapsed() > Duration::from_secs(3) {
+                attempt = 0;
+            }
+            tokio::time::sleep(PAIR_RECONNECT_BACKOFF.next(attempt)).await;
             let handles = support::connect_two_daemons_with_handles(
                 &state_i, &device_i, &state_j, &device_j, &group_ids,
             )
             .await;
             [h_i, h_j] = handles;
+            attempt = attempt.saturating_add(1);
+            generation_started = tokio::time::Instant::now();
         }
     });
 }

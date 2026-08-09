@@ -1488,6 +1488,7 @@ fn spawn_peer_session(
     tokio::spawn(async move {
         let mut attempt: u32 = 0;
         loop {
+            let generation_started = tokio::time::Instant::now();
             run_one_peer_session_attempt(
                 &state,
                 &keypair,
@@ -1497,6 +1498,20 @@ fn spawn_peer_session(
                 session_index.fetch_add(1, Ordering::Relaxed),
             )
             .await;
+            // A generation that stayed up for a while was a genuine
+            // success -- reset the backoff instead of letting it ratchet
+            // toward its 45s cap and stay there for the rest of this
+            // device's lifetime. Without this, a peer that reconnects
+            // occasionally but healthily over a long-running daemon (a
+            // laptop sleeping overnight, a brief network blip) would
+            // eventually always wait the full 45s after ANY disconnect,
+            // indistinguishable from a peer that is genuinely struggling
+            // to reconnect. Only a generation that dies almost immediately
+            // (repeated handshake failures, a genuinely unreachable peer)
+            // should escalate.
+            if generation_started.elapsed() > Duration::from_secs(3) {
+                attempt = 0;
+            }
             let delay = BackoffConfig::RECONNECT.next(attempt);
             tracing::info!(
                 peer = %peer_device_id,
@@ -2026,6 +2041,7 @@ fn spawn_direct_peer_session(
     tokio::spawn(async move {
         let mut attempt: u32 = 0;
         loop {
+            let generation_started = tokio::time::Instant::now();
             run_one_direct_peer_session_attempt(
                 &state,
                 &keypair,
@@ -2035,6 +2051,11 @@ fn spawn_direct_peer_session(
                 session_index.fetch_add(1, Ordering::Relaxed),
             )
             .await;
+            // See `spawn_peer_session`'s identical reset -- a generation
+            // that stayed up for a while was a genuine success.
+            if generation_started.elapsed() > Duration::from_secs(3) {
+                attempt = 0;
+            }
             let delay = BackoffConfig::RECONNECT.next(attempt);
             tracing::info!(
                 peer = %peer_device_id,

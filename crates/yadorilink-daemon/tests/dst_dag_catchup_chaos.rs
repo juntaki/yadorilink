@@ -405,11 +405,20 @@ async fn connect_once(
     (tokio::spawn(session_l.run()), tokio::spawn(session_a.run()))
 }
 
-/// How long to wait before starting a fresh generation once either side's
-/// session ends -- deliberately short: the whole point is that a natural
-/// end (no revoke, no test-driven partition) must not leave the pair
-/// silently disconnected until some unrelated event happens to notice.
-const RECONNECT_BACKOFF: Duration = Duration::from_millis(200);
+/// Exponential backoff between reconnect attempts -- matches
+/// `peer_orchestrator::spawn_peer_session`'s own production schedule
+/// (`supervise::BackoffConfig::RECONNECT`: 1s doubling, capped at 45s)
+/// rather than a fixed short delay. A fixed short delay is actively
+/// dangerous under real CI-runner load: if a handshake is failing because
+/// the runner is too contended to complete it in time (not because the
+/// peer is genuinely gone), retrying every ~200ms just adds MORE
+/// concurrent connect/handshake attempts on top of the contention that
+/// caused the failure -- guaranteeing it never recovers. Confirmed for the
+/// identical shape of supervisor in `row14_strict_acceptance.rs`'s own CI
+/// run: 26 consecutive handshake failures over 321s with a fixed-delay
+/// retry.
+const RECONNECT_BACKOFF: yadorilink_daemon::supervise::BackoffConfig =
+    yadorilink_daemon::supervise::BackoffConfig::RECONNECT;
 
 /// Establishes the laptop/always-on pair and keeps them connected for the
 /// rest of the scenario: a background supervisor watches both sides'
@@ -448,6 +457,8 @@ async fn connect(
     let always_on = always_on.clone();
     tokio::spawn(async move {
         let mut rng = StdRng::seed_from_u64(reconnect_seed);
+        let mut attempt: u32 = 0;
+        let mut generation_started = tokio::time::Instant::now();
         loop {
             // Cancel-safe: `select!` on `&mut JoinHandle` only consumes
             // whichever side actually resolved first; the other side's
@@ -462,11 +473,24 @@ async fn connect(
                 _ = &mut h_l => {}
                 _ = &mut h_a => {}
             }
-            tokio::time::sleep(RECONNECT_BACKOFF).await;
+            // A generation that stayed up for a while was a genuine
+            // success (this scenario's own partition/heal cycles are the
+            // expected, healthy source of many reconnects over one run) --
+            // reset the backoff instead of letting it ratchet toward its
+            // 45s cap and stay there for the rest of the run. Only a
+            // generation that dies almost immediately (handshake never
+            // completing -- CI contention, or a peer that is not coming
+            // back) escalates.
+            if generation_started.elapsed() > Duration::from_secs(3) {
+                attempt = 0;
+            }
+            tokio::time::sleep(RECONNECT_BACKOFF.next(attempt)).await;
             let (new_h_l, new_h_a) =
                 connect_once(&mut rng, &laptop, store_l.clone(), &always_on, store_a.clone()).await;
             h_l = new_h_l;
             h_a = new_h_a;
+            attempt = attempt.saturating_add(1);
+            generation_started = tokio::time::Instant::now();
         }
     });
 }
