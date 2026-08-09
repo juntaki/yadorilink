@@ -1489,13 +1489,14 @@ fn spawn_peer_session(
         let mut attempt: u32 = 0;
         loop {
             let generation_started = tokio::time::Instant::now();
+            let this_generation = session_index.fetch_add(1, Ordering::Relaxed);
             run_one_peer_session_attempt(
                 &state,
                 &keypair,
                 &local_device_id,
                 &peer_device_id,
                 &diff_state,
-                session_index.fetch_add(1, Ordering::Relaxed),
+                this_generation,
             )
             .await;
             // A generation that stayed up for a while was a genuine
@@ -1515,8 +1516,10 @@ fn spawn_peer_session(
             let delay = BackoffConfig::RECONNECT.next(attempt);
             tracing::info!(
                 peer = %peer_device_id,
+                generation = this_generation,
                 attempt,
                 ?delay,
+                generation_elapsed_ms = generation_started.elapsed().as_millis(),
                 "peer session ended; reconnecting after backoff"
             );
             tokio::time::sleep(delay).await;
@@ -1540,6 +1543,7 @@ async fn run_one_peer_session_attempt(
     diff_state: &NetmapDiffState,
     session_index: u32,
 ) {
+    let attempt_started = tokio::time::Instant::now();
     let Some(spec) = diff_state
         .desired_peers
         .lock()
@@ -1554,6 +1558,7 @@ async fn run_one_peer_session_attempt(
         // is a harmless no-op retry.
         tracing::debug!(
             peer = %peer_device_id,
+            generation = session_index,
             "no desired connect spec for this peer; skipping this reconnect attempt"
         );
         return;
@@ -1568,7 +1573,7 @@ async fn run_one_peer_session_attempt(
     let shared = match state.ensure_shared_socket().await {
         Ok(shared) => shared,
         Err(e) => {
-            tracing::warn!(peer = %peer_device_id, error = %e, "failed to bind the shared transport socket");
+            tracing::warn!(peer = %peer_device_id, generation = session_index, error = %e, "failed to bind the shared transport socket");
             set_reachability(
                 state,
                 peer_device_id,
@@ -1583,6 +1588,8 @@ async fn run_one_peer_session_attempt(
     // `poll_reachability` surfaces. A `connect` error here is therefore
     // a genuine construction failure, reported as unreachable rather than
     // dropping the peer silently.
+    let candidate_count = spec.candidates.len();
+    let connect_started = tokio::time::Instant::now();
     let connect_result = PeerChannel::connect(
         keypair.secret.clone(),
         spec.peer_public,
@@ -1591,6 +1598,15 @@ async fn run_one_peer_session_attempt(
         shared,
     )
     .await;
+    tracing::debug!(
+        peer = %peer_device_id,
+        generation = session_index,
+        candidate_count,
+        connect_ok = connect_result.is_ok(),
+        connect_elapsed_ms = connect_started.elapsed().as_millis(),
+        desired_spec_wait_ms = attempt_started.elapsed().as_millis(),
+        "peer channel connect attempt finished"
+    );
 
     let channel = match connect_result {
         Ok(c) => Arc::new(c),
@@ -1655,7 +1671,7 @@ async fn run_one_peer_session_attempt(
     state.peers.register_session(peer_device_id.to_string(), session.clone());
 
     if let Err(e) = session.clone().run().await {
-        tracing::warn!(peer = %peer_device_id, error = %e, "peer sync session ended with an error");
+        tracing::warn!(peer = %peer_device_id, generation = session_index, error = %e, "peer sync session ended with an error");
     }
     end_session_if_current(state, peer_device_id, &session);
     // The session ended on its own (not via `teardown_peer`, which
@@ -1666,11 +1682,29 @@ async fn run_one_peer_session_attempt(
     // ongoing supervisor loop, not the task ending) -- only
     // `teardown_peer`'s abort or process shutdown ends the supervisor
     // itself.
-    diff_state
+    let removed_channel = diff_state
         .channels
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(peer_device_id);
+    // `revoke()` (not just dropping the `Arc`) is what actually stops the
+    // channel's actor task and frees its transport-hub demux registration
+    // -- `PeerChannel` has no `Drop` impl, so a channel whose owner just
+    // stops holding it keeps running forever: still registered under this
+    // peer's static key, still answering every future handshake
+    // initiation for this same peer with its OWN (stale) session index.
+    // Confirmed via `reconnect_handshake_stress.rs`: the shared transport
+    // hub broadcasts a handshake initiation to every channel registered
+    // for a matching key, so this zombie channel and the NEXT generation's
+    // fresh channel would both decapsulate and respond to the same
+    // initiation, racing the reconnecting peer's single Tunn with two
+    // competing handshake_response datagrams (`WrongKey`/`UnexpectedPacket`
+    // decapsulate errors, `exact-generation handshake: exhausted bounded
+    // retries` on the reconnecting side) -- every time, not intermittently,
+    // since the zombie never goes away on its own.
+    if let Some(channel) = removed_channel {
+        channel.revoke();
+    }
 }
 
 /// Reflects the channel's reachability into status, waking on each change
@@ -2042,13 +2076,14 @@ fn spawn_direct_peer_session(
         let mut attempt: u32 = 0;
         loop {
             let generation_started = tokio::time::Instant::now();
+            let this_generation = session_index.fetch_add(1, Ordering::Relaxed);
             run_one_direct_peer_session_attempt(
                 &state,
                 &keypair,
                 &local_device_id,
                 &peer_device_id,
                 &diff_state,
-                session_index.fetch_add(1, Ordering::Relaxed),
+                this_generation,
             )
             .await;
             // See `spawn_peer_session`'s identical reset -- a generation
@@ -2059,6 +2094,7 @@ fn spawn_direct_peer_session(
             let delay = BackoffConfig::RECONNECT.next(attempt);
             tracing::info!(
                 peer = %peer_device_id,
+                generation = this_generation,
                 attempt,
                 ?delay,
                 "direct peer session ended; reconnecting after backoff"
@@ -2163,14 +2199,19 @@ async fn run_one_direct_peer_session_attempt(
     state.peers.register_session(peer_device_id.to_string(), session.clone());
 
     if let Err(e) = session.clone().run().await {
-        tracing::warn!(peer = %peer_device_id, error = %e, "peer sync session ended with an error");
+        tracing::warn!(peer = %peer_device_id, generation = session_index, error = %e, "peer sync session ended with an error");
     }
     end_session_if_current(state, peer_device_id, &session);
-    diff_state
+    // See `run_one_peer_session_attempt`'s identical fix for why `revoke()`
+    // (not just dropping the `Arc`) is required here.
+    let removed_channel = diff_state
         .channels
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(peer_device_id);
+    if let Some(channel) = removed_channel {
+        channel.revoke();
+    }
 }
 
 #[cfg(test)]
