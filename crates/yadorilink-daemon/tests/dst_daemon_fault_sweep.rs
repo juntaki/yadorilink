@@ -191,6 +191,7 @@ impl SimDaemon {
     }
     fn get_record(&self, path: &str) -> Option<(VersionVector, bool, u64)> {
         self.replica_coordinator()
+            .file_index_repository()
             .get_file(GROUP_ID, path)
             .ok()
             .flatten()
@@ -241,6 +242,7 @@ async fn boot_daemon(
 
     state
         .replica_coordinator
+        .link_repository()
         .add_link(&root.to_string_lossy(), GROUP_ID)
         .map_err(|e| format!("add_link: {e}"))?;
     let (watch_source, events_tx) = SimulatedFolderWatchSource::new(64);
@@ -478,7 +480,12 @@ fn conflict_copy_present(root: &Path, rel: &str, expected: &[u8]) -> bool {
 /// with our bytes captured nowhere, means our write was overwritten before it
 /// was ever indexed).
 fn current_live_hash(daemon: &SimDaemon, rel: &str) -> Option<String> {
-    let record = daemon.replica_coordinator().get_file(GROUP_ID, rel).ok().flatten()?;
+    let record = daemon
+        .replica_coordinator()
+        .file_index_repository()
+        .get_file(GROUP_ID, rel)
+        .ok()
+        .flatten()?;
     if record.deleted || record.blocks.len() != 1 {
         return None;
     }
@@ -775,10 +782,13 @@ async fn scenario_body(seed: u64) -> Result<Vec<Violation>, String> {
             d.content_table.iter().map(|(_, b)| content_hash(b)).collect();
         for daemon in [&daemon_a, &daemon_b] {
             println!("---- DEBUG seed {seed} device {} INDEX ----", daemon.device_id);
-            if let Ok(files) = daemon.replica_coordinator().list_files(GROUP_ID) {
+            if let Ok(files) =
+                daemon.replica_coordinator().file_index_repository().list_files(GROUP_ID)
+            {
                 for f in &files {
                     let st = daemon
                         .replica_coordinator()
+                        .materialization_state_repository()
                         .get_materialization_state(GROUP_ID, &f.path)
                         .ok()
                         .flatten();

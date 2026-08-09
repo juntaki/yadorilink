@@ -90,18 +90,264 @@ async fn start_watching(device: &TestDevice, group_id: &str) {
         .unwrap();
 }
 
-async fn connect_all_pairs(devices: &[TestDevice], group_ids: &[String]) {
-    for i in 0..devices.len() {
-        for j in (i + 1)..devices.len() {
-            support::connect_two_daemons(
-                &devices[i].state,
-                &devices[i].device_id,
-                &devices[j].state,
-                &devices[j].device_id,
-                group_ids,
+/// Exponential backoff between reconnect attempts, matching
+/// `peer_orchestrator::spawn_peer_session`'s own production schedule
+/// exactly (`supervise::BackoffConfig::RECONNECT`) rather than a fixed
+/// short delay. This matters here specifically: on a resource-constrained
+/// CI runner, a handshake can fail not because the peer is gone but
+/// because the runner is too loaded to complete it within the bounded
+/// handshake timeout. A fixed ~200ms retry then hammers reconnects in a
+/// tight loop, adding MORE concurrent connect/handshake attempts to an
+/// already-contended runner -- worsening the exact contention causing the
+/// failures, with no way to ever recover. Confirmed in CI (this file's own
+/// run): 26 consecutive handshake failures over 321s with a fixed-delay
+/// retry, several pairs never establishing a session for the whole run.
+/// Backing off (1s, doubling, capped at 45s) gives transient load a real
+/// chance to subside between attempts instead of adding to it.
+const PAIR_RECONNECT_BACKOFF: yadorilink_daemon::supervise::BackoffConfig =
+    yadorilink_daemon::supervise::BackoffConfig::RECONNECT;
+
+/// Global cap on concurrent in-flight connect+handshake attempts across
+/// EVERY pair in this run -- both the initial full-mesh formation
+/// ([`connect_all_pairs`]) and every later reconnect
+/// ([`spawn_pair_reconnect_supervisor`]). `one_factorization`'s round
+/// batching alone only bounds the *initial* burst: each pair's reconnect
+/// supervisor otherwise reconnects independently, so a burst of
+/// chaos-triggered ARQ teardowns hitting several pairs around the same
+/// moment can still recreate an unbounded concurrent-handshake burst
+/// during the run's steady state, well after the initial mesh formed
+/// cleanly -- confirmed in CI: the *first* handshake failure landed
+/// ~1m50s into a run whose initial mesh (round-batched) had already
+/// formed successfully, with every failure after that point coming from
+/// independent reconnect attempts racing each other. One shared
+/// `tokio::sync::Semaphore`, permit held for the full connect+ready
+/// duration (not just the cheap initial `PeerChannel::connect` call --
+/// the actual CPU cost is the handshake retries running inside the
+/// spawned `PeerSyncSession::run` tasks afterward), is the single source
+/// of truth for that bound regardless of which phase is calling.
+/// Started at `n/2` = 3 (matching `one_factorization`'s own per-round
+/// concurrency, which is proven to let the initial mesh form cleanly), but
+/// CI's debug-build daemon-e2e job still exhausted the production
+/// exact-generation handshake retry budget under that much concurrency
+/// during the run's steady state -- every device pair failed at some point
+/// over a 6-minute run, not merely the odd straggler. Serialized to 1
+/// (fully sequential handshakes, never more than one in flight at a time)
+/// rather than extending timeouts, since initial-connection speed is not
+/// what row14 is evaluating.
+const MAX_CONCURRENT_HANDSHAKES: usize = 1;
+
+/// Connects one pair and blocks until it is genuinely ready
+/// ([`wait_pair_ready`]), holding `handshake_semaphore` for the whole
+/// duration -- see [`MAX_CONCURRENT_HANDSHAKES`]'s own doc comment for
+/// why the permit must span the wait, not just the initial connect call.
+async fn connect_pair_with_bounded_concurrency(
+    handshake_semaphore: &tokio::sync::Semaphore,
+    state_i: &Arc<DaemonState>,
+    device_i: &str,
+    state_j: &Arc<DaemonState>,
+    device_j: &str,
+    group_ids: &[String],
+) -> [tokio::task::JoinHandle<()>; 2] {
+    let _permit = handshake_semaphore.acquire().await.unwrap();
+    let handles =
+        support::connect_two_daemons_with_handles(state_i, device_i, state_j, device_j, group_ids)
+            .await;
+    wait_pair_ready(state_i, device_i, state_j, device_j).await;
+    handles
+}
+
+/// Keeps one device pair connected for the rest of the run: whenever
+/// either side's `PeerSyncSession::run` task ends on its own (not driven
+/// by this test -- e.g. `yadorilink-transport`'s ARQ layer tearing a
+/// channel down after exhausting retransmits against a peer this run's
+/// own chaos made transiently unreachable), reconnects both sides fresh.
+///
+/// `support::connect_two_daemons*` itself is deliberately NOT changed to
+/// do this: its own doc comment is explicit that its one-shot,
+/// discard-the-handles shape is the right default for the many other
+/// callers that pair a small, fixed device set once and let the process
+/// exit. This strict acceptance run is the one caller that specifically
+/// needs reconnect resilience (see `yadorilink-transport`'s ARQ hardening
+/// and `peer_orchestrator::spawn_peer_session`'s own doc comment for the
+/// production-side version of the identical reasoning), so the
+/// supervision lives here instead.
+fn spawn_pair_reconnect_supervisor(
+    state_i: Arc<DaemonState>,
+    device_i: String,
+    state_j: Arc<DaemonState>,
+    device_j: String,
+    group_ids: Vec<String>,
+    initial_handles: [tokio::task::JoinHandle<()>; 2],
+    handshake_semaphore: Arc<tokio::sync::Semaphore>,
+) {
+    tokio::spawn(async move {
+        let [mut h_i, mut h_j] = initial_handles;
+        let mut attempt: u32 = 0;
+        let mut generation_started = tokio::time::Instant::now();
+        loop {
+            // Cancel-safe: only whichever side actually resolved is
+            // consumed; the other handle is still valid to select on
+            // again after reconnecting (its own task tears itself down on
+            // the fresh generation, same as a revoke would).
+            tokio::select! {
+                _ = &mut h_i => {}
+                _ = &mut h_j => {}
+            }
+            // A generation that stayed up for a while was a genuine
+            // success -- reset the backoff instead of letting it ratchet
+            // toward its 45s cap and stay there for the rest of this run.
+            // Only a generation that dies almost immediately (handshake
+            // never completing) escalates.
+            if generation_started.elapsed() > Duration::from_secs(3) {
+                attempt = 0;
+            }
+            tokio::time::sleep(PAIR_RECONNECT_BACKOFF.next(attempt)).await;
+            let handles = connect_pair_with_bounded_concurrency(
+                &handshake_semaphore,
+                &state_i,
+                &device_i,
+                &state_j,
+                &device_j,
+                &group_ids,
             )
             .await;
+            [h_i, h_j] = handles;
+            attempt = attempt.saturating_add(1);
+            generation_started = tokio::time::Instant::now();
         }
+    });
+}
+
+/// A round-robin 1-factorization of the complete graph on `n` vertices (the
+/// "circle method"): `n-1` rounds, each a set of `n/2` vertex-disjoint pairs
+/// -- every vertex appears in exactly one pair per round. `n` must be even.
+///
+/// This is what bounds row14's initial full-mesh connection burst to a
+/// production-plausible per-device concurrency: a real device's `netmap`
+/// growing to `n-1` peers arrives incrementally over real time (netmap
+/// pushes, existing sessions already up), never as an instantaneous
+/// simultaneous handshake against every peer at once. Connecting all
+/// `n*(n-1)/2` pairs together -- 15 for row14's 6 devices -- means every
+/// device races `n-1` (5) concurrent WireGuard handshakes from the first
+/// instant, all competing for the same process's CPU. Under a debug build
+/// on a resource-constrained CI runner, that CPU contention alone can push
+/// genuine handshake completion past its own bounded timeout -- confirmed:
+/// this exact shape, 26 consecutive handshake failures over a 321s CI run,
+/// independent of anything about reconnect-supervisor behavior (which
+/// only governs what happens once a *connected* pair later drops).
+/// Bounding round concurrency to `n/2` (3 for row14) caps every device at
+/// exactly one concurrent handshake at a time.
+fn one_factorization(n: usize) -> Vec<Vec<(usize, usize)>> {
+    assert!(
+        n >= 2 && n.is_multiple_of(2),
+        "one_factorization requires an even vertex count, got {n}"
+    );
+    let fixed = n - 1;
+    let mut rotating: Vec<usize> = (0..n - 1).collect();
+    let mut rounds = Vec::with_capacity(n - 1);
+    for _ in 0..n - 1 {
+        let mut round = Vec::with_capacity(n / 2);
+        round.push((fixed.min(rotating[0]), fixed.max(rotating[0])));
+        for k in 1..n / 2 {
+            let a = rotating[k];
+            let b = rotating[rotating.len() - k];
+            round.push((a.min(b), a.max(b)));
+        }
+        rounds.push(round);
+        rotating.rotate_right(1);
+    }
+    rounds
+}
+
+/// How long one pair's handshake + change-DAG negotiation may take before
+/// [`wait_pair_ready`] gives up. Generous relative to the exact-generation
+/// handshake's own bounded retry budget (~11s worst case) since this is a
+/// hard failure (test setup itself is broken), not a tuning knob to shave
+/// close -- initial connection speed is not what row14 exists to evaluate.
+const TEST_PAIR_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Blocks until both sides of a pair report a genuinely established
+/// session -- handshake received AND the change-DAG negotiated, on BOTH
+/// sides -- rather than a fixed sleep. A fixed delay is exactly the wrong
+/// tool here: too short under load and the next round's connects race an
+/// unfinished handshake (defeating the whole point of bounding per-round
+/// concurrency); too long and a slow-but-healthy run pays the cost even
+/// when nothing is wrong. Polling this session-state barrier instead scales
+/// with however long the current environment actually needs. Takes
+/// `(state, device_id)` pairs rather than `&TestDevice` so it can be
+/// called both from `connect_all_pairs` (borrowing from `TestDevice`) and
+/// from [`connect_pair_with_bounded_concurrency`] (which only has owned
+/// `Arc<DaemonState>`/`String` inside a 'static reconnect-supervisor
+/// task, not a `TestDevice` reference -- `TestDevice` owns a `TempDir`,
+/// not `Clone`).
+async fn wait_pair_ready(
+    state_a: &Arc<DaemonState>,
+    device_a_id: &str,
+    state_b: &Arc<DaemonState>,
+    device_b_id: &str,
+) {
+    tokio::time::timeout(TEST_PAIR_READY_TIMEOUT, async {
+        loop {
+            let a_session = state_a.peers.session(device_b_id);
+            let b_session = state_b.peers.session(device_a_id);
+            if let (Some(a_session), Some(b_session)) = (&a_session, &b_session) {
+                if a_session.peer_handshake_received()
+                    && b_session.peer_handshake_received()
+                    && a_session.change_dag_negotiated()
+                    && b_session.change_dag_negotiated()
+                {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("pair {device_a_id}<->{device_b_id} did not become ready within {TEST_PAIR_READY_TIMEOUT:?}")
+    });
+}
+
+/// Builds the full mesh via [`one_factorization`]'s bounded-concurrency
+/// rounds: within a round, every pair connects concurrently (still real
+/// production-shaped parallelism, just capped at one handshake per device
+/// instead of `n-1`), then this round's pairs must all report ready
+/// ([`wait_pair_ready`], via [`connect_pair_with_bounded_concurrency`])
+/// before the next round's connects begin -- a state barrier, not a fixed
+/// delay, so this scales correctly on a slower runner instead of racing
+/// ahead of an unfinished handshake or wasting time waiting past a fast
+/// one. Every pair still goes through [`spawn_pair_reconnect_supervisor`],
+/// sharing the same [`MAX_CONCURRENT_HANDSHAKES`] semaphore this function
+/// seeds, so nothing about post-connection convergence/reconnect
+/// semantics changes -- only the connection concurrency shape, uniformly
+/// across the whole run's lifetime.
+async fn connect_all_pairs(devices: &[TestDevice], group_ids: &[String]) {
+    let handshake_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+    for round in one_factorization(devices.len()) {
+        futures_util::future::join_all(round.into_iter().map(|(i, j)| {
+            let handshake_semaphore = handshake_semaphore.clone();
+            async move {
+                let handles = connect_pair_with_bounded_concurrency(
+                    &handshake_semaphore,
+                    &devices[i].state,
+                    &devices[i].device_id,
+                    &devices[j].state,
+                    &devices[j].device_id,
+                    group_ids,
+                )
+                .await;
+                spawn_pair_reconnect_supervisor(
+                    devices[i].state.clone(),
+                    devices[i].device_id.clone(),
+                    devices[j].state.clone(),
+                    devices[j].device_id.clone(),
+                    group_ids.to_vec(),
+                    handles,
+                    handshake_semaphore.clone(),
+                );
+            }
+        }))
+        .await;
     }
 }
 
@@ -473,9 +719,44 @@ async fn row14_strict_acceptance() {
                             if name.contains("(conflicted copy") { "shared.bin" } else { &name };
                         dump_conflict_diagnostic_snapshot(&devices, &group_id, source_path, &name)
                     })
+                    .or_else(|| {
+                        // No asymmetric name -- fall back to the pure
+                        // content-hash-mismatch case: every device has the
+                        // same name, but at least one disagrees with
+                        // device-0 on its sha256. Same three-layer dump as
+                        // the asymmetric branch, just keyed off whichever
+                        // mismatched name we find first.
+                        let reference = &current[0];
+                        let mut mismatched: Vec<String> = reference
+                            .iter()
+                            .filter(|(name, hash)| {
+                                current[1..].iter().any(|snap| snap.get(*name) != Some(*hash))
+                            })
+                            .map(|(name, _)| name.clone())
+                            .collect();
+                        mismatched.sort_by_key(|n| !n.contains("(conflicted copy"));
+                        mismatched.into_iter().next().map(|name| {
+                            let source_path = if name.contains("(conflicted copy") {
+                                "shared.bin".to_string()
+                            } else {
+                                name.clone()
+                            };
+                            format!(
+                                "content-hash mismatch on {name:?} (every device agrees on the \
+                                 name, not the bytes)\n{}",
+                                dump_conflict_diagnostic_snapshot(
+                                    &devices,
+                                    &group_id,
+                                    &source_path,
+                                    &name
+                                )
+                            )
+                        })
+                    })
                     .unwrap_or_else(|| {
-                        "no asymmetric path found (all devices agree on names; divergence must \
-                         be pure content-hash mismatch)"
+                        "no asymmetric path and no content-hash mismatch found among current \
+                         entries (the stall must have resolved between the comparison above and \
+                         this diagnostic pass)"
                             .to_string()
                     });
                 panic!(
@@ -546,5 +827,57 @@ async fn row14_strict_acceptance() {
             unfinished.len(),
             unfinished
         );
+    }
+}
+
+#[cfg(test)]
+mod one_factorization_tests {
+    use super::one_factorization;
+    use std::collections::HashSet;
+
+    /// Every pair of the `n` vertices appears exactly once across all
+    /// rounds combined, and within any single round no vertex appears
+    /// twice -- the two properties `connect_all_pairs` actually depends
+    /// on: full coverage (every pair eventually connects) and bounded
+    /// per-round concurrency (no device races two handshakes at once).
+    fn assert_valid_one_factorization(n: usize) {
+        let rounds = one_factorization(n);
+        assert_eq!(rounds.len(), n - 1, "n={n} must produce exactly n-1 rounds");
+
+        let mut all_pairs = HashSet::new();
+        for round in &rounds {
+            assert_eq!(round.len(), n / 2, "n={n}: every round must have exactly n/2 pairs");
+            let mut seen_this_round = HashSet::new();
+            for &(a, b) in round {
+                assert!(a < b, "pairs must be stored in canonical (a < b) order: got ({a}, {b})");
+                assert!(seen_this_round.insert(a), "vertex {a} appears twice in one round");
+                assert!(seen_this_round.insert(b), "vertex {b} appears twice in one round");
+                assert!(all_pairs.insert((a, b)), "pair ({a}, {b}) connected more than once");
+            }
+        }
+        let expected_pair_count = n * (n - 1) / 2;
+        assert_eq!(
+            all_pairs.len(),
+            expected_pair_count,
+            "n={n}: expected every one of the {expected_pair_count} pairs to appear exactly once"
+        );
+    }
+
+    #[test]
+    fn covers_every_pair_exactly_once_with_bounded_round_concurrency_for_row14() {
+        assert_valid_one_factorization(6);
+    }
+
+    #[test]
+    fn holds_for_other_even_vertex_counts_too() {
+        for n in [2, 4, 8, 10] {
+            assert_valid_one_factorization(n);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "even vertex count")]
+    fn refuses_an_odd_vertex_count() {
+        one_factorization(5);
     }
 }

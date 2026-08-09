@@ -16,5 +16,6 @@
 //! owned, the same reasoning already applied to `ReplicaCoordinator` itself.
 pub mod materialization_wake;
 pub mod path_locks;
+pub mod retirement_wake;
 pub mod schema;
 pub mod startup_readiness;

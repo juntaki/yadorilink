@@ -373,6 +373,49 @@ pub enum MaterializeResult {
     RetryRequired,
 }
 
+/// Outcome of one `retire_conflict_copies_only` attempt for a group.
+/// Exists so a generation-tracked caller (`engine_wrapper.rs`'s
+/// `RetirementWake`) can tell "this pass genuinely verified the frontier
+/// generation it targeted" from every way it might not have -- a plain
+/// `bool`/`Result<(), _>` return collapsed all three into "ran" vs
+/// "errored", which is exactly the shape that let a guard-busy skip get
+/// treated as a completed pass (see `RetirementWake`'s own doc comment for
+/// the resulting lost-wakeup bug this type closes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetirementAttempt {
+    /// Every copy-shaped file this pass examined was either justified by
+    /// the current frontier or successfully retired. Only this variant
+    /// means the caller may call `RetirementWake::complete` for the
+    /// generation this pass targeted. `retired` counts how many copies
+    /// were actually removed (informational only, not part of the
+    /// completion contract).
+    Settled { retired: usize },
+    /// `RetirementAuditGuard` contention: another retirement pass for this
+    /// same group already holds it, so this pass did not run at all. Not
+    /// an error -- that other pass's own retire step covers SOME
+    /// evaluation of this group, but not necessarily the frontier
+    /// generation this pass was asked to verify.
+    Busy,
+    /// The pass ran, but at least one copy's tombstone `materialize`
+    /// returned `MaterializeResult::RetryRequired` or errored -- that
+    /// copy's justification was never actually re-verified against the
+    /// targeted frontier, so the pass as a whole did not settle it.
+    RetryRequired,
+    /// The pass ran and every copy it examined resolved cleanly, but this
+    /// device's own admitted DAG frontier for the group was different
+    /// after the pass than before it started -- see
+    /// `retire_conflict_copies_only`'s own doc comment for exactly what is
+    /// compared and why. Every decision this pass made (justified/
+    /// unjustified, retire/retain) was made against SOME frontier that
+    /// existed during the pass, but not provably the one the caller's
+    /// generation was meant to verify, so it must not be treated as a
+    /// completion of that generation -- not "undo what this pass did"
+    /// (already-correct-for-some-real-frontier mutations are left as they
+    /// are), but "do not trust this pass's verdict as final; run again
+    /// against the CURRENT frontier."
+    FrontierChanged,
+}
+
 /// The outcome of one `reconcile_group_paths` call, split into two
 /// explicit, disjoint sets rather than a single "failed" set — a real,
 /// confirmed bug this shape exists to make structurally impossible (see
@@ -929,12 +972,32 @@ fn reconcile_retry_delay() -> std::time::Duration {
 /// `Arc<dyn PendingLocalChangeFlush>` — native `async fn` in traits isn't
 /// object-safe without this same boilerplate, and this crate has no
 /// `async_trait` dependency to hide it behind.
+/// Outcome of a targeted local-flush round trip
+/// (`PendingLocalChangeFlush::flush_pending_local_change` /
+/// `flush_case_fold_sibling`), through this link's debounce-accumulator
+/// channel. That channel is small and shared by every concurrent peer
+/// message handler reconciling a path against this link — under a
+/// duplicate-delivery storm it can back up, so the round trip is bounded
+/// rather than awaited unconditionally. `Settled` means the local side is
+/// safely accounted for (flushed, or genuinely nothing pending) and the
+/// peer change may proceed to DAG admission. `RetryRequired` means this
+/// round trip could not complete its bound (the enqueue or the reply timed
+/// out) — the local pending edit's state relative to the incoming peer
+/// change is unknown, so admitting the peer change now would risk silently
+/// clobbering it; the caller must defer this change instead (it will be
+/// re-requested by anti-entropy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingLocalFlushOutcome {
+    Settled,
+    RetryRequired,
+}
+
 pub trait PendingLocalChangeFlush: Send + Sync {
     fn flush_pending_local_change<'a>(
         &'a self,
         group_id: &'a str,
         rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>>;
 
     /// Like `flush_pending_local_change`, but for the *other* case-variant
     /// path that would collide with `rel_path` on a case-insensitive
@@ -945,7 +1008,7 @@ pub trait PendingLocalChangeFlush: Send + Sync {
         &'a self,
         group_id: &'a str,
         rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>>;
 }
 
 /// Mirrors `PendingLocalChangeFlush`'s injection shape exactly (see that
@@ -1025,16 +1088,16 @@ impl PendingLocalChangeFlush for DeniedPendingLocalChangeFlush {
         &'a self,
         _group_id: &'a str,
         _rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async {})
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
+        Box::pin(async { PendingLocalFlushOutcome::Settled })
     }
 
     fn flush_case_fold_sibling<'a>(
         &'a self,
         _group_id: &'a str,
         _rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async {})
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
+        Box::pin(async { PendingLocalFlushOutcome::Settled })
     }
 }
 
@@ -1674,6 +1737,73 @@ fn next_audit_attempt_id() -> u64 {
     NEXT_AUDIT_ATTEMPT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `retire_conflict_copies_only`'s whole-pass frontier freshness check --
+/// factored out to a pure function so its exact semantics (a plain slice
+/// comparison; any number of intermediate admissions during the pass
+/// collapses to the same before/after mismatch as a single one) can be
+/// tested without any async execution, DAG store, or session plumbing.
+/// `dag_group_heads`'s own `ORDER BY change_hash` makes two reads of an
+/// unchanged frontier compare equal regardless of admission order, so this
+/// never needs to sort its inputs itself.
+fn frontier_changed_during_pass(before: &[ChangeHash], after: &[ChangeHash]) -> bool {
+    before != after
+}
+
+#[cfg(test)]
+mod frontier_freshness_tests {
+    use super::*;
+
+    fn hash(byte: u8) -> ChangeHash {
+        ChangeHash([byte; 32])
+    }
+
+    /// Case 1: an unchanged frontier is the only shape
+    /// `retire_conflict_copies_only` may report its inner outcome as-is --
+    /// this is what lets a genuinely `Settled` pass complete its
+    /// generation.
+    #[test]
+    fn unchanged_frontier_is_not_reported_as_changed() {
+        let before = vec![hash(1), hash(2)];
+        let after = vec![hash(1), hash(2)];
+        assert!(!frontier_changed_during_pass(&before, &after));
+    }
+
+    /// Case 2: any admission during the pass -- growing the frontier, not
+    /// just replacing a head -- must be caught, since a caller that
+    /// completed the generation anyway would never re-evaluate the newly
+    /// admitted change's effect on justification.
+    #[test]
+    fn a_frontier_that_gained_a_head_during_the_pass_is_reported_as_changed() {
+        let before = vec![hash(1)];
+        let after = vec![hash(1), hash(2)];
+        assert!(frontier_changed_during_pass(&before, &after));
+    }
+
+    /// A head superseded mid-pass (frontier shrinks by one, gains a
+    /// different one) must equally be caught -- not just a pure growth.
+    #[test]
+    fn a_frontier_whose_heads_were_replaced_during_the_pass_is_reported_as_changed() {
+        let before = vec![hash(1), hash(2)];
+        let after = vec![hash(1), hash(3)];
+        assert!(frontier_changed_during_pass(&before, &after));
+    }
+
+    /// Case 4: multiple intermediate admissions during one pass (e.g. two
+    /// separate peer changes landing back to back) still collapse to a
+    /// single before/after mismatch -- there is no per-admission tracking
+    /// to lose count of; only the endpoints of the pass are ever compared,
+    /// so no intermediate change can be coalesced away and missed.
+    #[test]
+    fn multiple_intermediate_admissions_still_trip_the_check() {
+        let before = vec![hash(1)];
+        let mid = vec![hash(1), hash(2)];
+        let after = vec![hash(1), hash(2), hash(3)];
+        assert!(frontier_changed_during_pass(&before, &mid));
+        assert!(frontier_changed_during_pass(&before, &after));
+        assert!(frontier_changed_during_pass(&mid, &after));
+    }
+}
+
 struct MaterializationAuditGuard {
     key: String,
 }
@@ -1698,6 +1828,117 @@ impl Drop for MaterializationAuditGuard {
         if let Some(in_flight) = MATERIALIZATION_AUDITS_IN_FLIGHT.get() {
             in_flight.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.key);
         }
+    }
+}
+
+static RETIREMENT_AUDITS_IN_FLIGHT: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+
+/// `retire_conflict_copies_only`'s own single-flight, deliberately a
+/// SEPARATE key space from `MaterializationAuditGuard` rather than sharing
+/// its key. Before this, retirement contended with `reconcile_local_
+/// materialization_audit`/`reconcile_paths_directly` for the exact same
+/// per-group slot: a full audit or direct path reconciliation already in
+/// flight for a group made every retirement pass against it report `Busy`
+/// for that entire duration, even though retirement's own physical
+/// mutation is already independently serialized per-path by `state.
+/// path_lock` (see `retire_unjustified_ephemeral_conflict_copies`'s own
+/// path-lock acquisition, and `reconcile_group_paths`'/`apply_locked_
+/// record`'s matching ones) -- the group-wide guard was serializing far
+/// more than the one thing (two writers racing the SAME path) that
+/// actually needed serializing. Only retirement passes now contend with
+/// each other; a long-running full audit no longer blocks retirement's own
+/// progress, and vice versa.
+struct RetirementAuditGuard {
+    key: String,
+}
+
+impl RetirementAuditGuard {
+    fn try_acquire(
+        state: &Arc<dyn crate::ports::PeerReplicaStatePort>,
+        group_id: &str,
+    ) -> Option<Self> {
+        let key = format!("{:p}:{group_id}", Arc::as_ptr(state));
+        let in_flight = RETIREMENT_AUDITS_IN_FLIGHT.get_or_init(Default::default);
+        let mut in_flight = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        if !in_flight.insert(key.clone()) {
+            return None;
+        }
+        Some(Self { key })
+    }
+}
+
+impl Drop for RetirementAuditGuard {
+    fn drop(&mut self) {
+        if let Some(in_flight) = RETIREMENT_AUDITS_IN_FLIGHT.get() {
+            in_flight.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+mod retirement_audit_guard_tests {
+    use super::*;
+    use crate::test_support::FakeReplicaState;
+
+    /// The core Commit-4 regression: before `RetirementAuditGuard` existed,
+    /// `retire_conflict_copies_only` shared `MaterializationAuditGuard`'s
+    /// key, so a full audit already in flight for a group made every
+    /// retirement pass against it report `Busy` for the entire duration.
+    /// A held `MaterializationAuditGuard` must no longer block
+    /// `RetirementAuditGuard::try_acquire` for the SAME state+group.
+    #[test]
+    fn retirement_guard_is_independent_of_a_held_materialization_guard() {
+        let state: Arc<dyn crate::ports::PeerReplicaStatePort> = FakeReplicaState::new_arc();
+        let _materialization_guard = MaterializationAuditGuard::try_acquire(&state, "group-a")
+            .expect("materialization guard must be free at test start");
+        let retirement_guard = RetirementAuditGuard::try_acquire(&state, "group-a");
+        assert!(
+            retirement_guard.is_some(),
+            "a held MaterializationAuditGuard must not block RetirementAuditGuard"
+        );
+    }
+
+    /// The reverse must also hold: a held `RetirementAuditGuard` must not
+    /// block `MaterializationAuditGuard::try_acquire` for the same
+    /// state+group -- the two key spaces are fully independent, not just
+    /// independent in one direction.
+    #[test]
+    fn materialization_guard_is_independent_of_a_held_retirement_guard() {
+        let state: Arc<dyn crate::ports::PeerReplicaStatePort> = FakeReplicaState::new_arc();
+        let _retirement_guard = RetirementAuditGuard::try_acquire(&state, "group-a")
+            .expect("retirement guard must be free at test start");
+        let materialization_guard = MaterializationAuditGuard::try_acquire(&state, "group-a");
+        assert!(
+            materialization_guard.is_some(),
+            "a held RetirementAuditGuard must not block MaterializationAuditGuard"
+        );
+    }
+
+    /// `RetirementAuditGuard` must still single-flight against ITSELF per
+    /// group -- decoupling from `MaterializationAuditGuard` must not
+    /// accidentally drop retirement's own single-flight entirely.
+    #[test]
+    fn retirement_guard_still_excludes_a_second_retirement_pass_for_the_same_group() {
+        let state: Arc<dyn crate::ports::PeerReplicaStatePort> = FakeReplicaState::new_arc();
+        let _first = RetirementAuditGuard::try_acquire(&state, "group-a")
+            .expect("first retirement guard must be free at test start");
+        assert!(
+            RetirementAuditGuard::try_acquire(&state, "group-a").is_none(),
+            "two retirement passes for the same group must still contend"
+        );
+    }
+
+    /// A different group under the same state must never contend with
+    /// either guard -- the key is per-(state, group), not per-state alone.
+    #[test]
+    fn retirement_guard_does_not_contend_across_different_groups() {
+        let state: Arc<dyn crate::ports::PeerReplicaStatePort> = FakeReplicaState::new_arc();
+        let _guard_a = RetirementAuditGuard::try_acquire(&state, "group-a")
+            .expect("group-a's retirement guard must be free at test start");
+        assert!(
+            RetirementAuditGuard::try_acquire(&state, "group-b").is_some(),
+            "a held retirement guard for group-a must not block group-b"
+        );
     }
 }
 
@@ -2514,7 +2755,11 @@ impl PeerSyncSession {
     /// "`reconcile_one_file`-side" serialization requirements: by the time
     /// any downstream `materialize` call writes to disk, a local change
     /// that was still pending here has already been indexed.
-    async fn flush_pending_local_change_before_reconcile(&self, group_id: &str, rel_path: &str) {
+    async fn flush_pending_local_change_before_reconcile(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+    ) -> PendingLocalFlushOutcome {
         let handle = self.pending_local_change_flush.clone();
         // Marks that the guard was reached for this path — the first fork
         // when a local write is lost despite this guard existing. A missing
@@ -2532,7 +2777,7 @@ impl PeerSyncSession {
             peer = %self.peer_device_id,
             "checking this link's debounce accumulator for a pending local change before reconciling this path against a peer update"
         );
-        handle.flush_pending_local_change(group_id, rel_path).await;
+        handle.flush_pending_local_change(group_id, rel_path).await
     }
 
     /// Like `flush_pending_local_change_before_reconcile` above, but for
@@ -2556,14 +2801,18 @@ impl PeerSyncSession {
     /// filesystem` is true for this group's root — on a case-sensitive
     /// filesystem, two differently-cased names are simply unrelated
     /// files, and this extra round trip would have nothing to find.
-    async fn flush_case_fold_sibling_before_reconcile(&self, group_id: &str, rel_path: &str) {
+    async fn flush_case_fold_sibling_before_reconcile(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+    ) -> PendingLocalFlushOutcome {
         // No root for this group means nothing of ours is on disk to collide
         // with, so there is no case-fold sibling to flush.
         let Ok(root) = self.sync_root(group_id) else {
-            return;
+            return PendingLocalFlushOutcome::Settled;
         };
         if !hazard::is_case_insensitive_filesystem(&root) {
-            return;
+            return PendingLocalFlushOutcome::Settled;
         }
         let handle = self.pending_local_change_flush.clone();
         tracing::debug!(
@@ -2572,7 +2821,7 @@ impl PeerSyncSession {
             peer = %self.peer_device_id,
             "checking this link's debounce accumulator for a pending case-fold sibling change before reconciling this path against a peer update"
         );
-        handle.flush_case_fold_sibling(group_id, rel_path).await;
+        handle.flush_case_fold_sibling(group_id, rel_path).await
     }
 
     /// Records this peer's advertised
@@ -3627,6 +3876,10 @@ impl PeerSyncSession {
         ) {
             tracing::warn!(group_id, error = %e, "failed to record local frontier before announce");
         }
+        // A locally-authored commit advanced this device's own frontier the
+        // same way an admitted incoming batch does -- see the identical
+        // call in the incoming-batch path for why retirement needs to know.
+        self.state.notify_retirement_wake(group_id);
         self.send_heads_announce(group_id).await
     }
 
@@ -3677,6 +3930,65 @@ impl PeerSyncSession {
             return Ok(());
         }
         self.request_changes(&group_id, &missing).await
+    }
+
+    /// Standalone entry point for the retirement step alone -- see
+    /// `retire_unjustified_ephemeral_conflict_copies`'s own doc comment for
+    /// what it does and why. `engine_wrapper.rs`'s event-driven retirement
+    /// loop calls this directly instead of the full `reconcile_local_
+    /// materialization_audit` below, which also re-drives unapplied-change
+    /// reprojection and materialization-repair candidates -- heavier work
+    /// a frontier-changed/job-completed retirement trigger has no bearing
+    /// on. Single-flights per group through its OWN `RetirementAuditGuard`
+    /// key -- a SEPARATE key space from `reconcile_local_materialization_
+    /// audit`/`reconcile_paths_directly`'s `MaterializationAuditGuard`, so
+    /// a full audit already in flight for a group no longer makes THIS
+    /// call report `RetirementAttempt::Busy`; only two retirement passes
+    /// for the same group ever contend with each other. See
+    /// `RetirementAuditGuard`'s own doc comment for why that coarser
+    /// group-wide sharing was never actually load-bearing for correctness,
+    /// and `RetirementAttempt`'s own doc comment for what each variant
+    /// means for a generation-tracked caller.
+    ///
+    /// Whole-pass frontier freshness: `frontier_before` is this device's
+    /// own admitted DAG heads for `group_id`, read right after the
+    /// `RetirementAuditGuard` is acquired (before any copy is examined);
+    /// `frontier_after` is the same read again right after the retirement
+    /// pass returns (after every mutation it made is durable). If they
+    /// differ, some OTHER admission (a peer's change arriving, or a local
+    /// edit) landed while this pass was evaluating justification against
+    /// whatever frontier was current when it started -- every individual
+    /// decision inside the pass was locally consistent with SOME real
+    /// frontier, but not provably the one current when the pass returns,
+    /// so the whole pass reports `RetirementAttempt::FrontierChanged`
+    /// instead of its own inner outcome, even if that inner outcome was
+    /// `Settled`. This deliberately does not attempt a per-copy freshness
+    /// recheck immediately before each delete (Commit 5's own scope is the
+    /// whole-pass guard only) -- see `retire_unjustified_ephemeral_
+    /// conflict_copies`'s own doc comment for why a copy this pass
+    /// mutated is never left in a worse state than before, only
+    /// potentially stale, and a caller that does not complete the
+    /// generation on `FrontierChanged` gets exactly the re-evaluation
+    /// against the CURRENT frontier that closes the gap.
+    pub async fn retire_conflict_copies_only(
+        self: Arc<Self>,
+        group_id: &str,
+    ) -> Result<RetirementAttempt, PeerSessionError> {
+        if !matches!(self.state.link_gate_for_group(group_id)?, LinkGate::Live { .. }) {
+            return Ok(RetirementAttempt::Settled { retired: 0 });
+        }
+        let Some(_guard) = RetirementAuditGuard::try_acquire(&self.state, group_id) else {
+            return Ok(RetirementAttempt::Busy);
+        };
+        let frontier_before = self.state.dag_group_heads(group_id)?;
+        let audit_attempt_id = next_audit_attempt_id();
+        let outcome =
+            self.retire_unjustified_ephemeral_conflict_copies(group_id, audit_attempt_id).await?;
+        let frontier_after = self.state.dag_group_heads(group_id)?;
+        if frontier_changed_during_pass(&frontier_before, &frontier_after) {
+            return Ok(RetirementAttempt::FrontierChanged);
+        }
+        Ok(outcome)
     }
 
     /// Periodic DAG resync's local repair backstop. A heads announce keeps
@@ -3836,13 +4148,25 @@ impl PeerSyncSession {
     /// journal is skipped outright (its pending change is not yet
     /// re-driven), and the whole check-then-delete runs under the path
     /// lock, mirroring `reconcile_group_paths`' Absent-branch discipline.
+    ///
+    /// Returns `RetirementAttempt::Settled` only if every copy-shaped file
+    /// this pass examined was either justified or successfully retired.
+    /// One copy's tombstone `materialize` returning `MaterializeResult::
+    /// RetryRequired` (transient block/disk condition) makes the WHOLE
+    /// pass `RetirementAttempt::RetryRequired`, even if every other copy
+    /// settled cleanly: the caller uses this to decide whether it may
+    /// consider the frontier generation it targeted fully verified, and a
+    /// pass that skipped even one copy's re-evaluation has not verified
+    /// it. The operation is idempotent regardless -- a copy already
+    /// retired by an earlier pass this same call just does not appear in
+    /// `copy_shaped` on the next one.
     async fn retire_unjustified_ephemeral_conflict_copies(
         &self,
         group_id: &str,
         audit_attempt_id: u64,
-    ) -> Result<(), PeerSessionError> {
+    ) -> Result<RetirementAttempt, PeerSessionError> {
         let LinkGate::Live { policy, .. } = self.state.link_gate_for_group(group_id)? else {
-            return Ok(());
+            return Ok(RetirementAttempt::Settled { retired: 0 });
         };
         let copy_shaped: Vec<FileRecord> = self
             .state
@@ -3853,8 +4177,10 @@ impl PeerSyncSession {
             })
             .collect();
         if copy_shaped.is_empty() {
-            return Ok(());
+            return Ok(RetirementAttempt::Settled { retired: 0 });
         }
+        let mut retired = 0usize;
+        let mut retry_required = false;
         let history = self.state.dag_group_history_paths(group_id)?;
         for record in copy_shaped {
             if history.contains(&record.path) {
@@ -3895,32 +4221,53 @@ impl PeerSyncSession {
                 deleted: true,
             };
             match self.materialize(group_id, &tombstone, policy, &self.peer_device_id, None).await {
-                Ok(MaterializeResult::Settled) => tracing::info!(
-                    group_id,
-                    path = %record.path,
-                    audit_attempt_id,
-                    "retired an ephemeral conflict copy no longer justified by the current frontier"
-                ),
-                // `RetryRequired` is not a retirement, and logging it as one
-                // made this audit claim work it had not done. Nothing is lost
-                // — the copy is still live, so the next audit re-evaluates it
-                // — but the log has to say so, otherwise a copy that never
-                // retires reads as retiring cleanly every cycle.
-                Ok(MaterializeResult::RetryRequired) => tracing::debug!(
-                    group_id,
-                    path = %record.path,
-                    audit_attempt_id,
-                    "deferred retiring an ephemeral conflict copy; will re-evaluate next audit"
-                ),
-                Err(e) => tracing::warn!(
-                    group_id,
-                    path = %record.path,
-                    error = %e,
-                    "failed to retire an unjustified ephemeral conflict copy; will retry next audit"
-                ),
+                Ok(MaterializeResult::Settled) => {
+                    retired += 1;
+                    tracing::info!(
+                        group_id,
+                        path = %record.path,
+                        audit_attempt_id,
+                        "retired an ephemeral conflict copy no longer justified by the current frontier"
+                    )
+                }
+                // `RetryRequired` is not a retirement -- the copy is still
+                // live, so the next audit re-evaluates it -- but it also
+                // means THIS pass never verified this copy's justification
+                // against the frontier it targeted, so the whole pass must
+                // report `RetryRequired`, not `Settled`: a caller that
+                // completed its target generation on a pass that silently
+                // skipped a copy's re-evaluation would never re-examine it
+                // again unless some unrelated future event happened to
+                // re-mark the group dirty.
+                Ok(MaterializeResult::RetryRequired) => {
+                    retry_required = true;
+                    tracing::debug!(
+                        group_id,
+                        path = %record.path,
+                        audit_attempt_id,
+                        "deferred retiring an ephemeral conflict copy; will re-evaluate next audit"
+                    )
+                }
+                // Same reasoning as `RetryRequired` above: a transient
+                // per-copy failure must not let the pass as a whole report
+                // `Settled` for a generation whose frontier this copy was
+                // never actually re-verified against.
+                Err(e) => {
+                    retry_required = true;
+                    tracing::warn!(
+                        group_id,
+                        path = %record.path,
+                        error = %e,
+                        "failed to retire an unjustified ephemeral conflict copy; will retry next audit"
+                    )
+                }
             }
         }
-        Ok(())
+        Ok(if retry_required {
+            RetirementAttempt::RetryRequired
+        } else {
+            RetirementAttempt::Settled { retired }
+        })
     }
 
     /// Re-projects every admitted-but-not-yet-applied change for `group_id` —
@@ -4298,6 +4645,15 @@ impl PeerSyncSession {
         // disk-full / a missing block / an I/O error leaves the change
         // unapplied so the reprojection backstop keeps retrying it.
         let mut admitted: Vec<yadorilink_replica_engine::outcomes::AdmittedChange> = Vec::new();
+        // Already-known changes redelivered by anti-entropy that are worth
+        // re-planning materialization for even though they add nothing to
+        // `admitted` itself -- see the `dag_has_change` fast-path's own doc
+        // comment below for why. Kept separate from `admitted` because
+        // `admitted.is_empty()` also gates frontier recording and the
+        // retirement wake, which must stay scoped to genuinely new
+        // admissions from this receipt.
+        let mut redelivered_known: Vec<yadorilink_replica_engine::outcomes::AdmittedChange> =
+            Vec::new();
         for encoded in &batch.changes {
             let Some(change) = self.authenticate_incoming_change(&group_id, encoded) else {
                 continue;
@@ -4364,6 +4720,57 @@ impl PeerSyncSession {
                 continue;
             }
 
+            // A change already durably admitted (whether or not its own
+            // projection has succeeded yet -- `dag_list_unapplied_changes`'s
+            // durable retry backstop owns that separately) has nothing left
+            // for this receipt to do as far as DAG admission goes:
+            // re-running it through the local-flush barrier below cannot
+            // change DAG admission and only spends that barrier's bounded
+            // budget on gossip this device has already seen. Anti-entropy
+            // resends the same change on every heads announce until this
+            // device's frontier catches up, so under a duplicate-delivery
+            // storm this fast-path is what keeps the targeted-flush channel
+            // from staying saturated by re-flushing the same paths on every
+            // redundant redelivery.
+            //
+            // It must NOT also skip materialization re-triggering, though.
+            // A path's materialization job can reach `Completed`/
+            // `Superseded` against whatever was the live winner at THAT
+            // moment, then later be overtaken by a still-newer head this
+            // device already admitted -- but `materialization_claim_
+            // runnable_jobs` and the periodic repair sweep both structurally
+            // skip a job/file already in a terminal state, so nothing else
+            // ever re-examines it. Confirmed via `row14_strict_acceptance`
+            // (`fix/conflict-copy-convergence-obligation-20260723`): CI's
+            // slower daemon-e2e runner reliably reproduced two devices stuck
+            // forever with stale-but-`Completed` `shared.bin` jobs, despite
+            // their own DAG already holding the true winner and every
+            // device otherwise agreeing on the DAG. Redelivery of an
+            // already-known change is exactly the recurring signal that
+            // should re-arm a stale terminal job -- skip the (expensive)
+            // per-path local-flush barrier below, but still let this
+            // change's touched paths go through the same enqueue call as a
+            // freshly-admitted one. `materialization_enqueue_pending`'s own
+            // `ON CONFLICT` clause is a cheap, idempotent no-op when nothing
+            // has actually changed, so this does not reopen the flush-
+            // channel-saturation hazard the skip above still guards
+            // against.
+            if self.state.dag_has_change(&claimed_hash)? {
+                let mut touched_paths = std::collections::BTreeSet::new();
+                for op in &change.ops {
+                    collect_op_paths(op, &mut touched_paths);
+                }
+                if !touched_paths.is_empty() {
+                    affected_paths.extend(touched_paths.iter().cloned());
+                    redelivered_known.push(yadorilink_replica_engine::outcomes::AdmittedChange {
+                        hash: claimed_hash,
+                        lamport: change.lamport,
+                        touched_paths,
+                    });
+                }
+                continue;
+            }
+
             // Capture any local disk edit that predates this received change
             // before admitting the change into the DAG.  Flushing only during
             // materialization is too late: local emission would then select
@@ -4376,9 +4783,37 @@ impl PeerSyncSession {
             for op in &change.ops {
                 collect_op_paths(op, &mut incoming_paths);
             }
+            let mut flush_retry_required = false;
             for path in incoming_paths {
-                self.flush_pending_local_change_before_reconcile(&group_id, &path).await;
-                self.flush_case_fold_sibling_before_reconcile(&group_id, &path).await;
+                if self.flush_pending_local_change_before_reconcile(&group_id, &path).await
+                    == PendingLocalFlushOutcome::RetryRequired
+                {
+                    flush_retry_required = true;
+                }
+                if self.flush_case_fold_sibling_before_reconcile(&group_id, &path).await
+                    == PendingLocalFlushOutcome::RetryRequired
+                {
+                    flush_retry_required = true;
+                }
+            }
+            if flush_retry_required {
+                // The local-flush round trip above could not confirm this
+                // path's local state within its bound (the debounce
+                // accumulator's targeted-flush channel is backed up).
+                // Admitting the peer change now, without knowing whether a
+                // local edit for the same path is still unflushed, risks
+                // silently clobbering that local edit instead of producing
+                // a conflict copy for it. Defer: skip admission for this
+                // change and let anti-entropy re-deliver it once the local
+                // side has drained.
+                tracing::warn!(
+                    group_id,
+                    author = %change.device_id.as_str(),
+                    peer = %self.peer_device_id,
+                    "deferring a change at admission -- this link's debounce accumulator did \
+                     not confirm local-flush state within its bound; it will be re-requested"
+                );
+                continue;
             }
 
             match self.replica_engine.admit_authenticated_change(
@@ -4438,8 +4873,18 @@ impl PeerSyncSession {
             }
         }
 
+        // `redelivered_known` first, `admitted` last -- `plan_batch_
+        // materialization` picks whichever entry touches a given path LAST
+        // by plain iteration order, not by lamport (see its own doc
+        // comment), so a genuinely fresh admission from THIS receipt must
+        // always be the one that wins for any path it also touches. Putting
+        // `admitted` last preserves that existing invariant exactly;
+        // `redelivered_known` only ever supplies a path's trigger when
+        // nothing newly admitted this batch also touched it.
+        let plan_input: Vec<yadorilink_replica_engine::outcomes::AdmittedChange> =
+            redelivered_known.iter().cloned().chain(admitted.iter().cloned()).collect();
         let plans = yadorilink_replica_engine::materialization_plan::plan_batch_materialization(
-            &admitted,
+            &plan_input,
             &affected_paths,
         );
         // Deliberately the real (non-deterministic-clock-override) wall
@@ -4502,6 +4947,13 @@ impl PeerSyncSession {
             ) {
                 tracing::warn!(group_id, error = %e, "failed to record local frontier after apply");
             }
+            // The frontier just advanced -- some previously-live conflict
+            // copy may have just lost its justification (its loser was
+            // just superseded) or some previously-unjustified copy may have
+            // just become required again. Either way the retirement loop
+            // needs to re-evaluate this group promptly rather than waiting
+            // for its own periodic backstop poll.
+            self.state.notify_retirement_wake(&group_id);
         }
 
         if !missing_parents.is_empty() {

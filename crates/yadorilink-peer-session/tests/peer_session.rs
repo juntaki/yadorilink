@@ -7940,6 +7940,7 @@ mod reconcile_group_paths_flush_tests {
     use yadorilink_local_storage::FsBlockStore;
     use yadorilink_peer_session::peer_session_impl::{
         ChangeAuthenticator, PeerSyncSession, PeerSyncSessionOneTimeDeps, PendingLocalChangeFlush,
+        PendingLocalFlushOutcome,
     };
     use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
     use yadorilink_replica_domain::file::RecordKind;
@@ -8071,6 +8072,12 @@ mod reconcile_group_paths_flush_tests {
         root: PathBuf,
         pending: Mutex<BTreeSet<String>>,
         calls: Mutex<Vec<String>>,
+        /// When set, every call returns `RetryRequired` immediately instead
+        /// of running its normal body -- simulates the targeted-flush
+        /// channel staying permanently saturated (see
+        /// `handle_change_batch_does_not_park_when_local_flush_is_saturated`),
+        /// without needing a real bounded mpsc channel in this harness.
+        force_retry: std::sync::atomic::AtomicBool,
     }
     impl RecordingFlush {
         fn new(processor: Arc<LocalChangeProcessor>, root: PathBuf) -> Self {
@@ -8079,6 +8086,7 @@ mod reconcile_group_paths_flush_tests {
                 root,
                 pending: Mutex::new(BTreeSet::new()),
                 calls: Mutex::new(vec![]),
+                force_retry: std::sync::atomic::AtomicBool::new(false),
             }
         }
         fn mark_pending(&self, rel: &str) {
@@ -8087,15 +8095,21 @@ mod reconcile_group_paths_flush_tests {
         fn take_calls(&self) -> Vec<String> {
             std::mem::take(&mut *self.calls.lock().unwrap())
         }
+        fn set_force_retry(&self, force: bool) {
+            self.force_retry.store(force, std::sync::atomic::Ordering::SeqCst);
+        }
     }
     impl PendingLocalChangeFlush for RecordingFlush {
         fn flush_pending_local_change<'a>(
             &'a self,
             group_id: &'a str,
             rel_path: &'a str,
-        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push(rel_path.to_string());
+                if self.force_retry.load(std::sync::atomic::Ordering::SeqCst) {
+                    return PendingLocalFlushOutcome::RetryRequired;
+                }
                 // Drop the guard before the await below.
                 let is_pending = self.pending.lock().unwrap().remove(rel_path);
                 if is_pending {
@@ -8105,18 +8119,23 @@ mod reconcile_group_paths_flush_tests {
                     };
                     let _ = self.processor.process_event(group_id, &self.root, &event).await;
                 }
+                PendingLocalFlushOutcome::Settled
             })
         }
         fn flush_case_fold_sibling<'a>(
             &'a self,
             _group_id: &'a str,
             rel_path: &'a str,
-        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
             // On a case-insensitive filesystem (e.g. the macOS test host) the
             // session also probes for a colliding sibling; this scenario stages
             // no case-fold sibling, so it is a recorded no-op.
             Box::pin(async move {
                 self.calls.lock().unwrap().push(format!("casefold:{rel_path}"));
+                if self.force_retry.load(std::sync::atomic::Ordering::SeqCst) {
+                    return PendingLocalFlushOutcome::RetryRequired;
+                }
+                PendingLocalFlushOutcome::Settled
             })
         }
     }
@@ -8440,6 +8459,152 @@ mod reconcile_group_paths_flush_tests {
             .change_emitter()
             .expect("must be Some for a session constructed with an emitter");
         assert_eq!(installed.device_id(), LOCAL, "the installed emitter must be this device's own");
+    }
+
+    /// When the local-flush infrastructure stays saturated (`RetryRequired`
+    /// on every call, modeling a permanently-full targeted-flush channel),
+    /// `handle_change_batch` must still return promptly rather than parking
+    /// -- this is the peer-session-level counterpart to
+    /// `capture_local_change.rs`'s `flush_pending_local_change_returns_
+    /// retry_required_when_the_channel_stays_full`: it proves the message
+    /// handler itself (and the in-flight-message permit it holds) is never
+    /// held hostage by local-flush backpressure. The deferred change must
+    /// not be admitted; once the flush handle recovers, a resend of the
+    /// identical batch must admit normally.
+    #[tokio::test]
+    async fn handle_change_batch_does_not_park_when_local_flush_is_saturated() {
+        let h = setup().await;
+        let version = empty_version();
+        let chain = emit_remote_chain(&version, vec![vec![create_op(P, &version)]]);
+        let change = &chain[0];
+        let batch = batch_of(&[change], &[&version]);
+
+        h.flush.set_force_retry(true);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            h.session.handle_change_batch(batch.clone()),
+        )
+        .await
+        .expect(
+            "handle_change_batch must return promptly even when local-flush stays saturated, \
+             not park indefinitely holding its message-handling permit",
+        );
+        outcome.unwrap();
+        assert!(
+            !h.state.change_history_repository().dag_has_change(&change.compute_hash()).unwrap(),
+            "a change deferred by saturated local-flush must not be admitted"
+        );
+
+        // Once the flush handle recovers, a resend must admit normally --
+        // this failure mode must be transient, not a permanent black hole
+        // for this path/change.
+        h.flush.set_force_retry(false);
+        h.session.handle_change_batch(batch).await.unwrap();
+        assert!(
+            h.state.change_history_repository().dag_has_change(&change.compute_hash()).unwrap(),
+            "the change must admit once local-flush is no longer saturated"
+        );
+    }
+
+    /// A change already durably admitted must skip the local-flush barrier
+    /// entirely on re-delivery -- the fast path this session's duplicate-
+    /// delivery storm (row14) needs to keep the targeted-flush channel from
+    /// staying saturated forever.
+    #[tokio::test]
+    async fn duplicate_of_an_already_admitted_change_skips_the_local_flush_barrier() {
+        let h = setup().await;
+        let version = empty_version();
+        let chain = emit_remote_chain(&version, vec![vec![create_op(P, &version)]]);
+        let change = &chain[0];
+        let batch = batch_of(&[change], &[&version]);
+
+        h.session.handle_change_batch(batch.clone()).await.unwrap();
+        assert!(h
+            .state
+            .change_history_repository()
+            .dag_has_change(&change.compute_hash())
+            .unwrap());
+        let heads_after_first = h.state.sqlite().dag_group_heads(GROUP).unwrap();
+        h.flush.take_calls(); // clear whatever the first admission triggered
+
+        // Redeliver the identical batch (anti-entropy resending gossip this
+        // device has already seen).
+        h.session.handle_change_batch(batch).await.unwrap();
+
+        assert!(
+            h.flush.take_calls().is_empty(),
+            "a duplicate of an already-admitted change must never reach the local-flush barrier"
+        );
+        assert_eq!(
+            h.state.sqlite().dag_group_heads(GROUP).unwrap(),
+            heads_after_first,
+            "a duplicate delivery must not change DAG state"
+        );
+    }
+
+    /// The ordinary path for a genuinely new change is unaffected by the
+    /// duplicate fast-path: local-flush still runs, and a `Settled` outcome
+    /// still lets the change admit.
+    #[tokio::test]
+    async fn a_genuinely_new_change_still_runs_local_flush_and_admits() {
+        let h = setup().await;
+        let version = empty_version();
+        let chain = emit_remote_chain(&version, vec![vec![create_op(P, &version)]]);
+        let change = &chain[0];
+        let batch = batch_of(&[change], &[&version]);
+
+        h.session.handle_change_batch(batch).await.unwrap();
+
+        assert!(
+            h.flush.take_calls().contains(&P.to_string()),
+            "a genuinely new change must still run the local-flush barrier"
+        );
+        assert!(
+            h.state.change_history_repository().dag_has_change(&change.compute_hash()).unwrap(),
+            "a genuinely new change must still admit once flush settles"
+        );
+    }
+
+    /// The fast-path must not paper over projection durability: an admitted-
+    /// but-not-yet-applied change must stay exactly that (present in
+    /// `dag_list_unapplied_changes`, not silently marked applied) across a
+    /// duplicate re-delivery, since duplicate detection is an admission-
+    /// layer shortcut, never a stand-in for real projection.
+    #[tokio::test]
+    async fn duplicate_of_an_admitted_but_unapplied_change_does_not_touch_applied_state() {
+        let h = setup().await;
+        let version = empty_version();
+        let chain = emit_remote_chain(&version, vec![vec![create_op(P, &version)]]);
+        let change = &chain[0];
+        let batch = batch_of(&[change], &[&version]);
+
+        // Admit without ever running `reconcile_local_materialization_audit`
+        // -- the change is durably admitted but its own projection has not
+        // run, exactly the `dag_list_unapplied_changes` retry-backstop state.
+        h.session.handle_change_batch(batch.clone()).await.unwrap();
+        assert!(h
+            .state
+            .change_history_repository()
+            .dag_has_change(&change.compute_hash())
+            .unwrap());
+        let still_unapplied_before =
+            h.state.change_history_repository().dag_list_unapplied_changes(GROUP).unwrap();
+        assert!(still_unapplied_before.iter().any(|c| c.compute_hash() == change.compute_hash()));
+        h.flush.take_calls();
+
+        h.session.handle_change_batch(batch).await.unwrap();
+
+        assert!(
+            h.flush.take_calls().is_empty(),
+            "a duplicate of an admitted-but-unapplied change must also skip local-flush"
+        );
+        let still_unapplied_after =
+            h.state.change_history_repository().dag_list_unapplied_changes(GROUP).unwrap();
+        assert!(
+            still_unapplied_after.iter().any(|c| c.compute_hash() == change.compute_hash()),
+            "the fast-path must never mark a change applied as a side effect -- only real \
+             projection (reconcile_local_materialization_audit) may do that"
+        );
     }
 }
 
@@ -11866,6 +12031,243 @@ mod dag_convergence_authority_tests {
                 .unwrap()
                 .is_none_or(|r| r.deleted),
             "the retired copy's index row must not remain live"
+        );
+    }
+
+    /// Commit 5's own regression: a DAG admission landing WHILE a
+    /// retirement pass is mid-flight must not let that pass's outcome be
+    /// treated as `Settled` for the frontier generation it targeted, even
+    /// when the mutation the pass made was itself a correct decision for
+    /// the frontier it started with. Deterministic, not timing-dependent:
+    /// the pass is blocked on the SAME `path_lock` `retire_unjustified_
+    /// ephemeral_conflict_copies` acquires right before its own
+    /// `materialize` call, held by this test until after the new
+    /// admission lands, so there is no race to get unlucky on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frontier_change_mid_pass_defers_completion_and_a_follow_up_settles_the_new_frontier() {
+        let h = harness("device-local", "device-p", /*dag*/ true).await;
+        let key_a = SigningKey::from_bytes(&[21u8; 32]);
+        let key_b = SigningKey::from_bytes(&[22u8; 32]);
+        let version_w = empty_version(OLD_MTIME);
+
+        // A single, uncontested winner for "shared.bin" -- no live loser,
+        // so any copy-shaped file under it is unjustified from the start.
+        let change_w = Change::create_signed(
+            vec![],
+            0,
+            ChangeAuth::PLACEHOLDER,
+            yadorilink_replica_domain::ids::DeviceId("device-a".into()),
+            yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+            vec![Op::Put {
+                path: SyncPath("shared.bin".into()),
+                version: version_w.version_hash,
+                origin: PutOrigin::Direct,
+            }],
+            &key_a,
+        );
+        h.state
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change_w, std::slice::from_ref(&version_w), true)
+            .unwrap();
+
+        let copy_path = yadorilink_replica_engine::conflict::conflict_copy_path_for_losing_change(
+            "shared.bin",
+            "device-l",
+            NEW_MTIME,
+            &[9u8; 32],
+        );
+        let copy_record = FileRecord {
+            path: copy_path.clone(),
+            size: 0,
+            mtime_unix_nanos: 0,
+            blocks: vec![],
+            deleted: false,
+        };
+        h.state
+            .file_index_repository()
+            .upsert_file_with_origin_and_author(
+                GROUP,
+                &copy_record,
+                "device-local",
+                &change_w.compute_hash(),
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        std::fs::write(h.root.join(&copy_path), b"").unwrap();
+
+        // Hold the exact path_lock retirement's own materialize call for
+        // `copy_path` will block on -- see `retire_unjustified_ephemeral_
+        // conflict_copies`'s own doc comment for why it acquires this
+        // before deleting.
+        let path_lock = {
+            use yadorilink_peer_session::ports::PeerReplicaStatePort;
+            h.state.path_lock(GROUP, &copy_path)
+        };
+        let held = path_lock.lock().await;
+
+        let session = h.session.clone();
+        let pass = tokio::spawn(async move { session.retire_conflict_copies_only(GROUP).await });
+
+        // Real wall-clock margin for the spawned pass to reach the blocked
+        // lock -- it has already read `frontier_before` and determined
+        // `copy_path` unjustified by the time it gets there.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // A genuinely new admission lands while the pass is blocked
+        // mid-flight, unrelated to "shared.bin" or `copy_path` -- the
+        // frontier change alone is what must matter, not what it touches.
+        let version_l = empty_version(NEW_MTIME);
+        let change_l = Change::create_signed(
+            vec![],
+            0,
+            ChangeAuth::PLACEHOLDER,
+            yadorilink_replica_domain::ids::DeviceId("device-b".into()),
+            yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+            vec![Op::Put {
+                path: SyncPath("other.bin".into()),
+                version: version_l.version_hash,
+                origin: PutOrigin::Direct,
+            }],
+            &key_b,
+        );
+        h.state
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change_l, std::slice::from_ref(&version_l), true)
+            .unwrap();
+
+        drop(held); // let the blocked pass proceed and finish
+
+        let outcome = pass.await.unwrap().unwrap();
+        assert_eq!(
+            outcome,
+            yadorilink_peer_session::peer_session_impl::RetirementAttempt::FrontierChanged,
+            "a frontier change while the pass was mid-flight must not be reported as Settled, \
+             even though the copy it examined was correctly retired under the frontier it \
+             started with"
+        );
+        // The old-frontier mutation is NOT undone -- it was a correct
+        // decision for the frontier that existed while the pass ran.
+        assert!(
+            h.state
+                .file_index_repository()
+                .get_file(GROUP, &copy_path)
+                .unwrap()
+                .is_none_or(|r| r.deleted),
+            "the copy was genuinely unjustified under the frontier the pass evaluated it \
+             against; FrontierChanged must not roll this back"
+        );
+
+        // A follow-up pass against the now-stable frontier must settle
+        // cleanly -- this is the "always converge against the CURRENT
+        // frontier" half of the guarantee, not just "never lose an event".
+        let follow_up = h.session.clone().retire_conflict_copies_only(GROUP).await.unwrap();
+        assert!(
+            matches!(
+                follow_up,
+                yadorilink_peer_session::peer_session_impl::RetirementAttempt::Settled { .. }
+            ),
+            "a follow-up pass against a stable frontier must settle, got {follow_up:?}"
+        );
+    }
+
+    /// Confirmed regression, NOT yet fixed: `changes_for_request`'s ancestor
+    /// closure is gathered oldest-first (`collect_ancestor_closure`) and then
+    /// `ordered.truncate(max_changes_per_batch)` keeps only the FIRST
+    /// `max_changes_per_batch` entries -- so once a requested head's own
+    /// ancestor closure exceeds the batch cap (1000, `MAX_CHANGES_PER_BATCH`),
+    /// the requested head itself (necessarily the newest entry in an
+    /// oldest-first ordering) is silently dropped from every response,
+    /// forever, no matter how many times it is re-requested: the same
+    /// oldest-N-entries prefix is deterministic given an unchanged store, so
+    /// two identical requests produce byte-identical unprogressing batches.
+    /// There is no cursor/have-frontier in the wire protocol for a caller to
+    /// ask for "the NEXT 1000 after what you already sent me", so nothing
+    /// downstream (`missing_ancestor_frontier`, the periodic frontier
+    /// re-announce) can ever complete this catch-up either -- seeing the
+    /// same unknown head re-announced every second just re-triggers the
+    /// identical stuck request.
+    ///
+    /// This test is deliberately independent of row14_strict_acceptance's
+    /// own scale (tens of changes, well under 1000) -- it exists to nail
+    /// down a distinct, confirmed-by-reading-the-code defect, not to explain
+    /// row14's own stall. Do not fold a fix for this into the same commit as
+    /// a row14 fix; verify each independently.
+    #[tokio::test]
+    async fn changes_for_request_never_delivers_a_head_whose_ancestor_closure_exceeds_the_batch_cap(
+    ) {
+        let h = harness("device-local", "device-p", /*dag*/ true).await;
+        let key_a = SigningKey::from_bytes(&[30u8; 32]);
+
+        // A linear chain of 1002 changes on "chain.bin", each one's own
+        // parent. 1002, not 1000 or 1001, so the requested (latest) head is
+        // unambiguously excluded by an off-by-one-safe margin once the
+        // batch cap (1000) truncates the oldest-first closure.
+        let mut parent: Vec<yadorilink_replica_domain::ids::ChangeHash> = vec![];
+        let mut parent_lamport = 0u64;
+        let mut latest_hash = None;
+        for i in 0..1002u32 {
+            let version = empty_version(i as i64);
+            let change = Change::create_signed(
+                parent.clone(),
+                parent_lamport,
+                ChangeAuth::PLACEHOLDER,
+                yadorilink_replica_domain::ids::DeviceId("device-a".into()),
+                yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+                vec![Op::Put {
+                    path: SyncPath("chain.bin".into()),
+                    version: version.version_hash,
+                    origin: PutOrigin::Direct,
+                }],
+                &key_a,
+            );
+            h.state
+                .change_history_repository()
+                .dag_admit_change_with_versions(&change, std::slice::from_ref(&version), true)
+                .unwrap();
+            let hash = change.compute_hash();
+            parent = vec![hash];
+            parent_lamport = change.lamport;
+            latest_hash = Some(hash);
+        }
+        let latest_hash = latest_hash.unwrap();
+
+        let (batch_1, _versions_1) = h
+            .session
+            .replica_engine
+            .changes_for_request(
+                &yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+                std::slice::from_ref(&latest_hash),
+                1000,
+            )
+            .unwrap();
+        assert_eq!(batch_1.len(), 1000, "the batch cap must still be honored");
+
+        let latest_encoded =
+            h.state.sqlite().dag_get_change(&latest_hash).unwrap().unwrap().to_wire_bytes();
+        assert!(
+            !batch_1.contains(&latest_encoded),
+            "CONFIRMED BUG: the oldest-first truncation drops the actually-requested head from \
+             its own response"
+        );
+
+        // Re-requesting the SAME head against an unchanged store must, per
+        // the current implementation, reproduce the identical batch --
+        // proving this is a permanent stall, not merely a slow multi-round
+        // catch-up: nothing in the request/response shape lets a second
+        // identical request make different progress than the first.
+        let (batch_2, _versions_2) = h
+            .session
+            .replica_engine
+            .changes_for_request(
+                &yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+                std::slice::from_ref(&latest_hash),
+                1000,
+            )
+            .unwrap();
+        assert_eq!(
+            batch_1, batch_2,
+            "CONFIRMED BUG: an identical re-request of the same never-delivered head returns the \
+             identical stuck batch -- no progress across repeated requests"
         );
     }
 

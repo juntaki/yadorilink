@@ -37,8 +37,17 @@ use std::time::Duration;
 
 use sha2::Digest;
 use support::{
-    open_file_backed_replica_coordinator, real_entry_names, wait_until_with_context, TestAccount,
+    open_file_backed_replica_coordinator, real_entry_names, wait_until_or_stalled, TestAccount,
 };
+
+// A fixed 30s deadline flaked under CI load (macOS/Linux hosted runners can
+// spend tens of seconds retrying transient SQLite lock contention -- see
+// `directory_conflict_matrix.rs`'s identical rationale) even though
+// multi-device convergence was still making progress. Same
+// absolute-deadline-plus-stall-detector split used there and in
+// `taguchi_collision_matrix.rs`.
+const CONVERGENCE_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(120);
+const CONVERGENCE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::FsBlockStore;
@@ -176,13 +185,15 @@ async fn run_multiway_row(device_count: usize, stagger_ms: u64, row_name: &str) 
     // ever exercising conflict resolution. The full-snapshot + expected-count
     // wait below cannot pass until content has actually crossed devices.
     let devices_ref = &devices;
-    wait_until_with_context(
+    wait_until_or_stalled(
         || {
             let reference = snapshot(devices_ref[0].root.path());
             reference.len() == device_count
                 && devices_ref[1..].iter().all(|d| snapshot(d.root.path()) == reference)
         },
-        Duration::from_secs(30),
+        || devices_ref.iter().map(|d| snapshot(d.root.path())).collect::<Vec<_>>(),
+        CONVERGENCE_ABSOLUTE_TIMEOUT,
+        CONVERGENCE_STALL_TIMEOUT,
         || {
             devices_ref
                 .iter()

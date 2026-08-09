@@ -146,6 +146,7 @@ impl SimDaemon {
     }
     fn get_record(&self, path: &str) -> Option<(VersionVector, bool, u64)> {
         self.replica_coordinator()
+            .file_index_repository()
             .get_file(GROUP_ID, path)
             .ok()
             .flatten()
@@ -185,6 +186,7 @@ async fn boot_daemon(
 
     state
         .replica_coordinator
+        .link_repository()
         .add_link(&root.to_string_lossy(), GROUP_ID)
         .map_err(|e| format!("add_link: {e}"))?;
     let (watch_source, events_tx) = SimulatedFolderWatchSource::new(64);

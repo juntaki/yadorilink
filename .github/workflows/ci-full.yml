@@ -17,9 +17,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  linux-full:
+  # The five linux-full lanes below used to run as sequential steps inside
+  # one job, so a slow/failing step (e.g. DST lanes) delayed the verdict on
+  # every other independent lane behind it. They don't share build output or
+  # mutable state -- each is a fresh `cargo test`/`cargo run` invocation --
+  # so splitting them into their own jobs lets them run concurrently instead.
+  # Each keeps its own Swatinem/rust-cache key so their cache writes don't
+  # race or clobber each other.
+  linux-workspace:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -32,13 +39,31 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: linux-full
+          key: linux-workspace
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Full workspace
         # Daemon integration tests own real watcher/SQLite/network runtimes and
-        # run in the single-threaded lane below. Running them here as well makes
-        # several independent multi-daemon scenarios contend in parallel.
+        # run in the linux-daemon-e2e job below. Running them here as well
+        # would make several independent multi-daemon scenarios contend.
         run: cargo test --workspace --exclude yadorilink-daemon --exclude yadorilink-desktop-app
+
+  linux-daemon-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: linux-daemon-e2e
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Daemon E2E
         # The two monkey-chaos cases are private seed/soak coverage. They run
         # in private beta-heat, while every ordinary daemon integration test
@@ -48,14 +73,68 @@ jobs:
           --test-threads=1
           --skip random_concurrent_operations_converge_to_an_identical_file_set
           --skip replay_known_failing_seeds
+
+  linux-wire-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: linux-wire-integration
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Wire integration
         run: |
           cargo test -p yadorilink-peer-session --test peer_session --test crash_recovery --test dag_two_device_wire_convergence -- --test-threads=1
           cargo test -p yadorilink-daemon --test watcher_decompose_conformance -- --test-threads=1
+
+  linux-dst-lanes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: linux-dst-lanes
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: DST lanes 0 and 1
         run: |
           cargo run -p xtask -- dst-lane0
           cargo run -p xtask -- dst-lane1
+
+  linux-installer-build-health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: linux-installer-build-health
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Unsigned Linux installer build-health
         run: ./installer/linux/build-deb.sh
 
@@ -76,6 +155,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
         with:
           toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: platform-e2e-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Daemon E2E
         run: >-
           cargo test -p yadorilink-daemon --tests --

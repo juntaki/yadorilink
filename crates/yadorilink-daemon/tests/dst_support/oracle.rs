@@ -297,7 +297,11 @@ impl GlobalOracle {
         }
         devices.iter().any(|(_, state)| {
             matches!(
-                state.dag_compare_authoring(group_id, &earlier_hash, &later_hash),
+                state.change_history_repository().dag_compare_authoring(
+                    group_id,
+                    &earlier_hash,
+                    &later_hash
+                ),
                 Ok(Some(ChangeOrdering::Before))
             )
         })
@@ -487,7 +491,9 @@ impl GlobalOracle {
                     continue; // device-local identity marker, not a synced write
                 }
                 if matches!(
-                    state.get_materialization_state(group_id, &file_name.to_string_lossy()),
+                    state
+                        .materialization_state_repository()
+                        .get_materialization_state(group_id, &file_name.to_string_lossy()),
                     Ok(Some(MaterializationState::Placeholder))
                 ) {
                     continue;
@@ -562,11 +568,22 @@ impl GlobalOracle {
             )>,
         > = HashMap::new();
         for (device_idx, (root, state)) in devices.iter().enumerate() {
-            let Ok(files) = state.list_files(group_id) else { continue };
+            let Ok(files) = state.file_index_repository().list_files(group_id) else { continue };
             for record in files {
-                if let Ok(Some(current)) = state.get_current_version_record(group_id, &record.path)
-                {
-                    let version_hash = current.to_file_version().version_hash;
+                if let Ok(Some(current)) = state.sqlite().get_current_version_record(
+                    &yadorilink_replica_domain::ids::FolderGroupId(group_id.to_string()),
+                    &record.path,
+                ) {
+                    let version_hash =
+                        yadorilink_replica_domain::file::FileVersion::from_index_row(
+                            current.blocks.clone(),
+                            current.size,
+                            current.mtime_unix_nanos,
+                            current.record_kind,
+                            current.exec_bit,
+                            current.symlink_target.clone(),
+                        )
+                        .version_hash;
                     // The authoring-identity invariant is defined over LIVE
                     // content rows: one authoring change must project one
                     // content identity everywhere. A tombstone's authored
@@ -582,9 +599,12 @@ impl GlobalOracle {
                     // convergence oracle flags the file's presence anyway.
                     // (Scoped to this check only — the tombstone-orphan
                     // disk check below must still see deleted records.)
-                    if let (false, Ok(Some(authoring_hash))) =
-                        (record.deleted, state.get_authoring_change_hash(group_id, &record.path))
-                    {
+                    if let (false, Ok(Some(authoring_hash))) = (
+                        record.deleted,
+                        state
+                            .file_index_repository()
+                            .get_authoring_change_hash(group_id, &record.path),
+                    ) {
                         let identities = identities_by_path.entry(record.path.clone()).or_default();
                         if let Some((other_device, _, other_hash)) =
                             identities.iter().find(|(_, author, hash)| {
@@ -655,6 +675,7 @@ impl GlobalOracle {
                 // (3) StructuralMaterializationMismatch: only meaningful for
                 // content-bearing file rows.
                 let kind = state
+                    .file_index_repository()
                     .get_record_kind(group_id, &record.path)
                     .ok()
                     .flatten()
@@ -662,7 +683,10 @@ impl GlobalOracle {
                 if kind != RecordKind::File {
                     continue;
                 }
-                let Ok(Some(mat)) = state.get_materialization_state(group_id, &record.path) else {
+                let Ok(Some(mat)) = state
+                    .materialization_state_repository()
+                    .get_materialization_state(group_id, &record.path)
+                else {
                     continue;
                 };
                 let disk_len = std::fs::metadata(&on_disk).map(|m| m.len()).unwrap_or(0);
@@ -1165,7 +1189,7 @@ mod tests {
     fn setup() -> (ReplicaCoordinator, tempfile::TempDir) {
         let root = tempfile::tempdir().unwrap();
         let state = ReplicaCoordinator::open_in_memory().unwrap();
-        state.add_link(&root.path().to_string_lossy(), group_id()).unwrap();
+        state.link_repository().add_link(&root.path().to_string_lossy(), group_id()).unwrap();
         state.set_local_change_auth_provider(std::sync::Arc::new(|_| {
             Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER)
         }));
@@ -1211,7 +1235,7 @@ mod tests {
                 &emitter,
             )
             .unwrap();
-        let heads = state.dag_group_heads(group_id()).unwrap();
+        let heads = state.sqlite().dag_group_heads(group_id()).unwrap();
         assert_eq!(heads.len(), 1, "linear fixture must keep one head");
         heads[0]
     }
@@ -1488,6 +1512,7 @@ mod tests {
     fn structural_flags_a_live_index_row_with_no_file_on_disk() {
         let (state_a, root_a) = setup();
         state_a
+            .file_index_repository()
             .upsert_file(
                 group_id(),
                 &FileRecord {
@@ -1497,6 +1522,7 @@ mod tests {
                     blocks: Vec::new(),
                     deleted: false,
                 },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
 
@@ -1514,6 +1540,7 @@ mod tests {
             [(&state_a, root_a.path(), b'a'), (&state_b, root_b.path(), b'b')]
         {
             state
+                .file_index_repository()
                 .upsert_file(
                     group_id(),
                     &FileRecord {
@@ -1527,9 +1554,11 @@ mod tests {
                         }],
                         deleted: false,
                     },
+                    &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
                 )
                 .unwrap();
             state
+                .file_index_repository()
                 .set_authoring_change_hash(
                     group_id(),
                     "split.txt",
@@ -1567,6 +1596,7 @@ mod tests {
         let (state_a, root_a) = setup();
         // A current tombstone row: the index says "gone.txt" is deleted...
         state_a
+            .file_index_repository()
             .upsert_file(
                 group_id(),
                 &FileRecord {
@@ -1576,6 +1606,7 @@ mod tests {
                     blocks: Vec::new(),
                     deleted: true,
                 },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
         // ...but a real file still lives at that exact path.
@@ -1593,6 +1624,7 @@ mod tests {
         let (state_a, root_a) = setup();
         // A correctly-applied delete: tombstone row, and no file on disk.
         state_a
+            .file_index_repository()
             .upsert_file(
                 group_id(),
                 &FileRecord {
@@ -1602,6 +1634,7 @@ mod tests {
                     blocks: Vec::new(),
                     deleted: true,
                 },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
 
@@ -1617,7 +1650,14 @@ mod tests {
     fn structural_materialization_flags_hydrated_row_backed_by_empty_file() {
         let (state_a, root_a) = setup();
         // Row claims a 5-byte hydrated file (hydrated is the default state)...
-        state_a.upsert_file(group_id(), &live_record("a.txt", 5)).unwrap();
+        state_a
+            .file_index_repository()
+            .upsert_file(
+                group_id(),
+                &live_record("a.txt", 5),
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
         // ...but disk holds an empty file: content was never materialized.
         std::fs::write(root_a.path().join("a.txt"), b"").unwrap();
 
@@ -1630,7 +1670,14 @@ mod tests {
     #[test]
     fn structural_materialization_silent_for_hydrated_row_with_real_content() {
         let (state_a, root_a) = setup();
-        state_a.upsert_file(group_id(), &live_record("a.txt", 5)).unwrap();
+        state_a
+            .file_index_repository()
+            .upsert_file(
+                group_id(),
+                &live_record("a.txt", 5),
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
         std::fs::write(root_a.path().join("a.txt"), b"hello").unwrap();
 
         let oracle = GlobalOracle::new();
@@ -1644,9 +1691,22 @@ mod tests {
     #[test]
     fn structural_materialization_flags_placeholder_that_is_fully_materialized() {
         let (state_a, root_a) = setup();
-        state_a.upsert_file(group_id(), &live_record("a.txt", 5)).unwrap();
         state_a
-            .set_materialization_state(group_id(), "a.txt", MaterializationState::Placeholder)
+            .file_index_repository()
+            .upsert_file(
+                group_id(),
+                &live_record("a.txt", 5),
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        state_a
+            .materialization_state_repository()
+            .set_materialization_state(
+                group_id(),
+                "a.txt",
+                MaterializationState::Placeholder,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
             .unwrap();
         // A placeholder stub should not already hold its full content, but
         // disk has the whole 5 bytes: the index state disagrees with disk.
@@ -1661,9 +1721,22 @@ mod tests {
     #[test]
     fn structural_materialization_silent_for_legitimate_placeholder_stub() {
         let (state_a, root_a) = setup();
-        state_a.upsert_file(group_id(), &live_record("a.txt", 5)).unwrap();
         state_a
-            .set_materialization_state(group_id(), "a.txt", MaterializationState::Placeholder)
+            .file_index_repository()
+            .upsert_file(
+                group_id(),
+                &live_record("a.txt", 5),
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        state_a
+            .materialization_state_repository()
+            .set_materialization_state(
+                group_id(),
+                "a.txt",
+                MaterializationState::Placeholder,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
             .unwrap();
         // A legitimate placeholder: an empty stub on disk, not yet hydrated.
         std::fs::write(root_a.path().join("a.txt"), b"").unwrap();

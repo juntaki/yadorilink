@@ -90,8 +90,11 @@ type IndexSnapshot = Vec<(String, i64, Vec<String>)>;
 /// Reads the linked group's live records out of `DaemonState` and folds
 /// them into a deterministic, order-independent [`IndexSnapshot`].
 fn capture_index(state: &DaemonState) -> Result<IndexSnapshot, String> {
-    let files =
-        state.replica_coordinator.list_files(GROUP_ID).map_err(|e| format!("list_files: {e}"))?;
+    let files = state
+        .replica_coordinator
+        .file_index_repository()
+        .list_files(GROUP_ID)
+        .map_err(|e| format!("list_files: {e}"))?;
     let mut snapshot: IndexSnapshot = files
         .iter()
         .filter(|r| !r.deleted)

@@ -106,6 +106,28 @@ struct NetmapDiffState {
     /// judged unreachable. Threaded through every `run_netmap_attempt` like
     /// the maps above so the bound survives a coordination-stream reconnect.
     punch_limiter: Arc<StdMutex<PunchLimiter<String>>>,
+    /// device_id -> the latest connect parameters this daemon knows for that
+    /// peer (public key, candidate addresses, authorized groups) — the
+    /// source of truth `spawn_peer_session`'s reconnect loop re-reads at the
+    /// START of every attempt, not just its first. Without this, a
+    /// supervisor asleep in its reconnect backoff would keep retrying
+    /// against a candidate list captured once at first-spawn time, forever,
+    /// even after a later netmap push moved the peer to a new endpoint.
+    /// Every netmap update upserts this unconditionally for every peer it
+    /// carries, whether or not a session is currently live for that peer
+    /// (mirrors `replace_coordination_candidates`'s live-session path, one
+    /// layer earlier so a backoff-sleeping supervisor sees it too).
+    desired_peers: Arc<StdMutex<HashMap<String, PeerConnectSpec>>>,
+}
+
+/// One peer's current connect parameters, re-read by
+/// `spawn_peer_session`'s reconnect loop at the start of every attempt —
+/// see `NetmapDiffState::desired_peers`'s own doc comment.
+#[derive(Clone)]
+struct PeerConnectSpec {
+    peer_public: boringtun::x25519::PublicKey,
+    candidates: Vec<SocketAddr>,
+    effective_group_ids: Vec<String>,
 }
 
 impl NetmapDiffState {
@@ -116,6 +138,7 @@ impl NetmapDiffState {
             channels: Arc::new(StdMutex::new(HashMap::new())),
             session_tasks: Arc::new(StdMutex::new(HashMap::new())),
             punch_limiter: Arc::new(StdMutex::new(PunchLimiter::new(PunchConfig::default()))),
+            desired_peers: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 }
@@ -1022,8 +1045,42 @@ mod ws_netmap {
                 );
                 let candidates: Vec<SocketAddr> =
                     peer.endpoints.iter().filter_map(|e| e.address.parse().ok()).collect();
+                let mut effective_group_ids: Vec<String> =
+                    effective_authorized_groups.into_iter().collect();
+                effective_group_ids.sort();
+                // Unconditionally upserted, whether or not a session is
+                // currently live for this peer -- see
+                // `NetmapDiffState::desired_peers`'s own doc comment for why
+                // a backoff-sleeping reconnect supervisor needs this too,
+                // not just a currently-connected session.
+                diff_state
+                    .desired_peers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(
+                        peer.device_id.clone(),
+                        PeerConnectSpec {
+                            peer_public,
+                            candidates: candidates.clone(),
+                            effective_group_ids: effective_group_ids.clone(),
+                        },
+                    );
                 if let Some(session) = state.peers.session(&peer.device_id) {
                     session.replace_coordination_candidates(candidates).await;
+                    continue;
+                }
+                // A supervisor for this device may already be running --
+                // e.g. asleep in its reconnect backoff after a prior
+                // attempt ended -- even though no session is currently
+                // live. Checking `state.peers.session()` alone (as above)
+                // is not enough to decide whether to spawn: that map only
+                // reflects a *currently connected* session, and is exactly
+                // empty during a backoff sleep. Checking `session_tasks`
+                // liveness instead is what actually answers "is someone
+                // already responsible for reconnecting this peer" and
+                // avoids spawning a second, duplicate supervisor that
+                // would race the existing one.
+                if peer_has_live_supervisor(diff_state, &peer.device_id) {
                     continue;
                 }
 
@@ -1033,19 +1090,13 @@ mod ws_netmap {
                 maybe_initiate_rendezvous(&peer.device_id, config, state, diff_state);
 
                 let device_id = peer.device_id.clone();
-                let mut effective_group_ids: Vec<String> =
-                    effective_authorized_groups.into_iter().collect();
-                effective_group_ids.sort();
                 let handle = spawn_peer_session(
                     state.clone(),
                     keypair.clone(),
                     config.device_id.clone(),
                     device_id.clone(),
-                    peer_public,
-                    candidates,
-                    effective_group_ids,
-                    session_index.fetch_add(1, Ordering::Relaxed),
                     diff_state.clone(),
+                    session_index.clone(),
                 );
                 diff_state
                     .session_tasks
@@ -1218,9 +1269,28 @@ fn service_key_pins_path() -> PathBuf {
 /// check `run_netmap_attempt`'s update loop uses to avoid opening a
 /// second `PeerChannel`/`PeerSyncSession` for a peer that's already
 /// connected (module docs on the deliberately-simple session lifecycle).
-#[cfg(test)]
+/// Its only non-test caller is `run_sim`, `#[cfg(madsim)]`-only -- gated
+/// the same way here so a plain non-test, non-madsim build (which has no
+/// caller at all) doesn't trip `-D dead-code`.
+#[cfg(any(test, madsim))]
 fn peer_already_connected(state: &DaemonState, peer_device_id: &str) -> bool {
     state.peers.has_session(peer_device_id)
+}
+
+/// Whether a reconnect supervisor is already responsible for `peer_device_id`
+/// -- distinct from [`peer_already_connected`], which only reflects a
+/// *currently connected* session and is exactly empty while a supervisor
+/// sleeps in its reconnect backoff between attempts. The netmap-update loop
+/// must check THIS before spawning a new supervisor: `state.peers.session()`
+/// alone would spawn a duplicate, racing supervisor for a peer whose
+/// existing one just hasn't reconnected yet.
+fn peer_has_live_supervisor(diff_state: &NetmapDiffState, peer_device_id: &str) -> bool {
+    diff_state
+        .session_tasks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(peer_device_id)
+        .is_some_and(|handle| !handle.is_finished())
 }
 
 /// Records `peer_device_id`'s current reachability for the control socket,
@@ -1341,12 +1411,31 @@ fn teardown_peer(state: &Arc<DaemonState>, diff_state: &NetmapDiffState, device_
     {
         channel.revoke();
     }
+    // Must happen before aborting the supervisor task below: once removed,
+    // even an in-flight reconnect attempt that started just before the
+    // abort lands finds no spec at its next check and stops trying, rather
+    // than possibly reconnecting with stale parameters in the narrow window
+    // before the abort is actually observed.
+    diff_state
+        .desired_peers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(device_id);
     if let Some(handle) = diff_state
         .session_tasks
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(device_id)
     {
+        // Aborts the supervisor task itself, not a detached per-attempt
+        // task -- `spawn_peer_session`'s reconnect loop runs inline in this
+        // one task (deliberately not `supervise::spawn_restarting`, whose
+        // own per-attempt `tokio::spawn` would leave an in-flight attempt
+        // running detached past this abort; see this module's own doc
+        // comment on `run`'s coordination loop for the identical reasoning).
+        // This cancels whatever the supervisor is currently doing --
+        // mid-connect, mid-`session.run()`, or mid-backoff-sleep -- with
+        // nothing left running behind it.
         handle.abort();
     }
     end_session(state, device_id);
@@ -1371,189 +1460,217 @@ fn prune_finished_session_tasks(diff_state: &NetmapDiffState) {
         .retain(|_, handle| !handle.is_finished());
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Persistent per-peer supervisor: connects, runs the session to
+/// completion, then reconnects with backoff -- forever, until this exact
+/// task's `JoinHandle` (held in `diff_state.session_tasks`) is aborted by
+/// `teardown_peer`. A `PeerChannel`'s actor can end cleanly as part of its
+/// own normal operation now (e.g. `yadorilink-transport`'s ARQ layer tears
+/// a channel down after exhausting retransmits on a genuinely lost peer,
+/// rather than continuing with a permanently-poisoned ack window) -- before
+/// this loop existed, that clean end was indistinguishable from
+/// `teardown_peer`'s own bookkeeping cleanup to this function's caller, so
+/// nothing ever reconnected: the peer stayed silently absent until some
+/// *unrelated* netmap push happened to re-observe it (which, for an
+/// unchanged authorized peer, might never happen again). The loop runs
+/// inline in this one task -- deliberately NOT `supervise::spawn_restarting`,
+/// whose own per-attempt `tokio::spawn` would leave an in-flight attempt
+/// running detached past an abort of the *outer* handle (see this module's
+/// own doc comment on `run`'s coordination loop, which hit the identical
+/// footgun first).
 fn spawn_peer_session(
     state: Arc<DaemonState>,
     keypair: Arc<DeviceKeyPair>,
     local_device_id: String,
     peer_device_id: String,
-    peer_public: boringtun::x25519::PublicKey,
-    candidates: Vec<SocketAddr>,
-    shared_group_ids: Vec<String>,
-    session_index: u32,
     diff_state: NetmapDiffState,
+    session_index: Arc<AtomicU32>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        mark_connecting(&state, &peer_device_id);
-
-        // All peer channels share this device's one long-lived UDP socket, so
-        // the NAT candidates it advertises describe the exact binding data
-        // flows on. A bind failure here means no direct transport at all —
-        // report the peer unreachable rather than dropping it silently.
-        let shared = match state.ensure_shared_socket().await {
-            Ok(shared) => shared,
-            Err(e) => {
-                tracing::warn!(peer = %peer_device_id, error = %e, "failed to bind the shared transport socket");
-                set_reachability(
-                    &state,
-                    &peer_device_id,
-                    PeerReachability::Unreachable(UnreachableCategory::NoResponse),
-                );
-                return;
+        let mut attempt: u32 = 0;
+        loop {
+            let generation_started = tokio::time::Instant::now();
+            run_one_peer_session_attempt(
+                &state,
+                &keypair,
+                &local_device_id,
+                &peer_device_id,
+                &diff_state,
+                session_index.fetch_add(1, Ordering::Relaxed),
+            )
+            .await;
+            // A generation that stayed up for a while was a genuine
+            // success -- reset the backoff instead of letting it ratchet
+            // toward its 45s cap and stay there for the rest of this
+            // device's lifetime. Without this, a peer that reconnects
+            // occasionally but healthily over a long-running daemon (a
+            // laptop sleeping overnight, a brief network blip) would
+            // eventually always wait the full 45s after ANY disconnect,
+            // indistinguishable from a peer that is genuinely struggling
+            // to reconnect. Only a generation that dies almost immediately
+            // (repeated handshake failures, a genuinely unreachable peer)
+            // should escalate.
+            if generation_started.elapsed() > Duration::from_secs(3) {
+                attempt = 0;
             }
-        };
-
-        // An empty candidate set is not an error — the channel is created
-        // and immediately reports `Unreachable { NoCandidates }`, which
-        // `poll_reachability` surfaces. A `connect` error here is therefore
-        // a genuine construction failure, reported as unreachable rather than
-        // dropping the peer silently.
-        let connect_result = PeerChannel::connect(
-            keypair.secret.clone(),
-            peer_public,
-            session_index,
-            candidates,
-            shared,
-        )
-        .await;
-
-        let channel = match connect_result {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                tracing::warn!(peer = %peer_device_id, error = %e, "failed to establish peer channel");
-                state.telemetry.record_connection_attempt(
-                    peer_device_id.clone(),
-                    CandidateSource::DirectPath,
-                    AddressClass::Unknown,
-                    AttemptOutcome::Failed,
-                    0,
-                    UnreachableCategory::NoResponse.as_str(),
-                    false,
-                    None,
-                );
-                // The status entry stays so `yadorilink status` shows
-                // "cannot connect"; the next netmap push re-attempts (this
-                // peer is not in `state.peers.sessions`, so it is not suppressed
-                // as connected).
-                set_reachability(
-                    &state,
-                    &peer_device_id,
-                    PeerReachability::Unreachable(UnreachableCategory::NoResponse),
-                );
-                return;
-            }
-        };
-
-        // registered so a later netmap-diff teardown
-        // (`teardown_peer`) can find and `revoke` this exact channel —
-        // dropping every `Arc<PeerChannel>` clone this task will go on to
-        // hand out (below, and via `PeerSyncSession`) is not by itself
-        // enough to stop the actor (see `PeerChannel::revoke`'s doc
-        // comment), so `teardown_peer` needs a live reference, not just
-        // to out-live every other clone.
-        diff_state
-            .channels
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(peer_device_id.clone(), channel.clone());
-
-        // Reflect the channel's live reachability into status: it starts
-        // `Connecting` while candidates race, becomes `Connected` once a
-        // direct path is confirmed, or `Unreachable` if the race is lost.
-        tokio::spawn(poll_reachability(state.clone(), peer_device_id.clone(), channel.clone()));
-
-        let sync_roots = sync_roots_for_groups(&state, &shared_group_ids);
-        let dependencies = PeerSyncSessionDeps {
-            // Every session shares this daemon's one global upload/download
-            // token-bucket pair (never an independent per-session copy).
-            rate_limiters: state.rate_limiters.clone(),
-            block_serve_engine: state.block_serve_engine.clone(),
-            // This session's own disk-headroom preflight is turned on only
-            // once `main.rs` has opted the whole daemon into enforcement
-            // (see `DaemonState::disk_headroom_enforcement_enabled`'s doc
-            // comment for why that's not just always-on here).
-            headroom_enforced: state.disk_headroom_enforcement_enabled(),
-            // Lets this session's `reconcile_one_file` force a racing local
-            // change out of this device's per-link debounce accumulators
-            // before comparing/applying a peer update — see
-            // `PendingLocalChangeFlush for DaemonState`'s doc comment
-            // (the daemon's own `LinkRuntimeController`).
-            pending_local_change_flush: state.clone(),
-            root_commit_authority_provider: state.clone(),
-            // Admit incoming change-history changes only when this device
-            // has pinned the author's signing key and the author is an
-            // authorized writer for the change's group — both mirrored from
-            // the netmap onto `DaemonState`. Without an authenticator a
-            // session announces heads and serves stored changes but never
-            // admits an incoming one.
-            change_authenticator: crate::change_auth::NetmapChangeAuthenticator::new(state.clone()),
-            // Lets this session author a captured change for content its
-            // own materialize path displaces during custody transfer (see
-            // `PeerSyncSession::set_change_emitter`'s doc comment). A device
-            // that has not yet been provisioned a signing key is left with
-            // no emitter -- the same fail-closed default the field itself
-            // documents -- so a future caller must retain rather than
-            // author in that case; it never falls back to an unsigned or
-            // wrong-identity write.
-            change_emitter: state.device_signing_key().map(|signing_key| {
-                Arc::new(yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
-                    state.device_id.clone(),
-                    signing_key,
-                ))
-            }),
-            // Lets this session answer an incoming peer `HandoffLeaseRequest`
-            // by running this device's own target-side lease flow — see
-            // `HandoffLeaseResponder for DaemonState`'s doc comment
-            // (`daemon_state.rs`).
-            handoff_lease_responder: state.clone(),
-            block_write_activity_provider: state.clone(),
-            // Lets this session answer an incoming peer `HandoffTicketRequest`
-            // (from a different device removing/revoking this one) by running
-            // this device's own removed-device-ticket flow — see
-            // `HandoffTicketResponder for DaemonState`'s doc comment
-            // (`daemon_state.rs`).
-            handoff_ticket_responder: state.clone(),
-            // Lets this session answer an incoming peer `RebootstrapSnapshotRequest`
-            // and process an incoming `RebootstrapSnapshotResponse` by running this
-            // device's own signing identity and pinned-key trust resolver — see
-            // `DaemonRebootstrapHandler`'s doc comment (`rebootstrap_handler.rs`).
-            rebootstrap_handler: crate::rebootstrap_handler::DaemonRebootstrapHandler::new(
-                state.clone(),
-            ),
-            ..PeerSyncSessionDeps::standalone()
-        };
-        let session = PeerSyncSession::new_with_dependencies(
-            channel,
-            local_device_id,
-            peer_device_id.clone(),
-            state.replica_coordinator.clone(),
-            Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                state.block_store.clone(),
-            )),
-            shared_group_ids.clone(),
-            sync_roots,
-            Some(state.forward_tx.clone()),
-            dependencies,
-        );
-        state.peers.register_session(peer_device_id.clone(), session.clone());
-
-        if let Err(e) = session.clone().run().await {
-            tracing::warn!(peer = %peer_device_id, error = %e, "peer sync session ended with an error");
+            let delay = BackoffConfig::RECONNECT.next(attempt);
+            tracing::info!(
+                peer = %peer_device_id,
+                attempt,
+                ?delay,
+                "peer session ended; reconnecting after backoff"
+            );
+            tokio::time::sleep(delay).await;
+            attempt = attempt.saturating_add(1);
         }
-        end_session_if_current(&state, &peer_device_id, &session);
-        // The session ended on its own (not via `teardown_peer`, which
-        // already would have removed this entry) — clean up the
-        // bookkeeping `teardown_peer` would otherwise use to find a
-        // channel that no longer has a live session behind it. This
-        // task's own `session_tasks` entry is left for
-        // `prune_finished_session_tasks` to sweep (see that function's
-        // doc comment for why this task can't remove it itself).
-        diff_state
-            .channels
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&peer_device_id);
     })
+}
+
+/// One connect-then-run cycle of [`spawn_peer_session`]'s reconnect loop.
+/// Reads `diff_state.desired_peers` fresh at the start -- not once at
+/// `spawn_peer_session`'s own call time -- so a supervisor woken from a
+/// long backoff sleep reconnects using the peer's LATEST known endpoint/
+/// authorized-groups, not a stale snapshot from whenever this device's
+/// session for that peer first started (see `PeerConnectSpec`'s own doc
+/// comment).
+async fn run_one_peer_session_attempt(
+    state: &Arc<DaemonState>,
+    keypair: &Arc<DeviceKeyPair>,
+    local_device_id: &str,
+    peer_device_id: &str,
+    diff_state: &NetmapDiffState,
+    session_index: u32,
+) {
+    let Some(spec) = diff_state
+        .desired_peers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(peer_device_id)
+        .cloned()
+    else {
+        // The peer was removed (and this supervisor's abort is presumably
+        // already in flight) between this attempt starting and this check
+        // -- nothing to connect to. The next loop iteration's backoff sleep
+        // gives the pending abort time to land; if it hasn't landed, this
+        // is a harmless no-op retry.
+        tracing::debug!(
+            peer = %peer_device_id,
+            "no desired connect spec for this peer; skipping this reconnect attempt"
+        );
+        return;
+    };
+
+    mark_connecting(state, peer_device_id);
+
+    // All peer channels share this device's one long-lived UDP socket, so
+    // the NAT candidates it advertises describe the exact binding data
+    // flows on. A bind failure here means no direct transport at all —
+    // report the peer unreachable rather than dropping it silently.
+    let shared = match state.ensure_shared_socket().await {
+        Ok(shared) => shared,
+        Err(e) => {
+            tracing::warn!(peer = %peer_device_id, error = %e, "failed to bind the shared transport socket");
+            set_reachability(
+                state,
+                peer_device_id,
+                PeerReachability::Unreachable(UnreachableCategory::NoResponse),
+            );
+            return;
+        }
+    };
+
+    // An empty candidate set is not an error — the channel is created
+    // and immediately reports `Unreachable { NoCandidates }`, which
+    // `poll_reachability` surfaces. A `connect` error here is therefore
+    // a genuine construction failure, reported as unreachable rather than
+    // dropping the peer silently.
+    let connect_result = PeerChannel::connect(
+        keypair.secret.clone(),
+        spec.peer_public,
+        session_index,
+        spec.candidates,
+        shared,
+    )
+    .await;
+
+    let channel = match connect_result {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            tracing::warn!(peer = %peer_device_id, error = %e, "failed to establish peer channel");
+            state.telemetry.record_connection_attempt(
+                peer_device_id.to_string(),
+                CandidateSource::DirectPath,
+                AddressClass::Unknown,
+                AttemptOutcome::Failed,
+                0,
+                UnreachableCategory::NoResponse.as_str(),
+                false,
+                None,
+            );
+            // The status entry stays so `yadorilink status` shows
+            // "cannot connect"; this supervisor's own reconnect loop
+            // re-attempts after backoff (this peer is not in
+            // `state.peers.sessions`, so it is not suppressed as connected).
+            set_reachability(
+                state,
+                peer_device_id,
+                PeerReachability::Unreachable(UnreachableCategory::NoResponse),
+            );
+            return;
+        }
+    };
+
+    // registered so a later netmap-diff teardown
+    // (`teardown_peer`) can find and `revoke` this exact channel —
+    // dropping every `Arc<PeerChannel>` clone this task will go on to
+    // hand out (below, and via `PeerSyncSession`) is not by itself
+    // enough to stop the actor (see `PeerChannel::revoke`'s doc
+    // comment), so `teardown_peer` needs a live reference, not just
+    // to out-live every other clone.
+    diff_state
+        .channels
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(peer_device_id.to_string(), channel.clone());
+
+    // Reflect the channel's live reachability into status: it starts
+    // `Connecting` while candidates race, becomes `Connected` once a
+    // direct path is confirmed, or `Unreachable` if the race is lost.
+    tokio::spawn(poll_reachability(state.clone(), peer_device_id.to_string(), channel.clone()));
+
+    let sync_roots = sync_roots_for_groups(state, &spec.effective_group_ids);
+    let dependencies = peer_sync_session_deps(state);
+    let session = PeerSyncSession::new_with_dependencies(
+        channel,
+        local_device_id.to_string(),
+        peer_device_id.to_string(),
+        state.replica_coordinator.clone(),
+        Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            state.block_store.clone(),
+        )),
+        spec.effective_group_ids,
+        sync_roots,
+        Some(state.forward_tx.clone()),
+        dependencies,
+    );
+    state.peers.register_session(peer_device_id.to_string(), session.clone());
+
+    if let Err(e) = session.clone().run().await {
+        tracing::warn!(peer = %peer_device_id, error = %e, "peer sync session ended with an error");
+    }
+    end_session_if_current(state, peer_device_id, &session);
+    // The session ended on its own (not via `teardown_peer`, which
+    // already would have removed this entry) — clean up the
+    // bookkeeping `teardown_peer` would otherwise use to find a
+    // channel that no longer has a live session behind it. This task's
+    // own `session_tasks` entry stays live (this is one attempt of an
+    // ongoing supervisor loop, not the task ending) -- only
+    // `teardown_peer`'s abort or process shutdown ends the supervisor
+    // itself.
+    diff_state
+        .channels
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(peer_device_id);
 }
 
 /// Reflects the channel's reachability into status, waking on each change
@@ -1702,7 +1819,80 @@ fn map_transport_category(
 /// is "the" root for one group, at the same moment. An orphaned link's
 /// coordination-side authorization is gone and must never be handed back as a
 /// valid write target; the primitive filters those out.
-fn sync_roots_for_groups(state: &DaemonState, group_ids: &[String]) -> HashMap<String, PathBuf> {
+/// Every `PeerSyncSessionDeps` field this device's own daemon state can
+/// supply, identical for every `PeerSyncSession` this device constructs --
+/// factored out of what used to be two independently-maintained inline
+/// literals (the outbound-connect and inbound-accept paths below) that had
+/// already drifted (one carried every field's doc comment, the other only
+/// some), and reused as-is by `DaemonState::local_retirement_session` for a
+/// session bound to no live peer at all (`LoopbackPeerMessageChannel`) --
+/// see that method's own doc comment for why retirement needs one.
+pub(crate) fn peer_sync_session_deps(state: &Arc<DaemonState>) -> PeerSyncSessionDeps {
+    PeerSyncSessionDeps {
+        // Every session shares this daemon's one global upload/download
+        // token-bucket pair (never an independent per-session copy).
+        rate_limiters: state.rate_limiters.clone(),
+        block_serve_engine: state.block_serve_engine.clone(),
+        // This session's own disk-headroom preflight is turned on only
+        // once `main.rs` has opted the whole daemon into enforcement
+        // (see `DaemonState::disk_headroom_enforcement_enabled`'s doc
+        // comment for why that's not just always-on here).
+        headroom_enforced: state.disk_headroom_enforcement_enabled(),
+        // Lets this session's `reconcile_one_file` force a racing local
+        // change out of this device's per-link debounce accumulators
+        // before comparing/applying a peer update — see
+        // `PendingLocalChangeFlush for DaemonState`'s doc comment
+        // (the daemon's own `LinkRuntimeController`).
+        pending_local_change_flush: state.clone(),
+        root_commit_authority_provider: state.clone(),
+        // Admit incoming change-history changes only when this device
+        // has pinned the author's signing key and the author is an
+        // authorized writer for the change's group — both mirrored from
+        // the netmap onto `DaemonState`. Without an authenticator a
+        // session announces heads and serves stored changes but never
+        // admits an incoming one.
+        change_authenticator: crate::change_auth::NetmapChangeAuthenticator::new(state.clone()),
+        // Lets this session author a captured change for content its
+        // own materialize path displaces during custody transfer (see
+        // `PeerSyncSession::set_change_emitter`'s doc comment). A device
+        // that has not yet been provisioned a signing key is left with
+        // no emitter -- the same fail-closed default the field itself
+        // documents -- so a future caller must retain rather than
+        // author in that case; it never falls back to an unsigned or
+        // wrong-identity write.
+        change_emitter: state.device_signing_key().map(|signing_key| {
+            Arc::new(yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
+                state.device_id.clone(),
+                signing_key,
+            ))
+        }),
+        // Lets this session answer an incoming peer `HandoffLeaseRequest`
+        // by running this device's own target-side lease flow — see
+        // `HandoffLeaseResponder for DaemonState`'s doc comment
+        // (`daemon_state.rs`).
+        handoff_lease_responder: state.clone(),
+        block_write_activity_provider: state.clone(),
+        // Lets this session answer an incoming peer `HandoffTicketRequest`
+        // (from a different device removing/revoking this one) by running
+        // this device's own removed-device-ticket flow — see
+        // `HandoffTicketResponder for DaemonState`'s doc comment
+        // (`daemon_state.rs`).
+        handoff_ticket_responder: state.clone(),
+        // Lets this session answer an incoming peer `RebootstrapSnapshotRequest`
+        // and process an incoming `RebootstrapSnapshotResponse` by running this
+        // device's own signing identity and pinned-key trust resolver — see
+        // `DaemonRebootstrapHandler`'s doc comment (`rebootstrap_handler.rs`).
+        rebootstrap_handler: crate::rebootstrap_handler::DaemonRebootstrapHandler::new(
+            state.clone(),
+        ),
+        ..PeerSyncSessionDeps::standalone()
+    }
+}
+
+pub(crate) fn sync_roots_for_groups(
+    state: &DaemonState,
+    group_ids: &[String],
+) -> HashMap<String, PathBuf> {
     let mut roots = HashMap::new();
     for group_id in group_ids {
         match state.replica_coordinator.link_repository().live_link_local_path_for_group(group_id) {
@@ -1798,7 +1988,17 @@ pub async fn run_sim(discovery: SimDiscovery, state: Arc<DaemonState>) -> Result
     ));
 
     for peer in peers {
-        if peer_already_connected(&state, &peer.device_id) {
+        diff_state.desired_peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(
+            peer.device_id.clone(),
+            PeerConnectSpec {
+                peer_public: peer.public_key,
+                candidates: peer.peer_candidates,
+                effective_group_ids: peer.shared_group_ids,
+            },
+        );
+        if peer_already_connected(&state, &peer.device_id)
+            || peer_has_live_supervisor(&diff_state, &peer.device_id)
+        {
             continue;
         }
         let handle = spawn_direct_peer_session(
@@ -1806,11 +2006,8 @@ pub async fn run_sim(discovery: SimDiscovery, state: Arc<DaemonState>) -> Result
             keypair.clone(),
             local_device_id.clone(),
             peer.device_id.clone(),
-            peer.public_key,
-            peer.peer_candidates,
-            peer.shared_group_ids,
-            session_index.fetch_add(1, Ordering::Relaxed),
             diff_state.clone(),
+            session_index.clone(),
         );
         diff_state
             .session_tasks
@@ -1828,147 +2025,152 @@ pub async fn run_sim(discovery: SimDiscovery, state: Arc<DaemonState>) -> Result
 /// [`spawn_peer_session`]'s counterpart for the deterministic simulator:
 /// connects over a pre-bound UDP socket (supplied by the harness) rather
 /// than binding one, then runs the *same* `PeerSyncSession` with the same
-/// forwarding/rate-limit/materialization wiring as production.
+/// forwarding/rate-limit/materialization wiring as production. Same
+/// persistent-supervisor shape as `spawn_peer_session` -- see that
+/// function's own doc comment for why the reconnect loop runs inline in
+/// this one task rather than via `supervise::spawn_restarting`.
 #[cfg(madsim)]
-#[allow(clippy::too_many_arguments)]
 fn spawn_direct_peer_session(
     state: Arc<DaemonState>,
     keypair: Arc<DeviceKeyPair>,
     local_device_id: String,
     peer_device_id: String,
-    peer_public: boringtun::x25519::PublicKey,
-    candidates: Vec<SocketAddr>,
-    shared_group_ids: Vec<String>,
-    session_index: u32,
     diff_state: NetmapDiffState,
+    session_index: Arc<AtomicU32>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        mark_connecting(&state, &peer_device_id);
-
-        // `run_sim` installed the device's shared socket before spawning any
-        // session, so it is always present here.
-        let shared = state
-            .shared_socket()
-            .expect("run_sim installs the shared socket before opening channels");
-
-        let channel = match PeerChannel::connect(
-            keypair.secret.clone(),
-            peer_public,
-            session_index,
-            candidates,
-            shared,
-        )
-        .await
-        {
-            Ok(c) => Arc::new(c),
-            Err(e) => {
-                tracing::warn!(peer = %peer_device_id, error = %e, "failed to establish direct peer channel in-sim");
-                end_session(&state, &peer_device_id);
-                return;
+        let mut attempt: u32 = 0;
+        loop {
+            let generation_started = tokio::time::Instant::now();
+            run_one_direct_peer_session_attempt(
+                &state,
+                &keypair,
+                &local_device_id,
+                &peer_device_id,
+                &diff_state,
+                session_index.fetch_add(1, Ordering::Relaxed),
+            )
+            .await;
+            // See `spawn_peer_session`'s identical reset -- a generation
+            // that stayed up for a while was a genuine success.
+            if generation_started.elapsed() > Duration::from_secs(3) {
+                attempt = 0;
             }
-        };
-
-        diff_state
-            .channels
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(peer_device_id.clone(), channel.clone());
-
-        // Reflect the channel's live reachability into status: it starts
-        // `Connecting` while candidates race, becomes `Connected` once a
-        // direct path is confirmed, or `Unreachable` if the race is lost.
-        tokio::spawn(poll_reachability(state.clone(), peer_device_id.clone(), channel.clone()));
-
-        // The static netmap can race the harness linking the shared folder
-        // (in production a device knows its links before a netmap peer
-        // appears; in-sim the daemon boots and this seam runs before the
-        // harness has called `add_link`). Received files materialize into
-        // `sync_roots`, so wait briefly for the shared group's local root
-        // to appear before starting the session rather than constructing it
-        // with an empty root map. The channel is already up while we wait,
-        // so pairing is not delayed by this.
-        let mut sync_roots = sync_roots_for_groups(&state, &shared_group_ids);
-        for _ in 0..200 {
-            if !sync_roots.is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            sync_roots = sync_roots_for_groups(&state, &shared_group_ids);
+            let delay = BackoffConfig::RECONNECT.next(attempt);
+            tracing::info!(
+                peer = %peer_device_id,
+                attempt,
+                ?delay,
+                "direct peer session ended; reconnecting after backoff"
+            );
+            tokio::time::sleep(delay).await;
+            attempt = attempt.saturating_add(1);
         }
-
-        let dependencies = PeerSyncSessionDeps {
-            rate_limiters: state.rate_limiters.clone(),
-            block_serve_engine: state.block_serve_engine.clone(),
-            headroom_enforced: state.disk_headroom_enforcement_enabled(),
-            pending_local_change_flush: state.clone(),
-            root_commit_authority_provider: state.clone(),
-            // Admit incoming change-history changes only when this device
-            // has pinned the author's signing key and the author is an
-            // authorized writer for the change's group — both mirrored from
-            // the netmap onto `DaemonState`. Without an authenticator a
-            // session announces heads and serves stored changes but never
-            // admits an incoming one.
-            change_authenticator: crate::change_auth::NetmapChangeAuthenticator::new(state.clone()),
-            // Lets this session author a captured change for content its
-            // own materialize path displaces during custody transfer (see
-            // `PeerSyncSession::set_change_emitter`'s doc comment). A device
-            // that has not yet been provisioned a signing key is left with
-            // no emitter -- the same fail-closed default the field itself
-            // documents -- so a future caller must retain rather than
-            // author in that case; it never falls back to an unsigned or
-            // wrong-identity write.
-            change_emitter: state.device_signing_key().map(|signing_key| {
-                Arc::new(yadorilink_sync_sqlite::dag_store::ChangeEmitter::new(
-                    state.device_id.clone(),
-                    signing_key,
-                ))
-            }),
-            // Lets this session answer an incoming peer `HandoffLeaseRequest`
-            // by running this device's own target-side lease flow — see
-            // `HandoffLeaseResponder for DaemonState`'s doc comment
-            // (`daemon_state.rs`).
-            handoff_lease_responder: state.clone(),
-            block_write_activity_provider: state.clone(),
-            // Lets this session answer an incoming peer `HandoffTicketRequest`
-            // (from a different device removing/revoking this one) by running
-            // this device's own removed-device-ticket flow — see
-            // `HandoffTicketResponder for DaemonState`'s doc comment
-            // (`daemon_state.rs`).
-            handoff_ticket_responder: state.clone(),
-            // Lets this session answer an incoming peer `RebootstrapSnapshotRequest`
-            // and process an incoming `RebootstrapSnapshotResponse` by running this
-            // device's own signing identity and pinned-key trust resolver — see
-            // `DaemonRebootstrapHandler`'s doc comment (`rebootstrap_handler.rs`).
-            rebootstrap_handler: crate::rebootstrap_handler::DaemonRebootstrapHandler::new(
-                state.clone(),
-            ),
-            ..PeerSyncSessionDeps::standalone()
-        };
-        let session = PeerSyncSession::new_with_dependencies(
-            channel,
-            local_device_id,
-            peer_device_id.clone(),
-            state.replica_coordinator.clone(),
-            Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                state.block_store.clone(),
-            )),
-            shared_group_ids,
-            sync_roots,
-            Some(state.forward_tx.clone()),
-            dependencies,
-        );
-        state.peers.register_session(peer_device_id.clone(), session.clone());
-
-        if let Err(e) = session.clone().run().await {
-            tracing::warn!(peer = %peer_device_id, error = %e, "peer sync session ended with an error");
-        }
-        end_session_if_current(&state, &peer_device_id, &session);
-        diff_state
-            .channels
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&peer_device_id);
     })
+}
+
+/// One connect-then-run cycle of [`spawn_direct_peer_session`]'s reconnect
+/// loop -- mirrors `run_one_peer_session_attempt`'s own doc comment.
+#[cfg(madsim)]
+async fn run_one_direct_peer_session_attempt(
+    state: &Arc<DaemonState>,
+    keypair: &Arc<DeviceKeyPair>,
+    local_device_id: &str,
+    peer_device_id: &str,
+    diff_state: &NetmapDiffState,
+    session_index: u32,
+) {
+    let Some(spec) = diff_state
+        .desired_peers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(peer_device_id)
+        .cloned()
+    else {
+        tracing::debug!(
+            peer = %peer_device_id,
+            "no desired connect spec for this peer; skipping this reconnect attempt"
+        );
+        return;
+    };
+
+    mark_connecting(state, peer_device_id);
+
+    // `run_sim` installed the device's shared socket before spawning any
+    // session, so it is always present here.
+    let shared =
+        state.shared_socket().expect("run_sim installs the shared socket before opening channels");
+
+    let channel = match PeerChannel::connect(
+        keypair.secret.clone(),
+        spec.peer_public,
+        session_index,
+        spec.candidates,
+        shared,
+    )
+    .await
+    {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            tracing::warn!(peer = %peer_device_id, error = %e, "failed to establish direct peer channel in-sim");
+            end_session(state, peer_device_id);
+            return;
+        }
+    };
+
+    diff_state
+        .channels
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(peer_device_id.to_string(), channel.clone());
+
+    // Reflect the channel's live reachability into status: it starts
+    // `Connecting` while candidates race, becomes `Connected` once a
+    // direct path is confirmed, or `Unreachable` if the race is lost.
+    tokio::spawn(poll_reachability(state.clone(), peer_device_id.to_string(), channel.clone()));
+
+    // The static netmap can race the harness linking the shared folder
+    // (in production a device knows its links before a netmap peer
+    // appears; in-sim the daemon boots and this seam runs before the
+    // harness has called `add_link`). Received files materialize into
+    // `sync_roots`, so wait briefly for the shared group's local root
+    // to appear before starting the session rather than constructing it
+    // with an empty root map. The channel is already up while we wait,
+    // so pairing is not delayed by this.
+    let mut sync_roots = sync_roots_for_groups(state, &spec.effective_group_ids);
+    for _ in 0..200 {
+        if !sync_roots.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sync_roots = sync_roots_for_groups(state, &spec.effective_group_ids);
+    }
+
+    let dependencies = peer_sync_session_deps(state);
+    let session = PeerSyncSession::new_with_dependencies(
+        channel,
+        local_device_id.to_string(),
+        peer_device_id.to_string(),
+        state.replica_coordinator.clone(),
+        Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+            state.block_store.clone(),
+        )),
+        spec.effective_group_ids,
+        sync_roots,
+        Some(state.forward_tx.clone()),
+        dependencies,
+    );
+    state.peers.register_session(peer_device_id.to_string(), session.clone());
+
+    if let Err(e) = session.clone().run().await {
+        tracing::warn!(peer = %peer_device_id, error = %e, "peer sync session ended with an error");
+    }
+    end_session_if_current(state, peer_device_id, &session);
+    diff_state
+        .channels
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(peer_device_id);
 }
 
 #[cfg(test)]
@@ -2634,6 +2836,178 @@ mod tests {
         assert!(
             !still_running.load(Ordering::Relaxed),
             "the aborted session task must never reach its post-sleep code"
+        );
+    }
+
+    /// `peer_has_live_supervisor` is the netmap-update loop's dedup source
+    /// of truth for whether to spawn a new supervisor -- it must say "yes,
+    /// already supervised" while a supervisor is asleep in its reconnect
+    /// backoff (no live session, but its task is still running), not just
+    /// while a session is actually connected. `state.peers.session()` alone
+    /// (the OLD dedup check) would be empty in exactly this situation and
+    /// spawn a second, racing supervisor for the same peer.
+    #[tokio::test]
+    async fn peer_has_live_supervisor_reflects_a_backoff_sleeping_task_not_just_a_live_session() {
+        let diff_state = NetmapDiffState::new();
+        assert!(
+            !peer_has_live_supervisor(&diff_state, "device-b"),
+            "no task at all must not be reported as supervised"
+        );
+
+        // Simulates a supervisor mid-backoff-sleep between reconnect
+        // attempts: no live session anywhere, but its task is still
+        // running.
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+        diff_state
+            .session_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert("device-b".to_string(), handle);
+        assert!(
+            peer_has_live_supervisor(&diff_state, "device-b"),
+            "a running (even backoff-sleeping) supervisor task must count as already supervised"
+        );
+
+        // A finished task must not count -- otherwise a peer whose
+        // supervisor genuinely exited (e.g. a bug, or the not-actually-
+        // infinite test double above) would be stuck unsupervised forever.
+        let finished = tokio::spawn(async {});
+        finished.await.unwrap();
+        diff_state
+            .session_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert("device-c".to_string(), tokio::spawn(async {}));
+        tokio::task::yield_now().await;
+        assert!(
+            !peer_has_live_supervisor(&diff_state, "device-c"),
+            "a finished task must not count as an active supervisor"
+        );
+    }
+
+    /// `teardown_peer` must clear `desired_peers` too, not just
+    /// `channels`/`session_tasks`/the session itself -- otherwise a
+    /// reconnect attempt that started just before `teardown_peer`'s abort
+    /// actually lands could still read a (stale, about-to-be-revoked)
+    /// connect spec and reconnect anyway, resurrecting a peer this exact
+    /// call is trying to permanently remove.
+    #[tokio::test]
+    async fn teardown_peer_clears_the_desired_connect_spec() {
+        let state = test_state();
+        let diff_state = NetmapDiffState::new();
+        let (_secret, peer_public) = gen_keypair();
+        diff_state.desired_peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(
+            "device-b".to_string(),
+            PeerConnectSpec {
+                peer_public,
+                candidates: vec!["127.0.0.1:9".parse().unwrap()],
+                effective_group_ids: vec!["group-1".to_string()],
+            },
+        );
+
+        teardown_peer(&state, &diff_state, "device-b");
+
+        assert!(
+            !diff_state
+                .desired_peers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key("device-b"),
+            "teardown_peer must clear the desired connect spec so a reconnect attempt racing \
+             the abort finds nothing to reconnect to"
+        );
+    }
+
+    /// `run_one_peer_session_attempt` reads `desired_peers` fresh at the
+    /// START of every call, not once at supervisor-spawn time -- this is
+    /// the mechanism that lets a supervisor asleep in backoff pick up a
+    /// later netmap push's updated endpoint/groups instead of retrying a
+    /// stale one forever. Proven here at the boundary that actually matters
+    /// for correctness: no entry at all means no session is established
+    /// (rather than connecting with some leftover/default spec).
+    #[tokio::test]
+    async fn run_one_peer_session_attempt_is_a_no_op_with_no_desired_spec() {
+        let state = test_state();
+        let diff_state = NetmapDiffState::new();
+        let keypair = Arc::new(DeviceKeyPair::generate());
+
+        run_one_peer_session_attempt(&state, &keypair, "local-device", "device-b", &diff_state, 0)
+            .await;
+
+        assert!(
+            !state.peers.has_session("device-b"),
+            "an attempt with no desired connect spec for the peer must never establish a session"
+        );
+        assert!(!diff_state
+            .channels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key("device-b"));
+    }
+
+    /// The end-to-end reconnect contract `spawn_peer_session`'s doc comment
+    /// promises: a session that ends NATURALLY (here, the exact-generation
+    /// handshake's own bounded retries all timing out against a peer that
+    /// never answers -- not a `teardown_peer` revoke) must be followed by a
+    /// second connect attempt, not silence. `session_index` incrementing
+    /// past its first value is the observable proof a second
+    /// `PeerChannel::connect` actually happened; a paused clock advanced in
+    /// steps makes the real ~11s handshake-timeout budget plus reconnect
+    /// backoff resolve without the test taking anywhere near that long in
+    /// wall-clock time.
+    #[tokio::test(start_paused = true)]
+    async fn spawn_peer_session_reconnects_after_the_session_ends_naturally() {
+        let state = test_state();
+        let diff_state = NetmapDiffState::new();
+        let keypair = Arc::new(DeviceKeyPair::generate());
+        let (_peer_secret, peer_public) = gen_keypair();
+        // Never answers -- so the exact-generation handshake preflight
+        // exhausts its own bounded retries and the session ends on its
+        // own, exactly the "natural end" case this reconnect loop exists
+        // for (as opposed to a revoke, which a different test already
+        // covers via `teardown_peer_aborts_the_session_task`).
+        let candidate: StdSocketAddr = "127.0.0.1:9".parse().unwrap();
+        diff_state.desired_peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(
+            "device-b".to_string(),
+            PeerConnectSpec {
+                peer_public,
+                candidates: vec![candidate],
+                effective_group_ids: vec![],
+            },
+        );
+        let session_index = Arc::new(AtomicU32::new(0));
+        let _handle = spawn_peer_session(
+            state.clone(),
+            keypair,
+            "local-device".to_string(),
+            "device-b".to_string(),
+            diff_state.clone(),
+            session_index.clone(),
+        );
+
+        // Advance in bounded steps (not one giant jump) so every timer this
+        // loop sets along the way -- each of the 4 handshake-attempt
+        // timeouts, then the reconnect backoff sleep -- actually gets to
+        // fire and let the supervisor task re-poll and set its next timer,
+        // rather than the paused clock racing past several of them before
+        // the task has had a chance to observe any of them elapsing.
+        let mut observed_second_attempt = false;
+        for _ in 0..80 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            if session_index.load(Ordering::Relaxed) >= 2 {
+                observed_second_attempt = true;
+                break;
+            }
+        }
+
+        assert!(
+            observed_second_attempt,
+            "the supervisor must start a second connect attempt after the first session ends \
+             naturally (handshake timeout, not a revoke) -- got session_index={}",
+            session_index.load(Ordering::Relaxed)
         );
     }
 

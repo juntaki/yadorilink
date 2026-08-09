@@ -5,10 +5,11 @@
 //! evolve independently. If either essential loop exits, this wrapper exits and
 //! `DaemonState`'s existing `spawn_restarting` supervision restarts both.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use yadorilink_peer_session::peer_session::RetirementAttempt;
 use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::session_state::RetroactiveRepairOutcome;
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
@@ -16,6 +17,16 @@ use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 use crate::daemon_state::DaemonState;
 
 const REPAIR_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// The retirement loop's own backstop cadence, now that
+/// `RetirementWake`-driven events (DAG frontier advanced, materialization
+/// job completed) are its primary trigger -- see
+/// `run_ephemeral_conflict_copy_retire_loop`'s own doc comment. Kept far
+/// looser than a correctness-critical poll needs to be: this pass exists
+/// only to catch a group whose dirty mark was somehow lost (a crash between
+/// the state change and the `notify_retirement_wake` call, or a group
+/// linked after an earlier mark for it was already drained), not to carry
+/// ordinary retirement latency.
+const RETIREMENT_BACKSTOP_INTERVAL: Duration = Duration::from_secs(30);
 /// Each rank gets an exclusive window before the next deterministic fallback
 /// becomes eligible. This only suppresses duplicate work: after enough
 /// unchanged-frontier windows every authorized writer may act.
@@ -28,135 +39,180 @@ fn eligible_rank_for_elapsed(elapsed: Duration) -> usize {
 }
 
 pub async fn run(state: Arc<DaemonState>) {
-    // Each loop is spawned as its own task, tracked in a `JoinSet`, rather
-    // than raced directly via `tokio::select!` on the bare futures:
-    // `run_retroactive_repair_loop` calls several synchronous, blocking
-    // `SyncState` methods; racing that future directly alongside the main
-    // engine's on the SAME task would let a slow synchronous call in this
-    // poll starve the engine's own tick for as long as it runs (`select!`
-    // only gets to poll whichever branch it currently has control in) --
-    // exactly the kind of added per-tick latency the row-14 stress
-    // scenario's stall detector is tuned to catch. Spawning each onto its
-    // own task lets tokio schedule them on genuinely separate worker
-    // threads (the blocking `SyncState` calls inside the repair loop are
-    // themselves further isolated via `spawn_blocking` at each call site
-    // below, since a plain `tokio::spawn` alone only guarantees a
-    // *possibly*-different async worker thread, not the dedicated blocking
-    // pool -- see `run_retroactive_repair_loop`'s own doc comment).
+    // Each loop is spawned as its own task rather than raced directly via
+    // `tokio::select!` on the bare futures: `run_retroactive_repair_loop`
+    // calls several synchronous, blocking `SyncState` methods; racing that
+    // future directly alongside the main engine's on the SAME task would
+    // let a slow synchronous call in this poll starve the engine's own tick
+    // for as long as it runs (`select!` only gets to poll whichever branch
+    // it currently has control in) -- exactly the kind of added per-tick
+    // latency the row-14 stress scenario's stall detector is tuned to
+    // catch. Spawning each onto its own task lets tokio schedule them on
+    // genuinely separate worker threads (the blocking `SyncState` calls
+    // inside the repair loop are themselves further isolated via
+    // `spawn_blocking` at each call site below, since a plain
+    // `tokio::spawn` alone only guarantees a *possibly*-different async
+    // worker thread, not the dedicated blocking pool -- see
+    // `run_retroactive_repair_loop`'s own doc comment).
     //
-    // `JoinSet::shutdown` -- not a bare `tokio::select!` over the two
-    // `JoinHandle`s -- gives the "either dies, both restart" semantics this
-    // wrapper's own doc comment describes: a `JoinHandle` a `select!`
-    // branch drops only DETACHES its task rather than cancelling it (it
-    // keeps running), so `spawn_restarting`'s subsequent restart would
-    // otherwise leave the old survivor running undetached alongside a
-    // brand new pair of tasks -- duplicate materialization engines or
-    // duplicate repair loops, compounding on every restart. `shutdown`
-    // aborts every task still in the set and awaits their completion, so
-    // this function never returns while either task is still alive.
+    // Explicit abort-and-await of the two survivors below, not a bare
+    // `tokio::select!` on the three `JoinHandle`s alone, gives the "either
+    // dies, all restart" semantics this wrapper's own doc comment
+    // describes: a `JoinHandle` a `select!` branch drops only DETACHES its
+    // task rather than cancelling it (it keeps running), so
+    // `spawn_restarting`'s subsequent restart would otherwise leave the old
+    // survivors running undetached alongside a brand new set of tasks --
+    // duplicate materialization engines or repair loops, compounding on
+    // every restart. `tokio::task::JoinSet` would give this same shape more
+    // directly, but is unavailable under `madsim-tokio`'s shim (no
+    // `JoinSet` at all), so this manual select-then-abort-and-await
+    // reproduces its exact "aborts every remaining task and awaits their
+    // completion" contract explicitly -- this function never returns while
+    // any of the three tasks is still alive.
     let engine_state = state.clone();
     let retire_state = state.clone();
-    let mut tasks = tokio::task::JoinSet::new();
-    tasks.spawn(super::engine_impl::run(engine_state));
-    tasks.spawn(run_retroactive_repair_loop(state));
-    tasks.spawn(run_ephemeral_conflict_copy_retire_loop(retire_state));
-    let _ = tasks.join_next().await;
-    tasks.shutdown().await;
+    let mut engine_handle = tokio::spawn(super::engine_impl::run(engine_state));
+    let mut repair_handle = tokio::spawn(run_retroactive_repair_loop(state));
+    let mut retire_handle = tokio::spawn(run_ephemeral_conflict_copy_retire_loop(retire_state));
+    tokio::select! {
+        _ = &mut engine_handle => {}
+        _ = &mut repair_handle => {}
+        _ = &mut retire_handle => {}
+    }
+    for handle in [&mut engine_handle, &mut repair_handle, &mut retire_handle] {
+        handle.abort();
+        let _ = handle.await;
+    }
 }
 
-/// Independent loop driving `PeerSyncSession::reconcile_local_materialization_
-/// audit` -- whose own body is what actually retires an ephemeral conflict
-/// copy once its losing branch is superseded -- for every linked group on
-/// its own interval, exactly like `run_retroactive_repair_loop` above.
+/// Retires ephemeral conflict copies -- ones whose losing branch has since
+/// been superseded with no cross-branch merge, so no admitted change ever
+/// carries them, and a device that already materialized one keeps it
+/// forever while a device that first reconciles after the window closed
+/// never derives it: byte-identical DAGs, permanently different file sets
+/// (see `PeerSyncSession::retire_unjustified_ephemeral_conflict_copies`'s
+/// own doc comment). Confirmed live: `row14_strict_acceptance` stalled with
+/// one device (out of six, all on an identical three-head DAG frontier)
+/// holding a conflict copy every device's own `resolve_path_heads` agreed
+/// was no longer required.
 ///
-/// Without this loop, that audit was reachable only through the legacy
-/// periodic materialization-repair sweep in `daemon_state.rs` (its sole
-/// caller before this loop existed). Stage 2's Convergence Engine
-/// (`engine.rs`) drives ordinary path reconciliation through
-/// `reconcile_paths_directly` instead, which never calls the audit or its
-/// retire step at all. A group whose sweep interval is long -- or, as
-/// `row14_strict_acceptance` sets for its own strict acceptance bar,
-/// disabled for the whole run, specifically to prove the Convergence
-/// Engine's own mechanism converges without the legacy sweep's help --
-/// then had no path left that ever retired a conflict copy the projection
-/// fixpoint materialized while its losing branch was transiently live: once
-/// that branch is superseded with no cross-branch merge (so no change ever
-/// carries the copy), a device that already materialized it keeps it
-/// forever, while a device that first reconciles after the window closed
-/// never derives it -- byte-identical DAGs, permanently different file
-/// sets. Confirmed live: `row14_strict_acceptance` stalled with one device
-/// (out of six, all on an identical three-head DAG frontier) holding a
-/// conflict copy every device's own `resolve_path_heads` agreed was no
-/// longer required (`conflict_copies=[]` everywhere) -- nothing had ever
-/// run the retire audit for it. This loop makes that audit, and therefore
-/// its retire step, a first-class, always-on part of the Convergence
-/// Engine's own machinery instead of only the legacy sweep's.
+/// Primarily event-driven, not polled: `RetirementWake::mark_dirty` fires
+/// after exactly the two events that can change a copy's justification --
+/// this device's own DAG frontier advancing (locally authored or admitted
+/// from a peer) and a materialization job reaching `Completed` -- so this
+/// loop reacts within one wake rather than waiting up to a whole poll
+/// interval. `RETIREMENT_BACKSTOP_INTERVAL` remains as a correctness
+/// backstop only, for a mark lost to a crash or a race with linking, not as
+/// the primary liveness path the way the old flat 1s poll was. Before this
+/// loop existed at all, this audit was reachable only through the legacy
+/// periodic materialization-repair sweep in `daemon_state.rs`; Stage 2's
+/// Convergence Engine (`engine.rs`) drives ordinary path reconciliation
+/// through `reconcile_paths_directly` instead, which never calls it. A
+/// group whose sweep interval is long -- or, as `row14_strict_acceptance`
+/// sets for its own strict acceptance bar, disabled for the whole run,
+/// specifically to prove the Convergence Engine's own mechanism converges
+/// without the legacy sweep's help -- then had no path left that ever
+/// retired a copy at all.
 async fn run_ephemeral_conflict_copy_retire_loop(state: Arc<DaemonState>) {
     loop {
-        let replica_coordinator_for_links = state.replica_coordinator.clone();
-        let groups = match tokio::task::spawn_blocking(move || {
-            replica_coordinator_for_links.link_repository().list_links()
-        })
-        .await
-        {
-            Ok(Ok(links)) => links
+        tokio::select! {
+            _ = state.replica_coordinator.retirement_wake().retirement_wake_notified() => {
+                let pending = state.replica_coordinator.retirement_wake().pending();
+                run_retirement_pass(&state, pending).await;
+            }
+            _ = tokio::time::sleep(RETIREMENT_BACKSTOP_INTERVAL) => {
+                if let Some(groups) = list_linked_groups_for_retirement(&state).await {
+                    // Backstop recovery for a mark lost before this
+                    // generation-tracked state existed for the group at
+                    // all (e.g. linked after an earlier drop, or after a
+                    // crash) -- `mark_dirty` makes every linked group
+                    // reportable by `pending`, matching the old flat
+                    // poll's "just re-check everything" behavior.
+                    for group_id in &groups {
+                        state.replica_coordinator.retirement_wake().mark_dirty(group_id);
+                    }
+                    let pending = state.replica_coordinator.retirement_wake().pending();
+                    run_retirement_pass(&state, pending).await;
+                }
+            }
+        }
+    }
+}
+
+/// Every currently linked, non-paused, non-orphaned group -- the backstop
+/// pass's own candidate set, since (unlike an event-driven wake) it has no
+/// narrower dirty set to go on.
+async fn list_linked_groups_for_retirement(state: &Arc<DaemonState>) -> Option<BTreeSet<String>> {
+    let replica_coordinator_for_links = state.replica_coordinator.clone();
+    match tokio::task::spawn_blocking(move || {
+        replica_coordinator_for_links.link_repository().list_links()
+    })
+    .await
+    {
+        Ok(Ok(links)) => Some(
+            links
                 .into_iter()
                 .filter(|link| !link.paused && !link.orphaned)
                 .map(|link| link.group_id)
-                .collect::<BTreeSet<_>>(),
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "ephemeral conflict-copy retire audit could not list links");
-                tokio::time::sleep(REPAIR_POLL_INTERVAL).await;
-                continue;
-            }
-            Err(error) => {
-                tracing::error!(
-                    %error,
-                    "ephemeral conflict-copy retire audit's list_links task panicked"
-                );
-                tokio::time::sleep(REPAIR_POLL_INTERVAL).await;
-                continue;
-            }
-        };
+                .collect(),
+        ),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "ephemeral conflict-copy retire audit could not list links");
+            None
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "ephemeral conflict-copy retire audit's list_links task panicked"
+            );
+            None
+        }
+    }
+}
 
-        for group_id in groups {
-            // Any currently-connected peer session for this group can run
-            // the audit -- it is driven by this device's own local DAG/file
-            // state (`self.state`), not by which specific peer object it is
-            // invoked through. Trying every candidate in turn (rather than
-            // just the first) matches the legacy sweep's own resilience to
-            // one stale/erroring session without giving up on the group for
-            // a whole poll interval.
-            let candidates = crate::hydration::candidate_sessions(&state, &group_id);
-            let mut last_error = None;
-            for (peer_id, session) in &candidates {
-                match session.clone().reconcile_local_materialization_audit(&group_id).await {
-                    Ok(_) => {
-                        last_error = None;
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            %group_id,
-                            peer = %peer_id,
-                            %error,
-                            "ephemeral conflict-copy retire audit peer failed; trying another peer"
-                        );
-                        last_error = Some(error);
-                    }
-                }
+/// Runs `ConvergenceRetirementService::reconcile_group` for each group in
+/// `pending` (group id -> the generation `RetirementWake::pending` reported
+/// for it) -- no live peer session involved (see
+/// `DaemonState::local_retirement_session`'s own doc comment for why
+/// retirement's own decision was never actually dependent on which, or
+/// any, peer happened to be connected). `RetirementWake::complete` is
+/// called for a group ONLY when `settles_generation` says the outcome was
+/// `RetirementAttempt::Settled` -- see that function's and
+/// `RetirementAttempt`'s own doc comments for why `Busy` and
+/// `RetryRequired` must not be treated as completions. Not completing
+/// leaves the group in `pending` with no separate re-mark needed -- see
+/// `RetirementWake::pending`'s own doc comment.
+async fn run_retirement_pass(state: &Arc<DaemonState>, pending: BTreeMap<String, u64>) {
+    let service = super::retirement_service::ConvergenceRetirementService::new(state.clone());
+    for (group_id, generation) in pending {
+        match service.reconcile_group(&group_id).await {
+            Ok(attempt) if settles_generation(&attempt) => {
+                state.replica_coordinator.retirement_wake().complete(&group_id, generation);
             }
-            if let Some(error) = last_error {
+            // `Busy` (a full audit already holds this group's guard) or
+            // `RetryRequired` (ran, but at least one copy's evaluation was
+            // not verified against the targeted frontier) -- neither
+            // settles this pass's target generation. Left pending; the
+            // next wake or backstop tries again.
+            Ok(_) => {}
+            Err(error) => {
                 tracing::warn!(
                     %group_id,
                     %error,
-                    "ephemeral conflict-copy retire audit failed for every connected peer this tick"
+                    "ephemeral conflict-copy retire audit failed"
                 );
             }
         }
-
-        tokio::time::sleep(REPAIR_POLL_INTERVAL).await;
     }
+}
+
+/// Whether `attempt` means the pass that produced it may be treated as
+/// having genuinely verified the frontier generation it targeted -- the
+/// single place the "only `Settled` completes a generation" contract is
+/// enforced, factored out so a test can exercise the decision without any
+/// `PeerSyncSession`/`DaemonState` plumbing.
+fn settles_generation(attempt: &RetirementAttempt) -> bool {
+    matches!(attempt, RetirementAttempt::Settled { .. })
 }
 
 /// Every direct `SyncState` call in this loop's body is wrapped in
@@ -349,5 +405,75 @@ mod tests {
         assert_eq!(eligible_rank_for_elapsed(Duration::from_secs(5)), 1);
         assert_eq!(eligible_rank_for_elapsed(Duration::from_millis(14_999)), 2);
         assert_eq!(eligible_rank_for_elapsed(Duration::from_secs(15)), 3);
+    }
+
+    #[test]
+    fn only_settled_settles_generation() {
+        assert!(settles_generation(&RetirementAttempt::Settled { retired: 0 }));
+        assert!(settles_generation(&RetirementAttempt::Settled { retired: 3 }));
+        assert!(!settles_generation(&RetirementAttempt::Busy));
+        assert!(!settles_generation(&RetirementAttempt::RetryRequired));
+    }
+
+    /// Guard-contention (`Busy`) failure injection: `RetirementWake::
+    /// complete` must not be called for the claimed generation, so the
+    /// group stays reported by `pending` for the next wake/backstop.
+    #[test]
+    fn busy_outcome_leaves_generation_pending() {
+        let wake = crate::sync_runtime::retirement_wake::RetirementWake::new();
+        wake.mark_dirty("g1");
+        let claimed = *wake.pending().get("g1").unwrap();
+        if settles_generation(&RetirementAttempt::Busy) {
+            wake.complete("g1", claimed);
+        }
+        assert_eq!(wake.pending().get("g1"), Some(&1));
+    }
+
+    /// Transient-retry failure injection: a `RetryRequired` outcome (a
+    /// copy's tombstone materialize hit a transient block/disk condition)
+    /// must equally not complete the claimed generation.
+    #[test]
+    fn retry_required_outcome_leaves_generation_pending() {
+        let wake = crate::sync_runtime::retirement_wake::RetirementWake::new();
+        wake.mark_dirty("g1");
+        let claimed = *wake.pending().get("g1").unwrap();
+        if settles_generation(&RetirementAttempt::RetryRequired) {
+            wake.complete("g1", claimed);
+        }
+        assert_eq!(wake.pending().get("g1"), Some(&1));
+    }
+
+    /// The core lost-wakeup regression test: an event landing WHILE a
+    /// pass is auditing generation 1 must not be swallowed by that pass's
+    /// own (successful) completion -- it must provoke exactly one
+    /// follow-up audit, which then settles cleanly with no event left
+    /// over.
+    #[test]
+    fn event_during_audit_provokes_exactly_one_follow_up_audit() {
+        let wake = crate::sync_runtime::retirement_wake::RetirementWake::new();
+        wake.mark_dirty("g1");
+        let claimed_generation_1 = *wake.pending().get("g1").unwrap();
+        assert_eq!(claimed_generation_1, 1);
+
+        // A DAG admission (or job completion) lands while the pass that
+        // claimed generation 1 is still auditing.
+        wake.mark_dirty("g1");
+
+        // That in-flight pass finishes and reports success for the
+        // generation it actually claimed, not the new one.
+        if settles_generation(&RetirementAttempt::Settled { retired: 1 }) {
+            wake.complete("g1", claimed_generation_1);
+        }
+
+        // Exactly one follow-up audit's worth of pending work remains --
+        // the mid-audit event was not lost.
+        let pending = wake.pending();
+        assert_eq!(pending.get("g1"), Some(&2));
+
+        let claimed_generation_2 = *pending.get("g1").unwrap();
+        if settles_generation(&RetirementAttempt::Settled { retired: 0 }) {
+            wake.complete("g1", claimed_generation_2);
+        }
+        assert!(wake.pending().is_empty());
     }
 }

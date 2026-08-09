@@ -78,8 +78,12 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
         Arc::new(ReplicaCoordinator::open_in_memory().map_err(|e| format!("sync state: {e}"))?);
     dst_support::link::link_and_start(&sync_state, &root, GROUP_ID)
         .map_err(|e| format!("link_and_start: {e}"))?;
-    let processor =
-        LocalChangeProcessor::new(sync_state.clone(), store.clone(), DEVICE_ID.to_string());
+    let processor = LocalChangeProcessor::new(
+        sync_state.clone(),
+        store.clone(),
+        DEVICE_ID.to_string(),
+        Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+    );
 
     let (watch_source, events_tx) = SimulatedFolderWatchSource::new(64);
     let ignore_set =

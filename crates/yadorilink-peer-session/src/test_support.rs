@@ -125,6 +125,10 @@ struct Inner {
     /// wake-once-per-batch (not once-per-change) invariant `handle_change_
     /// batch`'s own `if !affected_paths.is_empty()` gate documents.
     notify_materialization_wake_count: usize,
+    /// Groups `notify_retirement_wake` has been called with, in call order
+    /// (duplicates kept) -- lets a test assert which groups an admission or
+    /// job-completion path actually marked dirty.
+    notify_retirement_wake_calls: Vec<String>,
 }
 
 /// The fake itself. `Arc`-wrapped by callers exactly like a real
@@ -188,6 +192,11 @@ impl FakeReplicaState {
     /// See `Inner::notify_materialization_wake_count`'s doc comment.
     pub fn notify_materialization_wake_count(&self) -> usize {
         self.lock().notify_materialization_wake_count
+    }
+
+    /// See `Inner::notify_retirement_wake_calls`'s doc comment.
+    pub fn notify_retirement_wake_calls(&self) -> Vec<String> {
+        self.lock().notify_retirement_wake_calls.clone()
     }
 
     pub fn set_link_gate(&self, group_id: &str, gate: LinkGate) {
@@ -298,13 +307,6 @@ impl FakeReplicaState {
     }
 
     pub fn mark_group_ready(&self, _group_id: &str, _generation: u64) {}
-
-    /// Mirrors `SyncState::dag_has_change` (distinct from the port's own
-    /// `dag_has_change_or_pruned`, which this fake -- never pruning --
-    /// answers identically anyway).
-    pub fn dag_has_change(&self, hash: &ChangeHash) -> Result<bool, PeerSessionError> {
-        Ok(self.lock().changes.contains_key(hash))
-    }
 
     /// Mirrors `SyncState::dag_has_change_or_buffered_orphan`.
     pub fn dag_has_change_or_buffered_orphan(
@@ -705,6 +707,10 @@ impl PeerReplicaStatePort for FakeReplicaState {
         self.lock().notify_materialization_wake_count += 1;
     }
 
+    fn notify_retirement_wake(&self, group_id: &str) {
+        self.lock().notify_retirement_wake_calls.push(group_id.to_string());
+    }
+
     fn is_path_dirty(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
         Ok(self
             .lock()
@@ -813,6 +819,10 @@ impl PeerReplicaStatePort for FakeReplicaState {
             .filter(|(hash, c)| c.group_id.as_str() == group_id && !inner.applied.contains(*hash))
             .map(|(_, c)| c.clone())
             .collect())
+    }
+
+    fn dag_has_change(&self, hash: &ChangeHash) -> Result<bool, PeerSessionError> {
+        Ok(self.lock().changes.contains_key(hash))
     }
 
     fn dag_has_change_or_pruned(

@@ -84,7 +84,9 @@ use yadorilink_filesystem_sync::watcher::{
 };
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_peer_session::peer_session::{PeerSyncSession, PendingLocalChangeFlush};
+use yadorilink_peer_session::peer_session::{
+    PeerSyncSession, PendingLocalChangeFlush, PendingLocalFlushOutcome,
+};
 use yadorilink_transport::PeerChannel;
 
 const GROUP_ID: &str = "dst-generated-sweep-group";
@@ -181,7 +183,7 @@ impl PendingLocalChangeFlush for ChaosDevice {
         &'a self,
         group_id: &'a str,
         rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
         Box::pin(async move {
             let path = self.root.join(rel_path);
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -195,7 +197,7 @@ impl PendingLocalChangeFlush for ChaosDevice {
                 .await
                 .is_err()
             {
-                return;
+                return PendingLocalFlushOutcome::Settled;
             }
             let found = match tokio::time::timeout(Duration::from_millis(500), reply_rx).await {
                 Ok(Ok(found)) => found,
@@ -206,7 +208,7 @@ impl PendingLocalChangeFlush for ChaosDevice {
             // `return` here is silently lossy.
             let Some((found_path, kind, observed_at)) = found else {
                 self.capture_undiscovered_local_change(group_id, &path).await;
-                return;
+                return PendingLocalFlushOutcome::Settled;
             };
             if let Ok(outcome) = self
                 .processor
@@ -226,6 +228,7 @@ impl PendingLocalChangeFlush for ChaosDevice {
                     }
                 }
             }
+            PendingLocalFlushOutcome::Settled
         })
     }
 
@@ -233,7 +236,7 @@ impl PendingLocalChangeFlush for ChaosDevice {
         &'a self,
         group_id: &'a str,
         rel_path: &'a str,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = PendingLocalFlushOutcome> + Send + 'a>> {
         Box::pin(async move {
             let path = self.root.join(rel_path);
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -247,13 +250,15 @@ impl PendingLocalChangeFlush for ChaosDevice {
                 .await
                 .is_err()
             {
-                return;
+                return PendingLocalFlushOutcome::Settled;
             }
             let found = match tokio::time::timeout(Duration::from_millis(500), reply_rx).await {
                 Ok(Ok(found)) => found,
                 _ => None,
             };
-            let Some((sibling_path, kind, observed_at)) = found else { return };
+            let Some((sibling_path, kind, observed_at)) = found else {
+                return PendingLocalFlushOutcome::Settled;
+            };
             if let Ok(outcome) = self
                 .processor
                 .process_flush(
@@ -271,6 +276,7 @@ impl PendingLocalChangeFlush for ChaosDevice {
                     }
                 }
             }
+            PendingLocalFlushOutcome::Settled
         })
     }
 }
@@ -282,7 +288,12 @@ fn authoring_of(
     device: &ChaosDevice,
     path: &str,
 ) -> Option<yadorilink_replica_domain::ids::ChangeHash> {
-    device.state.dag_last_authored_change_for_path(GROUP_ID, &device.device_id, path).ok().flatten()
+    device
+        .state
+        .change_history_repository()
+        .dag_last_authored_change_for_path(GROUP_ID, &device.device_id, path)
+        .ok()
+        .flatten()
 }
 
 fn setup_device(
@@ -292,8 +303,13 @@ fn setup_device(
     store: Arc<FsBlockStore>,
 ) -> Arc<ChaosDevice> {
     let processor = Arc::new(
-        LocalChangeProcessor::new(sync_state.clone(), store, device_id.to_string())
-            .with_change_emitter(dst_dag_migrate_b2::emitter_for(device_id)),
+        LocalChangeProcessor::new(
+            sync_state.clone(),
+            store,
+            device_id.to_string(),
+            Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+        )
+        .with_change_emitter(dst_dag_migrate_b2::emitter_for(device_id)),
     );
     let (flush_request_tx, flush_request_rx) = tokio::sync::mpsc::channel(4);
     let (watch_source, events_tx) = SimulatedFolderWatchSource::new(32);
@@ -405,9 +421,15 @@ async fn connect_sessions(
     // forwarding channel (`new_with_forwarding` + a re-`send_index_update`
     // loop) is dropped: both devices run the plain session and converge by
     // pulling each other's announced heads.
+    // Pin both devices' verifying keys -- moved ahead of session construction
+    // since `ChangeAuthenticator`/`PendingLocalChangeFlush` are now
+    // construction-only `PeerSyncSessionDeps` fields, not post-hoc setters.
+    let device_ids = [device_a.device_id.as_str(), device_b.device_id.as_str()];
+    let authenticator = dst_dag_migrate_b2::PinnedAuthenticator::new(device_ids);
+
     let mut sync_roots_a = HashMap::new();
     sync_roots_a.insert(GROUP_ID.to_string(), device_a.root.clone());
-    let session_a = PeerSyncSession::new(
+    let session_a = PeerSyncSession::new_with_dependencies(
         channel_a,
         device_a.device_id.clone(),
         device_b.device_id.clone(),
@@ -415,11 +437,20 @@ async fn connect_sessions(
         store_a,
         vec![GROUP_ID.to_string()],
         sync_roots_a,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            root_commit_authority_provider: std::sync::Arc::new(
+                dst_support::link::TestRootCommitAuthorityProvider,
+            ),
+            pending_local_change_flush: device_a.clone(),
+            change_authenticator: authenticator.clone(),
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
 
     let mut sync_roots_b = HashMap::new();
     sync_roots_b.insert(GROUP_ID.to_string(), device_b.root.clone());
-    let session_b = PeerSyncSession::new(
+    let session_b = PeerSyncSession::new_with_dependencies(
         channel_b,
         device_b.device_id.clone(),
         device_a.device_id.clone(),
@@ -427,16 +458,23 @@ async fn connect_sessions(
         store_b,
         vec![GROUP_ID.to_string()],
         sync_roots_b,
+        None,
+        yadorilink_peer_session::peer_session::PeerSyncSessionDeps {
+            root_commit_authority_provider: std::sync::Arc::new(
+                dst_support::link::TestRootCommitAuthorityProvider,
+            ),
+            pending_local_change_flush: device_b.clone(),
+            change_authenticator: authenticator,
+            ..yadorilink_peer_session::peer_session::PeerSyncSessionDeps::standalone()
+        },
     );
 
     device_a.session.set(session_a.clone()).ok();
     device_b.session.set(session_b.clone()).ok();
-    session_a.set_pending_local_change_flush(device_a.clone());
-    session_b.set_pending_local_change_flush(device_b.clone());
 
-    // Pin both devices' verifying keys and shorten the heads-announce cadence
-    // so DAG catch-up re-drives promptly under fault.
-    let device_ids = [device_a.device_id.as_str(), device_b.device_id.as_str()];
+    // Shorten the heads-announce cadence so DAG catch-up re-drives promptly
+    // under fault (the authenticator above is now already wired at
+    // construction).
     let group_ids = [GROUP_ID];
     dst_dag_migrate_b2::wire_dag_session(
         &session_a,
@@ -470,8 +508,8 @@ async fn poll_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
 /// still-diverging base. Returns whether it converged within the budget.
 async fn converge_path(a: &ChaosDevice, b: &ChaosDevice, path: &str) -> bool {
     dst_support::settle::settle_until(PER_PATH_CONVERGE_BUDGET, || {
-        let fa = a.state.get_file(GROUP_ID, path).ok().flatten();
-        let fb = b.state.get_file(GROUP_ID, path).ok().flatten();
+        let fa = a.state.file_index_repository().get_file(GROUP_ID, path).ok().flatten();
+        let fb = b.state.file_index_repository().get_file(GROUP_ID, path).ok().flatten();
         match (&fa, &fb) {
             (None, None) => true,
             (Some(x), Some(y)) => {
@@ -479,8 +517,16 @@ async fn converge_path(a: &ChaosDevice, b: &ChaosDevice, path: &str) -> bool {
                 // of a per-file counter: two replicas agree exactly when the
                 // same signed change authored the row they each project.
                 x == y
-                    && a.state.get_authoring_change_hash(GROUP_ID, path).ok().flatten()
-                        == b.state.get_authoring_change_hash(GROUP_ID, path).ok().flatten()
+                    && a.state
+                        .file_index_repository()
+                        .get_authoring_change_hash(GROUP_ID, path)
+                        .ok()
+                        .flatten()
+                        == b.state
+                            .file_index_repository()
+                            .get_authoring_change_hash(GROUP_ID, path)
+                            .ok()
+                            .flatten()
             }
             _ => false,
         }

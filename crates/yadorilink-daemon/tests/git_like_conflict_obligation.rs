@@ -24,7 +24,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
-use support::{open_file_backed_replica_coordinator, real_entry_names, wait_until_with_context};
+use support::{
+    open_file_backed_replica_coordinator, real_entry_names, wait_until_or_stalled,
+    wait_until_with_context,
+};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::FsBlockStore;
@@ -33,6 +36,18 @@ type Snapshot = HashMap<String, String>;
 
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(90);
 const STABILITY_WINDOW: Duration = Duration::from_millis(1_500);
+// Late-observer catch-up (`assert_late_observers_match`) has more ground to
+// cover than `settle_pair`'s direct convergence -- it replays the whole
+// ancestry through a fresh full sync -- and shares `settle_pair`'s
+// vulnerability to macOS hosted runners' slow/shared SQLite lock
+// contention. A fixed 90s deadline made
+// `multi_file_checkout_rewrite_preserves_every_loser_for_late_clones` flake
+// under CI load even though it was still making progress. Same
+// absolute-deadline-plus-stall-detector split `taguchi_collision_matrix.rs`
+// uses: a generous ceiling for genuinely slow-but-healthy convergence, and a
+// much tighter stall window that still fails fast on a real deadlock.
+const LATE_OBSERVER_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(180);
+const LATE_OBSERVER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct TestDevice {
     device_id: String,
@@ -260,9 +275,15 @@ async fn assert_late_observers_match(
     late_b: &TestDevice,
 ) {
     let devices = [source_a, source_b, late_a, late_b];
-    wait_until_with_context(
+    wait_until_or_stalled(
         || devices.iter().all(|device| snapshot(device.root.path()) == *expected),
-        SETTLE_TIMEOUT,
+        // Progress fingerprint: every device's own snapshot. Changes
+        // whenever any device's on-disk state moves at all, not just when
+        // they happen to already agree (which is what `cond` above checks,
+        // and is `false` for the entire interior of a real catch-up).
+        || devices.iter().map(|d| snapshot(d.root.path())).collect::<Vec<_>>(),
+        LATE_OBSERVER_ABSOLUTE_TIMEOUT,
+        LATE_OBSERVER_STALL_TIMEOUT,
         || snapshots_summary(&devices),
     )
     .await;
