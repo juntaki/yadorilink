@@ -63,10 +63,13 @@ struct CatalogNode {
 
 enum FileProviderCatalog {
     /// Fetches and decodes `yadorilink_fp_list_on_demand_folders`. Empty
-    /// on any decode failure — the daemon side already fails soft to
-    /// `"[]"` on its own errors (see fileprovider-core/src/lib.rs), so a
-    /// decode failure here would only indicate a schema mismatch, which
-    /// should never crash a synchronous OS-facing call.
+    /// on a NULL return (the daemon side returns NULL, not `"[]"`, when it
+    /// can't confirm the desired state — see fileprovider-core/src/lib.rs)
+    /// or a decode failure. This call site only needs its own folder's
+    /// entry to re-derive `localPath`, not a reconciliation snapshot, so
+    /// collapsing "can't confirm" and "confirmed empty" back to `[]` here
+    /// is fine — unlike `DomainRegistration.swift`'s add/remove
+    /// reconciliation, which must keep them distinct.
     static func listOnDemandFolders() -> [RemoteOnDemandFolder] {
         guard let json = yadorilink_fp_list_on_demand_folders() else { return [] }
         defer { yadorilink_fp_free_string(json) }

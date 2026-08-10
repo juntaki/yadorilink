@@ -457,6 +457,7 @@
 					"@executable_path/../Frameworks",
 				);
 				LIBRARY_SEARCH_PATHS = "../fileprovider-core/target/aarch64-apple-darwin/release";
+				MACOSX_DEPLOYMENT_TARGET = 12.0;
 				OTHER_LDFLAGS = "-lyadorilink_fileprovider_core -liconv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink;
 				PRODUCT_NAME = YadoriLinkFinderSyncHost;
@@ -477,6 +478,7 @@
 					"@executable_path/../Frameworks",
 				);
 				LIBRARY_SEARCH_PATHS = "../fileprovider-core/target/aarch64-apple-darwin/release";
+				MACOSX_DEPLOYMENT_TARGET = 12.0;
 				OTHER_LDFLAGS = "-lyadorilink_fileprovider_core -liconv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.juntaki.yadorilink;
 				PRODUCT_NAME = YadoriLinkFinderSyncHost;

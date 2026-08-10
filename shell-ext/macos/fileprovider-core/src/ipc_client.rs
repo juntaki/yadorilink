@@ -118,7 +118,7 @@ pub fn real_home_dir_string() -> String {
     real_home_dir().to_string_lossy().into_owned()
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct OnDemandFolderInfo {
     pub local_path: String,
     pub group_id: String,
@@ -129,33 +129,145 @@ pub struct OnDemandFolderInfo {
 /// `ListOnDemandFoldersRequest`/`Response` pair already added to
 /// shellipc.proto (see this crate's module doc — added by the parallel
 /// Windows cfapi work for the identical need, reused here rather than
-/// inventing a second protocol surface). Empty on any failure
-/// (unreachable daemon, timeout) — the caller (host app, at domain-
-/// registration time) is expected to just skip registration and retry
-/// on next launch/poll, not crash or block.
-pub fn list_on_demand_folders() -> Vec<OnDemandFolderInfo> {
+/// inventing a second protocol surface). The daemon's own handler
+/// (`shell_ipc.rs`'s `ListOnDemandFoldersRequest` arm) answers straight
+/// from the persisted link table (`link_repository().list_links()`,
+/// filtered to `OnDemand` and not orphaned) — this response IS the
+/// authoritative desired-registration-state snapshot, not a cache of it.
+///
+/// `None` on any failure (unreachable daemon, timeout, malformed
+/// response, or an explicit `snapshot_available: false` from the daemon
+/// itself — see `shellipc.proto`'s own doc comment on that field) —
+/// deliberately distinct from `Some(vec![])`, a *confirmed* "no OnDemand
+/// folders exist right now" snapshot. The caller
+/// (`DomainRegistration.registerOnDemandDomains`, which reconciles by
+/// both registering missing domains AND removing stale ones) must treat
+/// `None` as "cannot currently reconcile, leave existing registrations
+/// untouched" — collapsing this into an empty `Vec` the way earlier code
+/// did would make a transient daemon-unreachable moment look identical to
+/// "every domain should be removed," which is exactly the fail-open
+/// mistake a snapshot-based reconciliation must not make.
+pub fn list_on_demand_folders() -> Option<Vec<OnDemandFolderInfo>> {
     runtime().block_on(async {
-        tokio::time::timeout(ENUMERATION_TIMEOUT, list_on_demand_folders_inner())
-            .await
-            .unwrap_or_default()
+        tokio::time::timeout(ENUMERATION_TIMEOUT, list_on_demand_folders_inner()).await.ok()?
     })
 }
 
-async fn list_on_demand_folders_inner() -> Vec<OnDemandFolderInfo> {
-    let Ok(mut stream) = connect().await else { return Vec::new() };
+async fn list_on_demand_folders_inner() -> Option<Vec<OnDemandFolderInfo>> {
+    let mut stream = connect().await.ok()?;
+    list_on_demand_folders_over(&mut stream).await
+}
+
+/// The stream-generic core of `list_on_demand_folders_inner`, split out
+/// so this load-bearing None-vs-Some distinction is testable against an
+/// in-memory duplex stream instead of a real Unix socket + daemon —
+/// mirrors `yadorilink-daemon`'s own `shell_ipc.rs::query_over<S>` split.
+async fn list_on_demand_folders_over<S>(stream: &mut S) -> Option<Vec<OnDemandFolderInfo>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let msg = ShellIpcMessage {
         payload: Some(Payload::ListOnDemandFoldersRequest(ListOnDemandFoldersRequest {})),
     };
-    if write_message(&mut stream, &msg).await.is_err() {
-        return Vec::new();
+    write_message(stream, &msg).await.ok()?;
+    match read_message::<ShellIpcMessage>(stream).await {
+        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListOnDemandFoldersResponse(r)) }))
+            if r.snapshot_available =>
+        {
+            Some(
+                r.folders
+                    .into_iter()
+                    .map(|f| OnDemandFolderInfo { local_path: f.local_path, group_id: f.group_id })
+                    .collect(),
+            )
+        }
+        _ => None,
     }
-    match read_message::<ShellIpcMessage>(&mut stream).await {
-        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListOnDemandFoldersResponse(r)) })) => r
-            .folders
-            .into_iter()
-            .map(|f| OnDemandFolderInfo { local_path: f.local_path, group_id: f.group_id })
-            .collect(),
-        _ => Vec::new(),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A duplex "server" half that writes `response` (if any) back after
+    /// reading whatever request arrives, then closes -- enough to drive
+    /// `list_on_demand_folders_over` through each branch without a real
+    /// daemon.
+    async fn respond_with(response: Option<ShellIpcMessage>) -> Option<Vec<OnDemandFolderInfo>> {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let _ = read_message::<ShellIpcMessage>(&mut server).await;
+            if let Some(response) = response {
+                let _ = write_message(&mut server, &response).await;
+            }
+            // Dropping `server` here closes the duplex from this end,
+            // so a caller expecting a response after a `None` (simulating
+            // "server closed the connection without answering") sees EOF
+            // rather than hanging.
+        });
+        let result = list_on_demand_folders_over(&mut client).await;
+        server_task.await.unwrap();
+        result
+    }
+
+    fn response(folders: Vec<OnDemandFolderInfo>, snapshot_available: bool) -> ShellIpcMessage {
+        ShellIpcMessage {
+            payload: Some(Payload::ListOnDemandFoldersResponse(
+                yadorilink_ipc_proto::shellipc::ListOnDemandFoldersResponse {
+                    folders: folders
+                        .into_iter()
+                        .map(|f| yadorilink_ipc_proto::shellipc::OnDemandFolder {
+                            local_path: f.local_path,
+                            group_id: f.group_id,
+                        })
+                        .collect(),
+                    snapshot_available,
+                },
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn confirmed_nonempty_snapshot_is_some() {
+        let folders = vec![OnDemandFolderInfo {
+            local_path: "/Users/x/A".to_string(),
+            group_id: "group-a".to_string(),
+        }];
+        let result = respond_with(Some(response(folders.clone(), true))).await;
+        assert_eq!(result, Some(folders));
+    }
+
+    #[tokio::test]
+    async fn confirmed_empty_snapshot_is_some_empty() {
+        let result = respond_with(Some(response(vec![], true))).await;
+        assert_eq!(result, Some(vec![]));
+    }
+
+    /// The exact daemon-side bug this whole change closes: a response
+    /// whose `snapshot_available` is `false` (the daemon could not
+    /// confirm the desired state, e.g. a DB read error) must be treated
+    /// identically to a transport failure, never as "confirmed empty."
+    #[tokio::test]
+    async fn unconfirmed_snapshot_with_folders_flag_false_is_none() {
+        let result = respond_with(Some(response(vec![], false))).await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn connection_closed_without_a_response_is_none() {
+        let result = respond_with(None).await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn wrong_payload_type_is_none() {
+        let wrong = ShellIpcMessage {
+            payload: Some(Payload::HydrateResponse(
+                yadorilink_ipc_proto::shellipc::HydrateResponse { ok: false, error: String::new() },
+            )),
+        };
+        let result = respond_with(Some(wrong)).await;
+        assert_eq!(result, None);
     }
 }
 
