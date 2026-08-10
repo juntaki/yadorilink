@@ -183,29 +183,47 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
         // provider (Windows cfapi) discover which linked folders are
         // OnDemand and enumerate their files to register sync roots and
         // create placeholders.
+        //
+        // `list_links()`'s `Err` must NOT collapse into an empty `Vec` here
+        // (a prior `unwrap_or_default()` did exactly that) -- a DB/read
+        // error is "cannot currently confirm the desired state," not "the
+        // desired state is confirmed empty." A macOS caller
+        // (`DomainRegistration.swift`) reconciles OS-level domain
+        // registrations against this response, including REMOVING
+        // registrations absent from it; silently reporting an empty
+        // snapshot on a transient read error would tell that caller to
+        // remove every registered domain. `snapshot_available` makes the
+        // distinction explicit on the wire instead of relying on the
+        // client inferring it from a transport-level failure.
         Some(Payload::ListOnDemandFoldersRequest(_)) => {
-            let folders = state
-                .replica_coordinator
-                .link_repository()
-                .list_links()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|l| {
-                    l.materialization_policy
-                        == yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand
-                        // An orphaned link's coordination-side authorization
-                        // is gone -- it must never be handed to the
-                        // platform virtual-filesystem provider as a sync
-                        // root to enumerate and register placeholders for.
-                        && !l.orphaned
-                })
-                .map(|l| OnDemandFolder { local_path: l.local_path, group_id: l.group_id })
-                .collect();
-            Some(ShellIpcMessage {
-                payload: Some(Payload::ListOnDemandFoldersResponse(ListOnDemandFoldersResponse {
-                    folders,
-                })),
-            })
+            let response = match state.replica_coordinator.link_repository().list_links() {
+                Ok(links) => {
+                    let folders = links
+                        .into_iter()
+                        .filter(|l| {
+                            l.materialization_policy
+                                == yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand
+                                // An orphaned link's coordination-side
+                                // authorization is gone -- it must never be
+                                // handed to the platform virtual-filesystem
+                                // provider as a sync root to enumerate and
+                                // register placeholders for.
+                                && !l.orphaned
+                        })
+                        .map(|l| OnDemandFolder { local_path: l.local_path, group_id: l.group_id })
+                        .collect();
+                    ListOnDemandFoldersResponse { folders, snapshot_available: true }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to list links for ListOnDemandFoldersRequest; reporting \
+                         snapshot_available=false rather than an empty snapshot"
+                    );
+                    ListOnDemandFoldersResponse { folders: Vec::new(), snapshot_available: false }
+                }
+            };
+            Some(ShellIpcMessage { payload: Some(Payload::ListOnDemandFoldersResponse(response)) })
         }
         Some(Payload::ListFolderFilesRequest(req)) => {
             let entries = state

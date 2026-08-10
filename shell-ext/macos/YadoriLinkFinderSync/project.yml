@@ -33,6 +33,16 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.juntaki.yadorilink
         INFOPLIST_FILE: HostApp/Info.plist
         PRODUCT_NAME: YadoriLinkFinderSyncHost
+        # Per-target override above the project-wide 11.0 base --
+        # DomainRegistration.swift's domain-removal reconciliation calls
+        # NSFileProviderManager.remove(_:mode:completionHandler:) (M1-1),
+        # API_AVAILABLE(macos(12.0)) per FileProvider.framework's own
+        # NSFileProviderDefines.h. YadoriLinkFileProvider (below) stays at
+        # the 11.0 base -- its own comment already verified
+        # NSFileProviderReplicatedExtension itself only needs macOS 11.0;
+        # do not raise it to "13+" on the assumption this comment once
+        # made elsewhere in this codebase (now corrected).
+        MACOSX_DEPLOYMENT_TARGET: "12.0"
         # HostApp/DomainRegistration.swift needs the
         # fileprovider-core FFI (yadorilink_fp_list_on_demand_folders) to
         # discover which OnDemand folder groups to register as File

@@ -38,7 +38,11 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 yadorilink-ipc-proto = { path = "../../../crates/yadorilink-ipc-proto" }
 prost = "0.14.4"
-tokio = { version = "1", features = ["net", "rt", "time", "io-util"] }
+# `macros` (for `#[tokio::test]`) is only exercised by this crate's own
+# `#[cfg(test)]` module, but declared here rather than split into a
+# `[dev-dependencies]` override to avoid re-declaring `tokio` twice --
+# negligible extra compile surface for a small leaf crate.
+tokio = { version = "1", features = ["net", "rt", "time", "io-util", "macros"] }
 libc = "0.2"
 # Item/enumerator lists cross the FFI boundary as JSON (see lib.rs's doc
 # comment) rather than hand-rolled C arrays-of-structs — the payloads are

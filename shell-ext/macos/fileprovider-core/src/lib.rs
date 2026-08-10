@@ -78,17 +78,24 @@ pub extern "C" fn yadorilink_fp_real_home_dir() -> *mut c_char {
 }
 
 /// Lists every OnDemand-linked folder group known to the daemon, as a
-/// JSON array of `{"local_path":..., "group_id":...}` objects (used for
-/// the domain-discovery call). Empty JSON array (`"[]"`) on any
-/// failure — never blocks past `ipc_client`'s enumeration timeout, never
-/// panics across the FFI boundary. Caller must free with
-/// `yadorilink_fp_free_string`.
+/// JSON array of `{"local_path":..., "group_id":...}` objects — the
+/// authoritative desired-registration-state snapshot domain reconciliation
+/// reconciles against (see `ipc_client::list_on_demand_folders`'s own doc
+/// comment). Returns NULL, deliberately distinct from a valid `"[]"` JSON
+/// string, when the daemon could not be reached or the call otherwise
+/// failed/panicked — the caller MUST treat NULL as "cannot currently
+/// confirm the desired state, do not reconcile (leave existing domain
+/// registrations untouched)," never as "the desired state is empty."
+/// Collapsing these two cases is exactly the fail-open mistake a
+/// snapshot-based reconciliation must not make: a transient daemon
+/// hiccup must never be read as "remove every registered domain." Caller
+/// must free a non-NULL result with `yadorilink_fp_free_string`.
 #[no_mangle]
 pub extern "C" fn yadorilink_fp_list_on_demand_folders() -> *mut c_char {
     let result = catch_unwind(ipc_client::list_on_demand_folders);
     match result {
-        Ok(folders) => to_c_json(&folders, "[]"),
-        Err(_) => CString::new("[]").unwrap().into_raw(),
+        Ok(Some(folders)) => to_c_json(&folders, "[]"),
+        Ok(None) | Err(_) => std::ptr::null_mut(),
     }
 }
 
