@@ -40,8 +40,14 @@ char *yadorilink_fp_real_home_dir(void);
 /*
  * Returns a JSON array of {"local_path": string, "group_id": string}
  * for every OnDemand-linked folder group the daemon currently knows
- * about. "[]" on any failure (unreachable daemon, timeout). Caller must
- * free with yadorilink_fp_free_string.
+ * about -- the authoritative desired-registration-state snapshot domain
+ * reconciliation (DomainRegistration.swift) reconciles against. Returns
+ * NULL, deliberately distinct from a valid "[]" string, on any failure
+ * (unreachable daemon, timeout, malformed response): the caller MUST
+ * treat NULL as "cannot currently confirm the desired state, do not
+ * reconcile," never as "the desired state is empty, remove everything
+ * registered." Caller must free a non-NULL result with
+ * yadorilink_fp_free_string.
  */
 char *yadorilink_fp_list_on_demand_folders(void);
 

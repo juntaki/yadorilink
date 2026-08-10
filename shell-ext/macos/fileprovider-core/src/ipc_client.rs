@@ -129,33 +129,44 @@ pub struct OnDemandFolderInfo {
 /// `ListOnDemandFoldersRequest`/`Response` pair already added to
 /// shellipc.proto (see this crate's module doc — added by the parallel
 /// Windows cfapi work for the identical need, reused here rather than
-/// inventing a second protocol surface). Empty on any failure
-/// (unreachable daemon, timeout) — the caller (host app, at domain-
-/// registration time) is expected to just skip registration and retry
-/// on next launch/poll, not crash or block.
-pub fn list_on_demand_folders() -> Vec<OnDemandFolderInfo> {
+/// inventing a second protocol surface). The daemon's own handler
+/// (`shell_ipc.rs`'s `ListOnDemandFoldersRequest` arm) answers straight
+/// from the persisted link table (`link_repository().list_links()`,
+/// filtered to `OnDemand` and not orphaned) — this response IS the
+/// authoritative desired-registration-state snapshot, not a cache of it.
+///
+/// `None` on any failure (unreachable daemon, timeout, malformed
+/// response) — deliberately distinct from `Some(vec![])`, a *confirmed*
+/// "no OnDemand folders exist right now" snapshot. The caller
+/// (`DomainRegistration.registerOnDemandDomains`, which reconciles by
+/// both registering missing domains AND removing stale ones) must treat
+/// `None` as "cannot currently reconcile, leave existing registrations
+/// untouched" — collapsing this into an empty `Vec` the way earlier code
+/// did would make a transient daemon-unreachable moment look identical to
+/// "every domain should be removed," which is exactly the fail-open
+/// mistake a snapshot-based reconciliation must not make.
+pub fn list_on_demand_folders() -> Option<Vec<OnDemandFolderInfo>> {
     runtime().block_on(async {
-        tokio::time::timeout(ENUMERATION_TIMEOUT, list_on_demand_folders_inner())
-            .await
-            .unwrap_or_default()
+        tokio::time::timeout(ENUMERATION_TIMEOUT, list_on_demand_folders_inner()).await.ok()?
     })
 }
 
-async fn list_on_demand_folders_inner() -> Vec<OnDemandFolderInfo> {
-    let Ok(mut stream) = connect().await else { return Vec::new() };
+async fn list_on_demand_folders_inner() -> Option<Vec<OnDemandFolderInfo>> {
+    let mut stream = connect().await.ok()?;
     let msg = ShellIpcMessage {
         payload: Some(Payload::ListOnDemandFoldersRequest(ListOnDemandFoldersRequest {})),
     };
-    if write_message(&mut stream, &msg).await.is_err() {
-        return Vec::new();
-    }
+    write_message(&mut stream, &msg).await.ok()?;
     match read_message::<ShellIpcMessage>(&mut stream).await {
-        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListOnDemandFoldersResponse(r)) })) => r
-            .folders
-            .into_iter()
-            .map(|f| OnDemandFolderInfo { local_path: f.local_path, group_id: f.group_id })
-            .collect(),
-        _ => Vec::new(),
+        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListOnDemandFoldersResponse(r)) })) => {
+            Some(
+                r.folders
+                    .into_iter()
+                    .map(|f| OnDemandFolderInfo { local_path: f.local_path, group_id: f.group_id })
+                    .collect(),
+            )
+        }
+        _ => None,
     }
 }
 
