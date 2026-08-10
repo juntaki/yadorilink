@@ -57,14 +57,40 @@
 //  VM screenshot of `~/Library/CloudStorage/` after domain registration
 //  to confirm.
 //
-//  Removing a domain removes its on-disk managed-location directory along
-//  with it (per NSFileProviderManager.h's own doc comment on
-//  `removeDomain:completionHandler:`) — the correct, expected outcome for
-//  a folder that stopped being OnDemand-linked (converted to Eager, or
-//  unlinked entirely), never a data-loss concern for a folder that's
-//  merely offline: this reconciliation only ever removes a domain whose
-//  group_id is CONFIRMED absent from the daemon's own live snapshot, not
-//  one it simply failed to hear about.
+//  DOMAIN REMOVAL DATA-PRESERVATION MODE: the plain
+//  `removeDomain:completionHandler:` (no mode) DELETES the on-disk
+//  managed-location directory outright, per NSFileProviderManager.h's own
+//  doc comment. That is not an acceptable default here — File Provider
+//  write support does not exist yet (M1-3), but the READ path already
+//  hydrates real file content into the managed location today, and this
+//  reconciliation has no way to know, from `group_id` absence alone,
+//  whether a user has anything open or otherwise depends on that content
+//  still being present at the moment removal fires. This code therefore
+//  uses `removeDomain:mode:completionHandler:` with
+//  `.preserveDownloadedUserData` (API_AVAILABLE(macos(12.0)) per
+//  FileProvider.framework's own NSFileProviderDefines.h -- this target's
+//  own MACOSX_DEPLOYMENT_TARGET is bumped to 12.0 in project.yml
+//  specifically for this call; YadoriLinkFileProvider itself correctly
+//  stays at the project-wide 11.0 base, verified directly against this
+//  SDK's headers, not the "macOS 13+" figure an earlier version of this
+//  comment repeated from elsewhere in this codebase) rather than the
+//  mode-less overload —
+//  removal still only ever fires for a domain whose group_id is CONFIRMED
+//  absent from the daemon's own live snapshot (never one this run simply
+//  failed to hear about, per the FAIL-CLOSED RECONCILIATION note above),
+//  but "confirmed absent from the desired-state snapshot" is a claim about
+//  the daemon's *link* state, not a claim that no local content matters
+//  anymore.
+//
+//  NOT YET DECIDED (left for M1-3, not resolved here): `OnDemand → Eager`
+//  (content should end up materialized as a normal Eager copy, not merely
+//  "preserved" wherever the OS puts it) and `unlink` (content disposition
+//  is a user decision, possibly "discard entirely") likely need DIFFERENT
+//  preservation semantics from each other and from this default. Do not
+//  read `.preserveDownloadedUserData` as a final answer for either case —
+//  it is only the conservative choice for what this PR's scope handles
+//  (a group_id that dropped out of the OnDemand set, of either kind,
+//  through today's blunt reconciliation).
 
 import FileProvider
 
@@ -100,11 +126,14 @@ enum DomainRegistration {
                 return
             }
             for existingDomain in existingDomains where !desiredIdentifiers.contains(existingDomain.identifier.rawValue) {
-                NSFileProviderManager.remove(existingDomain) { error in
+                // `.preserveDownloadedUserData`, not the mode-less
+                // overload -- see this file's own DOMAIN REMOVAL
+                // DATA-PRESERVATION MODE doc comment for why.
+                NSFileProviderManager.remove(existingDomain, mode: .preserveDownloadedUserData) { preservedLocation, error in
                     if let error {
                         NSLog("yadorilink: failed to remove stale domain \(existingDomain.identifier.rawValue): \(error)")
                     } else {
-                        NSLog("yadorilink: removed stale File Provider domain \(existingDomain.identifier.rawValue) (no longer OnDemand-linked)")
+                        NSLog("yadorilink: removed stale File Provider domain \(existingDomain.identifier.rawValue) (no longer OnDemand-linked); preserved data at \(preservedLocation?.path ?? "<none>")")
                     }
                 }
             }

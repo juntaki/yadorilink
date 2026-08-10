@@ -104,6 +104,18 @@ message OnDemandFolder {
 
 message ListOnDemandFoldersResponse {
   repeated OnDemandFolder folders = 1;
+  // Explicit success signal, not merely "folders is empty" -- the daemon
+  // sets this true only when it actually confirmed the desired-registration-
+  // state snapshot (read the persisted link table without error). proto3's
+  // zero-value default for bool is false, so any response that omits this
+  // field, or a decode/framing failure that produces a default-valued
+  // message, is indistinguishable from an explicit "could not confirm" --
+  // by construction, not by convention. Callers that reconcile OS-level
+  // registrations against `folders` (see fileprovider-core's
+  // DomainRegistration.swift) MUST treat `snapshot_available == false` the
+  // same as a transport-level failure: do not reconcile, leave existing
+  // registrations untouched.
+  bool snapshot_available = 2;
 }
 
 message ListFolderFilesRequest {
