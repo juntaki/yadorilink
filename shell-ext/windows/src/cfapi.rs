@@ -240,12 +240,38 @@ pub fn unregister(local_path: &Path) -> WinResult<()> {
 /// not this pass). Minting it in the already-correct format now means
 /// M2-2 only has to add a reader, not also fix up every placeholder this
 /// process already created.
+///
+/// M2-2 note (review finding, not fixed here): `sync_placeholders` below
+/// skips every path whose placeholder already exists on disk, so a
+/// placeholder created before this change keeps its old filename-derived
+/// `FileIdentity` forever -- an 8-byte blob is NOT self-describing, so
+/// M2-2's reader cannot assume every `FileIdentity` it encounters is one
+/// of these generation tokens. It needs either a legacy-identity
+/// detection/migration path, or a self-identifying tag (e.g. a version
+/// byte) added to the blob format before M2-2 lands.
+///
+/// Review finding (M2-0 Codex pass): a bare wall-clock read is not
+/// actually guaranteed unique -- two placeholders minted back-to-back
+/// can land in the same clock tick at the OS's effective resolution.
+/// Seeded once from wall-clock time and then strictly incremented per
+/// call, so every token minted within a single `cfapi-host` process
+/// lifetime is unique regardless of clock resolution; the wall-clock
+/// seed keeps values from restarting at zero across process restarts
+/// (a fresh seed collides with a prior run's exact counter value only if
+/// the two processes start in the same nanosecond, which the increment
+/// does not need to defend against -- the dead backend this scheme is
+/// ported from relied on the same wall-clock seed with no such guard at
+/// all).
 fn mint_generation_token() -> [u8; 8] {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(1);
-    nanos.to_le_bytes()
+    static COUNTER: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    let counter = COUNTER.get_or_init(|| {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1);
+        std::sync::atomic::AtomicU64::new(seed)
+    });
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_le_bytes()
 }
 
 /// Creates a cfapi placeholder for one file. `relative_path`
@@ -304,9 +330,11 @@ pub fn create_placeholder(
         // "in sync" tracks local-modification state, orthogonal to
         // population/hydration state (`Population: PARTIAL`, set on this
         // sync root's own registration above, already governs whether
-        // content is present; `InSync: CF_INSYNC_POLICY_TRACK_ALL`,
-        // also already set there, is what makes the OS actually track
-        // this bit at all). Deliberately does NOT also port
+        // content is present; `MARK_IN_SYNC` at creation is honored on
+        // its own -- `InSync: CF_INSYNC_POLICY_TRACK_ALL`, also already
+        // set on that registration, instead governs which *subsequent*
+        // filesystem changes clear the in-sync bit, not whether it's
+        // honored at creation time). Deliberately does NOT also port
         // `CF_PLACEHOLDER_CREATE_FLAG_ALWAYS_FULL` from the dead
         // backend: that flag existed there specifically to compensate for
         // having NO `FETCH_DATA` callback registered (an ordinary local
