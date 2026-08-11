@@ -39,7 +39,10 @@ path = "src/bin/cfapi_host.rs"
 
 [dependencies]
 yadorilink-ipc-proto = { path = "../../crates/yadorilink-ipc-proto" }
-tokio = { version = "1", features = ["net", "rt", "time", "io-util"] }
+# `macros` (for `#[tokio::test]`) is only exercised by this crate's own
+# tests but declared here rather than a dev-dependency override, matching
+# `shell-ext/macos/fileprovider-core/Cargo.toml`'s own reasoning.
+tokio = { version = "1", features = ["net", "rt", "time", "io-util", "macros"] }
 prost = "0.14.4"
 # The `#[implement]` macro's generated code references `windows_core::...`
 # at the crate root directly, not through `windows::core` — an explicit
