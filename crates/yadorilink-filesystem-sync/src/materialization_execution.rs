@@ -313,6 +313,15 @@ pub trait MaterializationExecutionPort: Send + Sync {
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), MaterializationExecutionError>;
 
+    /// Every still-`Placeholder` path in `group_id` with no recorded
+    /// identity -- see `MaterializationStateRepository::
+    /// list_placeholder_paths_missing_generation`'s own doc comment for
+    /// the crash window this exists to close.
+    fn list_placeholder_paths_missing_generation(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<String>, MaterializationExecutionError>;
+
     /// Acquires the per-`(group_id, path)` lock so a materialization write
     /// cannot race a concurrent local capture or peer reconciliation of the
     /// same path.

@@ -227,6 +227,40 @@ impl LinkRuntimeFactory {
                 }
             }
         };
+        // M1-5: closes the crash window between `write_placeholder`'s
+        // durable disk write and its separate `record_placeholder_
+        // generation` commit -- see that function's own doc comment. Runs
+        // here, still before this link's watcher starts (same ordering
+        // guarantee `repair_interrupted_materializations` above relies
+        // on), and is soft-fail for the same reason: a failure here must
+        // not abort this link's startup, only leave the affected paths on
+        // the existing fail-closed fallback (full chunk-and-compare on
+        // their next local event) until the next successful boot's pass.
+        match crate::link_runtime::operations::repair_materialization::backfill_placeholder_generations(
+            &deps.replica_coordinator,
+            &root_lease,
+            Path::new(&local_path),
+            &group_id,
+        ) {
+            Ok(backfilled) => {
+                if backfilled > 0 {
+                    tracing::info!(
+                        local_path = %local_path,
+                        backfilled,
+                        "backfilled placeholder identity for paths left unrecorded by an \
+                         interrupted eviction"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    local_path = %local_path,
+                    "failed to backfill placeholder identities on startup; affected paths stay \
+                     on the fail-closed full chunk-and-compare fallback"
+                );
+            }
+        }
         // The additive-scan window, read HERE rather than at the caller, and ANDed
         // with whatever the caller already decided.
         //

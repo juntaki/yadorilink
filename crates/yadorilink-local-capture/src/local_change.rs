@@ -85,16 +85,41 @@ fn metadata_mtime_matches(metadata: &std::fs::Metadata, indexed_mtime_unix_nanos
 #[cfg(unix)]
 fn untouched_placeholder_verdict(
     lstat: &std::fs::Metadata,
-    _existing: Option<&FileRecord>,
+    existing: Option<&FileRecord>,
     placeholder_generation: Option<&yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
 ) -> bool {
     use std::os::unix::fs::MetadataExt;
-    placeholder_generation.is_some_and(|recorded| {
-        recorded.provider_kind == yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND
+    if let Some(recorded) = placeholder_generation {
+        return recorded.provider_kind == yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND
             && yadorilink_local_storage::PlaceholderDiskIdentity::from_metadata(lstat)
                 == Some(recorded.identity)
-            && lstat.blocks() == 0
-    })
+            && lstat.blocks() == 0;
+    }
+    // Defense in depth -- an independent review's finding on M1-5's own
+    // startup repair pass (`materialization_repair::
+    // backfill_placeholder_generations`): persisting an identity is not
+    // atomic with `write_placeholder`'s own disk write (a crash between
+    // the two, or the repair pass itself failing for this one path,
+    // leaves no identity recorded even though the placeholder is
+    // genuinely untouched). Falling through unconditionally whenever no
+    // identity is recorded would chunk and index the placeholder's own
+    // sparse/all-zero bytes as if real content on every such path --
+    // exactly the corruption this whole mechanism exists to prevent, and
+    // it would keep happening for as long as backfill keeps failing for
+    // that path.
+    //
+    // A completely unallocated object at EXACTLY the indexed size, with
+    // no identity to compare against, is still overwhelming evidence
+    // this is still the crate's own untouched placeholder: no ordinary
+    // editor or real edit leaves a file fully sparse. This closes the
+    // gap independent of the backfill pass's own success -- it is not a
+    // substitute for identity tracking (a same-size in-place edit that
+    // preserves sparseness, or a deliberately-crafted same-size sparse
+    // replacement, are both still missed -- the same class of residual
+    // gap the size/mtime-only heuristic always had), only a narrower,
+    // still-safe fallback for the one case identity tracking cannot
+    // currently guarantee it has closed.
+    existing.is_some_and(|record| lstat.len() == record.size) && lstat.blocks() == 0
 }
 
 /// On any other platform, no stable on-disk identity is capturable yet
@@ -3688,6 +3713,72 @@ mod tests {
             matches!(result, LocalChangeOutcome::FileChanged(_)),
             "an in-place edit that keeps the same inode but writes real content must still be \
              captured -- got {result:?}"
+        );
+    }
+
+    /// M1-5's defense-in-depth fallback: a placeholder with NO recorded
+    /// identity at all (simulating `backfill_placeholder_generations`
+    /// having not yet run, or having failed for this specific path) must
+    /// still be recognized as untouched when it is still fully sparse at
+    /// exactly the indexed size -- otherwise this exact event would
+    /// chunk and index the placeholder's own sparse/all-zero bytes as a
+    /// genuine local edit.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn placeholder_with_no_recorded_identity_is_still_untouched_when_still_sparse() {
+        let (proc, state, _store_dir, root_dir) = processor();
+        let root = canonical_root(&root_dir);
+        adopt_root(&state, "group-1", &root);
+        let file_path = root.join("placeholder.bin");
+        let content_size: u64 = 4096;
+
+        state
+            .file_index_repository()
+            .upsert_file(
+                "group-1",
+                &FileRecord {
+                    path: "placeholder.bin".into(),
+                    size: content_size,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![yadorilink_replica_domain::file::BlockInfo {
+                        hash: vec![0xAB; 32],
+                        offset: 0,
+                        size: content_size as u32,
+                    }],
+                    deleted: false,
+                },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(
+                "group-1",
+                "placeholder.bin",
+                MaterializationState::Placeholder,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        // Deliberately no `record_placeholder_generation` call -- this is
+        // the exact state a crashed-before-backfill (or backfill-failed)
+        // path is left in. The file itself is still the genuine, untouched
+        // sparse placeholder.
+        yadorilink_local_storage::write_placeholder(&file_path, content_size, 0).unwrap();
+
+        let result = proc
+            .process_event(
+                "group-1",
+                &root,
+                &FsChangeEvent { path: file_path, kind: FsChangeKind::CreatedOrModified },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            LocalChangeOutcome::None,
+            "a still-sparse placeholder at the exact indexed size must be recognized as \
+             untouched even with no recorded identity -- got {result:?}"
         );
     }
 
