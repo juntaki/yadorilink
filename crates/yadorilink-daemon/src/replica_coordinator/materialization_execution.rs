@@ -375,6 +375,170 @@ mod tests {
     /// shape as `materialization_state::tests::
     /// arc_replica_coordinator_coerces_to_port_trait` for the wider port
     /// this one narrows.
+    struct NeverConfirms;
+
+    impl FullReplicaCustody for NeverConfirms {
+        fn confirm_exact_version(
+            &self,
+            _: &str,
+            _: &str,
+            _: &VersionHash,
+            _: &[yadorilink_replica_domain::file::VersionBlock],
+        ) -> Option<CustodyStamp> {
+            None
+        }
+
+        fn confirmation_still_valid(&self, _: &str, _: &CustodyStamp) -> bool {
+            false
+        }
+    }
+
+    /// M1-4: a pinned file must never be evicted -- `EvictionEligibilitySnapshot::pinned`
+    /// is the very first check `evict_file` performs, before it reads any
+    /// version or custody state.
+    #[test]
+    fn evict_rejects_a_pinned_file() {
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-a", root.path());
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = FsBlockStore::new(store_dir.path()).unwrap();
+        let content = b"pinned content must never be evicted";
+        let record = store_and_record(&store, "a.bin", content);
+        let permit = RootCommitPermit::for_tests();
+        state.file_index_repository().upsert_file("group-a", &record, &permit).unwrap();
+        state.file_index_repository().set_pinned("group-a", "a.bin", true).unwrap();
+        std::fs::write(root.path().join("a.bin"), content).unwrap();
+
+        let result = evict_file(
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+                permit: &permit,
+            },
+            "group-a",
+            "a.bin",
+            false,
+            &AlwaysConfirmed,
+        );
+
+        assert!(
+            matches!(result, Err(MaterializationExecutionError::EvictionRejected(_))),
+            "a pinned file must be rejected outright, got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("a.bin")).unwrap(),
+            content,
+            "the pinned file's own bytes must be untouched"
+        );
+    }
+
+    /// M1-4: on an on-demand (non-full-replica) device, a file whose
+    /// custody cannot be confirmed elsewhere still becomes a placeholder
+    /// (freeing this file's own on-disk footprint), but its content-
+    /// addressed blocks are NEVER purged from the local block store --
+    /// `verify_reclaim_custody` returning `None` must not be read as
+    /// license to physically delete the only copy this device can prove
+    /// exists. This is the codebase's actual two-layer safety design (the
+    /// roadmap's "custody unknown → evict拒否" in spirit: nothing is ever
+    /// destroyed without confirmed custody, even though the working-tree
+    /// copy is still freed).
+    #[test]
+    fn evict_of_unconfirmed_custody_frees_the_file_but_never_purges_its_blocks() {
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-a", root.path());
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = FsBlockStore::new(store_dir.path()).unwrap();
+        let content = b"content nobody else has confirmed custody of";
+        let record = store_and_record(&store, "a.bin", content);
+        let hash = hex::encode(&record.blocks[0].hash);
+        let permit = RootCommitPermit::for_tests();
+        state.file_index_repository().upsert_file("group-a", &record, &permit).unwrap();
+        std::fs::write(root.path().join("a.bin"), content).unwrap();
+
+        let outcome = evict_file(
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+                permit: &permit,
+            },
+            "group-a",
+            "a.bin",
+            false, // on-demand device, not a full replica
+            &NeverConfirms,
+        )
+        .unwrap();
+
+        assert!(outcome.dehydrated, "the working-tree copy is still freed");
+        assert!(outcome.blocks_retained, "unconfirmed custody must never authorize a block purge");
+        assert!(store.exists(&hash).unwrap(), "the block must survive on disk, unconfirmed");
+        assert_eq!(
+            state
+                .materialization_state_repository()
+                .get_materialization_state("group-a", "a.bin")
+                .unwrap(),
+            Some(MaterializationState::Placeholder)
+        );
+    }
+
+    /// M1-4: content that diverged from the indexed version between the
+    /// last index write and this eviction attempt (an unsynced local
+    /// edit, or any other source of on-disk drift) must abort the
+    /// eviction before any placeholder is written -- never silently
+    /// discard those bytes.
+    #[test]
+    fn evict_aborts_when_disk_content_diverges_from_the_indexed_version() {
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-a", root.path());
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = FsBlockStore::new(store_dir.path()).unwrap();
+        let indexed_content = b"the version the index still believes is current";
+        let record = store_and_record(&store, "a.bin", indexed_content);
+        let permit = RootCommitPermit::for_tests();
+        state.file_index_repository().upsert_file("group-a", &record, &permit).unwrap();
+        // A local edit landed on disk that the index does not know about
+        // yet -- exactly the race this check exists to close.
+        std::fs::write(root.path().join("a.bin"), b"a locally edited, unindexed replacement")
+            .unwrap();
+
+        let outcome = evict_file(
+            MaterializationContext {
+                state: &state,
+                liveness_gate: &BlockLivenessGate::default(),
+                store: &store,
+                root: root.path(),
+                permit: &permit,
+            },
+            "group-a",
+            "a.bin",
+            false,
+            &AlwaysConfirmed,
+        )
+        .unwrap();
+
+        assert!(!outcome.dehydrated, "eviction must abort, not silently discard the local edit");
+        assert!(outcome.blocks_retained);
+        assert_eq!(
+            std::fs::read(root.path().join("a.bin")).unwrap(),
+            b"a locally edited, unindexed replacement",
+            "the unindexed local edit's bytes must survive untouched"
+        );
+        assert_eq!(
+            state
+                .materialization_state_repository()
+                .get_materialization_state("group-a", "a.bin")
+                .unwrap(),
+            Some(MaterializationState::Hydrated),
+            "the row must be left exactly as it was, not stuck mid-transition"
+        );
+    }
+
     #[test]
     fn arc_replica_coordinator_coerces_to_execution_port_trait() {
         let coordinator: Arc<ReplicaCoordinator> =
