@@ -87,7 +87,15 @@ fn remove_registered_root_at(file: &Path, path: &Path) {
     if !filtered.is_empty() {
         new_contents.push('\n');
     }
-    if let Err(e) = std::fs::write(file, new_contents) {
+    // Write-to-temp-then-rename rather than a direct `std::fs::write` (which
+    // truncates in place): a crash between truncation and the new content
+    // landing would otherwise lose every other root's registration, not
+    // just the one being removed. `rename` onto an existing path is atomic
+    // on both NTFS and POSIX filesystems.
+    let tmp = file.with_extension("tmp");
+    let result = std::fs::write(&tmp, &new_contents).and_then(|()| std::fs::rename(&tmp, file));
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
         eprintln!(
             "yadorilink-cfapi-host: failed to update sync-root registry after removing {}: {e}",
             path.display()
@@ -97,6 +105,21 @@ fn remove_registered_root_at(file: &Path, path: &Path) {
 
 fn remove_registered_root(path: &Path) {
     remove_registered_root_at(&registry_file_path(), path);
+}
+
+/// Every root this process currently believes is registered from a
+/// *previous* run (this process's own in-memory `known_roots` always
+/// starts empty -- see `main`'s own comment on why a CfAPI connection
+/// must be freshly established every process start regardless). Used
+/// only to widen `reconcile_sync_roots`'s stale-detection beyond what
+/// this run has itself registered so far -- see that function's own doc
+/// comment for the restart-recovery gap this closes.
+fn read_registry_roots_at(file: &Path) -> HashSet<PathBuf> {
+    std::fs::read_to_string(file).unwrap_or_default().lines().map(PathBuf::from).collect()
+}
+
+fn read_registry_roots() -> HashSet<PathBuf> {
+    read_registry_roots_at(&registry_file_path())
 }
 
 fn unregister_all() {
@@ -146,15 +169,37 @@ impl SyncRootBackend for RealSyncRootBackend {
     }
 }
 
-/// Converges `known_roots` (the sync roots this process believes are
-/// currently registered) onto `desired` (a *confirmed* snapshot of every
-/// OnDemand-linked folder) by registering whatever's missing and
-/// unregistering whatever's no longer desired. Idempotent: calling this
-/// again with the same `desired` set and an unchanged `known_roots` makes
-/// no further backend calls (both returned `Vec`s are empty). A failed
-/// individual register/unregister call is logged and left for the next
-/// poll to retry -- `known_roots` only changes for operations that
-/// actually succeeded, so it never drifts from backend reality.
+/// Converges `known_roots` (the sync roots this process itself has
+/// registered+connected so far this run) onto `desired` (a *confirmed*
+/// snapshot of every OnDemand-linked folder) by registering whatever's
+/// missing and unregistering whatever's no longer desired. Idempotent:
+/// calling this again with the same `desired` set and an unchanged
+/// `known_roots` makes no further backend calls (both returned `Vec`s are
+/// empty). A failed individual register/unregister call is logged and
+/// left for the next poll to retry -- `known_roots` only changes for
+/// operations that actually succeeded, so it never drifts from backend
+/// reality.
+///
+/// `registry_roots` (the on-disk registry's contents -- see
+/// `registry_file_path`) is a SEPARATE, wider set of stale-unregister
+/// candidates, unioned into the stale check but never consulted for
+/// registration. This closes a restart-recovery gap: `known_roots` always
+/// starts empty on process start (`main`'s own doc comment explains why
+/// a CfAPI connection must be freshly established every run regardless
+/// of prior registration), so a root this process registered in a
+/// *previous* run, then had removed from the daemon's desired snapshot
+/// while this process was down, would otherwise be invisible to
+/// staleness detection forever -- absent from both the fresh empty
+/// `known_roots` and the current `desired` set, so the `known_roots -
+/// desired` stale computation alone would never flag it. Unioning in
+/// `registry_roots` (this process's own record of every root it has
+/// registered and not yet cleaned up, converged by this same function's
+/// callers on every successful unregister) surfaces exactly that gap.
+/// Correctness is unaffected for the registration side: whether or not a
+/// root appears in `registry_roots`, this fresh process has no live
+/// connection for it until `register_and_connect` actually runs this
+/// run, so the missing-registration check must stay keyed on
+/// `known_roots` alone.
 ///
 /// Returns the paths successfully registered and successfully
 /// unregistered this call, for the caller to keep the on-disk registry
@@ -163,6 +208,7 @@ fn reconcile_sync_roots<B: SyncRootBackend>(
     backend: &mut B,
     known_roots: &mut HashSet<PathBuf>,
     desired: &[OnDemandFolder],
+    registry_roots: &HashSet<PathBuf>,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let desired_paths: HashSet<PathBuf> =
         desired.iter().map(|f| PathBuf::from(&f.local_path)).collect();
@@ -191,8 +237,14 @@ fn reconcile_sync_roots<B: SyncRootBackend>(
         }
     }
 
-    let stale: Vec<PathBuf> =
-        known_roots.iter().filter(|root| !desired_paths.contains(*root)).cloned().collect();
+    let stale: Vec<PathBuf> = known_roots
+        .iter()
+        .chain(registry_roots.iter())
+        .filter(|root| !desired_paths.contains(*root))
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     let mut unregistered = Vec::new();
     for root in stale {
         match backend.unregister(&root) {
@@ -226,7 +278,9 @@ fn poll_once(backend: &mut impl SyncRootBackend, known_roots: &mut HashSet<PathB
         return;
     };
 
-    let (registered, unregistered) = reconcile_sync_roots(&mut *backend, known_roots, &folders);
+    let registry_roots = read_registry_roots();
+    let (registered, unregistered) =
+        reconcile_sync_roots(&mut *backend, known_roots, &folders, &registry_roots);
     for root in &registered {
         record_registered_root(root);
     }
@@ -301,12 +355,20 @@ mod reconcile_tests {
         paths.iter().map(PathBuf::from).collect()
     }
 
+    fn no_registry() -> HashSet<PathBuf> {
+        HashSet::new()
+    }
+
     #[test]
     fn missing_root_is_registered() {
         let mut backend = FakeBackend::default();
         let mut known = path_set(&["A"]);
-        let (registered, unregistered) =
-            reconcile_sync_roots(&mut backend, &mut known, &[folder("A"), folder("B")]);
+        let (registered, unregistered) = reconcile_sync_roots(
+            &mut backend,
+            &mut known,
+            &[folder("A"), folder("B")],
+            &no_registry(),
+        );
         assert_eq!(registered, vec![PathBuf::from("B")]);
         assert!(unregistered.is_empty());
         assert_eq!(known, path_set(&["A", "B"]));
@@ -317,7 +379,7 @@ mod reconcile_tests {
         let mut backend = FakeBackend::default();
         let mut known = path_set(&["A", "B"]);
         let (registered, unregistered) =
-            reconcile_sync_roots(&mut backend, &mut known, &[folder("A")]);
+            reconcile_sync_roots(&mut backend, &mut known, &[folder("A")], &no_registry());
         assert!(registered.is_empty());
         assert_eq!(unregistered, vec![PathBuf::from("B")]);
         assert_eq!(known, path_set(&["A"]));
@@ -327,7 +389,8 @@ mod reconcile_tests {
     fn empty_desired_unregisters_everything() {
         let mut backend = FakeBackend::default();
         let mut known = path_set(&["A", "B"]);
-        let (registered, unregistered) = reconcile_sync_roots(&mut backend, &mut known, &[]);
+        let (registered, unregistered) =
+            reconcile_sync_roots(&mut backend, &mut known, &[], &no_registry());
         assert!(registered.is_empty());
         let mut unregistered = unregistered;
         unregistered.sort();
@@ -340,9 +403,9 @@ mod reconcile_tests {
         let mut backend = FakeBackend::default();
         let mut known = path_set(&["A"]);
         let desired = [folder("A"), folder("B")];
-        let first = reconcile_sync_roots(&mut backend, &mut known, &desired);
+        let first = reconcile_sync_roots(&mut backend, &mut known, &desired, &no_registry());
         assert_eq!(first.0, vec![PathBuf::from("B")]);
-        let second = reconcile_sync_roots(&mut backend, &mut known, &desired);
+        let second = reconcile_sync_roots(&mut backend, &mut known, &desired, &no_registry());
         assert!(second.0.is_empty());
         assert!(second.1.is_empty());
     }
@@ -353,12 +416,12 @@ mod reconcile_tests {
         backend.fail_register.insert(PathBuf::from("B"));
         let mut known = path_set(&["A"]);
         let desired = [folder("A"), folder("B")];
-        let first = reconcile_sync_roots(&mut backend, &mut known, &desired);
+        let first = reconcile_sync_roots(&mut backend, &mut known, &desired, &no_registry());
         assert!(first.0.is_empty());
         assert_eq!(known, path_set(&["A"]));
 
         backend.fail_register.clear();
-        let second = reconcile_sync_roots(&mut backend, &mut known, &desired);
+        let second = reconcile_sync_roots(&mut backend, &mut known, &desired, &no_registry());
         assert_eq!(second.0, vec![PathBuf::from("B")]);
         assert_eq!(known, path_set(&["A", "B"]));
     }
@@ -368,13 +431,34 @@ mod reconcile_tests {
         let mut backend = FakeBackend::default();
         backend.fail_unregister.insert(PathBuf::from("B"));
         let mut known = path_set(&["A", "B"]);
-        let first = reconcile_sync_roots(&mut backend, &mut known, &[folder("A")]);
+        let first = reconcile_sync_roots(&mut backend, &mut known, &[folder("A")], &no_registry());
         assert!(first.1.is_empty());
         assert_eq!(known, path_set(&["A", "B"]));
 
         backend.fail_unregister.clear();
-        let second = reconcile_sync_roots(&mut backend, &mut known, &[folder("A")]);
+        let second = reconcile_sync_roots(&mut backend, &mut known, &[folder("A")], &no_registry());
         assert_eq!(second.1, vec![PathBuf::from("B")]);
+        assert_eq!(known, path_set(&["A"]));
+    }
+
+    /// Pins the restart-recovery gap `reconcile_sync_roots`'s `registry_roots`
+    /// parameter closes: a root registered by a *previous* process run
+    /// (recorded in the registry, hence in `registry_roots`) but absent
+    /// from BOTH the fresh, empty `known_roots` (this run hasn't connected
+    /// to anything yet) and the current `desired` snapshot must still be
+    /// unregistered -- `known_roots` alone would never see it, since it's
+    /// missing from both sides of that comparison.
+    #[test]
+    fn registry_only_orphan_is_unregistered_on_fresh_process_start() {
+        let mut backend = FakeBackend::default();
+        let mut known = HashSet::new(); // fresh process: nothing connected yet
+        let registry = path_set(&["A", "B"]); // A still desired; B is a restart orphan
+        let (registered, unregistered) =
+            reconcile_sync_roots(&mut backend, &mut known, &[folder("A")], &registry);
+        // A is still desired, so it must still be freshly registered+connected
+        // this run (registry membership must NOT skip that).
+        assert_eq!(registered, vec![PathBuf::from("A")]);
+        assert_eq!(unregistered, vec![PathBuf::from("B")]);
         assert_eq!(known, path_set(&["A"]));
     }
 
@@ -396,9 +480,12 @@ mod reconcile_tests {
         let contents = std::fs::read_to_string(&registry).unwrap();
         assert_eq!(contents.lines().count(), 2);
 
+        assert_eq!(read_registry_roots_at(&registry), path_set(&["A", "B"]));
+
         remove_registered_root_at(&registry, Path::new("A"));
         let contents = std::fs::read_to_string(&registry).unwrap();
         assert_eq!(contents.lines().collect::<Vec<_>>(), vec!["B"]);
+        assert_eq!(read_registry_roots_at(&registry), path_set(&["B"]));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
