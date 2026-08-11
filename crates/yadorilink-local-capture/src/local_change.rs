@@ -64,18 +64,62 @@ fn metadata_mtime_matches(metadata: &std::fs::Metadata, indexed_mtime_unix_nanos
         == Some(indexed_mtime_unix_nanos)
 }
 
+/// Whether the on-disk object `lstat` describes is still proven to be this
+/// crate's own untouched placeholder, for the `MaterializationState::
+/// Placeholder` fast path in `build_record_for_created_or_modified`. On
+/// Unix, this requires BOTH: a `(dev, ino)` identity match against
+/// `placeholder_generation` (M1-2), AND the object still being sparse (no
+/// allocated data blocks) -- see that call site's own doc comment for why
+/// this replaces the old size/mtime/sparse-file heuristic there.
+///
+/// Identity alone is not sufficient -- an independent review's finding: a
+/// genuine in-place edit (a `truncate`+`write` that reuses the same file
+/// descriptor/inode rather than an atomic rename, or an `mmap` write) keeps
+/// the SAME inode while genuinely changing the file's bytes. The OLD
+/// heuristic caught this case (real content allocates disk blocks, so the
+/// sparse-file check alone already said "not untouched") even though it
+/// missed the atomic-rename-preserving-size/mtime case this file's own
+/// identity check exists to close. Requiring both keeps the union of what
+/// each signal alone catches: identity closes the atomic-rename gap,
+/// sparseness closes the in-place-edit gap.
 #[cfg(unix)]
-fn placeholder_has_no_allocated_data(metadata: &std::fs::Metadata) -> bool {
+fn untouched_placeholder_verdict(
+    lstat: &std::fs::Metadata,
+    _existing: Option<&FileRecord>,
+    placeholder_generation: Option<&yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
+) -> bool {
     use std::os::unix::fs::MetadataExt;
-    metadata.blocks() == 0
+    placeholder_generation.is_some_and(|recorded| {
+        recorded.provider_kind == yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND
+            && yadorilink_local_storage::PlaceholderDiskIdentity::from_metadata(lstat)
+                == Some(recorded.identity)
+            && lstat.blocks() == 0
+    })
 }
 
+/// On any other platform, no stable on-disk identity is capturable yet
+/// (`yadorilink_local_storage::write_placeholder` returns `None` there --
+/// a real Windows CfAPI generation belongs to `placeholder_backend_windows`
+/// once M2 wires it through this same seam), so `placeholder_generation` is
+/// always `None` and falling back to "not proven untouched" unconditionally
+/// would treat the crate's OWN harmless placeholder-refresh echo as a
+/// genuine edit on every single occurrence -- chunking and indexing the
+/// placeholder's own sparse/all-zero bytes as if they were the file's real
+/// content. That is a correctness regression, not merely a missed
+/// optimization, so this platform instead falls back to the same
+/// size+mtime comparison this whole check used everywhere before M1-2 --
+/// weaker (misses a same-size/mtime in-place edit), but not one that
+/// corrupts the index on an ordinary self-echo.
+
 #[cfg(not(unix))]
-fn placeholder_has_no_allocated_data(_metadata: &std::fs::Metadata) -> bool {
-    // Windows needs a provider/allocated-range marker for the same
-    // guarantee. Until that lands, combine this conservative fallback
-    // with the exact mtime check below rather than trusting size alone.
-    true
+fn untouched_placeholder_verdict(
+    lstat: &std::fs::Metadata,
+    existing: Option<&FileRecord>,
+    _placeholder_generation: Option<&yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
+) -> bool {
+    existing.is_some_and(|record| {
+        lstat.len() == record.size && metadata_mtime_matches(lstat, record.mtime_unix_nanos)
+    })
 }
 
 /// True when `rel_path` (a root-relative index path, `/`-separated) sits
@@ -532,6 +576,7 @@ impl LocalChangeProcessor {
             .map(|record| (record.path.clone(), record))
             .collect();
         let materialization_by_path = self.state.list_materialization_states(group_id)?;
+        let placeholder_generation_by_path = self.state.list_placeholder_generations(group_id)?;
 
         // Test-only seam: fires right after the whole-index snapshot
         // (`existing_by_path`) has been read but before any record derived from
@@ -765,6 +810,7 @@ impl LocalChangeProcessor {
             }
 
             let materialization_state = materialization_by_path.get(&rel_path).copied();
+            let placeholder_generation = placeholder_generation_by_path.get(&rel_path).cloned();
             let (outcome, classification, exec_bit) = self.build_record_for_created_or_modified(
                 group_id,
                 root,
@@ -772,6 +818,7 @@ impl LocalChangeProcessor {
                 path,
                 existing,
                 materialization_state,
+                placeholder_generation,
             )?;
             if let LocalChangeOutcome::FileChanged(record) = outcome {
                 records.push(record);
@@ -1267,6 +1314,8 @@ impl LocalChangeProcessor {
             FsChangeKind::CreatedOrModified => {
                 let materialization_state =
                     self.state.get_materialization_state(group_id, &rel_path)?;
+                let placeholder_generation =
+                    self.state.get_placeholder_generation(group_id, &rel_path)?;
                 let existing = self.state.get_file(group_id, &rel_path)?;
                 let (outcome, classification, exec_bit) = self
                     .build_record_for_created_or_modified(
@@ -1276,6 +1325,7 @@ impl LocalChangeProcessor {
                         &event.path,
                         existing,
                         materialization_state,
+                        placeholder_generation,
                     )?;
                 if let LocalChangeOutcome::FileChanged(record) = &outcome {
                     // Re-verified here, immediately before the commit below,
@@ -1381,6 +1431,13 @@ impl LocalChangeProcessor {
     /// index row may not exist yet at this point (a brand-new file, not
     /// written until the caller's `upsert_file_with_origin`/
     /// `upsert_files_batch` runs).
+    /// `materialization_state` and `placeholder_generation` are two
+    /// separate, independently-`None`-able lookups (a row can have a
+    /// materialization state with no recorded identity, e.g. right after
+    /// this build's own migration) -- bundling them into one struct would
+    /// obscure that rather than clarify it, so this stays a plain argument
+    /// list at 8 rather than introducing a parameter object.
+    #[allow(clippy::too_many_arguments)]
     fn build_record_for_created_or_modified(
         &self,
         group_id: &str,
@@ -1389,6 +1446,7 @@ impl LocalChangeProcessor {
         path: &Path,
         existing: Option<FileRecord>,
         materialization_state: Option<MaterializationState>,
+        placeholder_generation: Option<yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
     ) -> Result<(LocalChangeOutcome, Option<SymlinkClassification>, Option<bool>), LocalCaptureError>
     {
         // classify via an lstat-equivalent check first —
@@ -1422,55 +1480,60 @@ impl LocalChangeProcessor {
         // below but before the expensive (and here, actively incorrect)
         // chunking step.
         //
-        // BUT only when the on-disk object still actually looks like this
-        // crate's own untouched placeholder — an independent review's
-        // finding: this platform has no real OS-level transparent-
-        // hydration provider wired up yet (no Cloud Filter API reparse
-        // point on Windows, no File Provider item on macOS — see
-        // `chunker::write_placeholder`'s own doc comment), so a
-        // `Placeholder` row's on-disk file is, today, an ORDINARY sparse
-        // file sitting at an ordinary path: nothing stops a user (or an
-        // editor that doesn't know or care it's "just a placeholder")
-        // from opening and overwriting it directly. Unconditionally
-        // treating every `CreatedOrModified` on a `Placeholder` path as
-        // this crate's own echo — as this check used to, with no
-        // comparison at all — silently and PERMANENTLY discarded such an
-        // edit: never chunked, never indexed, and the next `hydrate`
-        // would then overwrite it again with the stale synced content,
-        // with no error, no warning, and no way for the user to discover
-        // their edit was ever lost. `write_placeholder` creates the
-        // sparse stand-in at EXACTLY `record.size` bytes; comparing the
-        // current on-disk length against the indexed record's own `size`
-        // catches the common case (a real edit changes the file's
-        // length) without paying for a full content read on the
-        // overwhelmingly common case (an untouched placeholder, where
-        // this event really is this crate's own echo).
+        // BUT only when the on-disk object is PROVEN to still be this
+        // crate's own untouched placeholder -- via `placeholder_generation`
+        // (M1-2), the `(dev, ino)` identity `write_placeholder` captured
+        // and persisted when it created this exact file, compared here
+        // against the identity `lstat` (already fetched above) reports for
+        // whatever object is at `path` right now. This platform has no
+        // real OS-level transparent-hydration provider wired up yet (no
+        // Cloud Filter API reparse point on Windows, no File Provider item
+        // on macOS -- see `chunker::write_placeholder`'s own doc comment),
+        // so a `Placeholder` row's on-disk file is, today, an ORDINARY
+        // sparse file sitting at an ordinary path: nothing stops a user
+        // (or an editor that doesn't know or care it's "just a
+        // placeholder") from opening and overwriting it directly.
+        // Unconditionally treating every `CreatedOrModified` on a
+        // `Placeholder` path as this crate's own echo -- as this check
+        // used to, with no comparison at all -- silently and PERMANENTLY
+        // discarded such an edit: never chunked, never indexed, and the
+        // next `hydrate` would then overwrite it again with the stale
+        // synced content, with no error, no warning, and no way for the
+        // user to discover their edit was ever lost.
+        //
+        // Deliberately NOT a size/mtime/sparse-file comparison anymore --
+        // an earlier version of this check used exactly that, and an
+        // independent review found the residual gap it could never close:
+        // an edit that happens to preserve both byte length and mtime (an
+        // in-place same-length overwrite, or any writer that restores
+        // mtime via `utimes`/`touch -r` after editing) was invisible to
+        // it. `(dev, ino)` closes this: a same-size/mtime edit performed
+        // via an atomic-rename save (the common case for ordinary editors)
+        // still mints a fresh inode, so it is caught here even though it
+        // would have slipped past the old heuristic. An in-place
+        // truncate-and-rewrite that reuses the same inode is the one edit
+        // shape this still cannot distinguish from an untouched
+        // placeholder -- accepted as the same class of residual gap the
+        // old heuristic already had, not a new one, and one only a real
+        // OS-transparent provider closes for good.
+        //
+        // `provider_kind` is checked too: only `INTERNAL_INODE_PROVIDER_KIND`
+        // is a `(dev, ino)` comparison this process can perform itself. A
+        // future real OS provider's own token needs its own comparison
+        // logic, not this one, so an unrecognized kind falls through to
+        // the ordinary local-edit path below rather than being silently
+        // (and wrongly) compared as if it were an inode pair.
         if let Some(MaterializationState::Placeholder) = materialization_state {
-            let still_looks_like_the_untouched_placeholder =
-                existing.as_ref().is_some_and(|record| {
-                    lstat.len() == record.size
-                        && metadata_mtime_matches(&lstat, record.mtime_unix_nanos)
-                        && placeholder_has_no_allocated_data(&lstat)
-                });
-            if still_looks_like_the_untouched_placeholder {
+            if untouched_placeholder_verdict(
+                &lstat,
+                existing.as_ref(),
+                placeholder_generation.as_ref(),
+            ) {
                 return Ok((LocalChangeOutcome::None, None, None));
             }
-            // The size no longer matches what this crate itself wrote —
-            // something else touched this path. Do NOT silently discard
-            // it: fall through to the same ordinary local-edit path
-            // (chunk, compare, index) any other `CreatedOrModified` event
-            // takes. A residual gap, documented rather than silently
-            // assumed away: an edit that happens to leave the file at
-            // EXACTLY the same byte length as the placeholder (a same-
-            // size in-place overwrite) is not caught by this length-only
-            // check and would still be missed — closing that fully would
-            // need either reading the whole file to prove its content
-            // really is still the placeholder's sparse/all-zero stand-in
-            // (expensive on every ordinary placeholder-refresh echo, the
-            // overwhelmingly common case this fast path exists for), or a
-            // real OS transparent-hydration provider that makes "someone
-            // wrote to this file" an unambiguous, cheap, provider-level
-            // signal instead of something this crate has to infer.
+            // Not proven untouched -- do NOT silently discard the event:
+            // fall through to the same ordinary local-edit path (chunk,
+            // compare, index) any other `CreatedOrModified` event takes.
         }
 
         // a size+mtime fast-path, checked before
@@ -2258,6 +2321,65 @@ pub(crate) mod scan_test_hooks {
         if let Some(hook) = hook {
             hook(group_id);
         }
+    }
+}
+
+/// `untouched_placeholder_verdict`'s non-Unix fallback (plain size+mtime
+/// comparison, no identity involved) has no coverage from this module's
+/// other placeholder tests, which are all `#[cfg(unix)]` (they need a real
+/// captured identity, which only Unix produces) -- an independent review's
+/// finding. These call the free function directly against a hand-built
+/// `Metadata`/`FileRecord` rather than through the full processor fixture,
+/// so they compile and run on every platform this crate ships for,
+/// specifically exercising whichever `untouched_placeholder_verdict` is
+/// active on that build. On Unix this is a weaker assertion than the
+/// dedicated identity/sparse tests above (it cannot force a `PlaceholderGeneration`
+/// mismatch by itself, since that overload ignores `existing` and looks
+/// only at `placeholder_generation`), so it is gated to non-Unix, where
+/// it is this fallback's only coverage.
+#[cfg(all(test, not(unix)))]
+mod untouched_placeholder_verdict_fallback_tests {
+    use super::{untouched_placeholder_verdict, FileRecord};
+
+    fn record(size: u64, mtime_unix_nanos: i64) -> FileRecord {
+        FileRecord {
+            path: "placeholder.bin".into(),
+            size,
+            mtime_unix_nanos,
+            blocks: Vec::new(),
+            deleted: false,
+        }
+    }
+
+    fn metadata_for(size: u64) -> std::fs::Metadata {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, vec![0u8; size as usize]).unwrap();
+        std::fs::metadata(&path).unwrap()
+    }
+
+    #[test]
+    fn matching_size_and_mtime_is_untouched() {
+        let metadata = metadata_for(4096);
+        let mtime =
+            metadata.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+                as i64;
+        assert!(untouched_placeholder_verdict(&metadata, Some(&record(4096, mtime)), None));
+    }
+
+    #[test]
+    fn mismatched_size_is_not_untouched() {
+        let metadata = metadata_for(4096);
+        let mtime =
+            metadata.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+                as i64;
+        assert!(!untouched_placeholder_verdict(&metadata, Some(&record(9999, mtime)), None));
+    }
+
+    #[test]
+    fn no_existing_record_is_not_untouched() {
+        let metadata = metadata_for(4096);
+        assert!(!untouched_placeholder_verdict(&metadata, None, None));
     }
 }
 
@@ -3324,7 +3446,12 @@ mod tests {
     /// as a local edit": a placeholder's own write must not be indexed as
     /// a genuine local change, or chunked (which would index wrong content
     /// — the placeholder's sparse bytes, not the file's real ones).
+    /// Unix-only: exercises the `(dev, ino)` identity path specifically --
+    /// `write_placeholder` only captures an identity on Unix (see its own
+    /// doc comment), so this test's `.expect(...)` on that identity would
+    /// panic on a platform where it always returns `None`.
     #[tokio::test]
+    #[cfg(unix)]
     async fn placeholder_write_is_not_treated_as_a_local_edit() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
@@ -3361,7 +3488,19 @@ mod tests {
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
-        yadorilink_local_storage::write_placeholder(&file_path, 5_000_000, 0).unwrap();
+        let identity = yadorilink_local_storage::write_placeholder(&file_path, 5_000_000, 0)
+            .unwrap()
+            .expect("this test runs on unix, where an identity is always captured");
+        state
+            .materialization_state_repository()
+            .record_placeholder_generation(
+                "group-1",
+                "placeholder.bin",
+                identity,
+                yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
 
         let result = proc
             .process_event(
@@ -3381,6 +3520,174 @@ mod tests {
             state.sqlite().dag_list_versions("group-1", "placeholder.bin").unwrap().len(),
             1,
             "no spurious local version bump"
+        );
+    }
+
+    /// The exact gap M1-2 closes, that the old size/mtime/sparse-file
+    /// heuristic documented but could never fix: an atomic-save editor
+    /// replaces the placeholder with a real file of the SAME size, stamped
+    /// to the SAME mtime -- indistinguishable from an untouched placeholder
+    /// by size and mtime alone, but the rename mints a fresh inode. Unix-
+    /// only, same reason as the sibling placeholder tests above.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn atomic_replace_edit_at_the_placeholders_exact_size_and_mtime_is_captured() {
+        let (proc, state, _store_dir, root_dir) = processor();
+        let root = canonical_root(&root_dir);
+        adopt_root(&state, "group-1", &root);
+        let file_path = root.join("placeholder.bin");
+        let content_size: u64 = 64;
+
+        state
+            .file_index_repository()
+            .upsert_file(
+                "group-1",
+                &FileRecord {
+                    path: "placeholder.bin".into(),
+                    size: content_size,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![yadorilink_replica_domain::file::BlockInfo {
+                        hash: vec![0xAB; 32],
+                        offset: 0,
+                        size: content_size as u32,
+                    }],
+                    deleted: false,
+                },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(
+                "group-1",
+                "placeholder.bin",
+                MaterializationState::Placeholder,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        let identity = yadorilink_local_storage::write_placeholder(&file_path, content_size, 0)
+            .unwrap()
+            .expect("this test runs on unix, where an identity is always captured");
+        state
+            .materialization_state_repository()
+            .record_placeholder_generation(
+                "group-1",
+                "placeholder.bin",
+                identity,
+                yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+
+        // Simulate an atomic-save editor: write the SAME-size real content
+        // to a sibling temp path, stamp it to the EXACT same mtime the
+        // placeholder carries, then rename it over the placeholder's own
+        // path -- an ordinary editor save flow, and the exact edit shape
+        // the old size/mtime/sparse heuristic could never distinguish from
+        // an untouched placeholder.
+        let tmp_path = root.join("placeholder.bin.editor-tmp");
+        std::fs::write(&tmp_path, vec![0x42u8; content_size as usize]).unwrap();
+        std::fs::File::open(&tmp_path).unwrap().set_modified(std::time::UNIX_EPOCH).unwrap();
+        std::fs::rename(&tmp_path, &file_path).unwrap();
+
+        let result = proc
+            .process_event(
+                "group-1",
+                &root,
+                &FsChangeEvent { path: file_path, kind: FsChangeKind::CreatedOrModified },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(result, LocalChangeOutcome::FileChanged(_)),
+            "an atomic-save edit landing at the placeholder's exact size and mtime must be \
+             captured, not discarded as a self-echo -- got {result:?}"
+        );
+    }
+
+    /// The OLD size/mtime/sparse-file heuristic caught an in-place edit
+    /// (same inode, real bytes written directly into the placeholder's
+    /// path rather than an atomic rename) via its sparse-file check: real
+    /// content allocates disk blocks. A second independent review's
+    /// finding: an identity-only comparison LOSES that coverage, since an
+    /// in-place write never changes the inode. This pins the fix requiring
+    /// BOTH identity match and continued sparseness.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn in_place_edit_that_keeps_the_same_inode_is_still_captured() {
+        let (proc, state, _store_dir, root_dir) = processor();
+        let root = canonical_root(&root_dir);
+        adopt_root(&state, "group-1", &root);
+        let file_path = root.join("placeholder.bin");
+        let content_size: u64 = 64;
+
+        state
+            .file_index_repository()
+            .upsert_file(
+                "group-1",
+                &FileRecord {
+                    path: "placeholder.bin".into(),
+                    size: content_size,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![yadorilink_replica_domain::file::BlockInfo {
+                        hash: vec![0xAB; 32],
+                        offset: 0,
+                        size: content_size as u32,
+                    }],
+                    deleted: false,
+                },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(
+                "group-1",
+                "placeholder.bin",
+                MaterializationState::Placeholder,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        let identity = yadorilink_local_storage::write_placeholder(&file_path, content_size, 0)
+            .unwrap()
+            .expect("this test runs on unix, where an identity is always captured");
+        state
+            .materialization_state_repository()
+            .record_placeholder_generation(
+                "group-1",
+                "placeholder.bin",
+                identity,
+                yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+
+        // Write real content directly into the placeholder's own path (no
+        // rename) -- the same inode as before, but no longer sparse, and
+        // restore the exact original mtime afterward so size AND mtime
+        // both still match the untouched placeholder too.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().write(true).open(&file_path).unwrap();
+            file.write_all(&vec![0x99u8; content_size as usize]).unwrap();
+            file.sync_all().unwrap();
+        }
+        std::fs::File::open(&file_path).unwrap().set_modified(std::time::UNIX_EPOCH).unwrap();
+
+        let result = proc
+            .process_event(
+                "group-1",
+                &root,
+                &FsChangeEvent { path: file_path, kind: FsChangeKind::CreatedOrModified },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(result, LocalChangeOutcome::FileChanged(_)),
+            "an in-place edit that keeps the same inode but writes real content must still be \
+             captured -- got {result:?}"
         );
     }
 
@@ -3940,8 +4247,10 @@ mod tests {
     /// not skip a genuine placeholder (OnDemand sync) during a bulk scan —
     /// the bulk-loaded materialization-state map must still
     /// correctly prevent chunking a placeholder's sparse bytes, exactly as
-    /// the old per-file `get_materialization_state` lookup did.
+    /// the old per-file `get_materialization_state` lookup did. Unix-only,
+    /// same reason as `placeholder_write_is_not_treated_as_a_local_edit`.
     #[test]
+    #[cfg(unix)]
     fn scan_existing_files_still_skips_placeholders_when_bulk_loading_materialization_state() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
@@ -3973,7 +4282,22 @@ mod tests {
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
-        yadorilink_local_storage::write_placeholder(&root.join("placeholder.bin"), 2_000_000, 0)
+        let identity = yadorilink_local_storage::write_placeholder(
+            &root.join("placeholder.bin"),
+            2_000_000,
+            0,
+        )
+        .unwrap()
+        .expect("this test runs on unix, where an identity is always captured");
+        state
+            .materialization_state_repository()
+            .record_placeholder_generation(
+                "group-1",
+                "placeholder.bin",
+                identity,
+                yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
             .unwrap();
         std::fs::write(root.join("ordinary.txt"), b"a real file").unwrap();
 

@@ -131,6 +131,25 @@ impl LocalMutationStore for TestReplica {
         self.materialization_state_repository().get_materialization_state(group_id, path)
     }
 
+    fn list_placeholder_generations(
+        &self,
+        group_id: &str,
+    ) -> Result<
+        std::collections::HashMap<String, yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
+        SyncSqliteError,
+    > {
+        self.materialization_state_repository().list_placeholder_generations(group_id)
+    }
+
+    fn get_placeholder_generation(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<yadorilink_sync_sqlite::RecordedPlaceholderGeneration>, SyncSqliteError>
+    {
+        self.materialization_state_repository().get_placeholder_generation(group_id, path)
+    }
+
     fn has_materialization_intent(
         &self,
         group_id: &str,
