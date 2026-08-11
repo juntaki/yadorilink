@@ -144,6 +144,19 @@ impl LinkRuntime {
         self.flush_handle.flush_case_fold_sibling(group_id, rel_path).await
     }
 
+    /// M1-3: routes a File-Provider-originated local write notification
+    /// through this link's `LocalChangeProcessor` -- see
+    /// `LinkFlushHandle::capture_local_write`'s own doc. Reached from
+    /// `shell_ipc`'s `LocalWriteRequest` handler via `LinkRegistry::runtime`.
+    pub(crate) async fn capture_local_write(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+        kind: yadorilink_filesystem_sync::watcher::FsChangeKind,
+    ) -> Result<yadorilink_local_capture::LocalChangeOutcome, String> {
+        self.flush_handle.capture_local_write(group_id, rel_path, kind).await
+    }
+
     /// The one deliberate exception to this type's "no raw internal-type
     /// getter" rule: `yadorilink_peer_session::peer_session::
     /// RootCommitAuthorityProvider` (implemented by `DaemonState` in the

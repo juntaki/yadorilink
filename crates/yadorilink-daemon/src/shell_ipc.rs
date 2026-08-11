@@ -26,7 +26,7 @@ use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
 use yadorilink_ipc_proto::shellipc::{
     ContextAction, ContextActionResponse, FolderFileEntry, HydrateResponse,
-    ListFolderFilesResponse, ListOnDemandFoldersResponse,
+    ListFolderFilesResponse, ListOnDemandFoldersResponse, LocalWriteKind, LocalWriteResponse,
     MaterializationState as ShellMaterializationState, OnDemandFolder, ShellIpcMessage,
     StatusResponse,
 };
@@ -269,7 +269,271 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
                 })),
             })
         }
+        // M1-3: the OS virtual-filesystem's own create/modify/delete
+        // callback (macOS `NSFileProviderReplicatedExtension`'s
+        // `createItem`/`modifyItem`/`deleteItem`) notifies the daemon that a
+        // local write already landed on disk. Routes through the same
+        // `LocalChangeProcessor::process_event` path a live filesystem
+        // watcher's own event would take -- see `shellipc.proto`'s own doc
+        // comment on `LocalWriteRequest` and
+        // `LinkFlushHandle::capture_local_write`'s own doc for why no
+        // File-Provider-specific sync logic exists here.
+        Some(Payload::LocalWriteRequest(req)) => {
+            let response = 'resolve: {
+                let kind = match LocalWriteKind::try_from(req.kind) {
+                    Ok(LocalWriteKind::CreatedOrModified) => {
+                        yadorilink_filesystem_sync::watcher::FsChangeKind::CreatedOrModified
+                    }
+                    Ok(LocalWriteKind::Deleted) => {
+                        yadorilink_filesystem_sync::watcher::FsChangeKind::Removed
+                    }
+                    Ok(LocalWriteKind::Unspecified) | Err(_) => {
+                        break 'resolve LocalWriteResponse {
+                            ok: false,
+                            error: "unknown or unspecified write kind".into(),
+                        };
+                    }
+                };
+                // An orphaned link's coordination-side authorization is
+                // permanently gone -- same exclusion `ListFolderFilesRequest`
+                // and `ListOnDemandFoldersRequest` above already apply, for
+                // the same reason: this must never accept a File-Provider
+                // write for a link that's no longer a live sync target.
+                let Some(group_id) = state
+                    .replica_coordinator
+                    .link_repository()
+                    .list_links()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|l| l.local_path == req.local_path && !l.orphaned)
+                    .map(|l| l.group_id)
+                else {
+                    break 'resolve LocalWriteResponse {
+                        ok: false,
+                        error: "local_path is not a currently linked, live folder".into(),
+                    };
+                };
+                let Some(runtime) = state.links.runtime(&req.local_path) else {
+                    break 'resolve LocalWriteResponse {
+                        ok: false,
+                        error: "link is not currently running".into(),
+                    };
+                };
+                match runtime.capture_local_write(&group_id, &req.relative_path, kind).await {
+                    Ok(_) => LocalWriteResponse { ok: true, error: String::new() },
+                    Err(e) => LocalWriteResponse { ok: false, error: e },
+                }
+            };
+            Some(ShellIpcMessage { payload: Some(Payload::LocalWriteResponse(response)) })
+        }
         _ => None, // StatusResponse/StatusPush/ContextActionResponse/... are server->client only
+    }
+}
+
+#[cfg(test)]
+mod local_write_tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use yadorilink_filesystem_sync::watcher::RealFolderWatchSource;
+    use yadorilink_ipc_proto::shellipc::LocalWriteRequest;
+    use yadorilink_local_storage::FsBlockStore;
+
+    use crate::adapters::runtime::link_runtime_controller::LinkRuntimeController;
+    use crate::daemon_state::DaemonState;
+    use crate::replica_coordinator::ReplicaCoordinator;
+
+    use super::*;
+
+    fn test_state() -> Arc<DaemonState> {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let state = DaemonState::new("device-a".into(), sync_state, store);
+        state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        state.replica_coordinator.set_local_change_auth_provider(std::sync::Arc::new(
+            |_group_id| Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER),
+        ));
+        state
+    }
+
+    async fn start_watch_and_await_scan(state: &Arc<DaemonState>, root: &Path, group: &str) {
+        let controller = LinkRuntimeController::new(state.clone());
+        controller
+            .start_with_source(
+                root.to_string_lossy().into_owned(),
+                group.to_string(),
+                Arc::new(RealFolderWatchSource),
+            )
+            .expect("the watch must start");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            state.replica_coordinator.wait_group_ready(group),
+        )
+        .await
+        .expect("the initial scan must finish")
+        .expect("the initial scan must succeed");
+    }
+
+    fn local_write_request(
+        local_path: &str,
+        relative_path: &str,
+        kind: LocalWriteKind,
+    ) -> ShellIpcMessage {
+        ShellIpcMessage {
+            payload: Some(Payload::LocalWriteRequest(LocalWriteRequest {
+                local_path: local_path.to_string(),
+                relative_path: relative_path.to_string(),
+                kind: kind as i32,
+            })),
+        }
+    }
+
+    /// The core M1-3 create-path RED test: a File Provider `createItem`
+    /// notification (here, a plain file already written to disk plus this
+    /// request -- see `LinkFlushHandle::capture_local_write`'s own doc for
+    /// why the request itself carries no content) results in exactly one
+    /// DAG change and one indexed row, through the SAME admission path a
+    /// filesystem watcher's own event takes.
+    #[tokio::test]
+    async fn local_write_request_for_a_new_file_admits_exactly_one_dag_change() {
+        let state = test_state();
+        let root = tempfile::tempdir().unwrap();
+        let local_path = root.path().to_string_lossy().to_string();
+        state.replica_coordinator.link_repository().add_link(&local_path, "group-1").unwrap();
+        start_watch_and_await_scan(&state, root.path(), "group-1").await;
+        std::fs::write(root.path().join("new.txt"), b"hello from the file provider").unwrap();
+
+        let response = handle_message(
+            &state,
+            local_write_request(&local_path, "new.txt", LocalWriteKind::CreatedOrModified),
+        )
+        .await
+        .unwrap();
+
+        let Some(Payload::LocalWriteResponse(r)) = response.payload else {
+            panic!("expected a LocalWriteResponse");
+        };
+        assert!(r.ok, "expected ok=true, got error: {}", r.error);
+        let record = state
+            .replica_coordinator
+            .file_index_repository()
+            .get_file("group-1", "new.txt")
+            .unwrap();
+        assert!(record.is_some_and(|r| !r.deleted), "the new file must be indexed and not deleted");
+        assert_eq!(
+            state
+                .replica_coordinator
+                .sqlite()
+                .dag_list_versions("group-1", "new.txt")
+                .unwrap()
+                .len(),
+            1,
+            "exactly one DAG change for the create"
+        );
+    }
+
+    /// A duplicate `createItem` replay for the exact same unchanged content
+    /// (a real callback retry, or the OS re-delivering the same
+    /// notification) must not mint a second DAG change -- `process_event`'s
+    /// own self-echo/no-op suppression, exercised here through the new
+    /// signal source.
+    #[tokio::test]
+    async fn duplicate_local_write_request_for_unchanged_content_does_not_duplicate_the_change() {
+        let state = test_state();
+        let root = tempfile::tempdir().unwrap();
+        let local_path = root.path().to_string_lossy().to_string();
+        state.replica_coordinator.link_repository().add_link(&local_path, "group-1").unwrap();
+        start_watch_and_await_scan(&state, root.path(), "group-1").await;
+        std::fs::write(root.path().join("new.txt"), b"hello from the file provider").unwrap();
+        handle_message(
+            &state,
+            local_write_request(&local_path, "new.txt", LocalWriteKind::CreatedOrModified),
+        )
+        .await
+        .unwrap();
+
+        let response = handle_message(
+            &state,
+            local_write_request(&local_path, "new.txt", LocalWriteKind::CreatedOrModified),
+        )
+        .await
+        .unwrap();
+
+        let Some(Payload::LocalWriteResponse(r)) = response.payload else {
+            panic!("expected a LocalWriteResponse");
+        };
+        assert!(r.ok, "a no-op replay must still report ok=true, got error: {}", r.error);
+        assert_eq!(
+            state
+                .replica_coordinator
+                .sqlite()
+                .dag_list_versions("group-1", "new.txt")
+                .unwrap()
+                .len(),
+            1,
+            "a duplicate replay of unchanged content must not mint a second DAG change"
+        );
+    }
+
+    /// A `deleteItem` notification for an existing file tombstones it
+    /// through the same admission path.
+    #[tokio::test]
+    async fn local_write_request_for_a_delete_tombstones_the_file() {
+        let state = test_state();
+        let root = tempfile::tempdir().unwrap();
+        let local_path = root.path().to_string_lossy().to_string();
+        state.replica_coordinator.link_repository().add_link(&local_path, "group-1").unwrap();
+        start_watch_and_await_scan(&state, root.path(), "group-1").await;
+        std::fs::write(root.path().join("gone.txt"), b"will be deleted").unwrap();
+        handle_message(
+            &state,
+            local_write_request(&local_path, "gone.txt", LocalWriteKind::CreatedOrModified),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_file(root.path().join("gone.txt")).unwrap();
+
+        let response = handle_message(
+            &state,
+            local_write_request(&local_path, "gone.txt", LocalWriteKind::Deleted),
+        )
+        .await
+        .unwrap();
+
+        let Some(Payload::LocalWriteResponse(r)) = response.payload else {
+            panic!("expected a LocalWriteResponse");
+        };
+        assert!(r.ok, "expected ok=true, got error: {}", r.error);
+        let record = state
+            .replica_coordinator
+            .file_index_repository()
+            .get_file("group-1", "gone.txt")
+            .unwrap();
+        assert!(
+            record.is_some_and(|r| r.deleted),
+            "the file must be tombstoned, not merely absent"
+        );
+    }
+
+    /// An unrecognized `local_path` (not currently a live linked folder)
+    /// must fail closed, never silently admit a write for a group this
+    /// request cannot actually be authorized against.
+    #[tokio::test]
+    async fn local_write_request_for_an_unknown_local_path_is_rejected() {
+        let state = test_state();
+
+        let response = handle_message(
+            &state,
+            local_write_request("/not/a/linked/folder", "x.txt", LocalWriteKind::CreatedOrModified),
+        )
+        .await
+        .unwrap();
+
+        let Some(Payload::LocalWriteResponse(r)) = response.payload else {
+            panic!("expected a LocalWriteResponse");
+        };
+        assert!(!r.ok, "an unknown local_path must not be silently accepted");
     }
 }
 

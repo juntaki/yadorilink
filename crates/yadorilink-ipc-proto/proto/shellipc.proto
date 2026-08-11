@@ -136,6 +136,37 @@ message ListFolderFilesResponse {
   repeated FolderFileEntry entries = 1;
 }
 
+enum LocalWriteKind {
+  LOCAL_WRITE_KIND_UNSPECIFIED = 0;
+  LOCAL_WRITE_KIND_CREATED_OR_MODIFIED = 1;
+  LOCAL_WRITE_KIND_DELETED = 2;
+}
+
+// M1-3: the OS virtual-filesystem's own create/modify/delete callbacks
+// (macOS `NSFileProviderReplicatedExtension`'s `createItem`/`modifyItem`/
+// `deleteItem`) notify the daemon that a local write already landed on
+// disk under `local_path`/`relative_path` -- the daemon re-observes the
+// live file itself (never trusts the OS-supplied `contents`/metadata) and
+// routes it through the EXACT same local-change/DAG admission path a
+// filesystem watcher's own `CreatedOrModified`/`Removed` event would take
+// (`yadorilink_local_capture::LocalChangeProcessor::process_event`). This
+// is purely a second *signal source* for that one existing path -- no
+// File-Provider-specific sync logic exists anywhere in the daemon.
+message LocalWriteRequest {
+  // Must match a `local_path` returned by `ListOnDemandFoldersResponse`,
+  // same resolution convention as `ListFolderFilesRequest.local_path`.
+  string local_path = 1;
+  // Forward-slash-separated, relative to `local_path` -- same convention
+  // as `FolderFileEntry.relative_path`.
+  string relative_path = 2;
+  LocalWriteKind kind = 3;
+}
+
+message LocalWriteResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
 message ShellIpcMessage {
   oneof payload {
     StatusQuery status_query = 1;
@@ -149,5 +180,7 @@ message ShellIpcMessage {
     ListOnDemandFoldersResponse list_on_demand_folders_response = 9;
     ListFolderFilesRequest list_folder_files_request = 10;
     ListFolderFilesResponse list_folder_files_response = 11;
+    LocalWriteRequest local_write_request = 12;
+    LocalWriteResponse local_write_response = 13;
   }
 }

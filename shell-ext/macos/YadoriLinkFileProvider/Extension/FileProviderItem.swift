@@ -57,8 +57,19 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
         return ext.isEmpty ? .data : (UTType(filenameExtension: ext) ?? .data)
     }
 
+    // M1-3: write support (createItem/modifyItem/deleteItem) is now wired
+    // through to the daemon's local-change/DAG admission path -- see
+    // FileProviderExtension.swift's own doc comment. Deliberately NOT
+    // `.allowsRenaming`/`.allowsReparenting`/`.allowsTrashing`: none of
+    // those are implemented (`modifyItem` here does not handle a
+    // filename/parent change, and `deleteItem` performs a plain delete,
+    // not a move-to-trash) -- advertising a capability Finder would then
+    // let the user invoke, with no backing implementation, is worse than
+    // not advertising it at all.
     var capabilities: NSFileProviderItemCapabilities {
-        node.isDirectory ? [.allowsReading, .allowsContentEnumerating] : [.allowsReading]
+        node.isDirectory
+            ? [.allowsReading, .allowsContentEnumerating, .allowsAddingSubItems]
+            : [.allowsReading, .allowsWriting, .allowsDeleting]
     }
 
     var documentSize: NSNumber? {

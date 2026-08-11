@@ -504,6 +504,63 @@ impl LinkFlushHandle {
             ),
         }
     }
+
+    /// M1-3: routes a File-Provider-originated create/modify/delete
+    /// notification (macOS `NSFileProviderReplicatedExtension`'s own
+    /// `createItem`/`modifyItem`/`deleteItem`, relayed via `yadorilink-daemon`'s
+    /// shell_ipc `LocalWriteRequest` handler) through the EXACT same
+    /// `LocalChangeProcessor::process_event` path a live filesystem
+    /// watcher's own `FsChangeEvent` would take -- no File-Provider-specific
+    /// sync logic exists anywhere in the daemon; this is purely a second
+    /// *signal source* for that one existing admission path.
+    ///
+    /// Unlike `capture_undiscovered_local_change` above (a defensive,
+    /// `CreatedOrModified`-only fallback for a path racing a peer update),
+    /// `kind` here is whatever the caller actually observed -- a `Removed`
+    /// notification from a real, one-time OS delete callback is not a
+    /// speculative synthesis, so none of that method's "don't
+    /// double-tombstone an already-deleted path" concern applies: a genuine
+    /// watcher fires exactly one `Removed` per deletion, and this is that
+    /// same shape of event, just sourced from the File Provider system
+    /// instead of `notify`.
+    ///
+    /// `process_event` never trusts the OS-supplied metadata that
+    /// accompanied the original File Provider callback (`createItem`'s
+    /// `contents`/`modifyItem`'s `newContents`/`changedFields`) -- by the
+    /// time this call reaches it, the caller (the shell_ipc handler) has
+    /// already discarded all of that; only `rel_path` and `kind` survive.
+    /// `process_event` re-observes whatever is actually on disk at that
+    /// path right now, exactly as it does for a live filesystem-watcher
+    /// event.
+    pub(crate) async fn capture_local_write(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+        kind: FsChangeKind,
+    ) -> Result<LocalChangeOutcome, String> {
+        let path = self.canonical_root.join(rel_path);
+        let Some(deps) = self.deps.upgrade() else {
+            return Err("link is shutting down".to_string());
+        };
+        let _op = self
+            .root_lease
+            .begin_operation()
+            .map_err(|_| "link is not currently accepting local writes".to_string())?;
+        let _write_activity = deps.begin_write_activity();
+        let event = FsChangeEvent { path, kind };
+        let outcome = self
+            .processor
+            .process_event(group_id, &self.root, &event)
+            .await
+            .map_err(|e| e.to_string())?;
+        let records = match &outcome {
+            LocalChangeOutcome::FileChanged(record) => vec![record.clone()],
+            LocalChangeOutcome::FilesChanged(records) => records.clone(),
+            LocalChangeOutcome::None => Vec::new(),
+        };
+        announce_local_change(&deps, &self.local_path, group_id, records).await;
+        Ok(outcome)
+    }
 }
 
 /// Whether a locally-indexed change may propagate right now. The authoritative
