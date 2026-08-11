@@ -259,25 +259,54 @@ async fn hydrate_inner(path: &str) -> bool {
 /// failure or if the daemon isn't reachable — the cfapi host's caller is
 /// expected to just register nothing and retry on its own poll interval,
 /// matching this client's fail-soft-never-hang contract elsewhere.
-pub fn list_on_demand_folders() -> Vec<OnDemandFolder> {
+/// Discovers every OnDemand-linked folder group (M2-1: the reconciliation
+/// input `cfapi_host`'s poll loop converges the CfAPI sync-root set
+/// against). Mirrors `shell-ext/macos/fileprovider-core/src/ipc_client.rs`'s
+/// `list_on_demand_folders` exactly, including its `None`/`Some(vec![])`
+/// contract -- both platforms answer the identical
+/// `ListOnDemandFoldersRequest`/`Response` pair.
+///
+/// `None` on any failure to confirm the daemon's current desired state
+/// (unreachable daemon, timeout, malformed response, or an explicit
+/// `snapshot_available: false` -- see `shellipc.proto`'s own doc comment
+/// on that field), deliberately distinct from `Some(vec![])`, a
+/// *confirmed* "no OnDemand folders exist right now" snapshot. The caller
+/// (`cfapi_host`'s `reconcile_sync_roots`, which both registers missing
+/// roots AND unregisters stale ones) must treat `None` as "cannot
+/// currently reconcile, leave existing sync roots untouched" -- collapsing
+/// this into an empty `Vec` would make a transient daemon-unreachable
+/// moment look identical to "every sync root should be removed," which is
+/// exactly the fail-open mistake a snapshot-based reconciliation must not
+/// make.
+pub fn list_on_demand_folders() -> Option<Vec<OnDemandFolder>> {
     runtime().block_on(async {
-        tokio::time::timeout(LIST_TIMEOUT, list_on_demand_folders_inner()).await.unwrap_or_default()
+        tokio::time::timeout(LIST_TIMEOUT, list_on_demand_folders_inner()).await.ok()?
     })
 }
 
-async fn list_on_demand_folders_inner() -> Vec<OnDemandFolder> {
-    let Ok(mut stream) = connect().await else { return Vec::new() };
+async fn list_on_demand_folders_inner() -> Option<Vec<OnDemandFolder>> {
+    let mut stream = connect().await.ok()?;
+    list_on_demand_folders_over(&mut stream).await
+}
+
+/// The stream-generic core of `list_on_demand_folders_inner`, split out so
+/// the load-bearing `None`-vs-`Some` distinction is testable against an
+/// in-memory duplex stream instead of a real named pipe + daemon.
+async fn list_on_demand_folders_over<S>(stream: &mut S) -> Option<Vec<OnDemandFolder>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let msg = ShellIpcMessage {
         payload: Some(Payload::ListOnDemandFoldersRequest(ListOnDemandFoldersRequest {})),
     };
-    if write_message(&mut stream, &msg).await.is_err() {
-        return Vec::new();
-    }
-    match read_message::<ShellIpcMessage>(&mut stream).await {
-        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListOnDemandFoldersResponse(r)) })) => {
-            r.folders
+    write_message(stream, &msg).await.ok()?;
+    match read_message::<ShellIpcMessage>(stream).await {
+        Ok(Some(ShellIpcMessage { payload: Some(Payload::ListOnDemandFoldersResponse(r)) }))
+            if r.snapshot_available =>
+        {
+            Some(r.folders)
         }
-        _ => Vec::new(),
+        _ => None,
     }
 }
 
@@ -328,4 +357,68 @@ async fn send_context_action_inner(path: &str, action: ContextAction) -> bool {
         read_message::<ShellIpcMessage>(&mut stream).await,
         Ok(Some(ShellIpcMessage { payload: Some(Payload::ContextActionResponse(r)) })) if r.ok
     )
+}
+
+#[cfg(test)]
+mod list_on_demand_folders_tests {
+    use super::*;
+
+    async fn respond_with(response: Option<ShellIpcMessage>) -> Option<Vec<OnDemandFolder>> {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let _ = read_message::<ShellIpcMessage>(&mut server).await;
+            if let Some(response) = response {
+                let _ = write_message(&mut server, &response).await;
+            }
+        });
+        let result = list_on_demand_folders_over(&mut client).await;
+        server_task.await.unwrap();
+        result
+    }
+
+    fn response(folders: Vec<OnDemandFolder>, snapshot_available: bool) -> ShellIpcMessage {
+        ShellIpcMessage {
+            payload: Some(Payload::ListOnDemandFoldersResponse(
+                yadorilink_ipc_proto::shellipc::ListOnDemandFoldersResponse {
+                    folders,
+                    snapshot_available,
+                },
+            )),
+        }
+    }
+
+    fn folder(local_path: &str, group_id: &str) -> OnDemandFolder {
+        OnDemandFolder { local_path: local_path.to_string(), group_id: group_id.to_string() }
+    }
+
+    #[tokio::test]
+    async fn confirmed_empty_snapshot_is_some_empty_vec() {
+        let result = respond_with(Some(response(vec![], true))).await;
+        assert_eq!(result, Some(vec![]));
+    }
+
+    #[tokio::test]
+    async fn confirmed_nonempty_snapshot_is_some() {
+        let result = respond_with(Some(response(vec![folder("C:\\A", "group-a")], true))).await;
+        assert_eq!(result, Some(vec![folder("C:\\A", "group-a")]));
+    }
+
+    #[tokio::test]
+    async fn snapshot_unavailable_is_none_even_with_folders_present() {
+        let result = respond_with(Some(response(vec![folder("C:\\A", "group-a")], false))).await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn server_closes_without_responding_is_none() {
+        let result = respond_with(None).await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn malformed_response_payload_is_none() {
+        let msg = ShellIpcMessage { payload: Some(Payload::HydrateResponse(Default::default())) };
+        let result = respond_with(Some(msg)).await;
+        assert_eq!(result, None);
+    }
 }
