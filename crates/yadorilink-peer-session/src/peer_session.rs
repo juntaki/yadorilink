@@ -43,7 +43,7 @@ use yadorilink_local_storage::check_disk_headroom;
 use yadorilink_local_storage::{
     apply_exec_bit, reconstruct_file, verify_delete_target_within_canonical_root,
     verify_delete_target_within_root, verify_write_target_within_canonical_root,
-    verify_write_target_within_root, write_placeholder,
+    verify_write_target_within_root, write_placeholder, INTERNAL_INODE_PROVIDER_KIND,
 };
 use yadorilink_replica_domain::admission::ChangeOrdering;
 use yadorilink_replica_domain::change::Change;
@@ -9084,7 +9084,20 @@ impl PeerSyncSession {
                 )?;
                 let out_path = self.local_file_path(group_id, &record.path)?;
                 self.verify_write_target(group_id, &out_path)?;
-                write_placeholder(&out_path, record.size, record.mtime_unix_nanos)?;
+                match write_placeholder(&out_path, record.size, record.mtime_unix_nanos)? {
+                    Some(identity) => self.state.record_placeholder_generation(
+                        group_id,
+                        &record.path,
+                        identity,
+                        INTERNAL_INODE_PROVIDER_KIND,
+                        &root_commit_permit,
+                    )?,
+                    None => self.state.clear_placeholder_generation(
+                        group_id,
+                        &record.path,
+                        &root_commit_permit,
+                    )?,
+                }
                 apply_exec_bit(&out_path, self.state.get_exec_bit(group_id, &record.path)?)?;
                 // Eager/pinned wanted real content but not every block was
                 // available -- this is a retriable Placeholder, not a
@@ -9219,7 +9232,20 @@ impl PeerSyncSession {
                 // of this path must not be misread as a crash to reconstruct.
                 intent_guard.clear()?;
                 self.verify_write_target(group_id, &out_path)?;
-                write_placeholder(&out_path, record.size, record.mtime_unix_nanos)?;
+                match write_placeholder(&out_path, record.size, record.mtime_unix_nanos)? {
+                    Some(identity) => self.state.record_placeholder_generation(
+                        group_id,
+                        &record.path,
+                        identity,
+                        INTERNAL_INODE_PROVIDER_KIND,
+                        &root_commit_permit,
+                    )?,
+                    None => self.state.clear_placeholder_generation(
+                        group_id,
+                        &record.path,
+                        &root_commit_permit,
+                    )?,
+                }
                 apply_exec_bit(&out_path, self.state.get_exec_bit(group_id, &record.path)?)?;
                 // Reconstruct never actually succeeded despite the blocks
                 // being fetched -- demoted to a retriable Placeholder, not
@@ -9271,7 +9297,20 @@ impl PeerSyncSession {
             let out_path = self.local_file_path(group_id, &record.path)?;
             // defense-in-depth — see the comment above.
             self.verify_write_target(group_id, &out_path)?;
-            write_placeholder(&out_path, record.size, record.mtime_unix_nanos)?;
+            match write_placeholder(&out_path, record.size, record.mtime_unix_nanos)? {
+                Some(identity) => self.state.record_placeholder_generation(
+                    group_id,
+                    &record.path,
+                    identity,
+                    INTERNAL_INODE_PROVIDER_KIND,
+                    &root_commit_permit,
+                )?,
+                None => self.state.clear_placeholder_generation(
+                    group_id,
+                    &record.path,
+                    &root_commit_permit,
+                )?,
+            }
             // A placeholder still gets the recorded exec bit
             // applied now — `hydrate_file_with_timeout` re-applies it
             // again once real content lands, so this is never lost

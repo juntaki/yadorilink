@@ -209,6 +209,32 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
+    fn record_placeholder_generation(
+        &self,
+        group_id: &str,
+        path: &str,
+        identity: yadorilink_local_storage::PlaceholderDiskIdentity,
+        provider_kind: &str,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), PeerSessionError> {
+        self.materialization_state_repository()
+            .record_placeholder_generation(group_id, path, identity, provider_kind, permit)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
+    fn clear_placeholder_generation(
+        &self,
+        group_id: &str,
+        path: &str,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), PeerSessionError> {
+        self.materialization_state_repository()
+            .clear_placeholder_generation(group_id, path, permit)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
     fn is_pinned(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
         self.file_index_repository()
             .is_pinned(group_id, path)

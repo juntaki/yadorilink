@@ -31,7 +31,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use yadorilink_local_storage::{BlockReclamationStore, GcReport};
+use yadorilink_local_storage::{BlockReclamationStore, GcReport, PlaceholderDiskIdentity};
 use yadorilink_replica_domain::admission::ChangeEmitter;
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 use yadorilink_replica_domain::session_state::MaterializationState;
@@ -286,6 +286,32 @@ pub trait MaterializationExecutionPort: Send + Sync {
         next: MaterializationState,
         permit: &RootCommitPermit<'_>,
     ) -> Result<bool, MaterializationExecutionError>;
+
+    /// Records the identity of the exact on-disk object a `write_placeholder`
+    /// call just created for `(group_id, path)` (M1-2) -- always called
+    /// alongside that same call's `set_materialization_state(Placeholder)`.
+    /// See `yadorilink_sync_sqlite::materialization_state::
+    /// MaterializationStateRepository::record_placeholder_generation`'s own
+    /// doc comment.
+    fn record_placeholder_generation(
+        &self,
+        group_id: &str,
+        path: &str,
+        identity: PlaceholderDiskIdentity,
+        provider_kind: &str,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), MaterializationExecutionError>;
+
+    /// Clears any placeholder identity recorded for `(group_id, path)` -- a
+    /// no-op if none was recorded. See
+    /// `MaterializationStateRepository::clear_placeholder_generation`'s own
+    /// doc comment for when callers must call this.
+    fn clear_placeholder_generation(
+        &self,
+        group_id: &str,
+        path: &str,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), MaterializationExecutionError>;
 
     /// Acquires the per-`(group_id, path)` lock so a materialization write
     /// cannot race a concurrent local capture or peer reconciliation of the

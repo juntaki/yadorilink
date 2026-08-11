@@ -34,6 +34,7 @@ use sha2::{Digest, Sha256};
 use yadorilink_local_storage::{
     apply_exec_bit, disk_bytes_match_indexed_blocks, intent_target_hash, reconstruct_file,
     verify_write_target_within_root, write_placeholder, BlockContentStore,
+    INTERNAL_INODE_PROVIDER_KIND,
 };
 use yadorilink_replica_domain::admission::ChangeEmitter;
 use yadorilink_replica_domain::conflict::conflict_copy_path;
@@ -452,7 +453,16 @@ fn repair_interrupted_materializations_inner(
                         permit,
                     )?;
                     verify_write_target_within_root(&out_path, root)?;
-                    write_placeholder(&out_path, record.size, record.mtime_unix_nanos)?;
+                    match write_placeholder(&out_path, record.size, record.mtime_unix_nanos)? {
+                        Some(identity) => state.record_placeholder_generation(
+                            group_id,
+                            &path,
+                            identity,
+                            INTERNAL_INODE_PROVIDER_KIND,
+                            permit,
+                        )?,
+                        None => state.clear_placeholder_generation(group_id, &path, permit)?,
+                    }
                     apply_exec_bit(&out_path, state.get_exec_bit(group_id, &path)?)?;
                     // A Placeholder is not an in-progress write; drop any intent
                     // (`reconstruct_file_journaled` only clears on success) so a
@@ -470,7 +480,16 @@ fn repair_interrupted_materializations_inner(
                 permit,
             )?;
             verify_write_target_within_root(&out_path, root)?;
-            write_placeholder(&out_path, record.size, record.mtime_unix_nanos)?;
+            match write_placeholder(&out_path, record.size, record.mtime_unix_nanos)? {
+                Some(identity) => state.record_placeholder_generation(
+                    group_id,
+                    &path,
+                    identity,
+                    INTERNAL_INODE_PROVIDER_KIND,
+                    permit,
+                )?,
+                None => state.clear_placeholder_generation(group_id, &path, permit)?,
+            }
             // A placeholder is a fresh file too, so it needs the recorded exec
             // bit applied for the same reason the reconstruct path does — the
             // live peer materialize path stamps its own placeholders

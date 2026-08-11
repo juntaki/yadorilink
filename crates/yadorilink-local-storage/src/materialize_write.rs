@@ -278,6 +278,54 @@ fn sync_parent_directory(_path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Identity of the exact on-disk object [`write_placeholder`] just created,
+/// captured from the still-open temp-file handle before this crate's own
+/// rename into place -- a rename within the same filesystem preserves the
+/// inode, so this is exactly what `out_path` carries once that rename
+/// succeeds, without the TOCTOU window a later path-based `stat` on
+/// `out_path` itself would have (something else touching `out_path`
+/// between the rename and that stat).
+///
+/// Never derived from size/mtime -- those are exactly the signals this
+/// identity exists to stop relying on alone (see
+/// `yadorilink-filesystem-sync::placeholder_backend`'s doc comment on
+/// `PlaceholderGeneration`). `dev`/`ino` are the OS-assigned filesystem
+/// identity, so an atomic-rename save by an editor (a new inode) is
+/// distinguishable from an untouched placeholder even when it happens to
+/// land on the placeholder's exact size and mtime -- the residual gap
+/// `local_change.rs`'s own doc comment documents for the size/mtime-only
+/// heuristic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaceholderDiskIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// The `provider_kind` string every [`write_placeholder`] caller should
+/// persist alongside a `Some` [`PlaceholderDiskIdentity`] -- the single
+/// identity scheme this crate implements today. A single named constant
+/// (rather than each of the several call sites spelling the literal) so a
+/// future real OS provider's own kind string can't accidentally collide
+/// with this one, and so every persisted row this scheme ever wrote stays
+/// grep-able under one name.
+pub const INTERNAL_INODE_PROVIDER_KIND: &str = "internal-inode";
+
+#[cfg(unix)]
+fn disk_identity_of(file: &fs::File) -> Option<PlaceholderDiskIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().ok().map(|m| PlaceholderDiskIdentity { dev: m.dev(), ino: m.ino() })
+}
+
+/// No stable, OS-independent identity is captured on non-Unix builds yet
+/// (Windows' own real identity belongs to `placeholder_backend_windows`'s
+/// CfAPI generation token once M2 wires it through this same seam) --
+/// `None` here, and every caller already treats `None` the same as a later
+/// mismatch: fail closed, never assume "still untouched."
+#[cfg(not(unix))]
+fn disk_identity_of(_file: &fs::File) -> Option<PlaceholderDiskIdentity> {
+    None
+}
+
 /// Writes a placeholder at `out_path`: a sparse file of `size` bytes with
 /// no real content, so `stat`/`ls` report the file's correct size and
 /// modification time without its bytes occupying disk space or requiring
@@ -285,16 +333,25 @@ fn sync_parent_directory(_path: &Path) -> Result<(), StorageError> {
 ///
 /// Content-addressed dedup means this never collides with a genuine empty
 /// file: a placeholder is never chunked/indexed as content.
+///
+/// Returns the new placeholder's [`PlaceholderDiskIdentity`] when this
+/// platform can capture one (see [`disk_identity_of`]) -- callers should
+/// persist it (`MaterializationStateRepository::record_placeholder_generation`)
+/// alongside the `Placeholder` state transition this call is always paired
+/// with, and clear any prior identity for the same path when it comes back
+/// `None`, so a stale identity from a previous placeholder never survives
+/// under a row this call could not identify.
 pub fn write_placeholder(
     out_path: &Path,
     size: u64,
     mtime_unix_nanos: i64,
-) -> Result<(), StorageError> {
+) -> Result<Option<PlaceholderDiskIdentity>, StorageError> {
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent)?;
     }
     let tmp_path = unique_tmp_path(out_path);
-    let prepare = || -> Result<(), StorageError> {
+    let mut identity: Option<PlaceholderDiskIdentity> = None;
+    let mut prepare = || -> Result<(), StorageError> {
         let file = fs::File::create(&tmp_path)?;
         file.set_len(size)?;
         stamp_mtime(&file, mtime_unix_nanos);
@@ -302,6 +359,7 @@ pub fn write_placeholder(
         // the handle is closed. Persist the complete placeholder before its
         // name becomes visible, matching `reconstruct_file`'s ordering.
         file.sync_all()?;
+        identity = disk_identity_of(&file);
         Ok(())
     };
     if let Err(error) =
@@ -322,7 +380,7 @@ pub fn write_placeholder(
             "placeholder was published but its parent directory could not be synced"
         );
     }
-    Ok(())
+    Ok(identity)
 }
 
 /// Sets/clears the owner-exec bit on an already-materialized file. A no-op
@@ -462,6 +520,44 @@ mod tests {
         // whatever content a real 5MB file might have had.
         let content = fs::read(&out_path).unwrap();
         assert!(content.iter().all(|&b| b == 0));
+    }
+
+    /// The identity `write_placeholder` returns for a freshly-written
+    /// placeholder must actually match the placeholder's real on-disk
+    /// identity, not merely be present -- a caller comparing against it
+    /// later relies on this being the truth, not a synthetic value.
+    #[test]
+    #[cfg(unix)]
+    fn write_placeholder_returns_the_real_on_disk_identity() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("placeholder.bin");
+
+        let identity = write_placeholder(&out_path, 4096, 0).unwrap().unwrap();
+
+        let metadata = fs::metadata(&out_path).unwrap();
+        assert_eq!(identity.dev, metadata.dev());
+        assert_eq!(identity.ino, metadata.ino());
+    }
+
+    /// Two placeholders written to the SAME path in sequence (mirroring a
+    /// peer sending an updated version, or a repeated eviction) must mint
+    /// DIFFERENT identities -- each `write_placeholder` call creates a
+    /// fresh temp file and renames it in, so the second call's inode can
+    /// never equal the first's. This is the exact property M1-2's
+    /// generation-staleness invariant depends on: an old identity must
+    /// stop matching once its placeholder is superseded.
+    #[test]
+    #[cfg(unix)]
+    fn successive_placeholder_writes_to_the_same_path_mint_different_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("placeholder.bin");
+
+        let first = write_placeholder(&out_path, 100, 0).unwrap().unwrap();
+        let second = write_placeholder(&out_path, 100, 0).unwrap().unwrap();
+
+        assert_ne!(first, second, "a re-written placeholder must mint a fresh identity");
     }
 
     #[test]

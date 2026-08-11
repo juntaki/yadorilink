@@ -152,7 +152,15 @@ use crate::error::DatabaseError;
 /// full replica. A v20 database's `transferred` rows do not distinguish
 /// these two cases and cannot be safely reread as one or the other -- same
 /// no-compat-path policy: refused at open.
-pub const SCHEMA_VERSION: i32 = 21;
+/// Version 22 adds `files.placeholder_dev`/`placeholder_ino`/
+/// `placeholder_provider_kind` (M1-2): a persisted identity for the exact
+/// on-disk object `write_placeholder` created, replacing the pure
+/// size/mtime/sparse-file heuristic `local_change.rs` previously used
+/// alone to infer "this is still my own untouched placeholder." A v21
+/// database's rows are missing these columns entirely; same no-compat-path
+/// policy as every version above: refused at open, not silently reread
+/// with columns absent.
+pub const SCHEMA_VERSION: i32 = 22;
 
 /// Reads `PRAGMA user_version` and
 /// errors if it's newer than this binary's [`SCHEMA_VERSION`] — an older
@@ -629,6 +637,30 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
         // column above: an already-trusted chain stays trusted across the
         // upgrade.
         "ALTER TABLE group_policy_watermark ADD COLUMN authority_key_fingerprint BLOB",
+        // M1-2: persisted placeholder identity, replacing the pure
+        // size/mtime/sparse-file heuristic `local_change.rs` used to infer
+        // "this on-disk object is still the untouched placeholder this
+        // process wrote." `write_placeholder` (yadorilink-local-storage)
+        // captures the (device, inode) of the file it just created,
+        // immediately after its own rename-into-place, from the still-open
+        // handle -- so this identifies the exact filesystem object this
+        // process wrote, not a re-derived guess. `placeholder_provider_kind`
+        // records which identity scheme produced it ("internal-inode" is
+        // the only kind today; a future real OS provider -- File Provider
+        // on macOS, CfAPI on Windows -- would record its own kind here
+        // instead once wired, per `PlaceholderBackend`'s own doc comment in
+        // yadorilink-filesystem-sync::placeholder_backend). All three
+        // NULLable with no default: NULL means "no identity recorded for
+        // this row" -- which callers MUST treat the same as a later
+        // mismatch (fail closed), never as "still untouched." Every
+        // pre-existing row gets NULL, so no pre-existing placeholder is
+        // wrongly trusted as untouched after this upgrade -- the opposite
+        // failure mode (silently discarding a real edit) is the one this
+        // change exists to close, so erring toward "not proven untouched"
+        // here is the safe default.
+        "ALTER TABLE files ADD COLUMN placeholder_dev INTEGER",
+        "ALTER TABLE files ADD COLUMN placeholder_ino INTEGER",
+        "ALTER TABLE files ADD COLUMN placeholder_provider_kind TEXT",
     ] {
         match conn.execute(stmt, []) {
             Ok(_) => {}
