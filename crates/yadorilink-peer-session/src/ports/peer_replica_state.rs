@@ -154,6 +154,32 @@ pub trait PeerReplicaStatePort: Send + Sync {
         next: MaterializationState,
     ) -> Result<bool, PeerSessionError>;
 
+    /// Records the identity of the exact on-disk object a `write_placeholder`
+    /// call just created for `(group_id, path)` (M1-2) -- always called
+    /// alongside that same call's `set_materialization_state(Placeholder)`.
+    /// See `yadorilink_sync_sqlite::materialization_state::
+    /// MaterializationStateRepository::record_placeholder_generation`'s own
+    /// doc comment.
+    fn record_placeholder_generation(
+        &self,
+        group_id: &str,
+        path: &str,
+        identity: yadorilink_local_storage::PlaceholderDiskIdentity,
+        provider_kind: &str,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), PeerSessionError>;
+
+    /// Clears any placeholder identity recorded for `(group_id, path)` -- a
+    /// no-op if none was recorded. See
+    /// `MaterializationStateRepository::clear_placeholder_generation`'s own
+    /// doc comment for when callers must call this.
+    fn clear_placeholder_generation(
+        &self,
+        group_id: &str,
+        path: &str,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), PeerSessionError>;
+
     fn is_pinned(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError>;
 
     fn set_pinned(&self, group_id: &str, path: &str, pinned: bool) -> Result<(), PeerSessionError>;

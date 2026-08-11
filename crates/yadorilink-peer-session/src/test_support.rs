@@ -66,6 +66,7 @@ struct Row {
     origin_device_id: Option<String>,
     authoring_change_hash: Option<ChangeHash>,
     materialization_state: Option<MaterializationState>,
+    placeholder_identity: Option<yadorilink_local_storage::PlaceholderDiskIdentity>,
     pinned: bool,
     held: Option<HeldState>,
     last_accessed_unix_nanos: Option<i64>,
@@ -587,6 +588,42 @@ impl PeerReplicaStatePort for FakeReplicaState {
         }
         row.materialization_state = Some(next);
         Ok(true)
+    }
+
+    fn record_placeholder_generation(
+        &self,
+        group_id: &str,
+        path: &str,
+        identity: yadorilink_local_storage::PlaceholderDiskIdentity,
+        _provider_kind: &str,
+        _permit: &RootCommitPermit<'_>,
+    ) -> Result<(), PeerSessionError> {
+        self.lock()
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(path.to_string())
+            .or_default()
+            .placeholder_identity = Some(identity);
+        Ok(())
+    }
+
+    fn clear_placeholder_generation(
+        &self,
+        group_id: &str,
+        path: &str,
+        _permit: &RootCommitPermit<'_>,
+    ) -> Result<(), PeerSessionError> {
+        self.lock()
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(path.to_string())
+            .or_default()
+            .placeholder_identity = None;
+        Ok(())
     }
 
     fn is_pinned(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
