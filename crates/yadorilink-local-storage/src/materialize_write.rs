@@ -310,6 +310,19 @@ pub struct PlaceholderDiskIdentity {
 /// grep-able under one name.
 pub const INTERNAL_INODE_PROVIDER_KIND: &str = "internal-inode";
 
+/// The `provider_kind` string M2-2's Windows CfAPI generation-identity
+/// scheme persists alongside a `PlaceholderDiskIdentity` -- reusing this
+/// same two-`u64`-column shape even though the real value is a single
+/// opaque `u64` generation token, not a `(dev, ino)` pair: `dev` is always
+/// `0` (an unused sentinel) and `ino` carries the generation. See
+/// `yadorilink-daemon`'s `placeholder_inspect_windows` module (the real
+/// CfAPI-backed reader of this value) and `shell-ext/windows/src/cfapi.rs`'s
+/// `encode_generation_identity` (the writer, over on the CfAPI side of the
+/// process boundary) for the wire format this token is stored in as a
+/// placeholder's actual `FileIdentity` on disk -- unrelated to how it's
+/// persisted here in the daemon's own index.
+pub const WINDOWS_CFAPI_GENERATION_PROVIDER_KIND: &str = "windows-cfapi-generation";
+
 impl PlaceholderDiskIdentity {
     /// Extracts this identity from an already-fetched [`fs::Metadata`] --
     /// the read side of the same scheme [`write_placeholder`] mints on the
