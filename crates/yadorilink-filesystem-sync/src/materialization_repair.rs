@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 
 use yadorilink_local_storage::{
     apply_exec_bit, disk_bytes_match_indexed_blocks, intent_target_hash, reconstruct_file,
-    verify_write_target_within_root, write_placeholder, BlockContentStore,
+    verify_write_target_within_root, write_placeholder, BlockContentStore, PlaceholderDiskIdentity,
     INTERNAL_INODE_PROVIDER_KIND,
 };
 use yadorilink_replica_domain::admission::ChangeEmitter;
@@ -203,6 +203,61 @@ pub fn repair_interrupted_materializations_emitting_deletes(
         Some(delete_emitter),
         permit,
     )
+}
+
+/// M1-5: backfills a persisted placeholder identity for every path this
+/// group's index still shows as `Placeholder` with none recorded --
+/// closes a crash window an independent review found in M1-2's own
+/// design: `write_placeholder` durably writes the sparse placeholder
+/// file, then its identity is recorded in a SEPARATE commit
+/// (`record_placeholder_generation`), and a crash between the two
+/// leaves exactly this state. Run at startup, before any watcher can
+/// observe such a row: without a recorded identity to compare against,
+/// `local_change.rs`'s dirty-detection falls through to the full
+/// chunk-and-compare path for ANY `CreatedOrModified` event on it --
+/// including this crate's own harmless placeholder-refresh echo --
+/// which would chunk and index the placeholder's own sparse/all-zero
+/// bytes as if they were the file's real content, corrupting the file
+/// group-wide on the very first watcher tick after a mistimed crash.
+///
+/// For each such path, re-derives an identity from whatever is on disk
+/// RIGHT NOW, but ONLY when it still looks exactly like the placeholder
+/// this process would itself have written (regular file, exact indexed
+/// `size`) -- a path that no longer matches (diverged, or removed) is
+/// left with no generation. That is not a gap: the existing fail-closed
+/// behavior (fall through to full chunk-and-compare) is exactly correct
+/// there, since something genuinely unaccounted-for happened to it while
+/// this device was down.
+pub fn backfill_placeholder_generations(
+    state: &dyn MaterializationExecutionPort,
+    root: &Path,
+    group_id: &str,
+    permit: &RootCommitPermit<'_>,
+) -> Result<usize, MaterializationExecutionError> {
+    let root = state.open_root(root, group_id)?;
+    let root = root.path();
+    let mut backfilled = 0usize;
+    for path in state.list_placeholder_paths_missing_generation(group_id)? {
+        let Some(record) = state.get_file(group_id, &path)? else { continue };
+        if record.deleted {
+            continue;
+        }
+        let out_path = root.join(&path);
+        let Ok(metadata) = std::fs::symlink_metadata(&out_path) else { continue };
+        if !metadata.is_file() || metadata.len() != record.size {
+            continue;
+        }
+        let Some(identity) = PlaceholderDiskIdentity::from_metadata(&metadata) else { continue };
+        state.record_placeholder_generation(
+            group_id,
+            &path,
+            identity,
+            INTERNAL_INODE_PROVIDER_KIND,
+            permit,
+        )?;
+        backfilled += 1;
+    }
+    Ok(backfilled)
 }
 
 /// Takes a [`VerifiedRoot`] for the same reason

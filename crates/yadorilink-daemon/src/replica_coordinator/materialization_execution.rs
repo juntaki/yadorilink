@@ -221,6 +221,16 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .map_err(SyncError::from)?)
     }
 
+    fn list_placeholder_paths_missing_generation(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<String>, MaterializationExecutionError> {
+        Ok(self
+            .materialization_state_repository()
+            .list_placeholder_paths_missing_generation(group_id)
+            .map_err(SyncError::from)?)
+    }
+
     fn path_lock(&self, group_id: &str, path: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.path_lock_registry().path_lock(group_id, path)
     }
@@ -369,12 +379,15 @@ mod tests {
     use yadorilink_root_authority::root_commit::RootCommitPermit;
     use yadorilink_root_authority::root_identity::VerifiedRoot;
 
-    /// Proves the impl above lets a real `Arc<ReplicaCoordinator>`
-    /// unsize-coerce to `Arc<dyn MaterializationExecutionPort>`, and that
-    /// calls through the coerced handle still dispatch correctly -- same
-    /// shape as `materialization_state::tests::
-    /// arc_replica_coordinator_coerces_to_port_trait` for the wider port
-    /// this one narrows.
+    /// A custody oracle that never confirms anything. Note (an independent
+    /// review's finding): with today's `REMOTE_CUSTODY_LEASES_SUPPORTED =
+    /// false` global kill switch, `verify_reclaim_custody` returns `None`
+    /// unconditionally BEFORE ever consulting any oracle -- so a test using
+    /// this stub cannot, by itself, distinguish "the oracle said no" from
+    /// "custody leases are globally unsupported today." Kept for the
+    /// day `REMOTE_CUSTODY_LEASES_SUPPORTED` flips (at which point this
+    /// stub starts actually being consulted), and to make the test using
+    /// it self-documenting about which case is real right now.
     struct NeverConfirms;
 
     impl FullReplicaCustody for NeverConfirms {
@@ -393,9 +406,35 @@ mod tests {
         }
     }
 
+    /// A custody oracle that panics if it is ever consulted -- proves
+    /// `evict_file` rejects a pinned file WITHOUT reading any version or
+    /// custody state at all, not merely that it happens to reject one an
+    /// oracle would also have refused. An independent review's finding: a
+    /// plain rejection assertion with a permissive oracle (`AlwaysConfirmed`)
+    /// cannot distinguish "checked pinned first" from "checked custody
+    /// first, which also would have failed."
+    struct PanicsIfConsulted;
+
+    impl FullReplicaCustody for PanicsIfConsulted {
+        fn confirm_exact_version(
+            &self,
+            _: &str,
+            _: &str,
+            _: &VersionHash,
+            _: &[yadorilink_replica_domain::file::VersionBlock],
+        ) -> Option<CustodyStamp> {
+            panic!("a pinned file's eviction must be rejected before custody is ever consulted");
+        }
+
+        fn confirmation_still_valid(&self, _: &str, _: &CustodyStamp) -> bool {
+            panic!("a pinned file's eviction must be rejected before custody is ever consulted");
+        }
+    }
+
     /// M1-4: a pinned file must never be evicted -- `EvictionEligibilitySnapshot::pinned`
     /// is the very first check `evict_file` performs, before it reads any
-    /// version or custody state.
+    /// version or custody state. `PanicsIfConsulted` locks down that
+    /// ordering directly rather than merely observing rejection.
     #[test]
     fn evict_rejects_a_pinned_file() {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
@@ -421,7 +460,7 @@ mod tests {
             "group-a",
             "a.bin",
             false,
-            &AlwaysConfirmed,
+            &PanicsIfConsulted,
         );
 
         assert!(
@@ -433,20 +472,28 @@ mod tests {
             content,
             "the pinned file's own bytes must be untouched"
         );
+        assert_eq!(
+            state
+                .materialization_state_repository()
+                .get_materialization_state("group-a", "a.bin")
+                .unwrap(),
+            Some(MaterializationState::Hydrated),
+            "the row must be left exactly as it was"
+        );
     }
 
-    /// M1-4: on an on-demand (non-full-replica) device, a file whose
-    /// custody cannot be confirmed elsewhere still becomes a placeholder
-    /// (freeing this file's own on-disk footprint), but its content-
-    /// addressed blocks are NEVER purged from the local block store --
-    /// `verify_reclaim_custody` returning `None` must not be read as
-    /// license to physically delete the only copy this device can prove
-    /// exists. This is the codebase's actual two-layer safety design (the
-    /// roadmap's "custody unknown → evict拒否" in spirit: nothing is ever
-    /// destroyed without confirmed custody, even though the working-tree
-    /// copy is still freed).
+    /// M1-4: on an on-demand (non-full-replica) device, an evicted file's
+    /// content-addressed blocks are NEVER purged from the local block
+    /// store while `REMOTE_CUSTODY_LEASES_SUPPORTED` stays `false` --
+    /// `verify_reclaim_custody` returns `None` unconditionally at that
+    /// gate, before ever consulting an oracle (an independent review's
+    /// finding: `NeverConfirms` is not actually exercised here today --
+    /// see its own doc comment). This test pins the CURRENT, observable
+    /// production invariant (nothing is ever purged without a durable
+    /// custody lease, and none exist yet) rather than claiming to prove
+    /// oracle-specific handling this build cannot actually reach.
     #[test]
-    fn evict_of_unconfirmed_custody_frees_the_file_but_never_purges_its_blocks() {
+    fn evict_on_an_on_demand_device_frees_the_file_but_never_purges_its_blocks_today() {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
         let root = tempfile::tempdir().unwrap();
         adopt_root(&state, "group-a", root.path());
@@ -484,13 +531,33 @@ mod tests {
                 .unwrap(),
             Some(MaterializationState::Placeholder)
         );
+        // The working-tree file itself must actually have become a
+        // placeholder -- not merely have its index row updated. An
+        // independent review's finding: the prior version of this test
+        // never inspected `a.bin` after eviction at all.
+        assert_ne!(
+            std::fs::read(root.path().join("a.bin")).unwrap(),
+            content,
+            "the real content must no longer be materialized on disk"
+        );
+        assert_eq!(
+            std::fs::metadata(root.path().join("a.bin")).unwrap().len(),
+            content.len() as u64,
+            "the placeholder must still report the file's real size"
+        );
     }
 
-    /// M1-4: content that diverged from the indexed version between the
-    /// last index write and this eviction attempt (an unsynced local
-    /// edit, or any other source of on-disk drift) must abort the
-    /// eviction before any placeholder is written -- never silently
-    /// discard those bytes.
+    /// M1-4: content that already diverged from the indexed version
+    /// BEFORE `evict_file` is even called (an unsynced local edit landed
+    /// sometime after the last index write, or any other source of
+    /// pre-existing on-disk drift) must abort the eviction at its first
+    /// `disk_bytes_match_indexed_blocks` check, before any placeholder is
+    /// written -- never silently discard those bytes. An independent
+    /// review's finding: this specifically exercises the FIRST divergence
+    /// check (`materialization_eviction.rs`'s pre-lock read); it does NOT
+    /// exercise the SECOND recheck performed after the path lock is
+    /// acquired (the one that specifically closes a race occurring DURING
+    /// this call itself) -- that revalidation has no direct test today.
     #[test]
     fn evict_aborts_when_disk_content_diverges_from_the_indexed_version() {
         let state = ReplicaCoordinator::open_in_memory().unwrap();
@@ -500,10 +567,11 @@ mod tests {
         let store = FsBlockStore::new(store_dir.path()).unwrap();
         let indexed_content = b"the version the index still believes is current";
         let record = store_and_record(&store, "a.bin", indexed_content);
+        let hash = hex::encode(&record.blocks[0].hash);
         let permit = RootCommitPermit::for_tests();
         state.file_index_repository().upsert_file("group-a", &record, &permit).unwrap();
         // A local edit landed on disk that the index does not know about
-        // yet -- exactly the race this check exists to close.
+        // yet, before this call even begins.
         std::fs::write(root.path().join("a.bin"), b"a locally edited, unindexed replacement")
             .unwrap();
 
@@ -524,6 +592,10 @@ mod tests {
 
         assert!(!outcome.dehydrated, "eviction must abort, not silently discard the local edit");
         assert!(outcome.blocks_retained);
+        assert!(
+            store.exists(&hash).unwrap(),
+            "the aborted eviction must not touch the block store either"
+        );
         assert_eq!(
             std::fs::read(root.path().join("a.bin")).unwrap(),
             b"a locally edited, unindexed replacement",
@@ -539,6 +611,156 @@ mod tests {
         );
     }
 
+    /// M1-5: reproduces the exact crash window an independent review found
+    /// in M1-2's own design -- `write_placeholder` durably writes the
+    /// sparse placeholder file, then its identity is recorded in a
+    /// SEPARATE commit; a crash between the two leaves a `Placeholder`
+    /// row with no recorded identity, even though the placeholder file on
+    /// disk is genuinely untouched. Without a startup repair pass, the
+    /// very next watcher tick on that path would fall through to the
+    /// full chunk-and-compare path (no generation to compare against) and
+    /// index the placeholder's own sparse/all-zero bytes as if they were
+    /// real content -- `backfill_placeholder_generations` exists
+    /// specifically to close this before any watcher gets a chance to
+    /// observe the row. Unix-only: exercises the real captured-identity
+    /// path, matching M1-2's own `#[cfg(unix)]` placeholder tests.
+    #[test]
+    #[cfg(unix)]
+    fn backfill_placeholder_generations_recovers_the_write_placeholder_crash_window() {
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-a", root.path());
+        let permit = RootCommitPermit::for_tests();
+        let size = 4096u64;
+        state
+            .file_index_repository()
+            .upsert_file(
+                "group-a",
+                &FileRecord {
+                    path: "a.bin".into(),
+                    size,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![BlockInfo { hash: vec![0xAB; 32], offset: 0, size: size as u32 }],
+                    deleted: false,
+                },
+                &permit,
+            )
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(
+                "group-a",
+                "a.bin",
+                MaterializationState::Placeholder,
+                &permit,
+            )
+            .unwrap();
+        // Simulates exactly what `write_placeholder` leaves behind: a real
+        // sparse file at the indexed size, durably on disk -- but,
+        // crucially, NO `record_placeholder_generation` call ever ran
+        // (the simulated crash).
+        let identity =
+            yadorilink_local_storage::write_placeholder(&root.path().join("a.bin"), size, 0)
+                .unwrap()
+                .expect("this test runs on unix, where an identity is always captured");
+        assert_eq!(
+            state
+                .materialization_state_repository()
+                .get_placeholder_generation("group-a", "a.bin")
+                .unwrap(),
+            None,
+            "precondition: the crash window leaves no identity recorded"
+        );
+
+        let backfilled =
+            yadorilink_filesystem_sync::materialization_repair::backfill_placeholder_generations(
+                &state,
+                root.path(),
+                "group-a",
+                &permit,
+            )
+            .unwrap();
+
+        assert_eq!(backfilled, 1);
+        let recorded = state
+            .materialization_state_repository()
+            .get_placeholder_generation("group-a", "a.bin")
+            .unwrap()
+            .expect("the identity must now be recorded");
+        assert_eq!(
+            recorded.identity, identity,
+            "the backfilled identity must match the real on-disk object, not a synthetic value"
+        );
+        assert_eq!(recorded.provider_kind, yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND);
+    }
+
+    /// A path whose on-disk content no longer matches the indexed size
+    /// (a genuine local edit landed during the crash-to-restart window,
+    /// however unlikely) must NOT be backfilled -- fabricating an
+    /// identity for it would wrongly certify a file this process never
+    /// actually wrote as "still untouched." Leaving it with no identity
+    /// keeps it on the existing fail-closed full chunk-and-compare path,
+    /// which is the correct outcome for genuinely divergent content.
+    #[test]
+    fn backfill_placeholder_generations_skips_a_path_whose_disk_size_no_longer_matches() {
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-a", root.path());
+        let permit = RootCommitPermit::for_tests();
+        state
+            .file_index_repository()
+            .upsert_file(
+                "group-a",
+                &FileRecord {
+                    path: "a.bin".into(),
+                    size: 4096,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![BlockInfo { hash: vec![0xAB; 32], offset: 0, size: 4096 }],
+                    deleted: false,
+                },
+                &permit,
+            )
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(
+                "group-a",
+                "a.bin",
+                MaterializationState::Placeholder,
+                &permit,
+            )
+            .unwrap();
+        // Content of a DIFFERENT size than the index believes -- not the
+        // placeholder this process would have written.
+        std::fs::write(root.path().join("a.bin"), b"a genuine local edit, not a placeholder")
+            .unwrap();
+
+        let backfilled =
+            yadorilink_filesystem_sync::materialization_repair::backfill_placeholder_generations(
+                &state,
+                root.path(),
+                "group-a",
+                &permit,
+            )
+            .unwrap();
+
+        assert_eq!(backfilled, 0);
+        assert_eq!(
+            state
+                .materialization_state_repository()
+                .get_placeholder_generation("group-a", "a.bin")
+                .unwrap(),
+            None,
+            "a diverged path must be left with no identity, staying on the fail-closed path"
+        );
+    }
+
+    /// Proves the impl above lets a real `Arc<ReplicaCoordinator>`
+    /// unsize-coerce to `Arc<dyn MaterializationExecutionPort>`, and that
+    /// calls through the coerced handle still dispatch correctly -- same
+    /// shape as `materialization_state::tests::
+    /// arc_replica_coordinator_coerces_to_port_trait` for the wider port
+    /// this one narrows.
     #[test]
     fn arc_replica_coordinator_coerces_to_execution_port_trait() {
         let coordinator: Arc<ReplicaCoordinator> =
