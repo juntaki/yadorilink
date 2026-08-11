@@ -195,6 +195,32 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .map_err(SyncError::from)?)
     }
 
+    fn record_placeholder_generation(
+        &self,
+        group_id: &str,
+        path: &str,
+        identity: yadorilink_local_storage::PlaceholderDiskIdentity,
+        provider_kind: &str,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), MaterializationExecutionError> {
+        Ok(self
+            .materialization_state_repository()
+            .record_placeholder_generation(group_id, path, identity, provider_kind, permit)
+            .map_err(SyncError::from)?)
+    }
+
+    fn clear_placeholder_generation(
+        &self,
+        group_id: &str,
+        path: &str,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), MaterializationExecutionError> {
+        Ok(self
+            .materialization_state_repository()
+            .clear_placeholder_generation(group_id, path, permit)
+            .map_err(SyncError::from)?)
+    }
+
     fn path_lock(&self, group_id: &str, path: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.path_lock_registry().path_lock(group_id, path)
     }
@@ -581,5 +607,234 @@ mod tests {
                 .unwrap(),
             Some(MaterializationState::Placeholder)
         );
+    }
+
+    /// Sets up a file row already transitioned to `Placeholder` -- matching
+    /// every real caller, which always pairs `record_placeholder_generation`
+    /// with that same transition (never calls it on a `Hydrated` row).
+    fn setup_placeholder_file(
+        group_id: &str,
+        path: &str,
+    ) -> (ReplicaCoordinator, RootCommitPermit<'static>) {
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let permit = RootCommitPermit::for_tests();
+        state
+            .file_index_repository()
+            .upsert_file(group_id, &record_with_blocks(path, b"x", vec![0xab; 32]), &permit)
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(group_id, path, MaterializationState::Placeholder, &permit)
+            .unwrap();
+        (state, permit)
+    }
+
+    fn recorded(
+        identity: yadorilink_local_storage::PlaceholderDiskIdentity,
+    ) -> yadorilink_sync_sqlite::RecordedPlaceholderGeneration {
+        yadorilink_sync_sqlite::RecordedPlaceholderGeneration {
+            identity,
+            provider_kind: "internal-inode".to_owned(),
+        }
+    }
+
+    /// M1-2: a recorded placeholder identity survives an in-process
+    /// "restart" (a fresh read through the repository, not merely an
+    /// in-memory cache) -- the exact property `write_placeholder_backend`'s
+    /// `PlaceholderGeneration` doc comment names as the second missing
+    /// piece of a connected on-demand pipeline. `provider_kind` round-trips
+    /// too, not merely the `(dev, ino)` pair.
+    #[test]
+    fn recorded_placeholder_generation_is_readable_after_being_recorded() {
+        let (state, permit) = setup_placeholder_file("group-1", "doc.txt");
+        let identity = yadorilink_local_storage::PlaceholderDiskIdentity { dev: 7, ino: 42 };
+
+        state
+            .materialization_state_repository()
+            .record_placeholder_generation(
+                "group-1",
+                "doc.txt",
+                identity,
+                "internal-inode",
+                &permit,
+            )
+            .unwrap();
+
+        assert_eq!(
+            state
+                .materialization_state_repository()
+                .get_placeholder_generation("group-1", "doc.txt")
+                .unwrap(),
+            Some(recorded(identity))
+        );
+    }
+
+    /// A path with no recorded identity -- never placeholdered, or cleared
+    /// -- must read back `None`, not a synthetic zero identity: callers
+    /// treat `None` as fail-closed "unknown", which a real `dev:0, ino:0`
+    /// row would defeat.
+    #[test]
+    fn unrecorded_placeholder_generation_reads_back_as_none() {
+        let (state, _permit) = setup_placeholder_file("group-1", "doc.txt");
+
+        assert_eq!(
+            state
+                .materialization_state_repository()
+                .get_placeholder_generation("group-1", "doc.txt")
+                .unwrap(),
+            None
+        );
+    }
+
+    /// An independent review's finding: a row that has since left
+    /// `Placeholder` (hydrated, say) must never expose its old identity
+    /// through this getter, even though nothing explicitly cleared it --
+    /// gated on the row's own current `materialization_state`, not merely
+    /// on the recorded columns being non-NULL.
+    #[test]
+    fn placeholder_generation_is_hidden_once_the_row_leaves_placeholder_state() {
+        let (state, permit) = setup_placeholder_file("group-1", "doc.txt");
+        let identity = yadorilink_local_storage::PlaceholderDiskIdentity { dev: 1, ino: 1 };
+        let repo = state.materialization_state_repository();
+        repo.record_placeholder_generation(
+            "group-1",
+            "doc.txt",
+            identity,
+            "internal-inode",
+            &permit,
+        )
+        .unwrap();
+
+        repo.set_materialization_state(
+            "group-1",
+            "doc.txt",
+            MaterializationState::Hydrated,
+            &permit,
+        )
+        .unwrap();
+
+        assert_eq!(repo.get_placeholder_generation("group-1", "doc.txt").unwrap(), None);
+    }
+
+    /// A newer placeholder write's identity must fully replace an older
+    /// one -- `record_placeholder_generation` called twice for the same
+    /// path leaves only the SECOND identity readable, never a stale first
+    /// one a caller could wrongly trust. This is the exact "stale
+    /// generation must not be trusted" invariant M1-2's roadmap step names.
+    #[test]
+    fn recording_a_new_generation_replaces_the_old_one() {
+        let (state, permit) = setup_placeholder_file("group-1", "doc.txt");
+        let stale = yadorilink_local_storage::PlaceholderDiskIdentity { dev: 1, ino: 1 };
+        let fresh = yadorilink_local_storage::PlaceholderDiskIdentity { dev: 1, ino: 2 };
+        let repo = state.materialization_state_repository();
+        repo.record_placeholder_generation("group-1", "doc.txt", stale, "internal-inode", &permit)
+            .unwrap();
+
+        repo.record_placeholder_generation("group-1", "doc.txt", fresh, "internal-inode", &permit)
+            .unwrap();
+
+        assert_eq!(
+            repo.get_placeholder_generation("group-1", "doc.txt").unwrap(),
+            Some(recorded(fresh))
+        );
+    }
+
+    /// `clear_placeholder_generation` must actually erase the recorded
+    /// identity, not merely become unreachable -- a stale identity left in
+    /// place after a hydrate (say) could later be wrongly matched against a
+    /// brand-new placeholder that happens to reuse the same inode number.
+    #[test]
+    fn clearing_a_placeholder_generation_removes_it() {
+        let (state, permit) = setup_placeholder_file("group-1", "doc.txt");
+        let identity = yadorilink_local_storage::PlaceholderDiskIdentity { dev: 1, ino: 1 };
+        let repo = state.materialization_state_repository();
+        repo.record_placeholder_generation(
+            "group-1",
+            "doc.txt",
+            identity,
+            "internal-inode",
+            &permit,
+        )
+        .unwrap();
+
+        repo.clear_placeholder_generation("group-1", "doc.txt", &permit).unwrap();
+
+        assert_eq!(repo.get_placeholder_generation("group-1", "doc.txt").unwrap(), None);
+    }
+
+    /// Clearing a path that was never recorded is a no-op, not an error --
+    /// mirrors `clear_held`'s own precedent so callers never need to check
+    /// "was this ever a placeholder" first.
+    #[test]
+    fn clearing_an_unrecorded_placeholder_generation_is_not_an_error() {
+        let (state, permit) = setup_placeholder_file("group-1", "doc.txt");
+
+        state
+            .materialization_state_repository()
+            .clear_placeholder_generation("group-1", "doc.txt", &permit)
+            .unwrap();
+    }
+
+    /// `list_placeholder_generations` is the bulk-load path
+    /// `LocalChangeProcessor::scan_existing_files` will use -- it must
+    /// include every recorded identity for the group and exclude paths
+    /// with none, in one call.
+    #[test]
+    fn list_placeholder_generations_includes_only_recorded_paths() {
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let permit = RootCommitPermit::for_tests();
+        state
+            .file_index_repository()
+            .upsert_file(
+                "group-1",
+                &record_with_blocks("has-one.bin", b"x", vec![0xab; 32]),
+                &permit,
+            )
+            .unwrap();
+        state
+            .file_index_repository()
+            .upsert_file(
+                "group-1",
+                &record_with_blocks("has-none.bin", b"y", vec![0xcd; 32]),
+                &permit,
+            )
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(
+                "group-1",
+                "has-one.bin",
+                MaterializationState::Placeholder,
+                &permit,
+            )
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(
+                "group-1",
+                "has-none.bin",
+                MaterializationState::Placeholder,
+                &permit,
+            )
+            .unwrap();
+        let identity = yadorilink_local_storage::PlaceholderDiskIdentity { dev: 9, ino: 99 };
+        state
+            .materialization_state_repository()
+            .record_placeholder_generation(
+                "group-1",
+                "has-one.bin",
+                identity,
+                "internal-inode",
+                &permit,
+            )
+            .unwrap();
+
+        let all = state
+            .materialization_state_repository()
+            .list_placeholder_generations("group-1")
+            .unwrap();
+
+        assert_eq!(all.get("has-one.bin"), Some(&recorded(identity)));
+        assert!(!all.contains_key("has-none.bin"));
     }
 }

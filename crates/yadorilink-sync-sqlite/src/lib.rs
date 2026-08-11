@@ -56,6 +56,7 @@ pub use handoff_lease::HandoffLeaseRepository;
 pub use materialization_job_repository::MaterializationJobRepository;
 pub use materialization_state::{
     ContentHash, MaterializationCounts, MaterializationStateRepository,
+    RecordedPlaceholderGeneration,
 };
 pub use materialization_state_port::{
     EvictionEligibilitySnapshot, EvictionRevalidationSnapshot, MaterializationStatePort,

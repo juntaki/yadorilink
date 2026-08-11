@@ -639,4 +639,180 @@ impl MaterializationStateRepository {
             Ok(())
         })
     }
+
+    /// Records the identity of the exact on-disk object a `write_placeholder`
+    /// call just created for `group_id`/`path` (M1-2) — always paired with
+    /// that same call's `Placeholder` state transition, never called on its
+    /// own. `dev`/`ino` round-trip losslessly through SQLite's signed
+    /// 64-bit `INTEGER` via a bit-pattern cast (`as i64`/`as u64`); the
+    /// value is an opaque identity token, never interpreted as a signed
+    /// number.
+    pub fn record_placeholder_generation(
+        &self,
+        group_id: &str,
+        path: &str,
+        identity: yadorilink_local_storage::PlaceholderDiskIdentity,
+        provider_kind: &str,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), SyncSqliteError> {
+        let affected = self.database.write::<_, SyncSqliteError>(|conn| {
+            permit.verify()?;
+            Ok(conn.execute(
+                "UPDATE files SET placeholder_dev = ?1, placeholder_ino = ?2, \
+                 placeholder_provider_kind = ?3 \
+                 WHERE group_id = ?4 AND path = ?5 AND state = 'current'",
+                rusqlite::params![
+                    identity.dev as i64,
+                    identity.ino as i64,
+                    provider_kind,
+                    group_id,
+                    path
+                ],
+            )?)
+        })?;
+        if affected == 0 {
+            return Err(SyncSqliteError::NotFound(format!("file {group_id}/{path}")));
+        }
+        Ok(())
+    }
+
+    /// Clears any placeholder identity recorded for `group_id`/`path` — a
+    /// no-op, not an error, if none was recorded (or the row doesn't
+    /// exist). Callers use this whenever a path stops being a placeholder
+    /// this process can vouch for: `write_placeholder` returning `None`
+    /// (no identity capturable on this platform — see that function's own
+    /// doc comment) must not leave a PRIOR call's identity behind to be
+    /// wrongly trusted against the new placeholder's bytes, and a
+    /// transition out of `Placeholder` (hydrate, or a confirmed local
+    /// edit) leaves a stale identity with nothing left to identify.
+    pub fn clear_placeholder_generation(
+        &self,
+        group_id: &str,
+        path: &str,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            permit.verify()?;
+            conn.execute(
+                "UPDATE files SET placeholder_dev = NULL, placeholder_ino = NULL, \
+                 placeholder_provider_kind = NULL \
+                 WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
+                rusqlite::params![group_id, path],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The placeholder identity recorded for `group_id`/`path`, if any.
+    /// `None` — a row with no identity recorded, a row that isn't
+    /// currently a placeholder at all, or no row — is not "unknown, treat
+    /// as untouched": every caller of this method must treat it exactly
+    /// like a later identity mismatch (fail closed), never like a
+    /// confirmed match. See `crate::local_change`'s (yadorilink-local-capture)
+    /// own dirty-detection doc comment for why.
+    ///
+    /// Deliberately filtered to `materialization_state = 'placeholder'`,
+    /// not merely `placeholder_dev IS NOT NULL`: no production call site
+    /// clears a row's identity on every transition OUT of `Placeholder`
+    /// today (only `write_placeholder` returning `None` clears it, when a
+    /// fresh placeholder write captured no identity) -- an independent
+    /// review's finding. Without this filter, a file hydrated after being
+    /// a placeholder would keep exposing its now-meaningless prior
+    /// identity here, which a caller comparing against a freshly-observed
+    /// disk object could wrongly read as "matches, still untouched" even
+    /// though the row no longer describes a placeholder at all. Gating the
+    /// read on the row's own current state closes this at the one seam
+    /// every caller already goes through, without needing every hydrate/
+    /// transition call site across the codebase to remember to also call
+    /// `clear_placeholder_generation`.
+    pub fn get_placeholder_generation(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<RecordedPlaceholderGeneration>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let row: Option<(Option<i64>, Option<i64>, Option<String>)> = conn
+                .query_row(
+                    "SELECT placeholder_dev, placeholder_ino, placeholder_provider_kind \
+                     FROM files \
+                     WHERE group_id = ?1 AND path = ?2 AND state = 'current' \
+                       AND materialization_state = 'placeholder'",
+                    rusqlite::params![group_id, path],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            Ok(row.and_then(|(dev, ino, provider_kind)| match (dev, ino, provider_kind) {
+                (Some(dev), Some(ino), Some(provider_kind)) => {
+                    Some(RecordedPlaceholderGeneration {
+                        identity: yadorilink_local_storage::PlaceholderDiskIdentity {
+                            dev: dev as u64,
+                            ino: ino as u64,
+                        },
+                        provider_kind,
+                    })
+                }
+                _ => None,
+            }))
+        })
+    }
+
+    /// Bulk-loads every non-deleted, still-a-placeholder file's identity
+    /// for `group_id` in one query — the same batch-processing shape as
+    /// [`list_materialization_states`](Self::list_materialization_states),
+    /// for the same reason: `LocalChangeProcessor::scan_existing_files`
+    /// must not pay one query per file to decide whether an on-disk entry
+    /// is still its own untouched placeholder. Filtered to
+    /// `materialization_state = 'placeholder'` for the same reason as
+    /// [`get_placeholder_generation`](Self::get_placeholder_generation).
+    pub fn list_placeholder_generations(
+        &self,
+        group_id: &str,
+    ) -> Result<std::collections::HashMap<String, RecordedPlaceholderGeneration>, SyncSqliteError>
+    {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT path, placeholder_dev, placeholder_ino, placeholder_provider_kind \
+                 FROM files \
+                 WHERE group_id = ?1 AND deleted = 0 AND state = 'current' \
+                   AND materialization_state = 'placeholder' \
+                   AND placeholder_dev IS NOT NULL AND placeholder_ino IS NOT NULL \
+                   AND placeholder_provider_kind IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([group_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?;
+            let mut out = std::collections::HashMap::new();
+            for row in rows {
+                let (path, dev, ino, provider_kind) = row?;
+                out.insert(
+                    path,
+                    RecordedPlaceholderGeneration {
+                        identity: yadorilink_local_storage::PlaceholderDiskIdentity {
+                            dev: dev as u64,
+                            ino: ino as u64,
+                        },
+                        provider_kind,
+                    },
+                );
+            }
+            Ok(out)
+        })
+    }
+}
+
+/// A placeholder identity read back from storage, paired with which
+/// identity scheme produced it -- `provider_kind` matters once more than
+/// one scheme exists (a real OS provider's token is not comparable against
+/// [`INTERNAL_INODE_PROVIDER_KIND`](yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND)'s
+/// `(dev, ino)` shape), so a caller must know which scheme it's holding
+/// before comparing against a freshly-observed identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedPlaceholderGeneration {
+    pub identity: yadorilink_local_storage::PlaceholderDiskIdentity,
+    pub provider_kind: String,
 }

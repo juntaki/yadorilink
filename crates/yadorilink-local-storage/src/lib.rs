@@ -40,6 +40,7 @@ pub use materialize_write::materialize_symlink_windows;
 pub use materialize_write::{
     apply_exec_bit, reconstruct_file, verify_delete_target_within_canonical_root,
     verify_delete_target_within_root, verify_write_target_within_canonical_root,
-    verify_write_target_within_root, write_placeholder,
+    verify_write_target_within_root, write_placeholder, PlaceholderDiskIdentity,
+    INTERNAL_INODE_PROVIDER_KIND,
 };
 pub use traits::{BlockStore, ContentHash, GcReport, StorageUsage};
