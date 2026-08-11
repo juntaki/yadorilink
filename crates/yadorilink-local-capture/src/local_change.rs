@@ -67,10 +67,36 @@ fn metadata_mtime_matches(metadata: &std::fs::Metadata, indexed_mtime_unix_nanos
 /// Whether the on-disk object `lstat` describes is still proven to be this
 /// crate's own untouched placeholder, for the `MaterializationState::
 /// Placeholder` fast path in `build_record_for_created_or_modified`. On
-/// Unix, this is a `(dev, ino)` identity comparison against
-/// `placeholder_generation` (M1-2) -- see that call site's own doc comment
-/// for why this replaces the old size/mtime/sparse-file heuristic there.
+/// Unix, this requires BOTH: a `(dev, ino)` identity match against
+/// `placeholder_generation` (M1-2), AND the object still being sparse (no
+/// allocated data blocks) -- see that call site's own doc comment for why
+/// this replaces the old size/mtime/sparse-file heuristic there.
 ///
+/// Identity alone is not sufficient -- an independent review's finding: a
+/// genuine in-place edit (a `truncate`+`write` that reuses the same file
+/// descriptor/inode rather than an atomic rename, or an `mmap` write) keeps
+/// the SAME inode while genuinely changing the file's bytes. The OLD
+/// heuristic caught this case (real content allocates disk blocks, so the
+/// sparse-file check alone already said "not untouched") even though it
+/// missed the atomic-rename-preserving-size/mtime case this file's own
+/// identity check exists to close. Requiring both keeps the union of what
+/// each signal alone catches: identity closes the atomic-rename gap,
+/// sparseness closes the in-place-edit gap.
+#[cfg(unix)]
+fn untouched_placeholder_verdict(
+    lstat: &std::fs::Metadata,
+    _existing: Option<&FileRecord>,
+    placeholder_generation: Option<&yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    placeholder_generation.is_some_and(|recorded| {
+        recorded.provider_kind == yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND
+            && yadorilink_local_storage::PlaceholderDiskIdentity::from_metadata(lstat)
+                == Some(recorded.identity)
+            && lstat.blocks() == 0
+    })
+}
+
 /// On any other platform, no stable on-disk identity is capturable yet
 /// (`yadorilink_local_storage::write_placeholder` returns `None` there --
 /// a real Windows CfAPI generation belongs to `placeholder_backend_windows`
@@ -84,18 +110,6 @@ fn metadata_mtime_matches(metadata: &std::fs::Metadata, indexed_mtime_unix_nanos
 /// size+mtime comparison this whole check used everywhere before M1-2 --
 /// weaker (misses a same-size/mtime in-place edit), but not one that
 /// corrupts the index on an ordinary self-echo.
-#[cfg(unix)]
-fn untouched_placeholder_verdict(
-    lstat: &std::fs::Metadata,
-    _existing: Option<&FileRecord>,
-    placeholder_generation: Option<&yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
-) -> bool {
-    placeholder_generation.is_some_and(|recorded| {
-        recorded.provider_kind == yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND
-            && yadorilink_local_storage::PlaceholderDiskIdentity::from_metadata(lstat)
-                == Some(recorded.identity)
-    })
-}
 
 #[cfg(not(unix))]
 fn untouched_placeholder_verdict(
@@ -2310,6 +2324,65 @@ pub(crate) mod scan_test_hooks {
     }
 }
 
+/// `untouched_placeholder_verdict`'s non-Unix fallback (plain size+mtime
+/// comparison, no identity involved) has no coverage from this module's
+/// other placeholder tests, which are all `#[cfg(unix)]` (they need a real
+/// captured identity, which only Unix produces) -- an independent review's
+/// finding. These call the free function directly against a hand-built
+/// `Metadata`/`FileRecord` rather than through the full processor fixture,
+/// so they compile and run on every platform this crate ships for,
+/// specifically exercising whichever `untouched_placeholder_verdict` is
+/// active on that build. On Unix this is a weaker assertion than the
+/// dedicated identity/sparse tests above (it cannot force a `PlaceholderGeneration`
+/// mismatch by itself, since that overload ignores `existing` and looks
+/// only at `placeholder_generation`), so it is gated to non-Unix, where
+/// it is this fallback's only coverage.
+#[cfg(all(test, not(unix)))]
+mod untouched_placeholder_verdict_fallback_tests {
+    use super::{untouched_placeholder_verdict, FileRecord};
+
+    fn record(size: u64, mtime_unix_nanos: i64) -> FileRecord {
+        FileRecord {
+            path: "placeholder.bin".into(),
+            size,
+            mtime_unix_nanos,
+            blocks: Vec::new(),
+            deleted: false,
+        }
+    }
+
+    fn metadata_for(size: u64) -> std::fs::Metadata {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, vec![0u8; size as usize]).unwrap();
+        std::fs::metadata(&path).unwrap()
+    }
+
+    #[test]
+    fn matching_size_and_mtime_is_untouched() {
+        let metadata = metadata_for(4096);
+        let mtime =
+            metadata.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+                as i64;
+        assert!(untouched_placeholder_verdict(&metadata, Some(&record(4096, mtime)), None));
+    }
+
+    #[test]
+    fn mismatched_size_is_not_untouched() {
+        let metadata = metadata_for(4096);
+        let mtime =
+            metadata.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+                as i64;
+        assert!(!untouched_placeholder_verdict(&metadata, Some(&record(9999, mtime)), None));
+    }
+
+    #[test]
+    fn no_existing_record_is_not_untouched() {
+        let metadata = metadata_for(4096);
+        assert!(!untouched_placeholder_verdict(&metadata, None, None));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3530,6 +3603,91 @@ mod tests {
             matches!(result, LocalChangeOutcome::FileChanged(_)),
             "an atomic-save edit landing at the placeholder's exact size and mtime must be \
              captured, not discarded as a self-echo -- got {result:?}"
+        );
+    }
+
+    /// The OLD size/mtime/sparse-file heuristic caught an in-place edit
+    /// (same inode, real bytes written directly into the placeholder's
+    /// path rather than an atomic rename) via its sparse-file check: real
+    /// content allocates disk blocks. A second independent review's
+    /// finding: an identity-only comparison LOSES that coverage, since an
+    /// in-place write never changes the inode. This pins the fix requiring
+    /// BOTH identity match and continued sparseness.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn in_place_edit_that_keeps_the_same_inode_is_still_captured() {
+        let (proc, state, _store_dir, root_dir) = processor();
+        let root = canonical_root(&root_dir);
+        adopt_root(&state, "group-1", &root);
+        let file_path = root.join("placeholder.bin");
+        let content_size: u64 = 64;
+
+        state
+            .file_index_repository()
+            .upsert_file(
+                "group-1",
+                &FileRecord {
+                    path: "placeholder.bin".into(),
+                    size: content_size,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![yadorilink_replica_domain::file::BlockInfo {
+                        hash: vec![0xAB; 32],
+                        offset: 0,
+                        size: content_size as u32,
+                    }],
+                    deleted: false,
+                },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(
+                "group-1",
+                "placeholder.bin",
+                MaterializationState::Placeholder,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        let identity = yadorilink_local_storage::write_placeholder(&file_path, content_size, 0)
+            .unwrap()
+            .expect("this test runs on unix, where an identity is always captured");
+        state
+            .materialization_state_repository()
+            .record_placeholder_generation(
+                "group-1",
+                "placeholder.bin",
+                identity,
+                yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+
+        // Write real content directly into the placeholder's own path (no
+        // rename) -- the same inode as before, but no longer sparse, and
+        // restore the exact original mtime afterward so size AND mtime
+        // both still match the untouched placeholder too.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().write(true).open(&file_path).unwrap();
+            file.write_all(&vec![0x99u8; content_size as usize]).unwrap();
+            file.sync_all().unwrap();
+        }
+        std::fs::File::open(&file_path).unwrap().set_modified(std::time::UNIX_EPOCH).unwrap();
+
+        let result = proc
+            .process_event(
+                "group-1",
+                &root,
+                &FsChangeEvent { path: file_path, kind: FsChangeKind::CreatedOrModified },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(result, LocalChangeOutcome::FileChanged(_)),
+            "an in-place edit that keeps the same inode but writes real content must still be \
+             captured -- got {result:?}"
         );
     }
 
