@@ -217,73 +217,48 @@ pub fn unregister(local_path: &Path) -> WinResult<()> {
     unsafe { CfUnregisterSyncRoot(PCWSTR::from_raw(path_wide.as_ptr())) }
 }
 
-/// Mints a fresh opaque generation token for a placeholder about to be
-/// created -- M2-0: ports the identity scheme
-/// `yadorilink-daemon`'s now-superseded `placeholder_backend_windows.rs`
-/// (`WindowsCfApiBackend`, never wired into production -- see that
-/// module's own doc for why: a real `FETCH_DATA` callback, which THIS
-/// module already has, is what made that backend's own workarounds
-/// unnecessary here) proved end-to-end against real cfapi on a Windows 11
-/// VM: an 8-byte little-endian `u64` timestamp, not the file's name or any
-/// other content-derived value. A real generation source, not a constant,
-/// for the same reason that module documented: two placeholders created
-/// back-to-back at the same path (a delete immediately followed by a
-/// re-create) must not mint the same token, or a future dirty-detection
-/// reader could not tell them apart.
+/// Encodes `generation` -- a `u64` the DAEMON minted and persisted (M2-2
+/// moved minting authority there; see `crates/yadorilink-daemon/src/
+/// link_runtime/operations/capture_local_change.rs`'s
+/// `ensure_windows_placeholder_generation`, this value's origin) -- as
+/// the `FileIdentity` blob a placeholder is created with.
+///
+/// Self-describing on purpose: 1 version-tag byte (`1`, "generation-token
+/// v1") followed by the 8-byte little-endian `u64`. M2-0 originally
+/// shipped a bare, untagged 8-byte value; M2-2's Windows dirty-detection
+/// reader (`yadorilink-daemon::placeholder_inspect_windows::
+/// decode_generation_identity`) needs to tell "a generation token" apart
+/// from "an even older, pre-M2-0 filename-derived identity" -- both are
+/// now indistinguishable "not this format" to that reader, since this
+/// project ships pre-release with no compatibility burden (no migration
+/// path needed for a placeholder an earlier build created; M2-2's own
+/// doc comment on `sync_placeholders` below covers what happens to one).
 ///
 /// Matches `yadorilink_filesystem_sync::placeholder_backend::
-/// PlaceholderGeneration`'s own wire shape (`pub struct
-/// PlaceholderGeneration(pub u64)`, compared via `.to_le_bytes()`)
-/// exactly, even though nothing on this production path reads it back
-/// yet (that requires a new shell-IPC RPC letting the daemon ask this
-/// process "what generation is this placeholder currently at" -- M2-2,
-/// not this pass). Minting it in the already-correct format now means
-/// M2-2 only has to add a reader, not also fix up every placeholder this
-/// process already created.
-///
-/// M2-2 note (review finding, not fixed here): `sync_placeholders` below
-/// skips every path whose placeholder already exists on disk, so a
-/// placeholder created before this change keeps its old filename-derived
-/// `FileIdentity` forever -- an 8-byte blob is NOT self-describing, so
-/// M2-2's reader cannot assume every `FileIdentity` it encounters is one
-/// of these generation tokens. It needs either a legacy-identity
-/// detection/migration path, or a self-identifying tag (e.g. a version
-/// byte) added to the blob format before M2-2 lands.
-///
-/// Review finding (M2-0 Codex pass): a bare wall-clock read is not
-/// actually guaranteed unique -- two placeholders minted back-to-back
-/// can land in the same clock tick at the OS's effective resolution.
-/// Seeded once from wall-clock time and then strictly incremented per
-/// call, so every token minted within a single `cfapi-host` process
-/// lifetime is unique regardless of clock resolution; the wall-clock
-/// seed keeps values from restarting at zero across process restarts
-/// (a fresh seed collides with a prior run's exact counter value only if
-/// the two processes start in the same nanosecond, which the increment
-/// does not need to defend against -- the dead backend this scheme is
-/// ported from relied on the same wall-clock seed with no such guard at
-/// all).
-fn mint_generation_token() -> [u8; 8] {
-    static COUNTER: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
-    let counter = COUNTER.get_or_init(|| {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(1);
-        std::sync::atomic::AtomicU64::new(seed)
-    });
-    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_le_bytes()
+/// PlaceholderGeneration`'s own scalar type (`pub struct
+/// PlaceholderGeneration(pub u64)`) -- only the WIRE FORMAT (this 9-byte
+/// blob) is Windows/CfAPI-specific, not the underlying value.
+fn encode_generation_identity(generation: u64) -> [u8; 9] {
+    const VERSION_TAG: u8 = 1;
+    let mut buf = [0u8; 9];
+    buf[0] = VERSION_TAG;
+    buf[1..9].copy_from_slice(&generation.to_le_bytes());
+    buf
 }
 
 /// Creates a cfapi placeholder for one file. `relative_path`
 /// is forward-slash-separated (matching the shell-IPC wire format);
 /// converted to backslashes here. The immediate parent directory is
 /// created as an ordinary directory if missing (see module doc's
-/// "nested directories" limitation).
+/// "nested directories" limitation). `generation` is minted and
+/// persisted by the DAEMON (M2-2), not this process -- see
+/// `encode_generation_identity`'s own doc for why.
 pub fn create_placeholder(
     root: &Path,
     relative_path: &str,
     size: u64,
     mtime_unix_nanos: i64,
+    generation: u64,
 ) -> WinResult<()> {
     let relative_path = relative_path.replace('/', "\\");
     let full_path = root.join(&relative_path);
@@ -301,15 +276,16 @@ pub fn create_placeholder(
     // `FileIdentity` is documented as a *mandatory* field for files (not
     // directories) in `CfCreatePlaceholders` — a null/empty identity fails
     // with `ERROR_CLOUD_FILE_INVALID_REQUEST` (0x8007017C), confirmed
-    // against real cfapi on a Windows 11 VM. See `mint_generation_token`'s
-    // own doc for why this is now an opaque generation token rather than
-    // the file's own name: the fetch-data callback still resolves
-    // hydration data by looking up the path via shell-IPC (not by
+    // against real cfapi on a Windows 11 VM. See `encode_generation_identity`'s
+    // own doc for the wire format and why it carries the daemon-minted
+    // `generation`, not the file's own name: the fetch-data callback still
+    // resolves hydration data by looking up the path via shell-IPC (not by
     // decoding this blob) — this is not duplicated block/version state,
     // just enough of an opaque identity to satisfy the API contract AND
-    // (once M2-2 adds a reader) let a caller confirm a placeholder is
-    // still the exact one this process created.
-    let file_identity = mint_generation_token();
+    // let `yadorilink-daemon`'s Windows dirty-detection reader
+    // (`placeholder_inspect_windows::inspect_placeholder`) confirm a
+    // placeholder is still the exact one the daemon expects.
+    let file_identity = encode_generation_identity(generation);
 
     let mut entries = [CF_PLACEHOLDER_CREATE_INFO {
         RelativeFileName: PCWSTR::from_raw(file_name_wide.as_ptr()),
@@ -450,6 +426,17 @@ unsafe extern "system" fn fetch_data_callback(
 /// they either already have real content or are actively being written
 /// by a non-cfapi-routed hydration in progress, neither of which needs a
 /// placeholder created.
+/// M2-2 note: a path whose real CfAPI placeholder already exists on disk
+/// (the `full_path.exists()` skip below) never has its `FileIdentity`
+/// refreshed here even if the daemon reports a different
+/// `placeholder_generation` on a later poll -- it keeps whatever identity
+/// it was created with. This is intentional, not a gap this pass needs to
+/// close: `ensure_windows_placeholder_generation` (daemon-side) mints a
+/// generation exactly once per path and persists it, reusing the same
+/// value on every subsequent poll for as long as that path stays a
+/// `Placeholder` row -- so a real placeholder created here and the
+/// generation the daemon expects for it never actually diverge in
+/// practice.
 pub fn sync_placeholders(root: &Path, entries: &[yadorilink_ipc_proto::shellipc::FolderFileEntry]) {
     for entry in entries {
         if MaterializationState::try_from(entry.materialization_state)
@@ -461,9 +448,24 @@ pub fn sync_placeholders(root: &Path, entries: &[yadorilink_ipc_proto::shellipc:
         if full_path.exists() {
             continue;
         }
-        if let Err(e) =
-            create_placeholder(root, &entry.relative_path, entry.size, entry.mtime_unix_nanos)
-        {
+        // The daemon hasn't minted/persisted a generation for this path
+        // yet (a transient race between this poll's `ListFolderFilesRequest`
+        // and the daemon's own `ensure_windows_placeholder_generation`
+        // call) -- skip creating a placeholder this poll rather than
+        // inventing an identity locally; M2-2 moved minting authority to
+        // the daemon entirely (see `encode_generation_identity`'s own
+        // doc), so there is nothing safe to do here but wait for a future
+        // poll where the daemon has caught up.
+        let Some(generation) = entry.placeholder_generation else {
+            continue;
+        };
+        if let Err(e) = create_placeholder(
+            root,
+            &entry.relative_path,
+            entry.size,
+            entry.mtime_unix_nanos,
+            generation,
+        ) {
             eprintln!(
                 "yadorilink-cfapi-host: failed to create placeholder for {:?}: {e:?}",
                 entry.relative_path
@@ -497,7 +499,7 @@ mod tests {
         let now_nanos =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
                 as i64;
-        let create = super::create_placeholder(&dir, "hello.txt", 11, now_nanos);
+        let create = super::create_placeholder(&dir, "hello.txt", 11, now_nanos, 1);
         println!("create_placeholder: {:?}", create);
         create.expect("CfCreatePlaceholders should succeed");
 

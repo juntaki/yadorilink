@@ -88,6 +88,30 @@ pub trait LocalMutationStore: Send + Sync {
         path: &str,
     ) -> Result<Option<yadorilink_sync_sqlite::RecordedPlaceholderGeneration>, SyncSqliteError>;
 
+    /// M2-2: the ONLY way `local_change.rs`'s Windows dirty-detection
+    /// verdict may be `Untouched` -- a live query against the real CfAPI
+    /// placeholder at `path`, asking whether its OS-tracked
+    /// `CF_PLACEHOLDER_STATE_IN_SYNC` bit is set AND its current
+    /// `FileIdentity` still decodes to exactly `expected_generation`.
+    /// Never a local heuristic (no size/mtime comparison anywhere in this
+    /// call): any failure to confirm both -- the path isn't a real
+    /// placeholder, the identity doesn't decode, the API call itself
+    /// fails -- must come back as
+    /// [`yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus::Unknown`],
+    /// which every caller treats exactly like `Dirty` (fail-closed).
+    ///
+    /// `path` is the absolute on-disk path, not a `group_id`/relative-path
+    /// pair like every other method on this trait -- this is a live OS
+    /// call (`CreateFileW`+`CfGetPlaceholderInfo`), not an index query, so
+    /// it needs the same real filesystem path `local_change.rs` already
+    /// has in hand from its own `lstat`, not a re-resolution through the
+    /// index.
+    fn inspect_windows_placeholder(
+        &self,
+        path: &Path,
+        expected_generation: u64,
+    ) -> yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus;
+
     fn get_record_kind(
         &self,
         group_id: &str,
