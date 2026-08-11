@@ -310,20 +310,29 @@ pub struct PlaceholderDiskIdentity {
 /// grep-able under one name.
 pub const INTERNAL_INODE_PROVIDER_KIND: &str = "internal-inode";
 
-#[cfg(unix)]
-fn disk_identity_of(file: &fs::File) -> Option<PlaceholderDiskIdentity> {
-    use std::os::unix::fs::MetadataExt;
-    file.metadata().ok().map(|m| PlaceholderDiskIdentity { dev: m.dev(), ino: m.ino() })
+impl PlaceholderDiskIdentity {
+    /// Extracts this identity from an already-fetched [`fs::Metadata`] --
+    /// the read side of the same scheme [`write_placeholder`] mints on the
+    /// write side. Used both here (via an open file handle's `metadata()`)
+    /// and by `yadorilink-local-capture`'s dirty-detection, which already
+    /// has an `lstat`-equivalent `Metadata` in hand and must not pay for a
+    /// second stat just to compare identities. `None` on non-Unix builds,
+    /// same as [`write_placeholder`]'s own return -- see that function's
+    /// doc comment.
+    #[cfg(unix)]
+    pub fn from_metadata(metadata: &fs::Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        Some(Self { dev: metadata.dev(), ino: metadata.ino() })
+    }
+
+    #[cfg(not(unix))]
+    pub fn from_metadata(_metadata: &fs::Metadata) -> Option<Self> {
+        None
+    }
 }
 
-/// No stable, OS-independent identity is captured on non-Unix builds yet
-/// (Windows' own real identity belongs to `placeholder_backend_windows`'s
-/// CfAPI generation token once M2 wires it through this same seam) --
-/// `None` here, and every caller already treats `None` the same as a later
-/// mismatch: fail closed, never assume "still untouched."
-#[cfg(not(unix))]
-fn disk_identity_of(_file: &fs::File) -> Option<PlaceholderDiskIdentity> {
-    None
+fn disk_identity_of(file: &fs::File) -> Option<PlaceholderDiskIdentity> {
+    file.metadata().ok().and_then(|m| PlaceholderDiskIdentity::from_metadata(&m))
 }
 
 /// Writes a placeholder at `out_path`: a sparse file of `size` bytes with

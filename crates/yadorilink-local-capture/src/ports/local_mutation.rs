@@ -67,6 +67,27 @@ pub trait LocalMutationStore: Send + Sync {
         path: &str,
     ) -> Result<bool, SyncSqliteError>;
 
+    /// Bulk placeholder-identity lookup for a whole group -- used by
+    /// `scan_existing_files` for the same reason as
+    /// `list_materialization_states`: one query for the whole scan instead
+    /// of one per file. Only paths whose row is currently `Placeholder`
+    /// AND carries a recorded identity appear here -- see
+    /// `MaterializationStateRepository::list_placeholder_generations`'s own
+    /// doc comment for why the state gate matters.
+    fn list_placeholder_generations(
+        &self,
+        group_id: &str,
+    ) -> Result<
+        HashMap<String, yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
+        SyncSqliteError,
+    >;
+
+    fn get_placeholder_generation(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<yadorilink_sync_sqlite::RecordedPlaceholderGeneration>, SyncSqliteError>;
+
     fn get_record_kind(
         &self,
         group_id: &str,
