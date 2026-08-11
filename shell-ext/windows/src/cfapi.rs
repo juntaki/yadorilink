@@ -51,7 +51,7 @@ use windows::Win32::Storage::CloudFilters::{
     CF_HYDRATION_POLICY_MODIFIER_NONE, CF_INSYNC_POLICY_TRACK_ALL, CF_OPERATION_INFO,
     CF_OPERATION_PARAMETERS, CF_OPERATION_PARAMETERS_0, CF_OPERATION_PARAMETERS_0_6,
     CF_OPERATION_TRANSFER_DATA_FLAG_NONE, CF_OPERATION_TYPE_TRANSFER_DATA,
-    CF_PLACEHOLDER_CREATE_FLAG_NONE, CF_PLACEHOLDER_CREATE_INFO,
+    CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC, CF_PLACEHOLDER_CREATE_INFO,
     CF_PLACEHOLDER_MANAGEMENT_POLICY_DEFAULT, CF_POPULATION_POLICY,
     CF_POPULATION_POLICY_MODIFIER_NONE, CF_POPULATION_POLICY_PARTIAL, CF_REGISTER_FLAG_NONE,
     CF_SYNC_POLICIES, CF_SYNC_REGISTRATION,
@@ -217,6 +217,63 @@ pub fn unregister(local_path: &Path) -> WinResult<()> {
     unsafe { CfUnregisterSyncRoot(PCWSTR::from_raw(path_wide.as_ptr())) }
 }
 
+/// Mints a fresh opaque generation token for a placeholder about to be
+/// created -- M2-0: ports the identity scheme
+/// `yadorilink-daemon`'s now-superseded `placeholder_backend_windows.rs`
+/// (`WindowsCfApiBackend`, never wired into production -- see that
+/// module's own doc for why: a real `FETCH_DATA` callback, which THIS
+/// module already has, is what made that backend's own workarounds
+/// unnecessary here) proved end-to-end against real cfapi on a Windows 11
+/// VM: an 8-byte little-endian `u64` timestamp, not the file's name or any
+/// other content-derived value. A real generation source, not a constant,
+/// for the same reason that module documented: two placeholders created
+/// back-to-back at the same path (a delete immediately followed by a
+/// re-create) must not mint the same token, or a future dirty-detection
+/// reader could not tell them apart.
+///
+/// Matches `yadorilink_filesystem_sync::placeholder_backend::
+/// PlaceholderGeneration`'s own wire shape (`pub struct
+/// PlaceholderGeneration(pub u64)`, compared via `.to_le_bytes()`)
+/// exactly, even though nothing on this production path reads it back
+/// yet (that requires a new shell-IPC RPC letting the daemon ask this
+/// process "what generation is this placeholder currently at" -- M2-2,
+/// not this pass). Minting it in the already-correct format now means
+/// M2-2 only has to add a reader, not also fix up every placeholder this
+/// process already created.
+///
+/// M2-2 note (review finding, not fixed here): `sync_placeholders` below
+/// skips every path whose placeholder already exists on disk, so a
+/// placeholder created before this change keeps its old filename-derived
+/// `FileIdentity` forever -- an 8-byte blob is NOT self-describing, so
+/// M2-2's reader cannot assume every `FileIdentity` it encounters is one
+/// of these generation tokens. It needs either a legacy-identity
+/// detection/migration path, or a self-identifying tag (e.g. a version
+/// byte) added to the blob format before M2-2 lands.
+///
+/// Review finding (M2-0 Codex pass): a bare wall-clock read is not
+/// actually guaranteed unique -- two placeholders minted back-to-back
+/// can land in the same clock tick at the OS's effective resolution.
+/// Seeded once from wall-clock time and then strictly incremented per
+/// call, so every token minted within a single `cfapi-host` process
+/// lifetime is unique regardless of clock resolution; the wall-clock
+/// seed keeps values from restarting at zero across process restarts
+/// (a fresh seed collides with a prior run's exact counter value only if
+/// the two processes start in the same nanosecond, which the increment
+/// does not need to defend against -- the dead backend this scheme is
+/// ported from relied on the same wall-clock seed with no such guard at
+/// all).
+fn mint_generation_token() -> [u8; 8] {
+    static COUNTER: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    let counter = COUNTER.get_or_init(|| {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1);
+        std::sync::atomic::AtomicU64::new(seed)
+    });
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_le_bytes()
+}
+
 /// Creates a cfapi placeholder for one file. `relative_path`
 /// is forward-slash-separated (matching the shell-IPC wire format);
 /// converted to backslashes here. The immediate parent directory is
@@ -242,17 +299,17 @@ pub fn create_placeholder(
     let ticks = unix_nanos_to_filetime_ticks(mtime_unix_nanos);
 
     // `FileIdentity` is documented as a *mandatory* field for files (not
-    // directories) in `CfCreatePlaceholders` — a null/empty identity was
-    // originally tried (module doc's "prefer looking up hydration data by
-    // path via IPC" simplification) but fails with
-    // `ERROR_CLOUD_FILE_INVALID_REQUEST` (0x8007017C), confirmed against
-    // real cfapi on a Windows 11 VM. The relative path's UTF-8 bytes are
-    // used as a small, self-describing, well-under-4KB marker blob; the
-    // fetch-data callback still resolves hydration data by looking up the
-    // path via shell-IPC (not by decoding this blob) — this is not
-    // duplicated block/version state, just enough of an opaque identity
-    // to satisfy the API contract.
-    let file_identity = file_name.as_bytes();
+    // directories) in `CfCreatePlaceholders` — a null/empty identity fails
+    // with `ERROR_CLOUD_FILE_INVALID_REQUEST` (0x8007017C), confirmed
+    // against real cfapi on a Windows 11 VM. See `mint_generation_token`'s
+    // own doc for why this is now an opaque generation token rather than
+    // the file's own name: the fetch-data callback still resolves
+    // hydration data by looking up the path via shell-IPC (not by
+    // decoding this blob) — this is not duplicated block/version state,
+    // just enough of an opaque identity to satisfy the API contract AND
+    // (once M2-2 adds a reader) let a caller confirm a placeholder is
+    // still the exact one this process created.
+    let file_identity = mint_generation_token();
 
     let mut entries = [CF_PLACEHOLDER_CREATE_INFO {
         RelativeFileName: PCWSTR::from_raw(file_name_wide.as_ptr()),
@@ -268,7 +325,33 @@ pub fn create_placeholder(
         },
         FileIdentity: file_identity.as_ptr() as *const c_void,
         FileIdentityLength: file_identity.len() as u32,
-        Flags: CF_PLACEHOLDER_CREATE_FLAG_NONE,
+        // MARK_IN_SYNC (not ported: `ALWAYS_FULL`): a freshly created
+        // placeholder is, by definition, untouched by any local writer --
+        // "in sync" tracks local-modification state, orthogonal to
+        // population/hydration state (`Population: PARTIAL`, set on this
+        // sync root's own registration above, already governs whether
+        // content is present; `MARK_IN_SYNC` at creation is honored on
+        // its own -- `InSync: CF_INSYNC_POLICY_TRACK_ALL`, also already
+        // set on that registration, instead governs which *subsequent*
+        // filesystem changes clear the in-sync bit, not whether it's
+        // honored at creation time). Deliberately does NOT also port
+        // `CF_PLACEHOLDER_CREATE_FLAG_ALWAYS_FULL` from the dead
+        // backend: that flag existed there specifically to compensate for
+        // having NO `FETCH_DATA` callback registered (an ordinary local
+        // write into an unpopulated placeholder byte range otherwise
+        // times out waiting for a fetch that would never come) -- this
+        // module already registers a real one (`fetch_data_callback`
+        // above), so lazy population must stay genuinely lazy; forcing
+        // `ALWAYS_FULL` here would defeat the whole point of On-Demand.
+        //
+        // UNVERIFIED against real hardware (flagged honestly, matching
+        // this module's own doc-comment convention): `MARK_IN_SYNC`
+        // combined with `Population: PARTIAL` and a real `FETCH_DATA`
+        // callback has not been exercised on a live Windows machine in
+        // this codebase yet -- only the dead backend's OWN combination
+        // (`MARK_IN_SYNC | ALWAYS_FULL`, no fetch callback) was
+        // empirically confirmed working.
+        Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
         Result: windows::Win32::Foundation::S_OK,
         CreateUsn: 0,
     }];
