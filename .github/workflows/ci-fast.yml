@@ -97,6 +97,9 @@ jobs:
       - name: Windows shell extension
         working-directory: shell-ext/windows
         run: cargo build --release
+      - name: Windows shell extension tests
+        working-directory: shell-ext/windows
+        run: cargo test
 
   macos:
     runs-on: macos-latest
