@@ -151,6 +151,28 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     // for anything beyond computing the target path and staged content
     // location -- the daemon is the sole authority on what actually
     // landed.
+    //
+    // TWO KNOWN, ACCEPTED GAPS (an independent review's findings, not
+    // fixed in this iteration):
+    //
+    // - No rollback story: disk is mutated BEFORE the daemon is notified,
+    //   so a notify failure (daemon unreachable/timeout) after a
+    //   successful disk write leaves real bytes on disk with no
+    //   corresponding admission. A later retry of the SAME operation
+    //   (same content) self-heals once connectivity returns -- File
+    //   Provider's own retry behavior after a `.serverUnreachable`
+    //   completion is what's relied on here, not anything this extension
+    //   does itself. `deleteItem` specifically also tolerates its own
+    //   retry (see its own comment on `NSFileNoSuchFileError`).
+    // - An empty directory (`createItem` with `contentType == .folder`)
+    //   is reported to Finder as fully created, but nothing durable is
+    //   recorded on the daemon side for it: `LocalChangeProcessor` has no
+    //   directory-only admission signal, so an empty folder exists only
+    //   on THIS device's disk until either a file is created inside it
+    //   (which admits successfully, independent of any parent-directory
+    //   row) or this link's own reconcile/scan pass happens to observe
+    //   the bare directory. A folder created and left empty is not
+    //   guaranteed to survive indefinitely or reach peers.
 
     /// Resolves an item's on-disk relative path from its parent identifier
     /// (which is either `.rootContainer` or another item's own relative
@@ -180,10 +202,22 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                 if isDirectory {
                     try fm.createDirectory(atPath: absolutePath, withIntermediateDirectories: true)
                 } else if let url {
+                    // `replaceItemAt` when the destination already exists
+                    // (a `createItem` replay after a prior notify timeout,
+                    // say) is an ATOMIC same-directory rename, not a
+                    // remove-then-move -- an independent review's finding:
+                    // remove-then-move leaves a real window where the
+                    // filesystem watcher can observe the destination
+                    // genuinely absent and emit its own tombstone for it,
+                    // racing this call's own notify. `moveItem` (used only
+                    // when nothing exists at the destination yet, so there
+                    // is no such window) is still correct for a genuinely
+                    // brand-new path.
                     if fm.fileExists(atPath: absolutePath) {
-                        try fm.removeItem(atPath: absolutePath)
+                        _ = try fm.replaceItemAt(URL(fileURLWithPath: absolutePath), withItemAt: url)
+                    } else {
+                        try fm.moveItem(at: url, to: URL(fileURLWithPath: absolutePath))
                     }
-                    try fm.moveItem(at: url, to: URL(fileURLWithPath: absolutePath))
                 } else {
                     fm.createFile(atPath: absolutePath, contents: nil)
                 }
@@ -241,10 +275,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             if let newContents {
                 do {
                     let fm = FileManager.default
+                    // Same atomic-replace reasoning as `createItem`'s own
+                    // content-replace path above -- see that comment.
                     if fm.fileExists(atPath: absolutePath) {
-                        try fm.removeItem(atPath: absolutePath)
+                        _ = try fm.replaceItemAt(URL(fileURLWithPath: absolutePath), withItemAt: newContents)
+                    } else {
+                        try fm.moveItem(at: newContents, to: URL(fileURLWithPath: absolutePath))
                     }
-                    try fm.moveItem(at: newContents, to: URL(fileURLWithPath: absolutePath))
                 } catch {
                     completionHandler(nil, [], false, error)
                     return
@@ -271,7 +308,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                 completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
                 return
             }
-            completionHandler(FileProviderItem(node: node), [], false, nil)
+            // Only `.contents` is actually applied above -- any other
+            // requested field (rename, reparent, tags, ...) is neither
+            // implemented nor silently discarded: report it back as still
+            // pending, per this callback's own documented contract, rather
+            // than overclaiming every requested change was applied. An
+            // independent review's finding.
+            completionHandler(FileProviderItem(node: node), changedFields.subtracting(.contents), false, nil)
         }
         return progress
     }
@@ -291,6 +334,17 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             defer { progress.completedUnitCount = 1 }
             do {
                 try FileManager.default.removeItem(atPath: absolutePath)
+            } catch let error as NSError where error.domain == NSCocoaErrorDomain
+                && error.code == NSFileNoSuchFileError {
+                // Already absent from disk -- almost certainly a RETRY of
+                // a delete whose earlier attempt removed the file but
+                // never got a chance to notify the daemon (e.g. the
+                // daemon was briefly unreachable). An independent review's
+                // finding: bailing out here on "not found" would silently
+                // strand that earlier delete un-admitted forever, since
+                // nothing else ever re-notifies for a path the OS
+                // considers already gone. Fall through to notify exactly
+                // as if the removal had just succeeded.
             } catch {
                 completionHandler(error)
                 return
