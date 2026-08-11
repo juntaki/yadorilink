@@ -135,24 +135,30 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         FileProviderEnumerator(containerItemIdentifier: containerItemIdentifier, localPath: localPath)
     }
 
-    // MARK: - Write path: NOT IMPLEMENTED (documented, tracked gap)
+    // MARK: - Write path (M1-3)
     //
-    // The daemon side only implements read-direction materialization/
-    // hydration so far — there is no daemon IPC surface yet for "a File
-    // Provider client created/modified/deleted a file, apply this to the
-    // index and queue it for upload." Wiring that up is real scope (it
-    // would need a new shellipc.proto request analogous to how
-    // `local_change::process_event` handles a *filesystem watcher's*
-    // view of a local edit, but sourced from the File Provider system's
-    // create/modify/delete calls instead of `notify`).
-    // `FileProviderItem.capabilities` is deliberately
-    // `.allowsReading`-only (no `.allowsWriting`/`.allowsAddingSubItems`)
-    // specifically so Finder does not offer drag-and-drop-in/edit-in-place
-    // UI that would dead-end here — these three methods exist only to
-    // satisfy the protocol's required conformance and to fail cleanly
-    // (not hang or crash) for any write attempt that reaches them anyway
-    // (e.g. via a non-Finder File Provider client, or definitionally
-    // over the API rather than through Finder's own affordances).
+    // No File-Provider-specific sync engine: each of the three methods
+    // below (1) makes disk match what the OS callback asked for, using
+    // ordinary `FileManager` operations exactly like any other app would,
+    // then (2) notifies the daemon that *something* changed at this path
+    // via `yadorilink_fp_notify_local_write` -- carrying no content or
+    // metadata, only the relative path and a create/modify-vs-delete
+    // signal. The daemon re-observes the live file itself and routes it
+    // through the EXACT SAME `local_change::process_event` admission path
+    // a filesystem watcher's own event would take (see
+    // `LinkFlushHandle::capture_local_write`'s own doc comment on the Rust
+    // side). This callback never trusts `itemTemplate`/`changedFields`
+    // for anything beyond computing the target path and staged content
+    // location -- the daemon is the sole authority on what actually
+    // landed.
+
+    /// Resolves an item's on-disk relative path from its parent identifier
+    /// (which is either `.rootContainer` or another item's own relative
+    /// path, per `FileProviderItem.parentItemIdentifier`'s convention) and
+    /// filename.
+    private func relativePath(parent: NSFileProviderItemIdentifier, filename: String) -> String {
+        parent == .rootContainer ? filename : "\(parent.rawValue)/\(filename)"
+    }
 
     func createItem(
         basedOn itemTemplate: NSFileProviderItem,
@@ -163,8 +169,57 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: 1)
-        completionHandler(nil, [], false, NSFileProviderError(.notAuthenticated))
-        progress.completedUnitCount = 1
+        let localPath = self.localPath
+        let relPath = relativePath(parent: itemTemplate.parentItemIdentifier, filename: itemTemplate.filename)
+        let absolutePath = (localPath as NSString).appendingPathComponent(relPath)
+        let isDirectory = itemTemplate.contentType == .folder
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { progress.completedUnitCount = 1 }
+            do {
+                let fm = FileManager.default
+                if isDirectory {
+                    try fm.createDirectory(atPath: absolutePath, withIntermediateDirectories: true)
+                } else if let url {
+                    if fm.fileExists(atPath: absolutePath) {
+                        try fm.removeItem(atPath: absolutePath)
+                    }
+                    try fm.moveItem(at: url, to: URL(fileURLWithPath: absolutePath))
+                } else {
+                    fm.createFile(atPath: absolutePath, contents: nil)
+                }
+            } catch {
+                completionHandler(nil, [], false, error)
+                return
+            }
+            // Directory creation (mkdir) is a real, admissible local
+            // change too, but this device's daemon-side admission path
+            // (`local_change::process_event`) is file-content-oriented --
+            // it has no directory-creation signal to emit today. Only
+            // notify for a plain file; a bare mkdir with no file inside it
+            // yet is picked up by this link's own reconcile/scan passes
+            // the same way an out-of-band `mkdir` on an Eager folder
+            // already is.
+            guard !isDirectory else {
+                completionHandler(FileProviderItem(node: CatalogNode(relativePath: relPath, isDirectory: true, entry: nil)), [], false, nil)
+                return
+            }
+            let ok = localPath.withCString { lp in
+                relPath.withCString { rp in
+                    yadorilink_fp_notify_local_write(lp, rp, 0)
+                }
+            }
+            guard ok else {
+                completionHandler(nil, [], false, NSFileProviderError(.serverUnreachable))
+                return
+            }
+            let entries = FileProviderCatalog.listFiles(localPath: localPath)
+            let nodes = FileProviderCatalog.buildTree(from: entries)
+            guard let node = FileProviderCatalog.node(at: relPath, in: nodes) else {
+                completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
+                return
+            }
+            completionHandler(FileProviderItem(node: node), [], false, nil)
+        }
         return progress
     }
 
@@ -178,8 +233,46 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: 1)
-        completionHandler(nil, [], false, NSFileProviderError(.notAuthenticated))
-        progress.completedUnitCount = 1
+        let localPath = self.localPath
+        let relPath = item.itemIdentifier.rawValue
+        let absolutePath = (localPath as NSString).appendingPathComponent(relPath)
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { progress.completedUnitCount = 1 }
+            if let newContents {
+                do {
+                    let fm = FileManager.default
+                    if fm.fileExists(atPath: absolutePath) {
+                        try fm.removeItem(atPath: absolutePath)
+                    }
+                    try fm.moveItem(at: newContents, to: URL(fileURLWithPath: absolutePath))
+                } catch {
+                    completionHandler(nil, [], false, error)
+                    return
+                }
+            }
+            // A metadata-only modification (no `newContents`, e.g. only
+            // `changedFields` touched something this extension does not
+            // model, such as a Finder tag) still notifies the daemon --
+            // `process_event` re-observes disk and correctly finds nothing
+            // changed (a no-op), rather than this callback trying to guess
+            // which metadata-only changes are worth propagating.
+            let ok = localPath.withCString { lp in
+                relPath.withCString { rp in
+                    yadorilink_fp_notify_local_write(lp, rp, 0)
+                }
+            }
+            guard ok else {
+                completionHandler(nil, [], false, NSFileProviderError(.serverUnreachable))
+                return
+            }
+            let entries = FileProviderCatalog.listFiles(localPath: localPath)
+            let nodes = FileProviderCatalog.buildTree(from: entries)
+            guard let node = FileProviderCatalog.node(at: relPath, in: nodes) else {
+                completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
+                return
+            }
+            completionHandler(FileProviderItem(node: node), [], false, nil)
+        }
         return progress
     }
 
@@ -191,8 +284,24 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         completionHandler: @escaping (Error?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: 1)
-        completionHandler(NSFileProviderError(.notAuthenticated))
-        progress.completedUnitCount = 1
+        let localPath = self.localPath
+        let relPath = identifier.rawValue
+        let absolutePath = (localPath as NSString).appendingPathComponent(relPath)
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { progress.completedUnitCount = 1 }
+            do {
+                try FileManager.default.removeItem(atPath: absolutePath)
+            } catch {
+                completionHandler(error)
+                return
+            }
+            let ok = localPath.withCString { lp in
+                relPath.withCString { rp in
+                    yadorilink_fp_notify_local_write(lp, rp, 1)
+                }
+            }
+            completionHandler(ok ? nil : NSFileProviderError(.serverUnreachable))
+        }
         return progress
     }
 }
