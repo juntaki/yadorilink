@@ -130,6 +130,18 @@ message FolderFileEntry {
   uint64 size = 2;
   int64 mtime_unix_nanos = 3;
   MaterializationState materialization_state = 4;
+  // M2-2: set only when `materialization_state == MATERIALIZATION_STATE_
+  // PLACEHOLDER`, the CfAPI generation token the daemon has minted (and
+  // persisted in its own index) for this placeholder — cfapi-host encodes
+  // this EXACT value into the real placeholder's `FileIdentity` when it
+  // creates one, rather than minting its own. `optional`, not a bare
+  // `uint64` defaulting to 0: 0 is a value this daemon could mint, so
+  // "absent" (the daemon hasn't minted one yet for this path, or this
+  // entry isn't a placeholder at all) must be distinguishable from
+  // "generation zero" — a cfapi-host that treated absence as literal 0
+  // would create a placeholder for the WRONG generation the very first
+  // time a real mint raced ahead of a stale poll response.
+  optional uint64 placeholder_generation = 5;
 }
 
 message ListFolderFilesResponse {

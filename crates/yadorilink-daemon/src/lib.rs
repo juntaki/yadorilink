@@ -61,6 +61,8 @@ pub mod sync_runtime;
 // isolated per-instance paths and must not contend on real filesystem locks.
 #[cfg(windows)]
 pub mod placeholder_backend_windows;
+#[cfg(windows)]
+pub mod placeholder_inspect_windows;
 #[cfg(not(madsim))]
 pub mod resource_lock;
 pub mod shell_ipc;

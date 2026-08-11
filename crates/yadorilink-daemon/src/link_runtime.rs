@@ -157,6 +157,18 @@ impl LinkRuntime {
         self.flush_handle.capture_local_write(group_id, rel_path, kind).await
     }
 
+    /// M2-2: mints-or-reads this link's persisted Windows CfAPI generation
+    /// for `rel_path` -- see `LinkFlushHandle::ensure_windows_placeholder_
+    /// generation`'s own doc. Reached from `shell_ipc`'s
+    /// `ListFolderFilesRequest` handler via `LinkRegistry::runtime`.
+    pub(crate) fn ensure_windows_placeholder_generation(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+    ) -> Result<u64, String> {
+        self.flush_handle.ensure_windows_placeholder_generation(group_id, rel_path)
+    }
+
     /// The one deliberate exception to this type's "no raw internal-type
     /// getter" rule: `yadorilink_peer_session::peer_session::
     /// RootCommitAuthorityProvider` (implemented by `DaemonState` in the

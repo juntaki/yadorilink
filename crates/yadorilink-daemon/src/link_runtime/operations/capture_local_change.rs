@@ -561,6 +561,86 @@ impl LinkFlushHandle {
         announce_local_change(&deps, &self.local_path, group_id, records).await;
         Ok(outcome)
     }
+
+    /// M2-2: mint-or-read a Windows CfAPI generation token for `rel_path`,
+    /// persisting a freshly-minted one so a later `LocalMutationStore::
+    /// inspect_windows_placeholder` call has something durable to compare
+    /// against, and so a repeat call for the SAME still-placeholder path
+    /// (this is polled by `shell_ipc.rs`'s `ListFolderFilesRequest` handler
+    /// every time `yadorilink-cfapi-host.exe` asks, up to every 30s) gets
+    /// back the exact same value instead of a fresh one each time --
+    /// idempotent by construction, which is also what makes this safe
+    /// across a daemon restart: the persisted value in the index, not
+    /// anything held only in this process's memory, is the source of
+    /// truth a later read reads back.
+    ///
+    /// Review finding: an earlier version of this method read (`database.
+    /// read`, not serialized against this process's own writer lock), then
+    /// separately minted and wrote (`database.write`) -- two concurrent
+    /// callers for the SAME path (two overlapping `ListFolderFilesRequest`
+    /// handlers) could both observe "nothing recorded yet" and both mint
+    /// and persist, with the later write silently winning while
+    /// `cfapi-host.exe` might have already created a real placeholder
+    /// carrying the EARLIER (now-orphaned) generation -- permanently
+    /// `Unknown`/`Dirty` for that path until it transitions out of
+    /// `Placeholder` and back. `record_placeholder_generation_if_absent`
+    /// does the check-then-write in ONE `database.write` closure, so this
+    /// is no longer racy: whichever caller's mint actually gets persisted,
+    /// every caller (including ones that lost the race) gets back that
+    /// same winning value.
+    ///
+    /// Admits its own `LinkOperation` the same way every other mutating
+    /// method on this handle does -- `record_placeholder_generation_if_absent`
+    /// requires a `RootCommitPermit`, and this is the one seam that can
+    /// mint one for this call.
+    pub(crate) fn ensure_windows_placeholder_generation(
+        &self,
+        group_id: &str,
+        rel_path: &str,
+    ) -> Result<u64, String> {
+        let Some(deps) = self.deps.upgrade() else {
+            return Err("link is shutting down".to_string());
+        };
+        let op = self
+            .root_lease
+            .begin_operation()
+            .map_err(|_| "link is not currently accepting local writes".to_string())?;
+        let repo = deps.replica_coordinator.materialization_state_repository();
+        let candidate = yadorilink_local_storage::PlaceholderDiskIdentity {
+            dev: 0,
+            ino: mint_windows_placeholder_generation(),
+        };
+        let winner = repo
+            .record_placeholder_generation_if_absent(
+                group_id,
+                rel_path,
+                candidate,
+                yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
+                &op.permit(),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(winner.ino)
+    }
+}
+
+/// Mints a fresh Windows CfAPI generation token: a process-lifetime
+/// monotonic counter seeded from wall-clock time, so two placeholders
+/// minted back-to-back never collide regardless of clock resolution --
+/// same reasoning and shape as `shell-ext/windows/src/cfapi.rs`'s own
+/// `mint_generation_token` (which minted a generation on the OTHER side
+/// of the process boundary before M2-2 moved minting authority here; see
+/// that module's history for why the daemon, not `cfapi-host.exe`, is now
+/// the sole minter).
+fn mint_windows_placeholder_generation() -> u64 {
+    static COUNTER: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    let counter = COUNTER.get_or_init(|| {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1);
+        std::sync::atomic::AtomicU64::new(seed)
+    });
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether a locally-indexed change may propagate right now. The authoritative
@@ -916,5 +996,90 @@ mod tests {
             .expect("flush_case_fold_sibling must return promptly once its enqueue bound elapses, not park indefinitely")
             .unwrap();
         assert_eq!(outcome, PendingLocalFlushOutcome::RetryRequired);
+    }
+
+    /// M2-2: seeds a `Placeholder`-state row for `path` in `deps`'s index
+    /// (`ensure_windows_placeholder_generation` requires the row to
+    /// already exist -- `record_placeholder_generation`'s own `UPDATE`
+    /// affects zero rows and returns `NotFound` otherwise), independent of
+    /// any real `LinkFlushHandle`/`RootLease` -- `RootCommitPermit::
+    /// for_tests()` mirrors `materialization_execution.rs`'s own
+    /// `setup_placeholder_file` test helper.
+    fn seed_placeholder_row(deps: &LinkRuntimeDependencies, group_id: &str, path: &str) {
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        deps.replica_coordinator
+            .file_index_repository()
+            .upsert_file(group_id, &sample_record(path), &permit)
+            .unwrap();
+        deps.replica_coordinator
+            .materialization_state_repository()
+            .set_materialization_state(
+                group_id,
+                path,
+                yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
+                &permit,
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_windows_placeholder_generation_mints_once_and_persists() {
+        let deps = test_deps();
+        let root_dir = tempfile::tempdir().unwrap();
+        deps.replica_coordinator
+            .link_repository()
+            .add_link(&root_dir.path().display().to_string(), "group-1")
+            .unwrap();
+        seed_placeholder_row(&deps, "group-1", "doc.txt");
+        let (flush_request_tx, _flush_request_rx) = tokio::sync::mpsc::channel(1);
+        let handle = test_link_flush_handle(&deps, root_dir.path(), flush_request_tx);
+
+        let first = handle.ensure_windows_placeholder_generation("group-1", "doc.txt").unwrap();
+
+        // Idempotent: a second call for the SAME still-placeholder path
+        // (exactly what `shell_ipc.rs`'s `ListFolderFilesRequest` handler
+        // does on every ~30s cfapi-host poll) must return the identical
+        // persisted value, never mint a fresh one.
+        let second = handle.ensure_windows_placeholder_generation("group-1", "doc.txt").unwrap();
+        assert_eq!(first, second);
+
+        // Restart-safety proxy: a fresh read straight from the index (not
+        // anything this handle might have cached in memory) sees the same
+        // value -- the property that makes this safe across a real daemon
+        // restart, where a NEW handle re-reads whatever was persisted.
+        let recorded = deps
+            .replica_coordinator
+            .materialization_state_repository()
+            .get_placeholder_generation("group-1", "doc.txt")
+            .unwrap()
+            .expect("a generation should have been persisted");
+        assert_eq!(
+            recorded.provider_kind,
+            yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND
+        );
+        assert_eq!(recorded.identity.dev, 0);
+        assert_eq!(recorded.identity.ino, first);
+    }
+
+    /// Two different placeholder paths must never collide on the same
+    /// minted generation -- the same ABA-guard property `cfapi.rs`'s own
+    /// `mint_generation_token`/`encode_generation_identity` doc comments
+    /// require, now proved at the daemon-side minting authority instead.
+    #[tokio::test]
+    async fn ensure_windows_placeholder_generation_differs_across_paths() {
+        let deps = test_deps();
+        let root_dir = tempfile::tempdir().unwrap();
+        deps.replica_coordinator
+            .link_repository()
+            .add_link(&root_dir.path().display().to_string(), "group-1")
+            .unwrap();
+        seed_placeholder_row(&deps, "group-1", "a.txt");
+        seed_placeholder_row(&deps, "group-1", "b.txt");
+        let (flush_request_tx, _flush_request_rx) = tokio::sync::mpsc::channel(1);
+        let handle = test_link_flush_handle(&deps, root_dir.path(), flush_request_tx);
+
+        let a = handle.ensure_windows_placeholder_generation("group-1", "a.txt").unwrap();
+        let b = handle.ensure_windows_placeholder_generation("group-1", "b.txt").unwrap();
+        assert_ne!(a, b);
     }
 }

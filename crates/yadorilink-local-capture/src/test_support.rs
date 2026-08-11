@@ -69,6 +69,17 @@ type LocalChangeAuthProvider =
 pub(crate) struct TestReplica {
     inner: Arc<ReplicaCoordinator>,
     local_change_auth_provider: Mutex<Option<Arc<LocalChangeAuthProvider>>>,
+    /// M2-2: `inspect_windows_placeholder` is a live `CfGetPlaceholderInfo`
+    /// call in production (`yadorilink-daemon::placeholder_inspect_windows`,
+    /// Windows-only) -- nothing this crate's own `#[cfg(test)]` code can
+    /// exercise against a real placeholder, on any platform. Configurable
+    /// via `set_windows_placeholder_inspect_result` so a test can pin
+    /// exactly the verdict `local_change.rs`'s Windows dirty-detection
+    /// branch should see; defaults to `Unknown`, matching this whole
+    /// mechanism's own fail-closed contract for a scenario nothing has set
+    /// up an expectation for.
+    windows_placeholder_inspect_result:
+        Mutex<yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus>,
 }
 
 impl TestReplica {
@@ -76,7 +87,26 @@ impl TestReplica {
         Ok(Self {
             inner: Arc::new(ReplicaCoordinator::open_in_memory()?),
             local_change_auth_provider: Mutex::new(None),
+            windows_placeholder_inspect_result: Mutex::new(
+                yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus::Unknown,
+            ),
         })
+    }
+
+    /// Configures the verdict `LocalMutationStore::inspect_windows_placeholder`
+    /// returns for every subsequent call on this `TestReplica`, regardless
+    /// of `path`/`expected_generation` -- coarse (not per-path), matching
+    /// this fixture's one-scenario-per-test usage. Its only caller
+    /// (`local_change.rs`'s `untouched_placeholder_verdict_windows_tests`)
+    /// is itself `#[cfg(all(test, windows))]`, so this has no caller at
+    /// all on a non-Windows build -- not dead code, just untriggered on
+    /// this platform.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn set_windows_placeholder_inspect_result(
+        &self,
+        result: yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus,
+    ) {
+        *self.windows_placeholder_inspect_result.lock().unwrap_or_else(|p| p.into_inner()) = result;
     }
 
     /// The wrapped `ReplicaCoordinator` directly -- for callers (e.g.
@@ -148,6 +178,15 @@ impl LocalMutationStore for TestReplica {
     ) -> Result<Option<yadorilink_sync_sqlite::RecordedPlaceholderGeneration>, SyncSqliteError>
     {
         self.materialization_state_repository().get_placeholder_generation(group_id, path)
+    }
+
+    fn inspect_windows_placeholder(
+        &self,
+        path: &std::path::Path,
+        expected_generation: u64,
+    ) -> yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus {
+        let _ = (path, expected_generation);
+        *self.windows_placeholder_inspect_result.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     fn has_materialization_intent(

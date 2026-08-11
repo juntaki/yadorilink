@@ -237,6 +237,16 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
                 // never enumerated for placeholder registration either.
                 .find(|l| l.local_path == req.local_path && !l.orphaned)
                 .map(|l| {
+                    // M2-2: only needed to mint/persist a Windows CfAPI
+                    // generation for entries reported as `Placeholder`
+                    // below -- looked up once per link, not once per
+                    // file. `None` (link not currently running) means
+                    // every such entry's `placeholder_generation` stays
+                    // unset this poll; `cfapi_host.rs`'s `sync_placeholders`
+                    // already treats an unset generation as "not yet
+                    // ready to create, retry next poll", so this degrades
+                    // to a delayed placeholder creation, never a wrong one.
+                    let runtime = state.links.runtime(&req.local_path);
                     state
                         .replica_coordinator
                         .file_index_repository()
@@ -253,11 +263,36 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
                                     .ok()
                                     .flatten(),
                             );
+                            let placeholder_generation = if materialization_state
+                                == ShellMaterializationState::Placeholder
+                            {
+                                runtime.as_ref().and_then(|runtime| {
+                                    match runtime
+                                        .ensure_windows_placeholder_generation(&l.group_id, &f.path)
+                                    {
+                                        Ok(generation) => Some(generation),
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                group_id = %l.group_id,
+                                                path = %f.path,
+                                                error = %error,
+                                                "failed to mint/persist a Windows CfAPI \
+                                                 placeholder generation; cfapi-host will retry \
+                                                 creating this placeholder next poll"
+                                            );
+                                            None
+                                        }
+                                    }
+                                })
+                            } else {
+                                None
+                            };
                             FolderFileEntry {
                                 relative_path: f.path,
                                 size: f.size,
                                 mtime_unix_nanos: f.mtime_unix_nanos,
                                 materialization_state: materialization_state as i32,
+                                placeholder_generation,
                             }
                         })
                         .collect()

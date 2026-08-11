@@ -111,6 +111,34 @@ impl LocalMutationStore for ReplicaCoordinator {
         self.materialization_state_repository().get_placeholder_generation(group_id, path)
     }
 
+    /// M2-2: delegates to `crate::placeholder_inspect_windows`, the only
+    /// module in this crate allowed to make a real `CfGetPlaceholderInfo`
+    /// call -- see that module's own doc comment for why this daemon
+    /// process, not `yadorilink-cfapi-host.exe`, makes the call directly.
+    /// The `#[cfg(not(windows))]` arm is unreachable in practice:
+    /// `local_change.rs`'s dirty-detection verdict only ever calls this
+    /// method from its own `#[cfg(windows)]` branch, so this body exists
+    /// solely to keep the trait implementable (and this crate compiling)
+    /// on every other platform.
+    fn inspect_windows_placeholder(
+        &self,
+        path: &Path,
+        expected_generation: u64,
+    ) -> yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus {
+        #[cfg(windows)]
+        {
+            crate::placeholder_inspect_windows::inspect_placeholder(path, expected_generation)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (path, expected_generation);
+            unreachable!(
+                "inspect_windows_placeholder is only ever called from local_change.rs's own \
+                 #[cfg(windows)] branch"
+            )
+        }
+    }
+
     fn has_materialization_intent(
         &self,
         group_id: &str,

@@ -676,6 +676,72 @@ impl MaterializationStateRepository {
         Ok(())
     }
 
+    /// M2-2: atomically "mint-or-read" a placeholder identity -- returns
+    /// whatever identity `group_id`/`path` ends up recorded with, which is
+    /// `candidate` if none was recorded yet for `provider_kind`, or the
+    /// ALREADY-recorded one otherwise (`candidate` is then discarded,
+    /// never written). Unlike calling `get_placeholder_generation` (a
+    /// `database.read`, not serialized against this process's own writer
+    /// lock) followed by a separate `record_placeholder_generation` call,
+    /// this does the check-then-write in ONE `database.write` closure, so
+    /// two callers racing to mint a generation for the same path (e.g. two
+    /// concurrent `ListFolderFilesRequest` handlers) cannot both "win" --
+    /// exactly the race an independent review found in the two-call
+    /// pattern this replaces at its one call site
+    /// (`LinkFlushHandle::ensure_windows_placeholder_generation`).
+    ///
+    /// Only compares against a currently-recorded identity whose
+    /// `provider_kind` matches the one passed in -- a row already carrying
+    /// a DIFFERENT provider's identity (e.g. `INTERNAL_INODE_PROVIDER_KIND`
+    /// on a cross-platform-mismatched row) is treated as "nothing recorded
+    /// for this provider yet" and overwritten with `candidate`, same as
+    /// `record_placeholder_generation`'s own unconditional behavior always
+    /// did for that case.
+    pub fn record_placeholder_generation_if_absent(
+        &self,
+        group_id: &str,
+        path: &str,
+        candidate: yadorilink_local_storage::PlaceholderDiskIdentity,
+        provider_kind: &str,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<yadorilink_local_storage::PlaceholderDiskIdentity, SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            permit.verify()?;
+            let existing: Option<(Option<i64>, Option<i64>, Option<String>)> = conn
+                .query_row(
+                    "SELECT placeholder_dev, placeholder_ino, placeholder_provider_kind \
+                     FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
+                    rusqlite::params![group_id, path],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            if let Some((Some(dev), Some(ino), Some(existing_kind))) = existing {
+                if existing_kind == provider_kind {
+                    return Ok(yadorilink_local_storage::PlaceholderDiskIdentity {
+                        dev: dev as u64,
+                        ino: ino as u64,
+                    });
+                }
+            }
+            let affected = conn.execute(
+                "UPDATE files SET placeholder_dev = ?1, placeholder_ino = ?2, \
+                 placeholder_provider_kind = ?3 \
+                 WHERE group_id = ?4 AND path = ?5 AND state = 'current'",
+                rusqlite::params![
+                    candidate.dev as i64,
+                    candidate.ino as i64,
+                    provider_kind,
+                    group_id,
+                    path
+                ],
+            )?;
+            if affected == 0 {
+                return Err(SyncSqliteError::NotFound(format!("file {group_id}/{path}")));
+            }
+            Ok(candidate)
+        })
+    }
+
     /// Clears any placeholder identity recorded for `group_id`/`path` — a
     /// no-op, not an error, if none was recorded (or the row doesn't
     /// exist). Callers use this whenever a path stops being a placeholder

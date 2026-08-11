@@ -84,6 +84,8 @@ fn metadata_mtime_matches(metadata: &std::fs::Metadata, indexed_mtime_unix_nanos
 /// sparseness closes the in-place-edit gap.
 #[cfg(unix)]
 fn untouched_placeholder_verdict(
+    _store: &dyn crate::ports::LocalMutationStore,
+    _path: &Path,
     lstat: &std::fs::Metadata,
     existing: Option<&FileRecord>,
     placeholder_generation: Option<&yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
@@ -122,29 +124,54 @@ fn untouched_placeholder_verdict(
     existing.is_some_and(|record| lstat.len() == record.size) && lstat.blocks() == 0
 }
 
-/// On any other platform, no stable on-disk identity is capturable yet
-/// (`yadorilink_local_storage::write_placeholder` returns `None` there --
-/// a real Windows CfAPI generation belongs to `placeholder_backend_windows`
-/// once M2 wires it through this same seam), so `placeholder_generation` is
-/// always `None` and falling back to "not proven untouched" unconditionally
-/// would treat the crate's OWN harmless placeholder-refresh echo as a
-/// genuine edit on every single occurrence -- chunking and indexing the
-/// placeholder's own sparse/all-zero bytes as if they were the file's real
-/// content. That is a correctness regression, not merely a missed
-/// optimization, so this platform instead falls back to the same
-/// size+mtime comparison this whole check used everywhere before M1-2 --
-/// weaker (misses a same-size/mtime in-place edit), but not one that
-/// corrupts the index on an ordinary self-echo.
-
-#[cfg(not(unix))]
+/// M2-2: on Windows, this is the ONLY signal permitted to produce
+/// `true` -- a live query against the real CfAPI placeholder at `path`
+/// (`LocalMutationStore::inspect_windows_placeholder`, which in
+/// production calls `CfGetPlaceholderInfo`/`CfGetPlaceholderStateFromFileInfo`
+/// via `yadorilink-daemon::placeholder_inspect_windows`). No size/mtime
+/// comparison anywhere in this function -- the fallback this replaced
+/// (plain `lstat.len() == record.size && mtime matches`) is exactly the
+/// heuristic this whole mechanism exists to stop relying on (see this
+/// module's own top-level doc and the `#[cfg(unix)]` overload above for
+/// the residual gap a size/mtime-only check always had: an in-place edit
+/// that happens to land on the same size and mtime was invisible to it).
+///
+/// Two independent fail-closed gates, either of which alone forces
+/// `false` (never silently treated as untouched):
+/// - No `placeholder_generation` recorded at all, or its `provider_kind`
+///   isn't [`yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND`]
+///   (a legacy/pre-M2 row, or one this build's `record_placeholder_generation`
+///   call site hasn't reached yet) -- there is nothing to compare against,
+///   so this cannot possibly be proven untouched.
+/// - `inspect_windows_placeholder` returns anything other than
+///   [`yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus::Untouched`]
+///   -- `Dirty` is an honest "this was locally written since creation",
+///   and `Unknown` (the path isn't a real placeholder, the identity
+///   doesn't decode, the API call itself failed) is deliberately treated
+///   exactly like `Dirty`, never like a confirmed match.
+#[cfg(windows)]
 fn untouched_placeholder_verdict(
-    lstat: &std::fs::Metadata,
-    existing: Option<&FileRecord>,
-    _placeholder_generation: Option<&yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
+    store: &dyn crate::ports::LocalMutationStore,
+    path: &Path,
+    _lstat: &std::fs::Metadata,
+    _existing: Option<&FileRecord>,
+    placeholder_generation: Option<&yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
 ) -> bool {
-    existing.is_some_and(|record| {
-        lstat.len() == record.size && metadata_mtime_matches(lstat, record.mtime_unix_nanos)
-    })
+    let Some(recorded) = placeholder_generation else {
+        return false;
+    };
+    if recorded.provider_kind != yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND {
+        return false;
+    }
+    // `dev` is always `0` (an unused sentinel) for this provider kind;
+    // `ino` carries the actual `u64` generation -- see
+    // `WINDOWS_CFAPI_GENERATION_PROVIDER_KIND`'s own doc comment for why
+    // this reuses `PlaceholderDiskIdentity`'s two-`u64` shape.
+    let expected_generation = recorded.identity.ino;
+    matches!(
+        store.inspect_windows_placeholder(path, expected_generation),
+        yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus::Untouched
+    )
 }
 
 /// True when `rel_path` (a root-relative index path, `/`-separated) sits
@@ -1550,6 +1577,8 @@ impl LocalChangeProcessor {
         // (and wrongly) compared as if it were an inode pair.
         if let Some(MaterializationState::Placeholder) = materialization_state {
             if untouched_placeholder_verdict(
+                self.state.as_ref(),
+                path,
                 &lstat,
                 existing.as_ref(),
                 placeholder_generation.as_ref(),
@@ -2349,22 +2378,26 @@ pub(crate) mod scan_test_hooks {
     }
 }
 
-/// `untouched_placeholder_verdict`'s non-Unix fallback (plain size+mtime
-/// comparison, no identity involved) has no coverage from this module's
-/// other placeholder tests, which are all `#[cfg(unix)]` (they need a real
-/// captured identity, which only Unix produces) -- an independent review's
-/// finding. These call the free function directly against a hand-built
-/// `Metadata`/`FileRecord` rather than through the full processor fixture,
-/// so they compile and run on every platform this crate ships for,
-/// specifically exercising whichever `untouched_placeholder_verdict` is
-/// active on that build. On Unix this is a weaker assertion than the
-/// dedicated identity/sparse tests above (it cannot force a `PlaceholderGeneration`
-/// mismatch by itself, since that overload ignores `existing` and looks
-/// only at `placeholder_generation`), so it is gated to non-Unix, where
-/// it is this fallback's only coverage.
-#[cfg(all(test, not(unix)))]
-mod untouched_placeholder_verdict_fallback_tests {
+/// M2-2: pins `untouched_placeholder_verdict`'s Windows overload -- the
+/// size/mtime fallback this module used to fall back to on every non-Unix
+/// platform is gone; every scenario below proves the verdict now comes
+/// ONLY from `LocalMutationStore::inspect_windows_placeholder` (stubbed
+/// here via `TestReplica::set_windows_placeholder_inspect_result`, since
+/// nothing on this crate's own test matrix can exercise a real
+/// `CfGetPlaceholderInfo` call -- see that module's own doc comment).
+/// `#[cfg(all(test, windows))]`, not `not(unix)`: the fallback these tests
+/// replace ran on any non-Unix target as a catch-all; this project ships
+/// only macOS and Windows, so there is no longer a third platform to hedge
+/// for.
+#[cfg(all(test, windows))]
+mod untouched_placeholder_verdict_windows_tests {
     use super::{untouched_placeholder_verdict, FileRecord};
+    use crate::test_support::TestReplica;
+    use yadorilink_filesystem_sync::placeholder_backend::PlaceholderStatus;
+    use yadorilink_local_storage::{
+        PlaceholderDiskIdentity, WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
+    };
+    use yadorilink_sync_sqlite::RecordedPlaceholderGeneration;
 
     fn record(size: u64, mtime_unix_nanos: i64) -> FileRecord {
         FileRecord {
@@ -2383,28 +2416,146 @@ mod untouched_placeholder_verdict_fallback_tests {
         std::fs::metadata(&path).unwrap()
     }
 
+    fn generation(value: u64) -> RecordedPlaceholderGeneration {
+        RecordedPlaceholderGeneration {
+            identity: PlaceholderDiskIdentity { dev: 0, ino: value },
+            provider_kind: WINDOWS_CFAPI_GENERATION_PROVIDER_KIND.to_string(),
+        }
+    }
+
+    /// A same-size, same-mtime "real edit" is exactly what the removed
+    /// size/mtime fallback would have silently swallowed as a self-echo --
+    /// proves that path no longer exists: with a real generation recorded
+    /// but `inspect_windows_placeholder` reporting `Dirty`, the verdict is
+    /// `false` (captured) regardless of size/mtime agreement.
     #[test]
-    fn matching_size_and_mtime_is_untouched() {
+    fn same_size_and_mtime_real_edit_is_still_captured_when_inspect_says_dirty() {
+        let replica = TestReplica::open_in_memory().unwrap();
+        replica.set_windows_placeholder_inspect_result(PlaceholderStatus::Dirty);
         let metadata = metadata_for(4096);
         let mtime =
             metadata.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
                 as i64;
-        assert!(untouched_placeholder_verdict(&metadata, Some(&record(4096, mtime)), None));
+        let recorded = generation(7);
+        assert!(!untouched_placeholder_verdict(
+            &replica,
+            std::path::Path::new("placeholder.bin"),
+            &metadata,
+            Some(&record(4096, mtime)),
+            Some(&recorded),
+        ));
     }
 
     #[test]
-    fn mismatched_size_is_not_untouched() {
+    fn matching_generation_and_in_sync_is_ignored_as_self_echo() {
+        let replica = TestReplica::open_in_memory().unwrap();
+        replica.set_windows_placeholder_inspect_result(PlaceholderStatus::Untouched);
         let metadata = metadata_for(4096);
-        let mtime =
-            metadata.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-                as i64;
-        assert!(!untouched_placeholder_verdict(&metadata, Some(&record(9999, mtime)), None));
+        let recorded = generation(7);
+        assert!(untouched_placeholder_verdict(
+            &replica,
+            std::path::Path::new("placeholder.bin"),
+            &metadata,
+            None,
+            Some(&recorded),
+        ));
+    }
+
+    /// Represents `inspect_windows_placeholder` detecting an ABA mismatch
+    /// (the placeholder at `path` decodes an identity that doesn't match
+    /// the expected generation -- a different object now sits at this
+    /// path) -- `inspect_placeholder`'s own real implementation collapses
+    /// this into `Unknown`, same as an outright API failure (see the next
+    /// test): this layer cannot and must not distinguish the two, both
+    /// must fail closed identically.
+    #[test]
+    fn generation_mismatch_is_captured() {
+        let replica = TestReplica::open_in_memory().unwrap();
+        replica.set_windows_placeholder_inspect_result(PlaceholderStatus::Unknown);
+        let metadata = metadata_for(4096);
+        let recorded = generation(7);
+        assert!(!untouched_placeholder_verdict(
+            &replica,
+            std::path::Path::new("placeholder.bin"),
+            &metadata,
+            None,
+            Some(&recorded),
+        ));
     }
 
     #[test]
-    fn no_existing_record_is_not_untouched() {
+    fn inspect_failure_is_captured() {
+        let replica = TestReplica::open_in_memory().unwrap();
+        replica.set_windows_placeholder_inspect_result(PlaceholderStatus::Unknown);
         let metadata = metadata_for(4096);
-        assert!(!untouched_placeholder_verdict(&metadata, None, None));
+        let recorded = generation(7);
+        assert!(!untouched_placeholder_verdict(
+            &replica,
+            std::path::Path::new("placeholder.bin"),
+            &metadata,
+            None,
+            Some(&recorded),
+        ));
+    }
+
+    /// A legacy (pre-M2-2, or cross-platform-mismatched) recorded identity
+    /// must never be silently trusted as `Untouched`, even if
+    /// `inspect_windows_placeholder` -- which this test deliberately
+    /// leaves stubbed to say `Untouched` -- would have said so: the
+    /// `provider_kind` gate must short-circuit BEFORE that call is
+    /// consulted at all.
+    #[test]
+    fn legacy_identity_is_never_silently_untouched() {
+        let replica = TestReplica::open_in_memory().unwrap();
+        replica.set_windows_placeholder_inspect_result(PlaceholderStatus::Untouched);
+        let metadata = metadata_for(4096);
+        let legacy = RecordedPlaceholderGeneration {
+            identity: PlaceholderDiskIdentity { dev: 0, ino: 7 },
+            provider_kind: yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND.to_string(),
+        };
+        assert!(!untouched_placeholder_verdict(
+            &replica,
+            std::path::Path::new("placeholder.bin"),
+            &metadata,
+            None,
+            Some(&legacy),
+        ));
+    }
+
+    #[test]
+    fn no_recorded_generation_is_never_silently_untouched() {
+        let replica = TestReplica::open_in_memory().unwrap();
+        replica.set_windows_placeholder_inspect_result(PlaceholderStatus::Untouched);
+        let metadata = metadata_for(4096);
+        assert!(!untouched_placeholder_verdict(
+            &replica,
+            std::path::Path::new("placeholder.bin"),
+            &metadata,
+            None,
+            None,
+        ));
+    }
+
+    /// A generation read back from storage classifies identically on
+    /// repeat reads -- the property that makes "restart, then re-read the
+    /// persisted generation" safe: nothing about re-fetching the same
+    /// already-recorded value (as a restarted daemon would) changes the
+    /// verdict.
+    #[test]
+    fn repeated_reads_of_the_same_persisted_generation_classify_identically() {
+        let replica = TestReplica::open_in_memory().unwrap();
+        replica.set_windows_placeholder_inspect_result(PlaceholderStatus::Untouched);
+        let metadata = metadata_for(4096);
+        let recorded = generation(99);
+        for _ in 0..2 {
+            assert!(untouched_placeholder_verdict(
+                &replica,
+                std::path::Path::new("placeholder.bin"),
+                &metadata,
+                None,
+                Some(&recorded),
+            ));
+        }
     }
 }
 
