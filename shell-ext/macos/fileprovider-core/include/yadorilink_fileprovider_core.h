@@ -17,6 +17,7 @@
 #define YADORILINK_FILEPROVIDER_CORE_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -87,6 +88,25 @@ char *yadorilink_fp_query_status(const char *path);
  * `path` must be a null-terminated UTF-8 C string, or NULL.
  */
 bool yadorilink_fp_hydrate(const char *path);
+
+/*
+ * Notifies the daemon that a local write already landed on disk at
+ * local_path/relative_path (backs createItem/modifyItem via kind == 0,
+ * deleteItem via kind == 1). Carries no content or metadata -- the daemon
+ * re-observes the live file itself and routes it through the same
+ * local-change/DAG admission path a filesystem watcher's own event would
+ * take. Blocks the calling thread up to ~10s. Returns true only on a
+ * confirmed successful admission; false for a NULL/empty argument, an
+ * unrecognized kind, timeout, unreachable daemon, or a daemon-reported
+ * admission failure. Callers with a synchronous OS callback to satisfy
+ * (createItem/modifyItem/deleteItem) must complete that callback with a
+ * clear error on false, never report success for a write the daemon
+ * never actually admitted.
+ *
+ * `local_path` and `relative_path` must each be a null-terminated UTF-8
+ * C string, or NULL.
+ */
+bool yadorilink_fp_notify_local_write(const char *local_path, const char *relative_path, int32_t kind);
 
 #ifdef __cplusplus
 }

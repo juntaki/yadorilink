@@ -17,7 +17,8 @@ use tokio::runtime::Runtime;
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 use yadorilink_ipc_proto::shellipc::shell_ipc_message::Payload;
 use yadorilink_ipc_proto::shellipc::{
-    HydrateRequest, ListFolderFilesRequest, ListOnDemandFoldersRequest, MaterializationState,
+    HydrateRequest, ListFolderFilesRequest, ListOnDemandFoldersRequest,
+    LocalWriteKind as ProtoLocalWriteKind, LocalWriteRequest, MaterializationState,
     ShellIpcMessage, StatusQuery, SyncState,
 };
 
@@ -44,6 +45,13 @@ const ENUMERATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// is still a bounded wait, just a much longer tier than status/action —
 /// a multi-second timeout vs. ~200ms for status.
 const HYDRATION_TIMEOUT: Duration = Duration::from_secs(35);
+/// M1-3: a local-write notification (`createItem`/`modifyItem`/
+/// `deleteItem`) makes the daemon read the live file from disk, chunk/hash
+/// it, and commit an index+DAG write -- real local I/O, no network round
+/// trip (peer broadcast afterward is fire-and-forget from this call's
+/// point of view), so a longer budget than `ENUMERATION_TIMEOUT`'s cheap
+/// in-memory lookup, but well short of `HYDRATION_TIMEOUT`'s network wait.
+const WRITE_NOTIFY_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -419,5 +427,62 @@ async fn hydrate_inner(path: &str) -> bool {
     matches!(
         read_message::<ShellIpcMessage>(&mut stream).await,
         Ok(Some(ShellIpcMessage { payload: Some(Payload::HydrateResponse(r)) })) if r.ok
+    )
+}
+
+/// Which File Provider callback produced this notification --
+/// `createItem`/`modifyItem` both collapse to the same
+/// `CreatedOrModified` signal (the daemon re-observes the live file from
+/// disk either way, never trusting the callback's own `contents`/
+/// `changedFields`), and `deleteItem` to `Deleted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalWriteKind {
+    CreatedOrModified,
+    Deleted,
+}
+
+/// Notifies the daemon that a local write already landed on disk under
+/// `local_path`/`relative_path` (backs `createItem`/`modifyItem`/
+/// `deleteItem`). Carries no content or metadata -- only the signal that
+/// something changed and what kind; the daemon re-observes the live file
+/// itself. Returns `false` on timeout, an unreachable daemon, or a
+/// `LocalWriteResponse{ok: false, ..}` -- the caller is expected to
+/// complete the OS callback with a clear error in that case, never hang
+/// or silently report success for a write the daemon never actually
+/// admitted.
+pub fn notify_local_write(local_path: &str, relative_path: &str, kind: LocalWriteKind) -> bool {
+    runtime().block_on(async {
+        tokio::time::timeout(
+            WRITE_NOTIFY_TIMEOUT,
+            notify_local_write_inner(local_path, relative_path, kind),
+        )
+        .await
+        .unwrap_or(false)
+    })
+}
+
+async fn notify_local_write_inner(
+    local_path: &str,
+    relative_path: &str,
+    kind: LocalWriteKind,
+) -> bool {
+    let Ok(mut stream) = connect().await else { return false };
+    let proto_kind = match kind {
+        LocalWriteKind::CreatedOrModified => ProtoLocalWriteKind::CreatedOrModified,
+        LocalWriteKind::Deleted => ProtoLocalWriteKind::Deleted,
+    };
+    let msg = ShellIpcMessage {
+        payload: Some(Payload::LocalWriteRequest(LocalWriteRequest {
+            local_path: local_path.to_string(),
+            relative_path: relative_path.to_string(),
+            kind: proto_kind as i32,
+        })),
+    };
+    if write_message(&mut stream, &msg).await.is_err() {
+        return false;
+    }
+    matches!(
+        read_message::<ShellIpcMessage>(&mut stream).await,
+        Ok(Some(ShellIpcMessage { payload: Some(Payload::LocalWriteResponse(r)) })) if r.ok
     )
 }

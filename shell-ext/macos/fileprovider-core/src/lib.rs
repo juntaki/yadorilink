@@ -157,3 +157,36 @@ pub unsafe extern "C" fn yadorilink_fp_hydrate(path: *const c_char) -> bool {
     let Some(path) = path_from_c_str(path) else { return false };
     catch_unwind(|| ipc_client::hydrate(&path)).unwrap_or(false)
 }
+
+/// Notifies the daemon of a local write (backs `createItem`/`modifyItem`
+/// via `kind == 0`, `deleteItem` via `kind == 1`) already landed on disk
+/// at `local_path`/`relative_path` -- see `ipc_client::notify_local_write`'s
+/// own doc comment. Blocks the calling thread up to `ipc_client`'s
+/// `WRITE_NOTIFY_TIMEOUT` (10s). Returns `true` only on a confirmed
+/// `LocalWriteResponse{ok: true}`; `false` for a null/empty argument, an
+/// unrecognized `kind`, timeout, unreachable daemon, or a daemon-reported
+/// admission failure -- the Swift caller is expected to complete the OS
+/// callback with an `NSFileProviderError`, never report success for a
+/// write the daemon never actually admitted.
+///
+/// # Safety
+/// `local_path` and `relative_path` must each be a valid, null-terminated
+/// C string, or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn yadorilink_fp_notify_local_write(
+    local_path: *const c_char,
+    relative_path: *const c_char,
+    kind: i32,
+) -> bool {
+    let Some(local_path) = path_from_c_str(local_path) else { return false };
+    let Some(relative_path) = path_from_c_str(relative_path) else { return false };
+    let Some(kind) = (match kind {
+        0 => Some(ipc_client::LocalWriteKind::CreatedOrModified),
+        1 => Some(ipc_client::LocalWriteKind::Deleted),
+        _ => None,
+    }) else {
+        return false;
+    };
+    catch_unwind(|| ipc_client::notify_local_write(&local_path, &relative_path, kind))
+        .unwrap_or(false)
+}
