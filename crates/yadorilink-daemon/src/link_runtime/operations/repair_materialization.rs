@@ -105,3 +105,25 @@ pub(crate) fn repair_interrupted_materializations(
     )
     .map_err(SyncError::from)
 }
+
+/// M1-5: backfills a persisted placeholder identity for every path this
+/// link's index still shows as `Placeholder` with none recorded -- see
+/// `yadorilink_filesystem_sync::materialization_repair::
+/// backfill_placeholder_generations`'s own doc comment for the crash
+/// window this closes. Admits its own `LinkOperation` from `root_lease`,
+/// same shape as `repair_interrupted_materializations` above.
+pub(crate) fn backfill_placeholder_generations(
+    replica_coordinator: &Arc<ReplicaCoordinator>,
+    root_lease: &Arc<RootLease>,
+    root: &Path,
+    group_id: &str,
+) -> Result<usize, SyncError> {
+    let op = root_lease.begin_operation()?;
+    yadorilink_filesystem_sync::materialization_repair::backfill_placeholder_generations(
+        replica_coordinator.as_ref(),
+        root,
+        group_id,
+        &op.permit(),
+    )
+    .map_err(SyncError::from)
+}

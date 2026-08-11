@@ -803,6 +803,33 @@ impl MaterializationStateRepository {
             Ok(out)
         })
     }
+
+    /// Every non-deleted, still-`Placeholder` path in `group_id` with NO
+    /// recorded identity -- the exact crash window M1-2's own eviction
+    /// call sites cannot close atomically: `write_placeholder` durably
+    /// writes the sparse file, then a SEPARATE commit records its
+    /// identity; a crash between the two leaves a row exactly like this.
+    /// A caller (`materialization_repair::backfill_placeholder_
+    /// generations`) uses this list to re-derive an identity for each
+    /// path from its still-on-disk state at startup, before any watcher
+    /// gets a chance to observe the row and (with no generation to
+    /// compare against) fall through to treating the placeholder's own
+    /// sparse bytes as a genuine local edit.
+    pub fn list_placeholder_paths_missing_generation(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<String>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT path FROM files \
+                 WHERE group_id = ?1 AND deleted = 0 AND state = 'current' \
+                   AND materialization_state = 'placeholder' \
+                   AND placeholder_dev IS NULL",
+            )?;
+            let rows = stmt.query_map([group_id], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
 }
 
 /// A placeholder identity read back from storage, paired with which
