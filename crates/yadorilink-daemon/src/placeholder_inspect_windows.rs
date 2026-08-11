@@ -157,6 +157,19 @@ fn read_placeholder_identity(handle: windows_sys::Win32::Foundation::HANDLE) -> 
 /// comment for why that's the only sound default when this process
 /// cannot positively confirm both the identity match and the in-sync
 /// bit.
+///
+/// Reads identity BEFORE state (review finding: an earlier version read
+/// state first, then identity -- a local write landing between those two
+/// reads could clear `CF_PLACEHOLDER_STATE_IN_SYNC` while leaving the
+/// (still-matching) identity in place, and this function would still
+/// report `Untouched` using the now-stale, pre-write state it sampled
+/// first). Neither read is atomic with the other -- only an oplock or
+/// equivalent OS-level synchronization could close this window
+/// completely, which is out of scope here -- but sampling the state LAST,
+/// immediately before the final decision, narrows it to the smallest
+/// practical span: a write racing strictly between the state read and
+/// this function's return, rather than one racing across the entire
+/// identity-then-state sequence.
 pub fn inspect_placeholder(path: &Path, expected_generation: u64) -> PlaceholderStatus {
     let Some(handle) = open_reparse_handle_read_attributes(path) else {
         return PlaceholderStatus::Unknown;
@@ -164,6 +177,21 @@ pub fn inspect_placeholder(path: &Path, expected_generation: u64) -> Placeholder
     let close = || unsafe {
         CloseHandle(handle);
     };
+
+    let identity = read_placeholder_identity(handle);
+    let decoded = match identity {
+        Some(bytes) => decode_generation_identity(&bytes),
+        None => None,
+    };
+    if decoded != Some(expected_generation) {
+        // ABA guard: a placeholder deleted and replaced by an unrelated
+        // one at the same path (this process's index still expects the
+        // OLD generation) must not report `Untouched` for a stale
+        // expectation -- checked before state so a mismatched identity
+        // never even reaches the in-sync decision below.
+        close();
+        return PlaceholderStatus::Unknown;
+    }
 
     let mut attr_tag: FILE_ATTRIBUTE_TAG_INFO = unsafe { std::mem::zeroed() };
     // SAFETY: `handle` is a valid, open handle to `path`; `attr_tag` is
@@ -187,31 +215,14 @@ pub fn inspect_placeholder(path: &Path, expected_generation: u64) -> Placeholder
             FileAttributeTagInfo,
         )
     };
+    close();
     if state == CF_PLACEHOLDER_STATE_INVALID || state & CF_PLACEHOLDER_STATE_PLACEHOLDER == 0 {
         // No longer a real placeholder at all (hydrated in place by
         // something other than this process's own hydrate path, or
         // replaced outright). Cannot confirm it is still the one this
         // process's index expects.
-        close();
         return PlaceholderStatus::Unknown;
     }
-
-    let identity = read_placeholder_identity(handle);
-    close();
-    let decoded = match identity {
-        Some(bytes) => decode_generation_identity(&bytes),
-        None => None,
-    };
-    match decoded {
-        // ABA guard: a placeholder deleted and replaced by an unrelated,
-        // genuinely in-sync placeholder at the same path must not report
-        // `Untouched` for a caller still holding the OLD expected
-        // generation -- without this, a different object would be
-        // silently treated as the one the index remembers.
-        Some(generation) if generation == expected_generation => {}
-        _ => return PlaceholderStatus::Unknown,
-    }
-
     if state & CF_PLACEHOLDER_STATE_IN_SYNC != 0 {
         PlaceholderStatus::Untouched
     } else {

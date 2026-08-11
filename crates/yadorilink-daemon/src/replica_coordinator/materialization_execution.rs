@@ -1055,6 +1055,90 @@ mod tests {
         );
     }
 
+    /// M2-2 review finding: `record_placeholder_generation_if_absent` must
+    /// do its check-then-write atomically in one `database.write` closure
+    /// -- pins the exact race an independent review found in this method's
+    /// two-call predecessor (`get_placeholder_generation` then a separate
+    /// `record_placeholder_generation`): a second "concurrent" mint for
+    /// the same path with a DIFFERENT candidate identity must lose, not
+    /// silently overwrite the first winner.
+    #[test]
+    fn record_placeholder_generation_if_absent_keeps_the_first_winner() {
+        let (state, permit) = setup_placeholder_file("group-1", "doc.txt");
+        let first = yadorilink_local_storage::PlaceholderDiskIdentity { dev: 0, ino: 1 };
+        let second = yadorilink_local_storage::PlaceholderDiskIdentity { dev: 0, ino: 2 };
+
+        let winner_a = state
+            .materialization_state_repository()
+            .record_placeholder_generation_if_absent(
+                "group-1",
+                "doc.txt",
+                first,
+                "windows-cfapi-generation",
+                &permit,
+            )
+            .unwrap();
+        let winner_b = state
+            .materialization_state_repository()
+            .record_placeholder_generation_if_absent(
+                "group-1",
+                "doc.txt",
+                second,
+                "windows-cfapi-generation",
+                &permit,
+            )
+            .unwrap();
+
+        assert_eq!(winner_a, first);
+        assert_eq!(winner_b, first, "the second caller must see the first caller's winning value");
+        assert_eq!(
+            state
+                .materialization_state_repository()
+                .get_placeholder_generation("group-1", "doc.txt")
+                .unwrap()
+                .unwrap()
+                .identity,
+            first,
+            "the persisted row must still hold the first-minted identity, never the second"
+        );
+    }
+
+    /// A row already carrying a DIFFERENT provider's identity (e.g. the
+    /// Unix `(dev, ino)` scheme) is treated as "nothing recorded for THIS
+    /// provider yet" and overwritten -- matches
+    /// `record_placeholder_generation`'s own unconditional behavior for
+    /// that case, which this method must not silently change.
+    #[test]
+    fn record_placeholder_generation_if_absent_overwrites_a_different_providers_identity() {
+        let (state, permit) = setup_placeholder_file("group-1", "doc.txt");
+        let unix_identity = yadorilink_local_storage::PlaceholderDiskIdentity { dev: 7, ino: 42 };
+        state
+            .materialization_state_repository()
+            .record_placeholder_generation(
+                "group-1",
+                "doc.txt",
+                unix_identity,
+                "internal-inode",
+                &permit,
+            )
+            .unwrap();
+
+        let windows_identity =
+            yadorilink_local_storage::PlaceholderDiskIdentity { dev: 0, ino: 99 };
+        let winner = state
+            .materialization_state_repository()
+            .record_placeholder_generation_if_absent(
+                "group-1",
+                "doc.txt",
+                windows_identity,
+                "windows-cfapi-generation",
+                &permit,
+            )
+            .unwrap();
+
+        assert_eq!(winner, windows_identity);
+    }
+
     /// A path with no recorded identity -- never placeholdered, or cleared
     /// -- must read back `None`, not a synthetic zero identity: callers
     /// treat `None` as fail-closed "unknown", which a real `dev:0, ino:0`

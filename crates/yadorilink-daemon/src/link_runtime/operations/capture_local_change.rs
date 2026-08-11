@@ -572,10 +572,25 @@ impl LinkFlushHandle {
     /// idempotent by construction, which is also what makes this safe
     /// across a daemon restart: the persisted value in the index, not
     /// anything held only in this process's memory, is the source of
-    /// truth `get_placeholder_generation` reads back.
+    /// truth a later read reads back.
+    ///
+    /// Review finding: an earlier version of this method read (`database.
+    /// read`, not serialized against this process's own writer lock), then
+    /// separately minted and wrote (`database.write`) -- two concurrent
+    /// callers for the SAME path (two overlapping `ListFolderFilesRequest`
+    /// handlers) could both observe "nothing recorded yet" and both mint
+    /// and persist, with the later write silently winning while
+    /// `cfapi-host.exe` might have already created a real placeholder
+    /// carrying the EARLIER (now-orphaned) generation -- permanently
+    /// `Unknown`/`Dirty` for that path until it transitions out of
+    /// `Placeholder` and back. `record_placeholder_generation_if_absent`
+    /// does the check-then-write in ONE `database.write` closure, so this
+    /// is no longer racy: whichever caller's mint actually gets persisted,
+    /// every caller (including ones that lost the race) gets back that
+    /// same winning value.
     ///
     /// Admits its own `LinkOperation` the same way every other mutating
-    /// method on this handle does -- `record_placeholder_generation`
+    /// method on this handle does -- `record_placeholder_generation_if_absent`
     /// requires a `RootCommitPermit`, and this is the one seam that can
     /// mint one for this call.
     pub(crate) fn ensure_windows_placeholder_generation(
@@ -591,23 +606,20 @@ impl LinkFlushHandle {
             .begin_operation()
             .map_err(|_| "link is not currently accepting local writes".to_string())?;
         let repo = deps.replica_coordinator.materialization_state_repository();
-        if let Ok(Some(existing)) = repo.get_placeholder_generation(group_id, rel_path) {
-            if existing.provider_kind
-                == yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND
-            {
-                return Ok(existing.identity.ino);
-            }
-        }
-        let generation = mint_windows_placeholder_generation();
-        repo.record_placeholder_generation(
-            group_id,
-            rel_path,
-            yadorilink_local_storage::PlaceholderDiskIdentity { dev: 0, ino: generation },
-            yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
-            &op.permit(),
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(generation)
+        let candidate = yadorilink_local_storage::PlaceholderDiskIdentity {
+            dev: 0,
+            ino: mint_windows_placeholder_generation(),
+        };
+        let winner = repo
+            .record_placeholder_generation_if_absent(
+                group_id,
+                rel_path,
+                candidate,
+                yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
+                &op.permit(),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(winner.ino)
     }
 }
 
