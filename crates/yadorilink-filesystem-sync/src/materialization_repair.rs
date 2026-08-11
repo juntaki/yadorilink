@@ -237,8 +237,30 @@ pub fn backfill_placeholder_generations(
     let root = state.open_root(root, group_id)?;
     let root = root.path();
     let mut backfilled = 0usize;
+    // Deliberately does NOT `?`-propagate a single path's failure out of
+    // this loop -- an independent review's finding: a transient error on
+    // one candidate (a DB read hiccup, say) must not abandon every OTHER
+    // candidate this same pass could otherwise have safely backfilled.
+    // `local_change.rs`'s own `untouched_placeholder_verdict` also carries
+    // an independent, identity-free fallback for exactly the paths this
+    // loop leaves unbackfilled (a still-fully-sparse object at the exact
+    // indexed size), so a path skipped here is not left as exposed as it
+    // would be without that second layer.
     for path in state.list_placeholder_paths_missing_generation(group_id)? {
-        let Some(record) = state.get_file(group_id, &path)? else { continue };
+        let record = match state.get_file(group_id, &path) {
+            Ok(Some(record)) => record,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    group_id,
+                    path = %path,
+                    error = %e,
+                    "failed to read the index row for a placeholder-generation backfill candidate; \
+                     skipping this path this boot"
+                );
+                continue;
+            }
+        };
         if record.deleted {
             continue;
         }
@@ -248,13 +270,21 @@ pub fn backfill_placeholder_generations(
             continue;
         }
         let Some(identity) = PlaceholderDiskIdentity::from_metadata(&metadata) else { continue };
-        state.record_placeholder_generation(
+        if let Err(e) = state.record_placeholder_generation(
             group_id,
             &path,
             identity,
             INTERNAL_INODE_PROVIDER_KIND,
             permit,
-        )?;
+        ) {
+            tracing::warn!(
+                group_id,
+                path = %path,
+                error = %e,
+                "failed to record a backfilled placeholder identity; skipping this path this boot"
+            );
+            continue;
+        }
         backfilled += 1;
     }
     Ok(backfilled)
