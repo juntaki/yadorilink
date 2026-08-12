@@ -40,10 +40,12 @@ use crate::error::PeerSessionError;
 use crate::hazard;
 use crate::rate_limiter::RateLimiters;
 use yadorilink_local_storage::check_disk_headroom;
+use yadorilink_local_storage::create_or_defer_placeholder;
+use yadorilink_local_storage::PlaceholderIdentityToRecord;
 use yadorilink_local_storage::{
     apply_exec_bit, reconstruct_file, verify_delete_target_within_canonical_root,
     verify_delete_target_within_root, verify_write_target_within_canonical_root,
-    verify_write_target_within_root, write_placeholder, INTERNAL_INODE_PROVIDER_KIND,
+    verify_write_target_within_root,
 };
 use yadorilink_replica_domain::admission::ChangeOrdering;
 use yadorilink_replica_domain::change::Change;
@@ -9084,15 +9086,18 @@ impl PeerSyncSession {
                 )?;
                 let out_path = self.local_file_path(group_id, &record.path)?;
                 self.verify_write_target(group_id, &out_path)?;
-                match write_placeholder(&out_path, record.size, record.mtime_unix_nanos)? {
-                    Some(identity) => self.state.record_placeholder_generation(
-                        group_id,
-                        &record.path,
-                        identity,
-                        INTERNAL_INODE_PROVIDER_KIND,
-                        &root_commit_permit,
-                    )?,
-                    None => self.state.clear_placeholder_generation(
+                match create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)?
+                {
+                    PlaceholderIdentityToRecord::Record { identity, provider_kind } => {
+                        self.state.record_placeholder_generation(
+                            group_id,
+                            &record.path,
+                            identity,
+                            provider_kind,
+                            &root_commit_permit,
+                        )?
+                    }
+                    PlaceholderIdentityToRecord::Clear => self.state.clear_placeholder_generation(
                         group_id,
                         &record.path,
                         &root_commit_permit,
@@ -9232,15 +9237,18 @@ impl PeerSyncSession {
                 // of this path must not be misread as a crash to reconstruct.
                 intent_guard.clear()?;
                 self.verify_write_target(group_id, &out_path)?;
-                match write_placeholder(&out_path, record.size, record.mtime_unix_nanos)? {
-                    Some(identity) => self.state.record_placeholder_generation(
-                        group_id,
-                        &record.path,
-                        identity,
-                        INTERNAL_INODE_PROVIDER_KIND,
-                        &root_commit_permit,
-                    )?,
-                    None => self.state.clear_placeholder_generation(
+                match create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)?
+                {
+                    PlaceholderIdentityToRecord::Record { identity, provider_kind } => {
+                        self.state.record_placeholder_generation(
+                            group_id,
+                            &record.path,
+                            identity,
+                            provider_kind,
+                            &root_commit_permit,
+                        )?
+                    }
+                    PlaceholderIdentityToRecord::Clear => self.state.clear_placeholder_generation(
                         group_id,
                         &record.path,
                         &root_commit_permit,
@@ -9297,15 +9305,17 @@ impl PeerSyncSession {
             let out_path = self.local_file_path(group_id, &record.path)?;
             // defense-in-depth — see the comment above.
             self.verify_write_target(group_id, &out_path)?;
-            match write_placeholder(&out_path, record.size, record.mtime_unix_nanos)? {
-                Some(identity) => self.state.record_placeholder_generation(
-                    group_id,
-                    &record.path,
-                    identity,
-                    INTERNAL_INODE_PROVIDER_KIND,
-                    &root_commit_permit,
-                )?,
-                None => self.state.clear_placeholder_generation(
+            match create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)? {
+                PlaceholderIdentityToRecord::Record { identity, provider_kind } => {
+                    self.state.record_placeholder_generation(
+                        group_id,
+                        &record.path,
+                        identity,
+                        provider_kind,
+                        &root_commit_permit,
+                    )?
+                }
+                PlaceholderIdentityToRecord::Clear => self.state.clear_placeholder_generation(
                     group_id,
                     &record.path,
                     &root_commit_permit,

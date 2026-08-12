@@ -405,6 +405,108 @@ pub fn write_placeholder(
     Ok(identity)
 }
 
+/// What a placeholder-creation call site must persist once
+/// [`create_or_defer_placeholder`] returns -- either a fresh identity under
+/// the given provider kind, or a clear (mirrors `write_placeholder`'s own
+/// `Some`/`None` contract, but with the provider kind bundled in so a
+/// caller can never persist a Windows-minted generation under
+/// [`INTERNAL_INODE_PROVIDER_KIND`] or vice versa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceholderIdentityToRecord {
+    Record { identity: PlaceholderDiskIdentity, provider_kind: &'static str },
+    Clear,
+}
+
+/// The one sanctioned entry point every production placeholder-creation
+/// call site (repair, eviction, peer materialize) must use INSTEAD OF
+/// calling [`write_placeholder`] directly (M2-3a).
+///
+/// On every platform except Windows this is exactly `write_placeholder`,
+/// unchanged: writes a real sparse file and returns its on-disk identity
+/// under [`INTERNAL_INODE_PROVIDER_KIND`].
+///
+/// On Windows this writes NOTHING to disk. Before M2-3a, every caller here
+/// called `write_placeholder` unconditionally, which on Windows still wrote
+/// a real sparse file (identity capture is the only part that's a no-op on
+/// non-Unix) and returned `None` -- so the caller then called
+/// `clear_placeholder_generation`, silently discarding any Windows CfAPI
+/// generation. Two bugs followed: (1) `cfapi-host.exe`'s `sync_placeholders`
+/// skips any path that already `exists()` on disk, so that real sparse file
+/// permanently pre-empted the native `CfCreatePlaceholders` call -- these
+/// paths never became real CfAPI placeholders at all; (2) even had it not
+/// pre-empted native creation, the cleared generation meant M2-2's dirty
+/// detection could never do better than fail-closed `Unknown` for a path
+/// created through one of these three call sites.
+///
+/// Here, instead, no sparse file is written at all: a fresh generation is
+/// minted and returned tagged [`WINDOWS_CFAPI_GENERATION_PROVIDER_KIND`] for
+/// the caller to persist immediately (the same call-site pattern the
+/// `write_placeholder` path already used, just with a different provider
+/// kind). The caller's normal `set_materialization_state(..., Placeholder)`
+/// still runs exactly as before. The real on-disk reparse-point placeholder
+/// is created afterward by `cfapi-host.exe`'s existing poll
+/// (`sync_placeholders` -> `create_placeholder`), which is unaffected by
+/// this change and already reads the generation this call persists via
+/// `ListFolderFilesRequest`. Not creating the parent directory here either
+/// is deliberate for the same reason: `cfapi-host.exe`'s own
+/// `create_placeholder` already creates it.
+pub fn create_or_defer_placeholder(
+    out_path: &Path,
+    size: u64,
+    mtime_unix_nanos: i64,
+) -> Result<PlaceholderIdentityToRecord, StorageError> {
+    #[cfg(windows)]
+    {
+        let _ = (out_path, size, mtime_unix_nanos);
+        Ok(PlaceholderIdentityToRecord::Record {
+            identity: PlaceholderDiskIdentity {
+                dev: 0,
+                ino: mint_windows_placeholder_generation(),
+            },
+            provider_kind: WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(match write_placeholder(out_path, size, mtime_unix_nanos)? {
+            Some(identity) => PlaceholderIdentityToRecord::Record {
+                identity,
+                provider_kind: INTERNAL_INODE_PROVIDER_KIND,
+            },
+            None => PlaceholderIdentityToRecord::Clear,
+        })
+    }
+}
+
+/// Mints a fresh Windows CfAPI placeholder generation: a process-lifetime
+/// monotonic counter seeded from wall-clock time, so two placeholders
+/// minted back-to-back (even at the same path, e.g. an evict immediately
+/// followed by a re-create) never collide regardless of clock resolution.
+/// The single shared mint site for every Windows generation-minting caller
+/// in the daemon process -- both this module's [`create_or_defer_placeholder`]
+/// and `yadorilink-daemon`'s `LinkFlushHandle::ensure_windows_placeholder_
+/// generation` (the `ListFolderFilesRequest`-driven lazy backfill for
+/// placeholders that predate this call, or that this call's own persist
+/// raced with) call this same counter, since both run in the one daemon
+/// process. Uniqueness only needs to hold per-path over time, not globally
+/// across paths -- a live CfAPI generation comparison is always scoped to
+/// one path -- so a shared counter across unrelated paths is harmless.
+///
+/// Deliberately NOT `#[cfg(windows)]`-gated: it's pure counter logic with no
+/// platform API, and `yadorilink-daemon`'s caller invokes it unconditionally
+/// (dead code on non-Windows, never compiled out).
+pub fn mint_windows_placeholder_generation() -> u64 {
+    static COUNTER: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+    let counter = COUNTER.get_or_init(|| {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1);
+        AtomicU64::new(seed)
+    });
+    counter.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Sets/clears the owner-exec bit on an already-materialized file. A no-op
 /// on any non-Unix platform (Windows has no equivalent owner-exec
 /// permission bit, so this must be silent there, not an error).
@@ -580,6 +682,62 @@ mod tests {
         let second = write_placeholder(&out_path, 100, 0).unwrap().unwrap();
 
         assert_ne!(first, second, "a re-written placeholder must mint a fresh identity");
+    }
+
+    /// M2-3a: on Windows, `create_or_defer_placeholder` must write NOTHING
+    /// to disk -- the real reparse-point placeholder is created later by
+    /// `cfapi-host.exe`'s own poll, which `write_placeholder`'s prior
+    /// unconditional sparse-file write would have pre-empted (that write
+    /// made `full_path.exists()` true, and `sync_placeholders` skips any
+    /// path that already exists).
+    #[test]
+    #[cfg(windows)]
+    fn windows_create_or_defer_placeholder_writes_nothing_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("placeholder.bin");
+
+        let outcome = create_or_defer_placeholder(&out_path, 5_000_000, 0).unwrap();
+
+        assert!(!out_path.exists(), "Windows must defer creation to cfapi-host, not pre-empt it");
+        assert!(matches!(
+            outcome,
+            PlaceholderIdentityToRecord::Record {
+                provider_kind: WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
+                ..
+            }
+        ));
+    }
+
+    /// The old bug this closes: `write_placeholder` returning `None` on
+    /// Windows made every caller call `clear_placeholder_generation`,
+    /// discarding any generation. `create_or_defer_placeholder` must always
+    /// return `Record`, never `Clear`, on Windows.
+    #[test]
+    #[cfg(windows)]
+    fn windows_create_or_defer_placeholder_never_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("placeholder.bin");
+
+        let outcome = create_or_defer_placeholder(&out_path, 100, 0).unwrap();
+
+        assert_ne!(outcome, PlaceholderIdentityToRecord::Clear);
+    }
+
+    /// Mirrors `successive_placeholder_writes_to_the_same_path_mint_
+    /// different_identities` for the Windows path: a re-create at the same
+    /// path (an evict immediately followed by a re-materialize) must not
+    /// reuse a stale generation a live CfAPI comparison could mistake for
+    /// the OLD placeholder still being untouched.
+    #[test]
+    #[cfg(windows)]
+    fn windows_successive_defers_at_the_same_path_mint_different_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("placeholder.bin");
+
+        let first = create_or_defer_placeholder(&out_path, 100, 0).unwrap();
+        let second = create_or_defer_placeholder(&out_path, 100, 0).unwrap();
+
+        assert_ne!(first, second, "a re-deferred placeholder must mint a fresh generation");
     }
 
     #[test]
