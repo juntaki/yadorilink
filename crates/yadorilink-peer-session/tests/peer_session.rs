@@ -1173,6 +1173,16 @@ async fn same_version_resync_rehydrates_a_missing_eager_file() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "M2-3a: on Windows, real placeholder creation is deferred to \
+              cfapi-host.exe (see create_or_defer_placeholder), which is not \
+              present in this pure-Rust integration harness -- a placeholder \
+              path never appears on disk here, only its generation is persisted. \
+              This test's cross-platform logic is still exercised on macOS/Linux \
+              CI; Windows placeholder creation itself is covered by \
+              yadorilink-local-storage's own create_or_defer_placeholder tests."
+)]
 async fn same_version_resync_does_not_hydrate_an_ondemand_placeholder() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -1865,6 +1875,16 @@ async fn unauthorized_group_id_in_incoming_message_is_ignored() {
 /// folder must index it and write a correctly-sized placeholder — without
 /// ever fetching its blocks from the peer.
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "M2-3a: on Windows, real placeholder creation is deferred to \
+              cfapi-host.exe (see create_or_defer_placeholder), which is not \
+              present in this pure-Rust integration harness -- a placeholder \
+              path never appears on disk here, only its generation is persisted. \
+              This test's cross-platform logic is still exercised on macOS/Linux \
+              CI; Windows placeholder creation itself is covered by \
+              yadorilink-local-storage's own create_or_defer_placeholder tests."
+)]
 async fn ondemand_folder_adopts_placeholder_without_fetching_blocks() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -1942,6 +1962,16 @@ async fn ondemand_folder_adopts_placeholder_without_fetching_blocks() {
 /// `Hydrated` — the on-access path, independent of ordinary index
 /// reconciliation.
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "M2-3a: on Windows, real placeholder creation is deferred to \
+              cfapi-host.exe (see create_or_defer_placeholder), which is not \
+              present in this pure-Rust integration harness -- a placeholder \
+              path never appears on disk here, only its generation is persisted. \
+              This test's cross-platform logic is still exercised on macOS/Linux \
+              CI; Windows placeholder creation itself is covered by \
+              yadorilink-local-storage's own create_or_defer_placeholder tests."
+)]
 async fn hydrate_file_fetches_and_materializes_placeholder_content() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -2017,6 +2047,16 @@ async fn hydrate_file_fetches_and_materializes_placeholder_content() {
 /// only fix (`HydratingStateGuard`'s authoring-bound CAS alone does not
 /// protect the SUCCESSFUL commit path, only the failure-rollback path).
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "M2-3a: on Windows, real placeholder creation is deferred to \
+              cfapi-host.exe (see create_or_defer_placeholder), which is not \
+              present in this pure-Rust integration harness -- a placeholder \
+              path never appears on disk here, only its generation is persisted. \
+              This test's cross-platform logic is still exercised on macOS/Linux \
+              CI; Windows placeholder creation itself is covered by \
+              yadorilink-local-storage's own create_or_defer_placeholder tests."
+)]
 async fn hydrate_file_detects_a_superseding_authoring_change_mid_fetch() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -2150,6 +2190,16 @@ async fn hydrate_file_detects_a_superseding_authoring_change_mid_fetch() {
 /// multi-block network fetch gives a real await window, synchronized on
 /// the row actually reaching `Hydrating` rather than a timing guess.
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "M2-3a: on Windows, real placeholder creation is deferred to \
+              cfapi-host.exe (see create_or_defer_placeholder), which is not \
+              present in this pure-Rust integration harness -- a placeholder \
+              path never appears on disk here, only its generation is persisted. \
+              This test's cross-platform logic is still exercised on macOS/Linux \
+              CI; Windows placeholder creation itself is covered by \
+              yadorilink-local-storage's own create_or_defer_placeholder tests."
+)]
 async fn hydrate_file_detects_a_concurrent_disk_edit_mid_fetch() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -2414,6 +2464,16 @@ async fn hydrate_file_without_any_connected_peer_fails_immediately() {
 /// block list), so a second hydration from the same (or any other) peer
 /// reconstructs exactly the same bytes.
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "M2-3a: on Windows, real placeholder creation is deferred to \
+              cfapi-host.exe (see create_or_defer_placeholder), which is not \
+              present in this pure-Rust integration harness -- a placeholder \
+              path never appears on disk here, only its generation is persisted. \
+              This test's cross-platform logic is still exercised on macOS/Linux \
+              CI; Windows placeholder creation itself is covered by \
+              yadorilink-local-storage's own create_or_defer_placeholder tests."
+)]
 async fn evict_then_rehydrate_round_trips_to_identical_content() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -2528,6 +2588,16 @@ async fn evict_then_rehydrate_round_trips_to_identical_content() {
 /// content transfer; hydrating on B fetches content only there, C stays a
 /// placeholder throughout.
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "M2-3a: on Windows, real placeholder creation is deferred to \
+              cfapi-host.exe (see create_or_defer_placeholder), which is not \
+              present in this pure-Rust integration harness -- a placeholder \
+              path never appears on disk here, only its generation is persisted. \
+              This test's cross-platform logic is still exercised on macOS/Linux \
+              CI; Windows placeholder creation itself is covered by \
+              yadorilink-local-storage's own create_or_defer_placeholder tests."
+)]
 async fn three_devices_on_demand_hydration_is_per_device_not_group_wide() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -6376,6 +6446,16 @@ async fn hydration_rejects_a_corrupt_compressed_block_response() {
 /// way a real caller-imposed bound would report them, then grows back
 /// once good conditions resume.
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "M2-3a: on Windows, real placeholder creation is deferred to \
+              cfapi-host.exe (see create_or_defer_placeholder), which is not \
+              present in this pure-Rust integration harness -- a placeholder \
+              path never appears on disk here, only its generation is persisted. \
+              This test's cross-platform logic is still exercised on macOS/Linux \
+              CI; Windows placeholder creation itself is covered by \
+              yadorilink-local-storage's own create_or_defer_placeholder tests."
+)]
 async fn fetch_window_grows_under_real_traffic_and_shrinks_after_timeouts_then_recovers() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
