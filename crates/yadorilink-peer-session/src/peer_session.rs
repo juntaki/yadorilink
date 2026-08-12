@@ -9088,7 +9088,7 @@ impl PeerSyncSession {
                 self.verify_write_target(group_id, &out_path)?;
                 match create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)?
                 {
-                    PlaceholderIdentityToRecord::Record { identity, provider_kind } => {
+                    PlaceholderIdentityToRecord::RecordOverwrite { identity, provider_kind } => {
                         self.state.record_placeholder_generation(
                             group_id,
                             &record.path,
@@ -9096,6 +9096,15 @@ impl PeerSyncSession {
                             provider_kind,
                             &root_commit_permit,
                         )?
+                    }
+                    PlaceholderIdentityToRecord::RecordIfAbsent { identity, provider_kind } => {
+                        self.state.record_placeholder_generation_if_absent(
+                            group_id,
+                            &record.path,
+                            identity,
+                            provider_kind,
+                            &root_commit_permit,
+                        )?;
                     }
                     PlaceholderIdentityToRecord::Clear => self.state.clear_placeholder_generation(
                         group_id,
@@ -9239,7 +9248,7 @@ impl PeerSyncSession {
                 self.verify_write_target(group_id, &out_path)?;
                 match create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)?
                 {
-                    PlaceholderIdentityToRecord::Record { identity, provider_kind } => {
+                    PlaceholderIdentityToRecord::RecordOverwrite { identity, provider_kind } => {
                         self.state.record_placeholder_generation(
                             group_id,
                             &record.path,
@@ -9247,6 +9256,15 @@ impl PeerSyncSession {
                             provider_kind,
                             &root_commit_permit,
                         )?
+                    }
+                    PlaceholderIdentityToRecord::RecordIfAbsent { identity, provider_kind } => {
+                        self.state.record_placeholder_generation_if_absent(
+                            group_id,
+                            &record.path,
+                            identity,
+                            provider_kind,
+                            &root_commit_permit,
+                        )?;
                     }
                     PlaceholderIdentityToRecord::Clear => self.state.clear_placeholder_generation(
                         group_id,
@@ -9306,7 +9324,7 @@ impl PeerSyncSession {
             // defense-in-depth — see the comment above.
             self.verify_write_target(group_id, &out_path)?;
             match create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)? {
-                PlaceholderIdentityToRecord::Record { identity, provider_kind } => {
+                PlaceholderIdentityToRecord::RecordOverwrite { identity, provider_kind } => {
                     self.state.record_placeholder_generation(
                         group_id,
                         &record.path,
@@ -9314,6 +9332,15 @@ impl PeerSyncSession {
                         provider_kind,
                         &root_commit_permit,
                     )?
+                }
+                PlaceholderIdentityToRecord::RecordIfAbsent { identity, provider_kind } => {
+                    self.state.record_placeholder_generation_if_absent(
+                        group_id,
+                        &record.path,
+                        identity,
+                        provider_kind,
+                        &root_commit_permit,
+                    )?;
                 }
                 PlaceholderIdentityToRecord::Clear => self.state.clear_placeholder_generation(
                     group_id,

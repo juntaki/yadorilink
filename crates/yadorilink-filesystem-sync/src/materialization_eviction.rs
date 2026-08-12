@@ -309,11 +309,23 @@ pub fn evict_file(
         });
     }
     match placeholder_outcome {
-        yadorilink_local_storage::PlaceholderIdentityToRecord::Record {
+        yadorilink_local_storage::PlaceholderIdentityToRecord::RecordOverwrite {
             identity,
             provider_kind,
         } => {
             state.record_placeholder_generation(group_id, path, identity, provider_kind, permit)?
+        }
+        yadorilink_local_storage::PlaceholderIdentityToRecord::RecordIfAbsent {
+            identity,
+            provider_kind,
+        } => {
+            state.record_placeholder_generation_if_absent(
+                group_id,
+                path,
+                identity,
+                provider_kind,
+                permit,
+            )?;
         }
         yadorilink_local_storage::PlaceholderIdentityToRecord::Clear => {
             state.clear_placeholder_generation(group_id, path, permit)?

@@ -406,14 +406,28 @@ pub fn write_placeholder(
 }
 
 /// What a placeholder-creation call site must persist once
-/// [`create_or_defer_placeholder`] returns -- either a fresh identity under
-/// the given provider kind, or a clear (mirrors `write_placeholder`'s own
-/// `Some`/`None` contract, but with the provider kind bundled in so a
-/// caller can never persist a Windows-minted generation under
-/// [`INTERNAL_INODE_PROVIDER_KIND`] or vice versa).
+/// [`create_or_defer_placeholder`] returns, and HOW -- mirrors
+/// `write_placeholder`'s own `Some`/`None` contract, but with the provider
+/// kind bundled in (so a caller can never persist a Windows-minted
+/// generation under [`INTERNAL_INODE_PROVIDER_KIND`] or vice versa) and the
+/// persist DISCIPLINE made explicit, because the two platforms need
+/// different ones:
+///
+/// - Unix: the write and the identity are the same atomic fact -- this
+///   identity IS what's on disk right now, so persisting it must always WIN,
+///   unconditionally, even over a stale prior value.
+/// - Windows: real on-disk creation is deferred to a second process
+///   (`cfapi-host.exe`) polling on its own schedule, so a concurrent
+///   `ListFolderFilesRequest` backfill (`ensure_windows_placeholder_
+///   generation`) can mint and persist its OWN generation for the same path
+///   first and hand it to that process before this call's persist runs. An
+///   unconditional overwrite here would then silently orphan the generation
+///   already in use on disk. Must persist only-if-absent, keeping whichever
+///   value won.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaceholderIdentityToRecord {
-    Record { identity: PlaceholderDiskIdentity, provider_kind: &'static str },
+    RecordOverwrite { identity: PlaceholderDiskIdentity, provider_kind: &'static str },
+    RecordIfAbsent { identity: PlaceholderDiskIdentity, provider_kind: &'static str },
     Clear,
 }
 
@@ -458,7 +472,7 @@ pub fn create_or_defer_placeholder(
     #[cfg(windows)]
     {
         let _ = (out_path, size, mtime_unix_nanos);
-        Ok(PlaceholderIdentityToRecord::Record {
+        Ok(PlaceholderIdentityToRecord::RecordIfAbsent {
             identity: PlaceholderDiskIdentity {
                 dev: 0,
                 ino: mint_windows_placeholder_generation(),
@@ -469,7 +483,7 @@ pub fn create_or_defer_placeholder(
     #[cfg(not(windows))]
     {
         Ok(match write_placeholder(out_path, size, mtime_unix_nanos)? {
-            Some(identity) => PlaceholderIdentityToRecord::Record {
+            Some(identity) => PlaceholderIdentityToRecord::RecordOverwrite {
                 identity,
                 provider_kind: INTERNAL_INODE_PROVIDER_KIND,
             },
@@ -701,7 +715,7 @@ mod tests {
         assert!(!out_path.exists(), "Windows must defer creation to cfapi-host, not pre-empt it");
         assert!(matches!(
             outcome,
-            PlaceholderIdentityToRecord::Record {
+            PlaceholderIdentityToRecord::RecordIfAbsent {
                 provider_kind: WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
                 ..
             }
@@ -711,7 +725,10 @@ mod tests {
     /// The old bug this closes: `write_placeholder` returning `None` on
     /// Windows made every caller call `clear_placeholder_generation`,
     /// discarding any generation. `create_or_defer_placeholder` must always
-    /// return `Record`, never `Clear`, on Windows.
+    /// return `RecordIfAbsent`, never `Clear`, on Windows. It must also
+    /// never return `RecordOverwrite` -- an unconditional overwrite would
+    /// reintroduce the exact race this shape exists to prevent (see
+    /// `PlaceholderIdentityToRecord`'s own doc comment).
     #[test]
     #[cfg(windows)]
     fn windows_create_or_defer_placeholder_never_clears() {
@@ -720,7 +737,7 @@ mod tests {
 
         let outcome = create_or_defer_placeholder(&out_path, 100, 0).unwrap();
 
-        assert_ne!(outcome, PlaceholderIdentityToRecord::Clear);
+        assert!(matches!(outcome, PlaceholderIdentityToRecord::RecordIfAbsent { .. }));
     }
 
     /// Mirrors `successive_placeholder_writes_to_the_same_path_mint_
