@@ -302,6 +302,28 @@ pub trait MaterializationExecutionPort: Send + Sync {
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), MaterializationExecutionError>;
 
+    /// Like [`Self::record_placeholder_generation`], but only if nothing is
+    /// recorded yet -- a concurrent winner's value is kept instead of being
+    /// overwritten. M2-3a's Windows placeholder-creation path (via
+    /// `yadorilink_local_storage::create_or_defer_placeholder`'s
+    /// `RecordIfAbsent` outcome) MUST use this, never the unconditional
+    /// version: on Windows, real on-disk placeholder creation is deferred
+    /// to a second process (`cfapi-host.exe`) that a concurrent
+    /// `ListFolderFilesRequest` backfill can already have supplied a
+    /// generation to, and an unconditional overwrite here would silently
+    /// orphan whatever that process already used. See
+    /// `yadorilink_sync_sqlite::materialization_state::
+    /// MaterializationStateRepository::record_placeholder_generation_if_absent`'s
+    /// own doc comment.
+    fn record_placeholder_generation_if_absent(
+        &self,
+        group_id: &str,
+        path: &str,
+        candidate: PlaceholderDiskIdentity,
+        provider_kind: &str,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<PlaceholderDiskIdentity, MaterializationExecutionError>;
+
     /// Clears any placeholder identity recorded for `(group_id, path)` -- a
     /// no-op if none was recorded. See
     /// `MaterializationStateRepository::clear_placeholder_generation`'s own

@@ -32,9 +32,9 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use yadorilink_local_storage::{
-    apply_exec_bit, disk_bytes_match_indexed_blocks, intent_target_hash, reconstruct_file,
-    verify_write_target_within_root, write_placeholder, BlockContentStore, PlaceholderDiskIdentity,
-    INTERNAL_INODE_PROVIDER_KIND,
+    apply_exec_bit, create_or_defer_placeholder, disk_bytes_match_indexed_blocks,
+    intent_target_hash, reconstruct_file, verify_write_target_within_root, BlockContentStore,
+    PlaceholderDiskIdentity, PlaceholderIdentityToRecord, INTERNAL_INODE_PROVIDER_KIND,
 };
 use yadorilink_replica_domain::admission::ChangeEmitter;
 use yadorilink_replica_domain::conflict::conflict_copy_path;
@@ -538,15 +538,33 @@ fn repair_interrupted_materializations_inner(
                         permit,
                     )?;
                     verify_write_target_within_root(&out_path, root)?;
-                    match write_placeholder(&out_path, record.size, record.mtime_unix_nanos)? {
-                        Some(identity) => state.record_placeholder_generation(
+                    match create_or_defer_placeholder(
+                        &out_path,
+                        record.size,
+                        record.mtime_unix_nanos,
+                    )? {
+                        PlaceholderIdentityToRecord::RecordOverwrite {
+                            identity,
+                            provider_kind,
+                        } => state.record_placeholder_generation(
                             group_id,
                             &path,
                             identity,
-                            INTERNAL_INODE_PROVIDER_KIND,
+                            provider_kind,
                             permit,
                         )?,
-                        None => state.clear_placeholder_generation(group_id, &path, permit)?,
+                        PlaceholderIdentityToRecord::RecordIfAbsent { identity, provider_kind } => {
+                            state.record_placeholder_generation_if_absent(
+                                group_id,
+                                &path,
+                                identity,
+                                provider_kind,
+                                permit,
+                            )?;
+                        }
+                        PlaceholderIdentityToRecord::Clear => {
+                            state.clear_placeholder_generation(group_id, &path, permit)?
+                        }
                     }
                     apply_exec_bit(&out_path, state.get_exec_bit(group_id, &path)?)?;
                     // A Placeholder is not an in-progress write; drop any intent
@@ -565,15 +583,27 @@ fn repair_interrupted_materializations_inner(
                 permit,
             )?;
             verify_write_target_within_root(&out_path, root)?;
-            match write_placeholder(&out_path, record.size, record.mtime_unix_nanos)? {
-                Some(identity) => state.record_placeholder_generation(
+            match create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)? {
+                PlaceholderIdentityToRecord::RecordOverwrite { identity, provider_kind } => state
+                    .record_placeholder_generation(
                     group_id,
                     &path,
                     identity,
-                    INTERNAL_INODE_PROVIDER_KIND,
+                    provider_kind,
                     permit,
                 )?,
-                None => state.clear_placeholder_generation(group_id, &path, permit)?,
+                PlaceholderIdentityToRecord::RecordIfAbsent { identity, provider_kind } => {
+                    state.record_placeholder_generation_if_absent(
+                        group_id,
+                        &path,
+                        identity,
+                        provider_kind,
+                        permit,
+                    )?;
+                }
+                PlaceholderIdentityToRecord::Clear => {
+                    state.clear_placeholder_generation(group_id, &path, permit)?
+                }
             }
             // A placeholder is a fresh file too, so it needs the recorded exec
             // bit applied for the same reason the reconstruct path does — the

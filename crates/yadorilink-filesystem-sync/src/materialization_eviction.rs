@@ -19,10 +19,8 @@ use std::path::Path;
 
 use yadorilink_local_storage::disk_bytes_match_indexed_blocks;
 use yadorilink_local_storage::free_space::{self, FreeSpaceState};
+use yadorilink_local_storage::verify_write_target_within_root;
 use yadorilink_local_storage::BlockReclamationStore;
-use yadorilink_local_storage::{
-    verify_write_target_within_root, write_placeholder, PlaceholderDiskIdentity,
-};
 use yadorilink_replica_domain::file::RecordKind;
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_replica_engine::custody::FullReplicaCustody;
@@ -247,22 +245,28 @@ pub fn evict_file(
     }
 
     state.set_materialization_state(group_id, path, MaterializationState::Evicting, permit)?;
-    let placeholder_result: Result<Option<PlaceholderDiskIdentity>, MaterializationExecutionError> =
-        state
-            .verify_root(root, group_id)
-            .and_then(|_| Ok(verify_write_target_within_root(&out_path, root)?))
-            .and_then(|_| {
-                if disk_identity(&out_path)? != initial_disk_identity
-                    || !disk_bytes_match_indexed_blocks(&out_path, &record.blocks)?
-                {
-                    return Err(MaterializationExecutionError::EvictionRejected(format!(
-                        "{path} changed before placeholder commit"
-                    )));
-                }
-                Ok(write_placeholder(&out_path, record.size, record.mtime_unix_nanos)?)
-            });
-    let placeholder_identity = match placeholder_result {
-        Ok(identity) => identity,
+    let placeholder_result: Result<
+        yadorilink_local_storage::PlaceholderIdentityToRecord,
+        MaterializationExecutionError,
+    > = state
+        .verify_root(root, group_id)
+        .and_then(|_| Ok(verify_write_target_within_root(&out_path, root)?))
+        .and_then(|_| {
+            if disk_identity(&out_path)? != initial_disk_identity
+                || !disk_bytes_match_indexed_blocks(&out_path, &record.blocks)?
+            {
+                return Err(MaterializationExecutionError::EvictionRejected(format!(
+                    "{path} changed before placeholder commit"
+                )));
+            }
+            Ok(yadorilink_local_storage::create_or_defer_placeholder(
+                &out_path,
+                record.size,
+                record.mtime_unix_nanos,
+            )?)
+        });
+    let placeholder_outcome = match placeholder_result {
+        Ok(outcome) => outcome,
         Err(error) => {
             // The placeholder write failed, so the file is still fully materialized
             // on disk. Roll the row back out of the transient `Evicting` state to
@@ -304,15 +308,28 @@ pub fn evict_file(
             ..Default::default()
         });
     }
-    match placeholder_identity {
-        Some(identity) => state.record_placeholder_generation(
-            group_id,
-            path,
+    match placeholder_outcome {
+        yadorilink_local_storage::PlaceholderIdentityToRecord::RecordOverwrite {
             identity,
-            yadorilink_local_storage::INTERNAL_INODE_PROVIDER_KIND,
-            permit,
-        )?,
-        None => state.clear_placeholder_generation(group_id, path, permit)?,
+            provider_kind,
+        } => {
+            state.record_placeholder_generation(group_id, path, identity, provider_kind, permit)?
+        }
+        yadorilink_local_storage::PlaceholderIdentityToRecord::RecordIfAbsent {
+            identity,
+            provider_kind,
+        } => {
+            state.record_placeholder_generation_if_absent(
+                group_id,
+                path,
+                identity,
+                provider_kind,
+                permit,
+            )?;
+        }
+        yadorilink_local_storage::PlaceholderIdentityToRecord::Clear => {
+            state.clear_placeholder_generation(group_id, path, permit)?
+        }
     }
 
     // A full replica never drops live blocks; an on-demand device reclaims

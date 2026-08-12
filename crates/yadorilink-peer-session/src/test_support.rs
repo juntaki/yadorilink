@@ -609,6 +609,29 @@ impl PeerReplicaStatePort for FakeReplicaState {
         Ok(())
     }
 
+    fn record_placeholder_generation_if_absent(
+        &self,
+        group_id: &str,
+        path: &str,
+        candidate: yadorilink_local_storage::PlaceholderDiskIdentity,
+        _provider_kind: &str,
+        _permit: &RootCommitPermit<'_>,
+    ) -> Result<yadorilink_local_storage::PlaceholderDiskIdentity, PeerSessionError> {
+        let mut guard = self.lock();
+        let row = guard
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(path.to_string())
+            .or_default();
+        if let Some(existing) = row.placeholder_identity {
+            return Ok(existing);
+        }
+        row.placeholder_identity = Some(candidate);
+        Ok(candidate)
+    }
+
     fn clear_placeholder_generation(
         &self,
         group_id: &str,

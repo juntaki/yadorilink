@@ -608,7 +608,7 @@ impl LinkFlushHandle {
         let repo = deps.replica_coordinator.materialization_state_repository();
         let candidate = yadorilink_local_storage::PlaceholderDiskIdentity {
             dev: 0,
-            ino: mint_windows_placeholder_generation(),
+            ino: yadorilink_local_storage::mint_windows_placeholder_generation(),
         };
         let winner = repo
             .record_placeholder_generation_if_absent(
@@ -621,26 +621,6 @@ impl LinkFlushHandle {
             .map_err(|e| e.to_string())?;
         Ok(winner.ino)
     }
-}
-
-/// Mints a fresh Windows CfAPI generation token: a process-lifetime
-/// monotonic counter seeded from wall-clock time, so two placeholders
-/// minted back-to-back never collide regardless of clock resolution --
-/// same reasoning and shape as `shell-ext/windows/src/cfapi.rs`'s own
-/// `mint_generation_token` (which minted a generation on the OTHER side
-/// of the process boundary before M2-2 moved minting authority here; see
-/// that module's history for why the daemon, not `cfapi-host.exe`, is now
-/// the sole minter).
-fn mint_windows_placeholder_generation() -> u64 {
-    static COUNTER: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
-    let counter = COUNTER.get_or_init(|| {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(1);
-        std::sync::atomic::AtomicU64::new(seed)
-    });
-    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether a locally-indexed change may propagate right now. The authoritative

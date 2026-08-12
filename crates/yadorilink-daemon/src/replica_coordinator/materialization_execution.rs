@@ -209,6 +209,27 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .map_err(SyncError::from)?)
     }
 
+    fn record_placeholder_generation_if_absent(
+        &self,
+        group_id: &str,
+        path: &str,
+        candidate: yadorilink_local_storage::PlaceholderDiskIdentity,
+        provider_kind: &str,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<yadorilink_local_storage::PlaceholderDiskIdentity, MaterializationExecutionError>
+    {
+        Ok(self
+            .materialization_state_repository()
+            .record_placeholder_generation_if_absent(
+                group_id,
+                path,
+                candidate,
+                provider_kind,
+                permit,
+            )
+            .map_err(SyncError::from)?)
+    }
+
     fn clear_placeholder_generation(
         &self,
         group_id: &str,
