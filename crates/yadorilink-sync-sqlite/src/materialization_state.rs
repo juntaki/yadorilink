@@ -822,6 +822,50 @@ impl MaterializationStateRepository {
         })
     }
 
+    /// Unlike [`Self::get_placeholder_generation`], NOT gated on
+    /// `materialization_state = 'placeholder'` -- returns whatever identity
+    /// is currently on the row regardless of state. No production call site
+    /// clears `placeholder_dev`/`placeholder_ino`/`placeholder_provider_kind`
+    /// on the `Placeholder` -> `Hydrated` transition (only an explicit
+    /// [`Self::clear_placeholder_generation`] call does), so a `Hydrated`
+    /// row still exposes the generation its placeholder identity was minted
+    /// under here. M2-3b's Windows eviction path uses this -- reading a
+    /// `Hydrated` file's own still-recorded generation as the expected
+    /// identity for the native dehydrate call's defense-in-depth check --
+    /// which is exactly the "now-meaningless prior identity" scenario
+    /// [`Self::get_placeholder_generation`]'s own doc comment warns a
+    /// dirty-detection caller must not read; the two accessors exist because
+    /// the two callers need opposite answers to the same query.
+    pub fn get_recorded_placeholder_identity(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<RecordedPlaceholderGeneration>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let row: Option<(Option<i64>, Option<i64>, Option<String>)> = conn
+                .query_row(
+                    "SELECT placeholder_dev, placeholder_ino, placeholder_provider_kind \
+                     FROM files \
+                     WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
+                    rusqlite::params![group_id, path],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            Ok(row.and_then(|(dev, ino, provider_kind)| match (dev, ino, provider_kind) {
+                (Some(dev), Some(ino), Some(provider_kind)) => {
+                    Some(RecordedPlaceholderGeneration {
+                        identity: yadorilink_local_storage::PlaceholderDiskIdentity {
+                            dev: dev as u64,
+                            ino: ino as u64,
+                        },
+                        provider_kind,
+                    })
+                }
+                _ => None,
+            }))
+        })
+    }
+
     /// Bulk-loads every non-deleted, still-a-placeholder file's identity
     /// for `group_id` in one query — the same batch-processing shape as
     /// [`list_materialization_states`](Self::list_materialization_states),

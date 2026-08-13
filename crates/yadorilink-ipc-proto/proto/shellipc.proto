@@ -179,6 +179,39 @@ message LocalWriteResponse {
   string error = 2;
 }
 
+// M2-3b: the daemon-initiated counterpart to `HydrateRequest` -- native
+// Windows eviction must confirm real on-disk dehydration (`CfDehydrate
+// Placeholder`) happened before the daemon commits the row to `Placeholder`
+// and reclaims blocks, so (unlike every other message pair above, all of
+// which are shell-extension-initiated) this one flows daemon -> cfapi-host.
+// cfapi-host is the only process that reliably owns the sync root's CfAPI
+// connection (see `placeholder_inspect_windows.rs`'s doc comment on why a
+// *read-only* query is willing to bet otherwise, and why a *mutating*,
+// data-destructive call like dehydrate is not), so this is carried on a
+// SEPARATE named pipe that cfapi-host itself serves and the daemon dials
+// into as a client -- reusing this same envelope/framing for consistency,
+// even though that connection only ever exchanges this one request/response
+// pair.
+message DehydrateRequest {
+  // Absolute local path, same convention as `HydrateRequest.path`.
+  string path = 1;
+  // The generation the daemon has recorded for this file's placeholder
+  // identity (persists unchanged across the create-then-hydrate cycle, see
+  // `MaterializationExecutionPort::get_recorded_placeholder_identity`'s doc
+  // comment) -- cfapi-host verifies the on-disk object's current identity
+  // matches before dehydrating, refusing otherwise. `optional`: absent only
+  // if the daemon never had a generation recorded for this path at all (a
+  // pre-M2-3a row, or a legacy/mismatched provider_kind), in which case
+  // cfapi-host skips the identity check and dehydrates unconditionally,
+  // relying solely on `evict_file`'s own disk-content revalidation.
+  optional uint64 expected_generation = 2;
+}
+
+message DehydrateResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
 message ShellIpcMessage {
   oneof payload {
     StatusQuery status_query = 1;
@@ -194,5 +227,7 @@ message ShellIpcMessage {
     ListFolderFilesResponse list_folder_files_response = 11;
     LocalWriteRequest local_write_request = 12;
     LocalWriteResponse local_write_response = 13;
+    DehydrateRequest dehydrate_request = 14;
+    DehydrateResponse dehydrate_response = 15;
   }
 }
