@@ -25,10 +25,8 @@ use yadorilink_peer_session::peer_session::{RelayReplySink, RelaySessionHandler}
 use yadorilink_sync_wire::{RelayCloseFrame, RelayDataFrame, RelayOpenFrame, RelayOpenedFrame};
 
 use crate::daemon_state::DaemonState;
-use crate::peer_registry::PeerReachability;
 use crate::relay_grant::RelayGrant;
 use crate::relay_session::{admit_relay_open, RelayAdmissionContext};
-use crate::route::RouteKind;
 
 fn now_unix_seconds() -> i64 {
     std::time::SystemTime::now()
@@ -124,9 +122,23 @@ impl RelaySessionHandler for DaemonState {
                 // session`'s own no-chaining reasoning exactly (this
                 // device must never dial or wait for a new connection on
                 // the relay's own behalf).
+                //
+                // M3 Pass 8 (closeout, B-side): reads `direct_channel`'s
+                // OWN live `reachability()` -- the SAME `Arc<PeerChannel>`
+                // already fetched above for `confirmed_direct_addr()` --
+                // not `self.peers.reachability()`, which is only an
+                // asynchronously updated mirror of it (`poll_reachability`'s
+                // background task is what copies one into the other). The
+                // A-side requester check (`DaemonState::is_directly_
+                // reachable`) hit the identical staleness class first;
+                // this closes the same gap on B's own admission side --
+                // without it, B could admit a RelayOpen during the window
+                // where its OWN route to C had already stopped being
+                // direct (started relaying through some other device D),
+                // silently chaining A->B->D->C.
                 has_direct_route_to_destination: matches!(
-                    self.peers.reachability(&grant.destination_device_id),
-                    Some(PeerReachability::Connected(RouteKind::Direct))
+                    direct_channel.reachability(),
+                    yadorilink_transport::PeerReachability::Connected { .. }
                 ),
                 active_relay_session_count: self.relay_forwarder.active_session_count(),
                 max_concurrent_relay_sessions: crate::relay_forwarder::RELAY_MAX_CONCURRENT_SESSIONS,
