@@ -194,6 +194,37 @@ impl RelaySessionHandler for DaemonState {
                 }
             }
 
+            // M3 Pass 6: this device opened `data.session_id` itself, as
+            // relay REQUESTER (`RelayCarrier::send_via_relay`) -- an
+            // inbound `RelayData` for it is the destination's reply routed
+            // back by the relay, never a forward request THIS device is
+            // being asked to admit. Checked first, and returns either way,
+            // so a requester session id can never fall through into the
+            // provider-side admission/forwarding path below.
+            if let Some((relay_device_id, destination_peer_public)) =
+                self.requester_relay_session(data.session_id)
+            {
+                if relay_device_id != authenticated_peer_device_id {
+                    // Same ownership reasoning as independent-review
+                    // finding H1 on the provider side: two different
+                    // relays' own independent session-id counters can
+                    // coincide, so only the relay THIS device actually
+                    // opened this session through may deliver to it.
+                    tracing::debug!(
+                        session_id = data.session_id,
+                        peer = authenticated_peer_device_id,
+                        "relay data for a requester session opened via a different relay; dropping"
+                    );
+                    return;
+                }
+                if let Some(device_id) = self.device_id_for_peer_public(&destination_peer_public) {
+                    if let Some(channel) = self.direct_channel(&device_id) {
+                        channel.deliver_relay_datagram(data.payload);
+                    }
+                }
+                return;
+            }
+
             // M3 Pass 5 (independent-review finding H2): re-runs the exact
             // same authorization checks `admit_relay_open` ran at OPEN
             // time, against THIS device's CURRENT live state, on EVERY
@@ -262,6 +293,21 @@ impl RelaySessionHandler for DaemonState {
                 }
             }
 
+            // M3 Pass 6: same requester-session short-circuit as `handle_
+            // relay_data`'s own -- the relay this device opened the
+            // session through is reporting it closed (route lost, idle
+            // timeout, byte cap). Nothing on this device to close in turn
+            // (there is no local forwarding actor for a requester
+            // session); just stop treating it as usable so a later `send_
+            // via_relay` opens a fresh one instead of sending into a
+            // session the relay has already torn down.
+            if let Some((relay_device_id, _)) = self.requester_relay_session(close.session_id) {
+                if relay_device_id == authenticated_peer_device_id {
+                    self.forget_requester_relay_session(close.session_id);
+                }
+                return;
+            }
+
             // Ownership-checked (independent-review finding H1) -- an
             // ownership MISMATCH is logged; "already gone" (Ok from a
             // close racing the session's own natural end) is not.
@@ -280,6 +326,34 @@ impl RelaySessionHandler for DaemonState {
                     );
                 }
             }
+        })
+    }
+
+    fn handle_relay_opened<'a>(
+        &'a self,
+        opened: RelayOpenedFrame,
+        authenticated_peer_device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                let test_handler = self
+                    .test_relay_session_handler
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                if let Some(test_handler) = test_handler {
+                    return test_handler
+                        .handle_relay_opened(opened, authenticated_peer_device_id)
+                        .await;
+                }
+            }
+            // M3 Pass 6: resolves the oneshot `RelayCarrier::send_via_relay`
+            // registered under `opened.grant_id` before sending the
+            // matching `RelayOpen` -- see `pending_relay_opens`'s and
+            // `resolve_pending_relay_open`'s own doc comments for the
+            // sender-identity check this performs.
+            self.resolve_pending_relay_open(opened, authenticated_peer_device_id);
         })
     }
 }

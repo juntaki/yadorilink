@@ -1354,6 +1354,20 @@ pub trait RelaySessionHandler: Send + Sync {
         close: yadorilink_sync_wire::RelayCloseFrame,
         authenticated_peer_device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    /// M3 Pass 6: the reply leg of `send_relay_open` -- arrives on THIS
+    /// SAME session once the peer this device asked to relay for it
+    /// (`authenticated_peer_device_id`, playing role "B" here, the mirror
+    /// of `handle_relay_open`'s caller playing role "B" for someone else)
+    /// finishes admission. This crate has no pending-request bookkeeping
+    /// of its own (the same reasoning as this trait's own doc comment) --
+    /// an implementation with no outstanding request for `opened.grant_id`
+    /// simply has nothing to do with it.
+    fn handle_relay_opened<'a>(
+        &'a self,
+        opened: yadorilink_sync_wire::RelayOpenedFrame,
+        authenticated_peer_device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
 /// Where a `RelaySessionHandler` implementation sends bytes it receives
@@ -1395,6 +1409,14 @@ impl RelaySessionHandler for DeniedRelaySessionHandler {
     fn handle_relay_close<'a>(
         &'a self,
         _close: yadorilink_sync_wire::RelayCloseFrame,
+        _authenticated_peer_device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+
+    fn handle_relay_opened<'a>(
+        &'a self,
+        _opened: yadorilink_sync_wire::RelayOpenedFrame,
         _authenticated_peer_device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async {})
@@ -6026,14 +6048,21 @@ impl PeerSyncSession {
                 self.relay_session_handler().handle_relay_close(close, &self.peer_device_id).await;
                 Ok(())
             }
-            // A relay's answer to a `RelayOpen` this device never sent (or
-            // already timed out on) -- nothing to correlate it against.
-            // `PeerSyncSession` has no pending-request table for this one
-            // (unlike e.g. `pending_rebootstrap_snapshot`) because the
-            // requester side of this exchange also lives in the daemon-
-            // side adapter, not in this crate -- see this arm's own Pass
-            // 5 sibling arms above for why.
-            InboundFrame::RelayOpened(_) => Ok(()),
+            // M3 Pass 6: dispatched exactly like the other three relay
+            // frames above -- `PeerSyncSession` still keeps no
+            // pending-request table of its own (unlike e.g. `pending_
+            // rebootstrap_snapshot`); the daemon-side adapter's own
+            // correlation table (keyed by `opened.grant_id`) lives entirely
+            // on the other side of this same seam. An `opened` this device
+            // has no outstanding request for (already timed out, or never
+            // sent) is simply a no-op there -- see `RelaySessionHandler::
+            // handle_relay_opened`'s own doc comment.
+            InboundFrame::RelayOpened(opened) => {
+                self.relay_session_handler()
+                    .handle_relay_opened(opened, &self.peer_device_id)
+                    .await;
+                Ok(())
+            }
             // Covers a genuinely empty `SyncMessage.payload` oneof, a peer
             // running a *newer* protocol version that added a oneof
             // variant this build doesn't know about yet, and an old peer
