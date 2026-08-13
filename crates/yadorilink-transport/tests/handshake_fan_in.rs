@@ -145,6 +145,37 @@
 //!   gap, not something this reproducer introduced) now each log a
 //!   `tracing::debug!` on drop; this file counts those too and reports
 //!   them separately from wasted-but-delivered decapsulate attempts.
+//!
+//! # M3 Pass 2 update: this is no longer measurement-only
+//!
+//! A correction from the user, made while scoping Pass 2, changed this
+//! file's own job: bounding CONCURRENCY (a queue + worker pool) alone
+//! would only spread the SAME O(N^2) crypto cost across workers, not
+//! eliminate it -- WireGuard's Noise IK handshake message-1 encrypts the
+//! initiator's static public key using a key the RESPONDER can derive
+//! from ONLY its own static private key plus the message's own (already
+//! plaintext) ephemeral public key, so identifying the real sender is
+//! possible in O(1) crypto work per initiation, REGARDLESS of how many
+//! peers are registered -- no need to trial-decrypt against every
+//! registered channel's own key. `boringtun` already exposes exactly
+//! this seam (`noise::handshake::parse_handshake_anon`), and its own
+//! `device` module uses precisely this pattern for its reference
+//! multi-peer demux. `transport_hub.rs`'s `identify_and_route_
+//! initiation` (M3 Pass 2) now uses it: resolve the sender once, one
+//! hash-map lookup, dispatch to exactly the one matching channel.
+//!
+//! This file now runs the SAME scaling sweep in two modes and reports
+//! them side by side as the before/after KPI this correction asked for:
+//! - `IdentityMode::Fallback`: the receiver never calls
+//!   `TransportHub::set_device_identity` -- the ORIGINAL, pre-Pass-2
+//!   broadcast-to-every-channel behavior this file's first version
+//!   measured, kept as the "before" baseline (also still real production
+//!   behavior for the rare caller that never provides a device identity).
+//! - `IdentityMode::Resolved`: the receiver DOES call `set_device_
+//!   identity` -- the fixed path. Hard-asserted here (unlike Fallback,
+//!   and unlike this file's original Pass-1-only measurement stance):
+//!   wasted decapsulate attempts must not scale with N, and N=20 must
+//!   not reproduce the multi-second crypto collapse Pass 1 measured.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -230,6 +261,18 @@ enum ConnectOutcome {
     TimedOut,
 }
 
+/// M3 Pass 2: which handshake-identification path the receiver in one
+/// `run_fan_in` call exercises -- see this file's own top-level "M3 Pass
+/// 2 update" section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityMode {
+    /// The original broadcast-to-every-channel path (no device identity
+    /// provided to the receiver's hub).
+    Fallback,
+    /// The O(1) identify-then-dispatch path.
+    Resolved,
+}
+
 /// Awaits `rx` reaching `Connected`, relative to `start`, bounded by
 /// `deadline` -- change-driven via `watch::Receiver::wait_for`, not
 /// polled, so this has no fixed granularity to quantize small timings and
@@ -263,10 +306,14 @@ async fn run_fan_in(
     n: usize,
     budget: Duration,
     counters: &Arc<EventCounters>,
+    mode: IdentityMode,
 ) -> Vec<ConnectOutcome> {
     let receiver_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let (receiver_secret, receiver_public) = gen_keypair();
     let receiver_hub = TransportHub::from_socket(receiver_socket, Some(receiver_public));
+    if mode == IdentityMode::Resolved {
+        receiver_hub.set_device_identity(receiver_secret.clone());
+    }
 
     // Bind every initiator's socket FIRST so the receiver can register
     // each channel with that initiator's real candidate address. All on
@@ -408,9 +455,59 @@ fn summarize(outcomes: &[ConnectOutcome]) -> String {
     )
 }
 
-/// The reproducer: runs every configured fan-in size, prints a scaling
-/// table, and hard-asserts only the N=1 sanity bound (see this file's own
-/// top-level doc comment for why nothing else is asserted here).
+type Report = BTreeMap<usize, (Vec<ConnectOutcome>, usize, usize)>;
+
+/// Between iterations, gives the PREVIOUS iteration's `TransportHub`
+/// instances time to actually finish tearing down before the next
+/// iteration resets the shared event counters -- a real bug this file's
+/// own flakiness surfaced (not a production bug): `TransportHub::drop`
+/// calls `task.abort()` on its receive-loop and handshake-worker tasks,
+/// but `abort()` only takes effect at that task's NEXT `.await` point,
+/// not synchronously. A task that's mid-decapsulate (CPU-bound, no
+/// `.await` inside that single call) when aborted still finishes that
+/// one unit of work -- including logging a "wireguard decapsulate
+/// error" event -- before actually stopping. Without this delay, a
+/// still-finishing task from run N's teardown could log an event that
+/// lands AFTER run N+1's `counters.store(0)` reset, spuriously inflating
+/// N+1's count with N's leftover activity (observed empirically: an
+/// otherwise-clean N=1 run occasionally showed 100+ "wasted" attempts
+/// that were really N=20's prior teardown bleeding through).
+const ITERATION_SETTLE_DELAY: Duration = Duration::from_millis(200);
+
+async fn run_sweep(mode: IdentityMode, counters: &Arc<EventCounters>) -> Report {
+    let mut report = Report::new();
+    for &n in FAN_IN_SIZES {
+        let budget = if n == 1 { N1_SANITY_BUDGET } else { PER_N_BUDGET };
+        tokio::time::sleep(ITERATION_SETTLE_DELAY).await;
+        counters.decapsulate_errors.store(0, Ordering::Relaxed);
+        counters.queue_full_drops.store(0, Ordering::Relaxed);
+        let outcomes = run_fan_in(n, budget, counters, mode).await;
+        let decap_errors = counters.decapsulate_errors.load(Ordering::Relaxed);
+        let queue_drops = counters.queue_full_drops.load(Ordering::Relaxed);
+        report.insert(n, (outcomes, decap_errors, queue_drops));
+    }
+    report
+}
+
+fn print_report(label: &str, report: &Report) {
+    println!("\n=== handshake fan-in scaling report: {label} ===");
+    println!(
+        "{:>4}  {:>50}  {:>12}  {:>12}",
+        "N", "connect outcomes", "decap errors", "queue drops"
+    );
+    for (&n, (outcomes, decap_errors, queue_drops)) in report {
+        println!("{n:>4}  {:>50}  {decap_errors:>12}  {queue_drops:>12}", summarize(outcomes));
+    }
+    println!("========================================\n");
+}
+
+/// The reproducer: runs the same fan-in scaling sweep in both
+/// [`IdentityMode`]s and prints them side by side as a before/after
+/// comparison (see this file's own top-level "M3 Pass 2 update" section).
+/// `Fallback` is measured and reported only (matching Pass 1's original
+/// "explain, don't assert" stance -- it's still real, if now-uncommon,
+/// production behavior). `Resolved` is hard-asserted: the whole point of
+/// Pass 2 is that this mode must not reproduce Pass 1's O(N^2) collapse.
 ///
 /// `multi_thread`/`worker_threads = 8`: a real multi-core execution
 /// model, not the single-OS-thread cooperative scheduling
@@ -439,31 +536,69 @@ async fn handshake_fan_in_scaling_report() {
     tracing::subscriber::set_global_default(subscriber)
         .expect("no other global tracing subscriber must already be installed in this process");
 
-    let mut report: BTreeMap<usize, (Vec<ConnectOutcome>, usize, usize)> = BTreeMap::new();
-    for &n in FAN_IN_SIZES {
-        let budget = if n == 1 { N1_SANITY_BUDGET } else { PER_N_BUDGET };
-        counters.decapsulate_errors.store(0, Ordering::Relaxed);
-        counters.queue_full_drops.store(0, Ordering::Relaxed);
-        let outcomes = run_fan_in(n, budget, &counters).await;
-        let decap_errors = counters.decapsulate_errors.load(Ordering::Relaxed);
-        let queue_drops = counters.queue_full_drops.load(Ordering::Relaxed);
-        report.insert(n, (outcomes, decap_errors, queue_drops));
-    }
+    let fallback_report = run_sweep(IdentityMode::Fallback, &counters).await;
+    let resolved_report = run_sweep(IdentityMode::Resolved, &counters).await;
 
-    println!("\n=== handshake fan-in scaling report ===");
-    println!(
-        "{:>4}  {:>50}  {:>12}  {:>12}",
-        "N", "connect outcomes", "decap errors", "queue drops"
-    );
-    for (&n, (outcomes, decap_errors, queue_drops)) in &report {
-        println!("{n:>4}  {:>50}  {decap_errors:>12}  {queue_drops:>12}", summarize(outcomes));
-    }
-    println!("========================================\n");
+    print_report("Fallback (pre-Pass-2 broadcast, before)", &fallback_report);
+    print_report("Resolved (Pass 2 O(1) identification, after)", &resolved_report);
 
-    let (n1_outcomes, ..) = &report[&1];
+    let (n1_outcomes, ..) = &resolved_report[&1];
     assert!(
         matches!(n1_outcomes[0], ConnectOutcome::Connected(_)),
         "sanity check failed: N=1 (no fan-in at all) did not connect within {N1_SANITY_BUDGET:?} \
-         -- the reproducer harness itself is broken, not merely observing fan-in degradation"
+         in Resolved mode -- the reproducer harness itself is broken, not merely observing fan-in \
+         degradation"
     );
+
+    // The core M3 Pass 2 exit criterion: wasted decapsulate attempts must
+    // not SCALE WITH N -- a flat ceiling, deliberately not multiplied by
+    // `n` (a per-N-scaled bound like `n * 2` would itself imply some
+    // scaling is expected, which is exactly what this pass exists to
+    // rule out). In Resolved mode there is no trial-decryption against
+    // the wrong channel at all, so observed counts stay in the low tens
+    // regardless of N in practice; this ceiling is generous headroom
+    // above that. The "wireguard decapsulate error" event this counts
+    // (see `tunn_wrapper.rs::handle_incoming`) is not exclusively a
+    // fan-in signal -- WireGuard's own handshake retransmission (an
+    // initiator resending its own init packet before it sees a response,
+    // then that duplicate hitting an already-established session) also
+    // lands here, and happens occasionally regardless of N, including at
+    // N=1 -- observed empirically across repeated runs, not merely
+    // theorized, which is why this is a generous flat ceiling rather
+    // than a tight one.
+    const MAX_WASTED_DECAPSULATE_ATTEMPTS_RESOLVED: usize = 60;
+    for (&n, (outcomes, decap_errors, _queue_drops)) in &resolved_report {
+        assert!(
+            *decap_errors <= MAX_WASTED_DECAPSULATE_ATTEMPTS_RESOLVED,
+            "N={n}: {decap_errors} wasted decapsulate attempts in Resolved mode -- expected \
+             O(1)-per-initiation identification to keep this flat and bounded independent of N, \
+             not scaling like the pre-Pass-2 O(N^2) broadcast path"
+        );
+        // A second, RELATIVE check at the two N values where Pass 1
+        // measured the real O(N^2) collapse (hundreds of wasted attempts
+        // under Fallback) -- Resolved must be dramatically smaller at the
+        // SAME N, not merely under the flat ceiling above (which alone
+        // couldn't distinguish "the fix genuinely worked" from "this run
+        // just happened to land under an arbitrary constant").
+        if n >= 10 {
+            let fallback_decap_errors = fallback_report[&n].1;
+            assert!(
+                *decap_errors * 4 < fallback_decap_errors,
+                "N={n}: Resolved mode's {decap_errors} wasted decapsulate attempts is not \
+                 dramatically smaller than Fallback mode's {fallback_decap_errors} at the same \
+                 N -- the O(1) identification path may not actually be taking effect"
+            );
+        }
+
+        for outcome in outcomes {
+            if let ConnectOutcome::Connected(d) = outcome {
+                assert!(
+                    *d < Duration::from_secs(2),
+                    "N={n}: a channel took {d:?} to connect in Resolved mode -- Pass 1 measured \
+                     multi-second (up to ~16s) stalls at this scale under the OLD broadcast path; \
+                     Resolved mode must not reproduce that collapse"
+                );
+            }
+        }
+    }
 }

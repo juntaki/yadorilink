@@ -2019,10 +2019,16 @@ pub async fn run_sim(discovery: SimDiscovery, state: Arc<DaemonState>) -> Result
     // session demultiplexes off the one binding.
     let device_public = boringtun::x25519::PublicKey::from(&keypair.secret);
     state.set_device_static_public(device_public.to_bytes());
-    state.set_shared_socket(yadorilink_transport::TransportHub::from_socket(
-        local_socket,
-        Some(device_public),
-    ));
+    // M3 Pass 2: closes the O(N^2) handshake-fan-in cost measured by
+    // `handshake_fan_in.rs` -- see `DaemonState::set_device_static_secret`'s
+    // own doc comment. The DST/madsim harness benefits from this the same
+    // as production: a simulated many-peers-to-one-device fan-in scenario
+    // should exercise the real O(1) identification path too, not silently
+    // fall back to broadcast just because this is a test harness.
+    state.set_device_static_secret(keypair.secret.clone());
+    let hub = yadorilink_transport::TransportHub::from_socket(local_socket, Some(device_public));
+    hub.set_device_identity(keypair.secret.clone());
+    state.set_shared_socket(hub);
 
     for peer in peers {
         diff_state.desired_peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(
