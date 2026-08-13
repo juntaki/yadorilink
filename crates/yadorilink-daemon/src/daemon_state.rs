@@ -1568,6 +1568,21 @@ impl DaemonState {
         *self.relay_grant_source.lock().unwrap_or_else(|p| p.into_inner()) = Some(source);
     }
 
+    /// M3 Pass 7 (chaos tests): the requester-tracked session id this
+    /// device is currently using to reach `destination_peer_public` via
+    /// relay, if any -- `pub` under this same cfg and for the identical
+    /// reason as `set_relay_grant_source`, so an integration test can
+    /// distinguish multiple concurrent relay sessions (e.g. multi-peer
+    /// fan-in through one relay) by id rather than only by aggregate
+    /// count.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn requester_relay_session_id_for_destination_test(
+        &self,
+        destination_peer_public: &[u8; 32],
+    ) -> Option<u64> {
+        self.requester_relay_session_for_destination(destination_peer_public).map(|(id, _)| id)
+    }
+
     pub(crate) fn relay_grant_source(
         &self,
     ) -> Option<Arc<dyn crate::relay_carrier::RelayGrantSource>> {
