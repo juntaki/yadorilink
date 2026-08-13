@@ -118,7 +118,32 @@ struct NetmapDiffState {
     /// (mirrors `replace_coordination_candidates`'s live-session path, one
     /// layer earlier so a backoff-sleeping supervisor sees it too).
     desired_peers: Arc<StdMutex<HashMap<String, PeerConnectSpec>>>,
+    /// M3 Pass 3: `ReconnectCoordinator` -- a single global bound on how many
+    /// peer supervisors may be mid-handshake-attempt at once, across every
+    /// peer this device is reconnecting to. Without this, a steady-state
+    /// event that drops many sessions at once (a network flap, a Wi-Fi
+    /// roam, this process itself waking from sleep) makes every affected
+    /// supervisor race its handshake attempt simultaneously -- a thundering
+    /// herd of concurrent crypto/candidate-race work, independent of and in
+    /// addition to the already-fixed O(N^2) fan-in cost (Pass 2) and the
+    /// existing PER-PEER backoff+jitter (which only staggers ONE peer's OWN
+    /// repeated attempts against itself, not concurrent attempts across
+    /// DIFFERENT peers). The permit is acquired only immediately before the
+    /// actual handshake attempt -- never held across backoff sleep, which
+    /// happens entirely in `spawn_peer_session`'s loop, outside the scope
+    /// that touches this semaphore -- and released once that attempt
+    /// resolves one way or the other (session established, or the attempt
+    /// failed); see `wait_for_first_handshake_resolution`.
+    reconnect_semaphore: Arc<tokio::sync::Semaphore>,
 }
+
+/// M3 Pass 3: global cap on concurrent in-flight handshake attempts (see
+/// `NetmapDiffState::reconnect_semaphore`). Matches `HANDSHAKE_WORKER_COUNT`
+/// (`yadorilink_transport::transport_hub`) deliberately -- there is no
+/// benefit to more handshake attempts racing at once than there are
+/// crypto workers on the receiving side to actually identify and dispatch
+/// their initiations.
+const RECONNECT_HANDSHAKE_CONCURRENCY: usize = 4;
 
 /// One peer's current connect parameters, re-read by
 /// `spawn_peer_session`'s reconnect loop at the start of every attempt —
@@ -163,6 +188,7 @@ impl NetmapDiffState {
             session_tasks: Arc::new(StdMutex::new(HashMap::new())),
             punch_limiter: Arc::new(StdMutex::new(PunchLimiter::new(PunchConfig::default()))),
             desired_peers: Arc::new(StdMutex::new(HashMap::new())),
+            reconnect_semaphore: Arc::new(tokio::sync::Semaphore::new(RECONNECT_HANDSHAKE_CONCURRENCY)),
         }
     }
 }
@@ -1552,6 +1578,28 @@ fn spawn_peer_session(
     })
 }
 
+/// M3 Pass 3: waits for `channel`'s reachability to leave its initial
+/// `Connecting` state for the first time -- either the first `Connected` or
+/// the first `Unreachable` -- so `NetmapDiffState::reconnect_semaphore`'s
+/// permit can be released as soon as the actual handshake attempt it guards
+/// has resolved, without waiting on the channel's own subsequent, unrelated
+/// internal retry churn. Returns immediately if the channel is already past
+/// `Connecting` (e.g. it started `Unreachable { NoCandidates }`), or if the
+/// channel is revoked/dropped mid-wait (the `watch::Sender` side closing) --
+/// either way, there's nothing further for the permit to guard.
+async fn wait_for_first_handshake_resolution(channel: &PeerChannel) {
+    let mut rx = channel.reachability_watch();
+    loop {
+        let current = *rx.borrow();
+        if !matches!(current, yadorilink_transport::PeerReachability::Connecting { .. }) {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// One connect-then-run cycle of [`spawn_peer_session`]'s reconnect loop.
 /// Reads `diff_state.desired_peers` fresh at the start -- not once at
 /// `spawn_peer_session`'s own call time -- so a supervisor woken from a
@@ -1613,6 +1661,18 @@ async fn run_one_peer_session_attempt(
     // a genuine construction failure, reported as unreachable rather than
     // dropping the peer silently.
     let candidate_count = spec.candidates.len();
+    // M3 Pass 3: `ReconnectCoordinator` -- acquired here, immediately
+    // before the actual handshake attempt (this supervisor's own backoff
+    // sleep already happened, entirely in `spawn_peer_session`'s loop,
+    // before this function was even called), never during it. Dropped via
+    // an early `return` on a `connect` failure (nothing to wait on), or
+    // explicitly once `wait_for_first_handshake_resolution` resolves below.
+    let reconnect_permit = diff_state
+        .reconnect_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("reconnect semaphore is never closed");
     let connect_started = tokio::time::Instant::now();
     let connect_result = PeerChannel::connect(
         keypair.secret.clone(),
@@ -1658,6 +1718,26 @@ async fn run_one_peer_session_attempt(
             return;
         }
     };
+
+    // M3 Pass 3: release the permit once the actor resolves its FIRST
+    // candidate race one way or the other (`Connected` or `Unreachable`) --
+    // the actual handshake attempt this permit exists to bound. Done from a
+    // detached task, not inline here, so this global concurrency bound
+    // never delays this attempt's own registration/session-start below (an
+    // inline `.await` here would serialize channel registration and
+    // `PeerSyncSession` creation behind full handshake resolution, changing
+    // this function's own externally-observed timing contract for no
+    // reason -- the permit only needs to track candidate-race concurrency,
+    // it has no business gating anything else). The actor's own internal
+    // retry loop may keep flapping between `Connecting`/`Unreachable`
+    // indefinitely after the first resolution, on its own per-peer backoff;
+    // that ongoing churn is what the existing backoff+jitter already
+    // governs, not this global bound.
+    let channel_for_permit = channel.clone();
+    tokio::spawn(async move {
+        wait_for_first_handshake_resolution(&channel_for_permit).await;
+        drop(reconnect_permit);
+    });
 
     // registered so a later netmap-diff teardown
     // (`teardown_peer`) can find and `revoke` this exact channel —
