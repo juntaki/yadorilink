@@ -96,7 +96,18 @@ impl RelayCarrier for ForwardingRelayCarrier {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            self.socket.send_to(&datagram, self.destination).await.is_ok()
+            // M3 Pass 8 closeout: wraps in the SAME relay envelope
+            // `yadorilink-daemon`'s real `relay_forwarder.rs` now always
+            // wraps its own forwarding sends in -- see `wrap_relay_
+            // envelope`'s own doc comment. Without this, this test
+            // double would send raw, unwrapped bytes indistinguishable
+            // from genuine direct UDP, unable to actually exercise
+            // (or prove regressions in) the route-provenance mechanism
+            // this file's own `relay_delivered_traffic_from_a_colliding_
+            // known_candidate_never_confirms_direct` test below depends
+            // on.
+            let enveloped = yadorilink_transport::wrap_relay_envelope(1, &datagram);
+            self.socket.send_to(&enveloped, self.destination).await.is_ok()
         })
     }
 }
@@ -312,5 +323,127 @@ async fn direct_failure_falls_back_to_relay_then_promotes_back_once_direct_confi
         relay_carrier.calls.load(Ordering::Relaxed),
         calls_before,
         "no relay call once direct is confirmed and in use"
+    );
+}
+
+/// M3 Pass 8 closeout: the real end-to-end version of `peer_channel.rs`'s
+/// own unit test `relay_tagged_datagram_from_a_colliding_known_candidate_
+/// stays_relay` -- a GENUINE WireGuard handshake, relayed over a REAL UDP
+/// socket wrapped in a REAL relay envelope, arriving at C from an address
+/// C had ALREADY recorded as a known direct candidate for A (the exact
+/// coincidence the final-gate review's own "opaque forwarding is
+/// indistinguishable from direct" concern was about). Proves the address
+/// collision no longer confirms a false direct path: C reports
+/// `ConnectedRelay`, never `Connected`, and `confirmed_direct_addr` stays
+/// `None`, even though `from_addr` alone would satisfy the old
+/// candidate-membership check.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_delivered_traffic_from_a_colliding_known_candidate_never_confirms_direct() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let (secret_a, public_a) = gen_keypair();
+    let (secret_c, public_c) = gen_keypair();
+
+    let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let socket_c = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr_c = socket_c.local_addr().unwrap();
+
+    // Bound FIRST so its real (OS-assigned ephemeral) address is known
+    // before constructing C -- this is the "coincidentally matching"
+    // address: C is given it as a genuine direct candidate for A, even
+    // though it's actually going to be this test's relay-forwarding
+    // socket, exactly simulating the collision this test exists to prove
+    // is now harmless.
+    let relay_forward_socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let colliding_addr = relay_forward_socket.local_addr().unwrap();
+
+    let relay_carrier = Arc::new(ForwardingRelayCarrier {
+        socket: relay_forward_socket.clone(),
+        destination: addr_c,
+        calls: AtomicUsize::new(0),
+    });
+
+    // Empty candidate list -- `Unreachable { NoCandidates }` immediately,
+    // no need to wait out `CANDIDATE_RACE_TIMEOUT` first (this test isn't
+    // exercising that state machine, only the destination-side confirm
+    // gate), so `send_batch_direct`'s relay fallback is live right away.
+    let a = Arc::new(
+        PeerChannel::connect_with_relay(
+            secret_a,
+            public_c,
+            0,
+            Vec::new(),
+            yadorilink_transport::TransportHub::from_socket(socket_a, Some(public_a)),
+            relay_carrier,
+        )
+        .await
+        .unwrap(),
+    );
+    // C already "knows" the relay's own address as a direct candidate for
+    // A -- the collision. A real deployment would only hit this via
+    // astronomical coincidence (the relay's forwarding socket draws a
+    // fresh OS-random ephemeral port every session); this test constructs
+    // it deliberately rather than waiting for it.
+    let c = PeerChannel::connect_with_relay(
+        secret_c,
+        public_a,
+        0,
+        vec![colliding_addr],
+        yadorilink_transport::TransportHub::from_socket(socket_c, Some(public_c)),
+        Arc::new(DenyingRelayCarrier),
+    )
+    .await
+    .unwrap();
+    // Without this, C's own handshake RESPONSE (sent to `colliding_addr`,
+    // which is genuinely `relay_forward_socket`'s real address either
+    // way -- both C's direct-candidate race AND its `confirmed_relay_
+    // addr` reply path target it) never reaches A at all: nothing is
+    // listening on `relay_forward_socket` to relay it onward, so A's
+    // handshake never completes and `a.send`'s payload never actually
+    // goes out as encrypted data, only ever re-sent as a bare
+    // initiation. Same pattern as the earlier test in this file.
+    {
+        let relay_forward_socket = relay_forward_socket.clone();
+        let a = a.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_535];
+            while let Ok(n) = relay_forward_socket.recv(&mut buf).await {
+                a.deliver_relay_datagram(buf[..n].to_vec());
+            }
+        });
+    }
+
+    // A has no working direct path at all, so its own send falls back to
+    // the relay carrier immediately (`send_batch_direct`'s `Unreachable`
+    // branch) -- no need to wait out the candidate race first, since this
+    // test isn't exercising that state machine, only the destination-side
+    // confirm gate.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        a.send(b"hello".to_vec()).await.unwrap();
+        if timeout(Duration::from_millis(300), c.recv()).await.is_ok() {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("A's hello never reached C via the relay");
+        }
+    }
+
+    let reachability = wait_for_reachability(&c, Duration::from_secs(5), |r| {
+        !matches!(r, PeerReachability::Connecting { .. } | PeerReachability::Unreachable { .. })
+    })
+    .await;
+    assert_eq!(
+        reachability,
+        PeerReachability::ConnectedRelay,
+        "a relay-delivered datagram from a colliding known candidate must report ConnectedRelay, \
+         never a false Connected"
+    );
+    assert_eq!(
+        c.confirmed_direct_addr(),
+        None,
+        "the colliding address must never become a confirmed direct path"
     );
 }

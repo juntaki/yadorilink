@@ -312,7 +312,17 @@ impl RelayForwarder {
 
         byte_bucket.acquire(payload.len() as u64).await;
         packet_bucket.acquire(1).await;
-        let _ = socket.send(payload).await;
+        // M3 Pass 8 closeout: wraps the opaque WireGuard bytes in a relay
+        // envelope (`yadorilink_transport::wrap_relay_envelope`) before
+        // sending raw -- see that function's own doc comment. Payload
+        // opacity is unaffected (the envelope wraps the OUTER transport
+        // framing only, `payload` itself is never inspected here, same
+        // as before); the destination's own `TransportHub` unwraps it and
+        // tags the result `DatagramKind::Relay`, so its `PeerChannel`
+        // confirm gate can never mistake this forwarded traffic for a
+        // genuine direct arrival, regardless of this socket's own source
+        // address.
+        let _ = socket.send(&yadorilink_transport::wrap_relay_envelope(session_id, payload)).await;
         last_activity.store(now_unix_ms, Ordering::Relaxed);
         Ok(())
     }
@@ -529,7 +539,14 @@ mod tests {
         let now = now_unix_seconds();
 
         let session_id = forwarder
-            .open_session(OWNER.to_string(), dest_addr, None, now + 60, now_unix_millis(), sink.clone())
+            .open_session(
+                OWNER.to_string(),
+                dest_addr,
+                None,
+                now + 60,
+                now_unix_millis(),
+                sink.clone(),
+            )
             .unwrap();
 
         forwarder
@@ -540,8 +557,20 @@ mod tests {
         // Give the echo server + the forwarder's own recv loop a moment.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
+        // M3 Pass 8 closeout: `forward_from_source` now wraps the outbound
+        // send in a relay envelope (`yadorilink_transport::wrap_relay_
+        // envelope`) before it ever reaches the wire -- the echo server
+        // mirrors back exactly what it received, so the REPLY this
+        // forwarder relays to `sink` is the WRAPPED bytes, not the raw
+        // payload. This is unique to this test's echo-server double: a
+        // real destination peer never echoes B's own envelope back --
+        // it sends its own genuinely raw WireGuard reply, unwrapped
+        // (see `relay_failover.rs`'s own real-WireGuard-peer tests in
+        // `yadorilink-transport` for that side).
+        let expected =
+            yadorilink_transport::wrap_relay_envelope(session_id, b"hello from A");
         let data = sink.data.lock().unwrap().clone();
-        assert_eq!(data, vec![(session_id, b"hello from A".to_vec())]);
+        assert_eq!(data, vec![(session_id, expected)]);
     }
 
     #[tokio::test]
