@@ -514,6 +514,19 @@ pub struct DaemonState {
     /// outside test builds -- see this field's own `cfg`.
     #[cfg(any(test, feature = "test-support"))]
     pub test_placeholder_pipeline_connected: Mutex<Option<bool>>,
+    /// Test-only override consulted FIRST by `impl RelaySessionHandler for
+    /// DaemonState` (`relay_session_handler.rs`) -- `None` (the default)
+    /// leaves the real admission/forwarding pipeline wired in. Lets a test
+    /// give one specific device's own `PeerSyncSession`s a recording/
+    /// observing handler (e.g. the relay REQUESTER side, "A", which has
+    /// no production consumer of its own relayed replies yet -- that
+    /// wiring is Pass 6's job, not this mechanism's) without touching any
+    /// other device's real behavior. Not reachable outside test builds --
+    /// see this field's own `cfg`, mirroring `test_placeholder_pipeline_
+    /// connected`'s own reasoning exactly.
+    #[cfg(any(test, feature = "test-support"))]
+    pub test_relay_session_handler:
+        Mutex<Option<Arc<dyn yadorilink_peer_session::peer_session::RelaySessionHandler>>>,
     /// Absolute paths a shell-extension client has asked to pause
     /// individually via `ContextAction::PauseItem` — finer-grained than
     /// the whole-link pause in `SyncState`, and deliberately in-memory
@@ -1076,6 +1089,8 @@ impl DaemonState {
             test_root_commit_authorities: Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "test-support"))]
             test_placeholder_pipeline_connected: Mutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            test_relay_session_handler: Mutex::new(None),
             paused_paths: Mutex::new(HashSet::new()),
             telemetry: Arc::new(crate::runtime_telemetry::RuntimeTelemetry::new(status_push_tx)),
             forward_tx,

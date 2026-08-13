@@ -97,6 +97,30 @@ impl RelayForwarder {
         self.sessions.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
+    /// Test-only: an arbitrary currently-active session id, for a test
+    /// that only ever has one relay session open at a time and has no
+    /// other way to learn the id the forwarder itself assigned (in
+    /// production, that id arrives over the wire via `RelayOpened` --
+    /// this is a white-box shortcut, not a stand-in for that).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn any_active_session_id(&self) -> Option<u64> {
+        self.sessions.lock().unwrap_or_else(|p| p.into_inner()).keys().next().copied()
+    }
+
+    /// Test-only: total bytes forwarded so far on `session_id` (both
+    /// directions combined -- mirrors `bytes_forwarded`'s own accounting),
+    /// so a test can confirm a `forward_from_source` call actually reached
+    /// the destination-bound socket, without needing the destination to
+    /// meaningfully reply.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn session_bytes_forwarded(&self, session_id: u64) -> Option<u64> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&session_id)
+            .map(|h| h.bytes_forwarded.load(Ordering::Relaxed))
+    }
+
     /// Opens a new relay session toward `destination_addr`, valid until
     /// `expires_at_unix` (mirroring the admitting grant's own expiry --
     /// this forwarder enforces it independently, never trusting the

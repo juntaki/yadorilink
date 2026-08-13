@@ -52,6 +52,24 @@ impl RelaySessionHandler for DaemonState {
         reply_sink: Arc<dyn RelayReplySink>,
     ) -> Pin<Box<dyn Future<Output = RelayOpenedFrame> + Send + 'a>> {
         Box::pin(async move {
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                // The `MutexGuard` must not live across the `.await`
+                // below -- cloning into this local binding first (rather
+                // than matching directly on the locked expression) drops
+                // it immediately, before any `.await` point.
+                let test_handler = self
+                    .test_relay_session_handler
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                if let Some(test_handler) = test_handler {
+                    return test_handler
+                        .handle_relay_open(open, authenticated_peer_device_id, reply_sink)
+                        .await;
+                }
+            }
+
             let grant_id = open.grant_id.clone();
             let denied = |grant_id: String| RelayOpenedFrame { grant_id, granted: false, session_id: 0 };
 
@@ -156,6 +174,18 @@ impl RelaySessionHandler for DaemonState {
         data: RelayDataFrame,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                let test_handler = self
+                    .test_relay_session_handler
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                if let Some(test_handler) = test_handler {
+                    return test_handler.handle_relay_data(data).await;
+                }
+            }
+
             // An unknown session id (never granted, or already closed) is
             // dropped silently -- see `RelayData`'s own `.proto` doc
             // comment for why: replying to a probe for a session id an
@@ -173,6 +203,18 @@ impl RelaySessionHandler for DaemonState {
         close: RelayCloseFrame,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                let test_handler = self
+                    .test_relay_session_handler
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                if let Some(test_handler) = test_handler {
+                    return test_handler.handle_relay_close(close).await;
+                }
+            }
+
             self.relay_forwarder.close_session(close.session_id, "requester_closed");
         })
     }

@@ -3734,6 +3734,23 @@ impl PeerSyncSession {
         }
     }
 
+    /// M3 Pass 5: sends a `RelayOpen` over this channel -- the requester
+    /// ("A") side of the relay protocol. The peer on the other end of
+    /// THIS channel is the one being asked to relay ("B"); its own
+    /// `RelaySessionHandler` decides whether to grant it and, if so,
+    /// replies with `RelayOpened` (dispatched by `handle_message`'s own
+    /// `RelayOpened` arm -- currently a no-op there, since this crate has
+    /// no requester-side session bookkeeping of its own; correlating a
+    /// sent grant_id to its eventual `RelayOpened`/subsequent `RelayData`
+    /// is the caller's job today, via whatever `RelaySessionHandler` it
+    /// installed on ITS OWN session for the reply direction).
+    pub async fn send_relay_open(
+        &self,
+        open: yadorilink_sync_wire::RelayOpenFrame,
+    ) -> Result<(), PeerSessionError> {
+        self.send_frame(yadorilink_sync_wire::OutboundFrame::RelayOpen(open)).await
+    }
+
     /// Pairs `record` with its own symlink/exec-bit/authoring metadata for
     /// the local materialization-repair path (`reconcile_local_
     /// materialization_audit` / `rematerialize_local_records`): `record`
