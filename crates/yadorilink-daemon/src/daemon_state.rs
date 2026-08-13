@@ -369,6 +369,20 @@ pub struct DaemonState {
     /// destination`'s own doc comment for why that check specifically
     /// forbids relay chaining).
     direct_channels: Mutex<HashMap<String, Arc<yadorilink_transport::PeerChannel>>>,
+    /// M3 Pass 5: device_id -> relay session ids THIS device (as relay)
+    /// currently has open toward that destination -- see `remove_direct_
+    /// channel`'s own doc comment for why (closing a relay session
+    /// promptly when its destination's direct route is lost, rather than
+    /// leaving it to the forwarder's own idle timeout). Known limitation,
+    /// not yet worth the added plumbing to close: an entry for a session
+    /// that closes NORMALLY (idle timeout, grant expiry, explicit close)
+    /// -- as opposed to via THIS route-loss path -- is only pruned the
+    /// NEXT time that same destination's route is also lost, not
+    /// immediately; `RelayForwarder`'s own internal actor exit has no
+    /// callback into `DaemonState` today. Bounded in practice by how
+    /// often peer connections churn, not unbounded within a single
+    /// session's own lifetime.
+    relay_sessions_by_destination: Mutex<HashMap<String, Vec<u64>>>,
     /// M3 Pass 5: this device's own local configuration of whether it is
     /// willing to relay for other peers -- see `crate::route::
     /// RelayCapability`'s own doc comment. Defaults to `false` (the
@@ -1071,6 +1085,7 @@ impl DaemonState {
             relay_forwarder: Arc::new(crate::relay_forwarder::RelayForwarder::new()),
             relay_replay_guard: crate::relay_session::RelayReplayGuard::new(),
             direct_channels: Mutex::new(HashMap::new()),
+            relay_sessions_by_destination: Mutex::new(HashMap::new()),
             local_relay_capable: std::sync::atomic::AtomicBool::new(false),
             device_signing_key: Mutex::new(None),
             peer_netmap_metadata: Mutex::new(PeerNetmapMetadata::default()),
@@ -1319,6 +1334,43 @@ impl DaemonState {
 
     pub(crate) fn remove_direct_channel(&self, device_id: &str) {
         self.direct_channels.lock().unwrap_or_else(|p| p.into_inner()).remove(device_id);
+        // M3 Pass 5: cleanup on route loss -- any relay session THIS
+        // device (as relay) currently has open toward `device_id` no
+        // longer has a real direct path to forward through (`device_id`
+        // disconnected, was revoked, or its channel lost the ABA race on
+        // a reconnect -- any of `remove_direct_channel`'s own callers).
+        // Closed immediately here rather than left to the forwarder's own
+        // idle timeout, which would otherwise keep a now-meaningless
+        // session (and its slot) alive for up to a minute after the route
+        // it depends on is already gone.
+        let session_ids: Vec<u64> = self
+            .relay_sessions_by_destination
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(device_id)
+            .unwrap_or_default();
+        for session_id in session_ids {
+            self.relay_forwarder.close_session(session_id, "destination_route_lost");
+        }
+    }
+
+    /// M3 Pass 5: records that this device's relay session `session_id`
+    /// forwards toward `destination_device_id` -- see `remove_direct_
+    /// channel`'s own doc comment for why this exists (the forwarder
+    /// itself tracks sessions by id and raw address only, not by device
+    /// id, so this is the mapping that lets a channel teardown find and
+    /// close the relay sessions that depended on it).
+    pub(crate) fn record_relay_session_destination(
+        &self,
+        session_id: u64,
+        destination_device_id: &str,
+    ) {
+        self.relay_sessions_by_destination
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(destination_device_id.to_string())
+            .or_default()
+            .push(session_id);
     }
 
     /// `device_id`'s live direct channel, if this device currently has
