@@ -936,15 +936,32 @@ async fn run_one_io_turn(
 
 /// Handles one demultiplexed inbound datagram, updating direct-path liveness.
 /// A [`DatagramKind::Direct`] datagram was routed here by WireGuard receiver
-/// index, so it unquestionably belongs to this channel and refreshes liveness
-/// regardless of whether it decrypted (a keepalive that fails to decrypt still
-/// proves the peer is sending to us on this path). A
-/// [`DatagramKind::HandshakeProbe`] was offered to every channel, so it only
-/// counts as ours — and only refreshes liveness — if it authenticated.
+/// index, so it unquestionably belongs to this channel's SESSION and refreshes
+/// liveness regardless of whether it decrypted (a keepalive that fails to
+/// decrypt still proves the peer is sending to us on this path) -- but ONLY
+/// while no direct address is confirmed yet. A [`DatagramKind::HandshakeProbe`]
+/// was offered to every channel, so it only counts as ours -- and only
+/// refreshes liveness -- if it authenticated.
+///
+/// M3 Pass 8 (final-gate review finding, High): once a direct path IS
+/// confirmed, liveness refreshes ONLY from traffic that actually arrived
+/// FROM that confirmed address specifically -- receiver-index demux routes
+/// a datagram to this channel by SESSION, not by source address, so a
+/// relay-forwarded datagram for this same peer (genuinely arriving via
+/// ordinary UDP from a relaying peer's forwarding socket, exactly like
+/// `ConnectedRelay`'s own doc comment describes) would otherwise ALSO
+/// satisfy `kind == DatagramKind::Direct` and silently keep a DEAD direct
+/// path looking alive forever, permanently masking failover in this
+/// direction -- the destination side's own equivalent of the requester-side
+/// bug `last_relay_rx` was split out to fix.
 async fn handle_inbound(state: &mut ActorState, inbound: InboundDatagram) {
     let InboundDatagram { data, from, kind } = inbound;
     let authenticated = handle_datagram(state, &data, Some(from)).await;
-    if kind == DatagramKind::Direct || authenticated {
+    let refreshes_confirmed_direct_liveness = match state.confirmed_direct_addr {
+        Some(confirmed) => from == confirmed,
+        None => kind == DatagramKind::Direct || authenticated,
+    };
+    if refreshes_confirmed_direct_liveness {
         state.last_direct_rx = Some(Instant::now());
     }
 }

@@ -173,7 +173,16 @@ impl RelayForwarder {
             }
         };
 
-        let std_socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+        // M3 Pass 8 (final-gate finding): bind matches `destination_addr`'s
+        // OWN address family -- an IPv4-UNSPECIFIED socket refuses
+        // `connect()` to an IPv6 destination (a real, silent admission
+        // failure for any confirmed IPv6-only B->C direct route; every
+        // existing test only ever used 127.0.0.1).
+        let bind_addr: std::net::SocketAddr = match destination_addr {
+            SocketAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+            SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+        };
+        let std_socket = std::net::UdpSocket::bind(bind_addr)
             .map_err(|e| RelayForwarderError::SocketSetup(e.to_string()))?;
         std_socket
             .set_nonblocking(true)

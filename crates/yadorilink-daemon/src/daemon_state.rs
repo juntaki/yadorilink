@@ -271,6 +271,11 @@ struct RelaySessionRecord {
 struct RequesterRelaySession {
     relay_device_id: String,
     destination_peer_public: [u8; 32],
+    /// Mirrors the admitting grant's own expiry -- see `record_requester_
+    /// relay_session`'s own doc comment for why this device tracks it
+    /// independently rather than trusting B's `RelayClose` to always
+    /// arrive.
+    expires_at_unix: i64,
     opened_via: std::sync::Weak<yadorilink_peer_session::peer_session::PeerSyncSession>,
 }
 
@@ -428,8 +433,10 @@ pub struct DaemonState {
     /// provider-side path, so a reply this device's own `RelayCarrier` is
     /// waiting on is routed into the right `PeerChannel` via `deliver_
     /// relay_datagram` instead of being mistaken for a forward request
-    /// this device never opened.
-    requester_relay_sessions: Mutex<HashMap<u64, RequesterRelaySession>>,
+    /// this device never opened. Keyed by `(relay_device_id, session_id)`,
+    /// not `session_id` alone -- see `requester_relay_session`'s own doc
+    /// comment for the cross-relay session-id collision this closes.
+    requester_relay_sessions: Mutex<HashMap<(String, u64), RequesterRelaySession>>,
     /// M3 Pass 6: `grant_id -> ` the oneshot this device's own
     /// `RelayCarrier::send_via_relay` is waiting on for the matching
     /// `RelayOpenedFrame` reply, plus the device_id the matching `RelayOpen`
@@ -1580,7 +1587,8 @@ impl DaemonState {
         &self,
         destination_peer_public: &[u8; 32],
     ) -> Option<u64> {
-        self.requester_relay_session_for_destination(destination_peer_public).map(|(id, _)| id)
+        self.requester_relay_session_for_destination(destination_peer_public, now_unix())
+            .map(|(id, _)| id)
     }
 
     pub(crate) fn relay_grant_source(
@@ -1620,7 +1628,28 @@ impl DaemonState {
             if relay_device_id == &self.device_id || relay_device_id == destination_device_id {
                 continue;
             }
-            if !self.peers.has_session(relay_device_id) {
+            // M3 Pass 8 (final-gate review finding, High): a live SESSION
+            // to the candidate says nothing about whether the underlying
+            // `PeerChannel` to it is itself direct -- without this check,
+            // if this device's OWN path to `relay_device_id` is itself
+            // `ConnectedRelay` (through some other device D), a session
+            // opened "through" it would actually chain A->D->B->C: every
+            // local admission check on B still passes (B sees an
+            // authenticated peer and a direct B->C route), because
+            // nothing carries provenance that the frames arriving from A
+            // were themselves already relayed before reaching B. Requiring
+            // `Connected(RouteKind::Direct)` specifically -- not merely
+            // "connected" -- is what `relay_session::RelayAdmissionContext
+            // ::has_direct_route_to_destination`'s own doc comment already
+            // enforces on B's side for the B->C leg; this is the identical
+            // requirement for the A->B leg, closing the one hop that
+            // wasn't checked.
+            if !matches!(
+                self.peers.reachability(relay_device_id),
+                Some(crate::peer_registry::PeerReachability::Connected(
+                    crate::route::RouteKind::Direct
+                ))
+            ) {
                 continue;
             }
             let relay_groups = groups_of(relay_device_id);
@@ -1643,19 +1672,28 @@ impl DaemonState {
     /// M3 Pass 6: records that session `session_id`, opened by THIS device
     /// as relay REQUESTER via `relay_device_id`, carries traffic for
     /// `destination_peer_public` -- see `requester_relay_sessions`'s own
-    /// doc comment.
+    /// doc comment. `expires_at_unix` mirrors the admitting grant's own
+    /// expiry (independent-review, final-gate finding): B's forwarder
+    /// enforces its own expiry independently and closes on its own, but
+    /// its one-shot `RelayClose` frame can be lost (a dropped/full
+    /// `try_send`, or the A<->B session itself briefly backed up) with no
+    /// retry -- without also tracking the expiry HERE, a lost close would
+    /// let this device reuse (and report success for) a session B has
+    /// already forgotten, forever.
     pub(crate) fn record_requester_relay_session(
         &self,
         session_id: u64,
         relay_device_id: String,
         destination_peer_public: [u8; 32],
+        expires_at_unix: i64,
         opened_via: &Arc<yadorilink_peer_session::peer_session::PeerSyncSession>,
     ) {
         self.requester_relay_sessions.lock().unwrap_or_else(|p| p.into_inner()).insert(
-            session_id,
+            (relay_device_id.clone(), session_id),
             RequesterRelaySession {
                 relay_device_id,
                 destination_peer_public,
+                expires_at_unix,
                 opened_via: Arc::downgrade(opened_via),
             },
         );
@@ -1664,29 +1702,32 @@ impl DaemonState {
     /// An existing requester-opened session already carrying traffic for
     /// `destination_peer_public`, if this device has one AND the
     /// `PeerSyncSession` it was opened over is still the live one (see
-    /// `RequesterRelaySession::opened_via`'s own doc comment) -- `send_
-    /// via_relay` reuses it rather than opening a new one per datagram. A
-    /// stale entry (the relay connection was replaced since this session
-    /// opened) is removed here rather than left for a later caller to
-    /// rediscover the same staleness.
+    /// `RequesterRelaySession::opened_via`'s own doc comment) AND it
+    /// hasn't outlived its own recorded grant expiry -- `send_via_relay`
+    /// reuses it rather than opening a new one per datagram. A stale
+    /// entry (the relay connection was replaced since this session
+    /// opened, or the grant has expired) is removed here rather than left
+    /// for a later caller to rediscover the same staleness.
     pub(crate) fn requester_relay_session_for_destination(
         &self,
         destination_peer_public: &[u8; 32],
+        now_unix: i64,
     ) -> Option<(u64, String)> {
         let mut sessions = self.requester_relay_sessions.lock().unwrap_or_else(|p| p.into_inner());
-        let (session_id, record) = sessions
+        let (key, record) = sessions
             .iter()
             .find(|(_, s)| &s.destination_peer_public == destination_peer_public)
-            .map(|(id, s)| (*id, s.clone()))?;
-        let still_live = record.opened_via.upgrade().is_some_and(|session| {
-            self.peers
-                .session(&record.relay_device_id)
-                .is_some_and(|current| Arc::ptr_eq(&session, &current))
-        });
+            .map(|(key, s)| (key.clone(), s.clone()))?;
+        let still_live = now_unix < record.expires_at_unix
+            && record.opened_via.upgrade().is_some_and(|session| {
+                self.peers
+                    .session(&record.relay_device_id)
+                    .is_some_and(|current| Arc::ptr_eq(&session, &current))
+            });
         if still_live {
-            Some((session_id, record.relay_device_id))
+            Some((key.1, record.relay_device_id))
         } else {
-            sessions.remove(&session_id);
+            sessions.remove(&key);
             None
         }
     }
@@ -1695,19 +1736,33 @@ impl DaemonState {
     /// through, and its destination -- used to route an inbound
     /// `RelayData`/close for this session id (this device receiving its
     /// own relay's reply) rather than mistaking it for a forward request.
+    /// Keyed by `(relay_device_id, session_id)`, NOT `session_id` alone
+    /// (independent-review, final-gate finding): each relay assigns
+    /// session ids from its OWN independent counter starting at 1, so two
+    /// DIFFERENT relays this device is simultaneously using as requester
+    /// routinely hand back the identical number -- a bare `u64` key would
+    /// let the second `record_requester_relay_session` silently overwrite
+    /// the first device's entry. `relay_device_id` -- already known by the
+    /// caller as `authenticated_peer_device_id`, the identity of whichever
+    /// session this frame physically arrived on -- makes the lookup exact
+    /// rather than an ownership check performed after the fact.
     pub(crate) fn requester_relay_session(
         &self,
+        relay_device_id: &str,
         session_id: u64,
-    ) -> Option<(String, [u8; 32])> {
+    ) -> Option<[u8; 32]> {
         self.requester_relay_sessions
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(&session_id)
-            .map(|s| (s.relay_device_id.clone(), s.destination_peer_public))
+            .get(&(relay_device_id.to_string(), session_id))
+            .map(|s| s.destination_peer_public)
     }
 
-    pub(crate) fn forget_requester_relay_session(&self, session_id: u64) {
-        self.requester_relay_sessions.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id);
+    pub(crate) fn forget_requester_relay_session(&self, relay_device_id: &str, session_id: u64) {
+        self.requester_relay_sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(relay_device_id.to_string(), session_id));
     }
 
     /// M3 Pass 6: registers a oneshot to be resolved by the matching

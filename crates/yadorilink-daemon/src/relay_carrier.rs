@@ -79,8 +79,11 @@ impl yadorilink_transport::RelayCarrier for DaemonState {
             // B's forwarder has no way to learn about, so reusing a stale
             // one would silently drop every future datagram while still
             // reporting success), removing the entry itself if not.
-            if let Some((session_id, relay_device_id)) =
-                self.requester_relay_session_for_destination(peer_public)
+            if let Some((session_id, relay_device_id)) = self
+                .requester_relay_session_for_destination(
+                    peer_public,
+                    crate::daemon_state::now_unix(),
+                )
             {
                 if let Some(session) = self.peers.session(&relay_device_id) {
                     session.send_relay_data(session_id, datagram.to_vec());
@@ -157,6 +160,7 @@ impl yadorilink_transport::RelayCarrier for DaemonState {
                     opened.session_id,
                     relay_device_id,
                     *peer_public,
+                    grant.expires_at_unix,
                     &session,
                 );
                 session.send_relay_data(opened.session_id, datagram.to_vec());
