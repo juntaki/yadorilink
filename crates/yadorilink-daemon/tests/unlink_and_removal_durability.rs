@@ -559,6 +559,12 @@ async fn unlink_force_proceeds_without_a_lease_and_latches_durability_unknown() 
         .await;
 
     let (_a, b, socket_path) = unlink_setup(&server, true, false).await;
+    // M4: `Healthy` now requires a fresh peer-confirmed custody check
+    // (`DurabilityConfirmationJob`'s sweep, normally run periodically in
+    // the background) rather than this device's own local materialization
+    // state alone -- force one round synchronously so the sanity check
+    // below doesn't race the background sweep's own cadence.
+    b.state.refresh_custody_confirmation(GROUP).await;
     assert_eq!(
         b.state.group_durability_status(GROUP),
         GroupDurabilityStatus::Healthy,
@@ -660,6 +666,9 @@ async fn unlink_force_proceeds_without_config_and_latches_durability_unknown() {
         .await;
 
     let (_a, b, socket_path) = unlink_setup(&server, false, false).await;
+    // M4: see the identical comment in
+    // `unlink_force_proceeds_without_a_lease_and_latches_durability_unknown`.
+    b.state.refresh_custody_confirmation(GROUP).await;
     assert_eq!(
         b.state.group_durability_status(GROUP),
         GroupDurabilityStatus::Healthy,

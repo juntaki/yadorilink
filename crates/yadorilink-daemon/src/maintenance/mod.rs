@@ -24,6 +24,7 @@
 
 pub(crate) mod degraded_link_recheck;
 pub(crate) mod disk_reconcile_backstop;
+pub(crate) mod durability_confirmation;
 pub(crate) mod gc_idle;
 pub(crate) mod materialization_repair;
 pub(crate) mod membership_recovery;
@@ -41,7 +42,7 @@ pub(crate) mod update_check;
 /// own run both go through the same `run_once`" unification visible at
 /// each call site instead of implicit.
 ///
-/// No `Wake`/`Manual` variant: nothing among this daemon's 7 extracted
+/// No `Wake`/`Manual` variant: nothing among this daemon's extracted
 /// jobs is triggered by either today (every one of them is either a pure
 /// interval loop or an interval loop with one immediate run at startup),
 /// and adding unused variants speculatively would be exactly the kind of

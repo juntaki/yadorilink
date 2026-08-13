@@ -60,19 +60,48 @@ impl ReplicaRoleRepository for SyncStateReplicaRoleRepository {
         local_path: &str,
         expected_digest: [u8; 32],
     ) -> Result<bool, SyncError> {
-        self.state
+        let removed = self
+            .state
             .replica_coordinator
             .link_repository()
             .recheck_digest_then_remove_link(group_id, local_path, expected_digest)
-            .map_err(SyncError::from)
+            .map_err(SyncError::from)?;
+        if removed {
+            self.state.clear_custody_confirmation(group_id);
+        }
+        Ok(removed)
     }
 
     fn remove_link(&self, local_path: &str) -> Result<(), SyncError> {
+        // Look up this link's group_id before it's gone, so a stale
+        // custody confirmation cached for it can't be reused by a later
+        // relink of the same group -- see `clear_custody_confirmation`'s
+        // own doc comment. A `list_links` failure here just means the
+        // cache entry (if any) is left uncleared -- it still self-heals
+        // via the staleness bound and membership-generation check, but log
+        // it loudly rather than swallowing it, since a stale window is a
+        // real (if bounded) truthfulness gap.
+        let group_id = match self.state.replica_coordinator.link_repository().list_links() {
+            Ok(links) => links.into_iter().find(|l| l.local_path == local_path).map(|l| l.group_id),
+            Err(e) => {
+                tracing::warn!(
+                    local_path,
+                    error = %e,
+                    "remove_link: list_links failed, cannot clear this group's custody \
+                     confirmation cache entry (will self-heal via staleness bound)"
+                );
+                None
+            }
+        };
         self.state
             .replica_coordinator
             .link_repository()
             .remove_link(local_path)
-            .map_err(SyncError::from)
+            .map_err(SyncError::from)?;
+        if let Some(group_id) = group_id {
+            self.state.clear_custody_confirmation(&group_id);
+        }
+        Ok(())
     }
 
     fn set_materialization_policy(
