@@ -271,6 +271,31 @@ impl PeerSyncSession {
         self.inner.set_full_index_resync_interval(value);
     }
 
+    /// M3 Pass 5: sends a `RelayOpen` over this channel, asking the peer
+    /// on the other end to act as relay -- see `InnerPeerSyncSession::
+    /// send_relay_open`'s own doc comment.
+    pub async fn send_relay_open(
+        &self,
+        open: yadorilink_sync_wire::RelayOpenFrame,
+    ) -> Result<(), PeerSessionError> {
+        self.inner.send_relay_open(open).await
+    }
+
+    /// M3 Pass 5: sends a `RelayData` over this channel -- used by BOTH
+    /// directions of the relay protocol: the requester ("A") sending a
+    /// datagram toward the destination through this relay, and (via
+    /// `RelayReplySink`, `self.inner`'s own trait impl) the relay itself
+    /// forwarding a reply back. Exposed on the wrapper so a requester can
+    /// drive its own outbound side directly, symmetric with `send_relay_
+    /// open` above.
+    pub fn send_relay_data(&self, session_id: u64, payload: Vec<u8>) {
+        RelayReplySink::send_relay_data(&*self.inner, session_id, payload);
+    }
+
+    pub fn send_relay_close(&self, session_id: u64, reason: &str) {
+        RelayReplySink::send_relay_close(&*self.inner, session_id, reason);
+    }
+
     fn validate_exact_peer_config(
         config: &yadorilink_sync_wire::ClusterConfigFrame,
     ) -> Result<(), PeerSessionError> {
