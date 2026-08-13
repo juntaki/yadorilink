@@ -1548,6 +1548,26 @@ impl DaemonState {
         self.direct_channels.lock().unwrap_or_else(|p| p.into_inner()).get(device_id).cloned()
     }
 
+    /// M3 Pass 8 (final-gate review finding, High -- 2nd round): whether
+    /// this device's OWN path to `device_id` is CURRENTLY a confirmed
+    /// direct `PeerChannel`, read from the live channel object itself
+    /// (`direct_channel` above) rather than `self.peers.reachability()`
+    /// -- see `relay_candidates`'s own doc comment for why that
+    /// distinction matters here specifically: the registry is only an
+    /// asynchronously-updated mirror of this exact same channel's own
+    /// watch channel, so it can briefly still report a route that has
+    /// already changed. Used by both relay-candidate SELECTION and
+    /// immediately before actually sending, in `relay_carrier.rs`, to
+    /// keep the window between the two as narrow as this call's own cost.
+    pub(crate) fn is_directly_reachable(&self, device_id: &str) -> bool {
+        self.direct_channel(device_id).is_some_and(|channel| {
+            matches!(
+                channel.reachability(),
+                yadorilink_transport::PeerReachability::Connected { .. }
+            )
+        })
+    }
+
     /// The device_id that owns the channel whose WireGuard static public
     /// key is `peer_public` -- the reverse of `direct_channel` above. A
     /// linear scan over `direct_channels` rather than a second
@@ -1628,28 +1648,32 @@ impl DaemonState {
             if relay_device_id == &self.device_id || relay_device_id == destination_device_id {
                 continue;
             }
-            // M3 Pass 8 (final-gate review finding, High): a live SESSION
-            // to the candidate says nothing about whether the underlying
-            // `PeerChannel` to it is itself direct -- without this check,
+            // M3 Pass 8 (final-gate review finding, High -- 2nd round):
+            // requires the underlying `PeerChannel` to `relay_device_id`
+            // to be itself direct, not merely "connected" -- without this,
             // if this device's OWN path to `relay_device_id` is itself
             // `ConnectedRelay` (through some other device D), a session
             // opened "through" it would actually chain A->D->B->C: every
             // local admission check on B still passes (B sees an
-            // authenticated peer and a direct B->C route), because
-            // nothing carries provenance that the frames arriving from A
-            // were themselves already relayed before reaching B. Requiring
-            // `Connected(RouteKind::Direct)` specifically -- not merely
-            // "connected" -- is what `relay_session::RelayAdmissionContext
-            // ::has_direct_route_to_destination`'s own doc comment already
-            // enforces on B's side for the B->C leg; this is the identical
-            // requirement for the A->B leg, closing the one hop that
-            // wasn't checked.
-            if !matches!(
-                self.peers.reachability(relay_device_id),
-                Some(crate::peer_registry::PeerReachability::Connected(
-                    crate::route::RouteKind::Direct
-                ))
-            ) {
+            // authenticated peer and a direct B->C route), with no
+            // provenance that A's frames were already relayed before
+            // reaching B. This is the identical requirement `relay_
+            // session::RelayAdmissionContext::has_direct_route_to_
+            // destination`'s own doc comment already enforces on B's side
+            // for the B->C leg.
+            //
+            // Reads the LIVE `PeerChannel` (`is_directly_reachable`), not
+            // `self.peers.reachability()` -- the first review round's own
+            // fix used that daemon-level registry, which is only an
+            // ASYNCHRONOUSLY updated mirror of the channel's own watch
+            // channel (`poll_reachability`'s own background task is what
+            // copies one into the other), so a route that had just
+            // flipped away from Direct could still read as Direct here
+            // for one mirror-propagation cycle. `direct_channel` is the
+            // same `Arc<PeerChannel>` `send_via_relay` itself sends over
+            // moments later, so this reads the exact object whose state
+            // actually matters, not a lagging copy of it.
+            if !self.is_directly_reachable(relay_device_id) {
                 continue;
             }
             let relay_groups = groups_of(relay_device_id);
