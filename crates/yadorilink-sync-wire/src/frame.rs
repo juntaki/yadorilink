@@ -226,6 +226,58 @@ pub struct BlockReplyFrame {
     pub request_id: u64,
 }
 
+/// M3 Pass 5: a serialized `relay_grant::RelayGrant`, opening a relay
+/// session with the RECEIVING device acting as relay. Plain field mirror
+/// of every wire field -- the receiving side's `relay_session::
+/// admit_relay_open` independently re-verifies every one of these against
+/// its own live state, so nothing here is pre-validated or trimmed the
+/// way other inbound frames sometimes are. Same shape on both directions
+/// (the sender always sets every field the receiver reads), so `Outbound
+/// Frame` reuses this type directly rather than a dedicated `*Outbound
+/// Frame` -- see `OutboundFrame`'s own doc comment for that convention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayOpenFrame {
+    pub version: u32,
+    pub grant_id: String,
+    pub group_id: String,
+    pub source_device_id: String,
+    pub relay_device_id: String,
+    pub destination_device_id: String,
+    pub not_before_unix: i64,
+    pub expires_at_unix: i64,
+    /// `0` means "no plane-issued cap" (`RelayGrant.max_session_bytes:
+    /// None`) -- mirrors the wire message's own convention.
+    pub max_session_bytes: u64,
+    pub signature: Vec<u8>,
+}
+
+/// M3 Pass 5: the relay's answer to `RelayOpenFrame`. `granted = false`
+/// covers every admission failure uniformly -- see the `.proto` message's
+/// own doc comment for why the wire deliberately does not distinguish
+/// which check failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayOpenedFrame {
+    pub grant_id: String,
+    pub granted: bool,
+    pub session_id: u64,
+}
+
+/// M3 Pass 5: one opaque, already-encrypted datagram carried through a
+/// relay session. The relay never parses `payload` -- see the `.proto`
+/// message's own doc comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayDataFrame {
+    pub session_id: u64,
+    pub payload: Vec<u8>,
+}
+
+/// M3 Pass 5: ends a relay session before its grant's own expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayCloseFrame {
+    pub session_id: u64,
+    pub reason: String,
+}
+
 /// A decoded inbound wire message, in domain form. Grows one variant per
 /// migrated message family; `Unknown` covers both a genuinely-empty
 /// `SyncMessage.payload` and a forward-incompatible oneof case (a newer
@@ -250,6 +302,10 @@ pub enum InboundFrame {
     HandoffTicketRelease(HandoffTicketReleaseFrame),
     RebootstrapSnapshotRequest(RebootstrapSnapshotRequestFrame),
     RebootstrapSnapshotResponse(RebootstrapSnapshotResponseFrame),
+    RelayOpen(RelayOpenFrame),
+    RelayOpened(RelayOpenedFrame),
+    RelayData(RelayDataFrame),
+    RelayClose(RelayCloseFrame),
     Unknown { message_kind: Option<u32> },
 }
 
@@ -393,4 +449,8 @@ pub enum OutboundFrame {
     HandoffTicketRelease(HandoffTicketReleaseOutboundFrame),
     RebootstrapSnapshotRequest(RebootstrapSnapshotRequestFrame),
     RebootstrapSnapshotResponse(RebootstrapSnapshotResponseFrame),
+    RelayOpen(RelayOpenFrame),
+    RelayOpened(RelayOpenedFrame),
+    RelayData(RelayDataFrame),
+    RelayClose(RelayCloseFrame),
 }

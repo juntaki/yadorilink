@@ -5852,6 +5852,21 @@ impl PeerSyncSession {
                 self.handle_rebootstrap_snapshot_response(resp);
                 Ok(())
             }
+            // M3 Pass 5: the wire message types exist and decode/encode
+            // correctly (`yadorilink-sync-wire`'s own round-trip tests),
+            // but `PeerSyncSession` itself has no admission logic, session
+            // bookkeeping, or forwarding actor wired in yet -- those live
+            // one layer up (`relay_grant`/`relay_session` in
+            // `yadorilink-daemon`, which this crate does not and should
+            // not depend on) and are the remaining Pass 5 integration
+            // step. Safely ignored for now, exactly like `Unknown` below:
+            // a peer that sends one of these to a build that doesn't yet
+            // handle it sees no reply and times out its own request,
+            // never a crash or a malformed response.
+            InboundFrame::RelayOpen(_)
+            | InboundFrame::RelayOpened(_)
+            | InboundFrame::RelayData(_)
+            | InboundFrame::RelayClose(_) => Ok(()),
             // Covers a genuinely empty `SyncMessage.payload` oneof, a peer
             // running a *newer* protocol version that added a oneof
             // variant this build doesn't know about yet, and an old peer

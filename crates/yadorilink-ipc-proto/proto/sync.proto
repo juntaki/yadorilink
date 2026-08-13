@@ -607,6 +607,70 @@ message RebootstrapSnapshotResponse {
   bytes snapshot_bytes = 4;
 }
 
+// M3 Pass 5: opens a relay session with the receiving device acting as
+// relay ("B" in the feature's own design) between `source_device_id`
+// ("A", which MUST be the device authenticated on the channel this
+// message arrives on -- see `relay_session::admit_relay_open`'s own doc
+// comment) and `destination_device_id` ("C"). Every field mirrors
+// `relay_grant::RelayGrant` exactly -- this message IS a serialized
+// grant, nothing more; the receiving device independently re-verifies
+// every one of these fields against its own live state before opening
+// anything (a validly-signed grant is necessary, never sufficient).
+message RelayOpen {
+  uint32 version = 1;
+  string grant_id = 2;
+  string group_id = 3;
+  string source_device_id = 4;
+  string relay_device_id = 5;
+  string destination_device_id = 6;
+  int64 not_before_unix = 7;
+  int64 expires_at_unix = 8;
+  // 0 means "no plane-issued cap" (`RelayGrant.max_session_bytes: None`).
+  uint64 max_session_bytes = 9;
+  bytes signature = 10;
+}
+
+// The relay's answer to `RelayOpen`: either a locally-assigned
+// `session_id` (opaque to the requester, scoped to THIS relay device and
+// THIS one grant_id -- never reused across sessions, never meaningful to
+// any other relay) that `RelayData`/`RelayClose` on this same channel
+// must echo back, or a rejection. `granted = false` covers every
+// admission failure `relay_session::RelayAdmissionError` can produce --
+// deliberately not distinguishing which check failed on the wire (a
+// stolen-grant attempt and a genuinely-expired grant should look
+// identical to whoever is presenting it; the distinguishing detail is
+// this device's own local log, not something to hand back to the
+// requester).
+message RelayOpened {
+  string grant_id = 1;
+  bool granted = 2;
+  uint64 session_id = 3;
+}
+
+// One opaque, already-WireGuard-encrypted datagram, carried between A and
+// the relay's own direct channel to C. The relay never parses, inspects,
+// or modifies `payload` -- it is exactly the bytes one side's `PeerChannel`
+// would otherwise have sent directly to the other over raw UDP.
+// `session_id` is the value `RelayOpened` returned; a relay receiving a
+// `session_id` it does not recognize (never granted, or already closed)
+// silently drops the datagram rather than replying with any signal an
+// attacker probing for valid session ids could use.
+message RelayData {
+  uint64 session_id = 1;
+  bytes payload = 2;
+}
+
+// Ends a relay session before its grant's own `expires_at_unix` --
+// sent by either side (the requester giving up, or the relay itself on
+// idle timeout, resource pressure, or grant expiry). `reason` is a
+// short, stable slug (e.g. "idle_timeout", "grant_expired",
+// "byte_limit_reached", "requester_closed") for diagnostics only, never
+// parsed by the receiving side.
+message RelayClose {
+  uint64 session_id = 1;
+  string reason = 2;
+}
+
 message SyncMessage {
   // Fields 2-3 were `Index full_index` and `IndexUpdate index_update` (the
   // `oneof` cases below), removed with the mtime index-convergence engine
@@ -649,5 +713,9 @@ message SyncMessage {
     RebootstrapSnapshotRequest rebootstrap_snapshot_request = 21;
     RebootstrapSnapshotResponse rebootstrap_snapshot_response = 22;
     BlockReply block_reply = 23;
+    RelayOpen relay_open = 24;
+    RelayOpened relay_opened = 25;
+    RelayData relay_data = 26;
+    RelayClose relay_close = 27;
   }
 }
