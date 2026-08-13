@@ -1530,11 +1530,12 @@ impl DaemonState {
         if !self.is_local_relay_capable() {
             return Err("relay_capability_disabled");
         }
-        let still_direct = matches!(
-            self.peers.reachability(&record.destination_device_id),
-            Some(crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Direct))
-        );
-        if !still_direct {
+        // M3 Pass 8 (closeout, B-side): live-read `is_directly_reachable`,
+        // not `self.peers.reachability()` -- see that method's own doc
+        // comment, and `relay_session_handler.rs`'s admission-time check
+        // for the identical fix on the OPEN-time counterpart of this same
+        // per-datagram revalidation.
+        if !self.is_directly_reachable(&record.destination_device_id) {
             return Err("destination_route_no_longer_direct");
         }
         Ok(())
