@@ -956,7 +956,21 @@ async fn run_one_io_turn(
 /// bug `last_relay_rx` was split out to fix.
 async fn handle_inbound(state: &mut ActorState, inbound: InboundDatagram) {
     let InboundDatagram { data, from, kind } = inbound;
-    let authenticated = handle_datagram(state, &data, Some(from)).await;
+    // M3 Pass 8 closeout: `kind == DatagramKind::Relay` means the demux
+    // itself already proved this datagram arrived via a relay envelope
+    // (`unwrap_relay_envelope`), regardless of its outer UDP source
+    // address -- passed straight through to `handle_datagram`'s confirm
+    // gate so it can NEVER be treated as direct-confirmable, closing the
+    // address-collision gap `from_addr`-only matching had (see
+    // `DatagramKind::Relay`'s own doc comment).
+    let via_relay = kind == DatagramKind::Relay;
+    let authenticated = handle_datagram(state, &data, Some(from), via_relay).await;
+    if via_relay {
+        if authenticated {
+            state.last_relay_rx = Some(Instant::now());
+        }
+        return;
+    }
     let refreshes_confirmed_direct_liveness = match state.confirmed_direct_addr {
         Some(confirmed) => from == confirmed,
         None => kind == DatagramKind::Direct || authenticated,
@@ -977,7 +991,7 @@ async fn handle_inbound(state: &mut ActorState, inbound: InboundDatagram) {
 /// relay traffic silently kept a DEAD confirmed direct path looking
 /// alive forever -- see `last_relay_rx`'s own doc comment).
 async fn handle_relay_inbound(state: &mut ActorState, data: Vec<u8>) {
-    let authenticated = handle_datagram(state, &data, None).await;
+    let authenticated = handle_datagram(state, &data, None, true).await;
     if authenticated {
         state.last_relay_rx = Some(Instant::now());
     }
@@ -1114,6 +1128,7 @@ async fn handle_datagram(
     state: &mut ActorState,
     datagram: &[u8],
     from_addr: Option<SocketAddr>,
+    via_relay: bool,
 ) -> bool {
     // A revoked channel refuses to process anything further, including
     // a datagram that would otherwise be a perfectly valid WireGuard
@@ -1174,9 +1189,24 @@ async fn handle_datagram(
         // — authenticated traffic alone, from an address we never
         // solicited or learned of, isn't enough to adopt as the direct
         // endpoint.
-        if let Some(addr) =
+        //
+        // M3 Pass 8 closeout: `via_relay` short-circuits this to `None`
+        // BEFORE address matching is even attempted -- the demux itself
+        // (`DatagramKind::Relay`, or the synthetic requester-side
+        // injection path) already proved this datagram arrived via a
+        // relay, so its outer UDP source address is never consulted at
+        // all, regardless of whether it happens to coincidentally equal
+        // a known direct candidate for this peer. Closes the address-
+        // collision gap the previous from_addr-only matching had: a
+        // relay-forwarded datagram can no longer be confirmed as direct
+        // just because its relay's ephemeral forwarding-socket address
+        // happened to match an entry in `direct_candidates`.
+        let candidate_match = if via_relay {
+            None
+        } else {
             from_addr.filter(|a| state.direct_candidates.iter().any(|c| c.addr == *a))
-        {
+        };
+        if let Some(addr) = candidate_match {
             tracing::debug!(%addr, "direct candidate confirmed");
             state.confirmed_direct_addr = Some(addr);
             *state.confirmed_addr_shared.lock().unwrap_or_else(|p| p.into_inner()) = Some(addr);
@@ -2051,7 +2081,7 @@ mod tests {
         )
         .await;
 
-        handle_datagram(&mut state, &[0xAAu8; 200], Some(peer_addr())).await;
+        handle_datagram(&mut state, &[0xAAu8; 200], Some(peer_addr()), false).await;
 
         assert!(state.confirmed_direct_addr.is_none());
         assert!(matches!(state.reachability, PeerReachability::Connecting { .. }));
@@ -2076,9 +2106,48 @@ mod tests {
         // No candidates at all — the source address is not among them.
         let mut state = make_state(PeerReachability::Connecting { attempt: 0 }, vec![], None).await;
 
-        handle_datagram(&mut state, &init, Some(peer_addr())).await;
+        handle_datagram(&mut state, &init, Some(peer_addr()), false).await;
 
         assert!(state.confirmed_direct_addr.is_none());
+        assert_eq!(state.reachability, PeerReachability::ConnectedRelay);
+    }
+
+    /// M3 Pass 8 closeout: the address-collision scenario the final-gate
+    /// review's own "opaque forwarding is provably indistinguishable from
+    /// direct" concern was about -- a relay's ephemeral forwarding-socket
+    /// address coincidentally matching an address ALREADY in this peer's
+    /// own `direct_candidates` list. Before `DatagramKind::Relay`/
+    /// `via_relay` existed, this was indistinguishable from a genuine
+    /// direct arrival at the SAME code path, purely by address matching:
+    /// this test deliberately puts the colliding address in `direct_
+    /// candidates` (unlike the test above, which used no candidates at
+    /// all) and proves that a datagram explicitly tagged `via_relay` is
+    /// STILL never confirmed as direct, even though its `from_addr`
+    /// WOULD otherwise satisfy the candidate-membership check.
+    #[tokio::test]
+    async fn relay_tagged_datagram_from_a_colliding_known_candidate_stays_relay() {
+        let local_secret = StaticSecret::from([1u8; 32]);
+        let local_public = PublicKey::from(&local_secret);
+        let peer_secret = StaticSecret::from([2u8; 32]);
+        let mut peer_tunnel = WgTunnel::new(peer_secret, local_public, 1);
+        let init = peer_tunnel.probe().expect("fresh tunnel produces a handshake initiation");
+
+        // The "colliding" address IS a known direct candidate -- this is
+        // exactly what would have wrongly confirmed direct before this
+        // fix, since address-matching alone used to be the only signal.
+        let mut state = make_state(
+            PeerReachability::Connecting { attempt: 0 },
+            vec![coordination_candidate(peer_addr())],
+            None,
+        )
+        .await;
+
+        handle_datagram(&mut state, &init, Some(peer_addr()), true).await;
+
+        assert!(
+            state.confirmed_direct_addr.is_none(),
+            "a relay-tagged datagram must never confirm a direct address, even from a known candidate"
+        );
         assert_eq!(state.reachability, PeerReachability::ConnectedRelay);
     }
 
@@ -2183,7 +2252,7 @@ mod tests {
         )
         .await;
 
-        handle_datagram(&mut state, &init, Some(peer_addr())).await;
+        handle_datagram(&mut state, &init, Some(peer_addr()), false).await;
 
         assert_eq!(state.confirmed_direct_addr, Some(peer_addr()));
         assert!(matches!(state.reachability, PeerReachability::Connected { .. }));
@@ -2208,7 +2277,7 @@ mod tests {
         )
         .await;
 
-        handle_datagram(&mut state, &init, Some(peer_addr())).await;
+        handle_datagram(&mut state, &init, Some(peer_addr()), false).await;
 
         assert_eq!(state.confirmed_direct_addr, Some(peer_addr()));
         assert!(matches!(state.reachability, PeerReachability::Connected { .. }));
@@ -2234,7 +2303,7 @@ mod tests {
         .await;
         state.revoked.store(true, Ordering::Relaxed);
 
-        handle_datagram(&mut state, &init, Some(peer_addr())).await;
+        handle_datagram(&mut state, &init, Some(peer_addr()), false).await;
 
         assert!(state.confirmed_direct_addr.is_none());
         assert!(matches!(state.reachability, PeerReachability::Connecting { .. }));

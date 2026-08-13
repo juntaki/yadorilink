@@ -47,5 +47,7 @@ pub use peer_channel::{
     diff_netmap, NetmapDiff, NetmapSnapshot, PeerChannel, PeerReachability, RelayCarrier,
     UnreachableCategory,
 };
-pub use transport_hub::{DatagramKind, HubStunSocket, InboundDatagram, TransportHub};
+pub use transport_hub::{
+    wrap_relay_envelope, DatagramKind, HubStunSocket, InboundDatagram, TransportHub,
+};
 pub use tunn_wrapper::{IncomingResult, WireGuardEngine};
