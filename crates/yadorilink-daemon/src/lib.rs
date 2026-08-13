@@ -47,6 +47,7 @@ pub mod recovery;
 pub mod recovery_diagnosis;
 pub mod recovery_evidence;
 pub mod recovery_snapshot;
+pub mod relay_grant;
 /// `ReplicaCoordinator` (Phase 7D-10.2) -- see that module's own doc
 /// comment for what it is and why it is additive alongside `SyncState`,
 /// not a replacement for it, in this sub-phase.
