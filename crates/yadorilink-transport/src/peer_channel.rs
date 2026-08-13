@@ -279,6 +279,14 @@ pub struct PeerChannel {
     ///
     /// [`enable_reliable_delivery`]: PeerChannel::enable_reliable_delivery
     reliable_enabled: Arc<AtomicBool>,
+    /// M3 Pass 5: mirrors the actor's own `ActorState::confirmed_direct_addr`
+    /// (same shared-`Arc` pattern as `revoked`) so a caller outside the
+    /// actor -- specifically, this device acting as a Peer Relay, which
+    /// needs C's real address to open its own dedicated forwarding socket
+    /// -- can read the confirmed direct address without a message round
+    /// trip through the actor. `None` whenever no direct path is
+    /// confirmed, exactly mirroring `confirmed_direct_addr` itself.
+    confirmed_addr_shared: Arc<std::sync::Mutex<Option<SocketAddr>>>,
 }
 
 impl PeerChannel {
@@ -321,6 +329,7 @@ impl PeerChannel {
         let revoked = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(Notify::new());
         let reliable_enabled = Arc::new(AtomicBool::new(false));
+        let confirmed_addr_shared = Arc::new(std::sync::Mutex::new(None));
 
         // candidates supplied here come from the caller's
         // coordination-plane netmap (see the doc comment on `connect`'s
@@ -372,6 +381,7 @@ impl PeerChannel {
             reliable_enabled: reliable_enabled.clone(),
             reliable_send: ReliableSend::new(),
             reliable_recv: ReliableRecv::new(),
+            confirmed_addr_shared: confirmed_addr_shared.clone(),
         });
 
         Ok(Self {
@@ -382,6 +392,7 @@ impl PeerChannel {
             revoked,
             shutdown,
             reliable_enabled,
+            confirmed_addr_shared,
         })
     }
 
@@ -439,6 +450,15 @@ impl PeerChannel {
     /// to changes rather than poll [`reachability`](Self::reachability).
     pub fn reachability_watch(&self) -> watch::Receiver<PeerReachability> {
         self.reachability_rx.clone()
+    }
+
+    /// M3 Pass 5: the actual confirmed direct `SocketAddr` for this peer,
+    /// if one is currently confirmed -- `None` whenever `reachability()`
+    /// is not `Connected`. See `confirmed_addr_shared`'s own doc comment
+    /// for why this exists (Peer Relay needs a real address to open its
+    /// own dedicated forwarding socket toward this peer).
+    pub fn confirmed_direct_addr(&self) -> Option<SocketAddr> {
+        *self.confirmed_addr_shared.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Adds a newly-learned direct candidate at runtime — e.g.
@@ -549,6 +569,12 @@ struct ActorState {
     /// Receive-side dedup/ack state, owned solely by this actor task
     /// (see `reliable.rs`).
     reliable_recv: ReliableRecv,
+    /// See [`PeerChannel::confirmed_addr_shared`]'s own doc comment --
+    /// written every place this actor mutates its own `confirmed_direct_
+    /// addr` (never read back from here; this actor's own logic always
+    /// uses its local `confirmed_direct_addr` directly, this shared copy
+    /// exists purely for outside readers).
+    confirmed_addr_shared: Arc<std::sync::Mutex<Option<SocketAddr>>>,
 }
 
 /// Whether one `run_one_io_turn` call decided the actor loop must end.
@@ -922,6 +948,7 @@ async fn handle_datagram(
         {
             tracing::debug!(%addr, "direct candidate confirmed");
             state.confirmed_direct_addr = Some(addr);
+            *state.confirmed_addr_shared.lock().unwrap_or_else(|p| p.into_inner()) = Some(addr);
             state.attempt = 0;
             state.race_started_at = None;
             set_reachability(state, PeerReachability::Connected { path: classify_endpoint(addr) });
@@ -991,6 +1018,7 @@ fn replace_coordination_candidates(state: &mut ActorState, candidates: Vec<Socke
         .is_some_and(|confirmed| !state.direct_candidates.iter().any(|c| c.addr == confirmed))
     {
         state.confirmed_direct_addr = None;
+        *state.confirmed_addr_shared.lock().unwrap_or_else(|p| p.into_inner()) = None;
         state.last_direct_rx = None;
     }
     state.attempt = 0;
@@ -1105,6 +1133,7 @@ fn evaluate_reachability(state: &mut ActorState) {
             // candidate that just proved unreliable, and start a fresh
             // race with the backoff reset.
             state.confirmed_direct_addr = None;
+            *state.confirmed_addr_shared.lock().unwrap_or_else(|p| p.into_inner()) = None;
             state.attempt = 0;
             state.race_started_at = Some(now);
             set_reachability(state, PeerReachability::Connecting { attempt: 0 });
@@ -1260,6 +1289,7 @@ mod tests {
             reliable_enabled: Arc::new(AtomicBool::new(false)),
             reliable_send: ReliableSend::new(),
             reliable_recv: ReliableRecv::new(),
+            confirmed_addr_shared: Arc::new(std::sync::Mutex::new(confirmed)),
         }
     }
 
@@ -1322,6 +1352,7 @@ mod tests {
             reliable_enabled: Arc::new(AtomicBool::new(true)),
             reliable_send: ReliableSend::new(),
             reliable_recv: ReliableRecv::new(),
+            confirmed_addr_shared: Arc::new(std::sync::Mutex::new(None)),
         };
         // Prime a pending ack so `reliable_tick`'s guard is satisfied and
         // `reliable_send_due` has something concrete to send -- observed
