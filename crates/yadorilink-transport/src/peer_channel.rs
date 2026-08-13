@@ -55,6 +55,20 @@ const DIRECT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(20);
 /// candidate but short enough that a genuinely unreachable peer surfaces
 /// quickly.
 const CANDIDATE_RACE_TIMEOUT: Duration = Duration::from_secs(20);
+/// M3 Pass 6 (independent-review finding): how long a relay-routed path
+/// can go without any relay-delivered traffic before it's treated as
+/// dead. Deliberately LONGER than `DIRECT_LIVENESS_TIMEOUT` (20s) even
+/// though the underlying idea is the same -- unlike a confirmed direct
+/// path, a relay path has no independent `DIRECT_PROBE_INTERVAL` probe
+/// keeping it warm (`should_probe`'s probes only ever race `direct_
+/// candidates`, never go through the relay), so the ONLY thing refreshing
+/// this is WireGuard's own ~25s keepalive (`tunn_wrapper::KEEPALIVE_
+/// SECS`) riding over the relay. A 20s timeout shorter than that
+/// keepalive interval would deterministically time out a perfectly
+/// healthy, merely-idle relay path on every cycle, bouncing it through a
+/// full `CANDIDATE_RACE_TIMEOUT` (another 20s) before relay could even
+/// resume -- a real, reproducible ~40s flap, not a theoretical one.
+const RELAY_LIVENESS_TIMEOUT: Duration = Duration::from_secs(35);
 const MAX_OUTBOUND_BATCH: usize = 16;
 const MAX_DIRECT_RECV_BATCH: usize = 16;
 /// How often the actor checks for a due standalone ack and/or a due
@@ -490,6 +504,8 @@ impl PeerChannel {
             direct_candidates: bounded_candidates,
             confirmed_direct_addr: None,
             last_direct_rx: None,
+            last_relay_rx: None,
+            confirmed_relay_addr: None,
             outbound_rx,
             candidate_rx,
             inbound_tx,
@@ -687,6 +703,29 @@ struct ActorState {
     /// socket. `None` means never — used to detect a gone-quiet confirmed
     /// path and trigger re-traversal.
     last_direct_rx: Option<Instant>,
+    /// M3 Pass 6 (independent-review finding): when the last authenticated
+    /// relay-attributed datagram arrived -- deliberately SEPARATE from
+    /// `last_direct_rx`. Before this field existed, `handle_relay_inbound`
+    /// bumped `last_direct_rx` directly, which meant continuing
+    /// relay-delivered traffic silently kept a DEAD confirmed direct path
+    /// looking alive forever (the `Connected` liveness check in `evaluate_
+    /// reachability` never saw it go stale, so outbound traffic stayed
+    /// pinned to the dead direct address and never reached relay
+    /// fallback) -- exactly backwards from the intended failover. `None`
+    /// means never — consulted only by `evaluate_reachability`'s
+    /// `ConnectedRelay` arm.
+    last_relay_rx: Option<Instant>,
+    /// M3 Pass 6 (independent-review finding): the address authenticated
+    /// relay-delivered traffic most recently arrived from over the real
+    /// UDP socket (never set by `handle_relay_inbound`'s synthetic,
+    /// address-less requester-side path) -- lets a REPLY (e.g. this
+    /// device's own WireGuard handshake response to an initiation that
+    /// arrived via a relay) go straight back to the exact relay socket
+    /// that delivered the request, without this device needing its own
+    /// `RelayCarrier`/grant just to answer. Never added to `direct_
+    /// candidates` and never promotes to `Connected` -- see
+    /// `send_batch_direct`'s own doc comment for how this is used.
+    confirmed_relay_addr: Option<SocketAddr>,
     outbound_rx: mpsc::Receiver<Bytes>,
     candidate_rx: mpsc::Receiver<CandidateUpdate>,
     inbound_tx: mpsc::Sender<Vec<u8>>,
@@ -916,15 +955,14 @@ async fn handle_inbound(state: &mut ActorState, inbound: InboundDatagram) {
 /// (`handle_datagram`, called with `from_addr: None`), so the confirm gate
 /// there can never mistake it for a genuine direct candidate address --
 /// `None` fails both of that gate's `from_addr` checks by construction.
-/// `last_direct_rx` is bumped here too (the field now really means "last
-/// authenticated-path traffic of any kind", direct or relay -- see its own
-/// doc comment) so the liveness timeout that already exists for a
-/// confirmed direct path (`evaluate_reachability`'s `Connected` arm)
-/// applies identically to `ConnectedRelay`.
+/// Bumps `last_relay_rx`, NEVER `last_direct_rx` (independent-review
+/// finding: this used to bump `last_direct_rx`, which meant continuing
+/// relay traffic silently kept a DEAD confirmed direct path looking
+/// alive forever -- see `last_relay_rx`'s own doc comment).
 async fn handle_relay_inbound(state: &mut ActorState, data: Vec<u8>) {
     let authenticated = handle_datagram(state, &data, None).await;
     if authenticated {
-        state.last_direct_rx = Some(Instant::now());
+        state.last_relay_rx = Some(Instant::now());
     }
 }
 
@@ -1139,11 +1177,20 @@ async fn handle_datagram(
             // device still doesn't know a usable direct address for this
             // peer, only that *some* path, direct or not, is carrying
             // real traffic.
+            state.last_relay_rx = Some(Instant::now());
             if let Some(addr) = from_addr {
                 tracing::debug!(
                     %addr,
                     "authenticated traffic from an address that is not a known direct candidate; treating as relay-routed"
                 );
+                // M3 Pass 6 (independent-review finding): remembered so a
+                // REPLY this device generates (e.g. its own WireGuard
+                // handshake response) can be sent straight back to the
+                // exact relay socket that delivered the request -- see
+                // `confirmed_relay_addr`'s own doc comment. Deliberately
+                // NOT added to `direct_candidates` and never promotes to
+                // `Connected` from this branch alone.
+                state.confirmed_relay_addr = Some(addr);
             } else {
                 tracing::debug!("authenticated relay-delivered traffic");
             }
@@ -1340,17 +1387,18 @@ fn evaluate_reachability(state: &mut ActorState) {
             state.race_started_at = Some(now);
             set_reachability(state, PeerReachability::Connecting { attempt: 0 });
         }
-        // M3 Pass 6: same liveness-timeout policy as `Connected` above --
-        // `last_direct_rx` is bumped by `handle_relay_inbound` on every
-        // authenticated relay-delivered datagram too (see its own doc
-        // comment), so a relay session that has gone quiet (relay-side
-        // idle timeout, route loss, or the relaying peer disappearing) is
-        // detected the same way a dead direct path is. There is no
-        // `confirmed_direct_addr` to clear here -- `ConnectedRelay` never
-        // sets one.
+        // M3 Pass 6: same liveness-timeout SHAPE as `Connected` above, its
+        // own SEPARATE field and (independent-review finding) a LONGER
+        // timeout -- see `last_relay_rx`/`RELAY_LIVENESS_TIMEOUT`'s own
+        // doc comments for why reusing `last_direct_rx`/`DIRECT_LIVENESS_
+        // TIMEOUT` was wrong (relay traffic corrupting direct's own
+        // liveness) and why 20s is too short here (no independent probe
+        // keeps a relay path warm the way `DIRECT_PROBE_INTERVAL` does
+        // for direct). There is no `confirmed_direct_addr` to clear here
+        // -- `ConnectedRelay` never sets one.
         PeerReachability::ConnectedRelay => {
-            let Some(last_rx) = state.last_direct_rx else { return };
-            if last_rx.elapsed() < DIRECT_LIVENESS_TIMEOUT {
+            let Some(last_rx) = state.last_relay_rx else { return };
+            if last_rx.elapsed() < RELAY_LIVENESS_TIMEOUT {
                 return;
             }
             tracing::warn!(
@@ -1441,38 +1489,60 @@ async fn send_batch_direct(state: &ActorState, datagrams: Vec<Vec<u8>>) {
     if datagrams.is_empty() {
         return;
     }
-    match state.confirmed_direct_addr {
+    if let Some(addr) = state.confirmed_direct_addr {
         // Once a candidate has proven reachable, stop racing and
         // send only there.
-        Some(addr) => {
-            let _ = state.shared.send_batch(&datagrams, addr).await;
-        }
-        // Not yet confirmed: race every candidate with this
-        // datagram too, not just probes, so app data isn't stuck
-        // waiting for a separate probe round-trip to finish first.
-        None => {
-            for candidate in &state.direct_candidates {
-                let _ = state.shared.send_batch(&datagrams, candidate.addr).await;
-            }
-            // M3 Pass 6: direct is always tried first (above, unconditionally
-            // whenever any candidate is known); relay is reached for ONLY
-            // once this peer has already given up on direct for now
-            // (`Unreachable`) or is already using it (`ConnectedRelay`,
-            // kept flowing while direct reprobes in the background via
-            // `should_probe`). Never attempted while still mid-race
-            // (`Connecting`) -- see `RelayCarrier`'s own doc comment for
-            // why this is deliberately best-effort/fire-and-forget.
-            if matches!(
-                state.reachability,
-                PeerReachability::Unreachable { .. } | PeerReachability::ConnectedRelay
-            ) {
-                for datagram in datagrams {
-                    let _ = state
-                        .relay_carrier
-                        .send_via_relay(&state.peer_public_bytes, Bytes::from(datagram))
-                        .await;
-                }
-            }
+        let _ = state.shared.send_batch(&datagrams, addr).await;
+        return;
+    }
+
+    // Not yet confirmed: race every candidate with this datagram too, not
+    // just probes, so app data isn't stuck waiting for a separate probe
+    // round-trip to finish first.
+    for candidate in &state.direct_candidates {
+        let _ = state.shared.send_batch(&datagrams, candidate.addr).await;
+    }
+
+    // M3 Pass 6 (independent-review finding H1): reply straight back to
+    // the exact relay socket that most recently delivered authenticated
+    // traffic FROM this peer, if this device has one -- closes the loop
+    // for a relay-only WireGuard handshake. Without this, this device's
+    // own response to an initiation that arrived via a relay had NO path
+    // back to the relay's forwarding socket at all: that address is
+    // deliberately never added to `direct_candidates` (see `confirmed_
+    // relay_addr`'s own doc comment), so the race above never reaches
+    // it, and `RelayCarrier::send_via_relay` below is the REQUESTER-side
+    // open-a-NEW-session mechanism, not a way to reply to an address this
+    // device already has independent, already-authenticated evidence
+    // for. Raw UDP, the same trust level as the direct-candidate confirm
+    // gate above: this address is only ever set from ALREADY-
+    // authenticated inbound traffic. Tried before the `RelayCarrier`
+    // fallback, and regardless of `state.reachability` (unlike that
+    // fallback) -- a stale value here is harmless (a silently-dropped
+    // send, same as any other best-effort path), and this is the ONLY
+    // way a relay-arrived request's own reply ever gets back to its
+    // sender at all.
+    if let Some(relay_addr) = state.confirmed_relay_addr {
+        let _ = state.shared.send_batch(&datagrams, relay_addr).await;
+        return;
+    }
+
+    // Still nothing to reply through directly: this device is the relay
+    // REQUESTER for this peer. Reached for ONLY once this peer has
+    // already given up on direct for now (`Unreachable`) or is already
+    // using relay (`ConnectedRelay`, kept flowing while direct reprobes
+    // in the background via `should_probe`). Never attempted while still
+    // mid-race (`Connecting`) -- see `RelayCarrier`'s own doc comment for
+    // why this is deliberately best-effort/fire-and-forget.
+    if matches!(
+        state.reachability,
+        PeerReachability::Unreachable { .. } | PeerReachability::ConnectedRelay
+    ) {
+        for datagram in datagrams {
+            let _ = state
+                .relay_carrier
+                .send_via_relay(&state.peer_public_bytes, Bytes::from(datagram))
+                .await;
         }
     }
 }
@@ -1522,6 +1592,8 @@ mod tests {
             direct_candidates: candidates,
             confirmed_direct_addr: confirmed,
             last_direct_rx: None,
+            last_relay_rx: None,
+            confirmed_relay_addr: None,
             outbound_rx,
             candidate_rx,
             inbound_tx,
@@ -1588,6 +1660,8 @@ mod tests {
             direct_candidates: Vec::new(),
             confirmed_direct_addr: None,
             last_direct_rx: None,
+            last_relay_rx: None,
+            confirmed_relay_addr: None,
             outbound_rx,
             candidate_rx,
             inbound_tx,
@@ -1854,7 +1928,7 @@ mod tests {
             None,
         )
         .await;
-        state.last_direct_rx = Some(Instant::now() - Duration::from_secs(25));
+        state.last_relay_rx = Some(Instant::now() - Duration::from_secs(40));
 
         evaluate_reachability(&mut state);
 
@@ -2015,7 +2089,61 @@ mod tests {
 
         assert!(state.confirmed_direct_addr.is_none());
         assert_eq!(state.reachability, PeerReachability::ConnectedRelay);
-        assert!(state.last_direct_rx.is_some());
+        assert!(state.last_relay_rx.is_some());
+        assert!(state.last_direct_rx.is_none());
+    }
+
+    /// Independent-review finding (H3): relay-delivered traffic must
+    /// never refresh a CONFIRMED DIRECT path's own liveness clock -- a
+    /// dead direct path that keeps "looking alive" because relay traffic
+    /// for the same peer happens to also be arriving would stay pinned to
+    /// that dead address forever and never reach relay fallback,
+    /// backwards from the intended failover.
+    #[tokio::test]
+    async fn relay_inbound_never_refreshes_confirmed_direct_liveness() {
+        let local_secret = StaticSecret::from([1u8; 32]);
+        let local_public = PublicKey::from(&local_secret);
+        let peer_secret = StaticSecret::from([2u8; 32]);
+        let mut peer_tunnel = WgTunnel::new(peer_secret, local_public, 1);
+        let init = peer_tunnel.probe().expect("fresh tunnel produces a handshake initiation");
+
+        let mut state = make_state(
+            PeerReachability::Connected { path: CandidateClass::Lan },
+            vec![coordination_candidate(peer_addr())],
+            Some(peer_addr()),
+        )
+        .await;
+        let stale = Instant::now() - Duration::from_secs(25);
+        state.last_direct_rx = Some(stale);
+
+        handle_relay_inbound(&mut state, init).await;
+
+        assert_eq!(state.last_direct_rx, Some(stale), "direct liveness must be untouched");
+        assert!(state.last_relay_rx.is_some());
+        assert_eq!(state.confirmed_direct_addr, Some(peer_addr()), "still confirmed direct");
+    }
+
+    /// Independent-review finding (H1): once this device has learned a
+    /// relay's forwarding-socket address from genuinely-authenticated
+    /// inbound traffic, its own reply (e.g. a WireGuard handshake
+    /// response) must go straight back to that exact address -- otherwise
+    /// a relay-only WireGuard handshake can never complete at all (the
+    /// relay's forwarding socket is deliberately never added to `direct_
+    /// candidates`, so the ordinary candidate race would never reach it).
+    #[tokio::test]
+    async fn send_batch_direct_replies_to_the_confirmed_relay_address() {
+        let mut state = make_state(PeerReachability::ConnectedRelay, Vec::new(), None).await;
+        state.confirmed_relay_addr = Some(peer_addr());
+        let spy = Arc::new(SpyRelayCarrier::new());
+        state.relay_carrier = spy.clone();
+
+        send_batch_direct(&state, vec![vec![7]]).await;
+
+        // The RelayCarrier (open-a-NEW-session mechanism) must not be
+        // invoked when a known relay reply address is already available --
+        // that would open a needless new session just to answer a reply
+        // this device already knows exactly where to send.
+        assert!(spy.calls.lock().unwrap().is_empty());
     }
 
     /// While already `ConnectedRelay`, a subsequent authenticated

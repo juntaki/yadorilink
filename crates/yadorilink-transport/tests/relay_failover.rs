@@ -41,6 +41,17 @@ async fn recv_within(channel: &PeerChannel, d: Duration) -> Vec<u8> {
         .expect("channel closed unexpectedly")
 }
 
+/// Drains any already-queued inbound messages -- a retry loop that sends
+/// the same logical step more than once (because an earlier attempt's
+/// own short per-try timeout gave up before delivery actually completed,
+/// not because delivery failed) can leave duplicates queued behind a
+/// later, distinct message; without draining first, a later `recv_within`
+/// picks up a STALE duplicate via plain FIFO order instead of the new one
+/// it's actually asserting on.
+async fn drain_queued(channel: &PeerChannel) {
+    while timeout(Duration::from_millis(200), channel.recv()).await.is_ok() {}
+}
+
 async fn wait_for_reachability(
     channel: &PeerChannel,
     d: Duration,
@@ -67,9 +78,12 @@ async fn wait_for_reachability(
 /// its own real UDP socket -- standing in for a real relay peer's own
 /// dedicated forwarding socket (`yadorilink-daemon`'s `relay_forwarder.rs`)
 /// without any of that crate's grant/admission/session bookkeeping, which
-/// is proven separately.
+/// is proven separately. `socket` is also read by a background task (see
+/// this test's own setup) that injects whatever arrives on it back into
+/// A via `deliver_relay_datagram` -- the REQUESTER-side half of the H1
+/// round trip this test proves; this struct is only ever the SEND half.
 struct ForwardingRelayCarrier {
-    socket: tokio::net::UdpSocket,
+    socket: Arc<tokio::net::UdpSocket>,
     destination: SocketAddr,
     calls: AtomicUsize,
 }
@@ -136,71 +150,103 @@ async fn direct_failure_falls_back_to_relay_then_promotes_back_once_direct_confi
     // fast rather than relying on silence alone.
     let unreachable_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
-    let relay_forward_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_forward_socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let relay_carrier = Arc::new(ForwardingRelayCarrier {
-        socket: relay_forward_socket,
+        socket: relay_forward_socket.clone(),
         destination: addr_c,
         calls: AtomicUsize::new(0),
     });
 
-    let a = PeerChannel::connect_with_relay(
-        secret_a,
-        public_c,
-        0,
-        vec![unreachable_addr],
-        yadorilink_transport::TransportHub::from_socket(socket_a, Some(public_a)),
-        relay_carrier.clone(),
-    )
-    .await
-    .unwrap();
+    let a = Arc::new(
+        PeerChannel::connect_with_relay(
+            secret_a,
+            public_c,
+            0,
+            vec![unreachable_addr],
+            yadorilink_transport::TransportHub::from_socket(socket_a, Some(public_a)),
+            relay_carrier.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    // C is given NO working candidate for A at all (unlike a real B's own
+    // relay_forwarder, this test's `ForwardingRelayCarrier` is one-way --
+    // it only forwards A's OUTBOUND datagrams to C; nothing about C
+    // itself changes just because A has a relay carrier). Whatever
+    // arrives at `relay_forward_socket` (C's own reply, sent to the
+    // `confirmed_relay_addr` it learns from A's relayed initiation -- see
+    // this test's own module doc comment / H1's own fix) is injected
+    // back into A's requester-side inbound path here, exactly mirroring
+    // how the daemon layer's own `handle_relay_data` routes a relay
+    // reply into `deliver_relay_datagram` in production.
     let c = PeerChannel::connect_with_relay(
         secret_c,
         public_a,
         0,
-        vec![addr_a],
+        Vec::new(),
         yadorilink_transport::TransportHub::from_socket(socket_c, Some(public_c)),
         Arc::new(DenyingRelayCarrier),
     )
     .await
     .unwrap();
+    {
+        let relay_forward_socket = relay_forward_socket.clone();
+        let a = a.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_535];
+            while let Ok(n) = relay_forward_socket.recv(&mut buf).await {
+                a.deliver_relay_datagram(buf[..n].to_vec());
+            }
+        });
+    }
 
     // Wait out the candidate race (real wall-clock CANDIDATE_RACE_TIMEOUT,
     // 20s -- see this file's own module doc comment) so A has genuinely
-    // given up on direct before any send is attempted. Not asserted as a
-    // literal observed `Unreachable` watch event: C's own `direct_probe`
-    // timer independently races a REAL handshake initiation toward A
-    // (C's `direct_candidates` includes A's real address, so `should_
-    // probe` is satisfied for C from the moment it connects) completely
-    // independently of anything this test does with A -- by the time
-    // this sleep elapses, A may already be `ConnectedRelay` from THAT
-    // inbound traffic rather than sitting in `Unreachable`, and a `watch`
-    // channel only ever exposes the LATEST value, not every intermediate
-    // one, so a transient `Unreachable` in between is not reliably
-    // observable anyway. Both outcomes are equally valid for what this
-    // test actually asserts: `send_batch_direct`'s relay-fallback
-    // condition covers `Unreachable | ConnectedRelay`, and A is
-    // guaranteed to be in one or the other (never `Connecting`) once this
-    // elapses.
+    // given up on direct before any send is attempted. Bounded-backoff
+    // re-races mean A can cycle back into a transient `Connecting` even
+    // after this (each attempt against `unreachable_addr` still fails,
+    // it just takes another race-timeout round) -- `send_batch_direct`
+    // refuses relay fallback specifically during `Connecting`, so rather
+    // than pin this test to one exact moment in that cycle, retry the
+    // send until it lands in a window where A isn't mid-race.
     tokio::time::sleep(Duration::from_secs(25)).await;
-    assert!(
-        !matches!(a.reachability(), PeerReachability::Connecting { .. }),
-        "A must have left the initial candidate race by now"
-    );
 
-    a.send(b"hello via relay, A never reached C directly".to_vec()).await.unwrap();
+    // Bounded-backoff re-races cycle A through a FULL CANDIDATE_RACE_
+    // TIMEOUT (20s) of `Connecting` each time `unreachable_addr` fails
+    // again, so a short retry window can land entirely inside one such
+    // cycle and never once catch A outside it -- this budget spans
+    // several full cycles rather than assuming a specific one.
+    let payload = b"hello via relay, A never reached C directly".to_vec();
+    let mut delivered = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    while tokio::time::Instant::now() < deadline {
+        if matches!(a.reachability(), PeerReachability::Connecting { .. }) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+        a.send(payload.clone()).await.unwrap();
+        if let Ok(Some(received)) = timeout(Duration::from_millis(500), c.recv()).await {
+            assert_eq!(received, payload);
+            delivered = true;
+            break;
+        }
+    }
+    assert!(delivered, "A's hello never reached C via relay fallback");
+    drain_queued(&c).await;
 
-    // A's fallback must have actually been invoked, and the datagram must
-    // have physically reached C (real WireGuard handshake -- C only ever
-    // relays a message up to `recv()` once its own tunnel decrypts it).
-    let received = recv_within(&c, Duration::from_secs(10)).await;
-    assert_eq!(received, b"hello via relay, A never reached C directly");
+    // A's fallback must have actually been invoked (real WireGuard
+    // handshake -- C only ever relays a message up to `recv()` once its
+    // own tunnel decrypts it, so `delivered` above already proves the
+    // datagram physically reached C).
     assert!(relay_carrier.calls.load(Ordering::Relaxed) >= 1);
 
-    // C's reply travels back over C's own real direct path to A's real
-    // address -- A's real socket receives it, but from an address (C's
-    // real address) that was never one of A's own advertised candidates,
-    // so A must report `ConnectedRelay`, never silently treat this as a
-    // confirmed direct path.
+    // C's reply goes to `confirmed_relay_addr` (H1's own fix) -- the
+    // relay forwarding socket's address, learned from A's relayed
+    // initiation -- which the background task above relays back into A
+    // via `deliver_relay_datagram`. A's real socket never sees this
+    // reply directly at all (C has no candidate for A's real address),
+    // so this is a genuine end-to-end proof of the round trip, not an
+    // accidental direct path.
     c.send(b"reply".to_vec()).await.unwrap();
     let reachability = wait_for_reachability(&a, Duration::from_secs(10), |r| {
         !matches!(r, PeerReachability::Unreachable { .. })
@@ -222,7 +268,13 @@ async fn direct_failure_falls_back_to_relay_then_promotes_back_once_direct_confi
     // changed()` would then never observe). Retrying the send is what
     // actually exercises the intended behavior ("A confirms direct once
     // it knows the candidate"), not a race against the registration.
+    // C also needs a real candidate for A -- C started with none at all
+    // (see this test's own setup), so without this its replies would
+    // keep going out via `confirmed_relay_addr` (the relay path) forever,
+    // never as real UDP to A's real address, and A could never confirm
+    // direct no matter what candidates IT learns.
     a.add_direct_candidate(addr_c).await;
+    c.add_direct_candidate(addr_a).await;
     let mut promoted = false;
     for _ in 0..25 {
         c.send(b"reply after candidate learned".to_vec()).await.unwrap();
