@@ -152,6 +152,10 @@ impl RelaySessionHandler for DaemonState {
                 reply_sink,
             ) {
                 Ok(session_id) => {
+                    self.record_relay_session_destination(
+                        session_id,
+                        &grant.destination_device_id,
+                    );
                     tracing::info!(
                         grant_id = %grant.grant_id,
                         source = %grant.source_device_id,

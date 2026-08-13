@@ -213,6 +213,92 @@ async fn opaque_bytes_flow_from_a_through_b_to_cs_real_address_over_the_real_wir
     .await;
 }
 
+/// Cleanup regression: when B's own direct route to the DESTINATION is
+/// lost (here, a netmap revoke tearing down B<->C), any relay session B
+/// was forwarding toward it must close PROMPTLY -- not merely eventually
+/// via the forwarder's own 60s idle timeout, which this test's own bound
+/// (well under that) would catch a regression back to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn relay_session_closes_promptly_when_the_destination_route_is_lost() {
+    support::ensure_isolated_config_dir();
+    let fake = FakeCoordination::start().await;
+    fake.enable_signed_policy();
+    let group_id = "relay-e2e-route-loss-group";
+
+    let a = new_test_daemon("relay-e2e-loss-a");
+    let b = new_test_daemon("relay-e2e-loss-b");
+    let c = new_test_daemon("relay-e2e-loss-c");
+    for daemon in [&a, &b, &c] {
+        register_with_fake(
+            &fake,
+            &daemon.state,
+            &daemon.device_id,
+            daemon.keypair.public_bytes(),
+            &[group_id],
+        )
+        .await;
+        link(&daemon.state, daemon._root.path(), group_id);
+    }
+    b.state.set_local_relay_capable(true);
+    fake.set_relay_capable(&b.device_id, true);
+
+    spawn_orchestrator(fake.addr(), a.device_id.clone(), a.keypair.clone(), a.state.clone());
+    spawn_orchestrator(fake.addr(), b.device_id.clone(), b.keypair.clone(), b.state.clone());
+    spawn_orchestrator(fake.addr(), c.device_id.clone(), c.keypair.clone(), c.state.clone());
+
+    wait_until_with_context(
+        || fully_connected(&a.state, &b.device_id) && fully_connected(&b.state, &c.device_id),
+        Duration::from_secs(60),
+        || "required hops never connected".to_string(),
+    )
+    .await;
+
+    let grant = fake.issue_relay_grant(&a.device_id, &c.device_id, 120).unwrap();
+    let session_a_to_b = a.state.peers.session(&b.device_id).unwrap();
+    session_a_to_b
+        .send_relay_open(RelayOpenFrame {
+            version: grant.version,
+            grant_id: grant.grant_id.clone(),
+            group_id: grant.group_id.clone(),
+            source_device_id: grant.source_device_id.clone(),
+            relay_device_id: grant.relay_device_id.clone(),
+            destination_device_id: grant.destination_device_id.clone(),
+            not_before_unix: grant.not_before_unix,
+            expires_at_unix: grant.expires_at_unix,
+            max_session_bytes: grant.max_session_bytes.unwrap_or(0),
+            signature: grant.signature.clone(),
+        })
+        .await
+        .unwrap();
+
+    wait_until_with_context(
+        || b.state.relay_forwarder.active_session_count() == 1,
+        Duration::from_secs(10),
+        || "B never admitted the relay session".to_string(),
+    )
+    .await;
+
+    // B<->C's direct route goes away -- not A's own request, not an idle
+    // timeout, not grant expiry: purely the destination becoming
+    // unreachable out from under an already-open relay session.
+    fake.revoke(&c.device_id, group_id);
+
+    // Well under `RELAY_IDLE_TIMEOUT` (60s) -- if this regresses back to
+    // "only the idle timeout ever closes it", this bound catches that.
+    wait_until_with_context(
+        || b.state.relay_forwarder.active_session_count() == 0,
+        Duration::from_secs(15),
+        || {
+            format!(
+                "relay session was not closed promptly after B's route to the destination was \
+                 lost (active_session_count={})",
+                b.state.relay_forwarder.active_session_count()
+            )
+        },
+    )
+    .await;
+}
+
 /// Security-boundary regression: a device NOT declared relay-capable must
 /// have its `RelayOpen` refused, even with an otherwise-perfectly-valid
 /// signed grant (a real coordination-plane bug or a compromised plane
