@@ -429,28 +429,47 @@ async fn pathological_peer_does_not_starve_healthy_peers() {
         healthy_leaves.push(leaf);
     }
 
-    // The pathological peer: registered with the fake so the hub's netmap
-    // carries it as a desired peer, but pointed at a real, bound, and
-    // deliberately never-read UDP socket -- every handshake initiation the
-    // hub sends it vanishes into genuine silence (not a closed port, which
-    // can resolve faster via an ICMP unreachable and would understate a
-    // truly silent peer). No orchestrator is spawned for it: it exists
-    // purely as a permanently-failing target that the hub's own supervisor
-    // retries forever, repeatedly acquiring and releasing one of the
-    // ReconnectCoordinator's global permits.
-    let pathological_keypair = DeviceKeyPair::generate();
-    // Leaked deliberately: this socket must stay bound (and unread) for the
-    // whole test so the hub's initiations keep vanishing into it, not get
-    // rebound/reused once this scope's local drops.
-    let pathological_socket: &'static std::net::UdpSocket =
-        Box::leak(Box::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()));
-    fake.register_device(
-        "pathological-peer",
-        pathological_keypair.public_bytes(),
-        [0u8; 32],
-        pathological_socket.local_addr().unwrap().to_string(),
-        &[pathological_group],
-    );
+    // The pathological peers: registered with the fake so the hub's netmap
+    // carries them as desired peers, but each pointed at its own real,
+    // bound, and deliberately never-read UDP socket -- every handshake
+    // initiation the hub sends any of them vanishes into genuine silence
+    // (not a closed port, which can resolve faster via an ICMP unreachable
+    // and would understate truly silent peers). No orchestrator is spawned
+    // for any of them: they exist purely as permanently-failing targets
+    // that the hub's own supervisors retry forever, repeatedly acquiring
+    // and releasing the ReconnectCoordinator's global permits.
+    //
+    // Deliberately MORE pathological peers than
+    // `RECONNECT_HANDSHAKE_CONCURRENCY` (4): with only one (this test's
+    // first-draft version), 3 of the 4 global permits are always free no
+    // matter what, so the healthy leaves below can connect trivially
+    // regardless of whether the coordinator's fairness/bound is correct at
+    // all -- that version could not fail even if the semaphore were deleted
+    // entirely (a real gap caught in independent review). With enough
+    // pathological peers to legitimately consume every permit at once, the
+    // healthy leaves' progress genuinely depends on permits being returned
+    // and fairly redistributed, not merely on some being left over.
+    // `peer_orchestrator::RECONNECT_HANDSHAKE_CONCURRENCY` is private to
+    // that module (not `pub`), so this is hardcoded rather than imported --
+    // kept deliberately above it (+2), not merely equal to it, so the
+    // healthy leaves' fair share doesn't depend on this test's own exact
+    // value tracking production's constant precisely.
+    const N_PATHOLOGICAL: usize = 4 + 2;
+    for i in 0..N_PATHOLOGICAL {
+        let pathological_keypair = DeviceKeyPair::generate();
+        // Leaked deliberately: each socket must stay bound (and unread) for
+        // the whole test so the hub's initiations keep vanishing into it,
+        // not get rebound/reused once this scope's local drops.
+        let pathological_socket: &'static std::net::UdpSocket =
+            Box::leak(Box::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()));
+        fake.register_device(
+            &format!("pathological-peer-{i}"),
+            pathological_keypair.public_bytes(),
+            [0u8; 32],
+            pathological_socket.local_addr().unwrap().to_string(),
+            &[pathological_group],
+        );
+    }
 
     spawn_orchestrator(fake.addr(), hub.device_id.clone(), hub.keypair.clone(), hub.state.clone());
     for leaf in &healthy_leaves {
@@ -483,12 +502,14 @@ async fn pathological_peer_does_not_starve_healthy_peers() {
     // wire -- so it's always true almost immediately regardless of whether
     // the peer ever actually answers. The real sanity signal is that the
     // handshake itself never completes.
-    assert!(
-        !hub.state
-            .peers
-            .session("pathological-peer")
-            .is_some_and(|s| s.peer_handshake_received()),
-        "sanity: the pathological peer must genuinely never complete a handshake -- otherwise \
-         this test isn't exercising what it claims to"
-    );
+    for i in 0..N_PATHOLOGICAL {
+        assert!(
+            !hub.state
+                .peers
+                .session(&format!("pathological-peer-{i}"))
+                .is_some_and(|s| s.peer_handshake_received()),
+            "sanity: pathological-peer-{i} must genuinely never complete a handshake -- \
+             otherwise this test isn't exercising what it claims to"
+        );
+    }
 }

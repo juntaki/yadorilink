@@ -145,6 +145,24 @@ struct NetmapDiffState {
 /// their initiations.
 const RECONNECT_HANDSHAKE_CONCURRENCY: usize = 4;
 
+/// M3 Pass 3 (independent-review finding M2): caps how long a single
+/// attempt may hold a `reconnect_semaphore` permit before it's released
+/// regardless of whether the candidate race has actually resolved.
+/// `PeerChannel`'s own candidate race can run for its full
+/// `CANDIDATE_RACE_TIMEOUT` (20s, `yadorilink_transport::peer_channel`)
+/// before giving up on a silent peer -- without this cap, a device with
+/// many simultaneously-unreachable peers (a real outage, not a handful of
+/// slow ones) would only be able to attempt `RECONNECT_HANDSHAKE_CONCURRENCY`
+/// of them every ~20s, adding minutes of pure queuing latency for peers
+/// that would connect instantly once the network actually returns -- a
+/// regression this pass would otherwise introduce, not fix. Deliberately
+/// well below the full race timeout: the permit's job is only to bound how
+/// many candidate races run AT ONCE, not to track a specific attempt all
+/// the way to resolution -- the actor keeps racing candidates on its own
+/// after the permit is released early, this just stops it from also
+/// occupying a global concurrency slot while doing so.
+const RECONNECT_PERMIT_MAX_HOLD: Duration = Duration::from_secs(3);
+
 /// One peer's current connect parameters, re-read by
 /// `spawn_peer_session`'s reconnect loop at the start of every attempt —
 /// see `NetmapDiffState::desired_peers`'s own doc comment.
@@ -520,6 +538,14 @@ pub async fn run(
     // with no compile-time or runtime signal that the real fix wasn't
     // active. Idempotent (`OnceLock`-backed) — a redundant call from
     // `app.rs` alongside this one is a harmless no-op.
+    //
+    // The public key is set alongside it for the identical reason
+    // (independent-review finding L1): `run_sim` and `app.rs` both set
+    // BOTH keys together; `run` previously set only the secret, so a
+    // caller relying on `run` alone would get the O(1) identification path
+    // wired up but no MAC1 initiation gate on the hub (the gate keys off
+    // `device_static_public`, not the secret).
+    state.set_device_static_public(keypair.public_bytes());
     state.set_device_static_secret(keypair.secret.clone());
 
     let mut attempt: u32 = 0;
@@ -1128,7 +1154,50 @@ mod ws_netmap {
                         },
                     );
                 if let Some(session) = state.peers.session(&peer.device_id) {
+                    // M3 Pass 3 (independent-review finding M1):
+                    // `replace_coordination_candidates` (`yadorilink_
+                    // transport::peer_channel`) feeds into the actor's own
+                    // candidate-update handler, which resets an
+                    // `Unreachable` channel straight back into `Connecting`,
+                    // bypassing that peer's own backoff entirely -- and this
+                    // whole `for peer in
+                    // update.peers` loop fans out to EVERY live session from
+                    // a single netmap push. Without a permit here, one
+                    // coordination-plane update after a network flap would
+                    // kick every currently-unreachable peer into a
+                    // simultaneous candidate race at once, reproducing the
+                    // exact thundering herd `reconnect_semaphore` exists to
+                    // bound, just through this code path instead of
+                    // `run_one_peer_session_attempt`'s. If the channel was
+                    // already `Connected` (the common case -- most netmap
+                    // pushes don't follow an outage), the wait below returns
+                    // immediately and this permit is held only briefly.
+                    let permit = diff_state
+                        .reconnect_semaphore
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("reconnect semaphore is never closed");
                     session.replace_coordination_candidates(candidates).await;
+                    let channel = diff_state
+                        .channels
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get(&peer.device_id)
+                        .cloned();
+                    match channel {
+                        Some(channel) => {
+                            tokio::spawn(async move {
+                                let _ = tokio::time::timeout(
+                                    RECONNECT_PERMIT_MAX_HOLD,
+                                    wait_for_first_handshake_resolution(&channel),
+                                )
+                                .await;
+                                drop(permit);
+                            });
+                        }
+                        None => drop(permit),
+                    }
                     continue;
                 }
                 // A supervisor for this device may already be running --
@@ -1731,6 +1800,31 @@ async fn run_one_peer_session_attempt(
         }
     };
 
+    // M3 Pass 3 (independent-review finding H1): re-check the peer is
+    // still desired right before registering the channel -- `teardown_peer`
+    // removes `desired_peers` BEFORE calling `handle.abort()` on this
+    // supervisor, specifically so an in-flight attempt can notice and stop
+    // cleanly (see `teardown_peer`'s own comment). But `abort()` only takes
+    // effect at this task's NEXT `.await` point, and `PeerChannel::connect`
+    // above already completed -- there is no `.await` between here and the
+    // channel-registration code below for the abort to land on. Without
+    // this second check (the first is the `desired_peers` lookup at this
+    // function's own top, BEFORE `connect`), a `teardown_peer` that raced
+    // in during `connect`'s own await would go completely unnoticed: this
+    // attempt would insert a live channel and register a session, then get
+    // aborted before ever reaching this function's own natural-end cleanup
+    // below -- leaving a permanently unrevoked zombie channel with no
+    // supervisor left alive to clean it up.
+    if !diff_state
+        .desired_peers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(peer_device_id)
+    {
+        channel.revoke();
+        return;
+    }
+
     // M3 Pass 3: release the permit once the actor resolves its FIRST
     // candidate race one way or the other (`Connected` or `Unreachable`) --
     // the actual handshake attempt this permit exists to bound. Done from a
@@ -1747,7 +1841,14 @@ async fn run_one_peer_session_attempt(
     // governs, not this global bound.
     let channel_for_permit = channel.clone();
     tokio::spawn(async move {
-        wait_for_first_handshake_resolution(&channel_for_permit).await;
+        // `RECONNECT_PERMIT_MAX_HOLD` bounds this wait -- see its own doc
+        // comment for why: the permit's job is bounding concurrent races,
+        // not tracking one attempt to full resolution.
+        let _ = tokio::time::timeout(
+            RECONNECT_PERMIT_MAX_HOLD,
+            wait_for_first_handshake_resolution(&channel_for_permit),
+        )
+        .await;
         drop(reconnect_permit);
     });
 
