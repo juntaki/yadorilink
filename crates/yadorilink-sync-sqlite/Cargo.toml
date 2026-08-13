@@ -46,7 +46,7 @@ serde.workspace = true
 serde_json = "1"
 hex = "0.4"
 # `dag_store::causal_basis`'s content-addressed causal-basis-set hashing.
-sha2 = "0.10"
+sha2 = "0.11"
 # `filesystem_transaction::begin_transaction_unchecked`'s transaction-id
 # generation -- same version pin as `yadorilink-sync-core`'s own use.
 rand = "0.10.2"
