@@ -873,6 +873,30 @@ pub async fn hydrate_with_timeout(
     path: &str,
     timeout: std::time::Duration,
 ) -> Result<(), SyncError> {
+    // M2-5: single-flight coalescing -- a concurrent caller for the SAME
+    // path (two apps opening the same file at once, or a retried
+    // FETCH_DATA callback racing the original) becomes a follower here
+    // and simply awaits this round's eventual outcome instead of running
+    // its own redundant peer fetch. See `hydration_single_flight`'s own
+    // module doc for why this is layered outside `hydrate_inner`'s
+    // per-path lock, not a replacement for it.
+    let leader = match state.hydrate_single_flight.join(group_id, path) {
+        crate::hydration_single_flight::Role::Follower(mut rx) => {
+            return match rx.changed().await {
+                Ok(()) => match *rx.borrow() {
+                    Some(Ok(())) => Ok(()),
+                    _ => Err(SyncError::HydrationFailed(path.to_string())),
+                },
+                // The leader's `Sender` was dropped without ever sending --
+                // structurally unreachable (`Leader`'s own `Drop` always
+                // sends), kept as a fail-closed fallback rather than a
+                // `.unwrap()`.
+                Err(_) => Err(SyncError::HydrationFailed(path.to_string())),
+            };
+        }
+        crate::hydration_single_flight::Role::Leader(leader) => leader,
+    };
+
     // `tokio::time::timeout` dropping the `hydrate_inner` future on
     // elapse runs that future's own local drop glue exactly like any
     // other Rust value drop -- including `HydrationStateGuard`'s
@@ -895,10 +919,12 @@ pub async fn hydrate_with_timeout(
     // return) lands in the recent-error ring buffer here, centrally —
     // `SyncError::category`'s doc comment for why this is safe to record
     // unconditionally (never derived from `Display`, so never a
-    // path/volume/hash).
+    // path/volume/hash). Only the leader's own attempt is recorded --
+    // followers observe the same underlying failure, not a distinct one.
     if let Err(e) = &result {
         state.telemetry.record_recent_error(e.category(), "hydration");
     }
+    leader.complete(result.as_ref().map(|_| ()).map_err(|_| ()));
     result
 }
 
@@ -2100,6 +2126,183 @@ mod tests {
             std::fs::read(root_dir.path().join("doc.txt")).unwrap(),
             content,
             "disk content must be exactly what was hydrated"
+        );
+    }
+
+    /// M2-5: the same scenario as `concurrent_hydrations_of_the_same_
+    /// version_do_not_race` above, but through `hydrate_with_timeout` --
+    /// the real public entry point `shell_ipc.rs`'s `HydrateRequest`
+    /// handler actually calls, which now single-flights (see
+    /// `hydration_single_flight`) -- rather than `hydrate_inner` directly.
+    /// Proves the single-flight leader/follower wiring doesn't disturb
+    /// this already-reviewed race: two concurrent FETCH_DATA-driven
+    /// callers for the SAME path (a live scenario, e.g. two apps opening
+    /// the same file at once) must both still observe success and the
+    /// exact same end state, whichever of them becomes the leader.
+    #[tokio::test]
+    async fn concurrent_hydrate_with_timeout_calls_for_the_same_path_both_succeed() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let root_dir = tempfile::tempdir().unwrap();
+        sync_state
+            .link_repository()
+            .add_link(&root_dir.path().to_string_lossy(), "group-1")
+            .unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            root_dir.path(),
+            "group-1",
+            sync_state.as_ref(),
+        )
+        .unwrap();
+
+        let content = b"single-flight hydration content";
+        let hash = Sha256::digest(content).to_vec();
+        store.put(content).unwrap();
+        sync_state
+            .change_history_repository()
+            .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
+            .unwrap();
+
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        sync_state
+            .file_index_repository()
+            .upsert_file(
+                "group-1",
+                &yadorilink_replica_domain::file::FileRecord {
+                    path: "doc.txt".into(),
+                    size: content.len() as u64,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![BlockInfo { hash, offset: 0, size: content.len() as u32 }],
+                    deleted: false,
+                },
+                &permit,
+            )
+            .unwrap();
+        sync_state
+            .materialization_state_repository()
+            .set_materialization_state(
+                "group-1",
+                "doc.txt",
+                MaterializationState::Placeholder,
+                &permit,
+            )
+            .unwrap();
+
+        let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
+        state.install_test_root_commit_authority("group-1");
+
+        let state_a = state.clone();
+        let state_b = state.clone();
+        let task_a = tokio::spawn(async move {
+            hydrate_with_timeout(&state_a, "group-1", "doc.txt", HYDRATION_TIMEOUT).await
+        });
+        let task_b = tokio::spawn(async move {
+            hydrate_with_timeout(&state_b, "group-1", "doc.txt", HYDRATION_TIMEOUT).await
+        });
+
+        let (result_a, result_b) = tokio::join!(task_a, task_b);
+
+        assert!(result_a.unwrap().is_ok(), "concurrent caller A must succeed");
+        assert!(result_b.unwrap().is_ok(), "concurrent caller B must succeed");
+        assert_eq!(
+            sync_state
+                .materialization_state_repository()
+                .get_materialization_state("group-1", "doc.txt")
+                .unwrap(),
+            Some(MaterializationState::Hydrated),
+        );
+        assert_eq!(std::fs::read(root_dir.path().join("doc.txt")).unwrap(), content);
+    }
+
+    /// M2-5: the follower path specifically -- a caller that joins the
+    /// single-flight registry strictly AFTER the leader has already
+    /// started (not merely "concurrently spawned", which can't
+    /// deterministically prove who becomes the follower) must still
+    /// observe the leader's real result rather than starting (and
+    /// potentially failing) its own attempt.
+    #[tokio::test]
+    async fn a_late_joining_caller_observes_the_leaders_result_as_a_follower() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let root_dir = tempfile::tempdir().unwrap();
+        sync_state
+            .link_repository()
+            .add_link(&root_dir.path().to_string_lossy(), "group-1")
+            .unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            root_dir.path(),
+            "group-1",
+            sync_state.as_ref(),
+        )
+        .unwrap();
+
+        let content = b"late follower content";
+        let hash = Sha256::digest(content).to_vec();
+        store.put(content).unwrap();
+        sync_state
+            .change_history_repository()
+            .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
+            .unwrap();
+
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        sync_state
+            .file_index_repository()
+            .upsert_file(
+                "group-1",
+                &yadorilink_replica_domain::file::FileRecord {
+                    path: "doc.txt".into(),
+                    size: content.len() as u64,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![BlockInfo { hash, offset: 0, size: content.len() as u32 }],
+                    deleted: false,
+                },
+                &permit,
+            )
+            .unwrap();
+        sync_state
+            .materialization_state_repository()
+            .set_materialization_state(
+                "group-1",
+                "doc.txt",
+                MaterializationState::Placeholder,
+                &permit,
+            )
+            .unwrap();
+
+        let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
+        state.install_test_root_commit_authority("group-1");
+
+        // Explicitly claim the leader role via the registry directly (not
+        // `hydrate_with_timeout`, so this test controls exactly when the
+        // late caller joins relative to it), matching how
+        // `hydrate_with_timeout` itself would join.
+        let leader = match state.hydrate_single_flight.join("group-1", "doc.txt") {
+            crate::hydration_single_flight::Role::Leader(l) => l,
+            crate::hydration_single_flight::Role::Follower(_) => {
+                panic!("the first joiner in a fresh registry must be the leader")
+            }
+        };
+
+        let state_follower = state.clone();
+        let follower_task = tokio::spawn(async move {
+            hydrate_with_timeout(&state_follower, "group-1", "doc.txt", HYDRATION_TIMEOUT).await
+        });
+        // Give the spawned follower task a chance to actually call `join`
+        // and observe the still-registered leader before it completes.
+        tokio::task::yield_now().await;
+
+        let leader_result = hydrate_inner(&state, "group-1", "doc.txt").await;
+        leader.complete(leader_result.as_ref().map(|_| ()).map_err(|_| ()));
+
+        let follower_result = follower_task.await.unwrap();
+
+        assert!(leader_result.is_ok(), "the leader's own attempt must succeed");
+        assert!(
+            follower_result.is_ok(),
+            "the follower must observe the leader's success, not fail independently: \
+             {follower_result:?}"
         );
     }
 
