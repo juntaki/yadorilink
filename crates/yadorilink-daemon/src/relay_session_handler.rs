@@ -201,22 +201,16 @@ impl RelaySessionHandler for DaemonState {
             // being asked to admit. Checked first, and returns either way,
             // so a requester session id can never fall through into the
             // provider-side admission/forwarding path below.
-            if let Some((relay_device_id, destination_peer_public)) =
-                self.requester_relay_session(data.session_id)
+            //
+            // M3 Pass 8 (final-gate finding): keyed by `(authenticated_
+            // peer_device_id, data.session_id)`, an EXACT lookup, not a
+            // plain `session_id` lookup followed by an ownership check --
+            // see `DaemonState::requester_relay_session`'s own doc comment
+            // for the cross-relay session-id collision a bare `u64` key
+            // used to be vulnerable to.
+            if let Some(destination_peer_public) =
+                self.requester_relay_session(authenticated_peer_device_id, data.session_id)
             {
-                if relay_device_id != authenticated_peer_device_id {
-                    // Same ownership reasoning as independent-review
-                    // finding H1 on the provider side: two different
-                    // relays' own independent session-id counters can
-                    // coincide, so only the relay THIS device actually
-                    // opened this session through may deliver to it.
-                    tracing::debug!(
-                        session_id = data.session_id,
-                        peer = authenticated_peer_device_id,
-                        "relay data for a requester session opened via a different relay; dropping"
-                    );
-                    return;
-                }
                 // M3 Pass 6 (independent-review finding H2): provider- and
                 // requester-tracked session ids are two independent
                 // numbering spaces that share one `u64` wire
@@ -327,34 +321,33 @@ impl RelaySessionHandler for DaemonState {
             // via_relay` opens a fresh one instead of sending into a
             // session the relay has already torn down.
             //
-            // A `relay_device_id` MISMATCH (independent-review finding,
-            // alongside H2) falls through to the provider-side check
-            // below instead of returning unconditionally -- this
-            // session_id genuinely belongs to a DIFFERENT relay's
-            // numbering, so it may still be a legitimate close for a
-            // session THIS device is providing (role "B") FOR the
-            // authenticated peer; the earlier code dropped that case
-            // silently regardless of which role it actually belonged to.
-            if let Some((relay_device_id, _)) = self.requester_relay_session(close.session_id) {
-                if relay_device_id == authenticated_peer_device_id {
-                    // Same H2 ambiguity as `handle_relay_data`: fail
-                    // closed rather than guess if this id is ALSO an
-                    // active provider session with this same peer as
-                    // source.
-                    if self.active_relay_session_source(close.session_id).as_deref()
-                        == Some(authenticated_peer_device_id)
-                    {
-                        tracing::warn!(
-                            session_id = close.session_id,
-                            peer = authenticated_peer_device_id,
-                            "relay close session id is ambiguous between a requester and a \
-                             provider session with the same peer; not resolving either"
-                        );
-                        return;
-                    }
-                    self.forget_requester_relay_session(close.session_id);
+            // M3 Pass 8 (final-gate finding): exact `(authenticated_peer_
+            // device_id, close.session_id)` lookup, same reasoning as
+            // `handle_relay_data`'s own -- a MISS here (this session_id
+            // belongs to a different relay's numbering) simply falls
+            // through to the provider-side check below, which may still
+            // find a legitimate close for a session THIS device is
+            // providing (role "B") FOR the authenticated peer.
+            if self
+                .requester_relay_session(authenticated_peer_device_id, close.session_id)
+                .is_some()
+            {
+                // Same H2 ambiguity as `handle_relay_data`: fail closed
+                // rather than guess if this id is ALSO an active provider
+                // session with this same peer as source.
+                if self.active_relay_session_source(close.session_id).as_deref()
+                    == Some(authenticated_peer_device_id)
+                {
+                    tracing::warn!(
+                        session_id = close.session_id,
+                        peer = authenticated_peer_device_id,
+                        "relay close session id is ambiguous between a requester and a \
+                         provider session with the same peer; not resolving either"
+                    );
                     return;
                 }
+                self.forget_requester_relay_session(authenticated_peer_device_id, close.session_id);
+                return;
             }
 
             // Ownership-checked (independent-review finding H1) -- an
