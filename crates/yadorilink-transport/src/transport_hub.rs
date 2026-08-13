@@ -143,11 +143,29 @@ impl DemuxRegistry {
         let session_index = receiver_idx >> 8;
         let channels = self.channels.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = channels.get(&session_index) {
-            let _ = entry.sender.try_send(InboundDatagram {
-                data: datagram.to_vec(),
-                from,
-                kind: DatagramKind::Direct,
-            });
+            // M3 Pass 1: was `let _ = ...`, silently discarding a full-queue
+            // drop with no signal anywhere -- a real observability gap the
+            // handshake fan-in reproducer's own review flagged (it could
+            // only measure wasted decapsulate attempts, not whether queue
+            // saturation was ALSO contributing). Log-only, no behavior
+            // change: `try_send`'s drop-on-full semantics are unchanged.
+            // Matched specifically on `Full`, not any error: the
+            // channel's own actor task exiting (`Closed`) is a completely
+            // different condition (the channel is gone, not merely busy)
+            // and a Codex review caught an earlier version of this fix
+            // conflating the two under one "queue full" message.
+            if let Err(mpsc::error::TrySendError::Full(_)) =
+                entry.sender.try_send(InboundDatagram {
+                    data: datagram.to_vec(),
+                    from,
+                    kind: DatagramKind::Direct,
+                })
+            {
+                tracing::debug!(
+                    session_index,
+                    "dropped inbound datagram: channel demux queue full"
+                );
+            }
         }
     }
 
@@ -186,12 +204,19 @@ impl DemuxRegistry {
         // are offered the initiation first.
         let mut ordered: Vec<&ChannelEntry> = channels.values().collect();
         ordered.sort_by_key(|entry| !entry.candidate_ips.contains(&src_ip));
+        // M3 Pass 1: was `let _ = ...`, same silent-drop gap as
+        // `route_by_index` above -- log-only, no behavior change. Matched
+        // specifically on `Full`, same reasoning as `route_by_index`.
         for entry in ordered {
-            let _ = entry.sender.try_send(InboundDatagram {
-                data: datagram.to_vec(),
-                from,
-                kind: DatagramKind::HandshakeProbe,
-            });
+            if let Err(mpsc::error::TrySendError::Full(_)) =
+                entry.sender.try_send(InboundDatagram {
+                    data: datagram.to_vec(),
+                    from,
+                    kind: DatagramKind::HandshakeProbe,
+                })
+            {
+                tracing::debug!("dropped handshake-initiation probe: channel demux queue full");
+            }
         }
     }
 
