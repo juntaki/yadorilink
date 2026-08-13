@@ -46,6 +46,79 @@ fn disk_identity(path: &Path) -> Result<DiskIdentity, MaterializationExecutionEr
     Ok(yadorilink_peer_session::peer_session::disk_race_fingerprint(path))
 }
 
+/// Reduces the already-`Hydrated` file at `out_path` to a placeholder.
+///
+/// Non-Windows: unchanged from before M2-3b -- `create_or_defer_placeholder`
+/// via `write_placeholder`, which IS the disk truth, so minting a fresh
+/// on-disk identity on every eviction is correct.
+///
+/// Windows: deliberately does NOT call `create_or_defer_placeholder`.
+/// That function's Windows arm always MINTS A FRESH generation, which is
+/// right for CREATING a placeholder that doesn't exist yet (M2-3a), but
+/// wrong here: this file's placeholder object already exists on disk (it
+/// went `Placeholder` -> `Hydrated` at some point), and
+/// `CfDehydratePlaceholder` does not reassign `FileIdentity` -- minting a
+/// new generation here would record an identity in the index that no
+/// longer matches what's actually on disk, breaking the same ABA guard
+/// M2-2's dirty detection and this call's own `expected_generation` check
+/// both depend on staying accurate. Instead this reads the identity
+/// ALREADY recorded for this row (unchanged by dehydration) and confirms
+/// real on-disk dehydration via `MaterializationExecutionPort::
+/// dehydrate_windows_placeholder` before returning.
+///
+/// If no identity is recorded at all (a legacy/never-cfapi-created
+/// `Hydrated` row, or one whose recorded provider isn't the Windows CfAPI
+/// generation provider), there is no existing placeholder object to
+/// dehydrate -- creating a fresh one here would reopen the exact bug
+/// M2-3a's whole design closed: `sync_placeholders` (cfapi-host's poll
+/// loop) skips any path that already `exists()` on disk, so a
+/// `Placeholder` row with no real placeholder object underneath it would
+/// sit stranded, permanently claiming to be dehydrated while the real
+/// file stays fully materialized. Fails closed instead (`EvictionRejected`),
+/// which the caller's existing placeholder-write-error branch already
+/// rolls back to `Hydrated` for.
+fn evict_to_placeholder(
+    state: &dyn MaterializationExecutionPort,
+    group_id: &str,
+    path: &str,
+    out_path: &Path,
+    size: u64,
+    mtime_unix_nanos: i64,
+) -> Result<yadorilink_local_storage::PlaceholderIdentityToRecord, MaterializationExecutionError> {
+    #[cfg(windows)]
+    {
+        let _ = (size, mtime_unix_nanos);
+        let recorded = state.get_recorded_placeholder_identity(group_id, path)?;
+        let Some((identity, provider_kind)) = recorded else {
+            return Err(MaterializationExecutionError::EvictionRejected(format!(
+                "{path} has no recorded Windows placeholder identity to dehydrate; refusing to \
+                 evict rather than strand a Placeholder row with no real placeholder object \
+                 underneath it"
+            )));
+        };
+        if provider_kind != yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND {
+            return Err(MaterializationExecutionError::EvictionRejected(format!(
+                "{path}'s recorded placeholder identity is provider {provider_kind:?}, not \
+                 {:?}; refusing to evict",
+                yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND
+            )));
+        }
+        state.dehydrate_windows_placeholder(path, out_path, Some(identity.ino))?;
+        // Identity is unchanged by dehydration -- re-affirmed, not
+        // replaced, since `CfDehydratePlaceholder` never reassigns
+        // `FileIdentity`.
+        Ok(yadorilink_local_storage::PlaceholderIdentityToRecord::RecordOverwrite {
+            identity,
+            provider_kind: yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (state, group_id, path);
+        Ok(yadorilink_local_storage::create_or_defer_placeholder(out_path, size, mtime_unix_nanos)?)
+    }
+}
+
 /// What one [`evict_file`] call did. The materialized file is always reduced
 /// to a placeholder; whether its cached blocks were reclaimed (freeing real
 /// space) depends on full-replica custody, and never happens on a full
@@ -259,11 +332,14 @@ pub fn evict_file(
                     "{path} changed before placeholder commit"
                 )));
             }
-            Ok(yadorilink_local_storage::create_or_defer_placeholder(
+            evict_to_placeholder(
+                state,
+                group_id,
+                path,
                 &out_path,
                 record.size,
                 record.mtime_unix_nanos,
-            )?)
+            )
         });
     let placeholder_outcome = match placeholder_result {
         Ok(outcome) => outcome,

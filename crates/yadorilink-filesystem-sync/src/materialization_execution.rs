@@ -335,6 +335,53 @@ pub trait MaterializationExecutionPort: Send + Sync {
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), MaterializationExecutionError>;
 
+    /// The identity currently recorded on `(group_id, path)`'s row,
+    /// regardless of its current `materialization_state` -- unlike
+    /// [`Self::record_placeholder_generation`]'s read counterpart in
+    /// `MaterializationStateRepository::get_placeholder_generation` (gated to
+    /// `materialization_state = 'placeholder'`, so it deliberately returns
+    /// nothing once a row has hydrated), no production call site clears
+    /// `placeholder_dev`/`placeholder_ino`/`placeholder_provider_kind` on the
+    /// `Placeholder` -> `Hydrated` transition -- they are simply left in
+    /// place until an explicit [`Self::clear_placeholder_generation`] call.
+    /// M2-3b's Windows eviction path relies on exactly that: it reads a
+    /// `Hydrated` file's still-recorded generation here as the expected
+    /// identity to pass into the native dehydrate call -- an extra
+    /// defense-in-depth check on top of the disk-content revalidation
+    /// `evict_file` already performs, not a substitute for it.
+    fn get_recorded_placeholder_identity(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<(PlaceholderDiskIdentity, String)>, MaterializationExecutionError>;
+
+    /// M2-3b: asks the real Windows CfAPI provider process
+    /// (`yadorilink-cfapi-host.exe`) to natively dehydrate the placeholder
+    /// at `out_path` (an absolute path), blocking until it confirms
+    /// success or failure. `expected_generation`: the generation
+    /// [`Self::get_recorded_placeholder_identity`] returned for this row,
+    /// passed through as a defense-in-depth ABA guard (see
+    /// `shell-ext/windows/src/cfapi.rs::dehydrate_placeholder`'s own doc
+    /// comment) -- `None` skips that guard. `materialization_eviction::
+    /// evict_to_placeholder`'s Windows arm gates the `Placeholder`
+    /// transition and block reclamation on this call's success; its
+    /// non-Windows arm never calls it at all.
+    ///
+    /// The default implementation (used by every platform except Windows,
+    /// where nothing calls this) fails closed -- there is no sound
+    /// "succeeded" answer to give when there is no real CfAPI provider to
+    /// ask.
+    fn dehydrate_windows_placeholder(
+        &self,
+        _path: &str,
+        _out_path: &Path,
+        _expected_generation: Option<u64>,
+    ) -> Result<(), MaterializationExecutionError> {
+        Err(MaterializationExecutionError::EvictionRejected(
+            "native Windows placeholder dehydration is not supported on this platform".to_string(),
+        ))
+    }
+
     /// Every still-`Placeholder` path in `group_id` with no recorded
     /// identity -- see `MaterializationStateRepository::
     /// list_placeholder_paths_missing_generation`'s own doc comment for

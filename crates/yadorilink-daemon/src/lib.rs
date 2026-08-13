@@ -62,6 +62,8 @@ pub mod sync_runtime;
 #[cfg(windows)]
 pub mod placeholder_backend_windows;
 #[cfg(windows)]
+pub mod placeholder_dehydrate_windows;
+#[cfg(windows)]
 pub mod placeholder_inspect_windows;
 #[cfg(not(madsim))]
 pub mod resource_lock;
