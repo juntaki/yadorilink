@@ -1177,6 +1177,57 @@ mod tests {
         assert_eq!(rx_other.try_recv().unwrap().kind, DatagramKind::HandshakeProbe);
     }
 
+    /// M3 Pass 8 closeout (route-provenance review, Low): the sibling of
+    /// `initiation_without_gate_is_offered_source_matching_channel_first`
+    /// above, proving `RoutedKind::Relay` threads through the SAME
+    /// broadcast-fallback path just as correctly as `RoutedKind::Direct`
+    /// does -- a relay-enveloped handshake initiation (this device has no
+    /// identity set, so `identify_and_route_initiation` falls back to
+    /// `offer_initiation` exactly like the no-identity case above) must
+    /// still be tagged `DatagramKind::Relay`, never `HandshakeProbe`.
+    #[test]
+    fn relay_routed_initiation_without_gate_is_offered_as_relay_kind() {
+        let registry = registry_without_gate();
+        let (tx, mut rx) = mpsc::channel(8);
+        registry.channels.lock().unwrap().insert(
+            1,
+            ChannelEntry { sender: tx, candidate_ips: HashSet::new(), peer_public: [1u8; 32] },
+        );
+
+        let mut init = Vec::new();
+        init.extend_from_slice(&1u32.to_le_bytes());
+        init.extend_from_slice(&[0u8; 144]);
+        registry.offer_initiation(&init, addr("198.51.100.4:41641"), RoutedKind::Relay);
+
+        assert_eq!(rx.try_recv().unwrap().kind, DatagramKind::Relay);
+    }
+
+    /// M3 Pass 8 closeout (route-provenance review, Low): the queue-send
+    /// half of the SAME gap -- `route()` itself, given a relay-enveloped
+    /// handshake initiation, must enqueue it onto `handshake_ingress_tx`
+    /// tagged `RoutedKind::Relay`, not silently default back to `Direct`.
+    /// Doesn't need a running worker: `handshake_ingress_rx` is peeked
+    /// directly, exercising exactly the one hop the review flagged as
+    /// untested (`route`/`route_kind`/`handle_initiation`'s own queue
+    /// send), independent of `identify_and_route_initiation`/`offer_
+    /// initiation`, both already covered by their own dedicated tests.
+    #[test]
+    fn route_enqueues_a_relay_enveloped_initiation_tagged_as_relay() {
+        let (registry, mut ingress_rx) = DemuxRegistry::new(None);
+
+        let mut init = Vec::new();
+        init.extend_from_slice(&1u32.to_le_bytes());
+        init.extend_from_slice(&[0u8; 144]);
+        let enveloped = wrap_relay_envelope(7, &init);
+
+        assert!(registry.route(&enveloped, addr("198.51.100.4:41641")).is_none());
+
+        let (queued_datagram, _from, routed) =
+            ingress_rx.try_recv().expect("a relay-enveloped initiation must reach the queue");
+        assert_eq!(queued_datagram, init, "the envelope header must not leak into the queued item");
+        assert_eq!(routed, RoutedKind::Relay);
+    }
+
     #[tokio::test]
     async fn endpoint_selects_socket_by_destination_family() {
         let v4 = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
