@@ -131,6 +131,30 @@ struct PeerConnectSpec {
 }
 
 impl NetmapDiffState {
+    /// M3 Pass 3: removes `device_id`'s entry from `channels` only if it is
+    /// STILL `expected` (`Arc::ptr_eq`), mirroring `PeerRegistry::
+    /// remove_if_current`'s own identity guard exactly, for the identical
+    /// reason. Without this, `run_one_peer_session_attempt`'s natural-
+    /// session-end cleanup did a KEY-ONLY `remove` -- if a second
+    /// supervisor task for the SAME peer briefly coexists with this one
+    /// (e.g. `teardown_peer`'s `handle.abort()` on the OLD supervisor
+    /// hasn't actually taken effect yet -- `abort()` only cancels at the
+    /// next `.await` point, not synchronously -- when a NEW supervisor for
+    /// the same, re-authorized peer is already spawned and has ALREADY
+    /// connected and inserted its own fresh channel under the same key),
+    /// the OLD supervisor's cleanup could match the NEW supervisor's fresh
+    /// entry by key and revoke it -- killing a session that had just
+    /// started. Returns whether the removal actually happened (the caller
+    /// only calls `revoke()` in that case).
+    fn remove_channel_if_current(&self, device_id: &str, expected: &Arc<PeerChannel>) -> bool {
+        let mut channels = self.channels.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let matches = channels.get(device_id).is_some_and(|current| Arc::ptr_eq(current, expected));
+        if matches {
+            channels.remove(device_id);
+        }
+        matches
+    }
+
     fn new() -> Self {
         Self {
             previous: Arc::new(StdMutex::new(HashMap::new())),
@@ -1655,6 +1679,7 @@ async fn run_one_peer_session_attempt(
 
     let sync_roots = sync_roots_for_groups(state, &spec.effective_group_ids);
     let dependencies = peer_sync_session_deps(state);
+    let channel_for_cleanup = channel.clone();
     let session = PeerSyncSession::new_with_dependencies(
         channel,
         local_device_id.to_string(),
@@ -1682,11 +1707,15 @@ async fn run_one_peer_session_attempt(
     // ongoing supervisor loop, not the task ending) -- only
     // `teardown_peer`'s abort or process shutdown ends the supervisor
     // itself.
-    let removed_channel = diff_state
-        .channels
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(peer_device_id);
+    // M3 Pass 3: `remove_channel_if_current`, not a bare key-only
+    // `remove` -- see that method's own doc comment for the ABA race
+    // this closes (a second, newer supervisor for the same peer briefly
+    // coexisting with this one during `teardown_peer`'s not-yet-effective
+    // `abort()`). Guarded by comparing against `channel`, the exact
+    // `Arc<PeerChannel>` THIS attempt itself created and inserted above --
+    // never anyone else's.
+    let removed = diff_state.remove_channel_if_current(peer_device_id, &channel_for_cleanup);
+    let removed_channel = removed.then_some(channel_for_cleanup);
     // `revoke()` (not just dropping the `Arc`) is what's needed here --
     // `PeerChannel` has no `Drop` impl, so a channel whose owner just stops
     // holding it keeps running forever: still registered under this peer's
@@ -3153,6 +3182,60 @@ mod tests {
              otherwise it stays registered in the transport hub's demux forever, still able to \
              answer a handshake initiation for this peer under its own stale session index and \
              race the next reconnect generation (the exact bug this fix closes)"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_supervisor_cleanup_does_not_evict_a_newer_generations_channel() {
+        // Directly exercises the ABA race `remove_channel_if_current` closes,
+        // without waiting on the full supervisor/backoff machinery: an old
+        // supervisor generation's channel is registered, then "replaced" by
+        // a newer generation's channel under the same key (exactly what
+        // happens when a new supervisor connects while `teardown_peer`'s
+        // `handle.abort()` on the old one hasn't taken effect yet, since
+        // `abort()` only cancels at the next `.await` point). The old
+        // generation's own natural-session-end cleanup must then be a no-op
+        // against the newer entry -- not evict it by key.
+        let diff_state = NetmapDiffState::new();
+        let old_channel = fake_channel().await;
+        let new_channel = fake_channel().await;
+
+        diff_state
+            .channels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert("device-b".to_string(), old_channel.clone());
+        diff_state
+            .channels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert("device-b".to_string(), new_channel.clone());
+
+        let removed = diff_state.remove_channel_if_current("device-b", &old_channel);
+        assert!(!removed, "cleanup keyed to the OLD generation's channel must not report removal");
+
+        let current = diff_state
+            .channels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get("device-b")
+            .cloned();
+        assert!(
+            current.is_some_and(|c| Arc::ptr_eq(&c, &new_channel)),
+            "the newer generation's channel must still be registered under its key -- the ABA \
+             race this test targets is the old generation's cleanup wrongly evicting it"
+        );
+
+        let removed = diff_state.remove_channel_if_current("device-b", &new_channel);
+        assert!(removed, "cleanup keyed to the CURRENT channel must succeed");
+        assert!(
+            diff_state
+                .channels
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get("device-b")
+                .is_none(),
+            "the entry must actually be gone once the current generation's own cleanup runs"
         );
     }
 
