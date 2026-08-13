@@ -213,6 +213,166 @@ async fn opaque_bytes_flow_from_a_through_b_to_cs_real_address_over_the_real_wir
     .await;
 }
 
+/// M3 Pass 6b acceptance: `DaemonState`'s own `RelayCarrier`/`RelayGrantSource`
+/// implementation, driven exactly the way `PeerChannel::send_batch_direct`
+/// drives it -- picks B as a relay candidate, obtains a grant, opens a
+/// session, and forwards -- over the SAME real orchestrator-managed
+/// sessions/sockets the rest of this file already proves the wire
+/// protocol and B's admission pipeline work over. This is the requester
+/// ("A") side; `opaque_bytes_flow_from_a_through_b_to_cs_real_address_
+/// over_the_real_wire` above already proves the provider ("B") side --
+/// together they cover the full A<->B<->C round trip this pass's
+/// `RelayCarrier` seam exists to drive.
+///
+/// Calls `send_via_relay` directly (as `PeerChannel` itself would once
+/// direct is `Unreachable`) rather than forcing A's real direct path to
+/// C to fail via network topology -- that natural trigger belongs to
+/// Pass 6c's failover tests; this test isolates the requester mechanism
+/// itself: candidate selection, grant issuance, open, and forwarding.
+struct TestGrantSource {
+    fake: FakeCoordination,
+    source_device_id: String,
+}
+
+impl yadorilink_daemon::relay_carrier::RelayGrantSource for TestGrantSource {
+    fn request_relay_grant<'a>(
+        &'a self,
+        destination_device_id: &'a str,
+        _relay_device_id: &'a str,
+        _group_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Option<yadorilink_daemon::relay_grant::RelayGrant>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let grant = self.fake.issue_relay_grant(&self.source_device_id, destination_device_id, 60);
+        Box::pin(async move { grant })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn requester_relay_carrier_opens_a_session_and_forwards_via_a_real_relay() {
+    support::ensure_isolated_config_dir();
+    let fake = FakeCoordination::start().await;
+    fake.enable_signed_policy();
+    let group_id = "relay-carrier-e2e-group";
+
+    let a = new_test_daemon("relay-carrier-a");
+    let b = new_test_daemon("relay-carrier-b");
+    let c = new_test_daemon("relay-carrier-c");
+    for daemon in [&a, &b, &c] {
+        register_with_fake(
+            &fake,
+            &daemon.state,
+            &daemon.device_id,
+            daemon.keypair.public_bytes(),
+            &[group_id],
+        )
+        .await;
+        link(&daemon.state, daemon._root.path(), group_id);
+    }
+    b.state.set_local_relay_capable(true);
+    fake.set_relay_capable(&b.device_id, true);
+
+    spawn_orchestrator(fake.addr(), a.device_id.clone(), a.keypair.clone(), a.state.clone());
+    spawn_orchestrator(fake.addr(), b.device_id.clone(), b.keypair.clone(), b.state.clone());
+    spawn_orchestrator(fake.addr(), c.device_id.clone(), c.keypair.clone(), c.state.clone());
+
+    // A<->B (what `RelayOpen`/`RelayData` travel over) and B<->C (what
+    // B's admission requires and forwards toward) must both be real,
+    // fully-negotiated sessions first -- same precondition as this
+    // file's provider-side test above.
+    wait_until_with_context(
+        || fully_connected(&a.state, &b.device_id) && fully_connected(&b.state, &c.device_id),
+        Duration::from_secs(60),
+        || {
+            format!(
+                "required hops never connected: a<->b={} b<->c={}",
+                fully_connected(&a.state, &b.device_id),
+                fully_connected(&b.state, &c.device_id),
+            )
+        },
+    )
+    .await;
+
+    a.state.set_relay_grant_source(Arc::new(TestGrantSource {
+        fake: fake.clone(),
+        source_device_id: a.device_id.clone(),
+    }));
+
+    let c_peer_public = c.keypair.public_bytes();
+    let payload = b"real relay-carrier payload, opaque to B".to_vec();
+    let sent = yadorilink_transport::RelayCarrier::send_via_relay(
+        &*a.state,
+        &c_peer_public,
+        bytes::Bytes::from(payload.clone()),
+    )
+    .await;
+    assert!(sent, "send_via_relay should have found B, opened a session, and forwarded");
+
+    // The exact same admission/forwarding pipeline the provider-side test
+    // above already proves in detail -- here just confirming THIS attempt
+    // actually reached it, driven from the requester's own send_via_relay
+    // rather than a hand-built RelayOpenFrame.
+    wait_until_with_context(
+        || b.state.relay_forwarder.active_session_count() == 1,
+        Duration::from_secs(10),
+        || {
+            format!(
+                "B never admitted the requester-opened relay session (active_session_count={})",
+                b.state.relay_forwarder.active_session_count()
+            )
+        },
+    )
+    .await;
+    let session_id = b.state.relay_forwarder.any_active_session_id().unwrap();
+    wait_until_with_context(
+        || {
+            b.state.relay_forwarder.session_bytes_forwarded(session_id)
+                >= Some(payload.len() as u64)
+        },
+        Duration::from_secs(10),
+        || {
+            format!(
+                "B never forwarded A's requester-opened payload toward C (bytes_forwarded={:?}, \
+                 expected>={})",
+                b.state.relay_forwarder.session_bytes_forwarded(session_id),
+                payload.len()
+            )
+        },
+    )
+    .await;
+
+    // A second call for the same destination must reuse the existing
+    // requester session rather than opening a redundant one -- proves
+    // `requester_relay_session_for_destination`'s reuse path, not just
+    // the open path.
+    let second_payload = b"second payload on the same requester session".to_vec();
+    let sent_again = yadorilink_transport::RelayCarrier::send_via_relay(
+        &*a.state,
+        &c_peer_public,
+        bytes::Bytes::from(second_payload.clone()),
+    )
+    .await;
+    assert!(sent_again);
+    assert_eq!(
+        b.state.relay_forwarder.active_session_count(),
+        1,
+        "a second send for the same destination must reuse the existing session, not open another"
+    );
+    wait_until_with_context(
+        || {
+            b.state.relay_forwarder.session_bytes_forwarded(session_id)
+                >= Some((payload.len() + second_payload.len()) as u64)
+        },
+        Duration::from_secs(10),
+        || "B never forwarded the second payload on the reused session".to_string(),
+    )
+    .await;
+}
+
 /// Cleanup regression: when B's own direct route to the DESTINATION is
 /// lost (here, a netmap revoke tearing down B<->C), any relay session B
 /// was forwarding toward it must close PROMPTLY -- not merely eventually
