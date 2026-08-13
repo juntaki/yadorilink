@@ -217,6 +217,29 @@ impl RelaySessionHandler for DaemonState {
                     );
                     return;
                 }
+                // M3 Pass 6 (independent-review finding H2): provider- and
+                // requester-tracked session ids are two independent
+                // numbering spaces that share one `u64` wire
+                // representation -- if `authenticated_peer_device_id` is
+                // ALSO the recorded source of an active PROVIDER session
+                // with this exact id (this device relaying FOR that same
+                // peer, coincidentally assigned the same number by its
+                // own independent counter), which one this frame is
+                // actually for is genuinely ambiguous from the wire alone.
+                // Fail closed -- indistinguishable from ordinary packet
+                // loss to either side -- rather than guessing and risking
+                // delivering one session's bytes into the other's path.
+                if self.active_relay_session_source(data.session_id).as_deref()
+                    == Some(authenticated_peer_device_id)
+                {
+                    tracing::warn!(
+                        session_id = data.session_id,
+                        peer = authenticated_peer_device_id,
+                        "relay data session id is ambiguous between a requester and a provider \
+                         session with the same peer; dropping"
+                    );
+                    return;
+                }
                 if let Some(device_id) = self.device_id_for_peer_public(&destination_peer_public) {
                     if let Some(channel) = self.direct_channel(&device_id) {
                         channel.deliver_relay_datagram(data.payload);
@@ -289,7 +312,9 @@ impl RelaySessionHandler for DaemonState {
                     .unwrap_or_else(|p| p.into_inner())
                     .clone();
                 if let Some(test_handler) = test_handler {
-                    return test_handler.handle_relay_close(close, authenticated_peer_device_id).await;
+                    return test_handler
+                        .handle_relay_close(close, authenticated_peer_device_id)
+                        .await;
                 }
             }
 
@@ -301,11 +326,35 @@ impl RelaySessionHandler for DaemonState {
             // session); just stop treating it as usable so a later `send_
             // via_relay` opens a fresh one instead of sending into a
             // session the relay has already torn down.
+            //
+            // A `relay_device_id` MISMATCH (independent-review finding,
+            // alongside H2) falls through to the provider-side check
+            // below instead of returning unconditionally -- this
+            // session_id genuinely belongs to a DIFFERENT relay's
+            // numbering, so it may still be a legitimate close for a
+            // session THIS device is providing (role "B") FOR the
+            // authenticated peer; the earlier code dropped that case
+            // silently regardless of which role it actually belonged to.
             if let Some((relay_device_id, _)) = self.requester_relay_session(close.session_id) {
                 if relay_device_id == authenticated_peer_device_id {
+                    // Same H2 ambiguity as `handle_relay_data`: fail
+                    // closed rather than guess if this id is ALSO an
+                    // active provider session with this same peer as
+                    // source.
+                    if self.active_relay_session_source(close.session_id).as_deref()
+                        == Some(authenticated_peer_device_id)
+                    {
+                        tracing::warn!(
+                            session_id = close.session_id,
+                            peer = authenticated_peer_device_id,
+                            "relay close session id is ambiguous between a requester and a \
+                             provider session with the same peer; not resolving either"
+                        );
+                        return;
+                    }
                     self.forget_requester_relay_session(close.session_id);
+                    return;
                 }
-                return;
             }
 
             // Ownership-checked (independent-review finding H1) -- an

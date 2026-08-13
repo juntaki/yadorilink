@@ -250,15 +250,28 @@ struct RelaySessionRecord {
 }
 
 /// M3 Pass 6: see `DaemonState::requester_relay_sessions`'s own doc
-/// comment. `relay_device_id` is what lets `RelayCarrier::send_via_relay`
-/// find the live `PeerSyncSession` to send subsequent `RelayData` frames
-/// over (`self.peers.session(&relay_device_id)`, looked up fresh each
-/// time rather than cached, so a session that reconnects with a fresh
-/// object is still found).
-#[derive(Debug, Clone)]
+/// comment. `relay_device_id` is what `RelayCarrier::send_via_relay`
+/// looks up the live `PeerSyncSession` by (`self.peers.session(&relay_
+/// device_id)`) to send subsequent `RelayData` frames over.
+///
+/// `opened_via` (independent-review finding H4): the EXACT session
+/// object this relay session was opened over, captured at open time.
+/// `self.peers.session(&relay_device_id)` alone answers "is THIS DEVICE
+/// currently connected to the relay", not "is it the SAME connection
+/// this specific relay session_id was negotiated on" -- a disconnect and
+/// reconnect between the open and a later reuse attempt produces a
+/// DIFFERENT `PeerSyncSession` object (fresh handshake, fresh state) that
+/// merely happens to share the same device_id, and B's own forwarder
+/// still has its `RelayReplySink` pointed at the OLD (now-dead) session,
+/// with no way to learn otherwise. `Weak`, not `Arc`, so a requester
+/// session's bookkeeping never keeps a dead `PeerSyncSession` alive by
+/// itself; `Weak::upgrade` failing is exactly equivalent to a generation
+/// mismatch, both mean "treat as no existing session."
+#[derive(Clone)]
 struct RequesterRelaySession {
     relay_device_id: String,
     destination_peer_public: [u8; 32],
+    opened_via: std::sync::Weak<yadorilink_peer_session::peer_session::PeerSyncSession>,
 }
 
 #[derive(Default)]
@@ -1456,6 +1469,27 @@ impl DaemonState {
         self.active_relay_sessions.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id);
     }
 
+    /// M3 Pass 6 (independent-review finding H2): whether `session_id` is
+    /// CURRENTLY an active session this device is providing relay for
+    /// (role "B"), and if so, its `source_device_id`. Provider-assigned
+    /// session ids (this device's own `RelayForwarder` counter) and
+    /// requester-tracked session ids (assigned by whichever OTHER device
+    /// this device asked to relay for it) are two independent numbering
+    /// spaces that happen to share one `u64` wire representation -- a
+    /// device that is simultaneously providing relay for peer X AND has
+    /// its own requester session open THROUGH peer X can have the SAME
+    /// session_id mean two different things depending on role, both
+    /// legitimately reachable from an authenticated frame from X. Used by
+    /// `relay_session_handler::handle_relay_data`/`handle_relay_close` to
+    /// detect that ambiguity and fail closed rather than guess.
+    pub(crate) fn active_relay_session_source(&self, session_id: u64) -> Option<String> {
+        self.active_relay_sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&session_id)
+            .map(|record| record.source_device_id.clone())
+    }
+
     /// Re-runs the exact same authorization checks `admit_relay_open` ran
     /// when this session was first admitted, against THIS device's
     /// CURRENT live state -- see `record_relay_session`'s own doc comment
@@ -1600,26 +1634,46 @@ impl DaemonState {
         session_id: u64,
         relay_device_id: String,
         destination_peer_public: [u8; 32],
+        opened_via: &Arc<yadorilink_peer_session::peer_session::PeerSyncSession>,
     ) {
-        self.requester_relay_sessions
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(session_id, RequesterRelaySession { relay_device_id, destination_peer_public });
+        self.requester_relay_sessions.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            session_id,
+            RequesterRelaySession {
+                relay_device_id,
+                destination_peer_public,
+                opened_via: Arc::downgrade(opened_via),
+            },
+        );
     }
 
     /// An existing requester-opened session already carrying traffic for
-    /// `destination_peer_public`, if this device has one -- `send_via_
-    /// relay` reuses it rather than opening a new one per datagram.
+    /// `destination_peer_public`, if this device has one AND the
+    /// `PeerSyncSession` it was opened over is still the live one (see
+    /// `RequesterRelaySession::opened_via`'s own doc comment) -- `send_
+    /// via_relay` reuses it rather than opening a new one per datagram. A
+    /// stale entry (the relay connection was replaced since this session
+    /// opened) is removed here rather than left for a later caller to
+    /// rediscover the same staleness.
     pub(crate) fn requester_relay_session_for_destination(
         &self,
         destination_peer_public: &[u8; 32],
     ) -> Option<(u64, String)> {
-        self.requester_relay_sessions
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        let mut sessions = self.requester_relay_sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let (session_id, record) = sessions
             .iter()
             .find(|(_, s)| &s.destination_peer_public == destination_peer_public)
-            .map(|(id, s)| (*id, s.relay_device_id.clone()))
+            .map(|(id, s)| (*id, s.clone()))?;
+        let still_live = record.opened_via.upgrade().is_some_and(|session| {
+            self.peers
+                .session(&record.relay_device_id)
+                .is_some_and(|current| Arc::ptr_eq(&session, &current))
+        });
+        if still_live {
+            Some((session_id, record.relay_device_id))
+        } else {
+            sessions.remove(&session_id);
+            None
+        }
     }
 
     /// The relay device a requester-opened `session_id` was opened
@@ -1686,6 +1740,17 @@ impl DaemonState {
             drop(pending);
             let _ = sender.send(opened);
         }
+    }
+
+    /// M3 Pass 6 (independent-review finding): removes a pending open
+    /// this device's own `RelayCarrier::send_via_relay` is giving up on
+    /// (the `RelayOpen` send itself failed, or its reply timed out) --
+    /// without this, `pending_relay_opens` accumulates one entry per
+    /// failed/timed-out attempt forever, since `resolve_pending_relay_
+    /// open` only ever removes an entry that actually gets a matching
+    /// reply.
+    pub(crate) fn forget_pending_relay_open(&self, grant_id: &str) {
+        self.pending_relay_opens.lock().unwrap_or_else(|p| p.into_inner()).remove(grant_id);
     }
 
     /// Returns this device's transport hub, binding it on first use. All peer

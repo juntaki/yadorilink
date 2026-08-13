@@ -71,7 +71,14 @@ impl yadorilink_transport::RelayCarrier for DaemonState {
             };
 
             // Reuse an already-open requester session for this destination,
-            // if one exists and its relay session is still live.
+            // if one exists and its relay session is still live --
+            // `requester_relay_session_for_destination` itself verifies
+            // this is the SAME `PeerSyncSession` object the session was
+            // opened over (independent-review finding H4: a disconnect
+            // and reconnect to the relay produces a fresh session object
+            // B's forwarder has no way to learn about, so reusing a stale
+            // one would silently drop every future datagram while still
+            // reporting success), removing the entry itself if not.
             if let Some((session_id, relay_device_id)) =
                 self.requester_relay_session_for_destination(peer_public)
             {
@@ -79,10 +86,6 @@ impl yadorilink_transport::RelayCarrier for DaemonState {
                     session.send_relay_data(session_id, datagram.to_vec());
                     return true;
                 }
-                // The session to the relay itself is gone (disconnected) --
-                // forget this requester session (it cannot possibly still
-                // be forwarding) and fall through to opening a fresh one.
-                self.forget_requester_relay_session(session_id);
             }
 
             let Some(grant_source) = self.relay_grant_source() else {
@@ -120,6 +123,15 @@ impl yadorilink_transport::RelayCarrier for DaemonState {
                     signature: grant.signature.clone(),
                 };
                 if session.send_relay_open(open).await.is_err() {
+                    // M3 Pass 6 (independent-review finding): the pending
+                    // entry registered above has no requester left to
+                    // resolve it -- remove it now rather than leaving it
+                    // for `resolve_pending_relay_open` to never find a
+                    // match for (a `RelayOpenedFrame` that will now never
+                    // arrive, since the open itself never reached the
+                    // wire). Every `continue` below removes it for the
+                    // same reason.
+                    self.forget_pending_relay_open(&grant.grant_id);
                     continue;
                 }
 
@@ -129,7 +141,13 @@ impl yadorilink_transport::RelayCarrier for DaemonState {
                         // Timed out, or the sender was dropped without ever
                         // sending (the session tore down mid-wait) -- try
                         // the next candidate rather than giving up entirely.
-                        _ => continue,
+                        // `resolve_pending_relay_open` already removes the
+                        // entry on a genuine resolution; a timeout means
+                        // nobody ever will, so this device must.
+                        _ => {
+                            self.forget_pending_relay_open(&grant.grant_id);
+                            continue;
+                        }
                     };
                 if !opened.granted {
                     continue;
@@ -139,6 +157,7 @@ impl yadorilink_transport::RelayCarrier for DaemonState {
                     opened.session_id,
                     relay_device_id,
                     *peer_public,
+                    &session,
                 );
                 session.send_relay_data(opened.session_id, datagram.to_vec());
                 return true;
