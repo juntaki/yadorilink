@@ -311,7 +311,8 @@ impl PeerChannel {
 
         // Register with the peer's known candidate addresses so the hub can
         // order handshake-initiation trials by source endpoint.
-        let inbound_demux_rx = shared.register_channel(session_index, &direct_candidates);
+        let inbound_demux_rx =
+            shared.register_channel(session_index, &direct_candidates, peer_public);
 
         let tunn = WgTunnel::new(local_secret, peer_public, session_index);
         let (outbound_tx, outbound_rx) = mpsc::channel::<Bytes>(64);
@@ -1236,7 +1237,7 @@ mod tests {
         let (reachability_tx, _reachability_rx) = watch::channel(reachability);
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let shared = TransportHub::from_socket(socket, None);
-        let inbound_demux_rx = shared.register_channel(0, &[]);
+        let inbound_demux_rx = shared.register_channel(0, &[], peer_public);
         ActorState {
             tunn,
             peer_public_bytes: peer_public.to_bytes(),

@@ -324,6 +324,13 @@ pub struct DaemonState {
     /// transport hub's MAC1 initiation gate is keyed on it. Set once before the
     /// hub is first bound; absent only if identity was never available.
     pub device_static_public: std::sync::OnceLock<[u8; 32]>,
+    /// M3 Pass 2: this device's WireGuard static PRIVATE key -- see
+    /// `set_device_static_secret`'s own doc comment. Absent only if
+    /// identity was never available (the same case `device_static_public`
+    /// already handles); `ensure_shared_socket` degrades gracefully to
+    /// the pre-M3-Pass-2 broadcast fallback when unset, same as an absent
+    /// `device_static_public` already degrades the MAC1 gate.
+    pub device_static_secret: std::sync::OnceLock<boringtun::x25519::StaticSecret>,
     /// This device's Ed25519 change-history signing key, wired once at startup
     /// when the device is registered. `None` (the default) leaves signed
     /// change-history emission off — see `set_device_signing_key`.
@@ -992,6 +999,7 @@ impl DaemonState {
             nat_observations: yadorilink_transport::ObservationLog::new(),
             shared_socket: tokio::sync::OnceCell::new(),
             device_static_public: std::sync::OnceLock::new(),
+            device_static_secret: std::sync::OnceLock::new(),
             device_signing_key: Mutex::new(None),
             peer_netmap_metadata: Mutex::new(PeerNetmapMetadata::default()),
             membership_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1187,6 +1195,23 @@ impl DaemonState {
         let _ = self.device_static_public.set(public_bytes);
     }
 
+    /// M3 Pass 2: seeds this device's WireGuard static PRIVATE key so
+    /// `ensure_shared_socket` can call `TransportHub::set_device_identity`,
+    /// closing the O(N^2) handshake-fan-in cost the `handshake_fan_in.rs`
+    /// reproducer measured (M3 Pass 1) -- see that method's own doc
+    /// comment for the full mechanism. Held here the same way
+    /// `TransportHub`'s own `DemuxRegistry` now holds an identical copy
+    /// (set via that same call), and the same way every registered peer
+    /// channel's own `Tunn` ALREADY holds an identical copy for its
+    /// lifetime -- not a new class of exposure, one more copy of
+    /// already-in-process key material with the same lifetime
+    /// characteristics. Must be called before the hub is first bound; a
+    /// later call is a no-op (matching `set_device_static_public`'s own
+    /// contract exactly).
+    pub fn set_device_static_secret(&self, secret: boringtun::x25519::StaticSecret) {
+        let _ = self.device_static_secret.set(secret);
+    }
+
     /// Returns this device's transport hub, binding it on first use. All peer
     /// channels and the NAT prober/mapper drive this one endpoint so the
     /// advertised candidates describe the exact binding data flows on. A bind
@@ -1199,13 +1224,28 @@ impl DaemonState {
             .device_static_public
             .get()
             .and_then(|bytes| yadorilink_transport::public_key_from_bytes(bytes).ok());
-        self.shared_socket
+        let hub = self
+            .shared_socket
             .get_or_try_init(|| async {
                 let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0));
                 yadorilink_transport::TransportHub::bind(addr, device_public).await
             })
             .await
-            .cloned()
+            .cloned()?;
+        // M3 Pass 2: idempotent (`TransportHub::set_device_identity`'s own
+        // `OnceLock`-backed no-op-on-second-call contract), so calling it
+        // on every `ensure_shared_socket` invocation (not just the one
+        // that actually bound the hub) is deliberate and cheap -- avoids
+        // needing this closure itself to reach into `device_static_secret`
+        // (that would move the read outside `get_or_try_init`'s own
+        // closure, which is fine, but doing it here keeps the ordering
+        // dependency explicit: identity is set on whatever hub instance
+        // this call ends up returning, whether freshly bound or already
+        // cached).
+        if let Some(secret) = self.device_static_secret.get() {
+            hub.set_device_identity(secret.clone());
+        }
+        Ok(hub)
     }
 
     /// Installs a pre-bound transport hub (the deterministic-simulation harness
