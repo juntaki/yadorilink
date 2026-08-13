@@ -34,8 +34,8 @@ pub use crate::peer_session_impl::{
     disk_race_fingerprint, BlockWriteActivityProvider, ChangeAuthenticator, HandoffLeaseResponder,
     HandoffTicketResponder, HydrationOutcome, PeerHandoffLeaseGrant, PeerHandoffTicketGrant,
     PendingLocalChangeFlush, PendingLocalFlushOutcome, PreparedRebootstrap, ProjectionAttempt,
-    RebootstrapHandler, RootCommitAuthorityProvider, DEFAULT_HYDRATION_TIMEOUT,
-    DEFAULT_MAINTENANCE_RECONCILE_INTERVAL,
+    RebootstrapHandler, RelayReplySink, RelaySessionHandler, RootCommitAuthorityProvider,
+    DEFAULT_HYDRATION_TIMEOUT, DEFAULT_MAINTENANCE_RECONCILE_INTERVAL,
 };
 
 use crate::peer_session_impl::PeerSyncSession as InnerPeerSyncSession;
@@ -57,6 +57,8 @@ pub struct PeerSyncSessionDeps {
     pub block_write_activity_provider: Arc<dyn BlockWriteActivityProvider>,
     pub handoff_ticket_responder: Arc<dyn HandoffTicketResponder>,
     pub root_commit_authority_provider: Arc<dyn RootCommitAuthorityProvider>,
+    /// M3 Pass 5: see `RelaySessionHandler`'s own doc comment.
+    pub relay_session_handler: Arc<dyn RelaySessionHandler>,
     /// Lets this session author a captured change for content its own
     /// materialize path displaces during custody transfer (see
     /// `PeerSyncSession::set_change_emitter`'s doc comment). A device that
@@ -87,11 +89,12 @@ impl PeerSyncSessionDeps {
             block_write_activity_provider: Arc::new(NoopBlockWriteActivityProvider),
             handoff_ticket_responder: Arc::new(DenyHandoffTicketResponder),
             root_commit_authority_provider: Arc::new(DenyRootCommitAuthorityProvider),
+            relay_session_handler: Arc::new(DenyRelaySessionHandler),
             change_emitter: None,
         }
     }
 
-    /// This session's 8 one-time, construction-only capability injections,
+    /// This session's one-time, construction-only capability injections,
     /// in the shape `InnerPeerSyncSession::new_with_forwarding` takes them.
     fn one_time_deps(&self) -> PeerSyncSessionOneTimeDeps {
         PeerSyncSessionOneTimeDeps {
@@ -102,6 +105,7 @@ impl PeerSyncSessionDeps {
             rebootstrap_handler: self.rebootstrap_handler.clone(),
             block_write_activity_provider: self.block_write_activity_provider.clone(),
             handoff_ticket_responder: self.handoff_ticket_responder.clone(),
+            relay_session_handler: self.relay_session_handler.clone(),
             change_emitter: self.change_emitter.clone(),
         }
     }
@@ -652,6 +656,39 @@ impl ChangeAuthenticator for DenyAllChangeAuthenticator {
         _auth: ChangeAuth,
     ) -> bool {
         false
+    }
+}
+
+struct DenyRelaySessionHandler;
+
+impl RelaySessionHandler for DenyRelaySessionHandler {
+    fn handle_relay_open<'a>(
+        &'a self,
+        open: yadorilink_sync_wire::RelayOpenFrame,
+        _authenticated_peer_device_id: &'a str,
+        _reply_sink: Arc<dyn RelayReplySink>,
+    ) -> Pin<Box<dyn Future<Output = yadorilink_sync_wire::RelayOpenedFrame> + Send + 'a>> {
+        Box::pin(async move {
+            yadorilink_sync_wire::RelayOpenedFrame {
+                grant_id: open.grant_id,
+                granted: false,
+                session_id: 0,
+            }
+        })
+    }
+
+    fn handle_relay_data<'a>(
+        &'a self,
+        _data: yadorilink_sync_wire::RelayDataFrame,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+
+    fn handle_relay_close<'a>(
+        &'a self,
+        _close: yadorilink_sync_wire::RelayCloseFrame,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
     }
 }
 
