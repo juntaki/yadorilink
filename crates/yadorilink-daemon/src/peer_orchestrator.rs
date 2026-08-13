@@ -388,6 +388,13 @@ fn record_group_policy_states(
     let presented_hex = hex::encode(presented_key);
     let (verification_key, pin_decision) =
         policy_service_key_pin_decision(service_key_pins, coordination_endpoint, presented_key)?;
+    // M3 Pass 5: mirrored onto `DaemonState` (not just this attempt-scoped
+    // `service_key_pins` map) so relay-grant verification -- which can
+    // happen at any later point, independent of any specific netmap
+    // subscription attempt -- has the SAME trust anchor
+    // `change_policy::verify_group_policy_log` already uses, without
+    // needing its own separate pinning flow.
+    state.set_pinned_coordination_service_key(verification_key);
 
     let mut states = HashMap::new();
     let mut stale_groups: Vec<String> = Vec::new();
@@ -1564,6 +1571,11 @@ fn teardown_peer(state: &Arc<DaemonState>, diff_state: &NetmapDiffState, device_
     {
         channel.revoke();
     }
+    // M3 Pass 5: mirrors the removal above onto `DaemonState` -- see
+    // `DaemonState::set_direct_channel`'s own doc comment. Unconditional,
+    // same reasoning as the `diff_state.channels` removal right above:
+    // full revocation always clears whatever is currently registered.
+    state.remove_direct_channel(device_id);
     // Must happen before aborting the supervisor task below: once removed,
     // even an in-flight reconnect attempt that started just before the
     // abort lands finds no spec at its next check and stops trying, rather
@@ -1886,6 +1898,9 @@ async fn run_one_peer_session_attempt(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(peer_device_id.to_string(), channel.clone());
+    // M3 Pass 5: mirrors the insert above onto `DaemonState` -- see
+    // `DaemonState::set_direct_channel`'s own doc comment.
+    state.set_direct_channel(peer_device_id.to_string(), channel.clone());
 
     // Reflect the channel's live reachability into status: it starts
     // `Connecting` while candidates race, becomes `Connected` once a
@@ -1930,6 +1945,14 @@ async fn run_one_peer_session_attempt(
     // `Arc<PeerChannel>` THIS attempt itself created and inserted above --
     // never anyone else's.
     let removed = diff_state.remove_channel_if_current(peer_device_id, &channel_for_cleanup);
+    if removed {
+        // M3 Pass 5: mirrors `diff_state.channels`'s own removal onto
+        // `DaemonState`, guarded by the SAME `removed` check (only this
+        // generation's own cleanup, having won the ABA race above, may
+        // clear the mirror) -- see `DaemonState::set_direct_channel`'s own
+        // doc comment for why the relay-admission path needs this at all.
+        state.remove_direct_channel(peer_device_id);
+    }
     let removed_channel = removed.then_some(channel_for_cleanup);
     // `revoke()` (not just dropping the `Arc`) is what's needed here --
     // `PeerChannel` has no `Drop` impl, so a channel whose owner just stops
@@ -2149,6 +2172,9 @@ pub(crate) fn peer_sync_session_deps(state: &Arc<DaemonState>) -> PeerSyncSessio
         // (the daemon's own `LinkRuntimeController`).
         pending_local_change_flush: state.clone(),
         root_commit_authority_provider: state.clone(),
+        // M3 Pass 5: `impl RelaySessionHandler for DaemonState` --
+        // `relay_session_handler.rs`.
+        relay_session_handler: state.clone(),
         // Admit incoming change-history changes only when this device
         // has pinned the author's signing key and the author is an
         // authorized writer for the change's group — both mirrored from

@@ -339,6 +339,52 @@ pub struct DaemonState {
     /// the pre-M3-Pass-2 broadcast fallback when unset, same as an absent
     /// `device_static_public` already degrades the MAC1 gate.
     pub device_static_secret: std::sync::OnceLock<boringtun::x25519::StaticSecret>,
+    /// M3 Pass 5: the coordination plane's currently-pinned service
+    /// signing key -- the SAME trust anchor `change_policy::
+    /// verify_group_policy_log` uses for group policy logs, mirrored here
+    /// (from the identical pin decision `record_group_policy_states`
+    /// already makes on every netmap update) so relay-grant verification
+    /// can reach it at any later point, independent of any specific
+    /// netmap-subscription attempt. `None` until the first netmap update
+    /// with policy distribution enabled has been processed.
+    pinned_coordination_service_key: Mutex<Option<[u8; 32]>>,
+    /// M3 Pass 5: this device's own relay-session forwarding actor
+    /// registry (its role as "B") -- see
+    /// `crate::relay_forwarder::RelayForwarder`'s own doc comment.
+    pub relay_forwarder: Arc<crate::relay_forwarder::RelayForwarder>,
+    /// M3 Pass 5: replay guard for grant ids this device has admitted as a
+    /// relay -- see `crate::relay_session::RelayReplayGuard`'s own doc
+    /// comment. Device-wide (not per-session), since the same grant_id
+    /// must never be usable twice regardless of which channel presents it.
+    pub(crate) relay_replay_guard: crate::relay_session::RelayReplayGuard,
+    /// M3 Pass 5: mirrors `peer_orchestrator::NetmapDiffState::channels`
+    /// (device_id -> live direct `Arc<PeerChannel>`) onto `DaemonState`,
+    /// at the identical insert/remove points -- `diff_state` itself is
+    /// local to `run`'s own call stack, unreachable from a
+    /// `RelaySessionHandler` implementation on `DaemonState`, which needs
+    /// this device's OWN confirmed direct channel to the relay
+    /// destination (to open its dedicated forwarding socket against the
+    /// right address, and to confirm a direct route exists at all --
+    /// see `relay_session::RelayAdmissionContext::has_direct_route_to_
+    /// destination`'s own doc comment for why that check specifically
+    /// forbids relay chaining).
+    direct_channels: Mutex<HashMap<String, Arc<yadorilink_transport::PeerChannel>>>,
+    /// M3 Pass 5: this device's own local configuration of whether it is
+    /// willing to relay for other peers -- see `crate::route::
+    /// RelayCapability`'s own doc comment. Defaults to `false` (the
+    /// fail-safe default: a device must explicitly opt in). Distinct from
+    /// `peer_relay_capability`, which reads OTHER peers' netmap-advertised
+    /// capability -- this is what THIS device would itself advertise, and
+    /// what its own relay-admission check consults for "am I actually
+    /// willing to do this" (defense in depth beyond trusting the
+    /// coordination plane's own issuance decision, per `relay_session`'s
+    /// own doc comment). Not yet wired into netmap registration/
+    /// advertisement (`register_with_fake`'s production counterpart) --
+    /// a device that sets this locally is not yet visible to the
+    /// coordination plane as a relay candidate; that wiring is a
+    /// remaining follow-up, tracked separately from the relay mechanism
+    /// itself.
+    local_relay_capable: std::sync::atomic::AtomicBool,
     /// This device's Ed25519 change-history signing key, wired once at startup
     /// when the device is registered. `None` (the default) leaves signed
     /// change-history emission off — see `set_device_signing_key`.
@@ -1008,6 +1054,11 @@ impl DaemonState {
             shared_socket: tokio::sync::OnceCell::new(),
             device_static_public: std::sync::OnceLock::new(),
             device_static_secret: std::sync::OnceLock::new(),
+            pinned_coordination_service_key: Mutex::new(None),
+            relay_forwarder: Arc::new(crate::relay_forwarder::RelayForwarder::new()),
+            relay_replay_guard: crate::relay_session::RelayReplayGuard::new(),
+            direct_channels: Mutex::new(HashMap::new()),
+            local_relay_capable: std::sync::atomic::AtomicBool::new(false),
             device_signing_key: Mutex::new(None),
             peer_netmap_metadata: Mutex::new(PeerNetmapMetadata::default()),
             membership_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1218,6 +1269,49 @@ impl DaemonState {
     /// contract exactly).
     pub fn set_device_static_secret(&self, secret: boringtun::x25519::StaticSecret) {
         let _ = self.device_static_secret.set(secret);
+    }
+
+    /// M3 Pass 5: records the coordination plane's CURRENTLY pinned
+    /// service signing key, mirrored from `record_group_policy_states`'s
+    /// own pin decision on every netmap update -- see the field's own
+    /// doc comment. A `Mutex`, not a `OnceLock` like `device_static_
+    /// secret` above: unlike a device's own identity, the pinned service
+    /// key can legitimately be updated (the pin-decision logic itself
+    /// governs whether a NEW presented key is accepted as a rotation or
+    /// rejected as a mismatch; this setter just mirrors whatever that
+    /// logic already decided, it makes no decision of its own).
+    pub fn set_pinned_coordination_service_key(&self, key: [u8; 32]) {
+        *self.pinned_coordination_service_key.lock().unwrap_or_else(|p| p.into_inner()) = Some(key);
+    }
+
+    /// The coordination plane's currently pinned service signing key, if
+    /// this device has processed at least one policy-bearing netmap
+    /// update. `None` is the fail-safe default relay-grant verification
+    /// must treat as "cannot verify anything" -- never a wildcard accept.
+    pub fn pinned_coordination_service_key(&self) -> Option<[u8; 32]> {
+        *self.pinned_coordination_service_key.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// M3 Pass 5: records `device_id`'s live direct channel -- see
+    /// `direct_channels`'s own doc comment for why this mirror exists.
+    pub(crate) fn set_direct_channel(
+        &self,
+        device_id: String,
+        channel: Arc<yadorilink_transport::PeerChannel>,
+    ) {
+        self.direct_channels.lock().unwrap_or_else(|p| p.into_inner()).insert(device_id, channel);
+    }
+
+    pub(crate) fn remove_direct_channel(&self, device_id: &str) {
+        self.direct_channels.lock().unwrap_or_else(|p| p.into_inner()).remove(device_id);
+    }
+
+    /// `device_id`'s live direct channel, if this device currently has
+    /// one -- used by the relay-admission path to confirm a direct route
+    /// exists and to read its confirmed address (see `PeerChannel::
+    /// confirmed_direct_addr`).
+    pub(crate) fn direct_channel(&self, device_id: &str) -> Option<Arc<yadorilink_transport::PeerChannel>> {
+        self.direct_channels.lock().unwrap_or_else(|p| p.into_inner()).get(device_id).cloned()
     }
 
     /// Returns this device's transport hub, binding it on first use. All peer
@@ -1646,6 +1740,27 @@ impl DaemonState {
             self.replica_coordinator.link_repository().materialization_policy_for_group(group_id),
             Ok(Some(yadorilink_replica_domain::session_state::MaterializationPolicy::Eager))
         )
+    }
+
+    /// Whether THIS device is currently a member of `group_id` at all
+    /// (any storage mode, not just full-replica) -- used by relay
+    /// admission to re-verify its own membership in a grant's `group_id`
+    /// independent of what the grant itself claims.
+    pub fn is_local_group_member(&self, group_id: &str) -> bool {
+        self.replica_coordinator
+            .link_repository()
+            .materialization_policy_for_group(group_id)
+            .is_ok_and(|policy| policy.is_some())
+    }
+
+    /// M3 Pass 5: sets this device's own local relay-capability
+    /// configuration -- see `local_relay_capable`'s own doc comment.
+    pub fn set_local_relay_capable(&self, capable: bool) {
+        self.local_relay_capable.store(capable, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_local_relay_capable(&self) -> bool {
+        self.local_relay_capable.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether `device_id` is currently recorded as a full replica of

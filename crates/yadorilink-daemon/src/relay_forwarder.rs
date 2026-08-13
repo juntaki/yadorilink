@@ -48,15 +48,15 @@ pub const RELAY_MAX_CONCURRENT_SESSIONS: usize = 8;
 const RELAY_MAX_BYTES_PER_SEC: u64 = 2 * 1024 * 1024;
 const RELAY_MAX_PACKETS_PER_SEC: u64 = 500;
 
-/// Where the forwarder sends bytes it receives FROM the destination (C),
-/// and how it reports a session closing -- implemented by whatever sent
-/// the original `RelayOpen` (a live `PeerSyncSession`, in production),
-/// which pushes these back out as `RelayData`/`RelayClose` on that same
-/// A<->B channel.
-pub trait RelayReplySink: Send + Sync {
-    fn send_relay_data(&self, session_id: u64, payload: Vec<u8>);
-    fn send_relay_close(&self, session_id: u64, reason: &str);
-}
+// Where the forwarder sends bytes it receives FROM the destination (C),
+// and how it reports a session closing -- implemented by whatever sent
+// the original `RelayOpen` (a live `PeerSyncSession`, in production),
+// which pushes these back out as `RelayData`/`RelayClose` on that same
+// A<->B channel. Reuses `yadorilink_peer_session::peer_session::
+// RelayReplySink` directly (not a separate duplicate trait) -- the same
+// object a `PeerSyncSession` already implements gets handed straight
+// through from `relay_session_handler.rs`, with no adapter shim needed.
+pub use yadorilink_peer_session::peer_session::RelayReplySink;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RelayForwarderError {
