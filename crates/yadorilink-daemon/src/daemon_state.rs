@@ -241,6 +241,14 @@ impl FullReplicaCustody for DaemonState {
     }
 }
 
+/// M3 Pass 5: see `DaemonState::active_relay_sessions`'s own doc comment.
+#[derive(Debug, Clone)]
+struct RelaySessionRecord {
+    source_device_id: String,
+    group_id: String,
+    destination_device_id: String,
+}
+
 #[derive(Default)]
 struct PeerNetmapMetadata {
     signing_keys: HashMap<String, [u8; 32]>,
@@ -369,20 +377,23 @@ pub struct DaemonState {
     /// destination`'s own doc comment for why that check specifically
     /// forbids relay chaining).
     direct_channels: Mutex<HashMap<String, Arc<yadorilink_transport::PeerChannel>>>,
-    /// M3 Pass 5: device_id -> relay session ids THIS device (as relay)
-    /// currently has open toward that destination -- see `remove_direct_
-    /// channel`'s own doc comment for why (closing a relay session
-    /// promptly when its destination's direct route is lost, rather than
-    /// leaving it to the forwarder's own idle timeout). Known limitation,
-    /// not yet worth the added plumbing to close: an entry for a session
-    /// that closes NORMALLY (idle timeout, grant expiry, explicit close)
-    /// -- as opposed to via THIS route-loss path -- is only pruned the
-    /// NEXT time that same destination's route is also lost, not
-    /// immediately; `RelayForwarder`'s own internal actor exit has no
-    /// callback into `DaemonState` today. Bounded in practice by how
-    /// often peer connections churn, not unbounded within a single
-    /// session's own lifetime.
-    relay_sessions_by_destination: Mutex<HashMap<String, Vec<u64>>>,
+    /// M3 Pass 5: session id -> the full authorization tuple it was
+    /// admitted under -- see `record_relay_session`'s own doc comment for
+    /// why (per-datagram revalidation, closing H2/M3 in the independent
+    /// review). Also what `remove_direct_channel` searches to find
+    /// sessions affected by a specific destination's route disappearing.
+    /// Known limitation, not yet worth further plumbing to close: an
+    /// entry for a session that closes NORMALLY (idle timeout, grant
+    /// expiry, explicit close, or a `revalidate_relay_session` failure --
+    /// all of which go through `RelayForwarder::close_session`, not
+    /// straight through this map) is only pruned by `forget_relay_
+    /// session`, called from `handle_relay_data`'s own dispatch once a
+    /// close is detected there -- a session that goes idle and times out
+    /// with NO further datagrams ever arriving has no such trigger and
+    /// stays in this map until this device restarts. Bounded in practice
+    /// (each entry is a few small strings, and idle sessions are rare
+    /// relative to active ones), not fixed here.
+    active_relay_sessions: Mutex<HashMap<u64, RelaySessionRecord>>,
     /// M3 Pass 5: this device's own local configuration of whether it is
     /// willing to relay for other peers -- see `crate::route::
     /// RelayCapability`'s own doc comment. Defaults to `false` (the
@@ -1085,7 +1096,7 @@ impl DaemonState {
             relay_forwarder: Arc::new(crate::relay_forwarder::RelayForwarder::new()),
             relay_replay_guard: crate::relay_session::RelayReplayGuard::new(),
             direct_channels: Mutex::new(HashMap::new()),
-            relay_sessions_by_destination: Mutex::new(HashMap::new()),
+            active_relay_sessions: Mutex::new(HashMap::new()),
             local_relay_capable: std::sync::atomic::AtomicBool::new(false),
             device_signing_key: Mutex::new(None),
             peer_netmap_metadata: Mutex::new(PeerNetmapMetadata::default()),
@@ -1342,35 +1353,100 @@ impl DaemonState {
         // Closed immediately here rather than left to the forwarder's own
         // idle timeout, which would otherwise keep a now-meaningless
         // session (and its slot) alive for up to a minute after the route
-        // it depends on is already gone.
-        let session_ids: Vec<u64> = self
-            .relay_sessions_by_destination
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(device_id)
-            .unwrap_or_default();
-        for session_id in session_ids {
+        // it depends on is already gone. See `active_relay_sessions`'s own
+        // doc comment for the independent-review finding (M3) this half
+        // addresses -- the OTHER half, a route that's still nominally
+        // "connected" but no longer `RouteKind::Direct` specifically
+        // (e.g. re-racing candidates without the channel object itself
+        // being removed), is covered by `revalidate_relay_session`'s own
+        // per-datagram check, not here.
+        let mut sessions = self.active_relay_sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let affected: Vec<u64> = sessions
+            .iter()
+            .filter(|(_, record)| record.destination_device_id == device_id)
+            .map(|(id, _)| *id)
+            .collect();
+        for session_id in &affected {
+            sessions.remove(session_id);
+        }
+        drop(sessions);
+        for session_id in affected {
             self.relay_forwarder.close_session(session_id, "destination_route_lost");
         }
     }
 
-    /// M3 Pass 5: records that this device's relay session `session_id`
-    /// forwards toward `destination_device_id` -- see `remove_direct_
-    /// channel`'s own doc comment for why this exists (the forwarder
-    /// itself tracks sessions by id and raw address only, not by device
-    /// id, so this is the mapping that lets a channel teardown find and
-    /// close the relay sessions that depended on it).
-    pub(crate) fn record_relay_session_destination(
+    /// M3 Pass 5 (independent-review findings H2/M3): the full
+    /// authorization tuple a relay session was admitted under, keyed by
+    /// its forwarder-assigned session id. `RelayForwarder` itself tracks
+    /// sessions only by id and raw destination address -- it has no
+    /// concept of groups, peers, or authorization at all (deliberately;
+    /// see its own module doc comment) -- so THIS is what lets `handle_
+    /// relay_data` re-run the exact same group-membership/relay-
+    /// capability/direct-route checks `admit_relay_open` ran at OPEN
+    /// time, on every single subsequent datagram, closing the session
+    /// the moment any of them stops holding. Without this, an already-
+    /// open session kept forwarding on stale authorization for the rest
+    /// of its grant's lifetime after a group-edge revoke that left
+    /// another shared group intact (the exact gap the review's own
+    /// framing asked about).
+    pub(crate) fn record_relay_session(
         &self,
         session_id: u64,
-        destination_device_id: &str,
+        source_device_id: String,
+        group_id: String,
+        destination_device_id: String,
     ) {
-        self.relay_sessions_by_destination
+        self.active_relay_sessions.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            session_id,
+            RelaySessionRecord { source_device_id, group_id, destination_device_id },
+        );
+    }
+
+    pub(crate) fn forget_relay_session(&self, session_id: u64) {
+        self.active_relay_sessions.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id);
+    }
+
+    /// Re-runs the exact same authorization checks `admit_relay_open` ran
+    /// when this session was first admitted, against THIS device's
+    /// CURRENT live state -- see `record_relay_session`'s own doc comment
+    /// for why this exists and what gap it closes. Returns `Ok(())` if
+    /// the session is still fully authorized, `Err(reason)` (a short,
+    /// stable slug matching `RelayClose`'s own convention) otherwise --
+    /// the caller (`handle_relay_data`) is responsible for actually
+    /// closing the session on `Err`; this method only decides, it does
+    /// not act. Treats an untracked session id as already-invalid
+    /// (`"unknown_session"`) rather than panicking or defaulting
+    /// permissive.
+    pub(crate) fn revalidate_relay_session(&self, session_id: u64) -> Result<(), &'static str> {
+        let record = self
+            .active_relay_sessions
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .entry(destination_device_id.to_string())
-            .or_default()
-            .push(session_id);
+            .get(&session_id)
+            .cloned();
+        let Some(record) = record else {
+            return Err("unknown_session");
+        };
+        if !self.peer_is_writer(&record.source_device_id, &record.group_id) {
+            return Err("source_no_longer_a_group_member");
+        }
+        if !self.is_local_group_member(&record.group_id) {
+            return Err("relay_no_longer_a_group_member");
+        }
+        if !self.peer_is_writer(&record.destination_device_id, &record.group_id) {
+            return Err("destination_no_longer_a_group_member");
+        }
+        if !self.is_local_relay_capable() {
+            return Err("relay_capability_disabled");
+        }
+        let still_direct = matches!(
+            self.peers.reachability(&record.destination_device_id),
+            Some(crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Direct))
+        );
+        if !still_direct {
+            return Err("destination_route_no_longer_direct");
+        }
+        Ok(())
     }
 
     /// `device_id`'s live direct channel, if this device currently has

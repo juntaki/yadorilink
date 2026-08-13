@@ -705,6 +705,7 @@ impl RelaySessionHandler for DenyRelaySessionHandler {
     fn handle_relay_data<'a>(
         &'a self,
         _data: yadorilink_sync_wire::RelayDataFrame,
+        _authenticated_peer_device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async {})
     }
@@ -712,6 +713,7 @@ impl RelaySessionHandler for DenyRelaySessionHandler {
     fn handle_relay_close<'a>(
         &'a self,
         _close: yadorilink_sync_wire::RelayCloseFrame,
+        _authenticated_peer_device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async {})
     }

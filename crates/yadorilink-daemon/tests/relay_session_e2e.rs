@@ -394,3 +394,129 @@ async fn relay_open_is_refused_when_the_relay_never_declared_capability() {
         "a RelayOpen for a relay that never declared RelayCapability::Capable must never be admitted"
     );
 }
+
+/// Independent-review finding H2, exactly as specified: revoking the
+/// destination's membership in the grant's OWN group must close the
+/// relay session PROMPTLY, even though B<->C's underlying channel stays
+/// alive the whole time via a SECOND shared group they never lose --
+/// proving the session closes because `revalidate_relay_session` (run on
+/// every datagram, not just at open) actually re-checks group membership,
+/// not merely because the channel itself happened to tear down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn relay_session_closes_on_stale_group_authorization_while_the_channel_stays_alive() {
+    support::ensure_isolated_config_dir();
+    let fake = FakeCoordination::start().await;
+    fake.enable_signed_policy();
+    let group_relay = "relay-e2e-h2-relay-group";
+    let group_keepalive = "relay-e2e-h2-keepalive-group";
+
+    let a = new_test_daemon("relay-e2e-h2-a");
+    let b = new_test_daemon("relay-e2e-h2-b");
+    let c = new_test_daemon("relay-e2e-h2-c");
+    // Kept alive for the test's duration -- each device needs a SEPARATE
+    // local root per group it links.
+    let mut keepalive_roots = Vec::new();
+    for daemon in [&a, &b, &c] {
+        register_with_fake(
+            &fake,
+            &daemon.state,
+            &daemon.device_id,
+            daemon.keypair.public_bytes(),
+            &[group_relay, group_keepalive],
+        )
+        .await;
+        link(&daemon.state, daemon._root.path(), group_relay);
+        // `issue_relay_grant`'s own group selection is non-deterministic
+        // (`HashSet` intersection) when a device shares MULTIPLE groups
+        // with both the grant's source and destination -- it could pick
+        // EITHER `group_relay` or `group_keepalive`. Every device must be
+        // genuinely (locally) linked to BOTH, or admission fails for the
+        // wrong reason (this device never linked to whichever group the
+        // grant happened to land on) instead of the one this test
+        // actually exercises.
+        let keepalive_root = tempfile::tempdir().unwrap();
+        link(&daemon.state, keepalive_root.path(), group_keepalive);
+        keepalive_roots.push(keepalive_root);
+    }
+    b.state.set_local_relay_capable(true);
+    fake.set_relay_capable(&b.device_id, true);
+
+    spawn_orchestrator(fake.addr(), a.device_id.clone(), a.keypair.clone(), a.state.clone());
+    spawn_orchestrator(fake.addr(), b.device_id.clone(), b.keypair.clone(), b.state.clone());
+    spawn_orchestrator(fake.addr(), c.device_id.clone(), c.keypair.clone(), c.state.clone());
+
+    wait_until_with_context(
+        || fully_connected(&a.state, &b.device_id) && fully_connected(&b.state, &c.device_id),
+        Duration::from_secs(60),
+        || "required hops never connected".to_string(),
+    )
+    .await;
+
+    let grant = fake.issue_relay_grant(&a.device_id, &c.device_id, 120).unwrap();
+    let session_a_to_b = a.state.peers.session(&b.device_id).unwrap();
+    session_a_to_b
+        .send_relay_open(RelayOpenFrame {
+            version: grant.version,
+            grant_id: grant.grant_id.clone(),
+            group_id: grant.group_id.clone(),
+            source_device_id: grant.source_device_id.clone(),
+            relay_device_id: grant.relay_device_id.clone(),
+            destination_device_id: grant.destination_device_id.clone(),
+            not_before_unix: grant.not_before_unix,
+            expires_at_unix: grant.expires_at_unix,
+            max_session_bytes: grant.max_session_bytes.unwrap_or(0),
+            signature: grant.signature.clone(),
+        })
+        .await
+        .unwrap();
+
+    wait_until_with_context(
+        || b.state.relay_forwarder.active_session_count() == 1,
+        Duration::from_secs(10),
+        || "B never admitted the relay session".to_string(),
+    )
+    .await;
+    let session_id = b.state.relay_forwarder.any_active_session_id().unwrap();
+
+    // Sanity: forwarding works before the revoke.
+    session_a_to_b.send_relay_data(session_id, b"before revoke".to_vec());
+    wait_until_with_context(
+        || b.state.relay_forwarder.session_bytes_forwarded(session_id) >= Some(13),
+        Duration::from_secs(10),
+        || "pre-revoke forward never landed".to_string(),
+    )
+    .await;
+
+    // Revoke exactly the group the grant was scoped to, for the
+    // DESTINATION -- but C keeps `group_keepalive`, so B<->C's channel
+    // itself must NOT tear down.
+    fake.revoke(&c.device_id, &grant.group_id);
+    wait_until_with_context(
+        || !b.state.peer_is_writer(&c.device_id, &grant.group_id),
+        Duration::from_secs(10),
+        || "B never observed C's group revoke".to_string(),
+    )
+    .await;
+    assert!(
+        fully_connected(&b.state, &c.device_id),
+        "the channel must stay alive via the second shared group -- this test is only \
+         meaningful if the session closes due to revalidation, not because the channel itself \
+         tore down"
+    );
+
+    // The next datagram must fail revalidation and close the session --
+    // not "eventually, at grant expiry in 120s".
+    session_a_to_b.send_relay_data(session_id, b"after revoke".to_vec());
+    wait_until_with_context(
+        || b.state.relay_forwarder.active_session_count() == 0,
+        Duration::from_secs(10),
+        || {
+            format!(
+                "relay session was not closed after stale group authorization \
+                 (active_session_count={})",
+                b.state.relay_forwarder.active_session_count()
+            )
+        },
+    )
+    .await;
+}

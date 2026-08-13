@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
-use tokio::sync::watch;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use yadorilink_peer_session::rate_limiter::TokenBucket;
 
 /// Generous for a WireGuard datagram (typical MTU well under this); rejects
@@ -68,9 +68,21 @@ pub enum RelayForwarderError {
     UnknownSession(u64),
     #[error("relay session {session_id} byte cap reached ({sent}/{cap})")]
     ByteCapReached { session_id: u64, sent: u64, cap: u64 },
+    #[error(
+        "device {presented} is not the device that opened relay session {session_id} -- refused"
+    )]
+    OwnerMismatch { session_id: u64, presented: String },
 }
 
 struct RelaySessionHandle {
+    /// M3 Pass 5 (independent-review finding H1): the device_id that
+    /// OPENED this session (the grant's own `source_device_id`) -- the
+    /// only identity ever allowed to drive it via `forward_from_source`/
+    /// `close_session`. Without this, session ids are a device-global,
+    /// sequential (easily guessable) counter: ANY authenticated peer of
+    /// this device could inject datagrams into, or close, a session it
+    /// never opened, just by presenting a plausible-looking id.
+    owner_device_id: String,
     socket: Arc<UdpSocket>,
     close_tx: watch::Sender<Option<String>>,
     bytes_forwarded: Arc<AtomicU64>,
@@ -86,15 +98,28 @@ struct RelaySessionHandle {
 pub struct RelayForwarder {
     sessions: StdMutex<HashMap<u64, RelaySessionHandle>>,
     next_session_id: AtomicU64,
+    /// M3 Pass 5 (independent-review finding M2): the ONLY thing that
+    /// decides whether a new session may open. A permit is acquired
+    /// atomically (`try_acquire_owned`, before any socket work) and held
+    /// for the session's own actor task lifetime, released automatically
+    /// when that task exits for any reason -- replaces the previous
+    /// "check `sessions.len()`, then separately create the socket, then
+    /// separately insert" sequence, which let concurrent opens all
+    /// observe room and collectively overshoot the limit.
+    slot_semaphore: Arc<Semaphore>,
 }
 
 impl RelayForwarder {
     pub fn new() -> Self {
-        Self { sessions: StdMutex::new(HashMap::new()), next_session_id: AtomicU64::new(0) }
+        Self {
+            sessions: StdMutex::new(HashMap::new()),
+            next_session_id: AtomicU64::new(0),
+            slot_semaphore: Arc::new(Semaphore::new(RELAY_MAX_CONCURRENT_SESSIONS)),
+        }
     }
 
     pub fn active_session_count(&self) -> usize {
-        self.sessions.lock().unwrap_or_else(|p| p.into_inner()).len()
+        RELAY_MAX_CONCURRENT_SESSIONS - self.slot_semaphore.available_permits()
     }
 
     /// Test-only: an arbitrary currently-active session id, for a test
@@ -128,19 +153,25 @@ impl RelayForwarder {
     /// the system clock, so this stays testable under a fake clock.
     pub fn open_session(
         self: &Arc<Self>,
+        owner_device_id: String,
         destination_addr: SocketAddr,
         max_session_bytes: Option<u64>,
         expires_at_unix: i64,
         now_unix_ms: i64,
         reply_sink: Arc<dyn RelayReplySink>,
     ) -> Result<u64, RelayForwarderError> {
-        let active = self.active_session_count();
-        if active >= RELAY_MAX_CONCURRENT_SESSIONS {
-            return Err(RelayForwarderError::SlotLimitReached {
-                active,
-                max: RELAY_MAX_CONCURRENT_SESSIONS,
-            });
-        }
+        // Atomic reservation -- see `slot_semaphore`'s own doc comment.
+        // Failing here does no socket work at all, so a flood of refused
+        // opens costs nothing beyond this one non-blocking check.
+        let permit = match self.slot_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Err(RelayForwarderError::SlotLimitReached {
+                    active: self.active_session_count(),
+                    max: RELAY_MAX_CONCURRENT_SESSIONS,
+                })
+            }
+        };
 
         let std_socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
             .map_err(|e| RelayForwarderError::SocketSetup(e.to_string()))?;
@@ -171,6 +202,7 @@ impl RelayForwarder {
         self.sessions.lock().unwrap_or_else(|p| p.into_inner()).insert(
             session_id,
             RelaySessionHandle {
+                owner_device_id: owner_device_id.clone(),
                 socket: socket.clone(),
                 close_tx,
                 bytes_forwarded: bytes_forwarded.clone(),
@@ -194,6 +226,10 @@ impl RelayForwarder {
             last_activity_unix_ms,
             reply_sink,
             registry,
+            // Held for this task's own lifetime -- dropped (releasing the
+            // slot back to `slot_semaphore`) exactly once, on actor exit,
+            // regardless of exit reason.
+            permit,
         ));
 
         Ok(session_id)
@@ -207,9 +243,17 @@ impl RelayForwarder {
     /// caller drops silently per `RelayData`'s own doc comment) -- this is
     /// the internal admission-checked path, so an unknown id here is
     /// always this device's own bookkeeping bug, worth surfacing.
+    /// `requester_device_id` must be the AUTHENTICATED identity of
+    /// whoever is presenting this `RelayData` -- verified against the
+    /// session's own recorded `owner_device_id` (the device that opened
+    /// it) before anything is sent. Without this check, session ids are a
+    /// device-global, sequential counter: ANY authenticated peer of this
+    /// device could inject datagrams into a session it never opened, just
+    /// by guessing a plausible id (independent-review finding H1).
     pub async fn forward_from_source(
         &self,
         session_id: u64,
+        requester_device_id: &str,
         payload: &[u8],
         now_unix_ms: i64,
     ) -> Result<(), RelayForwarderError> {
@@ -217,6 +261,7 @@ impl RelayForwarder {
             let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
             match sessions.get(&session_id) {
                 Some(h) => (
+                    h.owner_device_id.clone(),
                     h.socket.clone(),
                     h.bytes_forwarded.clone(),
                     h.max_session_bytes,
@@ -227,38 +272,46 @@ impl RelayForwarder {
                 None => return Err(RelayForwarderError::UnknownSession(session_id)),
             }
         };
-        let (socket, bytes_forwarded, max_session_bytes, byte_bucket, packet_bucket, last_activity) =
-            handle;
+        let (
+            owner_device_id,
+            socket,
+            bytes_forwarded,
+            max_session_bytes,
+            byte_bucket,
+            packet_bucket,
+            last_activity,
+        ) = handle;
+
+        if owner_device_id != requester_device_id {
+            return Err(RelayForwarderError::OwnerMismatch {
+                session_id,
+                presented: requester_device_id.to_string(),
+            });
+        }
 
         if payload.len() > MAX_RELAY_PACKET_SIZE {
             return Ok(()); // oversized: silently dropped, matches datagram-loss semantics.
         }
-        let prospective_total = bytes_forwarded.load(Ordering::Relaxed) + payload.len() as u64;
-        if let Some(cap) = max_session_bytes {
-            if prospective_total > cap {
-                self.close_session(session_id, "byte_limit_reached");
-                return Err(RelayForwarderError::ByteCapReached {
-                    session_id,
-                    sent: prospective_total,
-                    cap,
-                });
-            }
+        if !try_reserve_bytes(&bytes_forwarded, payload.len() as u64, max_session_bytes) {
+            self.close_session(session_id, "byte_limit_reached");
+            return Err(RelayForwarderError::ByteCapReached {
+                session_id,
+                sent: bytes_forwarded.load(Ordering::Relaxed),
+                cap: max_session_bytes.unwrap_or(u64::MAX),
+            });
         }
 
         byte_bucket.acquire(payload.len() as u64).await;
         packet_bucket.acquire(1).await;
         let _ = socket.send(payload).await;
-        bytes_forwarded.fetch_add(payload.len() as u64, Ordering::Relaxed);
         last_activity.store(now_unix_ms, Ordering::Relaxed);
         Ok(())
     }
 
     /// Ends a session immediately, regardless of idle/expiry state --
-    /// used both for an explicit `RelayClose` from the requester and
-    /// internally (byte-cap exceeded). The actor task notices via `close`
-    /// and removes its own registry entry; this method does not remove it
-    /// directly, so there is exactly one removal path (the actor's own
-    /// exit), not two that could race.
+    /// unchecked (internal callers only: byte-cap breach, route loss,
+    /// idle/expiry). For a wire-triggered `RelayClose`, use `close_
+    /// session_as` instead, which verifies ownership first.
     pub fn close_session(&self, session_id: u64, reason: &str) {
         if let Some(handle) = self.sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&session_id)
         {
@@ -266,9 +319,59 @@ impl RelayForwarder {
         }
     }
 
+    /// `RelayClose` version of `forward_from_source`'s own ownership
+    /// check (independent-review finding H1) -- without this, any
+    /// authenticated peer of this device could close a session it never
+    /// opened, just by guessing its id. Returns `Ok(())` on both "closed"
+    /// and "already gone" (a close racing the session's own natural end
+    /// is not an error); returns `Err` only on a genuine ownership
+    /// mismatch, which the caller should treat as a hostile or buggy
+    /// presenter, not silently ignore.
+    pub fn close_session_as(
+        &self,
+        session_id: u64,
+        requester_device_id: &str,
+        reason: &str,
+    ) -> Result<(), RelayForwarderError> {
+        let owner = {
+            let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            match sessions.get(&session_id) {
+                Some(h) => h.owner_device_id.clone(),
+                None => return Ok(()), // already gone -- not an error.
+            }
+        };
+        if owner != requester_device_id {
+            return Err(RelayForwarderError::OwnerMismatch {
+                session_id,
+                presented: requester_device_id.to_string(),
+            });
+        }
+        self.close_session(session_id, reason);
+        Ok(())
+    }
+
     fn remove_session(&self, session_id: u64) {
         self.sessions.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id);
     }
+}
+
+/// M3 Pass 5 (independent-review finding M2): atomically reserves
+/// `additional` bytes against `cap` (if any) -- a single `fetch_update`
+/// rather than the previous `load` -> compare -> `fetch_add`, which let
+/// concurrent A->C and C->A traffic both pass the cap check before either
+/// had recorded its own addition, collectively exceeding it. `None` cap
+/// means unlimited: always reserves, always succeeds.
+fn try_reserve_bytes(counter: &AtomicU64, additional: u64, cap: Option<u64>) -> bool {
+    let Some(cap) = cap else {
+        counter.fetch_add(additional, Ordering::Relaxed);
+        return true;
+    };
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            let next = current.checked_add(additional)?;
+            (next <= cap).then_some(next)
+        })
+        .is_ok()
 }
 
 impl Default for RelayForwarder {
@@ -276,6 +379,19 @@ impl Default for RelayForwarder {
         Self::new()
     }
 }
+
+#[allow(clippy::too_many_arguments)]
+/// Sized to the largest possible UDP payload (over IPv4; IPv6 jumbograms
+/// are out of scope) -- independent-review finding L5: a buffer sized to
+/// only `MAX_RELAY_PACKET_SIZE` let the OS silently truncate any larger
+/// incoming datagram at `recv()` time with no way to detect it happened,
+/// so the truncated PREFIX was forwarded as if it were the whole thing --
+/// a real violation of "never modifies a payload", even though it never
+/// enabled redirection. Receiving into a buffer this large means `recv()`
+/// itself never truncates; an oversized datagram's true length is then
+/// checked explicitly below and the whole thing dropped, never forwarded
+/// partially.
+const MAX_UDP_DATAGRAM_SIZE: usize = 65_507;
 
 #[allow(clippy::too_many_arguments)]
 async fn run_relay_forwarder_actor(
@@ -290,13 +406,14 @@ async fn run_relay_forwarder_actor(
     last_activity_unix_ms: Arc<AtomicI64>,
     reply_sink: Arc<dyn RelayReplySink>,
     registry: Arc<RelayForwarder>,
+    _slot_permit: OwnedSemaphorePermit,
 ) {
+    let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
     let reason = loop {
         let now_unix = now_unix_seconds();
         if now_unix > expires_at_unix {
             break "grant_expired".to_string();
         }
-        let mut buf = [0u8; MAX_RELAY_PACKET_SIZE];
         tokio::select! {
             biased;
             _ = close_rx.changed() => {
@@ -314,15 +431,17 @@ async fn run_relay_forwarder_actor(
                 if n == 0 {
                     continue;
                 }
-                let prospective_total = bytes_forwarded.load(Ordering::Relaxed) + n as u64;
-                if let Some(cap) = max_session_bytes {
-                    if prospective_total > cap {
-                        break "byte_limit_reached".to_string();
-                    }
+                if n > MAX_RELAY_PACKET_SIZE {
+                    // Oversized: dropped WHOLE, never forwarded partially
+                    // -- see `MAX_UDP_DATAGRAM_SIZE`'s own doc comment.
+                    tracing::debug!(session_id, n, "oversized relay datagram dropped");
+                    continue;
+                }
+                if !try_reserve_bytes(&bytes_forwarded, n as u64, max_session_bytes) {
+                    break "byte_limit_reached".to_string();
                 }
                 byte_bucket.acquire(n as u64).await;
                 packet_bucket.acquire(1).await;
-                bytes_forwarded.fetch_add(n as u64, Ordering::Relaxed);
                 last_activity_unix_ms.store(now_unix_millis(), Ordering::Relaxed);
                 reply_sink.send_relay_data(session_id, buf[..n].to_vec());
             }
@@ -387,6 +506,9 @@ mod tests {
         (addr, handle)
     }
 
+    const OWNER: &str = "device-a";
+    const IMPOSTER: &str = "device-x";
+
     /// Opaque bytes sent from the "source" direction reach the destination
     /// and the reply comes back through the sink -- the core round trip
     /// this whole module exists for.
@@ -398,11 +520,11 @@ mod tests {
         let now = now_unix_seconds();
 
         let session_id = forwarder
-            .open_session(dest_addr, None, now + 60, now_unix_millis(), sink.clone())
+            .open_session(OWNER.to_string(), dest_addr, None, now + 60, now_unix_millis(), sink.clone())
             .unwrap();
 
         forwarder
-            .forward_from_source(session_id, b"hello from A", now_unix_millis())
+            .forward_from_source(session_id, OWNER, b"hello from A", now_unix_millis())
             .await
             .unwrap();
 
@@ -420,8 +542,9 @@ mod tests {
         let sink = RecordingSink::new();
         let now = now_unix_seconds();
 
-        let session_id =
-            forwarder.open_session(dest_addr, None, now + 60, now_unix_millis(), sink.clone()).unwrap();
+        let session_id = forwarder
+            .open_session(OWNER.to_string(), dest_addr, None, now + 60, now_unix_millis(), sink.clone())
+            .unwrap();
         forwarder.close_session(session_id, "requester_closed");
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -438,10 +561,12 @@ mod tests {
         let now = now_unix_seconds();
 
         let session_id = forwarder
-            .open_session(dest_addr, Some(4), now + 60, now_unix_millis(), sink.clone())
+            .open_session(OWNER.to_string(), dest_addr, Some(4), now + 60, now_unix_millis(), sink.clone())
             .unwrap();
 
-        let result = forwarder.forward_from_source(session_id, b"way too many bytes", now_unix_millis()).await;
+        let result = forwarder
+            .forward_from_source(session_id, OWNER, b"way too many bytes", now_unix_millis())
+            .await;
         assert!(matches!(result, Err(RelayForwarderError::ByteCapReached { .. })));
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(forwarder.active_session_count(), 0);
@@ -454,18 +579,118 @@ mod tests {
         let now = now_unix_seconds();
         for _ in 0..RELAY_MAX_CONCURRENT_SESSIONS {
             forwarder
-                .open_session(dest_addr, None, now + 60, now_unix_millis(), RecordingSink::new())
+                .open_session(
+                    OWNER.to_string(),
+                    dest_addr,
+                    None,
+                    now + 60,
+                    now_unix_millis(),
+                    RecordingSink::new(),
+                )
                 .unwrap();
         }
-        let result =
-            forwarder.open_session(dest_addr, None, now + 60, now_unix_millis(), RecordingSink::new());
+        let result = forwarder.open_session(
+            OWNER.to_string(),
+            dest_addr,
+            None,
+            now + 60,
+            now_unix_millis(),
+            RecordingSink::new(),
+        );
         assert!(matches!(result, Err(RelayForwarderError::SlotLimitReached { .. })));
     }
 
     #[tokio::test]
     async fn forwarding_on_an_unknown_session_id_is_an_error() {
         let forwarder = Arc::new(RelayForwarder::new());
-        let result = forwarder.forward_from_source(999, b"data", now_unix_millis()).await;
+        let result = forwarder.forward_from_source(999, OWNER, b"data", now_unix_millis()).await;
         assert_eq!(result, Err(RelayForwarderError::UnknownSession(999)));
+    }
+
+    /// Independent-review finding H1: a peer that never opened a session
+    /// must not be able to inject data into it, even knowing its exact id.
+    #[tokio::test]
+    async fn forwarding_by_a_device_that_did_not_open_the_session_is_refused() {
+        let (dest_addr, _server) = echo_server().await;
+        let forwarder = Arc::new(RelayForwarder::new());
+        let sink = RecordingSink::new();
+        let now = now_unix_seconds();
+        let session_id = forwarder
+            .open_session(OWNER.to_string(), dest_addr, None, now + 60, now_unix_millis(), sink.clone())
+            .unwrap();
+
+        let result = forwarder
+            .forward_from_source(session_id, IMPOSTER, b"injected", now_unix_millis())
+            .await;
+        assert_eq!(
+            result,
+            Err(RelayForwarderError::OwnerMismatch {
+                session_id,
+                presented: IMPOSTER.to_string()
+            })
+        );
+        // Nothing was sent, and the session is still alive for its real owner.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(forwarder.active_session_count(), 1);
+    }
+
+    /// Independent-review finding H1: a peer that never opened a session
+    /// must not be able to close it either.
+    #[tokio::test]
+    async fn closing_by_a_device_that_did_not_open_the_session_is_refused() {
+        let (dest_addr, _server) = echo_server().await;
+        let forwarder = Arc::new(RelayForwarder::new());
+        let sink = RecordingSink::new();
+        let now = now_unix_seconds();
+        let session_id = forwarder
+            .open_session(OWNER.to_string(), dest_addr, None, now + 60, now_unix_millis(), sink.clone())
+            .unwrap();
+
+        let result = forwarder.close_session_as(session_id, IMPOSTER, "hostile_close");
+        assert_eq!(
+            result,
+            Err(RelayForwarderError::OwnerMismatch {
+                session_id,
+                presented: IMPOSTER.to_string()
+            })
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(forwarder.active_session_count(), 1, "session must still be open");
+
+        // The real owner can still close it.
+        forwarder.close_session_as(session_id, OWNER, "requester_closed").unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(forwarder.active_session_count(), 0);
+    }
+
+    /// Independent-review finding L5: a datagram larger than
+    /// `MAX_RELAY_PACKET_SIZE` from the destination must be dropped WHOLE,
+    /// never forwarded as a truncated prefix.
+    #[tokio::test]
+    async fn oversized_reply_from_destination_is_dropped_not_truncated() {
+        let echo = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest_addr = echo.local_addr().unwrap();
+        let forwarder = Arc::new(RelayForwarder::new());
+        let sink = RecordingSink::new();
+        let now = now_unix_seconds();
+        let session_id = forwarder
+            .open_session(OWNER.to_string(), dest_addr, None, now + 60, now_unix_millis(), sink.clone())
+            .unwrap();
+
+        // Trigger the destination to learn the relay's ephemeral source
+        // address, then reply with an oversized datagram.
+        forwarder.forward_from_source(session_id, OWNER, b"hi", now_unix_millis()).await.unwrap();
+        let mut probe = [0u8; 8];
+        let (_, relay_addr) =
+            tokio::time::timeout(Duration::from_secs(2), echo.recv_from(&mut probe))
+                .await
+                .unwrap()
+                .unwrap();
+        let oversized = vec![0xABu8; MAX_RELAY_PACKET_SIZE + 100];
+        echo.send_to(&oversized, relay_addr).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let data = sink.data.lock().unwrap().clone();
+        assert!(data.is_empty(), "an oversized reply must never be forwarded, truncated or not");
     }
 }

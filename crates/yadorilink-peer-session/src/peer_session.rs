@@ -1334,14 +1334,25 @@ pub trait RelaySessionHandler: Send + Sync {
         reply_sink: Arc<dyn RelayReplySink>,
     ) -> Pin<Box<dyn Future<Output = yadorilink_sync_wire::RelayOpenedFrame> + Send + 'a>>;
 
+    /// `authenticated_peer_device_id`: same reasoning as `handle_relay_
+    /// open`'s own -- independent-review finding H1: without this, a
+    /// session id is a device-global, guessable counter any authenticated
+    /// peer of this device could present to inject datagrams into a
+    /// session it never opened. The implementation must verify this
+    /// matches whatever identity actually opened `data.session_id`.
     fn handle_relay_data<'a>(
         &'a self,
         data: yadorilink_sync_wire::RelayDataFrame,
+        authenticated_peer_device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
+    /// Same ownership requirement as `handle_relay_data`'s own -- an
+    /// unauthenticated-for-this-session `RelayClose` must not close a
+    /// session belonging to a different peer.
     fn handle_relay_close<'a>(
         &'a self,
         close: yadorilink_sync_wire::RelayCloseFrame,
+        authenticated_peer_device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
@@ -1376,6 +1387,7 @@ impl RelaySessionHandler for DeniedRelaySessionHandler {
     fn handle_relay_data<'a>(
         &'a self,
         _data: yadorilink_sync_wire::RelayDataFrame,
+        _authenticated_peer_device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async {})
     }
@@ -1383,6 +1395,7 @@ impl RelaySessionHandler for DeniedRelaySessionHandler {
     fn handle_relay_close<'a>(
         &'a self,
         _close: yadorilink_sync_wire::RelayCloseFrame,
+        _authenticated_peer_device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async {})
     }
@@ -6006,11 +6019,11 @@ impl PeerSyncSession {
                 self.send_frame(yadorilink_sync_wire::OutboundFrame::RelayOpened(opened)).await
             }
             InboundFrame::RelayData(data) => {
-                self.relay_session_handler().handle_relay_data(data).await;
+                self.relay_session_handler().handle_relay_data(data, &self.peer_device_id).await;
                 Ok(())
             }
             InboundFrame::RelayClose(close) => {
-                self.relay_session_handler().handle_relay_close(close).await;
+                self.relay_session_handler().handle_relay_close(close, &self.peer_device_id).await;
                 Ok(())
             }
             // A relay's answer to a `RelayOpen` this device never sent (or
