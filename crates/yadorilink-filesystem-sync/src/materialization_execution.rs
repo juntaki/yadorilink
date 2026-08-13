@@ -121,6 +121,29 @@ pub enum MaterializationExecutionError {
     #[error("eviction of {0:?} was rejected")]
     EvictionRejected(String),
 
+    /// M2-3b: a `dehydrate_windows_placeholder` call's outcome could not be
+    /// determined -- a Codex-review finding on this method's own doc
+    /// comment claiming "every returned error means dehydration did NOT
+    /// happen" was false as originally written: `dehydrate_server`
+    /// performs the real `CfDehydratePlaceholder` call BEFORE writing its
+    /// response, so a transport-level failure (timeout, a dropped pipe,
+    /// the response never arriving) can happen AFTER the native dehydrate
+    /// already succeeded server-side -- the daemon genuinely cannot tell
+    /// the two apart from a bare I/O error or timeout. Unlike
+    /// `EvictionRejected` (a coherent response was received, so the
+    /// server's own logic ran to completion and its answer is trusted),
+    /// this variant must NOT be treated as "the file is still fully
+    /// materialized" -- `evict_file`'s caller must leave the row in
+    /// `Evicting` rather than roll it back to `Hydrated`, since `Evicting`
+    /// is the state `reset_stale_evicting_to_placeholder`'s startup
+    /// recovery already safely resolves regardless of which of the two
+    /// real outcomes actually happened (see that function's own doc
+    /// comment; M2-3b's design never mints a fresh identity on eviction,
+    /// which is exactly what makes resolving to `Placeholder` safe in
+    /// both cases).
+    #[error("eviction outcome for {0:?} could not be confirmed")]
+    EvictionOutcomeAmbiguous(String),
+
     /// The group's policy has not loaded this run, so a change-emitting
     /// write withheld its emission rather than stamp a placeholder-auth
     /// change. See `yadorilink_replica_domain::change::PolicyUnavailable`.
@@ -367,10 +390,19 @@ pub trait MaterializationExecutionPort: Send + Sync {
     /// transition and block reclamation on this call's success; its
     /// non-Windows arm never calls it at all.
     ///
+    /// An implementor MUST return
+    /// [`MaterializationExecutionError::EvictionOutcomeAmbiguous`], never
+    /// [`MaterializationExecutionError::EvictionRejected`], for any
+    /// failure mode that cannot positively rule out the native dehydrate
+    /// having actually succeeded (a transport timeout, a dropped
+    /// connection, a response that never arrived) -- see that variant's
+    /// own doc comment for why `evict_file`'s caller handles the two
+    /// differently.
+    ///
     /// The default implementation (used by every platform except Windows,
-    /// where nothing calls this) fails closed -- there is no sound
-    /// "succeeded" answer to give when there is no real CfAPI provider to
-    /// ask.
+    /// where nothing calls this) fails closed with `EvictionRejected` --
+    /// there is no real provider to ask at all, so there is no ambiguity:
+    /// dehydration definitely did not happen.
     fn dehydrate_windows_placeholder(
         &self,
         _path: &str,
