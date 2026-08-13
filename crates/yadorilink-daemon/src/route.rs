@@ -2,7 +2,9 @@
 //! Pass 6 (direct<->relay failover) build on. This pass introduces the
 //! types and threads `RelayCapability` through the netmap; it does not
 //! implement relay forwarding or failover itself -- today, every
-//! `RouteKind::Direct` is the only kind ever actually produced.
+//! `RouteKind::Direct` is the only kind ever actually produced; M3 Pass 6
+//! is what starts producing `RouteKind::Relay` (see `peer_orchestrator::
+//! map_transport_reachability`).
 //!
 //! **Standing invariant, unchanged from the decision that scoped this
 //! work: `Durability != Connectivity`.** `RelayCapability`, `RouteKind`,
@@ -66,19 +68,18 @@ impl RelayCapability {
 /// `PeerReachability::Connected` so a caller can distinguish "connected
 /// directly" from "connected via a relaying peer" without that
 /// distinction implying anything about durability (see this module's own
-/// doc comment). Today only `Direct` is ever produced -- `Relay` exists as
-/// a shape for Pass 5/6 to fill in, not yet reachable from any production
-/// code path.
+/// doc comment). `Relay` is produced once `PeerChannel`'s own reachability
+/// reports `ConnectedRelay` -- see `peer_orchestrator::map_transport_
+/// reachability`.
 ///
 /// Deliberately fieldless (unlike a natural `Relay { via: DeviceId }`
 /// shape) so this stays `Copy`, matching `PeerReachability`'s own existing
 /// by-value-`self` API used throughout the daemon and CLI -- adding a
 /// `String` payload here would ripple `Copy` loss through every caller of
-/// `PeerReachability` for a variant nothing produces yet. Pass 5, when it
-/// actually starts producing `Relay` routes, is the right place to widen
-/// this (and thread the resulting `Clone`-only ripple through call sites
-/// that actually need to know WHO is relaying) alongside real behavior --
-/// not speculatively here.
+/// `PeerReachability`. M3 Pass 6 starts producing this variant (via
+/// `peer_orchestrator::map_transport_reachability`) without adding that
+/// payload; a caller that needs to know WHO is relaying reads it from the
+/// daemon's own relay-session bookkeeping instead, not from this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteKind {
     /// A direct, authenticated WireGuard path to the peer.

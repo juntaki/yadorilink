@@ -2069,12 +2069,12 @@ fn record_reachability_transition(
                 Some(true),
             );
         }
-        // M3 Pass 4: no production code path produces this yet (see
-        // `crate::route::RouteKind`'s own doc comment) -- reachable only
-        // once Pass 5 exists. Deliberately a no-op rather than recording
-        // direct-path/NAT telemetry that wouldn't be true of a relay hop;
-        // Pass 5/6 is the right place to add whatever relay-specific
-        // telemetry (if any) belongs here.
+        // M3 Pass 6: reachable now (`map_transport_reachability` produces
+        // it). Deliberately still a no-op -- a relay hop never touched
+        // this device's own NAT traversal, so recording a direct-path
+        // punch success or `DirectPath` telemetry here would misreport
+        // what actually happened. No relay-specific telemetry exists yet;
+        // add it here if/when it's needed, not speculatively.
         PeerReachability::Connected(crate::route::RouteKind::Relay) => {}
         PeerReachability::Unreachable(category) => state.telemetry.record_connection_attempt(
             peer_device_id.to_string(),
@@ -2097,15 +2097,13 @@ fn map_transport_reachability(
     use yadorilink_transport::PeerReachability as Transport;
     match reachability {
         Transport::Connecting { .. } => PeerReachability::Connecting,
-        // M3 Pass 4: `PeerChannel`'s own reachability watch (the source
-        // this function converts from) only ever races DIRECT candidates
-        // -- a relay-sourced connection, when Pass 5/6 exists, will not
-        // come through this transport-hub path at all, so `Direct` is not
-        // a placeholder here, it is the only route this conversion can
-        // ever correctly report.
-        Transport::Connected { .. } => {
-            PeerReachability::Connected(crate::route::RouteKind::Direct)
-        }
+        Transport::Connected { .. } => PeerReachability::Connected(crate::route::RouteKind::Direct),
+        // M3 Pass 6: `PeerChannel`'s own reachability watch reports this
+        // when authenticated WireGuard traffic is flowing but not from a
+        // known direct candidate -- see `yadorilink_transport::
+        // PeerReachability::ConnectedRelay`'s own doc comment for why that
+        // can only mean a relaying peer, never a spoofed source.
+        Transport::ConnectedRelay => PeerReachability::Connected(crate::route::RouteKind::Relay),
         Transport::Unreachable { category, .. } => {
             PeerReachability::Unreachable(map_transport_category(category))
         }
