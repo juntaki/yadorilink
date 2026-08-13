@@ -145,6 +145,7 @@ impl RelaySessionHandler for DaemonState {
             }
 
             match self.relay_forwarder.open_session(
+                grant.source_device_id.clone(),
                 destination_addr,
                 grant.max_session_bytes,
                 grant.expires_at_unix,
@@ -152,9 +153,11 @@ impl RelaySessionHandler for DaemonState {
                 reply_sink,
             ) {
                 Ok(session_id) => {
-                    self.record_relay_session_destination(
+                    self.record_relay_session(
                         session_id,
-                        &grant.destination_device_id,
+                        grant.source_device_id.clone(),
+                        grant.group_id.clone(),
+                        grant.destination_device_id.clone(),
                     );
                     tracing::info!(
                         grant_id = %grant.grant_id,
@@ -176,6 +179,7 @@ impl RelaySessionHandler for DaemonState {
     fn handle_relay_data<'a>(
         &'a self,
         data: RelayDataFrame,
+        authenticated_peer_device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             #[cfg(any(test, feature = "test-support"))]
@@ -186,25 +190,64 @@ impl RelaySessionHandler for DaemonState {
                     .unwrap_or_else(|p| p.into_inner())
                     .clone();
                 if let Some(test_handler) = test_handler {
-                    return test_handler.handle_relay_data(data).await;
+                    return test_handler.handle_relay_data(data, authenticated_peer_device_id).await;
                 }
             }
 
-            // An unknown session id (never granted, or already closed) is
-            // dropped silently -- see `RelayData`'s own `.proto` doc
-            // comment for why: replying to a probe for a session id an
-            // attacker doesn't actually hold gives them a signal, so this
-            // stays indistinguishable from ordinary packet loss.
-            let _ = self
+            // M3 Pass 5 (independent-review finding H2): re-runs the exact
+            // same authorization checks `admit_relay_open` ran at OPEN
+            // time, against THIS device's CURRENT live state, on EVERY
+            // datagram -- not just once at open. A group-edge revoke, a
+            // relay-capability disablement, or the destination's route
+            // dropping out of `RouteKind::Direct` (independent-review
+            // finding M3 -- covers a route that stops being direct
+            // WITHOUT the channel object itself being removed, which
+            // `remove_direct_channel`'s own route-loss cleanup wouldn't
+            // otherwise catch) all take effect on the very next datagram,
+            // not merely "eventually, at grant expiry".
+            if let Err(reason) = self.revalidate_relay_session(data.session_id) {
+                tracing::warn!(
+                    session_id = data.session_id,
+                    peer = authenticated_peer_device_id,
+                    reason,
+                    "relay session failed revalidation; closing"
+                );
+                self.relay_forwarder.close_session(data.session_id, reason);
+                self.forget_relay_session(data.session_id);
+                return;
+            }
+
+            // An unknown session id (never granted, or already closed), OR
+            // one this peer never opened (independent-review finding H1 --
+            // `forward_from_source` verifies ownership before sending
+            // anything) is dropped silently -- see `RelayData`'s own
+            // `.proto` doc comment for why: replying to a probe an
+            // attacker doesn't actually own gives them a signal, so both
+            // cases stay indistinguishable from ordinary packet loss.
+            if let Err(error) = self
                 .relay_forwarder
-                .forward_from_source(data.session_id, &data.payload, now_unix_millis())
-                .await;
+                .forward_from_source(
+                    data.session_id,
+                    authenticated_peer_device_id,
+                    &data.payload,
+                    now_unix_millis(),
+                )
+                .await
+            {
+                tracing::debug!(
+                    session_id = data.session_id,
+                    peer = authenticated_peer_device_id,
+                    error = %error,
+                    "relay data refused"
+                );
+            }
         })
     }
 
     fn handle_relay_close<'a>(
         &'a self,
         close: RelayCloseFrame,
+        authenticated_peer_device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             #[cfg(any(test, feature = "test-support"))]
@@ -215,11 +258,28 @@ impl RelaySessionHandler for DaemonState {
                     .unwrap_or_else(|p| p.into_inner())
                     .clone();
                 if let Some(test_handler) = test_handler {
-                    return test_handler.handle_relay_close(close).await;
+                    return test_handler.handle_relay_close(close, authenticated_peer_device_id).await;
                 }
             }
 
-            self.relay_forwarder.close_session(close.session_id, "requester_closed");
+            // Ownership-checked (independent-review finding H1) -- an
+            // ownership MISMATCH is logged; "already gone" (Ok from a
+            // close racing the session's own natural end) is not.
+            match self.relay_forwarder.close_session_as(
+                close.session_id,
+                authenticated_peer_device_id,
+                "requester_closed",
+            ) {
+                Ok(()) => self.forget_relay_session(close.session_id),
+                Err(error) => {
+                    tracing::debug!(
+                        session_id = close.session_id,
+                        peer = authenticated_peer_device_id,
+                        error = %error,
+                        "relay close refused"
+                    );
+                }
+            }
         })
     }
 }
