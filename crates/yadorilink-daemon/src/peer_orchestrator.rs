@@ -2022,7 +2022,15 @@ fn record_reachability_transition(
     connected_class: Option<AddressClass>,
 ) {
     match current {
-        PeerReachability::Connected(_) => {
+        // M3 Pass 4 (independent-review finding): explicit on `Direct`
+        // rather than a `Connected(_)` wildcard -- a confirmed DIRECT path
+        // means UDP got through, so a punch success and `DirectPath`
+        // telemetry are warranted; neither is true of a relay-routed
+        // connection (Pass 5+), which never touched this device's own NAT
+        // traversal at all. Matched explicitly now so a future `Relay`
+        // route doesn't silently fall into this arm and misreport a
+        // successful direct punch that never happened.
+        PeerReachability::Connected(crate::route::RouteKind::Direct) => {
             // A confirmed direct path means UDP got through, so record a punch
             // success — this keeps NAT classification from misjudging the
             // network as UDP-blocked once any peer connects.
@@ -2038,6 +2046,13 @@ fn record_reachability_transition(
                 Some(true),
             );
         }
+        // M3 Pass 4: no production code path produces this yet (see
+        // `crate::route::RouteKind`'s own doc comment) -- reachable only
+        // once Pass 5 exists. Deliberately a no-op rather than recording
+        // direct-path/NAT telemetry that wouldn't be true of a relay hop;
+        // Pass 5/6 is the right place to add whatever relay-specific
+        // telemetry (if any) belongs here.
+        PeerReachability::Connected(crate::route::RouteKind::Relay) => {}
         PeerReachability::Unreachable(category) => state.telemetry.record_connection_attempt(
             peer_device_id.to_string(),
             CandidateSource::DirectPath,

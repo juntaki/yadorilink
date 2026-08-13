@@ -115,28 +115,34 @@ async fn relay_capable_propagates_over_the_real_netmap_wire_independent_of_full_
         archivist.state.clone(),
     );
 
+    // M3 Pass 4 (independent-review finding): both axes -- relay
+    // capability AND full-replica status -- belong in the SAME wait
+    // predicate. `netmap_frame_for` iterates peers and each peer's own
+    // `apply_authoritative_peer_metadata` call awaits real async session
+    // work in between (see peer_orchestrator.rs's own netmap-apply loop),
+    // so the two devices' metadata is not guaranteed to land atomically --
+    // waiting on relay capability alone and then immediately asserting
+    // full-replica status separately was a genuine ordering race.
     wait_until_with_context(
         || {
             hub.state.peer_relay_capability(&nas.device_id) == RelayCapability::Capable
                 && hub.state.peer_relay_capability(&archivist.device_id)
                     == RelayCapability::Disabled
+                && !hub.state.peer_group_is_full_replica(&nas.device_id, group_id)
+                && hub.state.peer_group_is_full_replica(&archivist.device_id, group_id)
         },
         Duration::from_secs(30),
         || {
             format!(
-                "relay capability never propagated as expected over the real netmap wire: \
-                 nas={:?} archivist={:?}",
+                "relay capability / full-replica status never propagated as expected over the \
+                 real netmap wire: nas relay={:?} full_replica={} archivist relay={:?} \
+                 full_replica={}",
                 hub.state.peer_relay_capability(&nas.device_id),
+                hub.state.peer_group_is_full_replica(&nas.device_id, group_id),
                 hub.state.peer_relay_capability(&archivist.device_id),
+                hub.state.peer_group_is_full_replica(&archivist.device_id, group_id),
             )
         },
     )
     .await;
-
-    // The independence this whole model exists to guarantee: relay
-    // capability said nothing about full-replica status, in either
-    // direction, over the real wire -- not just in the unit-level test
-    // that drives `apply_authoritative_peer_metadata` directly.
-    assert!(!hub.state.peer_group_is_full_replica(&nas.device_id, group_id));
-    assert!(hub.state.peer_group_is_full_replica(&archivist.device_id, group_id));
 }
