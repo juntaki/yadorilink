@@ -125,6 +125,20 @@ impl yadorilink_transport::RelayCarrier for DaemonState {
                     max_session_bytes: grant.max_session_bytes.unwrap_or(0),
                     signature: grant.signature.clone(),
                 };
+                // M3 Pass 8 (final-gate review finding, High -- 2nd
+                // round): re-verified immediately before actually sending
+                // -- the grant round trip just awaited above is real wall-
+                // clock time during which this device's own route to
+                // `relay_device_id` could have stopped being direct
+                // (e.g. it started relaying through a third device). A
+                // stale grant is harmless on its own (B independently
+                // re-validates its own B->C leg on open and on every
+                // subsequent datagram); this check is what keeps the A->B
+                // leg itself from silently becoming a second hop.
+                if !self.is_directly_reachable(&relay_device_id) {
+                    self.forget_pending_relay_open(&grant.grant_id);
+                    continue;
+                }
                 if session.send_relay_open(open).await.is_err() {
                     // M3 Pass 6 (independent-review finding): the pending
                     // entry registered above has no requester left to
