@@ -323,6 +323,10 @@ impl PeerSyncSession {
             InboundFrame::HandoffTicketRelease(_) => "HandoffTicketRelease",
             InboundFrame::RebootstrapSnapshotRequest(_) => "RebootstrapSnapshotRequest",
             InboundFrame::RebootstrapSnapshotResponse(_) => "RebootstrapSnapshotResponse",
+            InboundFrame::RelayOpen(_) => "RelayOpen",
+            InboundFrame::RelayOpened(_) => "RelayOpened",
+            InboundFrame::RelayData(_) => "RelayData",
+            InboundFrame::RelayClose(_) => "RelayClose",
             InboundFrame::Unknown { .. } => "Unknown",
         }
     }
