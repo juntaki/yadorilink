@@ -47,6 +47,7 @@ pub mod recovery;
 pub mod recovery_diagnosis;
 pub mod recovery_evidence;
 pub mod recovery_snapshot;
+pub mod relay_forwarder;
 pub mod relay_grant;
 pub mod relay_session;
 /// `ReplicaCoordinator` (Phase 7D-10.2) -- see that module's own doc
