@@ -279,6 +279,15 @@ pub struct DaemonState {
     /// `docs/design/phase7d10-exit-report.md`'s 7D-10.9 addendum.
     pub replica_coordinator: Arc<crate::replica_coordinator::ReplicaCoordinator>,
     pub block_store: Arc<dyn BlockStore + Send + Sync>,
+    /// M2-5: coalesces concurrent `FETCH_DATA`-driven `hydration::hydrate`
+    /// calls for the same path onto one real attempt -- see
+    /// `hydration_single_flight`'s own module doc for why this is
+    /// layered outside, not a replacement for, `hydrate_inner`'s
+    /// per-path lock. Per daemon-instance state, matching
+    /// `ReplicaCoordinator::path_lock_registry`'s own reasoning (never a
+    /// process-wide `static`, which the deterministic simulator's many
+    /// in-process daemon instances would wrongly share).
+    pub hydrate_single_flight: crate::hydration_single_flight::HydrateSingleFlight,
     /// Shared, device-wide block-serve credit/coalescing engine (stage 2)
     /// -- one instance for the whole daemon, handed to every
     /// `PeerSyncSession` this device constructs via
@@ -954,6 +963,7 @@ impl DaemonState {
             device_id,
             replica_coordinator,
             block_store,
+            hydrate_single_flight: crate::hydration_single_flight::HydrateSingleFlight::new(),
             // 512 MiB global / 128 MiB per-peer / 256 MiB per-group,
             // sized against `MAX_BLOCK_SIZE` (16 MiB, `chunker.rs`) --
             // each of a request's credit is reserved pessimistically at

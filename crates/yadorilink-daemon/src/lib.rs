@@ -23,6 +23,7 @@ pub mod gc;
 pub mod gc_state;
 pub mod governance_config;
 pub mod hydration;
+pub mod hydration_single_flight;
 pub mod link_registry;
 pub mod link_runtime;
 pub(crate) mod local_session_channel;
