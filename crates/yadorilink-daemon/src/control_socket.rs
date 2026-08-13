@@ -1135,7 +1135,12 @@ fn reachability_to_proto(
     };
     match reachability {
         Daemon::Connecting => (Wire::Connecting, WireCat::Unspecified),
-        Daemon::Connected => (Wire::Connected, WireCat::Unspecified),
+        // M3 Pass 4: the wire enum does not yet distinguish direct from
+        // relay connectivity (see `PeerReachability::route_str` for where
+        // that lives internally) -- Pass 6 is the right place to extend
+        // this wire contract, once a route other than `Direct` can
+        // actually occur.
+        Daemon::Connected(_) => (Wire::Connected, WireCat::Unspecified),
         Daemon::ProtocolIncompatible => (Wire::ProtocolIncompatible, WireCat::Unspecified),
         Daemon::Unreachable(category) => {
             let wire_category = match category {

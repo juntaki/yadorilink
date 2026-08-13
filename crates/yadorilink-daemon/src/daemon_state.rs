@@ -246,6 +246,14 @@ struct PeerNetmapMetadata {
     signing_keys: HashMap<String, [u8; 32]>,
     writers: HashSet<(String, String)>,
     full_replicas: HashSet<(String, String)>,
+    /// M3 Pass 4: device ids that have declared `RelayCapability::Capable`
+    /// on the coordination-plane netmap. Deliberately device-keyed, not
+    /// group-scoped like `full_replicas` -- relay capability is not a
+    /// per-group storage role, and (per `crate::route`'s own doc comment)
+    /// is never derived from or gated by group authorization/full-replica
+    /// status the way `full_replicas` is gated by `authorized_groups` in
+    /// `replace_peer_netmap_metadata`.
+    relay_capable: HashSet<String>,
 }
 
 /// The outcome of [`DaemonState::resolve_group_policy`] — the single
@@ -1518,6 +1526,7 @@ impl DaemonState {
         signing_key: Option<[u8; 32]>,
         authorized_groups: &HashSet<String>,
         full_replica_groups: &HashSet<String>,
+        relay_capable: bool,
     ) {
         let mut metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
         let before_writers: HashSet<String> = metadata
@@ -1532,6 +1541,7 @@ impl DaemonState {
             .filter(|(peer, _)| peer == device_id)
             .map(|(_, group)| group.clone())
             .collect();
+        let before_relay_capable = metadata.relay_capable.contains(device_id);
         let next_replicas: HashSet<String> =
             full_replica_groups.intersection(authorized_groups).cloned().collect();
         let key_changed = match signing_key {
@@ -1546,8 +1556,15 @@ impl DaemonState {
         metadata
             .full_replicas
             .extend(next_replicas.iter().cloned().map(|group| (device_id.to_string(), group)));
-        let changed =
-            key_changed || before_writers != *authorized_groups || before_replicas != next_replicas;
+        if relay_capable {
+            metadata.relay_capable.insert(device_id.to_string());
+        } else {
+            metadata.relay_capable.remove(device_id);
+        }
+        let changed = key_changed
+            || before_writers != *authorized_groups
+            || before_replicas != next_replicas
+            || before_relay_capable != relay_capable;
         if changed {
             self.bump_membership_generation();
         }
@@ -1555,7 +1572,7 @@ impl DaemonState {
     }
 
     pub fn clear_peer_netmap_metadata(&self, device_id: &str) {
-        self.replace_peer_netmap_metadata(device_id, None, &HashSet::new(), &HashSet::new());
+        self.replace_peer_netmap_metadata(device_id, None, &HashSet::new(), &HashSet::new(), false);
     }
 
     /// Records (or clears) whether `device_id` may write `group_id`, derived
@@ -1631,6 +1648,25 @@ impl DaemonState {
             .unwrap_or_else(|p| p.into_inner())
             .full_replicas
             .contains(&(device_id.to_string(), group_id.to_string()))
+    }
+
+    /// `device_id`'s current, netmap-derived relay capability -- see
+    /// `crate::route::RelayCapability`'s own doc comment for the
+    /// `Durability != Connectivity` invariant this deliberately does NOT
+    /// derive from `peer_group_is_full_replica` or anything else: it is
+    /// purely that peer's own self-declaration, recorded independently.
+    pub fn peer_relay_capability(&self, device_id: &str) -> crate::route::RelayCapability {
+        if self
+            .peer_netmap_metadata
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .relay_capable
+            .contains(device_id)
+        {
+            crate::route::RelayCapability::Capable
+        } else {
+            crate::route::RelayCapability::Disabled
+        }
     }
 
     /// Installs the custody confirmer used by the on-demand reclamation gate.
