@@ -73,27 +73,40 @@ pub fn dehydrate_via_cfapi_host_blocking(
 /// synchronous driver operation with no network I/O, unlike hydration's
 /// `HYDRATE_TIMEOUT`) but still finite: if `cfapi-host.exe` is wedged or
 /// its dehydrate pipe is saturated, `evict_file`'s caller must eventually
-/// get an error back and roll the row back to `Hydrated` rather than hang
-/// the eviction sweep indefinitely.
+/// get an error back rather than hang the eviction sweep indefinitely --
+/// see [`DehydrateError`]'s own doc comment for what the caller does with
+/// that error (NOT an unconditional rollback to `Hydrated`).
 const DEHYDRATE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Every failure mode this returns must be treated as "dehydration did
-/// NOT happen" by the caller -- there is no variant here that means
-/// "unknown, might have succeeded". A `CfDehydratePlaceholder` call that
-/// itself partially completes before erroring is a real residual risk
-/// this module cannot close (see `dehydrate_placeholder`'s own doc
-/// comment in `cfapi.rs`), but every error THIS module can distinguish
-/// (connection refused, timeout, malformed response, an explicit `ok:
-/// false`) fails closed the same way: the caller must not commit the
-/// `Placeholder` transition or reclaim any block.
+/// A Codex-review finding caught an earlier version of this doc comment
+/// claiming every variant here means "dehydration did NOT happen" -- false
+/// as written: `dehydrate_server` performs the real
+/// `CfDehydratePlaceholder` call BEFORE writing its response, so `Io`/
+/// `Timeout` can both occur AFTER that call already succeeded server-side
+/// (a dropped connection, a lost response, a slow driver call racing the
+/// client's own timeout). Only [`Self::Rejected`] means a coherent
+/// response was actually received, so cfapi-host's own logic ran to
+/// completion and its answer can be trusted.
+///
+/// `dehydrate_windows_placeholder`'s `ReplicaCoordinator` implementation
+/// maps this split onto two DIFFERENT `MaterializationExecutionError`
+/// variants for exactly this reason: `Io`/`Timeout` become
+/// `EvictionOutcomeAmbiguous` (the caller must NOT assume the file is
+/// still materialized), `Rejected` becomes `EvictionRejected` (the caller
+/// safely rolls the row back to `Hydrated`). A `CfDehydratePlaceholder`
+/// call that itself partially completes before erroring at the Win32
+/// layer is a separate, deeper residual risk this module cannot close
+/// (see `dehydrate_placeholder`'s own doc comment in `cfapi.rs`) --
+/// orthogonal to the transport-level ambiguity this enum's split exists
+/// to handle.
 #[derive(Debug)]
 pub enum DehydrateError {
     Io(std::io::Error),
     Timeout,
     /// cfapi-host itself reported failure (`DehydrateResponse{ ok: false,
-    /// error }`), or the response was malformed/missing entirely -- the
-    /// `String` is a human-readable reason for logging, not something a
-    /// caller should pattern-match on.
+    /// error }`), or returned a well-formed message of an unexpected
+    /// payload type -- the `String` is a human-readable reason for
+    /// logging, not something a caller should pattern-match on.
     Rejected(String),
 }
 
@@ -160,13 +173,32 @@ async fn dehydrate_inner(
     .map_err(DehydrateError::Io)?;
     let response =
         read_message::<ShellIpcMessage>(&mut stream).await.map_err(DehydrateError::Io)?;
-    match response.and_then(|m| m.payload) {
-        Some(Payload::DehydrateResponse(DehydrateResponse { ok: true, .. })) => Ok(()),
-        Some(Payload::DehydrateResponse(DehydrateResponse { ok: false, error })) => {
+    // `None` here means the connection closed with no message at all --
+    // e.g. cfapi-host crashed or dropped the pipe after actually running
+    // the dehydrate but before it could write the response back. That is
+    // exactly as ambiguous as a bare `Io`/`Timeout` failure (the operation
+    // may have already succeeded), NOT a coherent "it was rejected"
+    // answer -- routed through the `Io` arm below so it reaches the
+    // caller as `EvictionOutcomeAmbiguous`, not `EvictionRejected`.
+    let Some(payload) = response.and_then(|m| m.payload) else {
+        return Err(DehydrateError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "dehydrate pipe closed before sending a response",
+        )));
+    };
+    match payload {
+        Payload::DehydrateResponse(DehydrateResponse { ok: true, .. }) => Ok(()),
+        Payload::DehydrateResponse(DehydrateResponse { ok: false, error }) => {
             Err(DehydrateError::Rejected(error))
         }
+        // A well-formed message of the WRONG payload type -- structurally
+        // unreachable given `dehydrate_server` only ever sends
+        // `DehydrateResponse` on this connection, but a real (if
+        // malformed) message was received, so treated as a coherent
+        // (if nonsensical) answer rather than routed through the
+        // ambiguous `Io` path.
         _ => Err(DehydrateError::Rejected(
-            "cfapi-host's dehydrate pipe returned a malformed or missing response".to_string(),
+            "cfapi-host's dehydrate pipe returned an unexpected payload type".to_string(),
         )),
     }
 }

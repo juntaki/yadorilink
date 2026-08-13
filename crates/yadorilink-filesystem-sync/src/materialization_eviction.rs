@@ -77,6 +77,14 @@ fn disk_identity(path: &Path) -> Result<DiskIdentity, MaterializationExecutionEr
 /// file stays fully materialized. Fails closed instead (`EvictionRejected`),
 /// which the caller's existing placeholder-write-error branch already
 /// rolls back to `Hydrated` for.
+///
+/// Actual commit order on Windows is `Evicting -> native dehydrate
+/// confirmed -> Placeholder -> identity re-affirmed -> blocks reclaimed`
+/// (the `Placeholder` transition happens before the returned
+/// `RecordOverwrite` is applied by `evict_file`'s caller, not after) --
+/// safe only because the value `RecordOverwrite` carries is READ before
+/// dehydration and never changes, so there is no window where the row
+/// could read as `Placeholder` with a wrong or absent identity.
 fn evict_to_placeholder(
     state: &dyn MaterializationExecutionPort,
     group_id: &str,
@@ -343,6 +351,30 @@ pub fn evict_file(
         });
     let placeholder_outcome = match placeholder_result {
         Ok(outcome) => outcome,
+        Err(MaterializationExecutionError::EvictionOutcomeAmbiguous(reason)) => {
+            // A Codex-review finding on M2-3b: unlike every other error
+            // here, this one does NOT mean "the file is still fully
+            // materialized" -- the native dehydrate call's outcome could
+            // not be confirmed (see the variant's own doc comment), so it
+            // may have already succeeded on disk. Rolling back to
+            // `Hydrated` here would be actively wrong in that case (a
+            // dehydrated placeholder mislabeled `Hydrated`, no longer
+            // reconciled by anything). Leave the row in `Evicting` instead
+            // -- the SAME state a mid-eviction crash leaves it in, which
+            // `reset_stale_evicting_to_placeholder`'s startup recovery
+            // already resolves safely regardless of which outcome actually
+            // happened (M2-3b's design never mints a fresh identity on
+            // eviction, so the already-recorded one stays correct either
+            // way).
+            tracing::warn!(
+                group_id,
+                path = %path,
+                reason = %reason,
+                "eviction dehydrate outcome unconfirmed; leaving the row in the transient \
+                 Evicting state for startup recovery to resolve, rather than assuming Hydrated"
+            );
+            return Err(MaterializationExecutionError::EvictionOutcomeAmbiguous(reason));
+        }
         Err(error) => {
             // The placeholder write failed, so the file is still fully materialized
             // on disk. Roll the row back out of the transient `Evicting` state to

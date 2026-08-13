@@ -270,9 +270,29 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             expected_generation,
         )
         .map_err(|e| {
-            MaterializationExecutionError::EvictionRejected(format!(
-                "{path}: native Windows dehydrate failed: {e}"
-            ))
+            // `Io`/`Timeout`: the round trip to `cfapi-host` did not
+            // complete, so whether `CfDehydratePlaceholder` itself ran
+            // (and possibly succeeded) before the failure is genuinely
+            // unknown -- `dehydrate_server` performs the real call BEFORE
+            // writing its response. `Rejected`: a coherent
+            // `DehydrateResponse` was received, so `cfapi-host`'s own
+            // logic ran to completion and its answer is trusted. See
+            // `MaterializationExecutionError::EvictionOutcomeAmbiguous`'s
+            // own doc comment for why the caller must handle these two
+            // differently.
+            match e {
+                crate::placeholder_dehydrate_windows::DehydrateError::Io(_)
+                | crate::placeholder_dehydrate_windows::DehydrateError::Timeout => {
+                    MaterializationExecutionError::EvictionOutcomeAmbiguous(format!(
+                        "{path}: native Windows dehydrate outcome unconfirmed: {e}"
+                    ))
+                }
+                crate::placeholder_dehydrate_windows::DehydrateError::Rejected(_) => {
+                    MaterializationExecutionError::EvictionRejected(format!(
+                        "{path}: native Windows dehydrate failed: {e}"
+                    ))
+                }
+            }
         })
     }
 
