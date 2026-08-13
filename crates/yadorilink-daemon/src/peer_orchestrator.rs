@@ -510,6 +510,18 @@ pub async fn run(
     // comment.
     let diff_state = NetmapDiffState::new();
 
+    // M3 Pass 2: closes the O(N^2) handshake-fan-in cost measured by
+    // `handshake_fan_in.rs` (see `DaemonState::set_device_static_secret`'s
+    // own doc comment) — belongs HERE, not left to each caller to remember
+    // externally (as `app.rs` previously did alone): any caller of `run`
+    // that skipped this, including every full-stack integration test that
+    // drives `run` directly rather than the production binary's own
+    // startup path, silently fell back to O(N^2) broadcast identification
+    // with no compile-time or runtime signal that the real fix wasn't
+    // active. Idempotent (`OnceLock`-backed) — a redundant call from
+    // `app.rs` alongside this one is a harmless no-op.
+    state.set_device_static_secret(keypair.secret.clone());
+
     let mut attempt: u32 = 0;
     loop {
         match run_netmap_attempt(&config, &keypair, &state, &session_index, &diff_state).await {
