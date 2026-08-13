@@ -1541,7 +1541,6 @@ impl DaemonState {
             .filter(|(peer, _)| peer == device_id)
             .map(|(_, group)| group.clone())
             .collect();
-        let before_relay_capable = metadata.relay_capable.contains(device_id);
         let next_replicas: HashSet<String> =
             full_replica_groups.intersection(authorized_groups).cloned().collect();
         let key_changed = match signing_key {
@@ -1561,10 +1560,19 @@ impl DaemonState {
         } else {
             metadata.relay_capable.remove(device_id);
         }
+        // M3 Pass 4 (independent-review finding): `relay_capable` changes
+        // deliberately do NOT bump `membership_generation` -- that counter
+        // is netmap AUTHORIZATION state (see its own doc comment), read by
+        // durability confirmations and full-replica handoffs to fail
+        // closed on ANY membership churn during their wait. Relay
+        // willingness is neither authorization nor durability -- coupling
+        // it in would make toggling a peer's relay declaration able to
+        // spuriously fail an unrelated in-flight durability confirmation,
+        // exactly the connectivity/durability coupling `crate::route`'s
+        // own doc comment says this model must never introduce.
         let changed = key_changed
             || before_writers != *authorized_groups
-            || before_replicas != next_replicas
-            || before_relay_capable != relay_capable;
+            || before_replicas != next_replicas;
         if changed {
             self.bump_membership_generation();
         }
