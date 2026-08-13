@@ -7836,6 +7836,7 @@ dependencies = [
  "yadorilink-root-authority",
  "yadorilink-sqlite-runtime",
  "yadorilink-sync-sqlite",
+ "yadorilink-sync-wire",
  "yadorilink-transport",
 ]
 

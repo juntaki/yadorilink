@@ -99,6 +99,11 @@ yadorilink-sync-sqlite = { path = "../yadorilink-sync-sqlite" }
 # now that this crate's own source references the type by path.
 yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
 yadorilink-peer-session = { path = "../yadorilink-peer-session" }
+# M3 Pass 5: relay_session_handler.rs implements RelaySessionHandler for
+# DaemonState, whose trait methods are typed over yadorilink_sync_wire's
+# own RelayOpenFrame/RelayOpenedFrame/RelayDataFrame/RelayCloseFrame --
+# any implementor needs this dependency directly to name those types.
+yadorilink-sync-wire = { path = "../yadorilink-sync-wire" }
 yadorilink-root-authority = { path = "../yadorilink-root-authority" }
 yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync" }
 yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
