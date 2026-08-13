@@ -1840,6 +1840,11 @@ mod migration_safety_tests {
             .await
             .expect("nothing to hand off, so unlink is vacuously allowed");
 
+        // M4: `Healthy`/non-Unknown now requires a fresh peer-confirmed (or
+        // vacuous-empty, still peer-round-trip-confirmed) sweep round --
+        // force one so this assertion tests the latch, not the unrelated
+        // "never swept yet" default.
+        state.refresh_custody_confirmation("group-1").await;
         assert_ne!(
             state.group_durability_status("group-1"),
             crate::durability_service::GroupDurabilityStatus::DurabilityUnknown,
@@ -1933,6 +1938,9 @@ mod migration_safety_tests {
     #[tokio::test]
     async fn latch_group_durability_unknown_request_latches_the_group() {
         let state = test_state();
+        // M4: Healthy now requires at least one confirmation sweep round
+        // (real or vacuous-empty) to have run -- force one.
+        state.refresh_custody_confirmation("group-1").await;
         assert_eq!(
             state.group_durability_status("group-1"),
             crate::durability_service::GroupDurabilityStatus::Healthy,

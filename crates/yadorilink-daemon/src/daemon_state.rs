@@ -83,6 +83,119 @@ fn default_materialization_repair_sweep_interval() -> Duration {
         .and_then(|m| *m.lock().unwrap_or_else(|p| p.into_inner()))
         .unwrap_or(MATERIALIZATION_REPAIR_SWEEP_INTERVAL)
 }
+
+/// How often `DurabilityConfirmationJob` re-runs `full_replica_handoff_
+/// ready_digest_and_peer` for every linked group, refreshing
+/// `DaemonState::custody_confirmation_cache`. Same cadence as
+/// `MATERIALIZATION_REPAIR_SWEEP_INTERVAL` — a whole-group custody check is
+/// the same order of cost (one round-trip per group) as a materialization
+/// repair pass, so there's no reason for it to run on a different clock.
+const CUSTODY_CONFIRMATION_SWEEP_INTERVAL: Duration = Duration::from_secs(90);
+
+/// How stale a `custody_confirmation_cache` entry may be before
+/// `group_durability_status` stops trusting it as `Healthy` evidence — 3x
+/// `CUSTODY_CONFIRMATION_SWEEP_INTERVAL`, so one missed sweep round (a
+/// transient peer hiccup, a slow round-trip) doesn't immediately flip a
+/// genuinely-protected group to `DurabilityUnknown`. Deliberately NOT
+/// unbounded: past this bound the evidence is old enough that "was
+/// protected" stops standing in for "is protected now" — see this module's
+/// M4 durability-model doc for why stale evidence must never be reported as
+/// current.
+const CUSTODY_CONFIRMATION_STALENESS_BOUND: Duration = Duration::from_secs(270);
+
+static CUSTODY_CONFIRMATION_SWEEP_INTERVAL_OVERRIDE_FOR_TESTS: std::sync::OnceLock<
+    Mutex<Option<Duration>>,
+> = std::sync::OnceLock::new();
+
+pub fn set_default_custody_confirmation_sweep_interval_for_tests(interval: Duration) {
+    *CUSTODY_CONFIRMATION_SWEEP_INTERVAL_OVERRIDE_FOR_TESTS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(interval);
+}
+
+fn default_custody_confirmation_sweep_interval() -> Duration {
+    CUSTODY_CONFIRMATION_SWEEP_INTERVAL_OVERRIDE_FOR_TESTS
+        .get()
+        .and_then(|m| *m.lock().unwrap_or_else(|p| p.into_inner()))
+        .unwrap_or(CUSTODY_CONFIRMATION_SWEEP_INTERVAL)
+}
+
+/// The result of one `DurabilityConfirmationJob` sweep round for a group —
+/// see `DaemonState::custody_confirmation_cache`'s own doc comment. Every
+/// sweep round writes a record regardless of outcome (`Confirmed` or
+/// `NotConfirmed`), so a cache entry's mere presence answers "has this
+/// group ever been swept at least once" (`DaemonState::
+/// has_ever_been_custody_swept`) independent of whether that most recent
+/// round actually confirmed anything — see M4 Codex review #1 findings #1
+/// and #2 for why conflating "never checked yet" with "checked and found
+/// nothing" produced both a false-`Healthy` and a false-`KnownMissing` bug.
+#[derive(Debug, Clone)]
+enum CustodyConfirmationOutcome {
+    /// `full_replica_handoff_ready_digest_and_peer` returned `Some`.
+    /// `peer_device_id` is `None` for a vacuous confirmation (the group's
+    /// real durability-root set, per `durability_roots_for_group`, is
+    /// empty) — mirrors that function's own return shape. `digest` is
+    /// stored for diagnostics only; nothing in `classify` compares it, so
+    /// this cache accepts up to `CUSTODY_CONFIRMATION_STALENESS_BOUND` of
+    /// drift between confirmation and the group's real current version,
+    /// same trust window `full_replica_handoff_ready`'s own live callers
+    /// (unlink/handoff) already accept from its single-snapshot root
+    /// enumeration.
+    Confirmed {
+        #[allow(dead_code)]
+        peer_device_id: Option<String>,
+        #[allow(dead_code)]
+        digest: [u8; 32],
+    },
+    /// The sweep ran for this group but found no confirming peer (or a
+    /// non-empty, non-vacuously-ready root set) this round.
+    NotConfirmed,
+}
+
+/// One group's most recent `DurabilityConfirmationJob` sweep result — see
+/// `DaemonState::custody_confirmation_cache`'s own doc comment.
+#[derive(Debug, Clone)]
+struct CustodyConfirmationRecord {
+    outcome: CustodyConfirmationOutcome,
+    /// Display-only (a future UI surface showing "confirmed 3 min ago").
+    /// NEVER used for the staleness gate itself -- `confirmed_at` below is
+    /// the monotonic clock that owns that, specifically because this is a
+    /// wall-clock value an adjusted system clock could roll backward (M4
+    /// Codex review #1 finding #5).
+    #[allow(dead_code)]
+    confirmed_at_unix: i64,
+    /// Monotonic staleness gate -- see `confirmed_at_unix`'s doc comment
+    /// for why this, not that, is what `has_fresh_custody_confirmation`
+    /// actually checks.
+    confirmed_at: std::time::Instant,
+    /// `DaemonState::membership_generation()` at the moment this record
+    /// was written. `has_fresh_custody_confirmation` requires this to
+    /// still match the CURRENT generation -- if any peer's writer/
+    /// full-replica/netmap state has changed since, the confirmation this
+    /// record represents may no longer hold (e.g. the confirming peer was
+    /// demoted or removed), so it's treated as stale regardless of its
+    /// age (M4 Codex review #1 finding #3's demotion sub-case).
+    membership_generation: u64,
+}
+
+/// `DaemonState::custody_confirmation_cache`'s per-group value: the most
+/// recent confirmation record (if any) PLUS an epoch counter, sharing one
+/// `HashMap` entry under one lock deliberately. An earlier version tracked
+/// the epoch in a SEPARATE `Mutex<HashMap<...>>`, which meant
+/// `clear_custody_confirmation`'s remove-then-bump and
+/// `record_custody_confirmation_outcome`'s check-then-insert each took two
+/// non-atomic lock acquisitions -- a real TOCTOU where a `clear` and an
+/// in-flight `refresh`'s publish could interleave such that the stale
+/// publish still landed after the clear (M4 Codex review #1 second
+/// follow-up, finding #3b). Keeping both fields in the same map entry,
+/// mutated under the same single lock acquisition in each method, makes
+/// that interleaving structurally impossible.
+#[derive(Debug, Clone, Default)]
+struct CustodyCacheEntry {
+    record: Option<CustodyConfirmationRecord>,
+    epoch: u64,
+}
 /// How often the role-loss-operation reconciliation sweep
 /// (`run_role_loss_reconciliation_sweep`) retries any journal row left
 /// mid-flight by a crash or a compensation attempt that couldn't reach the
@@ -550,6 +663,23 @@ pub struct DaemonState {
     /// to fire faster than production's cadence can opt in without a
     /// constructor parameter.
     materialization_repair_sweep_interval: Mutex<Duration>,
+    /// Overridable sweep interval for `maintenance::durability_confirmation::
+    /// DurabilityConfirmationJob`, same shape/reason as
+    /// `materialization_repair_sweep_interval` above.
+    custody_confirmation_sweep_interval: Mutex<Duration>,
+    /// group_id -> that group's custody-confirmation cache entry (the most
+    /// recent whole-group peer-confirmed custody evidence, if any, plus an
+    /// epoch counter) -- populated by `DurabilityConfirmationJob`'s
+    /// periodic sweep. `group_durability_status` only trusts a record here
+    /// as `Healthy` evidence within `CUSTODY_CONFIRMATION_STALENESS_BOUND`
+    /// of its confirmation time -- this is what lets `Healthy` mean "a
+    /// peer positively confirmed whole-group coverage recently," not "this
+    /// device's own local copy looks complete" (the conflation M4's audit
+    /// found in the prior derivation). The epoch and the record share ONE
+    /// lock deliberately -- see `CustodyCacheEntry`'s own doc comment for
+    /// why a prior two-lock split between them was a real TOCTOU (M4 Codex
+    /// review #1 second follow-up, finding #3b).
+    custody_confirmation_cache: Mutex<HashMap<String, CustodyCacheEntry>>,
     /// local_path -> that link's single runtime record: its
     /// folder-watcher tasks (the debounce accumulator and the executor
     /// that consumes its flushes, plus the periodic repair and
@@ -1180,6 +1310,10 @@ impl DaemonState {
             materialization_repair_sweep_interval: Mutex::new(
                 default_materialization_repair_sweep_interval(),
             ),
+            custody_confirmation_sweep_interval: Mutex::new(
+                default_custody_confirmation_sweep_interval(),
+            ),
+            custody_confirmation_cache: Mutex::new(HashMap::new()),
             links: Arc::new(crate::link_registry::LinkRegistry::new()),
             #[cfg(any(test, feature = "test-support"))]
             test_root_commit_authorities: Mutex::new(HashMap::new()),
@@ -1990,18 +2124,16 @@ impl DaemonState {
     }
 
     /// This group's current local durability status: the latched override
-    /// above if one is set, otherwise a value derived live from this
-    /// group's own sync state. The derived default is deliberately
-    /// conservative — it reports `Healthy` only when every current file is
-    /// actually `Hydrated` locally, `Syncing` while any file is still
-    /// catching up, and `DurabilityUnknown` (never `Healthy`) if the link's
-    /// materialization counts can't even be read. Note this derived
-    /// default does not itself perform a live peer handoff check (that's a
-    /// network round-trip per group, too costly to run on every `status`
-    /// call) — the `Healthy` it derives means "this device's own copy
-    /// looks complete," not "a whole-group peer replica was just
-    /// reconfirmed"; the latch above is what specifically tracks the
-    /// stronger "coverage was actively bypassed" fact.
+    /// above if one is set, otherwise a value derived live from
+    /// `custody_confirmation_cache` (a real, periodically-refreshed
+    /// peer-confirmed whole-group check -- see `DurabilityConfirmationJob`)
+    /// plus this device's own sync state. `Healthy` requires a fresh cache
+    /// entry; this device's own materialization completeness alone never
+    /// produces it (only `Syncing`, for a full-replica device still
+    /// catching up locally) -- see `crate::durability_service`'s own M4
+    /// model doc comment. This method itself never performs a live peer
+    /// round-trip (too costly to run on every `status` call); it only ever
+    /// reads what the background sweep already cached.
     pub fn group_durability_status(&self, group_id: &str) -> GroupDurabilityStatus {
         // The three account-wide/group-scoped "cannot currently confirm"
         // facts (latch-table load failure, an unresolved unknown-scope
@@ -2015,6 +2147,42 @@ impl DaemonState {
         // left `false` here -- `DurabilityService::classify` fills it in
         // from its own latch table, which this method never touches
         // directly.
+        //
+        // `Healthy` evidence comes ONLY from a fresh `custody_confirmation_
+        // cache` entry -- a real peer-confirmed whole-group check
+        // (`full_replica_handoff_ready`, run periodically by
+        // `DurabilityConfirmationJob`, which ALSO covers the vacuous
+        // "group has no durability roots at all" case using the real
+        // root-enumeration it already performs -- NOT this device's own
+        // locally-visible file count, which only reflects currently-live
+        // files and would miss retained/trash-restorable durability roots
+        // an empty-looking group might still have). This device's OWN
+        // materialization completeness (`is_local_full_replica` +
+        // `materialization`) is deliberately kept out of the `Healthy`
+        // path entirely -- it only ever feeds `Syncing`, for the case
+        // where this device itself is a full replica still catching up to
+        // head. This is the M4 fix for the prior derivation, which
+        // reported `Healthy` from local materialization alone and never
+        // consulted any peer.
+        let counts = self
+            .replica_coordinator
+            .materialization_state_repository()
+            .materialization_counts(group_id);
+        let materialization = match &counts {
+            Ok(counts) if counts.placeholder == 0 && counts.hydrating == 0 => {
+                Ok(crate::durability_service::MaterializationHealth::FullyLocal)
+            }
+            Ok(_) => Ok(crate::durability_service::MaterializationHealth::Partial),
+            Err(_) => Err(()),
+        };
+        // Used ONLY to gate a vacuous (no-peer) custody confirmation's
+        // freshness -- see `has_fresh_custody_confirmation`'s own doc
+        // comment. Never used as a `Healthy` fact on its own (that's
+        // exactly the conflation this M4 pass fixes).
+        let group_currently_empty = matches!(
+            &counts,
+            Ok(counts) if counts.hydrated == 0 && counts.placeholder == 0 && counts.hydrating == 0
+        );
         let facts = crate::durability_service::DurabilityFacts {
             latch_load_failed: self.durability_latch_load_failed.load(Ordering::SeqCst),
             scope_unknown: self.unknown_scope_membership_marker.load(Ordering::SeqCst),
@@ -2024,17 +2192,14 @@ impl DaemonState {
                 .has_recovery_blocked_membership_operation()
                 .unwrap_or(true),
             latched_unknown: false,
-            materialization: match self
-                .replica_coordinator
-                .materialization_state_repository()
-                .materialization_counts(group_id)
-            {
-                Ok(counts) if counts.placeholder == 0 && counts.hydrating == 0 => {
-                    Ok(crate::durability_service::MaterializationHealth::FullyLocal)
-                }
-                Ok(_) => Ok(crate::durability_service::MaterializationHealth::Partial),
-                Err(_) => Err(()),
-            },
+            group_policy_stale: self.is_group_policy_stale(group_id),
+            materialization,
+            is_local_full_replica: self.is_local_full_replica(group_id),
+            any_other_full_replica_peer_configured: self
+                .any_other_full_replica_peer_configured(group_id),
+            peer_confirmed_custody: self
+                .has_fresh_custody_confirmation(group_id, group_currently_empty),
+            ever_confirmation_swept: self.has_ever_been_custody_swept(group_id),
         };
         self.durability.classify(group_id, facts)
     }
@@ -2600,6 +2765,218 @@ impl DaemonState {
     /// `spawn_materialization_repair_scheduler`).
     pub(crate) fn materialization_repair_sweep_interval(&self) -> Duration {
         *self.materialization_repair_sweep_interval.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Same override contract as [`Self::set_materialization_repair_sweep_interval`],
+    /// for `maintenance::durability_confirmation::DurabilityConfirmationJob`.
+    pub fn set_custody_confirmation_sweep_interval(&self, interval: Duration) {
+        *self.custody_confirmation_sweep_interval.lock().unwrap_or_else(|p| p.into_inner()) =
+            interval;
+    }
+
+    /// `pub(crate)`: read by `maintenance::durability_confirmation::
+    /// DurabilityConfirmationJob`, which owns this scheduler's sleep-loop.
+    pub(crate) fn custody_confirmation_sweep_interval(&self) -> Duration {
+        *self.custody_confirmation_sweep_interval.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Records the outcome of one `DurabilityConfirmationJob` sweep round
+    /// for `group_id`, stamped with the `membership_generation` captured
+    /// BEFORE that round's peer round-trip started (not read fresh here --
+    /// see `refresh_custody_confirmation`'s own comment for why: reading it
+    /// fresh at write time could stamp a now-current generation onto
+    /// evidence a mid-flight demotion actually invalidated).
+    ///
+    /// `epoch_before` is the cache epoch captured before that same
+    /// round-trip started. The epoch check and the write happen in ONE
+    /// critical section (a single lock acquisition) together with
+    /// `clear_custody_confirmation`'s own epoch bump+remove -- so the two
+    /// can never interleave: either `clear_custody_confirmation` runs
+    /// fully before this call observes its bumped epoch and drops the
+    /// stale result, or it runs fully after and this call has already
+    /// published (in which case the clear correctly removes what was just
+    /// published). An earlier version checked the epoch and published as
+    /// two separate lock acquisitions, which left exactly this window open
+    /// (M4 Codex review #1 second follow-up, finding #3b).
+    ///
+    /// A `NotConfirmed` outcome does NOT overwrite an existing entry that
+    /// is still a fresh `Confirmed` record (by this same generation +
+    /// staleness test `has_fresh_custody_confirmation` applies) -- one
+    /// transient round-trip miss must not immediately erase the "tolerate
+    /// one missed sweep" property `CUSTODY_CONFIRMATION_STALENESS_BOUND`
+    /// exists to provide (M4 Codex review #1 follow-up: without this, every
+    /// `NotConfirmed` round unconditionally clobbered a still-good record,
+    /// making the staleness bound meaningless in practice). It's still
+    /// written when there's no existing entry at all, so
+    /// `has_ever_been_custody_swept` still becomes true on first contact.
+    fn record_custody_confirmation_outcome(
+        &self,
+        group_id: &str,
+        outcome: CustodyConfirmationOutcome,
+        membership_generation: u64,
+        epoch_before: u64,
+    ) {
+        let current_membership_generation = self.membership_generation();
+        let mut cache = self.custody_confirmation_cache.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = cache.entry(group_id.to_string()).or_default();
+        if entry.epoch != epoch_before {
+            // A clear (unlink, possibly followed by a relink) landed
+            // between when this sweep round started and now -- drop this
+            // stale result entirely rather than publish it.
+            return;
+        }
+        if matches!(outcome, CustodyConfirmationOutcome::NotConfirmed) {
+            if let Some(existing) = &entry.record {
+                let still_fresh = matches!(
+                    existing.outcome,
+                    CustodyConfirmationOutcome::Confirmed { .. }
+                ) && existing.confirmed_at.elapsed() <= CUSTODY_CONFIRMATION_STALENESS_BOUND
+                    && existing.membership_generation == current_membership_generation;
+                if still_fresh {
+                    return;
+                }
+            }
+        }
+        entry.record = Some(CustodyConfirmationRecord {
+            outcome,
+            confirmed_at_unix: now_unix(),
+            confirmed_at: std::time::Instant::now(),
+            membership_generation,
+        });
+    }
+
+    /// Whether `group_id` has a whole-group peer-confirmed custody record
+    /// in cache that is BOTH still within `CUSTODY_CONFIRMATION_STALENESS_
+    /// BOUND` of its confirmation time (monotonic clock, immune to a wall-
+    /// clock adjustment -- M4 Codex review #1 finding #5) AND was recorded
+    /// under the CURRENT `membership_generation` (any peer netmap change
+    /// since invalidates it outright, regardless of age -- finding #3's
+    /// demotion sub-case), AND -- for a vacuous (no-peer, empty-root-set)
+    /// confirmation specifically -- this device's own current
+    /// materialization view of the group still looks empty too. That last
+    /// condition is what stops a group that goes empty -> non-empty from
+    /// riding a stale vacuous confirmation as `Healthy` for up to the full
+    /// staleness bound: a new file's DAG record reaches every group member
+    /// well before the next confirmation sweep tick, so this device's own
+    /// materialization view moves off "empty" almost immediately, even
+    /// though it says nothing about the file's own hydration/custody state
+    /// (M4 Codex review #1 follow-up, finding #2). `group_durability_
+    /// status`'s only source of `Healthy` evidence -- see this cache's own
+    /// doc comment for why local materialization state must never
+    /// otherwise substitute for it.
+    fn has_fresh_custody_confirmation(&self, group_id: &str, group_currently_empty: bool) -> bool {
+        let cache = self.custody_confirmation_cache.lock().unwrap_or_else(|p| p.into_inner());
+        match cache.get(group_id).and_then(|entry| entry.record.as_ref()) {
+            Some(record) => match &record.outcome {
+                CustodyConfirmationOutcome::Confirmed { peer_device_id, .. } => {
+                    let fresh = record.confirmed_at.elapsed() <= CUSTODY_CONFIRMATION_STALENESS_BOUND
+                        && record.membership_generation == self.membership_generation();
+                    let vacuous = peer_device_id.is_none();
+                    fresh && (!vacuous || group_currently_empty)
+                }
+                CustodyConfirmationOutcome::NotConfirmed => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Whether `group_id` has had at least one `DurabilityConfirmationJob`
+    /// sweep round run for it, ever (not staleness-bounded — this only
+    /// exists to distinguish "never checked yet" from "checked and found
+    /// nothing," so `classify` doesn't jump straight to `KnownMissing`
+    /// during the narrow startup window before the first sweep tick has
+    /// even run once — M4 Codex review #1 findings #1/#2).
+    fn has_ever_been_custody_swept(&self, group_id: &str) -> bool {
+        self.custody_confirmation_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(group_id)
+            .is_some_and(|entry| entry.record.is_some())
+    }
+
+    /// Current epoch counter for `group_id`'s custody-confirmation cache
+    /// entry (0 if never cleared).
+    fn custody_confirmation_epoch(&self, group_id: &str) -> u64 {
+        self.custody_confirmation_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(group_id)
+            .map(|entry| entry.epoch)
+            .unwrap_or(0)
+    }
+
+    /// Runs one round of `DurabilityConfirmationJob`'s sweep for a single
+    /// group, synchronously from the caller's perspective (awaits the
+    /// peer round-trip), and records the outcome either way. Exists so
+    /// tests (and any other caller that needs `group_durability_status` to
+    /// reflect a fresh confirmation right now rather than waiting up to
+    /// `custody_confirmation_sweep_interval` for the background job's next
+    /// tick) can force the same real check the periodic sweep performs,
+    /// rather than reaching around it to poke the cache directly.
+    ///
+    /// Captures `membership_generation` AND the cache epoch BEFORE the
+    /// round-trip and re-checks both after (the epoch check happens
+    /// atomically with the publish itself inside
+    /// `record_custody_confirmation_outcome` -- see its own doc comment):
+    /// a generation change means a peer's authorization may have shifted
+    /// mid-check (the confirmation, if any, gets recorded as `NotConfirmed`
+    /// instead of trusted); an epoch change means `clear_custody_
+    /// confirmation` ran for this exact group while the round-trip was in
+    /// flight (an unlink, possibly followed by a relink) -- the result is
+    /// dropped entirely rather than published, so a stale in-flight
+    /// confirmation can never resurrect a cache entry a concurrent unlink
+    /// just cleared (M4 Codex review #1 follow-up, findings #3a/#3b).
+    pub async fn refresh_custody_confirmation(&self, group_id: &str) {
+        let generation_before = self.membership_generation();
+        let epoch_before = self.custody_confirmation_epoch(group_id);
+        let confirmed = self.full_replica_handoff_ready_digest_and_peer(group_id).await;
+        let outcome = if self.membership_generation() != generation_before {
+            CustodyConfirmationOutcome::NotConfirmed
+        } else {
+            match confirmed {
+                Some((digest, peer_device_id)) => {
+                    CustodyConfirmationOutcome::Confirmed { peer_device_id, digest }
+                }
+                None => CustodyConfirmationOutcome::NotConfirmed,
+            }
+        };
+        self.record_custody_confirmation_outcome(group_id, outcome, generation_before, epoch_before);
+    }
+
+    /// Drops `group_id`'s cached custody confirmation, if any, and bumps
+    /// its epoch, atomically (one lock acquisition) -- called whenever
+    /// this device's own link for that group is removed. The epoch bump
+    /// is what lets `refresh_custody_confirmation` detect and discard an
+    /// in-flight round-trip that started before this call and would
+    /// otherwise complete afterward and resurrect a cache entry for a
+    /// link that's no longer there (M4 Codex review #1 follow-up finding
+    /// #3b) -- doing the remove and the bump under the SAME critical
+    /// section `record_custody_confirmation_outcome` also uses is what
+    /// closes the window an earlier two-lock version left open. The
+    /// removal alone is what stops a later relink of the same `group_id`
+    /// within the staleness bound from reusing evidence confirmed under a
+    /// now-gone link/membership state (finding #3's original relink
+    /// sub-case). A no-op (beyond the epoch bump) if nothing was cached.
+    pub(crate) fn clear_custody_confirmation(&self, group_id: &str) {
+        let mut cache = self.custody_confirmation_cache.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = cache.entry(group_id.to_string()).or_default();
+        entry.record = None;
+        entry.epoch += 1;
+    }
+
+    /// Whether any device OTHER than this one is currently recorded
+    /// (netmap-derived, content-blind) as an authorized-writer full replica
+    /// of `group_id` — the structural fact that makes `KnownMissing`
+    /// (M4's `AtRisk`) a positively-known conclusion rather than merely
+    /// "not yet confirmed": with zero such peers configured, no amount of
+    /// waiting for `DurabilityConfirmationJob` will ever produce a
+    /// confirmation, so reporting anything but known-insufficient would be
+    /// false comfort.
+    fn any_other_full_replica_peer_configured(&self, group_id: &str) -> bool {
+        let metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
+        metadata.full_replicas.iter().any(|(device_id, gid)| {
+            gid == group_id && metadata.writers.contains(&(device_id.clone(), gid.clone()))
+        })
     }
 
     /// This device's coordination-plane address + access token, if recorded
@@ -4089,6 +4466,178 @@ mod tests {
         assert!(confirmer.confirmation_still_valid("group-a", &current_stamp));
         state.set_peer_group_full_replica("peer-b", "group-a", false);
         assert!(!confirmer.confirmation_still_valid("group-a", &current_stamp));
+    }
+
+    // --- M4 custody-confirmation cache mechanics ----
+
+    /// A transient `NotConfirmed` round must not erase a still-fresh
+    /// `Confirmed` record -- otherwise the staleness bound's "tolerate one
+    /// missed sweep" property would be meaningless (M4 Codex review #1
+    /// follow-up).
+    #[tokio::test]
+    async fn not_confirmed_does_not_downgrade_a_still_fresh_confirmed_record() {
+        let state = test_state();
+        let generation = state.membership_generation();
+        state.record_custody_confirmation_outcome(
+            "group-1",
+            CustodyConfirmationOutcome::Confirmed { peer_device_id: Some("peer-b".into()), digest: [7u8; 32] },
+            generation,
+            0,
+        );
+        assert!(state.has_fresh_custody_confirmation("group-1", false));
+
+        state.record_custody_confirmation_outcome(
+            "group-1",
+            CustodyConfirmationOutcome::NotConfirmed,
+            generation,
+            0,
+        );
+        assert!(
+            state.has_fresh_custody_confirmation("group-1", false),
+            "a transient NotConfirmed round must not clobber a still-fresh Confirmed record"
+        );
+    }
+
+    /// `NotConfirmed` is still written (and `has_ever_been_custody_swept`
+    /// still becomes true) the FIRST time, when there's no existing
+    /// record to preserve.
+    #[tokio::test]
+    async fn not_confirmed_is_recorded_when_nothing_cached_yet() {
+        let state = test_state();
+        assert!(!state.has_ever_been_custody_swept("group-1"));
+        state.record_custody_confirmation_outcome(
+            "group-1",
+            CustodyConfirmationOutcome::NotConfirmed,
+            state.membership_generation(),
+            0,
+        );
+        assert!(state.has_ever_been_custody_swept("group-1"));
+        assert!(!state.has_fresh_custody_confirmation("group-1", false));
+    }
+
+    /// A vacuous (no-peer) confirmation only counts as fresh while this
+    /// device's own materialization view of the group still looks empty
+    /// too -- otherwise a group going empty -> non-empty could ride a
+    /// stale vacuous confirmation as `Healthy` for up to the full
+    /// staleness bound (M4 Codex review #1 follow-up, finding #2).
+    #[tokio::test]
+    async fn vacuous_confirmation_requires_group_still_currently_empty() {
+        let state = test_state();
+        state.record_custody_confirmation_outcome(
+            "group-1",
+            CustodyConfirmationOutcome::Confirmed { peer_device_id: None, digest: [0u8; 32] },
+            state.membership_generation(),
+            0,
+        );
+        assert!(
+            state.has_fresh_custody_confirmation("group-1", true),
+            "a vacuous confirmation is fresh evidence while the group still looks empty"
+        );
+        assert!(
+            !state.has_fresh_custody_confirmation("group-1", false),
+            "a vacuous confirmation must stop counting as fresh once the group no longer \
+             looks empty locally, even within the staleness bound"
+        );
+    }
+
+    /// A REAL (non-vacuous) peer confirmation is unaffected by the
+    /// group's current local emptiness -- that check only ever gates the
+    /// vacuous case.
+    #[tokio::test]
+    async fn non_vacuous_confirmation_ignores_group_currently_empty() {
+        let state = test_state();
+        state.record_custody_confirmation_outcome(
+            "group-1",
+            CustodyConfirmationOutcome::Confirmed { peer_device_id: Some("peer-b".into()), digest: [1u8; 32] },
+            state.membership_generation(),
+            0,
+        );
+        assert!(state.has_fresh_custody_confirmation("group-1", false));
+        assert!(state.has_fresh_custody_confirmation("group-1", true));
+    }
+
+    /// A membership-generation change since the confirmation was recorded
+    /// invalidates it outright, regardless of age (M4 Codex review #1
+    /// finding #3's demotion sub-case).
+    #[tokio::test]
+    async fn confirmation_under_a_stale_membership_generation_is_not_fresh() {
+        let state = test_state();
+        let old_generation = state.membership_generation();
+        state.record_custody_confirmation_outcome(
+            "group-1",
+            CustodyConfirmationOutcome::Confirmed { peer_device_id: Some("peer-b".into()), digest: [2u8; 32] },
+            old_generation,
+            0,
+        );
+        assert!(state.has_fresh_custody_confirmation("group-1", false));
+
+        state.set_peer_group_writer("peer-c", "unrelated-group", true);
+        assert_ne!(state.membership_generation(), old_generation);
+        assert!(
+            !state.has_fresh_custody_confirmation("group-1", false),
+            "any membership generation change since confirmation must invalidate it"
+        );
+    }
+
+    /// `clear_custody_confirmation` both drops the cached record and bumps
+    /// the group's epoch -- the epoch is what `refresh_custody_
+    /// confirmation` uses to detect and discard an in-flight round-trip
+    /// that started before an unlink and would otherwise resurrect a
+    /// cleared entry (M4 Codex review #1 follow-up, finding #3b).
+    #[tokio::test]
+    async fn clear_custody_confirmation_drops_the_record_and_bumps_the_epoch() {
+        let state = test_state();
+        let generation = state.membership_generation();
+        state.record_custody_confirmation_outcome(
+            "group-1",
+            CustodyConfirmationOutcome::Confirmed { peer_device_id: Some("peer-b".into()), digest: [3u8; 32] },
+            generation,
+            0,
+        );
+        let epoch_before = state.custody_confirmation_epoch("group-1");
+
+        state.clear_custody_confirmation("group-1");
+
+        assert!(!state.has_ever_been_custody_swept("group-1"));
+        assert!(!state.has_fresh_custody_confirmation("group-1", false));
+        assert_ne!(
+            state.custody_confirmation_epoch("group-1"),
+            epoch_before,
+            "clearing must bump the epoch so an in-flight refresh started before this call \
+             can detect it happened and drop its stale result"
+        );
+    }
+
+    /// Directly pins the TOCTOU `record_custody_confirmation_outcome`
+    /// closes: a publish carrying a stale (pre-clear) `epoch_before` must
+    /// be dropped outright, never landing in the cache at all -- even
+    /// though nothing else about the confirmation looks wrong (M4 Codex
+    /// review #1 second follow-up, finding #3b). This simulates the
+    /// in-flight-round-trip race without needing real concurrency: capture
+    /// the epoch, clear (as if an unlink raced ahead of the round-trip),
+    /// then publish using the stale, pre-clear epoch (as
+    /// `refresh_custody_confirmation` would with what it captured before
+    /// the round-trip started).
+    #[tokio::test]
+    async fn publish_with_a_stale_epoch_is_dropped_not_resurrected() {
+        let state = test_state();
+        let generation = state.membership_generation();
+        let epoch_before = state.custody_confirmation_epoch("group-1");
+
+        state.clear_custody_confirmation("group-1");
+
+        state.record_custody_confirmation_outcome(
+            "group-1",
+            CustodyConfirmationOutcome::Confirmed { peer_device_id: Some("peer-b".into()), digest: [9u8; 32] },
+            generation,
+            epoch_before,
+        );
+
+        assert!(
+            !state.has_ever_been_custody_swept("group-1"),
+            "a publish carrying a stale pre-clear epoch must be dropped entirely, not \
+             resurrect a cache entry for a group that was unlinked mid-round-trip"
+        );
     }
 
     // --- Mandatory handoff-lease digest-match decision (source side) ----

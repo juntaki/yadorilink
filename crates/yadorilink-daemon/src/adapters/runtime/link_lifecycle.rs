@@ -83,11 +83,31 @@ impl LinkRepositoryPort for DaemonLinkRepositoryAdapter {
     }
 
     fn remove_link(&self, local_path: &str) -> Result<(), SyncError> {
+        // See `SyncStateReplicaRoleRepository::remove_link`'s identical
+        // comment (including the `list_links` failure logging): look up
+        // group_id before it's gone so a stale custody confirmation cached
+        // for it can't be reused by a later relink.
+        let group_id = match self.state.replica_coordinator.link_repository().list_links() {
+            Ok(links) => links.into_iter().find(|l| l.local_path == local_path).map(|l| l.group_id),
+            Err(e) => {
+                tracing::warn!(
+                    local_path,
+                    error = %e,
+                    "remove_link: list_links failed, cannot clear this group's custody \
+                     confirmation cache entry (will self-heal via staleness bound)"
+                );
+                None
+            }
+        };
         self.state
             .replica_coordinator
             .link_repository()
             .remove_link(local_path)
-            .map_err(SyncError::from)
+            .map_err(SyncError::from)?;
+        if let Some(group_id) = group_id {
+            self.state.clear_custody_confirmation(&group_id);
+        }
+        Ok(())
     }
 
     fn rollback_local_setup_to_cancel_pending(

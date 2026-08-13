@@ -52,6 +52,7 @@ use crate::daemon_state::{
 };
 use crate::maintenance::degraded_link_recheck::DegradedLinkRecheckJob;
 use crate::maintenance::disk_reconcile_backstop::DiskReconcileBackstopJob;
+use crate::maintenance::durability_confirmation::DurabilityConfirmationJob;
 use crate::maintenance::gc_idle::GcIdleJob;
 use crate::maintenance::materialization_repair::MaterializationRepairJob;
 use crate::maintenance::membership_recovery::MembershipRecoveryJob;
@@ -145,6 +146,22 @@ pub(crate) fn start(
             loop {
                 tokio::time::sleep(materialization_repair_job.sweep_interval()).await;
                 materialization_repair_job.run_once(MaintenanceTrigger::Interval).await;
+            }
+        });
+    }
+    // M4: durability confirmation sweep -- interval-only, same
+    // fresh-read-each-tick shape as materialization repair above, so
+    // `set_custody_confirmation_sweep_interval` takes effect on the very
+    // next sleep. This is what turns `group_durability_status`'s `Healthy`
+    // into real peer-confirmed evidence instead of a local-only heuristic
+    // -- see `durability_confirmation::DurabilityConfirmationJob`'s own
+    // doc comment.
+    {
+        let durability_confirmation_job = DurabilityConfirmationJob::new(state.clone());
+        supervise::spawn_logged("daemon-state-durability-confirmation", async move {
+            loop {
+                tokio::time::sleep(durability_confirmation_job.sweep_interval()).await;
+                durability_confirmation_job.run_once(MaintenanceTrigger::Interval).await;
             }
         });
     }
