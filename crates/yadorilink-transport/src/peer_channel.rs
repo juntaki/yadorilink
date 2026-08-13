@@ -370,6 +370,15 @@ pub struct PeerChannel {
     /// session rather than this device's own UDP socket -- see
     /// [`deliver_relay_datagram`](Self::deliver_relay_datagram).
     relay_inbound_tx: mpsc::Sender<Vec<u8>>,
+    /// M3 Pass 6: this peer's WireGuard static public key, exposed so a
+    /// caller holding a `direct_channels`-style `device_id -> PeerChannel`
+    /// map (see `DaemonState`) can go the other way -- match a
+    /// `RelayCarrier::send_via_relay` call's `peer_public` back to the
+    /// device_id that owns this channel, without a second synchronized
+    /// side table to keep in lockstep. Immutable for the channel's whole
+    /// lifetime, unlike `confirmed_addr_shared`, so a plain field is
+    /// enough -- no `Arc`/lock needed.
+    peer_public_bytes: [u8; 32],
 }
 
 impl PeerChannel {
@@ -507,6 +516,7 @@ impl PeerChannel {
             reliable_enabled,
             confirmed_addr_shared,
             relay_inbound_tx,
+            peer_public_bytes,
         })
     }
 
@@ -590,6 +600,12 @@ impl PeerChannel {
     /// own dedicated forwarding socket toward this peer).
     pub fn confirmed_direct_addr(&self) -> Option<SocketAddr> {
         *self.confirmed_addr_shared.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// This peer's WireGuard static public key -- see `peer_public_bytes`'s
+    /// own doc comment.
+    pub fn peer_public(&self) -> [u8; 32] {
+        self.peer_public_bytes
     }
 
     /// Adds a newly-learned direct candidate at runtime — e.g.

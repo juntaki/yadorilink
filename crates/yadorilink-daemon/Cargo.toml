@@ -84,6 +84,10 @@ test-support = [
 
 [dependencies]
 async-trait = "0.1"
+# M3 Pass 6: `relay_carrier.rs`'s `RelayCarrier` impl takes a `bytes::Bytes`
+# directly (the same type `yadorilink-transport`'s trait signature names),
+# not previously a direct dependency of this crate.
+bytes.workspace = true
 yadorilink-local-capture = { path = "../yadorilink-local-capture" }
 # `convergence/engine.rs` names `MaterializationJob`/`MaterializationJobState`
 # directly (Phase 7D-7.1 moved their definition here from the

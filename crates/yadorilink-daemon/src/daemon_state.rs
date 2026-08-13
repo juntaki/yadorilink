@@ -249,6 +249,18 @@ struct RelaySessionRecord {
     destination_device_id: String,
 }
 
+/// M3 Pass 6: see `DaemonState::requester_relay_sessions`'s own doc
+/// comment. `relay_device_id` is what lets `RelayCarrier::send_via_relay`
+/// find the live `PeerSyncSession` to send subsequent `RelayData` frames
+/// over (`self.peers.session(&relay_device_id)`, looked up fresh each
+/// time rather than cached, so a session that reconnects with a fresh
+/// object is still found).
+#[derive(Debug, Clone)]
+struct RequesterRelaySession {
+    relay_device_id: String,
+    destination_peer_public: [u8; 32],
+}
+
 #[derive(Default)]
 struct PeerNetmapMetadata {
     signing_keys: HashMap<String, [u8; 32]>,
@@ -394,6 +406,41 @@ pub struct DaemonState {
     /// (each entry is a few small strings, and idle sessions are rare
     /// relative to active ones), not fixed here.
     active_relay_sessions: Mutex<HashMap<u64, RelaySessionRecord>>,
+    /// M3 Pass 6: session id -> the destination peer's WireGuard static
+    /// public key, for a session THIS device opened as the relay
+    /// REQUESTER ("A"), not provider ("B") -- distinct from
+    /// `active_relay_sessions` above, which only ever tracks sessions this
+    /// device is providing forwarding for. Consulted first by
+    /// `handle_relay_data`'s dispatch, before falling through to the
+    /// provider-side path, so a reply this device's own `RelayCarrier` is
+    /// waiting on is routed into the right `PeerChannel` via `deliver_
+    /// relay_datagram` instead of being mistaken for a forward request
+    /// this device never opened.
+    requester_relay_sessions: Mutex<HashMap<u64, RequesterRelaySession>>,
+    /// M3 Pass 6: `grant_id -> ` the oneshot this device's own
+    /// `RelayCarrier::send_via_relay` is waiting on for the matching
+    /// `RelayOpenedFrame` reply, plus the device_id the matching `RelayOpen`
+    /// was actually sent to -- `resolve_pending_relay_open` checks a
+    /// `RelayOpened`'s own authenticated sender against this before
+    /// resolving, so a different peer this device happens to also have a
+    /// session with cannot complete (or poison) an open it was never asked
+    /// to answer, even if it somehow guesses/replays a live `grant_id`.
+    /// Removed on first delivery -- a sender with nobody left waiting (the
+    /// caller already gave up) is simply dropped when its receiver goes
+    /// away, not a leak; bounded by how many opens are ever in flight at
+    /// once.
+    pending_relay_opens: Mutex<
+        HashMap<
+            String,
+            (String, tokio::sync::oneshot::Sender<yadorilink_sync_wire::RelayOpenedFrame>),
+        >,
+    >,
+    /// M3 Pass 6: how this device (as relay REQUESTER) obtains a signed
+    /// `RelayGrant` before opening a session -- see `crate::relay_carrier::
+    /// RelayGrantSource`'s own doc comment for why this is `None` in
+    /// production today (no coordination-plane endpoint exists yet to
+    /// fill it) and only ever `Some` in tests, via `FakeCoordination`.
+    relay_grant_source: Mutex<Option<Arc<dyn crate::relay_carrier::RelayGrantSource>>>,
     /// M3 Pass 5: this device's own local configuration of whether it is
     /// willing to relay for other peers -- see `crate::route::
     /// RelayCapability`'s own doc comment. Defaults to `false` (the
@@ -1097,6 +1144,9 @@ impl DaemonState {
             relay_replay_guard: crate::relay_session::RelayReplayGuard::new(),
             direct_channels: Mutex::new(HashMap::new()),
             active_relay_sessions: Mutex::new(HashMap::new()),
+            requester_relay_sessions: Mutex::new(HashMap::new()),
+            pending_relay_opens: Mutex::new(HashMap::new()),
+            relay_grant_source: Mutex::new(None),
             local_relay_capable: std::sync::atomic::AtomicBool::new(false),
             device_signing_key: Mutex::new(None),
             peer_netmap_metadata: Mutex::new(PeerNetmapMetadata::default()),
@@ -1455,6 +1505,187 @@ impl DaemonState {
     /// confirmed_direct_addr`).
     pub(crate) fn direct_channel(&self, device_id: &str) -> Option<Arc<yadorilink_transport::PeerChannel>> {
         self.direct_channels.lock().unwrap_or_else(|p| p.into_inner()).get(device_id).cloned()
+    }
+
+    /// The device_id that owns the channel whose WireGuard static public
+    /// key is `peer_public` -- the reverse of `direct_channel` above. A
+    /// linear scan over `direct_channels` rather than a second
+    /// synchronized side table: this map is small (bounded by this
+    /// device's own connected-peer count) and only ever consulted from
+    /// `RelayCarrier::send_via_relay`, never a hot path.
+    pub(crate) fn device_id_for_peer_public(&self, peer_public: &[u8; 32]) -> Option<String> {
+        self.direct_channels
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|(_, channel)| &channel.peer_public() == peer_public)
+            .map(|(device_id, _)| device_id.clone())
+    }
+
+    /// M3 Pass 6: installs a `RelayGrantSource` -- see that trait's own
+    /// doc comment for why nothing calls this in production yet (`pub`
+    /// under this cfg, not `pub(crate)`, specifically so an integration
+    /// test in `tests/` -- a separate compilation unit from this crate's
+    /// own `src/` -- can install `FakeCoordination` as one, matching
+    /// `test_relay_session_handler`'s own visibility for the identical
+    /// reason).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_relay_grant_source(&self, source: Arc<dyn crate::relay_carrier::RelayGrantSource>) {
+        *self.relay_grant_source.lock().unwrap_or_else(|p| p.into_inner()) = Some(source);
+    }
+
+    pub(crate) fn relay_grant_source(
+        &self,
+    ) -> Option<Arc<dyn crate::relay_carrier::RelayGrantSource>> {
+        self.relay_grant_source.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// M3 Pass 6: candidate relay devices for reaching `destination_
+    /// device_id` -- every device that (a) has declared `RelayCapability::
+    /// Capable`, (b) shares at least one group with BOTH this device and
+    /// the destination (the same group, not merely one group each -- a
+    /// relay grant is scoped to one `group_id` shared by all three, see
+    /// `relay_grant::RelayGrant`'s own fields), and (c) this device
+    /// already has a live `PeerSyncSession` with (never dials a NEW
+    /// connection purely to use someone as a relay -- a real, deliberate
+    /// scope limit of this increment, not an oversight: opening fresh
+    /// connections on the relay-selection path would make an already
+    /// best-effort fallback path responsible for its own connection
+    /// supervision too). Returns `(relay_device_id, group_id)` pairs,
+    /// most-recently-registered-writer order is not meaningful here (plain
+    /// `HashSet` iteration) -- the caller tries them in whatever order
+    /// this returns and stops at the first that actually grants.
+    pub(crate) fn relay_candidates(&self, destination_device_id: &str) -> Vec<(String, String)> {
+        let metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
+        let groups_of = |device_id: &str| -> HashSet<String> {
+            metadata
+                .writers
+                .iter()
+                .filter(|(d, _)| d == device_id)
+                .map(|(_, g)| g.clone())
+                .collect()
+        };
+        let dest_groups = groups_of(destination_device_id);
+        let mut candidates = Vec::new();
+        for relay_device_id in &metadata.relay_capable {
+            if relay_device_id == &self.device_id || relay_device_id == destination_device_id {
+                continue;
+            }
+            if !self.peers.has_session(relay_device_id) {
+                continue;
+            }
+            let relay_groups = groups_of(relay_device_id);
+            // This device's own membership is NOT read from `metadata.
+            // writers` -- that set is populated per-PEER from the netmap
+            // (`replace_peer_netmap_metadata`), and self is not its own
+            // netmap peer entry. `is_local_group_member` is the same
+            // check `RelayAdmissionContext::relay_is_group_member` uses
+            // on the provider side, for the identical reason.
+            if let Some(group_id) = relay_groups
+                .intersection(&dest_groups)
+                .find(|group_id| self.is_local_group_member(group_id))
+            {
+                candidates.push((relay_device_id.clone(), group_id.clone()));
+            }
+        }
+        candidates
+    }
+
+    /// M3 Pass 6: records that session `session_id`, opened by THIS device
+    /// as relay REQUESTER via `relay_device_id`, carries traffic for
+    /// `destination_peer_public` -- see `requester_relay_sessions`'s own
+    /// doc comment.
+    pub(crate) fn record_requester_relay_session(
+        &self,
+        session_id: u64,
+        relay_device_id: String,
+        destination_peer_public: [u8; 32],
+    ) {
+        self.requester_relay_sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(session_id, RequesterRelaySession { relay_device_id, destination_peer_public });
+    }
+
+    /// An existing requester-opened session already carrying traffic for
+    /// `destination_peer_public`, if this device has one -- `send_via_
+    /// relay` reuses it rather than opening a new one per datagram.
+    pub(crate) fn requester_relay_session_for_destination(
+        &self,
+        destination_peer_public: &[u8; 32],
+    ) -> Option<(u64, String)> {
+        self.requester_relay_sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|(_, s)| &s.destination_peer_public == destination_peer_public)
+            .map(|(id, s)| (*id, s.relay_device_id.clone()))
+    }
+
+    /// The relay device a requester-opened `session_id` was opened
+    /// through, and its destination -- used to route an inbound
+    /// `RelayData`/close for this session id (this device receiving its
+    /// own relay's reply) rather than mistaking it for a forward request.
+    pub(crate) fn requester_relay_session(
+        &self,
+        session_id: u64,
+    ) -> Option<(String, [u8; 32])> {
+        self.requester_relay_sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&session_id)
+            .map(|s| (s.relay_device_id.clone(), s.destination_peer_public))
+    }
+
+    pub(crate) fn forget_requester_relay_session(&self, session_id: u64) {
+        self.requester_relay_sessions.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_id);
+    }
+
+    /// M3 Pass 6: registers a oneshot to be resolved by the matching
+    /// `RelayOpenedFrame` reply, scoped to `expected_relay_device_id` (the
+    /// device this device is actually sending the `RelayOpen` to) -- see
+    /// `pending_relay_opens`'s own doc comment.
+    pub(crate) fn register_pending_relay_open(
+        &self,
+        grant_id: String,
+        expected_relay_device_id: String,
+        sender: tokio::sync::oneshot::Sender<yadorilink_sync_wire::RelayOpenedFrame>,
+    ) {
+        self.pending_relay_opens
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(grant_id, (expected_relay_device_id, sender));
+    }
+
+    /// Resolves and removes the pending open matching `opened.grant_id`,
+    /// if this device has one outstanding AND `authenticated_peer_device_id`
+    /// matches the device that open was actually sent to -- called from
+    /// `handle_relay_opened`. A miss (already timed out, an `opened` for a
+    /// grant_id this device never requested, or a sender mismatch) is
+    /// silently a no-op, matching `RelaySessionHandler::handle_relay_
+    /// opened`'s own doc comment; a mismatch specifically is put back so
+    /// the device that was actually asked can still resolve it later.
+    pub(crate) fn resolve_pending_relay_open(
+        &self,
+        opened: yadorilink_sync_wire::RelayOpenedFrame,
+        authenticated_peer_device_id: &str,
+    ) {
+        let mut pending = self.pending_relay_opens.lock().unwrap_or_else(|p| p.into_inner());
+        let Some((expected_relay_device_id, _)) = pending.get(&opened.grant_id) else {
+            return;
+        };
+        if expected_relay_device_id != authenticated_peer_device_id {
+            tracing::debug!(
+                grant_id = %opened.grant_id,
+                peer = authenticated_peer_device_id,
+                "relay opened reply from a device that was never sent this open; ignoring"
+            );
+            return;
+        }
+        if let Some((_, sender)) = pending.remove(&opened.grant_id) {
+            drop(pending);
+            let _ = sender.send(opened);
+        }
     }
 
     /// Returns this device's transport hub, binding it on first use. All peer

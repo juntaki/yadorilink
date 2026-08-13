@@ -717,6 +717,14 @@ impl RelaySessionHandler for DenyRelaySessionHandler {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async {})
     }
+
+    fn handle_relay_opened<'a>(
+        &'a self,
+        _opened: yadorilink_sync_wire::RelayOpenedFrame,
+        _authenticated_peer_device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
 }
 
 struct DenyHandoffLeaseResponder;

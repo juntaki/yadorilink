@@ -1789,12 +1789,19 @@ async fn run_one_peer_session_attempt(
         .await
         .expect("reconnect semaphore is never closed");
     let connect_started = tokio::time::Instant::now();
-    let connect_result = PeerChannel::connect(
+    // M3 Pass 6: `state.clone()` as the `RelayCarrier` -- `DaemonState`
+    // implements it (`relay_carrier.rs`), so a peer this direct race
+    // loses (or a relay path that's already in use) can fall back to
+    // relay sending. See that trait's own doc comment for why this is
+    // still deny-by-default everywhere else (test call sites, the madsim
+    // sibling below): only production wiring opts in.
+    let connect_result = PeerChannel::connect_with_relay(
         keypair.secret.clone(),
         spec.peer_public,
         session_index,
         spec.candidates,
         shared,
+        state.clone() as Arc<dyn yadorilink_transport::RelayCarrier>,
     )
     .await;
     tracing::debug!(
@@ -2437,12 +2444,14 @@ async fn run_one_direct_peer_session_attempt(
     let shared =
         state.shared_socket().expect("run_sim installs the shared socket before opening channels");
 
-    let channel = match PeerChannel::connect(
+    // M3 Pass 6: same relay-carrier wiring as the production path above.
+    let channel = match PeerChannel::connect_with_relay(
         keypair.secret.clone(),
         spec.peer_public,
         session_index,
         spec.candidates,
         shared,
+        state.clone() as Arc<dyn yadorilink_transport::RelayCarrier>,
     )
     .await
     {

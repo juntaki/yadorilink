@@ -44,7 +44,8 @@ pub use nat::{
     Candidate, CandidateClass, CandidateSink, NatObservations, ObservationLog, PortMappingStatus,
 };
 pub use peer_channel::{
-    diff_netmap, NetmapDiff, NetmapSnapshot, PeerChannel, PeerReachability, UnreachableCategory,
+    diff_netmap, NetmapDiff, NetmapSnapshot, PeerChannel, PeerReachability, RelayCarrier,
+    UnreachableCategory,
 };
 pub use transport_hub::{DatagramKind, HubStunSocket, InboundDatagram, TransportHub};
 pub use tunn_wrapper::{IncomingResult, WireGuardEngine};
