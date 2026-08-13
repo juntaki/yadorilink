@@ -333,11 +333,22 @@ fn apply_authoritative_peer_metadata(
     signing_key: Option<[u8; 32]>,
     authorized_groups: &HashSet<String>,
     full_replica_groups: &HashSet<String>,
+    relay_capable: bool,
     validation_cache: &std::sync::Mutex<HashMap<String, bool>>,
 ) -> HashSet<String> {
     // Seed identity only. Group authorization is withheld until the local
-    // policy + retained-history validator positively admits it.
-    state.replace_peer_netmap_metadata(device_id, signing_key, &HashSet::new(), &HashSet::new());
+    // policy + retained-history validator positively admits it. Relay
+    // capability is NOT gated on that validation the way group
+    // authorization is -- see `crate::route::RelayCapability`'s own doc
+    // comment -- so it is recorded here already, on both calls, rather
+    // than only once authorization clears.
+    state.replace_peer_netmap_metadata(
+        device_id,
+        signing_key,
+        &HashSet::new(),
+        &HashSet::new(),
+        relay_capable,
+    );
 
     let effective_groups = crate::change_auth::NetmapChangeAuthenticator::effective_servable_groups(
         state.clone(),
@@ -352,6 +363,7 @@ fn apply_authoritative_peer_metadata(
         signing_key,
         &effective_groups,
         &effective_full_replica_groups,
+        relay_capable,
     );
     if let Some(session) = state.peers.session(device_id) {
         session.set_authorized_groups(effective_groups.iter().cloned());
@@ -752,6 +764,15 @@ mod ws_netmap {
         /// the fail-safe default of not treating this peer as a durable holder.
         #[serde(default)]
         full_replica_group_ids: Vec<String>,
+        /// M3 Pass 4: this peer's own declared willingness to relay opaque
+        /// WireGuard datagrams for other peers sharing a group with it --
+        /// see `crate::route::RelayCapability`'s own doc comment. Absent on
+        /// an older coordination plane, or a peer that has never opted in,
+        /// reads as `false` -- the fail-safe default, matching
+        /// `full_replica_group_ids`'s own "absence means not available"
+        /// convention.
+        #[serde(default)]
+        relay_capable: bool,
     }
 
     #[derive(serde::Deserialize)]
@@ -1129,6 +1150,7 @@ mod ws_netmap {
                     signing_key_bytes.as_deref().and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()),
                     &authorized_groups,
                     &full_replica_groups,
+                    peer.relay_capable,
                     &retained_group_validation_cache,
                 );
                 let candidates: Vec<SocketAddr> =
@@ -2000,7 +2022,7 @@ fn record_reachability_transition(
     connected_class: Option<AddressClass>,
 ) {
     match current {
-        PeerReachability::Connected => {
+        PeerReachability::Connected(_) => {
             // A confirmed direct path means UDP got through, so record a punch
             // success — this keeps NAT classification from misjudging the
             // network as UDP-blocked once any peer connects.
@@ -2037,7 +2059,15 @@ fn map_transport_reachability(
     use yadorilink_transport::PeerReachability as Transport;
     match reachability {
         Transport::Connecting { .. } => PeerReachability::Connecting,
-        Transport::Connected { .. } => PeerReachability::Connected,
+        // M3 Pass 4: `PeerChannel`'s own reachability watch (the source
+        // this function converts from) only ever races DIRECT candidates
+        // -- a relay-sourced connection, when Pass 5/6 exists, will not
+        // come through this transport-hub path at all, so `Direct` is not
+        // a placeholder here, it is the only route this conversion can
+        // ever correctly report.
+        Transport::Connected { .. } => {
+            PeerReachability::Connected(crate::route::RouteKind::Direct)
+        }
         Transport::Unreachable { category, .. } => {
             PeerReachability::Unreachable(map_transport_category(category))
         }
@@ -2699,6 +2729,7 @@ mod tests {
             Some([7; 32]),
             &initial_groups,
             &initial_groups,
+            false,
             &std::sync::Mutex::new(HashMap::new()),
         );
         assert!(session.shares_group("group-2"));
@@ -2713,6 +2744,7 @@ mod tests {
             None,
             &demoted_groups,
             &HashSet::new(),
+            false,
             &std::sync::Mutex::new(HashMap::new()),
         );
 
@@ -2724,6 +2756,57 @@ mod tests {
         assert!(!state.peer_group_is_full_replica("device-b", "group-2"));
         assert_eq!(state.peer_signing_key("device-b"), None);
         assert!(state.membership_generation() > generation_before);
+    }
+
+    /// M3 Pass 4: `RelayCapability` and full-replica status are two
+    /// independent axes on the SAME device -- see `crate::route`'s own
+    /// doc comment for the `Durability != Connectivity` invariant this
+    /// pins. Neither combination may be inferred from the other:
+    /// full-replica-but-not-relay-capable and relay-capable-but-not-
+    /// full-replica must both be representable and correctly reported.
+    #[tokio::test]
+    async fn relay_capability_and_full_replica_status_are_independent() {
+        let state = test_state();
+        let groups = HashSet::from(["group-1".to_string()]);
+
+        // device-b: full replica, NOT relay-capable.
+        apply_authoritative_peer_metadata(
+            &state,
+            "device-b",
+            None,
+            &groups,
+            &groups,
+            false,
+            &std::sync::Mutex::new(HashMap::new()),
+        );
+        assert!(state.peer_group_is_full_replica("device-b", "group-1"));
+        assert_eq!(
+            state.peer_relay_capability("device-b"),
+            crate::route::RelayCapability::Disabled
+        );
+
+        // device-c: relay-capable, NOT full replica.
+        apply_authoritative_peer_metadata(
+            &state,
+            "device-c",
+            None,
+            &groups,
+            &HashSet::new(),
+            true,
+            &std::sync::Mutex::new(HashMap::new()),
+        );
+        assert!(!state.peer_group_is_full_replica("device-c", "group-1"));
+        assert_eq!(
+            state.peer_relay_capability("device-c"),
+            crate::route::RelayCapability::Capable
+        );
+
+        // Neither device's OTHER axis moved.
+        assert!(!state.peer_group_is_full_replica("device-c", "group-1"));
+        assert_eq!(
+            state.peer_relay_capability("device-b"),
+            crate::route::RelayCapability::Disabled
+        );
     }
 
     #[test]
@@ -2848,7 +2931,7 @@ mod tests {
             assert!(!reachability.is_connected());
         }
 
-        set_reachability(&state, "device-b", PeerReachability::Connected);
+        set_reachability(&state, "device-b", PeerReachability::Connected(crate::route::RouteKind::Direct));
         {
             let reachability = state.peers.reachability("device-b").unwrap();
             assert!(reachability.is_connected());
@@ -2880,7 +2963,7 @@ mod tests {
         let session = fake_session(&state, channel.clone());
 
         mark_connecting(&state, "device-b");
-        set_reachability(&state, "device-b", PeerReachability::Connected);
+        set_reachability(&state, "device-b", PeerReachability::Connected(crate::route::RouteKind::Direct));
         state.peers.register_session("device-b".into(), session.clone());
 
         let poller =
@@ -2943,7 +3026,7 @@ mod tests {
     ) -> Arc<PeerChannel> {
         let channel = fake_channel().await;
         let session = fake_session_for(state, channel.clone(), peer_device_id, shared_group_ids);
-        set_reachability(state, peer_device_id, PeerReachability::Connected);
+        set_reachability(state, peer_device_id, PeerReachability::Connected(crate::route::RouteKind::Direct));
         state.peers.register_session(peer_device_id.to_string(), session);
         diff_state
             .channels
@@ -3093,7 +3176,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert("device-b".to_string(), handle);
-        set_reachability(&state, "device-b", PeerReachability::Connected);
+        set_reachability(&state, "device-b", PeerReachability::Connected(crate::route::RouteKind::Direct));
 
         teardown_peer(&state, &diff_state, "device-b");
 
@@ -3444,6 +3527,7 @@ mod tests {
             Some([7; 32]),
             &HashSet::from(["group-1".to_string()]),
             &HashSet::from(["group-1".to_string()]),
+            false,
             &std::sync::Mutex::new(HashMap::new()),
         );
         let handle = tokio::spawn(std::future::pending::<()>());

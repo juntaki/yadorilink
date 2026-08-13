@@ -114,7 +114,7 @@ impl RuntimeStatusQueryService {
             .into_iter()
             .map(|snapshot| {
                 let mut reachability = snapshot.reachability;
-                if reachability == PeerReachability::Connected && snapshot.protocol_incompatible {
+                if reachability.is_connected() && snapshot.protocol_incompatible {
                     reachability = PeerReachability::ProtocolIncompatible;
                 }
                 PeerStatusView { device_id: snapshot.device_id, reachability }

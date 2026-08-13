@@ -44,16 +44,20 @@ impl UnreachableCategory {
 }
 
 /// A peer's live connectivity as tracked by the daemon and reported to the
-/// CLI and desktop app. There is no operator-run relay: a peer is either
-/// being connected, connected over a confirmed direct path, or cannot be
-/// connected at all (with the reason it can't).
+/// CLI and desktop app. There is no operator-run RELAY -- a peer is
+/// either being connected, connected (directly, or -- from M3 Pass 4
+/// onward -- via another peer that is relaying for it), or cannot be
+/// connected at all (with the reason it can't). See `crate::route`'s own
+/// doc comment for the `Durability != Connectivity` invariant this extends
+/// without weakening.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerReachability {
     /// Candidate paths are still being raced; not yet connected, but not
     /// yet given up on either.
     Connecting,
-    /// A direct path to the peer is confirmed and in use.
-    Connected,
+    /// A path to the peer is confirmed and in use -- see `RouteKind` for
+    /// which kind.
+    Connected(crate::route::RouteKind),
     /// Transport is up, but sync protocol negotiation completed without the
     /// mandatory change-DAG capability.
     ProtocolIncompatible,
@@ -63,16 +67,27 @@ pub enum PeerReachability {
 
 impl PeerReachability {
     pub fn is_connected(self) -> bool {
-        matches!(self, PeerReachability::Connected)
+        matches!(self, PeerReachability::Connected(_))
     }
 
     /// Stable wire/status slug: "connecting" | "connected" | "unreachable".
+    /// Deliberately does NOT distinguish `RouteKind` -- unchanged from
+    /// before this pass, so no existing wire/CLI consumer's output shifts;
+    /// see `route_str` for that.
     pub fn as_str(self) -> &'static str {
         match self {
             PeerReachability::Connecting => "connecting",
-            PeerReachability::Connected => "connected",
+            PeerReachability::Connected(_) => "connected",
             PeerReachability::ProtocolIncompatible => "protocol_incompatible",
             PeerReachability::Unreachable(_) => "unreachable",
+        }
+    }
+
+    /// The route slug ("direct" | "relay") when connected, otherwise empty.
+    pub fn route_str(self) -> &'static str {
+        match self {
+            PeerReachability::Connected(route) => route.as_str(),
+            _ => "",
         }
     }
 

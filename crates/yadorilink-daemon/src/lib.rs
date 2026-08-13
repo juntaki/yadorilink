@@ -55,6 +55,7 @@ pub mod reporting;
 pub mod reporting_ipc;
 pub mod reporting_retry;
 pub mod root_commit_authority;
+pub mod route;
 pub mod runtime_telemetry;
 pub mod sync_runtime;
 // Exclusive OS locks on the block-store root and sync-state database. Not built

@@ -89,7 +89,7 @@ mod tests {
     #[tokio::test]
     async fn reflects_live_state_active_peers_transfers_bytes_and_errors() {
         let state = test_state();
-        state.peers.set_reachability("peer-a".to_string(), PeerReachability::Connected);
+        state.peers.set_reachability("peer-a".to_string(), PeerReachability::Connected(crate::route::RouteKind::Direct));
         state.peers.set_reachability(
             "peer-b".to_string(),
             PeerReachability::Unreachable(UnreachableCategory::NoResponse),
@@ -115,7 +115,7 @@ mod tests {
         let state = test_state();
         state
             .peers
-            .set_reachability("peer-secret-device-id".to_string(), PeerReachability::Connected);
+            .set_reachability("peer-secret-device-id".to_string(), PeerReachability::Connected(crate::route::RouteKind::Direct));
         let _guard =
             state.telemetry.begin_transfer("group-1", "/Users/alice/secret-plans.docx", 1000, 10);
         state.telemetry.record_transfer_block_done(

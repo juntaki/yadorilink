@@ -39,6 +39,9 @@ struct DeviceInfo {
     endpoint: String,
     groups: HashSet<String>,
     full_replica_groups: HashSet<String>,
+    /// M3 Pass 4: device-scoped (not group-scoped, unlike
+    /// `full_replica_groups`) -- see `crate::route::RelayCapability`.
+    relay_capable: bool,
 }
 
 #[derive(Default)]
@@ -127,6 +130,7 @@ impl FakeCoordination {
             endpoint,
             groups: groups.iter().map(|g| g.to_string()).collect(),
             full_replica_groups: HashSet::new(),
+            relay_capable: false,
         };
         self.inner.lock().unwrap().devices.insert(device_id.to_string(), info);
         self.push();
@@ -143,6 +147,21 @@ impl FakeCoordination {
                 } else {
                     dev.full_replica_groups.remove(group_id);
                 }
+            }
+        }
+        self.push();
+    }
+
+    /// M3 Pass 4: declares (or clears) a device's own relay capability --
+    /// mirrored onto peers' `relayCapable`. Deliberately independent of
+    /// `set_full_replica`: never coupled, never inferred from one another
+    /// (see `crate::route`'s own doc comment).
+    #[allow(dead_code)]
+    pub fn set_relay_capable(&self, device_id: &str, relay_capable: bool) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(dev) = inner.devices.get_mut(device_id) {
+                dev.relay_capable = relay_capable;
             }
         }
         self.push();
@@ -210,6 +229,7 @@ fn netmap_frame_for(inner: &mut Inner, subscriber_id: &str) -> String {
             "endpoints": [ { "address": dev.endpoint } ],
             "sharedGroupIds": shared,
             "fullReplicaGroupIds": full_replica,
+            "relayCapable": dev.relay_capable,
         }));
     }
     inner.snapshot_generation += 1;
