@@ -1412,8 +1412,12 @@ impl OverallState {
 /// Otherwise any conflict, held file, a `"low"` volume, a disconnected
 /// peer, a link whose `durability_status` cannot currently be confirmed
 /// (`UNKNOWN`/`UNSPECIFIED`) or whose `fetch_availability` is
-/// `UNAVAILABLE_NOW`, a non-empty recent-error feed, or a recorded update
-/// failure -> `Attention`. A merely-`paused` link is *not* by itself
+/// `UNAVAILABLE_NOW`/`UNKNOWN`/`UNSPECIFIED` (an unconfirmed fetch
+/// availability must never silently read as `AVAILABLE_NOW` any more than
+/// an unconfirmed durability status may silently read as `PROTECTED` --
+/// same fail-safe discipline, applied to both M4 axes uniformly), a
+/// non-empty recent-error feed, or a recorded update failure ->
+/// `Attention`. A merely-`paused` link is *not* by itself
 /// attention-worthy (spec's "Sync is healthy" scenario: "caught up or idle
 /// *without errors*" says nothing about pause being an error state --
 /// pausing is a deliberate user action, matching `status.rs`'s own
@@ -1446,8 +1450,14 @@ fn overall_status(response: &StatusResponse) -> (OverallState, Vec<String>) {
             }
             GroupDurabilityStatus::Protected | GroupDurabilityStatus::Protecting => {}
         }
-        if link.fetch_availability() == FetchAvailability::UnavailableNow {
-            attention_reasons.push(format!("fetch_unavailable:{}", link.group_id));
+        match link.fetch_availability() {
+            FetchAvailability::UnavailableNow => {
+                attention_reasons.push(format!("fetch_unavailable:{}", link.group_id));
+            }
+            FetchAvailability::Unknown | FetchAvailability::Unspecified => {
+                attention_reasons.push(format!("fetch_availability_unknown:{}", link.group_id));
+            }
+            FetchAvailability::AvailableNow => {}
         }
         if link.conflict_count > 0 {
             attention_reasons.push(format!("conflict:{}", link.group_id));
@@ -1605,6 +1615,30 @@ mod overall_status_tests {
         let (state, reasons) = overall_status(&response);
         assert_eq!(state, OverallState::Attention);
         assert_eq!(reasons, vec!["fetch_unavailable:group-1".to_string()]);
+    }
+
+    /// A link that is durably `Protected` but whose `fetch_availability`
+    /// cannot currently be confirmed (`Unknown`, or `Unspecified` from an
+    /// older daemon) is `Attention`, never silently `Healthy` -- an
+    /// unconfirmed fetch availability must fail closed exactly like an
+    /// unconfirmed durability status does (an M4 Pass 7 independent
+    /// review follow-up finding: an earlier version of this fold-in only
+    /// checked `UnavailableNow`, so `Unknown`/`Unspecified` fetch
+    /// availability paired with `Protected` durability silently read as
+    /// fully `Healthy`).
+    #[test]
+    fn unknown_fetch_availability_with_protected_durability_is_attention() {
+        let response = StatusResponse {
+            links: vec![LinkStatus {
+                fetch_availability: yadorilink_ipc_proto::daemonctl::FetchAvailability::Unknown
+                    as i32,
+                ..protected_link("group-1")
+            }],
+            ..Default::default()
+        };
+        let (state, reasons) = overall_status(&response);
+        assert_eq!(state, OverallState::Attention);
+        assert_eq!(reasons, vec!["fetch_availability_unknown:group-1".to_string()]);
     }
 
     /// spec "Sync needs attention": a `"low"` volume needs attention; a
