@@ -303,3 +303,176 @@ async fn n_restart_never_shows_a_stale_protected_status() {
     // find something in `take_and_shutdown` for N, closing finding #2.
     handles.shutdown();
 }
+
+/// M5-A Pass 5 regression-matrix item B/C (restart of a NON-anchor node):
+/// the canonical topology is a full mesh (N<->M, N<->W, M<->W all
+/// connected, `stand_up_canonical_topology`'s own wait proves this), so
+/// restarting M or W -- unlike N, which is the lone full-replica/relay
+/// anchor and has its own dedicated durability-status test above -- must
+/// be observed from BOTH of the other two nodes at once, not just one.
+/// Proves the same session-identity-first lifecycle N's own restart test
+/// proves (fresh `Arc<PeerSyncSession>` on every remaining peer before
+/// trusting negotiation flags), plus real bidirectional content
+/// convergence: the restarted node's own pre-restart authorship must
+/// still be held by its peers, and its post-restart authorship must
+/// reach them again over the fresh session. Does not repeat the
+/// N-restart test's `group_durability_status` assertions -- that
+/// machinery is evaluated from the full-replica anchor's perspective
+/// (N), which does not restart in this scenario, so there is nothing new
+/// to prove there; "stale evidence must not survive a restart" is
+/// already covered once, structurally, by the N-restart test above.
+async fn on_demand_node_restart_recovers_and_resyncs(restart_w: bool) {
+    init_tracing();
+    support::ensure_isolated_config_dir();
+    let fake = FakeCoordination::start().await;
+    fake.enable_signed_policy();
+    let group_id = "topology-restart-group";
+
+    let (n, mut m, mut w, mut handles) = stand_up_canonical_topology(&fake, group_id).await;
+    let label = if restart_w { "W" } else { "M" };
+
+    // The restarting node authors the baseline file; BOTH other nodes
+    // must converge on it before restart (Eager N via a direct read; the
+    // other On-Demand node via `hydration::hydrate`, exactly like the
+    // N-restart test's own established pattern for an On-Demand reader).
+    let before_name = format!("before-restart-{label}.txt");
+    {
+        let author_root = if restart_w { w.root.path() } else { m.root.path() };
+        std::fs::write(author_root.join(&before_name), b"before restart").unwrap();
+    }
+    wait_until_with_context(
+        || {
+            std::fs::read(n.root.path().join(&before_name)).ok().as_deref()
+                == Some(b"before restart" as &[u8])
+        },
+        Duration::from_secs(30),
+        || format!("N never converged on {label}'s pre-restart content"),
+    )
+    .await;
+    let bystander_hydrate_before = if restart_w { &m.state } else { &w.state };
+    wait_until_with_context(
+        || {
+            bystander_hydrate_before
+                .replica_coordinator
+                .file_index_repository()
+                .list_files(group_id)
+                .map(|files| files.iter().any(|f| f.path == before_name && !f.deleted))
+                .unwrap_or(false)
+        },
+        Duration::from_secs(30),
+        || format!("the bystander On-Demand peer never saw {label}'s pre-restart DAG record"),
+    )
+    .await;
+    yadorilink_daemon::hydration::hydrate(bystander_hydrate_before, group_id, &before_name)
+        .await
+        .expect("bystander hydration of the pre-restart baseline should succeed");
+
+    let restart_device_id = if restart_w { w.device_id.clone() } else { m.device_id.clone() };
+    let n_session_before: Arc<PeerSyncSession> =
+        n.state.peers.session(&restart_device_id).unwrap_or_else(|| {
+            panic!("N must have an established session with {label} before restart")
+        });
+    let bystander_state_before = if restart_w { &m.state } else { &w.state };
+    let bystander_session_before: Arc<PeerSyncSession> =
+        bystander_state_before.peers.session(&restart_device_id).unwrap_or_else(|| {
+            panic!(
+                "the bystander peer must have an established session with {label} before restart"
+            )
+        });
+
+    // Restart the target node exactly like the N-restart test does:
+    // tear down ONLY its own orchestrator runtime, reopen it against the
+    // same on-disk state, re-register, and re-spawn a fresh orchestrator
+    // tracked back into `handles`.
+    if restart_w {
+        handles.take_and_shutdown(&w.device_id).await;
+        w = restart_node(w).await;
+        register_with_fake(&fake, &w.state, &w.device_id, w.keypair.public_bytes(), &[group_id])
+            .await;
+        let runtime = support::topology::spawn_orchestrator(fake.addr(), &w);
+        handles.insert(w.device_id.clone(), runtime);
+    } else {
+        handles.take_and_shutdown(&m.device_id).await;
+        m = restart_node(m).await;
+        register_with_fake(&fake, &m.state, &m.device_id, m.keypair.public_bytes(), &[group_id])
+            .await;
+        let runtime = support::topology::spawn_orchestrator(fake.addr(), &m);
+        handles.insert(m.device_id.clone(), runtime);
+    }
+    tracing::info!(label, "TEST: restarted node's orchestrator re-spawned and re-registered");
+
+    let bystander_state_after = if restart_w { &m.state } else { &w.state };
+    wait_until_with_context(
+        || {
+            let n_replaced = n
+                .state
+                .peers
+                .session(&restart_device_id)
+                .is_some_and(|s| !Arc::ptr_eq(&s, &n_session_before));
+            let bystander_replaced = bystander_state_after
+                .peers
+                .session(&restart_device_id)
+                .is_some_and(|s| !Arc::ptr_eq(&s, &bystander_session_before));
+            n_replaced && bystander_replaced
+        },
+        Duration::from_secs(180),
+        || format!("N and/or the bystander peer never got a FRESH session identity for {label}"),
+    )
+    .await;
+    wait_until_with_context(
+        || {
+            fully_connected(&n.state, &restart_device_id)
+                && fully_connected(bystander_state_after, &restart_device_id)
+        },
+        Duration::from_secs(60),
+        || format!("fresh sessions with restarted {label} never completed negotiation"),
+    )
+    .await;
+    tracing::info!(label, "TEST: fresh sessions with restarted node negotiated");
+
+    // Real post-restart traffic authored BY the restarted node, over the
+    // fresh session, must reach BOTH other nodes again.
+    let after_name = format!("after-restart-{label}.txt");
+    let content = format!("content authored after {label}'s restart");
+    {
+        let author_root = if restart_w { w.root.path() } else { m.root.path() };
+        std::fs::write(author_root.join(&after_name), content.as_bytes()).unwrap();
+    }
+    wait_until_with_context(
+        || {
+            std::fs::read(n.root.path().join(&after_name)).ok().as_deref()
+                == Some(content.as_bytes())
+        },
+        Duration::from_secs(90),
+        || format!("N never converged on {label}'s post-restart content over the fresh session"),
+    )
+    .await;
+    wait_until_with_context(
+        || {
+            bystander_state_after
+                .replica_coordinator
+                .file_index_repository()
+                .list_files(group_id)
+                .map(|files| files.iter().any(|f| f.path == after_name && !f.deleted))
+                .unwrap_or(false)
+        },
+        Duration::from_secs(90),
+        || format!("bystander peer never saw {label}'s post-restart DAG record"),
+    )
+    .await;
+    yadorilink_daemon::hydration::hydrate(bystander_state_after, group_id, &after_name)
+        .await
+        .expect("bystander hydration of the post-restart content should succeed");
+
+    handles.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn m_restart_recovers_and_resyncs_with_both_peers() {
+    on_demand_node_restart_recovers_and_resyncs(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn w_restart_recovers_and_resyncs_with_both_peers() {
+    on_demand_node_restart_recovers_and_resyncs(true).await;
+}
