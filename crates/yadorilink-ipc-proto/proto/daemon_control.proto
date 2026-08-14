@@ -132,6 +132,13 @@ message LinkStatus {
   // field, which a client should treat the same as
   // `FETCH_AVAILABILITY_UNKNOWN` rather than assume content is available.
   FetchAvailability fetch_availability = 31;
+  // M4 Pass 3: device ids of every OTHER device currently recorded
+  // (netmap-derived, content-blind) as an authorized-writer full replica
+  // for this group -- feeds the "Complete copies" per-device list.
+  // Cross-reference against `StatusResponse.peers`'s own `reachability`
+  // for each device's current availability; this field alone says
+  // nothing about whether any of them are online.
+  repeated string full_replica_device_ids = 32;
 }
 
 // See `LinkStatus.local_storage_state`'s own doc comment.
@@ -300,6 +307,40 @@ message PeerStatus {
   // `PEER_REACHABILITY_UNREACHABLE`; `UNREACHABLE_CATEGORY_UNSPECIFIED`
   // otherwise.
   UnreachableCategory unreachable_category = 6;
+  // M4 Pass 3: which kind of path `reachability == PEER_REACHABILITY_
+  // CONNECTED` is over -- `ROUTE_KIND_UNSPECIFIED` whenever `reachability`
+  // is anything other than `CONNECTED` (there is no path to classify).
+  // This is the wire contract gap a prior M3 pass's own comment flagged
+  // ("Pass 6 is the right place to extend this... once a route other than
+  // Direct can actually occur") and never filled in once relay routes
+  // actually shipped -- a client could not previously distinguish a
+  // direct connection from a relayed one at all.
+  RouteKind route_kind = 7;
+  // M4 Pass 3: whether THIS peer has declared itself able to act as a
+  // relay for OTHER peers' traffic -- a device-level self-declared
+  // capability (`crate::route::RelayCapability`), independent of
+  // `route_kind` above (which describes THIS device's own connection TO
+  // this peer) and independent of the peer's storage role. Per the
+  // `Durability != Connectivity` invariant, this must never be read as
+  // implying anything about whether the peer durably holds any group's
+  // data.
+  RelayCapability relay_capability = 8;
+}
+
+// See `PeerStatus.route_kind`'s own doc comment, mirroring
+// `yadorilink_daemon::route::RouteKind`.
+enum RouteKind {
+  ROUTE_KIND_UNSPECIFIED = 0;
+  ROUTE_KIND_DIRECT = 1;
+  ROUTE_KIND_RELAY = 2;
+}
+
+// See `PeerStatus.relay_capability`'s own doc comment, mirroring
+// `yadorilink_daemon::route::RelayCapability`.
+enum RelayCapability {
+  RELAY_CAPABILITY_UNSPECIFIED = 0;
+  RELAY_CAPABILITY_CAPABLE = 1;
+  RELAY_CAPABILITY_DISABLED = 2;
 }
 
 // Which side of the crash-safe create/join enrollment protocol a

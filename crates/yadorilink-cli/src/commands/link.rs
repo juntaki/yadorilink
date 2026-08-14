@@ -407,6 +407,7 @@ mod tests {
             ambiguous_local_paths: Vec::new(),
             local_storage_state: LocalStorageState::FullCopy as i32,
             fetch_availability: FetchAvailability::AvailableNow as i32,
+            full_replica_device_ids: Vec::new(),
         }
     }
 

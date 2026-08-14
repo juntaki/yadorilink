@@ -177,6 +177,7 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
                 local_storage_state,
                 fetch_availability,
                 ambiguous_local_paths,
+                full_replica_device_ids: state.full_replica_devices_for_group(&link.group_id),
             });
         }
         Ok(out)

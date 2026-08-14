@@ -129,6 +129,13 @@ pub(crate) struct LinkStatusView {
     /// entry means the group is linked twice and refusing to sync -- the
     /// invariant this reports on.
     pub(crate) ambiguous_local_paths: Vec<String>,
+    /// M4 Pass 3: device ids of every OTHER device currently recorded
+    /// (netmap-derived, content-blind) as an authorized-writer full
+    /// replica for this group -- feeds the user-facing "Complete copies"
+    /// per-device list. Cross-reference against `StatusResponse.peers`'s
+    /// own `reachability` for each device's current availability; this
+    /// list alone says nothing about whether any of them are online.
+    pub(crate) full_replica_device_ids: Vec<String>,
 }
 
 pub(crate) trait LinkStatusReadPort: Send + Sync {
