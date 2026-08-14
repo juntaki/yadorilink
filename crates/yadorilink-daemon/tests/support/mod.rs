@@ -27,6 +27,7 @@ use yadorilink_peer_session::peer_session::{PeerSyncSession, PeerSyncSessionDeps
 use yadorilink_transport::{public_key_from_bytes, PeerChannel, TransportHub};
 
 pub mod fake_coordination;
+pub mod topology;
 
 use fake_coordination::FakeCoordination;
 
