@@ -250,8 +250,11 @@ mod tests {
                 &permit,
             )
             .unwrap();
-        let target =
-            if hydrated { MaterializationState::Hydrated } else { MaterializationState::Placeholder };
+        let target = if hydrated {
+            MaterializationState::Hydrated
+        } else {
+            MaterializationState::Placeholder
+        };
         state
             .replica_coordinator
             .materialization_state_repository()
@@ -637,7 +640,9 @@ mod m4_acceptance_matrix {
         );
         assert_eq!(
             state.peers.reachability("nas"),
-            Some(crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Direct)),
+            Some(crate::peer_registry::PeerReachability::Connected(
+                crate::route::RouteKind::Direct
+            )),
             "sanity check: this is genuinely a direct route"
         );
         let digest = real_digest(&state);
@@ -1020,7 +1025,11 @@ mod m4_acceptance_matrix {
             "sanity check: relay capability is genuinely disabled"
         );
         let views = reader_for(state).list_links().unwrap();
-        assert_eq!(views[0].durability_status, GroupDurabilityStatus::Protected, "J: still Protected");
+        assert_eq!(
+            views[0].durability_status,
+            GroupDurabilityStatus::Protected,
+            "J: still Protected"
+        );
         assert_eq!(
             views[0].full_replica_device_ids,
             vec!["nas".to_string()],

@@ -62,7 +62,8 @@ fn complete_copies_detail_lines(link: &LinkStatus, peers: &[PeerStatus]) -> Vec<
     link.full_replica_device_ids
         .iter()
         .map(|device_id| {
-            let reachability = peers.iter().find(|p| &p.device_id == device_id).map(|p| p.reachability());
+            let reachability =
+                peers.iter().find(|p| &p.device_id == device_id).map(|p| p.reachability());
             let state = match reachability {
                 Some(PeerReachability::Connected) => "available",
                 Some(PeerReachability::Unreachable) => "offline",
@@ -646,9 +647,11 @@ mod tests {
     fn indeterminate_reachability_states_read_unknown() {
         let mut link = base_link();
         link.full_replica_device_ids = vec!["nas-1".into()];
-        for state in
-            [PeerReachability::Connecting, PeerReachability::ProtocolIncompatible, PeerReachability::Unspecified]
-        {
+        for state in [
+            PeerReachability::Connecting,
+            PeerReachability::ProtocolIncompatible,
+            PeerReachability::Unspecified,
+        ] {
             let mut peer = base_peer();
             peer.device_id = "nas-1".into();
             peer.reachability = state as i32;

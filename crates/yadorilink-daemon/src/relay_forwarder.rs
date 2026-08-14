@@ -332,7 +332,8 @@ impl RelayForwarder {
     /// idle/expiry). For a wire-triggered `RelayClose`, use `close_
     /// session_as` instead, which verifies ownership first.
     pub fn close_session(&self, session_id: u64, reason: &str) {
-        if let Some(handle) = self.sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&session_id)
+        if let Some(handle) =
+            self.sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&session_id)
         {
             let _ = handle.close_tx.send(Some(reason.to_string()));
         }
@@ -499,7 +500,10 @@ mod tests {
 
     impl RecordingSink {
         fn new() -> Arc<Self> {
-            Arc::new(Self { data: StdSyncMutex::new(Vec::new()), closed: StdSyncMutex::new(Vec::new()) })
+            Arc::new(Self {
+                data: StdSyncMutex::new(Vec::new()),
+                closed: StdSyncMutex::new(Vec::new()),
+            })
         }
     }
 
@@ -567,8 +571,7 @@ mod tests {
         // it sends its own genuinely raw WireGuard reply, unwrapped
         // (see `relay_failover.rs`'s own real-WireGuard-peer tests in
         // `yadorilink-transport` for that side).
-        let expected =
-            yadorilink_transport::wrap_relay_envelope(session_id, b"hello from A");
+        let expected = yadorilink_transport::wrap_relay_envelope(session_id, b"hello from A");
         let data = sink.data.lock().unwrap().clone();
         assert_eq!(data, vec![(session_id, expected)]);
     }
@@ -581,7 +584,14 @@ mod tests {
         let now = now_unix_seconds();
 
         let session_id = forwarder
-            .open_session(OWNER.to_string(), dest_addr, None, now + 60, now_unix_millis(), sink.clone())
+            .open_session(
+                OWNER.to_string(),
+                dest_addr,
+                None,
+                now + 60,
+                now_unix_millis(),
+                sink.clone(),
+            )
             .unwrap();
         forwarder.close_session(session_id, "requester_closed");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -599,7 +609,14 @@ mod tests {
         let now = now_unix_seconds();
 
         let session_id = forwarder
-            .open_session(OWNER.to_string(), dest_addr, Some(4), now + 60, now_unix_millis(), sink.clone())
+            .open_session(
+                OWNER.to_string(),
+                dest_addr,
+                Some(4),
+                now + 60,
+                now_unix_millis(),
+                sink.clone(),
+            )
             .unwrap();
 
         let result = forwarder
@@ -654,7 +671,14 @@ mod tests {
         let sink = RecordingSink::new();
         let now = now_unix_seconds();
         let session_id = forwarder
-            .open_session(OWNER.to_string(), dest_addr, None, now + 60, now_unix_millis(), sink.clone())
+            .open_session(
+                OWNER.to_string(),
+                dest_addr,
+                None,
+                now + 60,
+                now_unix_millis(),
+                sink.clone(),
+            )
             .unwrap();
 
         let result = forwarder
@@ -662,10 +686,7 @@ mod tests {
             .await;
         assert_eq!(
             result,
-            Err(RelayForwarderError::OwnerMismatch {
-                session_id,
-                presented: IMPOSTER.to_string()
-            })
+            Err(RelayForwarderError::OwnerMismatch { session_id, presented: IMPOSTER.to_string() })
         );
         // Nothing was sent, and the session is still alive for its real owner.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -681,16 +702,20 @@ mod tests {
         let sink = RecordingSink::new();
         let now = now_unix_seconds();
         let session_id = forwarder
-            .open_session(OWNER.to_string(), dest_addr, None, now + 60, now_unix_millis(), sink.clone())
+            .open_session(
+                OWNER.to_string(),
+                dest_addr,
+                None,
+                now + 60,
+                now_unix_millis(),
+                sink.clone(),
+            )
             .unwrap();
 
         let result = forwarder.close_session_as(session_id, IMPOSTER, "hostile_close");
         assert_eq!(
             result,
-            Err(RelayForwarderError::OwnerMismatch {
-                session_id,
-                presented: IMPOSTER.to_string()
-            })
+            Err(RelayForwarderError::OwnerMismatch { session_id, presented: IMPOSTER.to_string() })
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(forwarder.active_session_count(), 1, "session must still be open");
@@ -712,7 +737,14 @@ mod tests {
         let sink = RecordingSink::new();
         let now = now_unix_seconds();
         let session_id = forwarder
-            .open_session(OWNER.to_string(), dest_addr, None, now + 60, now_unix_millis(), sink.clone())
+            .open_session(
+                OWNER.to_string(),
+                dest_addr,
+                None,
+                now + 60,
+                now_unix_millis(),
+                sink.clone(),
+            )
             .unwrap();
 
         // Trigger the destination to learn the relay's ephemeral source

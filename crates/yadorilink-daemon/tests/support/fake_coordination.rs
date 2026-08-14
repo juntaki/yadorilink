@@ -225,7 +225,8 @@ impl FakeCoordination {
         let (relay_device_id, group_id) = candidate?;
         let issued_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
         let now = issued_at.as_secs() as i64;
-        let grant_id = format!("grant-{source_device_id}-{destination_device_id}-{}", issued_at.as_nanos());
+        let grant_id =
+            format!("grant-{source_device_id}-{destination_device_id}-{}", issued_at.as_nanos());
         let grant = yadorilink_daemon::relay_grant::RelayGrant {
             version: 1,
             grant_id,

@@ -34,9 +34,7 @@ pub fn data_protection_label(link: &LinkStatus) -> &'static str {
         GroupDurabilityStatus::Protected => "Protected",
         GroupDurabilityStatus::Protecting => "Protecting",
         GroupDurabilityStatus::AtRisk => "At risk",
-        GroupDurabilityStatus::Unknown | GroupDurabilityStatus::Unspecified => {
-            "Status unavailable"
-        }
+        GroupDurabilityStatus::Unknown | GroupDurabilityStatus::Unspecified => "Status unavailable",
     }
 }
 
@@ -136,7 +134,8 @@ pub fn complete_copies(link: &LinkStatus, peers: &[PeerStatus]) -> Vec<CompleteC
     link.full_replica_device_ids
         .iter()
         .map(|device_id| {
-            let reachability = peers.iter().find(|p| &p.device_id == device_id).map(|p| p.reachability());
+            let reachability =
+                peers.iter().find(|p| &p.device_id == device_id).map(|p| p.reachability());
             let state = match reachability {
                 Some(PeerReachability::Connected) => CompleteCopyState::Available,
                 Some(PeerReachability::Unreachable) => CompleteCopyState::Offline,
@@ -288,8 +287,7 @@ mod tests {
     #[test]
     fn complete_copies_reports_available_offline_unknown() {
         let mut link = base_link();
-        link.full_replica_device_ids =
-            vec!["nas-1".into(), "nas-2".into(), "unseen".into()];
+        link.full_replica_device_ids = vec!["nas-1".into(), "nas-2".into(), "unseen".into()];
         let mut offline_peer = base_peer("nas-2");
         offline_peer.reachability = PeerReachability::Unreachable as i32;
         let peers = vec![base_peer("nas-1"), offline_peer];
@@ -308,7 +306,8 @@ mod tests {
     #[test]
     fn connection_distinguishes_direct_relay_and_unavailable() {
         let mut link = base_link();
-        link.full_replica_device_ids = vec!["direct-nas".into(), "relay-nas".into(), "down-nas".into()];
+        link.full_replica_device_ids =
+            vec!["direct-nas".into(), "relay-nas".into(), "down-nas".into()];
         let mut relay_peer = base_peer("relay-nas");
         relay_peer.route_kind = RouteKind::Relay as i32;
         let mut down_peer = base_peer("down-nas");

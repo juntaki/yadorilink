@@ -206,7 +206,9 @@ impl NetmapDiffState {
             session_tasks: Arc::new(StdMutex::new(HashMap::new())),
             punch_limiter: Arc::new(StdMutex::new(PunchLimiter::new(PunchConfig::default()))),
             desired_peers: Arc::new(StdMutex::new(HashMap::new())),
-            reconnect_semaphore: Arc::new(tokio::sync::Semaphore::new(RECONNECT_HANDSHAKE_CONCURRENCY)),
+            reconnect_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                RECONNECT_HANDSHAKE_CONCURRENCY,
+            )),
         }
     }
 }
@@ -2844,10 +2846,7 @@ mod tests {
             &std::sync::Mutex::new(HashMap::new()),
         );
         assert!(!state.peer_group_is_full_replica("device-c", "group-1"));
-        assert_eq!(
-            state.peer_relay_capability("device-c"),
-            crate::route::RelayCapability::Capable
-        );
+        assert_eq!(state.peer_relay_capability("device-c"), crate::route::RelayCapability::Capable);
 
         // Neither device's OTHER axis moved.
         assert!(!state.peer_group_is_full_replica("device-c", "group-1"));
@@ -2979,7 +2978,11 @@ mod tests {
             assert!(!reachability.is_connected());
         }
 
-        set_reachability(&state, "device-b", PeerReachability::Connected(crate::route::RouteKind::Direct));
+        set_reachability(
+            &state,
+            "device-b",
+            PeerReachability::Connected(crate::route::RouteKind::Direct),
+        );
         {
             let reachability = state.peers.reachability("device-b").unwrap();
             assert!(reachability.is_connected());
@@ -3011,7 +3014,11 @@ mod tests {
         let session = fake_session(&state, channel.clone());
 
         mark_connecting(&state, "device-b");
-        set_reachability(&state, "device-b", PeerReachability::Connected(crate::route::RouteKind::Direct));
+        set_reachability(
+            &state,
+            "device-b",
+            PeerReachability::Connected(crate::route::RouteKind::Direct),
+        );
         state.peers.register_session("device-b".into(), session.clone());
 
         let poller =
@@ -3074,7 +3081,11 @@ mod tests {
     ) -> Arc<PeerChannel> {
         let channel = fake_channel().await;
         let session = fake_session_for(state, channel.clone(), peer_device_id, shared_group_ids);
-        set_reachability(state, peer_device_id, PeerReachability::Connected(crate::route::RouteKind::Direct));
+        set_reachability(
+            state,
+            peer_device_id,
+            PeerReachability::Connected(crate::route::RouteKind::Direct),
+        );
         state.peers.register_session(peer_device_id.to_string(), session);
         diff_state
             .channels
@@ -3224,7 +3235,11 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert("device-b".to_string(), handle);
-        set_reachability(&state, "device-b", PeerReachability::Connected(crate::route::RouteKind::Direct));
+        set_reachability(
+            &state,
+            "device-b",
+            PeerReachability::Connected(crate::route::RouteKind::Direct),
+        );
 
         teardown_peer(&state, &diff_state, "device-b");
 
