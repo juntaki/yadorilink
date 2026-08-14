@@ -3,7 +3,8 @@ use std::io::{BufRead, IsTerminal, Write};
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
-    HandoffResult, LinkRequest, LinkStatus, ListLinksRequest, PendingEnrollmentKind, UnlinkRequest,
+    FetchAvailability, HandoffResult, LinkRequest, LinkStatus, ListLinksRequest, LocalStorageState,
+    PendingEnrollmentKind, UnlinkRequest,
 };
 use yadorilink_local_storage::link_preflight::{self, LinkPreflightReport};
 
@@ -404,6 +405,9 @@ mod tests {
             policy_stale: false,
             ambiguous: false,
             ambiguous_local_paths: Vec::new(),
+            local_storage_state: LocalStorageState::FullCopy as i32,
+            fetch_availability: FetchAvailability::AvailableNow as i32,
+            full_replica_device_ids: Vec::new(),
         }
     }
 

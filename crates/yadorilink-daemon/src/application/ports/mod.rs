@@ -36,7 +36,7 @@ pub(crate) use link_lifecycle::{
     LinkCommand, LinkRepositoryPort, LinkWatcherPort, PendingEnrollmentLinkCommand,
 };
 #[allow(unused_imports)]
-pub(crate) use materialization::MaterializationPort;
+pub(crate) use materialization::{EvictOutcome, MaterializationPort};
 #[allow(unused_imports)]
 pub(crate) use membership::{
     HandoffTicketPort, MembershipCoordination, MembershipRepository, ReplicaReadinessPort,

@@ -54,7 +54,7 @@ IDs are the stable source of truth; file line numbers are intentionally omitted.
 ## DL-7: Forced Durability Unknown Survives Restart
 
 - Target state: every group whose last-holder safety gate was bypassed with force.
-- Destructive operations: daemon restart or a status recomputation that would otherwise report `Healthy`.
+- Destructive operations: daemon restart or a status recomputation that would otherwise report `Protected`.
 - Enforcement symbol: `SyncState::latch_group_durability_unknown`, `DaemonState::group_durability_status`, and `DaemonState::clear_group_durability_latch`.
 - Test IDs: `forced_durability_unknown_latch_survives_daemon_restart`, `forced_unlink_latches_group_durability_unknown`.
 - Runtime diagnosis: `yadorilink status` displays `durability unknown`; persistent table `durability_unknown_latches` records the group until positive whole-group re-confirmation.

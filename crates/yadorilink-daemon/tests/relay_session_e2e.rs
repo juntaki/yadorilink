@@ -508,10 +508,8 @@ async fn relay_open_is_refused_when_the_relay_never_declared_capability() {
     // admission check under test here, not the fake's own candidate
     // search.
     let signing_key = fake.policy_signing_key().expect("signed policy must be enabled");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+        as i64;
     let grant = yadorilink_daemon::relay_grant::sign_relay_grant(
         yadorilink_daemon::relay_grant::RelayGrant {
             version: 1,

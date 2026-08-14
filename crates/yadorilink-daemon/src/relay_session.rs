@@ -373,7 +373,10 @@ mod tests {
         let mut ctx = valid_ctx(&pk, now);
         ctx.relay_capability = RelayCapability::Disabled;
         let guard = RelayReplayGuard::new();
-        assert_eq!(admit_relay_open(&grant, &ctx, &guard), Err(RelayAdmissionError::RelayNotCapable));
+        assert_eq!(
+            admit_relay_open(&grant, &ctx, &guard),
+            Err(RelayAdmissionError::RelayNotCapable)
+        );
     }
 
     /// 12. B has no direct route to C -> RelayOpen reject. Also the core

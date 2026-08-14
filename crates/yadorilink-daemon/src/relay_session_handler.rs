@@ -69,7 +69,8 @@ impl RelaySessionHandler for DaemonState {
             }
 
             let grant_id = open.grant_id.clone();
-            let denied = |grant_id: String| RelayOpenedFrame { grant_id, granted: false, session_id: 0 };
+            let denied =
+                |grant_id: String| RelayOpenedFrame { grant_id, granted: false, session_id: 0 };
 
             let grant = RelayGrant {
                 version: open.version,
@@ -141,7 +142,8 @@ impl RelaySessionHandler for DaemonState {
                     yadorilink_transport::PeerReachability::Connected { .. }
                 ),
                 active_relay_session_count: self.relay_forwarder.active_session_count(),
-                max_concurrent_relay_sessions: crate::relay_forwarder::RELAY_MAX_CONCURRENT_SESSIONS,
+                max_concurrent_relay_sessions:
+                    crate::relay_forwarder::RELAY_MAX_CONCURRENT_SESSIONS,
             };
 
             if let Err(error) = admit_relay_open(&grant, &ctx, &self.relay_replay_guard) {
@@ -202,7 +204,9 @@ impl RelaySessionHandler for DaemonState {
                     .unwrap_or_else(|p| p.into_inner())
                     .clone();
                 if let Some(test_handler) = test_handler {
-                    return test_handler.handle_relay_data(data, authenticated_peer_device_id).await;
+                    return test_handler
+                        .handle_relay_data(data, authenticated_peer_device_id)
+                        .await;
                 }
             }
 

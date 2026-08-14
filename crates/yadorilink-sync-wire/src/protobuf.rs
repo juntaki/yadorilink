@@ -1260,7 +1260,8 @@ mod tests {
     #[test]
     fn relay_opened_round_trips_through_the_wire() {
         let codec = ProtobufPeerWireCodec;
-        let original = RelayOpenedFrame { grant_id: "grant-1".to_string(), granted: true, session_id: 42 };
+        let original =
+            RelayOpenedFrame { grant_id: "grant-1".to_string(), granted: true, session_id: 42 };
 
         let bytes = codec.encode(OutboundFrame::RelayOpened(original.clone())).unwrap();
         let decoded = codec.decode(&bytes).unwrap();

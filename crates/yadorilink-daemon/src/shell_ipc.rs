@@ -164,7 +164,28 @@ async fn handle_message(state: &Arc<DaemonState>, msg: ShellIpcMessage) -> Optio
                     match resolve_group_and_rel_path(&state.replica_coordinator, &req.path) {
                         Some((group_id, rel_path)) => {
                             match hydration::evict(state, &group_id, &rel_path) {
-                                Ok(()) => ContextActionResponse { ok: true, error: String::new() },
+                                // M4 Pass 4: `Ok` alone does not mean the
+                                // file was actually freed -- `evict_file`
+                                // can return `Ok` while leaving it fully
+                                // materialized (pinned, busy, not yet
+                                // `Hydrated`, or changed on disk right
+                                // before the commit). `ok: true` here must
+                                // mean "the action was performed," not
+                                // merely "the request didn't error" -- see
+                                // `EvictOutcome::dehydrated`'s own doc
+                                // comment for the exact prior gap this
+                                // closes (the shell extension used to
+                                // report every non-erroring request as a
+                                // successful eviction).
+                                Ok(outcome) if outcome.dehydrated => {
+                                    ContextActionResponse { ok: true, error: String::new() }
+                                }
+                                Ok(_) => ContextActionResponse {
+                                    ok: false,
+                                    error: "not evicted: the file may be pinned, busy, not fully \
+                                            synced, or was just modified"
+                                        .into(),
+                                },
                                 Err(e) => ContextActionResponse { ok: false, error: e.to_string() },
                             }
                         }
