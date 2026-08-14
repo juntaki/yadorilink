@@ -107,7 +107,7 @@ fn ambiguous_suffix(link: &LinkStatus) -> String {
     )
 }
 
-/// The ` durability unknown`/` durability: known missing` suffix — same
+/// The ` durability unknown`/` durability: at risk` suffix — same
 /// "empty unless applicable" discipline as `degraded_suffix`, but
 /// deliberately the other way around: it renders *nothing extra* only for
 /// the two states that are safe to leave as plain "syncing" text
@@ -123,7 +123,7 @@ fn durability_suffix(link: &LinkStatus) -> String {
         GroupDurabilityStatus::Unknown | GroupDurabilityStatus::Unspecified => {
             "  durability unknown".to_string()
         }
-        GroupDurabilityStatus::AtRisk => "  durability: known missing".to_string(),
+        GroupDurabilityStatus::AtRisk => "  durability: at risk".to_string(),
     }
 }
 
@@ -748,7 +748,7 @@ mod tests {
     fn at_risk_durability_renders_its_own_suffix() {
         let mut link = base_link();
         link.durability_status = GroupDurabilityStatus::AtRisk as i32;
-        assert_eq!(durability_suffix(&link), "  durability: known missing");
+        assert_eq!(durability_suffix(&link), "  durability: at risk");
     }
 
     /// An older daemon that predates this field always sends
