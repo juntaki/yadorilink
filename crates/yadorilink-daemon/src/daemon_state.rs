@@ -4769,6 +4769,74 @@ mod tests {
         );
     }
 
+    /// M4 Pass 5: `custody_confirmation_cache` is purely in-memory
+    /// (`DaemonState`'s own `Mutex<HashMap<...>>` field, never persisted
+    /// to `replica_coordinator`'s DB) -- so a daemon restart, simulated
+    /// here by reopening a REAL on-disk `ReplicaCoordinator` database
+    /// under a SECOND `DaemonState` (genuinely fresh in-process fields,
+    /// same persisted on-disk state -- not merely a second `DaemonState`
+    /// sharing one still-open in-memory connection), must never let a
+    /// group that was `Healthy` under the first process instance keep
+    /// reading `Healthy` under the second before a real post-restart
+    /// confirmation sweep has run. This is the exact invariant Pass 5
+    /// requires ("never flash/retain a stale Protected state solely
+    /// because the last process said Protected") -- and it holds here
+    /// purely as a structural consequence of Pass 1's design (the cache
+    /// simply doesn't exist yet in the new process), not because of any
+    /// restart-specific logic; this test pins that consequence explicitly
+    /// so a future refactor (e.g. persisting the cache for a "faster warm
+    /// start") cannot silently reintroduce a stale-Protected-across-
+    /// restart bug without breaking a named test.
+    ///
+    /// Asserts the EXACT expected state (`DurabilityUnknown`), not merely
+    /// `!= Healthy` -- Pass 5 also forbids manufacturing `KnownMissing`
+    /// (AtRisk) purely from the startup uncertainty window, so a
+    /// regression landing there must fail this test too (M4 Pass 5 Codex
+    /// review follow-up).
+    #[tokio::test]
+    async fn restart_never_shows_a_stale_healthy_status() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("sync.sqlite3");
+
+        // First "process": open the real on-disk DB, confirm the group via
+        // a REAL sweep round (`refresh_custody_confirmation`, not a
+        // manually-planted cache entry) against a genuinely empty group --
+        // `full_replica_handoff_ready` confirms an empty root set
+        // vacuously, without needing a live peer -- and observe Healthy.
+        {
+            let coordinator = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
+            let first = DaemonState::new("device-a".into(), coordinator, store.clone());
+            first
+                .replica_coordinator
+                .link_repository()
+                .add_link(store_dir.path().to_str().unwrap(), "group-1")
+                .unwrap();
+            first.refresh_custody_confirmation("group-1").await;
+            assert_eq!(
+                first.group_durability_status("group-1"),
+                GroupDurabilityStatus::Healthy,
+                "sanity check: the first process instance genuinely observes Healthy after \
+                 a real confirmation sweep"
+            );
+        } // `first` and its `coordinator` are dropped here -- the DB file
+          // itself is all that persists, exactly like a real process exit.
+
+        // "Restart": a second DaemonState reopening the SAME on-disk
+        // database file, with entirely fresh in-memory fields -- exactly
+        // what a real process restart produces.
+        let coordinator = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
+        let second = DaemonState::new("device-a".into(), coordinator, store);
+        assert_eq!(
+            second.group_durability_status("group-1"),
+            GroupDurabilityStatus::DurabilityUnknown,
+            "a fresh process must report DurabilityUnknown (never Healthy, and never \
+             KnownMissing/AtRisk) for a group before its OWN confirmation sweep has run, \
+             even though the prior process instance had just confirmed it"
+        );
+    }
+
     // --- Mandatory handoff-lease digest-match decision (source side) ----
 
     /// The safety property this whole mechanism exists for: a target's
