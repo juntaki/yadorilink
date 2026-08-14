@@ -92,10 +92,23 @@ static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// `attention_reasons` so this file's "healthy" assertions verify the
 /// actual behavior under test (links/peers/volumes) without being flaky
 /// over how far that unrelated startup race happened to get.
+///
+/// The same discipline applies to `durability_unknown:...`: a freshly
+/// linked group's `durability_status` is genuinely `Unknown` (not
+/// `Protected`) until `DurabilityConfirmationJob`'s first periodic sweep
+/// round has actually run for it -- this test harness doesn't wait out
+/// that interval, so the reason is a real, correct reflection of an
+/// unrelated startup race, not a bug in the link/pause behavior under
+/// test here.
 fn attention_reasons_excluding_startup_update_check_race(
     status: &yadorilink_ipc_proto::daemonctl::StatusResponse,
 ) -> Vec<String> {
-    status.attention_reasons.iter().filter(|r| !r.starts_with("update_failed:")).cloned().collect()
+    status
+        .attention_reasons
+        .iter()
+        .filter(|r| !r.starts_with("update_failed:") && !r.starts_with("durability_unknown:"))
+        .cloned()
+        .collect()
 }
 
 async fn fetch_status() -> yadorilink_ipc_proto::daemonctl::StatusResponse {

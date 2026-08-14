@@ -152,7 +152,7 @@ pub(crate) fn start(
     // M4: durability confirmation sweep -- interval-only, same
     // fresh-read-each-tick shape as materialization repair above, so
     // `set_custody_confirmation_sweep_interval` takes effect on the very
-    // next sleep. This is what turns `group_durability_status`'s `Healthy`
+    // next sleep. This is what turns `group_durability_status`'s `Protected`
     // into real peer-confirmed evidence instead of a local-only heuristic
     // -- see `durability_confirmation::DurabilityConfirmationJob`'s own
     // doc comment.

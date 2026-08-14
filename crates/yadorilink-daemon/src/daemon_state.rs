@@ -2210,14 +2210,6 @@ impl DaemonState {
             Ok(_) => Ok(crate::durability_service::MaterializationHealth::Partial),
             Err(_) => Err(()),
         };
-        // Used ONLY to gate a vacuous (no-peer) custody confirmation's
-        // freshness -- see `has_fresh_custody_confirmation`'s own doc
-        // comment. Never used as a `Protected` fact on its own (that's
-        // exactly the conflation this M4 pass fixes).
-        let group_currently_empty = matches!(
-            &counts,
-            Ok(counts) if counts.hydrated == 0 && counts.placeholder == 0 && counts.hydrating == 0
-        );
         let facts = crate::durability_service::DurabilityFacts {
             latch_load_failed: self.durability_latch_load_failed.load(Ordering::SeqCst),
             scope_unknown: self.unknown_scope_membership_marker.load(Ordering::SeqCst),
@@ -2232,8 +2224,7 @@ impl DaemonState {
             is_local_full_replica: self.is_local_full_replica(group_id),
             any_other_full_replica_peer_configured: self
                 .any_other_full_replica_peer_configured(group_id),
-            peer_confirmed_custody: self
-                .has_fresh_custody_confirmation(group_id, group_currently_empty),
+            peer_confirmed_custody: self.has_fresh_custody_confirmation(group_id),
             ever_confirmation_swept: self.has_ever_been_custody_swept(group_id),
         };
         self.durability.classify(group_id, facts)
@@ -2886,33 +2877,49 @@ impl DaemonState {
     /// clock adjustment -- M4 Codex review #1 finding #5) AND was recorded
     /// under the CURRENT `membership_generation` (any peer netmap change
     /// since invalidates it outright, regardless of age -- finding #3's
-    /// demotion sub-case), AND -- for a vacuous (no-peer, empty-root-set)
-    /// confirmation specifically -- this device's own current
-    /// materialization view of the group still looks empty too. That last
-    /// condition is what stops a group that goes empty -> non-empty from
-    /// riding a stale vacuous confirmation as `Protected` for up to the full
-    /// staleness bound: a new file's DAG record reaches every group member
-    /// well before the next confirmation sweep tick, so this device's own
-    /// materialization view moves off "empty" almost immediately, even
-    /// though it says nothing about the file's own hydration/custody state
-    /// (M4 Codex review #1 follow-up, finding #2). `group_durability_
-    /// status`'s only source of `Protected` evidence -- see this cache's own
-    /// doc comment for why local materialization state must never
-    /// otherwise substitute for it.
-    fn has_fresh_custody_confirmation(&self, group_id: &str, group_currently_empty: bool) -> bool {
-        let cache = self.custody_confirmation_cache.lock().unwrap_or_else(|p| p.into_inner());
-        match cache.get(group_id).and_then(|entry| entry.record.as_ref()) {
-            Some(record) => match &record.outcome {
-                CustodyConfirmationOutcome::Confirmed { peer_device_id, .. } => {
-                    let fresh = record.confirmed_at.elapsed() <= CUSTODY_CONFIRMATION_STALENESS_BOUND
-                        && record.membership_generation == self.membership_generation();
-                    let vacuous = peer_device_id.is_none();
-                    fresh && (!vacuous || group_currently_empty)
-                }
-                CustodyConfirmationOutcome::NotConfirmed => false,
-            },
-            None => false,
-        }
+    /// demotion sub-case), AND still matches this group's CURRENT
+    /// durability-root digest (a cheap local DB read/hash, not a network
+    /// round-trip -- see `durability_roots_for_group`'s own doc comment).
+    ///
+    /// That last check is what stops a confirmed group's content changing
+    /// -- e.g. a new file synced in as a placeholder -- from riding a
+    /// stale confirmation as `Protected` for up to the full staleness
+    /// bound: a content/root-set change never bumps the netmap-
+    /// authorization `membership_generation` counter, so the generation
+    /// check alone cannot catch it (an M4 Pass 7 independent review
+    /// finding -- this cache's sibling consumer,
+    /// `fetch_available_via_confirmed_peer`, already re-derived and
+    /// compared the current digest for exactly this reason; this method
+    /// had not, so a group could report `Protected` while
+    /// `fetch_availability` correctly, and misleadingly, showed
+    /// `UnavailableNow` for content no peer had actually confirmed).
+    /// Digest equality also directly proves the vacuous (no-peer,
+    /// empty-root-set) case is still vacuous, since an empty root set has
+    /// a fixed digest distinct from any non-empty one -- so this
+    /// subsumes the separate "is the group still empty" check an earlier
+    /// version of this method took as its own parameter. Fail closed
+    /// (`false`) if the current enumeration itself errors.
+    fn has_fresh_custody_confirmation(&self, group_id: &str) -> bool {
+        let confirmed_digest = {
+            let cache = self.custody_confirmation_cache.lock().unwrap_or_else(|p| p.into_inner());
+            match cache.get(group_id).and_then(|entry| entry.record.as_ref()) {
+                Some(record) => match &record.outcome {
+                    CustodyConfirmationOutcome::Confirmed { digest, .. } => {
+                        let fresh = record.confirmed_at.elapsed()
+                            <= CUSTODY_CONFIRMATION_STALENESS_BOUND
+                            && record.membership_generation == self.membership_generation();
+                        if !fresh {
+                            return false;
+                        }
+                        *digest
+                    }
+                    CustodyConfirmationOutcome::NotConfirmed => return false,
+                },
+                None => return false,
+            }
+        };
+        self.durability_roots_for_group(group_id)
+            .is_some_and(|current_roots| current_roots.digest == confirmed_digest)
     }
 
     /// Whether `group_id` has had at least one `DurabilityConfirmationJob`
@@ -3062,8 +3069,8 @@ impl DaemonState {
     /// actually serve a fetch, even if its last confirmation is still
     /// technically fresh.
     ///
-    /// `group_currently_empty` has the identical meaning/role as in
-    /// `has_fresh_custody_confirmation` -- see that method's own doc
+    /// The current-digest re-derivation below has the identical role as
+    /// `has_fresh_custody_confirmation`'s own -- see that method's doc
     /// comment.
     pub(crate) fn fetch_available_via_confirmed_peer(&self, group_id: &str) -> bool {
         let (peer_device_id, confirmed_digest) = {
@@ -4574,6 +4581,40 @@ mod tests {
         DaemonState::new("device-a".into(), sync_state, store)
     }
 
+    /// `group_id`'s real current durability-root digest -- what a genuine
+    /// `full_replica_handoff_ready_digest_and_peer` round-trip would have
+    /// captured at confirmation time. `has_fresh_custody_confirmation`
+    /// requires this to still match, so a fixture-only test digest (an
+    /// arbitrary byte array) would never register as fresh; tests that
+    /// need a confirmation to actually count use this instead.
+    fn real_digest(state: &DaemonState, group_id: &str) -> [u8; 32] {
+        state.durability_roots_for_group(group_id).unwrap().digest
+    }
+
+    /// Indexes one current file record for `group_id`, changing its
+    /// durability-root digest -- the minimal way to make a previously
+    /// confirmed digest stale.
+    fn upsert_file(state: &DaemonState, group_id: &str, path: &str) {
+        use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
+
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file(
+                group_id,
+                &FileRecord {
+                    path: path.into(),
+                    size: 4,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![BlockInfo { hash: vec![1u8; 32], offset: 0, size: 4 }],
+                    deleted: false,
+                },
+                &permit,
+            )
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn custody_stamp_revalidation_rejects_wrong_peer_generation_change_and_demotion() {
         let state = test_state();
@@ -4607,13 +4648,14 @@ mod tests {
     async fn not_confirmed_does_not_downgrade_a_still_fresh_confirmed_record() {
         let state = test_state();
         let generation = state.membership_generation();
+        let digest = real_digest(&state, "group-1");
         state.record_custody_confirmation_outcome(
             "group-1",
-            CustodyConfirmationOutcome::Confirmed { peer_device_id: Some("peer-b".into()), digest: [7u8; 32] },
+            CustodyConfirmationOutcome::Confirmed { peer_device_id: Some("peer-b".into()), digest },
             generation,
             0,
         );
-        assert!(state.has_fresh_custody_confirmation("group-1", false));
+        assert!(state.has_fresh_custody_confirmation("group-1"));
 
         state.record_custody_confirmation_outcome(
             "group-1",
@@ -4622,7 +4664,7 @@ mod tests {
             0,
         );
         assert!(
-            state.has_fresh_custody_confirmation("group-1", false),
+            state.has_fresh_custody_confirmation("group-1"),
             "a transient NotConfirmed round must not clobber a still-fresh Confirmed record"
         );
     }
@@ -4641,48 +4683,65 @@ mod tests {
             0,
         );
         assert!(state.has_ever_been_custody_swept("group-1"));
-        assert!(!state.has_fresh_custody_confirmation("group-1", false));
+        assert!(!state.has_fresh_custody_confirmation("group-1"));
     }
 
-    /// A vacuous (no-peer) confirmation only counts as fresh while this
-    /// device's own materialization view of the group still looks empty
-    /// too -- otherwise a group going empty -> non-empty could ride a
-    /// stale vacuous confirmation as `Protected` for up to the full
+    /// A vacuous (no-peer) confirmation only counts as fresh while the
+    /// group's CURRENT durability-root digest still matches what was
+    /// confirmed -- otherwise a group going empty -> non-empty could ride
+    /// a stale vacuous confirmation as `Protected` for up to the full
     /// staleness bound (M4 Codex review #1 follow-up, finding #2).
     #[tokio::test]
-    async fn vacuous_confirmation_requires_group_still_currently_empty() {
+    async fn vacuous_confirmation_requires_current_digest_still_match() {
         let state = test_state();
+        let empty_digest = real_digest(&state, "group-1");
         state.record_custody_confirmation_outcome(
             "group-1",
-            CustodyConfirmationOutcome::Confirmed { peer_device_id: None, digest: [0u8; 32] },
+            CustodyConfirmationOutcome::Confirmed { peer_device_id: None, digest: empty_digest },
             state.membership_generation(),
             0,
         );
         assert!(
-            state.has_fresh_custody_confirmation("group-1", true),
-            "a vacuous confirmation is fresh evidence while the group still looks empty"
+            state.has_fresh_custody_confirmation("group-1"),
+            "a vacuous confirmation is fresh evidence while the group's digest is unchanged"
         );
+
+        upsert_file(&state, "group-1", "a.bin");
         assert!(
-            !state.has_fresh_custody_confirmation("group-1", false),
-            "a vacuous confirmation must stop counting as fresh once the group no longer \
-             looks empty locally, even within the staleness bound"
+            !state.has_fresh_custody_confirmation("group-1"),
+            "a vacuous confirmation must stop counting as fresh once the group's digest has \
+             moved off what was actually confirmed, even within the staleness bound"
         );
     }
 
-    /// A REAL (non-vacuous) peer confirmation is unaffected by the
-    /// group's current local emptiness -- that check only ever gates the
-    /// vacuous case.
+    /// A REAL (non-vacuous) peer confirmation is invalidated by a content
+    /// change exactly like the vacuous case -- the digest check applies
+    /// uniformly, closing the gap where only the vacuous case used to be
+    /// gated (M4 Pass 7 independent review finding: this device could
+    /// report `Protected` on a stale non-vacuous confirmation while
+    /// `fetch_availability` correctly showed `UnavailableNow` for content
+    /// no peer had actually confirmed).
     #[tokio::test]
-    async fn non_vacuous_confirmation_ignores_group_currently_empty() {
+    async fn non_vacuous_confirmation_is_also_invalidated_by_a_content_change() {
         let state = test_state();
+        let digest_before = real_digest(&state, "group-1");
         state.record_custody_confirmation_outcome(
             "group-1",
-            CustodyConfirmationOutcome::Confirmed { peer_device_id: Some("peer-b".into()), digest: [1u8; 32] },
+            CustodyConfirmationOutcome::Confirmed {
+                peer_device_id: Some("peer-b".into()),
+                digest: digest_before,
+            },
             state.membership_generation(),
             0,
         );
-        assert!(state.has_fresh_custody_confirmation("group-1", false));
-        assert!(state.has_fresh_custody_confirmation("group-1", true));
+        assert!(state.has_fresh_custody_confirmation("group-1"));
+
+        upsert_file(&state, "group-1", "a.bin");
+        assert!(
+            !state.has_fresh_custody_confirmation("group-1"),
+            "a non-vacuous confirmation must also stop counting as fresh once the group's \
+             digest has moved off what the confirming peer actually proved"
+        );
     }
 
     /// A membership-generation change since the confirmation was recorded
@@ -4692,18 +4751,19 @@ mod tests {
     async fn confirmation_under_a_stale_membership_generation_is_not_fresh() {
         let state = test_state();
         let old_generation = state.membership_generation();
+        let digest = real_digest(&state, "group-1");
         state.record_custody_confirmation_outcome(
             "group-1",
-            CustodyConfirmationOutcome::Confirmed { peer_device_id: Some("peer-b".into()), digest: [2u8; 32] },
+            CustodyConfirmationOutcome::Confirmed { peer_device_id: Some("peer-b".into()), digest },
             old_generation,
             0,
         );
-        assert!(state.has_fresh_custody_confirmation("group-1", false));
+        assert!(state.has_fresh_custody_confirmation("group-1"));
 
         state.set_peer_group_writer("peer-c", "unrelated-group", true);
         assert_ne!(state.membership_generation(), old_generation);
         assert!(
-            !state.has_fresh_custody_confirmation("group-1", false),
+            !state.has_fresh_custody_confirmation("group-1"),
             "any membership generation change since confirmation must invalidate it"
         );
     }
@@ -4728,7 +4788,7 @@ mod tests {
         state.clear_custody_confirmation("group-1");
 
         assert!(!state.has_ever_been_custody_swept("group-1"));
-        assert!(!state.has_fresh_custody_confirmation("group-1", false));
+        assert!(!state.has_fresh_custody_confirmation("group-1"));
         assert_ne!(
             state.custody_confirmation_epoch("group-1"),
             epoch_before,

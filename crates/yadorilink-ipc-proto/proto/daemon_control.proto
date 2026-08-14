@@ -186,19 +186,25 @@ enum GroupDurabilityStatus {
   // always sends): treat exactly like `UNKNOWN`, never as
   // `PROTECTED`.
   GROUP_DURABILITY_STATUS_UNSPECIFIED = 0;
-  // This device or a confirmed peer is a whole-group full replica for the
-  // current head.
+  // A peer round-trip has positively confirmed whole-group coverage
+  // recently (or the group is genuinely empty, confirmed the same way) --
+  // never derived from this device's own local materialization state
+  // alone, and never from any peer's current reachability: a full replica
+  // can be perfectly durable and completely offline at the same moment.
   GROUP_DURABILITY_STATUS_PROTECTED = 1;
-  // Configured for this group but still catching up to head (not every
-  // file materialized yet).
+  // This device itself is configured as a full replica for this group but
+  // still catching up to head (not every file materialized yet).
   GROUP_DURABILITY_STATUS_PROTECTING = 2;
   // Coverage cannot currently be confirmed -- most notably, right after a
   // `--force` override bypassed the durability handoff gate, until a later
   // handoff check positively reconfirms whole-group coverage. Must render
   // as its own state, never as `PROTECTED`.
   GROUP_DURABILITY_STATUS_UNKNOWN = 3;
-  // A current file is confirmed to have no durable holder reachable
-  // anywhere -- a positive negative, not merely "unconfirmed."
+  // No device other than this one is currently configured (netmap-derived)
+  // as an authorized-writer full replica for this group -- a structural,
+  // content-blind fact, independent of any peer's current reachability:
+  // this state answers "does a durable holder exist," never "is one
+  // reachable right now."
   GROUP_DURABILITY_STATUS_AT_RISK = 4;
 }
 
