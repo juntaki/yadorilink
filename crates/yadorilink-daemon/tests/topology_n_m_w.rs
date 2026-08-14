@@ -332,4 +332,70 @@ async fn happy_path_direct_convergence_and_hydration() {
         b"hello from W",
         "M's hydrated content must be the exact bytes W authored"
     );
+
+    // Read-model truthfulness through the REAL wire boundary -- the exact
+    // surface the CLI/desktop app actually read, not `DaemonState`
+    // internals (`queries::link_status`'s canonical types are
+    // deliberately `pub(crate)`; going through the real control socket,
+    // same as `desktop_status_parity.rs`/`storage_mode_orchestration.rs`
+    // already do, exercises `control_socket.rs`'s wire-conversion
+    // functions too, closing the gap an earlier draft of this test left
+    // -- M5-A Pass 3's "CLI/desktop-facing semantic status model"
+    // requirement).
+    let socket_dir = tempfile::tempdir().unwrap();
+    let control_socket_path = socket_dir.path().join("w-daemon.sock");
+    let serve_path = control_socket_path.clone();
+    let w_state_for_serve = w.state.clone();
+    tokio::spawn(async move {
+        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
+            &serve_path,
+            Arc::new(yadorilink_daemon::control_context::ControlContext::from_state(
+                w_state_for_serve,
+            )),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut stream = tokio::net::UnixStream::connect(&control_socket_path).await.unwrap();
+    yadorilink_ipc_proto::framing::write_message(
+        &mut stream,
+        &yadorilink_ipc_proto::daemonctl::DaemonControlRequest {
+            payload: Some(
+                yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload::Status(
+                    yadorilink_ipc_proto::daemonctl::StatusRequest {},
+                ),
+            ),
+            protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
+        },
+    )
+    .await
+    .unwrap();
+    let resp = yadorilink_ipc_proto::framing::read_message::<
+        yadorilink_ipc_proto::daemonctl::DaemonControlResponse,
+    >(&mut stream)
+    .await
+    .unwrap()
+    .unwrap();
+    let Some(yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload::Status(status)) =
+        resp.payload
+    else {
+        panic!("expected a Status response, got {:?}", resp.payload);
+    };
+    let w_link = status
+        .links
+        .iter()
+        .find(|l| l.group_id == group_id)
+        .expect("W's real control socket must report the shared group");
+    assert_eq!(
+        w_link.local_storage_state(),
+        yadorilink_ipc_proto::daemonctl::LocalStorageState::OnDemand,
+        "W's wire-reported local storage state must truthfully be OnDemand"
+    );
+    assert_eq!(
+        w_link.fetch_availability(),
+        yadorilink_ipc_proto::daemonctl::FetchAvailability::AvailableNow,
+        "W has both files fully hydrated locally now, so fetch_availability must read \
+         AvailableNow through the real wire boundary"
+    );
 }
