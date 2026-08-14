@@ -1,8 +1,8 @@
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
-    GroupDurabilityStatus, LinkStatus, PeerReachability, PeerStatus, StatusRequest, StatusResponse,
-    UnreachableCategory, VolumeFreeSpace,
+    FetchAvailability, GroupDurabilityStatus, LinkStatus, LocalStorageState, PeerReachability,
+    PeerStatus, StatusRequest, StatusResponse, UnreachableCategory, VolumeFreeSpace,
 };
 
 use crate::control_client;
@@ -83,6 +83,65 @@ fn durability_suffix(link: &LinkStatus) -> String {
             "  durability unknown".to_string()
         }
         GroupDurabilityStatus::KnownMissing => "  durability: known missing".to_string(),
+    }
+}
+
+/// The ` on-demand (...)` suffix -- M4 Pass 2: reads `link.
+/// local_storage_state()` directly, the daemon's own TRUTHFUL derivation
+/// (materialization policy AND actual current hydration state), rather
+/// than reconstructing an equivalent judgment here from
+/// `materialization_policy` plus the raw hydration counts (the earlier
+/// version of this function did exactly that, string-comparing
+/// `materialization_policy == "ondemand"` -- the anti-pattern M4's model
+/// exists to eliminate). `PartiallyMaterialized` gets its own distinct
+/// label rather than silently reading as either `FullCopy` or `OnDemand`:
+/// an eager link still catching up is neither.
+///
+/// `Unspecified` (an older daemon that predates `local_storage_state`)
+/// falls back to the raw `materialization_policy` string check ONLY for
+/// this one legacy case -- rendering it identically to `FullCopy` would
+/// silently drop the on-demand indicator for such a daemon (M4 Pass 2
+/// Codex review #2 finding #4). This is a narrow, explicitly-scoped
+/// compatibility fallback, not a reversion to reconstructing state from
+/// raw fields for the common (current-daemon) case above.
+fn local_storage_suffix(link: &LinkStatus) -> String {
+    match link.local_storage_state() {
+        LocalStorageState::FullCopy => String::new(),
+        LocalStorageState::OnDemand => format!(
+            "  on-demand (hydrated={} placeholder={} hydrating={})",
+            link.hydrated_count, link.placeholder_count, link.hydrating_count
+        ),
+        LocalStorageState::PartiallyMaterialized => format!(
+            "  making full copy (hydrated={} placeholder={} hydrating={})",
+            link.hydrated_count, link.placeholder_count, link.hydrating_count
+        ),
+        LocalStorageState::Unspecified => {
+            if link.materialization_policy == "ondemand" {
+                format!(
+                    "  on-demand (hydrated={} placeholder={} hydrating={})",
+                    link.hydrated_count, link.placeholder_count, link.hydrating_count
+                )
+            } else {
+                String::new()
+            }
+        }
+    }
+}
+
+/// The ` cannot fetch now`/` fetch availability unknown` suffix -- M4 Pass
+/// 2: reads `link.fetch_availability()` directly, NEVER reconstructed from
+/// peer reachability (that would make it a bare alias for connectivity,
+/// exactly what this field exists to NOT be). Silent for `AvailableNow`,
+/// the common case, same "empty unless applicable" discipline as
+/// `degraded_suffix`. `Unspecified` (a daemon predating this field) reads
+/// the same as `Unknown`, never as available.
+fn fetch_availability_suffix(link: &LinkStatus) -> String {
+    match link.fetch_availability() {
+        FetchAvailability::AvailableNow => String::new(),
+        FetchAvailability::UnavailableNow => "  cannot fetch now".to_string(),
+        FetchAvailability::Unknown | FetchAvailability::Unspecified => {
+            "  fetch availability unknown".to_string()
+        }
     }
 }
 
@@ -362,21 +421,15 @@ async fn render_status_once() -> Result<(), CliError> {
     }
     for link in &status.links {
         let state = if link.paused { "paused" } else { "syncing" };
-        let materialization = if link.materialization_policy == "ondemand" {
-            format!(
-                "  on-demand (hydrated={} placeholder={} hydrating={})",
-                link.hydrated_count, link.placeholder_count, link.hydrating_count
-            )
-        } else {
-            String::new()
-        };
+        let materialization = local_storage_suffix(link);
         let held = held_summary_suffix(link);
         let degraded = degraded_suffix(link);
         let transfer = transfer_progress_suffix(link);
         let durability = durability_suffix(link);
+        let fetch_availability = fetch_availability_suffix(link);
         let ambiguous = ambiguous_suffix(link);
         println!(
-            "{}  group={}  {state}  conflicts={}{materialization}{held}{degraded}{transfer}{durability}{ambiguous}",
+            "{}  group={}  {state}  conflicts={}{materialization}{held}{degraded}{transfer}{durability}{fetch_availability}{ambiguous}",
             link.local_path, link.group_id, link.conflict_count
         );
         for line in held_file_detail_lines(link) {
@@ -463,6 +516,8 @@ mod tests {
             policy_stale: false,
             ambiguous: false,
             ambiguous_local_paths: Vec::new(),
+            local_storage_state: LocalStorageState::FullCopy as i32,
+            fetch_availability: FetchAvailability::AvailableNow as i32,
         }
     }
 
@@ -558,6 +613,105 @@ mod tests {
         let mut link = base_link();
         link.durability_status = GroupDurabilityStatus::Unspecified as i32;
         assert_eq!(durability_suffix(&link), "  durability unknown");
+    }
+
+    /// M4 Pass 2: a full copy renders no local-storage suffix at all --
+    /// the common healthy case, same "empty unless applicable" discipline
+    /// as every other suffix here.
+    #[test]
+    fn full_copy_renders_no_local_storage_suffix() {
+        let link = base_link();
+        assert_eq!(local_storage_suffix(&link), "");
+    }
+
+    /// M4 Pass 2 Codex review #2 finding #4: an older daemon that predates
+    /// `local_storage_state` sends `Unspecified` -- for an on-demand link,
+    /// this must NOT render identically to `FullCopy` (that would silently
+    /// drop the on-demand indicator). Falls back to the raw
+    /// `materialization_policy` string ONLY for this legacy case.
+    #[test]
+    fn unspecified_local_storage_falls_back_to_materialization_policy_for_on_demand() {
+        let mut link = base_link();
+        link.local_storage_state = LocalStorageState::Unspecified as i32;
+        link.materialization_policy = "ondemand".into();
+        link.hydrated_count = 1;
+        link.placeholder_count = 2;
+        link.hydrating_count = 0;
+        assert_eq!(
+            local_storage_suffix(&link),
+            "  on-demand (hydrated=1 placeholder=2 hydrating=0)"
+        );
+    }
+
+    /// The same legacy fallback renders nothing for an eager link -- an
+    /// older daemon's eager link must not be treated as on-demand either.
+    #[test]
+    fn unspecified_local_storage_renders_nothing_for_eager() {
+        let mut link = base_link();
+        link.local_storage_state = LocalStorageState::Unspecified as i32;
+        link.materialization_policy = "eager".into();
+        assert_eq!(local_storage_suffix(&link), "");
+    }
+
+    /// M4 Pass 2: on-demand reads `local_storage_state` directly, not
+    /// `materialization_policy` string-matching plus raw counts.
+    #[test]
+    fn on_demand_renders_hydration_counts() {
+        let mut link = base_link();
+        link.local_storage_state = LocalStorageState::OnDemand as i32;
+        link.hydrated_count = 3;
+        link.placeholder_count = 2;
+        link.hydrating_count = 1;
+        assert_eq!(
+            local_storage_suffix(&link),
+            "  on-demand (hydrated=3 placeholder=2 hydrating=1)"
+        );
+    }
+
+    /// M4 Pass 2: an eager link still catching up must render its own
+    /// distinct label -- never silently as `FullCopy` (the earlier
+    /// materialization_policy-string-based reconstruction this replaces
+    /// would have shown nothing at all here, since it only special-cased
+    /// "ondemand").
+    #[test]
+    fn partially_materialized_renders_its_own_suffix() {
+        let mut link = base_link();
+        link.local_storage_state = LocalStorageState::PartiallyMaterialized as i32;
+        link.hydrated_count = 5;
+        link.placeholder_count = 1;
+        link.hydrating_count = 0;
+        assert_eq!(
+            local_storage_suffix(&link),
+            "  making full copy (hydrated=5 placeholder=1 hydrating=0)"
+        );
+    }
+
+    /// M4 Pass 2: `AvailableNow` renders no suffix -- the common case.
+    #[test]
+    fn available_now_renders_no_fetch_availability_suffix() {
+        let link = base_link();
+        assert_eq!(fetch_availability_suffix(&link), "");
+    }
+
+    /// M4 Pass 2: `UnavailableNow` must be visible and distinct from
+    /// `durability_status` -- protected-but-currently-unfetchable is not
+    /// the same claim as data loss.
+    #[test]
+    fn unavailable_now_renders_its_own_suffix() {
+        let mut link = base_link();
+        link.fetch_availability = FetchAvailability::UnavailableNow as i32;
+        assert_eq!(fetch_availability_suffix(&link), "  cannot fetch now");
+    }
+
+    /// M4 Pass 2: `Unknown`, and an older daemon's `Unspecified` default,
+    /// must never render as available.
+    #[test]
+    fn unknown_fetch_availability_never_reads_as_available() {
+        let mut link = base_link();
+        link.fetch_availability = FetchAvailability::Unknown as i32;
+        assert_eq!(fetch_availability_suffix(&link), "  fetch availability unknown");
+        link.fetch_availability = FetchAvailability::Unspecified as i32;
+        assert_eq!(fetch_availability_suffix(&link), "  fetch availability unknown");
     }
 
     /// `0` reads as "unlimited" — the shared convention
