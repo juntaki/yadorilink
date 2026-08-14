@@ -2,7 +2,8 @@ use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPaylo
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
     FetchAvailability, GroupDurabilityStatus, LinkStatus, LocalStorageState, PeerReachability,
-    PeerStatus, StatusRequest, StatusResponse, UnreachableCategory, VolumeFreeSpace,
+    PeerStatus, RelayCapability, RouteKind, StatusRequest, StatusResponse, UnreachableCategory,
+    VolumeFreeSpace,
 };
 
 use crate::control_client;
@@ -30,6 +31,46 @@ fn held_summary_suffix(link: &LinkStatus) -> String {
 /// held files.
 fn held_file_detail_lines(link: &LinkStatus) -> Vec<String> {
     link.held_files.iter().map(|h| format!("    held: {}  ({})", h.path, h.reason)).collect()
+}
+
+/// One `    configured full copy: <device>  (available|offline|unknown)`
+/// line per device in `link.full_replica_device_ids`.
+///
+/// Deliberately says "configured full copy," never "complete copy" --
+/// `full_replica_device_ids` is a netmap-derived, CONTENT-BLIND
+/// structural declaration (see `DaemonState::full_replica_devices_for_
+/// group`'s own doc comment: "a device is DECLARED a full-replica
+/// writer"), not the peer-confirmed content custody `durability_status`
+/// (Pass 1's `custody_confirmation_cache`) actually verifies. Labeling a
+/// merely-declared, possibly-never-confirmed, still-catching-up peer
+/// "complete copy (available)" would read as a stronger durability claim
+/// than this daemon can back up -- exactly the kind of per-device
+/// overclaim `durability_status` already exists to guard against at the
+/// group level (M4 Pass 3 Codex review #3 finding #1). This list is
+/// connectivity-layer inventory ONLY; `durability_status` remains the
+/// sole source of truth for whether the group is actually protected.
+///
+/// Per-device state: `available` requires the SAME device to appear in
+/// `peers` with `Connected` reachability; `offline` requires it to
+/// appear with an explicit `Unreachable` reachability (a POSITIVELY
+/// known-down fact); anything else -- absent from `peers` entirely,
+/// `Unspecified`, `Connecting`, or `ProtocolIncompatible` -- reads
+/// `unknown`, since this daemon has no positive evidence either way for
+/// those (M4 Pass 3 Codex review #3 finding #2: an earlier version
+/// conflated "never observed" with "known offline").
+fn complete_copies_detail_lines(link: &LinkStatus, peers: &[PeerStatus]) -> Vec<String> {
+    link.full_replica_device_ids
+        .iter()
+        .map(|device_id| {
+            let reachability = peers.iter().find(|p| &p.device_id == device_id).map(|p| p.reachability());
+            let state = match reachability {
+                Some(PeerReachability::Connected) => "available",
+                Some(PeerReachability::Unreachable) => "offline",
+                _ => "unknown",
+            };
+            format!("    configured full copy: {device_id}  ({state})")
+        })
+        .collect()
 }
 
 /// The ` degraded (<reason>)` suffix — same "empty unless applicable"
@@ -208,15 +249,39 @@ fn limits_summary_line(status: &StatusResponse) -> String {
 /// connected — in which case the reason (its failure category) is shown so
 /// the user understands why. A daemon that has not yet determined a peer's
 /// reachability leaves it unspecified, shown as "unknown".
+/// M4 Pass 3: `Connected` now distinguishes direct from relayed --
+/// `route_kind` is only meaningful when reachability is `Connected` (see
+/// its own proto doc comment), so this reads it ONLY in that branch,
+/// never treating `Unspecified` there as anything but "direct" (an older
+/// daemon predating this field always sends `Unspecified`, and this CLI's
+/// prior behavior -- before route_kind existed at all -- was to say
+/// simply "connected" for every route, so this is the closest
+/// backward-compatible default, not a new claim).
 fn peer_connectivity_label(peer: &PeerStatus) -> String {
     match peer.reachability() {
-        PeerReachability::Connected => "connected".to_string(),
+        PeerReachability::Connected => match peer.route_kind() {
+            RouteKind::Relay => "connected (via relay)".to_string(),
+            RouteKind::Direct | RouteKind::Unspecified => "connected".to_string(),
+        },
         PeerReachability::ProtocolIncompatible => "protocol incompatible".to_string(),
         PeerReachability::Connecting => "connecting".to_string(),
         PeerReachability::Unreachable => {
             format!("cannot connect ({})", unreachable_category_label(peer.unreachable_category()))
         }
         PeerReachability::Unspecified => "unknown".to_string(),
+    }
+}
+
+/// The `  (relay-capable)` suffix -- M4 Pass 3: `relay_capability` is a
+/// device-level self-declared fact, independent of `route_kind` (THIS
+/// device's own connection to the peer) and independent of storage role
+/// (`Durability != Connectivity`) -- see `RelayCapability`'s own proto
+/// doc comment. Silent for `Disabled`/`Unspecified`, same "empty unless
+/// applicable" discipline as every other suffix here.
+fn relay_capability_suffix(peer: &PeerStatus) -> String {
+    match peer.relay_capability() {
+        RelayCapability::Capable => "  (relay-capable)".to_string(),
+        RelayCapability::Disabled | RelayCapability::Unspecified => String::new(),
     }
 }
 
@@ -435,6 +500,9 @@ async fn render_status_once() -> Result<(), CliError> {
         for line in held_file_detail_lines(link) {
             println!("{line}");
         }
+        for line in complete_copies_detail_lines(link, &status.peers) {
+            println!("{line}");
+        }
     }
 
     if !status.peers.is_empty() {
@@ -442,7 +510,8 @@ async fn render_status_once() -> Result<(), CliError> {
         println!("Peers:");
         for peer in &status.peers {
             let connectivity = peer_connectivity_label(peer);
-            println!("  {}  {connectivity}", peer.device_id);
+            let relay = relay_capability_suffix(peer);
+            println!("  {}  {connectivity}{relay}", peer.device_id);
         }
     }
 
@@ -518,6 +587,7 @@ mod tests {
             ambiguous_local_paths: Vec::new(),
             local_storage_state: LocalStorageState::FullCopy as i32,
             fetch_availability: FetchAvailability::AvailableNow as i32,
+            full_replica_device_ids: Vec::new(),
         }
     }
 
@@ -528,6 +598,82 @@ mod tests {
         let link = base_link();
         assert_eq!(held_summary_suffix(&link), "");
         assert!(held_file_detail_lines(&link).is_empty());
+    }
+
+    /// M4 Pass 3: no full-replica peers configured renders no "Complete
+    /// copies" lines at all.
+    #[test]
+    fn no_full_replica_peers_renders_no_complete_copies_lines() {
+        let link = base_link();
+        assert!(complete_copies_detail_lines(&link, &[]).is_empty());
+    }
+
+    /// M4 Pass 3 Codex review #3 finding #1: the label says "configured
+    /// full copy," never "complete copy" -- this list is a structural,
+    /// content-blind netmap declaration, not peer-confirmed content
+    /// custody (that's `durability_status`'s job). A `Connected` device
+    /// reads "available".
+    #[test]
+    fn complete_copies_lines_report_available_for_a_connected_device() {
+        let mut link = base_link();
+        link.full_replica_device_ids = vec!["nas-1".into()];
+        let mut peer = base_peer();
+        peer.device_id = "nas-1".into();
+        peer.reachability = PeerReachability::Connected as i32;
+
+        let lines = complete_copies_detail_lines(&link, &[peer]);
+        assert_eq!(lines, vec!["    configured full copy: nas-1  (available)".to_string()]);
+    }
+
+    /// M4 Pass 3 Codex review #3 finding #2: a device this daemon has
+    /// never even seen (absent from `peers` entirely) reads "unknown",
+    /// NOT "offline" -- "offline" is a positive claim this daemon has no
+    /// basis for here. Only an explicit `Unreachable` reachability earns
+    /// "offline".
+    #[test]
+    fn unseen_device_reads_unknown_not_offline() {
+        let mut link = base_link();
+        link.full_replica_device_ids = vec!["unseen-device".into()];
+
+        let lines = complete_copies_detail_lines(&link, &[]);
+        assert_eq!(lines, vec!["    configured full copy: unseen-device  (unknown)".to_string()]);
+    }
+
+    /// `Connecting`/`ProtocolIncompatible`/`Unspecified` are ALSO not
+    /// positive "offline" evidence -- they read "unknown" too, the same
+    /// as a device absent from `peers` entirely.
+    #[test]
+    fn indeterminate_reachability_states_read_unknown() {
+        let mut link = base_link();
+        link.full_replica_device_ids = vec!["nas-1".into()];
+        for state in
+            [PeerReachability::Connecting, PeerReachability::ProtocolIncompatible, PeerReachability::Unspecified]
+        {
+            let mut peer = base_peer();
+            peer.device_id = "nas-1".into();
+            peer.reachability = state as i32;
+            let lines = complete_copies_detail_lines(&link, &[peer]);
+            assert_eq!(
+                lines,
+                vec!["    configured full copy: nas-1  (unknown)".to_string()],
+                "reachability {state:?} must read unknown, not offline"
+            );
+        }
+    }
+
+    /// A full-replica device that IS known but currently `Unreachable`
+    /// (a positive, known-down fact) reads "offline" -- distinct from the
+    /// "unknown" cases above.
+    #[test]
+    fn complete_copies_line_reports_offline_for_a_known_unreachable_device() {
+        let mut link = base_link();
+        link.full_replica_device_ids = vec!["nas-1".into()];
+        let mut peer = base_peer();
+        peer.device_id = "nas-1".into();
+        peer.reachability = PeerReachability::Unreachable as i32;
+
+        let lines = complete_copies_detail_lines(&link, &[peer]);
+        assert_eq!(lines, vec!["    configured full copy: nas-1  (offline)".to_string()]);
     }
 
     /// a link with held files shows the count and, for each
@@ -863,6 +1009,8 @@ mod tests {
             device_id: "device-1".into(),
             reachability: PeerReachability::Connected as i32,
             unreachable_category: UnreachableCategory::Unspecified as i32,
+            route_kind: RouteKind::Direct as i32,
+            relay_capability: RelayCapability::Disabled as i32,
         }
     }
 
@@ -882,6 +1030,58 @@ mod tests {
 
         peer.reachability = PeerReachability::ProtocolIncompatible as i32;
         assert_eq!(peer_connectivity_label(&peer), "protocol incompatible");
+    }
+
+    /// M4 Pass 3: a relayed connection reads distinctly from a direct one
+    /// -- this is the exact wire-contract gap a prior M3 pass flagged and
+    /// never filled in (`PeerStatus` had no way to distinguish direct from
+    /// relayed connectivity at all before this pass).
+    #[test]
+    fn connected_via_relay_renders_its_own_label() {
+        let mut peer = base_peer();
+        peer.route_kind = RouteKind::Relay as i32;
+        assert_eq!(peer_connectivity_label(&peer), "connected (via relay)");
+    }
+
+    /// An older daemon predating `route_kind` sends `Unspecified` for a
+    /// connected peer -- must fail back to the pre-existing plain
+    /// "connected" label (the only claim this CLI ever made before
+    /// `route_kind` existed), never silently as "connected (via relay)".
+    #[test]
+    fn connected_with_unspecified_route_kind_reads_as_plain_connected() {
+        let mut peer = base_peer();
+        peer.route_kind = RouteKind::Unspecified as i32;
+        assert_eq!(peer_connectivity_label(&peer), "connected");
+    }
+
+    /// M4 Pass 3: relay capability is silent unless the peer has actually
+    /// declared it -- same "empty unless applicable" discipline as every
+    /// other suffix here.
+    #[test]
+    fn relay_incapable_peer_renders_no_suffix() {
+        let peer = base_peer();
+        assert_eq!(relay_capability_suffix(&peer), "");
+    }
+
+    #[test]
+    fn relay_capable_peer_renders_its_own_suffix() {
+        let mut peer = base_peer();
+        peer.relay_capability = RelayCapability::Capable as i32;
+        assert_eq!(relay_capability_suffix(&peer), "  (relay-capable)");
+    }
+
+    /// Relay capability must be independent of route kind -- a peer can be
+    /// relay-capable while THIS device's own connection to it is direct
+    /// (`Durability != Connectivity`'s connectivity-side parallel: relay
+    /// capability is a peer's own declared capability, not a statement
+    /// about any specific connection).
+    #[test]
+    fn relay_capability_is_independent_of_this_connections_route_kind() {
+        let mut peer = base_peer();
+        peer.route_kind = RouteKind::Direct as i32;
+        peer.relay_capability = RelayCapability::Capable as i32;
+        assert_eq!(peer_connectivity_label(&peer), "connected");
+        assert_eq!(relay_capability_suffix(&peer), "  (relay-capable)");
     }
 
     /// a volume line reports path, state, and byte counts.

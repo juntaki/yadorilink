@@ -1124,25 +1124,35 @@ fn trashed_file_view_to_proto(
 /// Maps the daemon's internal reachability into the control-socket wire
 /// enums (`PeerStatus.reachability` / `unreachable_category`). The category
 /// is `Unspecified` whenever the peer is not unreachable.
+/// M4 Pass 3: the third element is this connection's `RouteKind` (only
+/// meaningful, i.e. non-`Unspecified`, when the reachability itself is
+/// `Connected`) -- fills the exact wire-contract gap a prior M3 pass's own
+/// comment flagged here ("Pass 6 is the right place to extend this... once
+/// a route other than Direct can actually occur") and never filled in
+/// once relay routes actually shipped.
 fn reachability_to_proto(
     reachability: crate::peer_registry::PeerReachability,
 ) -> (
     yadorilink_ipc_proto::daemonctl::PeerReachability,
     yadorilink_ipc_proto::daemonctl::UnreachableCategory,
+    yadorilink_ipc_proto::daemonctl::RouteKind,
 ) {
     use crate::peer_registry::{PeerReachability as Daemon, UnreachableCategory as DaemonCat};
     use yadorilink_ipc_proto::daemonctl::{
-        PeerReachability as Wire, UnreachableCategory as WireCat,
+        PeerReachability as Wire, RouteKind as WireRoute, UnreachableCategory as WireCat,
     };
     match reachability {
-        Daemon::Connecting => (Wire::Connecting, WireCat::Unspecified),
-        // M3 Pass 4: the wire enum does not yet distinguish direct from
-        // relay connectivity (see `PeerReachability::route_str` for where
-        // that lives internally) -- Pass 6 is the right place to extend
-        // this wire contract, once a route other than `Direct` can
-        // actually occur.
-        Daemon::Connected(_) => (Wire::Connected, WireCat::Unspecified),
-        Daemon::ProtocolIncompatible => (Wire::ProtocolIncompatible, WireCat::Unspecified),
+        Daemon::Connecting => (Wire::Connecting, WireCat::Unspecified, WireRoute::Unspecified),
+        Daemon::Connected(route) => {
+            let wire_route = match route {
+                crate::route::RouteKind::Direct => WireRoute::Direct,
+                crate::route::RouteKind::Relay => WireRoute::Relay,
+            };
+            (Wire::Connected, WireCat::Unspecified, wire_route)
+        }
+        Daemon::ProtocolIncompatible => {
+            (Wire::ProtocolIncompatible, WireCat::Unspecified, WireRoute::Unspecified)
+        }
         Daemon::Unreachable(category) => {
             let wire_category = match category {
                 DaemonCat::NoCandidates => WireCat::NoCandidates,
@@ -1150,8 +1160,18 @@ fn reachability_to_proto(
                 DaemonCat::UdpBlocked => WireCat::UdpBlocked,
                 DaemonCat::HandshakeRefused => WireCat::HandshakeRefused,
             };
-            (Wire::Unreachable, wire_category)
+            (Wire::Unreachable, wire_category, WireRoute::Unspecified)
         }
+    }
+}
+
+fn relay_capability_to_proto(
+    capability: crate::route::RelayCapability,
+) -> yadorilink_ipc_proto::daemonctl::RelayCapability {
+    use yadorilink_ipc_proto::daemonctl::RelayCapability as Wire;
+    match capability {
+        crate::route::RelayCapability::Capable => Wire::Capable,
+        crate::route::RelayCapability::Disabled => Wire::Disabled,
     }
 }
 
@@ -1219,11 +1239,13 @@ fn encode_runtime_status(
         .peers
         .into_iter()
         .map(|peer| {
-            let (reachability, category) = reachability_to_proto(peer.reachability);
+            let (reachability, category, route_kind) = reachability_to_proto(peer.reachability);
             PeerStatus {
                 device_id: peer.device_id,
                 reachability: reachability as i32,
                 unreachable_category: category as i32,
+                route_kind: route_kind as i32,
+                relay_capability: relay_capability_to_proto(peer.relay_capability) as i32,
             }
         })
         .collect();
@@ -1338,6 +1360,7 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
         ambiguous_local_paths: view.ambiguous_local_paths,
         local_storage_state: local_storage_state_to_proto(view.local_storage_state) as i32,
         fetch_availability: fetch_availability_to_proto(view.fetch_availability) as i32,
+        full_replica_device_ids: view.full_replica_device_ids,
     }
 }
 
@@ -4703,5 +4726,62 @@ mod migration_safety_tests {
             assert_eq!(server.request_count(), 1, "exactly one Worker GET, no automatic retry");
             server.assert_clean("RoleLoss race");
         }
+    }
+
+    /// M4 Pass 3: `route_kind` is only meaningful when the connection is
+    /// actually `Connected` -- every other reachability reports
+    /// `RouteKind::Unspecified`, and `Connected` itself maps `Direct`/
+    /// `Relay` exactly (the gap a prior M3 pass's own comment flagged and
+    /// never filled in).
+    #[test]
+    fn reachability_to_proto_only_carries_route_kind_when_connected() {
+        use yadorilink_ipc_proto::daemonctl::{
+            PeerReachability as Wire, RouteKind as WireRoute,
+        };
+
+        let (reachability, _, route) =
+            super::reachability_to_proto(crate::peer_registry::PeerReachability::Connected(
+                crate::route::RouteKind::Direct,
+            ));
+        assert_eq!(reachability, Wire::Connected);
+        assert_eq!(route, WireRoute::Direct);
+
+        let (reachability, _, route) =
+            super::reachability_to_proto(crate::peer_registry::PeerReachability::Connected(
+                crate::route::RouteKind::Relay,
+            ));
+        assert_eq!(reachability, Wire::Connected);
+        assert_eq!(route, WireRoute::Relay);
+
+        let (_, _, route) = super::reachability_to_proto(
+            crate::peer_registry::PeerReachability::Connecting,
+        );
+        assert_eq!(route, WireRoute::Unspecified);
+
+        let (_, _, route) = super::reachability_to_proto(
+            crate::peer_registry::PeerReachability::ProtocolIncompatible,
+        );
+        assert_eq!(route, WireRoute::Unspecified);
+
+        let (_, _, route) =
+            super::reachability_to_proto(crate::peer_registry::PeerReachability::Unreachable(
+                crate::peer_registry::UnreachableCategory::NoResponse,
+            ));
+        assert_eq!(route, WireRoute::Unspecified);
+    }
+
+    /// M4 Pass 3: `relay_capability` maps exactly, independent of any
+    /// connection state -- it's a device-level self-declared fact.
+    #[test]
+    fn relay_capability_to_proto_maps_exactly() {
+        use yadorilink_ipc_proto::daemonctl::RelayCapability as Wire;
+        assert_eq!(
+            super::relay_capability_to_proto(crate::route::RelayCapability::Capable),
+            Wire::Capable
+        );
+        assert_eq!(
+            super::relay_capability_to_proto(crate::route::RelayCapability::Disabled),
+            Wire::Disabled
+        );
     }
 }

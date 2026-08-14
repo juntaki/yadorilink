@@ -354,6 +354,12 @@ impl FullReplicaCustody for DaemonState {
     }
 }
 
+impl crate::queries::runtime_status::RelayCapabilityPort for DaemonState {
+    fn relay_capability(&self, device_id: &str) -> crate::route::RelayCapability {
+        self.peer_relay_capability(device_id)
+    }
+}
+
 /// M3 Pass 5: see `DaemonState::active_relay_sessions`'s own doc comment.
 #[derive(Debug, Clone)]
 struct RelaySessionRecord {
@@ -3006,6 +3012,26 @@ impl DaemonState {
         metadata.full_replicas.iter().any(|(device_id, gid)| {
             gid == group_id && metadata.writers.contains(&(device_id.clone(), gid.clone()))
         })
+    }
+
+    /// M4 Pass 3: every device OTHER than this one currently recorded
+    /// (netmap-derived, content-blind) as an authorized-writer full
+    /// replica of `group_id` -- the enumerable counterpart to
+    /// `any_other_full_replica_peer_configured` above, feeding the
+    /// user-facing "Complete copies" per-device list (e.g. "Home NAS --
+    /// available/offline"), cross-referenced by the caller against each
+    /// device's own current `PeerReachability` to answer "available" vs.
+    /// "offline". Order is unspecified (backed by a `HashSet`); callers
+    /// needing a stable order should sort.
+    pub(crate) fn full_replica_devices_for_group(&self, group_id: &str) -> Vec<String> {
+        let metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
+        metadata
+            .full_replicas
+            .iter()
+            .filter(|(_, gid)| gid == group_id)
+            .filter(|(device_id, gid)| metadata.writers.contains(&(device_id.clone(), gid.clone())))
+            .map(|(device_id, _)| device_id.clone())
+            .collect()
     }
 
     /// M4 Pass 2: whether this group has REAL content-confirmed peer
