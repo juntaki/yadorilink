@@ -1368,7 +1368,23 @@ pub async fn unpin(state: &DaemonState, group_id: &str, path: &str) -> Result<()
 
 /// Manually evicts `path` back to a placeholder (spec "Manual Eviction").
 /// Resolves `group_id` to its local root path via the registered link.
-pub fn evict(state: &DaemonState, group_id: &str, path: &str) -> Result<(), SyncError> {
+///
+/// M4 Pass 4: returns the REAL `EvictionOutcome`, not just success/failure
+/// -- `evict_file` itself can return `Ok` while leaving the file fully
+/// materialized (pinned, busy, not yet `Hydrated`, or its on-disk
+/// identity changed right before the commit; see `EvictionOutcome::
+/// dehydrated`'s own doc comment), and this function used to collapse
+/// that into a bare `Ok(())` indistinguishable from a real eviction.
+/// Callers crossing the `application::ports` boundary (`DaemonMaterializationAdapter`)
+/// translate this into that layer's own `EvictOutcome` DTO -- this
+/// function itself stays in `yadorilink_filesystem_sync`'s vocabulary,
+/// matching every other type this module already uses directly from that
+/// crate.
+pub fn evict(
+    state: &DaemonState,
+    group_id: &str,
+    path: &str,
+) -> Result<yadorilink_filesystem_sync::materialization_eviction::EvictionOutcome, SyncError> {
     // Demoting a fully-materialized file to a placeholder is only safe to
     // reverse (re-fetch on next access) if a real OS-transparent placeholder
     // provider is actually watching the result -- see `placeholder_backend`'s
@@ -1408,7 +1424,6 @@ pub fn evict(state: &DaemonState, group_id: &str, path: &str) -> Result<(), Sync
         is_full_replica,
         state,
     )
-    .map(|_| ())
     .map_err(SyncError::from)
 }
 

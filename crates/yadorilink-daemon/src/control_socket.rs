@@ -421,7 +421,11 @@ async fn handle_request(
             Some((group_id, path)) => {
                 let application = context.application.clone();
                 match application.materialization.evict(&group_id, &path) {
-                    Ok(()) => RespPayload::Evict(EvictResponse {}),
+                    Ok(outcome) => RespPayload::Evict(EvictResponse {
+                        dehydrated: outcome.dehydrated,
+                        blocks_reclaimed: outcome.blocks_reclaimed,
+                        bytes_reclaimed: outcome.bytes_reclaimed,
+                    }),
                     Err(e) => RespPayload::Error(e.to_string()),
                 }
             }

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::sync_error::SyncError;
 
-use super::ports::MaterializationPort;
+use super::ports::{EvictOutcome, MaterializationPort};
 
 pub(crate) struct MaterializationService {
     port: Arc<dyn MaterializationPort>,
@@ -25,7 +25,7 @@ impl MaterializationService {
         self.port.unpin(group_id, path).await
     }
 
-    pub(crate) fn evict(&self, group_id: &str, path: &str) -> Result<(), SyncError> {
+    pub(crate) fn evict(&self, group_id: &str, path: &str) -> Result<EvictOutcome, SyncError> {
         self.port.evict(group_id, path)
     }
 }
@@ -76,9 +76,9 @@ mod tests {
             })
         }
 
-        fn evict(&self, group_id: &str, path: &str) -> Result<(), SyncError> {
+        fn evict(&self, group_id: &str, path: &str) -> Result<EvictOutcome, SyncError> {
             self.calls.lock().unwrap().push(format!("evict({group_id},{path})"));
-            Ok(())
+            Ok(EvictOutcome { dehydrated: true, ..Default::default() })
         }
     }
 
@@ -100,6 +100,52 @@ mod tests {
                 "unpin(group-1,/c)".to_string(),
                 "evict(group-1,/d)".to_string(),
             ]
+        );
+    }
+
+    /// M4 Pass 4: `evict` must pass the REAL `EvictOutcome` back to the
+    /// caller, not just `Ok(())` -- this is what closes the gap where a
+    /// silently-no-op'd eviction (pinned/busy/not-yet-hydrated/changed on
+    /// disk) used to be indistinguishable from a real one all the way up
+    /// to the CLI/shell-extension response.
+    #[tokio::test]
+    async fn evict_returns_the_ports_real_outcome_not_a_bare_ok() {
+        #[derive(Default)]
+        struct NoOpEvictionPort;
+        impl MaterializationPort for NoOpEvictionPort {
+            fn hydrate<'a>(
+                &'a self,
+                _group_id: &'a str,
+                _path: &'a str,
+            ) -> BoxFuture<'a, Result<(), SyncError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn pin<'a>(
+                &'a self,
+                _group_id: &'a str,
+                _path: &'a str,
+            ) -> BoxFuture<'a, Result<(), SyncError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn unpin<'a>(
+                &'a self,
+                _group_id: &'a str,
+                _path: &'a str,
+            ) -> BoxFuture<'a, Result<(), SyncError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn evict(&self, _group_id: &str, _path: &str) -> Result<EvictOutcome, SyncError> {
+                // Simulates a pinned/busy/not-yet-hydrated file: the call
+                // succeeds, but nothing was actually freed.
+                Ok(EvictOutcome { dehydrated: false, ..Default::default() })
+            }
+        }
+
+        let service = MaterializationService::new(Arc::new(NoOpEvictionPort));
+        let outcome = service.evict("group-1", "/pinned.bin").unwrap();
+        assert!(
+            !outcome.dehydrated,
+            "a no-op eviction must surface dehydrated=false, not an indistinguishable Ok"
         );
     }
 }
