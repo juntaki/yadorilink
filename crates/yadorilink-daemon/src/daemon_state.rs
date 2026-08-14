@@ -2328,6 +2328,22 @@ impl DaemonState {
             .insert(device_id.to_string(), key);
     }
 
+    /// Removes a peer's pinned signing key without touching its authorized
+    /// groups/full-replica/relay-capable state (unlike `clear_peer_netmap_
+    /// metadata`, which wipes all of it) -- for a netmap-update pass that
+    /// needs every admitted peer's CURRENT signing-key state (present or
+    /// absent) settled before validating ANY peer's shared groups, so a
+    /// peer that stopped advertising a signing key this pass cannot leave
+    /// a stale key behind for another peer's retained-history check to
+    /// validate against.
+    pub fn forget_peer_signing_key(&self, device_id: &str) {
+        self.peer_netmap_metadata
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .signing_keys
+            .remove(device_id);
+    }
+
     /// The pinned Ed25519 signing key for `device_id`, if one is known.
     pub fn peer_signing_key(&self, device_id: &str) -> Option<[u8; 32]> {
         self.peer_netmap_metadata
