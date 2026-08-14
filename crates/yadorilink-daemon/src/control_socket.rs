@@ -1402,25 +1402,52 @@ impl OverallState {
 /// established discipline), and guarantees the rollup can never disagree
 /// with the detail fields sitting right next to it in the same message.
 ///
-/// Precedence (highest first): any link `degraded` or any volume
-/// `state == "critical"` -> `Degraded` (spec: a low-disk condition on a
-/// linked folder needs attention; a *critical* one is actively blocking
-/// sync, same severity split `VolumeFreeSpace.state`'s own `"low"` vs
-/// `"critical"` already draws). Otherwise any conflict, held file, a
-/// `"low"` volume, a disconnected peer, a non-empty recent-error feed, or a
-/// recorded update failure -> `Attention`. A merely-`paused` link is
-/// *not* by itself attention-worthy (spec's "Sync is healthy" scenario:
-/// "caught up or idle *without errors*" says nothing about pause being an
-/// error state — pausing is a deliberate user action, matching
-/// `status.rs`'s own `held_summary_suffix`-style "only surface what's
-/// actionable" discipline). Otherwise `Healthy`, with no reasons.
+/// Precedence (highest first): any link `degraded`, any link whose
+/// `durability_status` is `AT_RISK` (a positively-known "no durable copy
+/// exists anywhere" fact -- the M4 durability axis's own most severe
+/// state), or any volume `state == "critical"` -> `Degraded` (spec: a
+/// low-disk condition on a linked folder needs attention; a *critical*
+/// one is actively blocking sync, same severity split
+/// `VolumeFreeSpace.state`'s own `"low"` vs `"critical"` already draws).
+/// Otherwise any conflict, held file, a `"low"` volume, a disconnected
+/// peer, a link whose `durability_status` cannot currently be confirmed
+/// (`UNKNOWN`/`UNSPECIFIED`) or whose `fetch_availability` is
+/// `UNAVAILABLE_NOW`, a non-empty recent-error feed, or a recorded update
+/// failure -> `Attention`. A merely-`paused` link is *not* by itself
+/// attention-worthy (spec's "Sync is healthy" scenario: "caught up or idle
+/// *without errors*" says nothing about pause being an error state --
+/// pausing is a deliberate user action, matching `status.rs`'s own
+/// `held_summary_suffix`-style "only surface what's actionable"
+/// discipline). Otherwise `Healthy`, with no reasons.
+///
+/// Folding in `durability_status`/`fetch_availability` here is required by
+/// this function's own doc comment above: it claims the rollup "can never
+/// disagree with the detail fields sitting right next to it in the same
+/// message," and before M4 added those two fields this function never
+/// read them at all -- a group with zero durable copies anywhere
+/// (`AtRisk`) could read `Overall: healthy` (M4 Pass 7 Codex/independent
+/// review finding).
 fn overall_status(response: &StatusResponse) -> (OverallState, Vec<String>) {
+    use yadorilink_ipc_proto::daemonctl::{FetchAvailability, GroupDurabilityStatus};
+
     let mut degraded_reasons = Vec::new();
     let mut attention_reasons = Vec::new();
 
     for link in &response.links {
         if link.degraded {
             degraded_reasons.push(format!("degraded:{}", link.group_id));
+        }
+        match link.durability_status() {
+            GroupDurabilityStatus::AtRisk => {
+                degraded_reasons.push(format!("durability_at_risk:{}", link.group_id));
+            }
+            GroupDurabilityStatus::Unknown | GroupDurabilityStatus::Unspecified => {
+                attention_reasons.push(format!("durability_unknown:{}", link.group_id));
+            }
+            GroupDurabilityStatus::Protected | GroupDurabilityStatus::Protecting => {}
+        }
+        if link.fetch_availability() == FetchAvailability::UnavailableNow {
+            attention_reasons.push(format!("fetch_unavailable:{}", link.group_id));
         }
         if link.conflict_count > 0 {
             attention_reasons.push(format!("conflict:{}", link.group_id));
@@ -1464,6 +1491,27 @@ fn overall_status(response: &StatusResponse) -> (OverallState, Vec<String>) {
 mod overall_status_tests {
     use super::*;
 
+    /// A link with every M4 axis in its healthiest state (`Protected`,
+    /// `AvailableNow`) and nothing else wrong -- the baseline every test
+    /// below that isn't specifically exercising `durability_status`/
+    /// `fetch_availability` starts from, so those two axes' own new
+    /// `overall_status` contribution doesn't leak into an unrelated test's
+    /// expected reasons. A bare `LinkStatus::default()` would NOT do this:
+    /// its zero-value `durability_status`/`fetch_availability` are
+    /// `Unspecified` -- deliberately treated as attention-worthy (an older
+    /// daemon that predates the field must not read as fine), so it would
+    /// contribute its own reason to every test that used it.
+    fn protected_link(group_id: &str) -> LinkStatus {
+        LinkStatus {
+            group_id: group_id.to_string(),
+            durability_status: yadorilink_ipc_proto::daemonctl::GroupDurabilityStatus::Protected
+                as i32,
+            fetch_availability: yadorilink_ipc_proto::daemonctl::FetchAvailability::AvailableNow
+                as i32,
+            ..Default::default()
+        }
+    }
+
     /// spec "Sync is healthy": no links/volumes/peers/errors at all (the
     /// zero-value default) is healthy with no reasons — matches this
     /// file's/`status.rs`'s "additive, empty/zero unless applicable"
@@ -1480,7 +1528,7 @@ mod overall_status_tests {
     #[test]
     fn paused_link_alone_is_still_healthy() {
         let response = StatusResponse {
-            links: vec![LinkStatus { paused: true, ..Default::default() }],
+            links: vec![LinkStatus { paused: true, ..protected_link("group-1") }],
             ..Default::default()
         };
         let (state, reasons) = overall_status(&response);
@@ -1493,16 +1541,70 @@ mod overall_status_tests {
     #[test]
     fn conflict_is_attention() {
         let response = StatusResponse {
-            links: vec![LinkStatus {
-                group_id: "group-1".into(),
-                conflict_count: 1,
-                ..Default::default()
-            }],
+            links: vec![LinkStatus { conflict_count: 1, ..protected_link("group-1") }],
             ..Default::default()
         };
         let (state, reasons) = overall_status(&response);
         assert_eq!(state, OverallState::Attention);
         assert_eq!(reasons, vec!["conflict:group-1".to_string()]);
+    }
+
+    /// A link the daemon has positively confirmed has no durable copy
+    /// anywhere (`AtRisk`) is `Degraded`, not `Healthy` -- this is the
+    /// exact overstatement an M4 Pass 7 review found: the rollup used to
+    /// never read `durability_status` at all, so a folder with zero
+    /// durable copies could still read `Overall: healthy`.
+    #[test]
+    fn at_risk_durability_is_degraded() {
+        let response = StatusResponse {
+            links: vec![LinkStatus {
+                durability_status:
+                    yadorilink_ipc_proto::daemonctl::GroupDurabilityStatus::AtRisk as i32,
+                ..protected_link("group-1")
+            }],
+            ..Default::default()
+        };
+        let (state, reasons) = overall_status(&response);
+        assert_eq!(state, OverallState::Degraded);
+        assert_eq!(reasons, vec!["durability_at_risk:group-1".to_string()]);
+    }
+
+    /// A link whose durability cannot currently be confirmed (`Unknown`,
+    /// or `Unspecified` from an older daemon that predates the field) is
+    /// `Attention`, never silently `Healthy` -- fail-safe, matching every
+    /// other "cannot currently confirm" surface in this daemon.
+    #[test]
+    fn unknown_durability_is_attention() {
+        let response = StatusResponse {
+            links: vec![LinkStatus {
+                durability_status:
+                    yadorilink_ipc_proto::daemonctl::GroupDurabilityStatus::Unknown as i32,
+                ..protected_link("group-1")
+            }],
+            ..Default::default()
+        };
+        let (state, reasons) = overall_status(&response);
+        assert_eq!(state, OverallState::Attention);
+        assert_eq!(reasons, vec!["durability_unknown:group-1".to_string()]);
+    }
+
+    /// A link that is durably `Protected` but cannot currently be fetched
+    /// is `Attention` -- "cannot fetch right now" is real and actionable,
+    /// but must never escalate to `Degraded`: the data itself is not at
+    /// risk, matching "Durability != Connectivity."
+    #[test]
+    fn unavailable_fetch_with_protected_durability_is_attention_not_degraded() {
+        let response = StatusResponse {
+            links: vec![LinkStatus {
+                fetch_availability:
+                    yadorilink_ipc_proto::daemonctl::FetchAvailability::UnavailableNow as i32,
+                ..protected_link("group-1")
+            }],
+            ..Default::default()
+        };
+        let (state, reasons) = overall_status(&response);
+        assert_eq!(state, OverallState::Attention);
+        assert_eq!(reasons, vec!["fetch_unavailable:group-1".to_string()]);
     }
 
     /// spec "Sync needs attention": a `"low"` volume needs attention; a
@@ -1557,8 +1659,8 @@ mod overall_status_tests {
     fn degraded_link_outranks_but_still_reports_attention_reasons() {
         let response = StatusResponse {
             links: vec![
-                LinkStatus { group_id: "group-1".into(), degraded: true, ..Default::default() },
-                LinkStatus { group_id: "group-2".into(), conflict_count: 1, ..Default::default() },
+                LinkStatus { degraded: true, ..protected_link("group-1") },
+                LinkStatus { conflict_count: 1, ..protected_link("group-2") },
             ],
             ..Default::default()
         };

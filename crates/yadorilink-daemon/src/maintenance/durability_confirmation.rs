@@ -1,5 +1,5 @@
 //! `DurabilityConfirmationJob` -- the M4 background sweep that turns
-//! `DaemonState::group_durability_status`'s `Healthy` from a local-only
+//! `DaemonState::group_durability_status`'s `Protected` from a local-only
 //! heuristic into real peer-confirmed evidence: periodically re-runs
 //! `full_replica_handoff_ready_digest_and_peer` (the existing whole-group,
 //! exact-version-hash, generation-stability-checked handoff-readiness
@@ -35,12 +35,12 @@ impl DurabilityConfirmationJob {
     /// Re-confirms whole-group custody for every non-orphaned linked
     /// group. Every round writes a record either way (`Confirmed` or
     /// `NotConfirmed` -- see `CustodyConfirmationOutcome`'s own doc
-    /// comment): a `NotConfirmed` round never itself produces `Healthy`
+    /// comment): a `NotConfirmed` round never itself produces `Protected`
     /// (only a fresh `Confirmed` record does), but it DOES mark the group
     /// as having been swept at least once, which is what lets
     /// `classify` distinguish "checked, found nothing" (eligible for the
-    /// structural `KnownMissing` conclusion) from "never checked yet"
-    /// (must stay `DurabilityUnknown` regardless of how the structural
+    /// structural `AtRisk` conclusion) from "never checked yet"
+    /// (must stay `Unknown` regardless of how the structural
     /// peer check would otherwise read).
     pub(crate) async fn run_once(&self, _trigger: MaintenanceTrigger) {
         let state = &self.state;
