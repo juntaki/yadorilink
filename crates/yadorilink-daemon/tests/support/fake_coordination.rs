@@ -160,6 +160,28 @@ impl FakeCoordination {
         self.push();
     }
 
+    /// M5-A: republishes `device_id`'s advertised endpoint -- mirroring
+    /// what a real coordination plane would push over the netmap
+    /// subscription if a device's network conditions changed (e.g. its
+    /// direct path became unreachable). Lets a test force a live
+    /// direct<->relay failover on an ALREADY-connected pair by pointing
+    /// one side at a real-but-refused address (the same deterministic
+    /// technique `yadorilink-transport`'s `relay_failover.rs` uses for
+    /// its own lower-layer proof: an immediately-refused destination,
+    /// not silence, so `PeerChannel`'s candidate race fails fast and
+    /// reproducibly rather than relying on a timeout alone) and later
+    /// restore it to force promotion back.
+    #[allow(dead_code)]
+    pub fn update_endpoint(&self, device_id: &str, endpoint: String) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(dev) = inner.devices.get_mut(device_id) {
+                dev.endpoint = endpoint;
+            }
+        }
+        self.push();
+    }
+
     /// M3 Pass 4: declares (or clears) a device's own relay capability --
     /// mirrored onto peers' `relayCapable`. Deliberately independent of
     /// `set_full_replica`: never coupled, never inferred from one another
