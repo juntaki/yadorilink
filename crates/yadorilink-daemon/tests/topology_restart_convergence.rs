@@ -476,3 +476,138 @@ async fn m_restart_recovers_and_resyncs_with_both_peers() {
 async fn w_restart_recovers_and_resyncs_with_both_peers() {
     on_demand_node_restart_recovers_and_resyncs(true).await;
 }
+
+/// M5-A Pass 5 regression-matrix item D: a restart while a large transfer
+/// is actively in flight must never accept stale ACK/data from the OLD
+/// transport epoch, and must still converge to the EXACT byte content --
+/// not merely "some content", the way the other restart tests' small
+/// single-write payloads could pass even with a subtly corrupted byte or
+/// two lost in transit. A large (multi-megabyte) payload forces the real
+/// reliable-delivery (ARQ) layer to actually chunk and multi-round the
+/// transfer over loopback, giving a real (if not perfectly deterministic)
+/// window for N's restart to land mid-transfer rather than either before
+/// it starts or comfortably after it finishes. Every restarted node's own
+/// `PeerChannel`/`ActorState` -- and with it `ReliableSend`/
+/// `ReliableRecv` -- is constructed fresh only for a genuinely NEW
+/// generation (never reused across a restart, per `peer_channel.rs`'s own
+/// established invariant this whole M5-A Pass 5 fix protects), so a
+/// correct implementation must recover to exact content regardless of
+/// exactly when the restart lands relative to the transfer; this test
+/// exercises that live, rather than only asserting the invariant
+/// statically.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn n_restart_mid_transfer_still_converges_exactly() {
+    init_tracing();
+    support::ensure_isolated_config_dir();
+    let fake = FakeCoordination::start().await;
+    fake.enable_signed_policy();
+    let group_id = "topology-restart-mid-transfer-group";
+
+    let (n, m, w, mut handles) = stand_up_canonical_topology(&fake, group_id).await;
+
+    // A large, non-repeating payload (LCG-derived, not all-zero/
+    // all-same-byte, so a corrupted or truncated transfer can't
+    // coincidentally hash-match the correct content) -- big enough that a
+    // real reliable-delivery transfer over loopback takes measurable,
+    // multi-chunk time rather than completing in a single round trip.
+    const PAYLOAD_LEN: usize = 24 * 1024 * 1024;
+    let mut payload = vec![0u8; PAYLOAD_LEN];
+    let mut lcg_state: u64 = 0x243F6A8885A308D3;
+    for byte in payload.iter_mut() {
+        lcg_state = lcg_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *byte = (lcg_state >> 56) as u8;
+    }
+    let expected_hash = {
+        use sha2::Digest;
+        sha2::Sha256::digest(&payload)
+    };
+
+    let path = m.root.path().join("mid-transfer.bin");
+    std::fs::write(&path, &payload).unwrap();
+
+    // Restart N shortly after the write starts propagating, without
+    // waiting for convergence first -- the whole point is to land the
+    // restart WHILE the transfer is (plausibly) still in flight, not
+    // after it has already settled.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    handles.take_and_shutdown(&n.device_id).await;
+    let n = restart_node(n).await;
+    tracing::info!(
+        "TEST: N restarted mid-transfer -- old orchestrator/link runtime torn down, fresh \
+         DaemonState opened"
+    );
+    register_with_fake(&fake, &n.state, &n.device_id, n.keypair.public_bytes(), &[group_id]).await;
+    let n_runtime = support::topology::spawn_orchestrator(fake.addr(), &n);
+    handles.insert(n.device_id.clone(), n_runtime);
+
+    // Regardless of exactly when the restart landed relative to the
+    // transfer, N must eventually converge on the EXACT payload -- no
+    // stale partial/corrupted data accepted from the old epoch, and no
+    // permanently-stuck-short transfer either. A generous deadline: the
+    // whole payload may need to be resent from scratch over a fresh
+    // generation, on top of the fresh handshake/negotiation this test
+    // doesn't separately gate on (unlike the other restart tests) since
+    // exact content convergence already implies it happened.
+    wait_until_with_context(
+        || {
+            std::fs::read(n.root.path().join("mid-transfer.bin"))
+                .map(|bytes| {
+                    use sha2::Digest;
+                    sha2::Sha256::digest(&bytes) == expected_hash
+                })
+                .unwrap_or(false)
+        },
+        Duration::from_secs(120),
+        || {
+            let actual_len = std::fs::read(n.root.path().join("mid-transfer.bin")).map(|b| b.len());
+            format!(
+                "N never converged on the EXACT mid-transfer payload after N's restart -- \
+                 expected_len={PAYLOAD_LEN} actual_len={actual_len:?}"
+            )
+        },
+    )
+    .await;
+    tracing::info!("TEST: N converged on the exact mid-transfer payload after restart");
+
+    // W (the third, uninvolved-in-the-restart peer) must also eventually
+    // reach the exact content over its own On-Demand hydration path --
+    // proving the mid-transfer restart didn't leave any peer's copy
+    // silently short or corrupted.
+    wait_until_with_context(
+        || {
+            w.state
+                .replica_coordinator
+                .file_index_repository()
+                .list_files(group_id)
+                .map(|files| files.iter().any(|f| f.path == "mid-transfer.bin" && !f.deleted))
+                .unwrap_or(false)
+        },
+        Duration::from_secs(60),
+        || "W never saw mid-transfer.bin's DAG record".to_string(),
+    )
+    .await;
+    let mut hydrate_attempts = 0;
+    loop {
+        match yadorilink_daemon::hydration::hydrate(&w.state, group_id, "mid-transfer.bin").await {
+            Ok(()) => break,
+            Err(error) if hydrate_attempts < 5 => {
+                hydrate_attempts += 1;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let _ = error;
+            }
+            Err(error) => panic!("W's hydration should eventually succeed: {error}"),
+        }
+    }
+    let w_bytes = std::fs::read(w.root.path().join("mid-transfer.bin"))
+        .expect("W must have the hydrated file");
+    assert_eq!(
+        {
+            use sha2::Digest;
+            sha2::Sha256::digest(&w_bytes)
+        },
+        expected_hash,
+        "W's copy of the mid-transfer payload must also be byte-exact"
+    );
+
+    handles.shutdown();
+}
