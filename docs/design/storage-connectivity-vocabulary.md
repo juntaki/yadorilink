@@ -37,52 +37,35 @@ OnDemand runtime path (see concept 4's gap).
 
 ## 2. DurabilityStatus — is there a confirmed full copy somewhere?
 
-**Maps to:** `GroupDurabilityStatus` (`Healthy` / `Syncing` /
-`DurabilityUnknown` / `KnownMissing`) in `yadorilink-daemon`'s
-`durability_service` module, computed by `DaemonState::group_durability_
-status` via the pure `classify` function. The underlying safety
-*mechanisms* it draws on — `data-durability-model.md`'s DL-1..DL-7 — are
-strong and already shipped.
+**Maps to:** `GroupDurabilityStatus` (`Protected` / `Protecting` /
+`Unknown` / `AtRisk` — named `Healthy`/`Syncing`/`DurabilityUnknown`/
+`KnownMissing` at M0 time, renamed to this vocabulary in M4 Pass 7) in
+`yadorilink-daemon`'s `durability_service` module, computed by
+`DaemonState::group_durability_status` via the pure `classify` function.
+The underlying safety *mechanisms* it draws on —
+`data-durability-model.md`'s DL-1..DL-7 — are strong and already shipped.
 
-**Status: the safety mechanisms are strong; the product-facing status type
-is not yet a full expression of them.** `classify`'s actual precedence is:
-four "cannot currently confirm" facts (latch-load failure, unknown-scope
-force, blocked recovery, a latched-unknown group) each short-circuit to
-`DurabilityUnknown`; only once none apply does it fall through to `Ok(
-MaterializationHealth::FullyLocal) → Healthy`. Critically, `classify`'s own
-input struct carries **no `StorageRole` and no peer `HandoffReady`
-confirmation at all** — `Healthy` today means "every current file is
-`Hydrated` on THIS device," nothing more.
-
-This is a real gap once M1 ships OnDemand: a `StorageRole::OnDemand`
-MacBook that happens to have every file locally hydrated right now (still
-mid-session, nothing evicted yet) would report `GroupDurabilityStatus::
-Healthy` — but that MacBook is not a durability anchor. Every file on it
-can be evicted at any time; nothing has confirmed a *durable* full copy
-exists anywhere, only that THIS device's local cache is momentarily
-complete. `GroupDurabilityStatus::Healthy` is not the same claim as "a full
-copy exists somewhere" — conflating the two is exactly the kind of status
-overstatement `classify`'s own doc comment says it must never do, and today
-it can, for an OnDemand device.
-
-**What the eventual product-level `DurabilityStatus` needs to derive from**
-(strengthening `classify`, or a new view model built on top of it — either
-is fine, decide in M1-M4, not M0):
+**Status (as of M4): closed.** At M0 time, `classify`'s input struct
+carried no `StorageRole` and no peer `HandoffReady` confirmation at all —
+`Healthy` meant only "every current file is `Hydrated` on THIS device,"
+which let an OnDemand device with a momentarily-complete local cache
+report the same status as a genuine durability anchor. M4 closed this
+exact gap: `classify` now requires real peer-confirmed evidence
+(`DaemonState::full_replica_handoff_ready`) or a positively-known
+structural fact to reach `Protected`/`AtRisk` — this device's own local
+materialization state alone never produces either. See
+`durability_service.rs`'s own module doc comment for the current
+precedence, which is exactly the four-value vocabulary this section
+originally proposed:
 
 ```text
 Protected     -- a StorageRole::Eager device (this one or a confirmed
                  peer) durably holds the current head, OR a peer's
                  HandoffReady confirmation is fresh and valid
 Protecting    -- configured Eager, still catching up to head
-Unknown       -- cannot currently confirm (today's DurabilityUnknown facts)
+Unknown       -- cannot currently confirm
 AtRisk        -- positively confirmed no durable holder exists anywhere
 ```
-
-The key addition versus today's `classify`: gate `Healthy`/`Protected` on
-`StorageRole::Eager` (local or peer), not on "every file happens to be
-`Hydrated` right now" alone. This is flagged for M1-M4 to strengthen —
-M0's job is only to name the gap precisely so it isn't rediscovered later
-as a surprise.
 
 ## 3. ConnectivityAnchorStatus — is a full-replica device reachable right now to relay?
 
@@ -140,7 +123,7 @@ right; the gap is wiring, not modeling.
 | Product concept | Current implementation |
 |---|---|
 | StorageRole | `MaterializationPolicy` ✅ |
-| DurabilityStatus | safety mechanisms (DL-1..DL-7) are strong; product-facing status type is only a partial expression of them ⚠️ |
+| DurabilityStatus | `GroupDurabilityStatus` ✅ (gap closed in M4) |
 | ConnectivityAnchorStatus | missing ❌ |
 | LocalMaterializationStatus | `MaterializationState` ✅ |
 

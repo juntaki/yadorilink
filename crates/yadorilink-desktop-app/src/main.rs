@@ -22,7 +22,9 @@ use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use yadorilink_desktop_app::{account, actions, ipc_client, login_item, status_model, window};
+use yadorilink_desktop_app::{
+    account, actions, folder_status_window, ipc_client, login_item, status_model, window,
+};
 use yadorilink_ipc_proto::daemonctl::StatusResponse;
 
 /// Sent from the background polling thread to the event loop whenever a
@@ -52,6 +54,12 @@ fn main() {
         Some(WindowKind::Account) => {
             if let Err(e) = account::run_account() {
                 tracing::error!(error = %e, "account window exited with an error");
+            }
+            return;
+        }
+        Some(WindowKind::FolderStatus(local_path)) => {
+            if let Err(e) = folder_status_window::run_folder_status(local_path) {
+                tracing::error!(error = %e, "folder status window exited with an error");
             }
             return;
         }
@@ -122,22 +130,39 @@ fn main() {
 enum WindowKind {
     Onboarding,
     Account,
+    /// M4 Pass 3: the per-folder detail window -- carries the folder's
+    /// `local_path`, since (unlike every other window kind) it needs to
+    /// know WHICH folder to show.
+    FolderStatus(String),
 }
 
 /// Parses `--window <kind>` (/— the tray items and installer first-run
-/// hook launch these windows this way).
+/// hook launch these windows this way). `folder-status` additionally
+/// requires a `--path <local_path>` argument, parsed regardless of
+/// argument order (matching `--window`'s own position-independent
+/// parsing below).
 fn requested_window() -> Option<WindowKind> {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--window" {
-            return match args.next().as_deref() {
-                Some("onboarding") => Some(WindowKind::Onboarding),
-                Some("account") => Some(WindowKind::Account),
-                _ => None,
-            };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut kind = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--window" && i + 1 < args.len() {
+            kind = Some(args[i + 1].clone());
+            i += 2;
+        } else {
+            i += 1;
         }
     }
-    None
+    match kind.as_deref() {
+        Some("onboarding") => Some(WindowKind::Onboarding),
+        Some("account") => Some(WindowKind::Account),
+        Some("folder-status") => {
+            let path =
+                args.iter().position(|a| a == "--path").and_then(|i| args.get(i + 1)).cloned()?;
+            Some(WindowKind::FolderStatus(path))
+        }
+        _ => None,
+    }
 }
 
 /// Launch one of this binary's GUI windows as a separate process — the
@@ -145,6 +170,19 @@ fn requested_window() -> Option<WindowKind> {
 fn spawn_window(kind: &str) {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::process::Command::new(exe).arg("--window").arg(kind).spawn();
+    }
+}
+
+/// Same as `spawn_window`, for a window kind that also needs a
+/// `--path <local_path>` argument (currently only `folder-status`).
+fn spawn_window_with_path(kind: &str, local_path: &str) {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe)
+            .arg("--window")
+            .arg(kind)
+            .arg("--path")
+            .arg(local_path)
+            .spawn();
     }
 }
 
@@ -221,6 +259,15 @@ fn build_menu(status: Option<&StatusResponse>) -> Menu {
                 let _ = per_folder.append(&MenuItem::with_id(
                     format!("open_folder:{}", link.local_path),
                     "Open Folder",
+                    true,
+                    None,
+                ));
+                // M4 Pass 3: opens the per-folder Data protection / This
+                // device / Availability / Complete copies / Connection
+                // detail window.
+                let _ = per_folder.append(&MenuItem::with_id(
+                    format!("folder_status:{}", link.local_path),
+                    "Details…",
                     true,
                     None,
                 ));
@@ -318,6 +365,10 @@ fn handle_menu_event(id: &str) {
         std::thread::spawn(move || {
             let _ = actions::open_folder(&path);
         });
+        return;
+    }
+    if let Some(path) = id.strip_prefix("folder_status:") {
+        spawn_window_with_path("folder-status", path);
         return;
     }
     // Guarded folder removal. The CLI's
