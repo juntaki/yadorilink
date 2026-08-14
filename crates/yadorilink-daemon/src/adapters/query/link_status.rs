@@ -489,7 +489,7 @@ mod tests {
         );
     }
 
-    /// A group latched `DurabilityUnknown` (a `--force` override bypassed
+    /// A group latched `Unknown` (a `--force` override bypassed
     /// the handoff gate) must ALSO report `fetch_availability: Unknown`,
     /// even with an otherwise-fresh confirmed+reachable peer -- M4 Pass 2
     /// Codex review #2 finding #2: `daemon_wide_evidence_uncertain` had
@@ -527,7 +527,7 @@ mod tests {
 
     /// Local certainty must win outright: every current file already
     /// hydrated locally is `AvailableNow` even while this group is
-    /// latched `DurabilityUnknown` -- daemon-wide "cannot confirm PEER
+    /// latched `Unknown` -- daemon-wide "cannot confirm PEER
     /// custody" uncertainty has nothing to do with whether THIS device's
     /// own disk state is legible (M4 Pass 2 Codex review #2 finding #5).
     #[tokio::test]
@@ -652,7 +652,7 @@ mod m4_acceptance_matrix {
         );
 
         let views = reader_for(state).list_links().unwrap();
-        assert_eq!(views[0].durability_status, GroupDurabilityStatus::Healthy, "A: Protected");
+        assert_eq!(views[0].durability_status, GroupDurabilityStatus::Protected, "A: Protected");
         assert_eq!(views[0].local_storage_state, LocalStorageState::OnDemand, "A: OnDemand");
         assert_eq!(views[0].fetch_availability, FetchAvailability::AvailableNow, "A: Available");
         assert_eq!(
@@ -708,7 +708,7 @@ mod m4_acceptance_matrix {
         );
 
         let views = reader_for(state).list_links().unwrap();
-        assert_eq!(views[0].durability_status, GroupDurabilityStatus::Healthy, "B: Protected");
+        assert_eq!(views[0].durability_status, GroupDurabilityStatus::Protected, "B: Protected");
         assert_eq!(views[0].local_storage_state, LocalStorageState::OnDemand, "B: OnDemand");
         assert_eq!(
             views[0].full_replica_device_ids,
@@ -725,7 +725,7 @@ mod m4_acceptance_matrix {
     /// Scenario C: the confirming peer is now UNREACHABLE, but the
     /// confirmation itself is still fresh (within the staleness bound,
     /// current membership generation, matching root digest) -- durability
-    /// stays whatever the still-valid evidence justifies (Healthy),
+    /// stays whatever the still-valid evidence justifies (Protected),
     /// while fetch_availability is separately, honestly `UnavailableNow`.
     /// This is the exact `Durability != Connectivity` pairing the M4
     /// directive singles out: "protected but currently unreachable" must
@@ -759,7 +759,7 @@ mod m4_acceptance_matrix {
         let views = reader_for(state).list_links().unwrap();
         assert_eq!(
             views[0].durability_status,
-            GroupDurabilityStatus::Healthy,
+            GroupDurabilityStatus::Protected,
             "C: durability reflects the still-valid confirmation, not current reachability"
         );
         assert_eq!(
@@ -771,7 +771,7 @@ mod m4_acceptance_matrix {
 
     /// Scenario D: no verified required custody -- structurally, no other
     /// full-replica peer is configured at all -- even though SOME peer is
-    /// reachable. AtRisk (KnownMissing) despite connectivity: reachability
+    /// reachable. AtRisk despite connectivity: reachability
     /// of a peer that isn't even a full-replica writer proves nothing.
     #[tokio::test]
     async fn scenario_d_no_full_replica_peer_configured_is_at_risk_despite_a_reachable_peer() {
@@ -791,7 +791,7 @@ mod m4_acceptance_matrix {
         let views = reader_for(state).list_links().unwrap();
         assert_eq!(
             views[0].durability_status,
-            GroupDurabilityStatus::KnownMissing,
+            GroupDurabilityStatus::AtRisk,
             "D: AtRisk -- structurally no full-replica peer exists, connectivity is irrelevant"
         );
         assert_eq!(
@@ -807,9 +807,9 @@ mod m4_acceptance_matrix {
     /// unconfirmed; in D there is no role at all).
     ///
     /// This device's OWN policy is On-Demand (not eager) so the local
-    /// "still catching up" `Syncing` branch never fires here -- if this
+    /// "still catching up" `Protecting` branch never fires here -- if this
     /// device were itself an eager full replica with a placeholder still
-    /// pending, the correct/distinct answer would be `Syncing`
+    /// pending, the correct/distinct answer would be `Protecting`
     /// (scenario F), not `Unknown`; using an on-demand local policy is
     /// what genuinely isolates "peer configured+reachable+unconfirmed" as
     /// the ONLY fact in play.
@@ -839,7 +839,7 @@ mod m4_acceptance_matrix {
         let views = reader_for(state).list_links().unwrap();
         assert_eq!(
             views[0].durability_status,
-            GroupDurabilityStatus::DurabilityUnknown,
+            GroupDurabilityStatus::Unknown,
             "E: Unknown -- a real role exists but was never actually confirmed"
         );
         assert_eq!(
@@ -850,14 +850,14 @@ mod m4_acceptance_matrix {
     }
 
     /// Scenario F: this device itself is a full replica still catching up
-    /// (a "protection operation running") -> Protecting (Syncing).
+    /// (a "protection operation running") -> Protecting.
     #[tokio::test]
     async fn scenario_f_local_full_replica_still_catching_up_is_protecting() {
         let state = test_state();
         state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
         // Eager (the default materialization policy) + a peer full
         // replica configured (so the structural AtRisk check doesn't
-        // preempt Syncing) + still-partial local hydration.
+        // preempt Protecting) + still-partial local hydration.
         state.set_peer_group_writer("nas", GROUP, true);
         state.set_peer_group_full_replica("nas", GROUP, true);
         upsert_file(&state, "a.bin", false);
@@ -866,7 +866,7 @@ mod m4_acceptance_matrix {
         let views = reader_for(state).list_links().unwrap();
         assert_eq!(
             views[0].durability_status,
-            GroupDurabilityStatus::Syncing,
+            GroupDurabilityStatus::Protecting,
             "F: Protecting -- this device is still becoming a full replica"
         );
     }
@@ -893,7 +893,7 @@ mod m4_acceptance_matrix {
         );
         assert_eq!(
             views[0].durability_status,
-            GroupDurabilityStatus::KnownMissing,
+            GroupDurabilityStatus::AtRisk,
             "G: but group-wide protection is NOT inferred from local completeness alone"
         );
     }
@@ -903,11 +903,11 @@ mod m4_acceptance_matrix {
     /// which describes a specific connection's path, not a peer's own
     /// declared capability) is available, but holds no storage role for
     /// this group at all (never declared writer/full-replica) --
-    /// connectivity benefit only. Establishes a genuine Healthy BASELINE
+    /// connectivity benefit only. Establishes a genuine Protected BASELINE
     /// first (a real confirmed full-replica peer), then adds the relay
     /// anchor and proves durability_status is unchanged -- proving "zero
     /// effect" against an established baseline, not merely re-observing
-    /// the already-KnownMissing default a group with zero peers at all
+    /// the already-AtRisk default a group with zero peers at all
     /// would trivially show regardless (M4 Pass 6 Codex review follow-up
     /// finding #2).
     #[tokio::test]
@@ -934,8 +934,8 @@ mod m4_acceptance_matrix {
         let baseline = reader_for(state.clone()).list_links().unwrap();
         assert_eq!(
             baseline[0].durability_status,
-            GroupDurabilityStatus::Healthy,
-            "sanity check: a genuine Healthy baseline is established before adding the anchor"
+            GroupDurabilityStatus::Protected,
+            "sanity check: a genuine Protected baseline is established before adding the anchor"
         );
         assert_eq!(
             baseline[0].fetch_availability,
@@ -967,8 +967,8 @@ mod m4_acceptance_matrix {
         let views = reader_for(state).list_links().unwrap();
         assert_eq!(
             views[0].durability_status,
-            GroupDurabilityStatus::Healthy,
-            "I: adding a relay anchor with no storage role leaves the established Healthy \
+            GroupDurabilityStatus::Protected,
+            "I: adding a relay anchor with no storage role leaves the established Protected \
              baseline completely unchanged -- zero durability effect"
         );
         assert_eq!(
@@ -1020,7 +1020,7 @@ mod m4_acceptance_matrix {
             "sanity check: relay capability is genuinely disabled"
         );
         let views = reader_for(state).list_links().unwrap();
-        assert_eq!(views[0].durability_status, GroupDurabilityStatus::Healthy, "J: still Protected");
+        assert_eq!(views[0].durability_status, GroupDurabilityStatus::Protected, "J: still Protected");
         assert_eq!(
             views[0].full_replica_device_ids,
             vec!["nas".to_string()],
@@ -1035,7 +1035,7 @@ mod m4_acceptance_matrix {
 
     /// Scenario K: a confirmed peer's route changes (direct -> relay ->
     /// unreachable) across three snapshots -- fetch_availability tracks
-    /// each transition, but durability_status stays Healthy throughout
+    /// each transition, but durability_status stays Protected throughout
     /// (unchanged custody evidence), never flickering with connectivity.
     #[tokio::test]
     async fn scenario_k_route_transitions_change_availability_never_durability() {
@@ -1089,7 +1089,7 @@ mod m4_acceptance_matrix {
             let views = DaemonLinkStatusReader::new(state.clone()).list_links().unwrap();
             assert_eq!(
                 views[0].durability_status,
-                GroupDurabilityStatus::Healthy,
+                GroupDurabilityStatus::Protected,
                 "K: durability must never change across a pure connectivity transition"
             );
             assert_eq!(views[0].fetch_availability, expected_fetch, "K: availability tracks route");

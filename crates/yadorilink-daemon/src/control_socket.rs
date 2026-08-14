@@ -1186,10 +1186,10 @@ fn durability_status_to_proto(
 ) -> GroupDurabilityStatus {
     use crate::durability_service::GroupDurabilityStatus as Daemon;
     match status {
-        Daemon::Healthy => GroupDurabilityStatus::Healthy,
-        Daemon::Syncing => GroupDurabilityStatus::Syncing,
-        Daemon::DurabilityUnknown => GroupDurabilityStatus::DurabilityUnknown,
-        Daemon::KnownMissing => GroupDurabilityStatus::KnownMissing,
+        Daemon::Protected => GroupDurabilityStatus::Protected,
+        Daemon::Protecting => GroupDurabilityStatus::Protecting,
+        Daemon::Unknown => GroupDurabilityStatus::Unknown,
+        Daemon::AtRisk => GroupDurabilityStatus::AtRisk,
     }
 }
 
@@ -1844,8 +1844,8 @@ mod migration_safety_tests {
     }
 
     /// `--force` bypassing the readiness gate latches the group's local
-    /// durability status to `DurabilityUnknown`: the UI must not be able to
-    /// keep reporting the group Healthy/"synced" after an override that may
+    /// durability status to `Unknown`: the UI must not be able to
+    /// keep reporting the group Protected/"synced" after an override that may
     /// have just discarded its only complete copy.
     #[tokio::test]
     async fn forced_unlink_latches_group_durability_unknown() {
@@ -1865,9 +1865,9 @@ mod migration_safety_tests {
 
         assert_eq!(
             state.group_durability_status("group-1"),
-            crate::durability_service::GroupDurabilityStatus::DurabilityUnknown,
-            "a force override must latch the group to DurabilityUnknown, never leave it \
-             reporting Healthy"
+            crate::durability_service::GroupDurabilityStatus::Unknown,
+            "a force override must latch the group to Unknown, never leave it \
+             reporting Protected"
         );
     }
 
@@ -1892,14 +1892,14 @@ mod migration_safety_tests {
             .await
             .expect("nothing to hand off, so unlink is vacuously allowed");
 
-        // M4: `Healthy`/non-Unknown now requires a fresh peer-confirmed (or
+        // M4: `Protected`/non-Unknown now requires a fresh peer-confirmed (or
         // vacuous-empty, still peer-round-trip-confirmed) sweep round --
         // force one so this assertion tests the latch, not the unrelated
         // "never swept yet" default.
         state.refresh_custody_confirmation("group-1").await;
         assert_ne!(
             state.group_durability_status("group-1"),
-            crate::durability_service::GroupDurabilityStatus::DurabilityUnknown,
+            crate::durability_service::GroupDurabilityStatus::Unknown,
             "an unforced unlink must never latch the group's durability status"
         );
     }
@@ -1983,20 +1983,20 @@ mod migration_safety_tests {
     /// `LatchGroupDurabilityUnknownRequest` -- the control request the
     /// CLI-orchestrated force paths (`durability_force.rs`) send for each
     /// group actually forced past the readiness gate, so `status` reports
-    /// `DurabilityUnknown` for it exactly like the daemon-side forced-unlink
+    /// `Unknown` for it exactly like the daemon-side forced-unlink
     /// path's own latch already does. Exercised through `handle_request`
     /// (the real dispatch a control-socket connection runs through), not the
     /// pub `latch_group_durability_unknown` method directly.
     #[tokio::test]
     async fn latch_group_durability_unknown_request_latches_the_group() {
         let state = test_state();
-        // M4: Healthy now requires at least one confirmation sweep round
+        // M4: Protected now requires at least one confirmation sweep round
         // (real or vacuous-empty) to have run -- force one.
         state.refresh_custody_confirmation("group-1").await;
         assert_eq!(
             state.group_durability_status("group-1"),
-            crate::durability_service::GroupDurabilityStatus::Healthy,
-            "sanity check: an untouched group with no files derives Healthy"
+            crate::durability_service::GroupDurabilityStatus::Protected,
+            "sanity check: an untouched group with no files derives Protected"
         );
 
         let req = DaemonControlRequest {
@@ -2020,7 +2020,7 @@ mod migration_safety_tests {
 
         assert_eq!(
             state.group_durability_status("group-1"),
-            crate::durability_service::GroupDurabilityStatus::DurabilityUnknown,
+            crate::durability_service::GroupDurabilityStatus::Unknown,
             "the latch must take effect through the real request-dispatch path"
         );
     }

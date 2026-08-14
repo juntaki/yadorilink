@@ -111,19 +111,19 @@ fn ambiguous_suffix(link: &LinkStatus) -> String {
 /// "empty unless applicable" discipline as `degraded_suffix`, but
 /// deliberately the other way around: it renders *nothing extra* only for
 /// the two states that are safe to leave as plain "syncing" text
-/// (`Healthy`, `Syncing`). A daemon that predates this field always sends
-/// `Unspecified`, which is treated exactly like `DurabilityUnknown` here —
+/// (`Protected`, `Protecting`). A daemon that predates this field always sends
+/// `Unspecified`, which is treated exactly like `Unknown` here —
 /// never silently shown as fine — so a link can never read as more durable
 /// than this daemon can actually back up right now (most notably right
 /// after a `--force` override bypassed the durability handoff gate for this
 /// group).
 fn durability_suffix(link: &LinkStatus) -> String {
     match link.durability_status() {
-        GroupDurabilityStatus::Healthy | GroupDurabilityStatus::Syncing => String::new(),
-        GroupDurabilityStatus::DurabilityUnknown | GroupDurabilityStatus::Unspecified => {
+        GroupDurabilityStatus::Protected | GroupDurabilityStatus::Protecting => String::new(),
+        GroupDurabilityStatus::Unknown | GroupDurabilityStatus::Unspecified => {
             "  durability unknown".to_string()
         }
-        GroupDurabilityStatus::KnownMissing => "  durability: known missing".to_string(),
+        GroupDurabilityStatus::AtRisk => "  durability: known missing".to_string(),
     }
 }
 
@@ -581,7 +581,7 @@ mod tests {
             transfer_blocks_done: 0,
             transfer_blocks_total: 0,
             transfer_eta_seconds: 0,
-            durability_status: GroupDurabilityStatus::Healthy as i32,
+            durability_status: GroupDurabilityStatus::Protected as i32,
             policy_stale: false,
             ambiguous: false,
             ambiguous_local_paths: Vec::new(),
@@ -720,14 +720,14 @@ mod tests {
         assert_eq!(degraded_suffix(&link), "  degraded (insufficient free space to write big.bin)");
     }
 
-    /// `Healthy` and `Syncing` are both fine to leave as plain "syncing"
+    /// `Protected` and `Protecting` are both fine to leave as plain "syncing"
     /// text -- neither renders the extra durability suffix.
     #[test]
-    fn healthy_or_syncing_durability_renders_no_new_output() {
+    fn protected_or_protecting_durability_renders_no_new_output() {
         let mut link = base_link();
-        link.durability_status = GroupDurabilityStatus::Healthy as i32;
+        link.durability_status = GroupDurabilityStatus::Protected as i32;
         assert_eq!(durability_suffix(&link), "");
-        link.durability_status = GroupDurabilityStatus::Syncing as i32;
+        link.durability_status = GroupDurabilityStatus::Protecting as i32;
         assert_eq!(durability_suffix(&link), "");
     }
 
@@ -738,22 +738,22 @@ mod tests {
     #[test]
     fn durability_unknown_renders_its_own_suffix() {
         let mut link = base_link();
-        link.durability_status = GroupDurabilityStatus::DurabilityUnknown as i32;
+        link.durability_status = GroupDurabilityStatus::Unknown as i32;
         assert_eq!(durability_suffix(&link), "  durability unknown");
     }
 
     /// A group with a confirmed missing durable holder renders its own,
     /// more severe suffix, distinct from the merely-unconfirmed case above.
     #[test]
-    fn known_missing_durability_renders_its_own_suffix() {
+    fn at_risk_durability_renders_its_own_suffix() {
         let mut link = base_link();
-        link.durability_status = GroupDurabilityStatus::KnownMissing as i32;
+        link.durability_status = GroupDurabilityStatus::AtRisk as i32;
         assert_eq!(durability_suffix(&link), "  durability: known missing");
     }
 
     /// An older daemon that predates this field always sends
     /// `Unspecified` (proto3's zero default) -- this must fail safe and
-    /// render exactly like `DurabilityUnknown`, never like `Healthy`.
+    /// render exactly like `Unknown`, never like `Protected`.
     #[test]
     fn unspecified_durability_fails_safe_like_unknown() {
         let mut link = base_link();

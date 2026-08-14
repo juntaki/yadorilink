@@ -542,7 +542,7 @@ async fn unlink_refused_when_no_lease_obtainable_without_force() {
 
 /// `--force` still overrides the missing-lease refusal: the unlink proceeds
 /// anyway, latching this device's own view of the group to
-/// `DurabilityUnknown` -- matching the pre-existing forced-unlink behavior
+/// `Unknown` -- matching the pre-existing forced-unlink behavior
 /// unchanged by the mandatory-lease requirement (which governs the
 /// non-forced path only).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -559,7 +559,7 @@ async fn unlink_force_proceeds_without_a_lease_and_latches_durability_unknown() 
         .await;
 
     let (_a, b, socket_path) = unlink_setup(&server, true, false).await;
-    // M4: `Healthy` now requires a fresh peer-confirmed custody check
+    // M4: `Protected` now requires a fresh peer-confirmed custody check
     // (`DurabilityConfirmationJob`'s sweep, normally run periodically in
     // the background) rather than this device's own local materialization
     // state alone -- force one round synchronously so the sanity check
@@ -567,7 +567,7 @@ async fn unlink_force_proceeds_without_a_lease_and_latches_durability_unknown() 
     b.state.refresh_custody_confirmation(GROUP).await;
     assert_eq!(
         b.state.group_durability_status(GROUP),
-        GroupDurabilityStatus::Healthy,
+        GroupDurabilityStatus::Protected,
         "sanity check: before the forced unlink, the group must not already read Unknown"
     );
 
@@ -584,9 +584,9 @@ async fn unlink_force_proceeds_without_a_lease_and_latches_durability_unknown() 
     );
     assert_eq!(
         b.state.group_durability_status(GROUP),
-        GroupDurabilityStatus::DurabilityUnknown,
+        GroupDurabilityStatus::Unknown,
         "a forced unlink with no confirmed lease must latch this device's own view of the \
-         group to DurabilityUnknown"
+         group to Unknown"
     );
 
     let requests = server.received_requests().await.unwrap();
@@ -650,7 +650,7 @@ async fn unlink_refused_when_a_target_is_confirmed_but_this_device_has_no_config
 
 /// `--force` still overrides the missing-config refusal for the same
 /// `(Some(target), None-config)` arm: a forced unlink proceeds and latches
-/// `DurabilityUnknown`, proving the new production fail-closed refusal does
+/// `Unknown`, proving the new production fail-closed refusal does
 /// not swallow the `--force` path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unlink_force_proceeds_without_config_and_latches_durability_unknown() {
@@ -671,7 +671,7 @@ async fn unlink_force_proceeds_without_config_and_latches_durability_unknown() {
     b.state.refresh_custody_confirmation(GROUP).await;
     assert_eq!(
         b.state.group_durability_status(GROUP),
-        GroupDurabilityStatus::Healthy,
+        GroupDurabilityStatus::Protected,
         "sanity check: before the forced unlink, the group must not already read Unknown"
     );
 
@@ -688,8 +688,8 @@ async fn unlink_force_proceeds_without_config_and_latches_durability_unknown() {
     );
     assert_eq!(
         b.state.group_durability_status(GROUP),
-        GroupDurabilityStatus::DurabilityUnknown,
-        "a forced unlink with no config/lease must latch this device's view to DurabilityUnknown"
+        GroupDurabilityStatus::Unknown,
+        "a forced unlink with no config/lease must latch this device's view to Unknown"
     );
 
     let requests = server.received_requests().await.unwrap();

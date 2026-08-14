@@ -1,6 +1,6 @@
 //! Owns this device's view of folder-group durability: which groups are
-//! latched `DurabilityUnknown` (a `--force` override bypassed the handoff
-//! gate for that group and its status must not report `Healthy` again
+//! latched `Unknown` (a `--force` override bypassed the handoff
+//! gate for that group and its status must not report `Protected` again
 //! until a real whole-group handoff re-check clears it), the pure
 //! precedence [`classify`] applies to derive a group's status from the
 //! facts `DaemonState` gathers, and the injectable custody confirmer the
@@ -22,16 +22,16 @@
 //! an equivalent judgment from lower-level booleans. Core invariant:
 //! **Durability != Connectivity.** This module never reads
 //! `PeerReachability`, relay route state, or any other connectivity
-//! signal, and must never be changed to. A group being `Healthy` says
+//! signal, and must never be changed to. A group being `Protected` says
 //! nothing about whether it can be fetched *right now*; a peer being
 //! online/reachable/relay-capable says nothing about whether this group is
-//! `Healthy`. See `crate::route::RelayCapability`'s own doc comment for the
+//! `Protected`. See `crate::route::RelayCapability`'s own doc comment for the
 //! parallel invariant on the connectivity side.
 //!
-//! `Healthy` requires real peer-confirmed evidence
+//! `Protected` requires real peer-confirmed evidence
 //! (`DaemonState::full_replica_handoff_ready`, an exact-version-hash,
 //! generation-stability-checked round-trip -- this is ALSO how a
-//! genuinely-empty group reaches `Healthy`, since that function's own real
+//! genuinely-empty group reaches `Protected`, since that function's own real
 //! durability-root enumeration confirms a vacuous root set exactly like a
 //! non-empty one; there is deliberately no separate "does this device's
 //! local file count look like zero" shortcut, since that would miss
@@ -42,7 +42,7 @@
 //! This device's own local materialization completeness is never
 //! sufficient on its own — that was the M4 audit's central finding: a
 //! device with a fully materialized local copy and zero peer confirmation
-//! used to report `Healthy` regardless of whether any peer held the group
+//! used to report `Protected` regardless of whether any peer held the group
 //! at all.
 
 use std::collections::HashMap;
@@ -59,23 +59,21 @@ use yadorilink_replica_engine::custody::CustodyStamp;
 /// pressure, an orthogonal axis). Answers "how safe is my data right now,
 /// from what this daemon can currently confirm" — and must never overstate
 /// safety: a group this daemon has no current basis to back up with a real
-/// confirmation reports `DurabilityUnknown`, never `Healthy`.
+/// confirmation reports `Unknown`, never `Protected`.
 ///
 /// See [`classify`] for how the unlatched default is derived, and
 /// [`DurabilityService::latch_unknown`] for the one place that pins a group
-/// to `DurabilityUnknown` regardless of what it would otherwise derive to.
-/// M4 canonical durability model: `Healthy` == "Protected" (positively
-/// verified), `Syncing` == "Protecting" (verification work in progress),
-/// `DurabilityUnknown` == "Unknown" (cannot currently prove either way),
-/// `KnownMissing` == "AtRisk" (positively known insufficient). Kept under
-/// these variant names for now (M4 Pass 1) rather than renamed outright —
-/// see this module's doc comment; a cosmetic rename to match the
-/// Protected/Protecting/AtRisk/Unknown vocabulary directly is deferred to
-/// M4 Pass 7 cleanup, once every call site (including the wire proto
-/// mirror) can be swept in one pass rather than piecemeal.
+/// to `Unknown` regardless of what it would otherwise derive to.
+/// M4 canonical durability model: `Protected` (positively verified),
+/// `Protecting` (verification work in progress), `Unknown` (cannot
+/// currently prove either way), `AtRisk` (positively known insufficient).
+/// Originally shipped under the names Healthy/Syncing/DurabilityUnknown/
+/// KnownMissing (M4 Pass 1) and renamed to this vocabulary in M4 Pass 7,
+/// once every call site (including the wire proto mirror) could be swept
+/// in one pass rather than piecemeal.
 ///
 /// Critical invariant, load-bearing across every derivation in this file:
-/// `Healthy`/`KnownMissing` must be earned by *peer-confirmed* evidence or
+/// `Protected`/`AtRisk` must be earned by *peer-confirmed* evidence or
 /// a positively-known structural fact — never by this device's own local
 /// state alone. "Durability != Connectivity": nothing here ever reads
 /// `PeerReachability`/relay route state, and this device being reachable
@@ -88,26 +86,26 @@ pub enum GroupDurabilityStatus {
     /// generation-stability-checked peer round-trip) that it holds the
     /// group's entire current durability-root set. Never derived from this
     /// device's own local materialization state alone.
-    Healthy,
+    Protected,
     /// This device is itself a full replica for this group and is still
     /// catching up to head (not every file materialized yet) — durability
     /// work in progress, not yet confirmed, not yet known insufficient.
-    Syncing,
+    Protecting,
     /// Coverage cannot currently be confirmed — either a daemon-wide
     /// "cannot currently confirm" condition applies (latch-table load
     /// failure, unresolved unknown-scope removal, recovery-blocked
     /// membership operation, a `--force`-induced per-group latch), or no
     /// peer full replica is configured to have failed the structural
-    /// `KnownMissing` check but no fresh peer confirmation exists either
+    /// `AtRisk` check but no fresh peer confirmation exists either
     /// (e.g. an On-Demand device whose only full-replica peer hasn't been
     /// reconfirmed since the last sweep). The fail-safe default whenever
     /// this daemon has no other basis to report from.
-    DurabilityUnknown,
+    Unknown,
     /// Positively known insufficient: no device other than this one is
     /// currently configured (netmap-derived) as an authorized-writer full
     /// replica for this group. Not "unconfirmed" — a structural fact that
     /// no amount of waiting for a peer round-trip will resolve on its own.
-    KnownMissing,
+    AtRisk,
 }
 
 /// Whether every current file in a group is already fully materialized
@@ -140,7 +138,7 @@ pub struct DurabilityFacts {
     /// recovery was refused, and this device cannot currently confirm
     /// whether the forced groups it names are durably latched.
     pub recovery_blocked: bool,
-    /// `group_id` is pinned to `DurabilityUnknown` in `DurabilityService`'s
+    /// `group_id` is pinned to `Unknown` in `DurabilityService`'s
     /// own latch table (a `--force` override bypassed the handoff gate for
     /// it), overriding whatever `materialization` would otherwise derive.
     pub latched_unknown: bool,
@@ -158,12 +156,12 @@ pub struct DurabilityFacts {
     /// This device's own storage mode for this group is a full replica
     /// (eager/"store everything") — the only case where local
     /// materialization state (`materialization`) is allowed to influence
-    /// the result at all, and even then only to decide `Syncing`, never
-    /// `Healthy`.
+    /// the result at all, and even then only to decide `Protecting`, never
+    /// `Protected`.
     pub is_local_full_replica: bool,
     /// Netmap-derived, content-blind: at least one device other than this
     /// one is currently configured as an authorized-writer full replica
-    /// for this group. `false` makes `KnownMissing` a positively-known
+    /// for this group. `false` makes `AtRisk` a positively-known
     /// conclusion, not merely "not yet confirmed" -- but only once
     /// `ever_confirmation_swept` is also true (see that field's own doc
     /// comment for why).
@@ -171,10 +169,10 @@ pub struct DurabilityFacts {
     /// A whole-group peer-confirmed custody check
     /// (`full_replica_handoff_ready`) succeeded within this daemon's
     /// staleness bound and under the current membership generation. The
-    /// ONLY source of `Healthy` — see this module's doc comment for why
+    /// ONLY source of `Protected` — see this module's doc comment for why
     /// local materialization state must never substitute for it. This is
     /// ALSO how a genuinely-empty group (nothing to protect) reaches
-    /// `Healthy`: `full_replica_handoff_ready`'s own real durability-root
+    /// `Protected`: `full_replica_handoff_ready`'s own real durability-root
     /// enumeration confirms a vacuous case exactly like a non-empty one,
     /// so there is no separate "group is empty" fact here — deriving
     /// emptiness from this device's own locally-visible file count would
@@ -185,7 +183,7 @@ pub struct DurabilityFacts {
     /// for this group (regardless of whether it confirmed anything).
     /// `false` means this daemon hasn't checked yet at all -- distinct
     /// from "checked and found no confirming peer" -- so `classify` must
-    /// not jump straight to the structural `KnownMissing` conclusion
+    /// not jump straight to the structural `AtRisk` conclusion
     /// before the very first sweep has even had a chance to run (M4 Codex
     /// review #1 findings #1/#2, most visible right after daemon startup).
     pub ever_confirmation_swept: bool,
@@ -198,20 +196,20 @@ pub struct DurabilityFacts {
 /// fail-*safe* property, not an implementation detail:
 /// 1. Any daemon-wide/latched "cannot currently confirm" fact
 ///    (including `group_policy_stale`), or an unreadable materialization
-///    read, wins outright -> `DurabilityUnknown`.
-/// 2. `peer_confirmed_custody` -> `Healthy` (the ONLY path to `Healthy`;
+///    read, wins outright -> `Unknown`.
+/// 2. `peer_confirmed_custody` -> `Protected` (the ONLY path to `Protected`;
 ///    never local materialization alone, never merely "the group looks
 ///    empty locally").
-/// 3. Not yet `ever_confirmation_swept` -> `DurabilityUnknown` (haven't
+/// 3. Not yet `ever_confirmation_swept` -> `Unknown` (haven't
 ///    checked at all yet — could still turn out empty or protected once
 ///    the first sweep runs; must not be reported as known-insufficient).
-/// 4. No other full-replica peer configured -> `KnownMissing` (positively
+/// 4. No other full-replica peer configured -> `AtRisk` (positively
 ///    known insufficient, checked before falling back to "still catching
-///    up" so a lone full replica with no peer never reports `Syncing` as
+///    up" so a lone full replica with no peer never reports `Protecting` as
 ///    if a peer confirmation were merely pending).
 /// 5. This device is itself a full replica still catching up locally ->
-///    `Syncing`.
-/// 6. Otherwise -> `DurabilityUnknown` (a peer full replica is configured
+///    `Protecting`.
+/// 6. Otherwise -> `Unknown` (a peer full replica is configured
 ///    but no fresh confirmation exists yet — e.g. an On-Demand device
 ///    waiting on the next confirmation sweep).
 ///
@@ -226,23 +224,23 @@ pub fn classify(facts: &DurabilityFacts) -> GroupDurabilityStatus {
         || facts.group_policy_stale
         || facts.materialization.is_err()
     {
-        return GroupDurabilityStatus::DurabilityUnknown;
+        return GroupDurabilityStatus::Unknown;
     }
     if facts.peer_confirmed_custody {
-        return GroupDurabilityStatus::Healthy;
+        return GroupDurabilityStatus::Protected;
     }
     if !facts.ever_confirmation_swept {
-        return GroupDurabilityStatus::DurabilityUnknown;
+        return GroupDurabilityStatus::Unknown;
     }
     if !facts.any_other_full_replica_peer_configured {
-        return GroupDurabilityStatus::KnownMissing;
+        return GroupDurabilityStatus::AtRisk;
     }
     if facts.is_local_full_replica
         && matches!(facts.materialization, Ok(MaterializationHealth::Partial))
     {
-        return GroupDurabilityStatus::Syncing;
+        return GroupDurabilityStatus::Protecting;
     }
-    GroupDurabilityStatus::DurabilityUnknown
+    GroupDurabilityStatus::Unknown
 }
 
 /// Confirms whether a full replica durably holds an exact file version — bound
@@ -297,17 +295,17 @@ impl DurabilityService {
         }
     }
 
-    /// Pins `group_id` to [`GroupDurabilityStatus::DurabilityUnknown`],
+    /// Pins `group_id` to [`GroupDurabilityStatus::Unknown`],
     /// overriding whatever [`classify_unlatched`] would otherwise derive.
     /// Idempotent — latching an already-latched group is a no-op.
     pub fn latch_unknown(&self, group_id: &str) {
         self.group_durability_latch
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(group_id.to_string(), GroupDurabilityStatus::DurabilityUnknown);
+            .insert(group_id.to_string(), GroupDurabilityStatus::Unknown);
     }
 
-    /// Clears a previously-latched `DurabilityUnknown` override for
+    /// Clears a previously-latched `Unknown` override for
     /// `group_id`, if any -- a no-op if it wasn't latched.
     pub fn clear_unknown(&self, group_id: &str) {
         self.group_durability_latch
@@ -426,42 +424,42 @@ mod tests {
         // each win outright, regardless of every other fact.
         assert_eq!(
             classify(&DurabilityFacts { latch_load_failed: true, ..protected_full_replica_facts() }),
-            GroupDurabilityStatus::DurabilityUnknown
+            GroupDurabilityStatus::Unknown
         );
         assert_eq!(
             classify(&DurabilityFacts { scope_unknown: true, ..protected_full_replica_facts() }),
-            GroupDurabilityStatus::DurabilityUnknown
+            GroupDurabilityStatus::Unknown
         );
         assert_eq!(
             classify(&DurabilityFacts { recovery_blocked: true, ..protected_full_replica_facts() }),
-            GroupDurabilityStatus::DurabilityUnknown
+            GroupDurabilityStatus::Unknown
         );
         assert_eq!(
             classify(&DurabilityFacts { latched_unknown: true, ..protected_full_replica_facts() }),
-            GroupDurabilityStatus::DurabilityUnknown
+            GroupDurabilityStatus::Unknown
         );
         // group_policy_stale wins outright too, even with an otherwise
         // fresh, current-generation peer confirmation -- an untrusted
         // authorization snapshot invalidates any confirmation it produced.
         assert_eq!(
             classify(&DurabilityFacts { group_policy_stale: true, ..protected_full_replica_facts() }),
-            GroupDurabilityStatus::DurabilityUnknown
+            GroupDurabilityStatus::Unknown
         );
         // Unreadable materialization wins outright too, even with an
         // otherwise-confirmed peer.
         assert_eq!(
             classify(&DurabilityFacts { materialization: unreadable, ..protected_full_replica_facts() }),
-            GroupDurabilityStatus::DurabilityUnknown
+            GroupDurabilityStatus::Unknown
         );
 
-        // Fresh peer confirmation is Healthy -- the ONLY path (whether it
+        // Fresh peer confirmation is Protected -- the ONLY path (whether it
         // came from a real full replica or a vacuous "group is empty"
         // confirmation is invisible at this layer; both set
         // peer_confirmed_custody the same way).
-        assert_eq!(classify(&protected_full_replica_facts()), GroupDurabilityStatus::Healthy);
+        assert_eq!(classify(&protected_full_replica_facts()), GroupDurabilityStatus::Protected);
 
         // Never swept yet (daemon just started, no round has run) must NOT
-        // jump to KnownMissing even with zero peers configured -- it
+        // jump to AtRisk even with zero peers configured -- it
         // hasn't been checked, so it might turn out empty or protected.
         assert_eq!(
             classify(&DurabilityFacts {
@@ -470,13 +468,13 @@ mod tests {
                 ever_confirmation_swept: false,
                 ..protected_full_replica_facts()
             }),
-            GroupDurabilityStatus::DurabilityUnknown
+            GroupDurabilityStatus::Unknown
         );
 
         // Local materialization alone, with NO peer confirmation, NO other
         // full-replica peer configured, but AT LEAST ONE sweep round
-        // already run, must NOT be Healthy -- this is the exact conflation
-        // the M4 audit found and this derivation fixes. It's KnownMissing:
+        // already run, must NOT be Protected -- this is the exact conflation
+        // the M4 audit found and this derivation fixes. It's AtRisk:
         // structurally no peer can ever confirm it.
         assert_eq!(
             classify(&DurabilityFacts {
@@ -485,7 +483,7 @@ mod tests {
                 ever_confirmation_swept: true,
                 ..protected_full_replica_facts()
             }),
-            GroupDurabilityStatus::KnownMissing
+            GroupDurabilityStatus::AtRisk
         );
 
         // A peer IS configured but hasn't confirmed yet: Unknown for an
@@ -497,9 +495,9 @@ mod tests {
                 materialization: partial,
                 ..protected_full_replica_facts()
             }),
-            GroupDurabilityStatus::DurabilityUnknown
+            GroupDurabilityStatus::Unknown
         );
-        // ...but Syncing for a full-replica device still catching up
+        // ...but Protecting for a full-replica device still catching up
         // locally.
         assert_eq!(
             classify(&DurabilityFacts {
@@ -508,23 +506,23 @@ mod tests {
                 materialization: partial,
                 ..protected_full_replica_facts()
             }),
-            GroupDurabilityStatus::Syncing
+            GroupDurabilityStatus::Protecting
         );
         // A full-replica device that's ALREADY fully caught up locally but
-        // has no fresh peer confirmation is Unknown, not Healthy -- local
+        // has no fresh peer confirmation is Unknown, not Protected -- local
         // completeness alone never proves group-wide coverage.
         assert_eq!(
             classify(&DurabilityFacts { peer_confirmed_custody: false, ..protected_full_replica_facts() }),
-            GroupDurabilityStatus::DurabilityUnknown
+            GroupDurabilityStatus::Unknown
         );
     }
 
     /// M4 acceptance requirement: an On-Demand client (not itself a full
     /// replica) whose group has a fresh peer-confirmed full replica must
-    /// report `Healthy` ("Protected") -- durability is a group-wide fact,
+    /// report `Protected` ("Protected") -- durability is a group-wide fact,
     /// never gated on THIS device's own local storage mode.
     #[test]
-    fn on_demand_device_with_confirmed_peer_replica_is_healthy() {
+    fn on_demand_device_with_confirmed_peer_replica_is_protected() {
         let facts = DurabilityFacts {
             latch_load_failed: false,
             scope_unknown: false,
@@ -539,19 +537,19 @@ mod tests {
         };
         assert_eq!(
             classify(&facts),
-            GroupDurabilityStatus::Healthy,
+            GroupDurabilityStatus::Protected,
             "an On-Demand device's own permanently-partial local materialization must never \
-             prevent Healthy once a peer positively confirms whole-group coverage"
+             prevent Protected once a peer positively confirms whole-group coverage"
         );
     }
 
     /// M4 acceptance requirement: a relay-reachable peer with no verified
-    /// custody must never read as `Healthy` -- this module has no way to
+    /// custody must never read as `Protected` -- this module has no way to
     /// even express "reachable" (no `DurabilityFacts` field for it), so
     /// this pins that a peer being configured/reachable is never, on its
     /// own, sufficient without `peer_confirmed_custody`.
     #[test]
-    fn configured_peer_without_confirmation_is_not_healthy() {
+    fn configured_peer_without_confirmation_is_not_protected() {
         let facts = DurabilityFacts {
             peer_confirmed_custody: false,
             any_other_full_replica_peer_configured: true,
@@ -559,7 +557,7 @@ mod tests {
         };
         assert_ne!(
             classify(&facts),
-            GroupDurabilityStatus::Healthy,
+            GroupDurabilityStatus::Protected,
             "a configured/reachable peer must never substitute for a real custody confirmation"
         );
     }
@@ -570,13 +568,13 @@ mod tests {
         service.latch_unknown("group-1");
         assert_eq!(
             service.classify("group-1", protected_full_replica_facts()),
-            GroupDurabilityStatus::DurabilityUnknown,
-            "a latched group must report DurabilityUnknown even when every fact looks healthy"
+            GroupDurabilityStatus::Unknown,
+            "a latched group must report Unknown even when every fact looks healthy"
         );
         service.clear_unknown("group-1");
         assert_eq!(
             service.classify("group-1", protected_full_replica_facts()),
-            GroupDurabilityStatus::Healthy,
+            GroupDurabilityStatus::Protected,
             "clearing the latch must let the unlatched derivation decide again"
         );
     }

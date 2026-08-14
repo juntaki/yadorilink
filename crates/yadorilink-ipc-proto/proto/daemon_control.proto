@@ -93,7 +93,7 @@ message LinkStatus {
   // group's data right now, from what this daemon can currently confirm."
   // Additive; `GROUP_DURABILITY_STATUS_UNSPECIFIED` (0) on a daemon that
   // predates this field, which a client should treat the same as
-  // `GROUP_DURABILITY_STATUS_DURABILITY_UNKNOWN` rather than assume the
+  // `GROUP_DURABILITY_STATUS_UNKNOWN` rather than assume the
   // group is fine.
   GroupDurabilityStatus durability_status = 26;
   // Whether this daemon currently distrusts this group's policy state: the
@@ -171,8 +171,7 @@ enum FetchAvailability {
   FETCH_AVAILABILITY_UNAVAILABLE_NOW = 2;
   // This daemon cannot currently vouch for either answer -- the same
   // daemon-wide "cannot currently confirm" condition that gates
-  // `LinkStatus.durability_status` to `GROUP_DURABILITY_STATUS_
-  // DURABILITY_UNKNOWN`.
+  // `LinkStatus.durability_status` to `GROUP_DURABILITY_STATUS_UNKNOWN`.
   FETCH_AVAILABILITY_UNKNOWN = 3;
 }
 
@@ -181,26 +180,26 @@ enum FetchAvailability {
 // disk-pressure `degraded` field above. Answers "how safe is my data right
 // now," and must never overstate safety: a status this daemon cannot
 // currently back up with a real confirmation reports
-// `DURABILITY_UNKNOWN`, never `HEALTHY`.
+// `UNKNOWN`, never `PROTECTED`.
 enum GroupDurabilityStatus {
   // Fail-safe default (also what an older daemon that predates this field
-  // always sends): treat exactly like `DURABILITY_UNKNOWN`, never as
-  // `HEALTHY`.
+  // always sends): treat exactly like `UNKNOWN`, never as
+  // `PROTECTED`.
   GROUP_DURABILITY_STATUS_UNSPECIFIED = 0;
   // This device or a confirmed peer is a whole-group full replica for the
   // current head.
-  GROUP_DURABILITY_STATUS_HEALTHY = 1;
+  GROUP_DURABILITY_STATUS_PROTECTED = 1;
   // Configured for this group but still catching up to head (not every
   // file materialized yet).
-  GROUP_DURABILITY_STATUS_SYNCING = 2;
+  GROUP_DURABILITY_STATUS_PROTECTING = 2;
   // Coverage cannot currently be confirmed -- most notably, right after a
   // `--force` override bypassed the durability handoff gate, until a later
   // handoff check positively reconfirms whole-group coverage. Must render
-  // as its own state, never as `HEALTHY`.
-  GROUP_DURABILITY_STATUS_DURABILITY_UNKNOWN = 3;
+  // as its own state, never as `PROTECTED`.
+  GROUP_DURABILITY_STATUS_UNKNOWN = 3;
   // A current file is confirmed to have no durable holder reachable
   // anywhere -- a positive negative, not merely "unconfirmed."
-  GROUP_DURABILITY_STATUS_KNOWN_MISSING = 4;
+  GROUP_DURABILITY_STATUS_AT_RISK = 4;
 }
 
 // One in-flight file transfer's

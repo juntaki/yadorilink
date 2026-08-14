@@ -69,7 +69,7 @@ pub(crate) enum FetchAvailability {
     UnavailableNow,
     /// This daemon cannot currently vouch for either answer (the same
     /// daemon-wide "cannot currently confirm" condition that gates
-    /// `durability_status` to `DurabilityUnknown` -- see
+    /// `durability_status` to `Unknown` -- see
     /// `DaemonState::daemon_wide_evidence_uncertain`).
     Unknown,
 }
