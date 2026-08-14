@@ -49,7 +49,13 @@ pub mod recovery_evidence;
 pub mod recovery_snapshot;
 pub mod relay_carrier;
 pub mod relay_forwarder;
+// Rust 1.97's doc_lazy_continuation lint treats explanatory paragraphs after
+// numbered security-review lists as malformed list continuations. These two
+// M3 relay modules intentionally keep those review notes as prose; scope the
+// compatibility allowance here rather than weakening the workspace lint gate.
+#[allow(clippy::doc_lazy_continuation)]
 pub mod relay_grant;
+#[allow(clippy::doc_lazy_continuation)]
 pub mod relay_session;
 pub mod relay_session_handler;
 /// `ReplicaCoordinator` (Phase 7D-10.2) -- see that module's own doc
