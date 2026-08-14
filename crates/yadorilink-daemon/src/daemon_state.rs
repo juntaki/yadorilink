@@ -93,10 +93,10 @@ fn default_materialization_repair_sweep_interval() -> Duration {
 const CUSTODY_CONFIRMATION_SWEEP_INTERVAL: Duration = Duration::from_secs(90);
 
 /// How stale a `custody_confirmation_cache` entry may be before
-/// `group_durability_status` stops trusting it as `Healthy` evidence — 3x
+/// `group_durability_status` stops trusting it as `Protected` evidence — 3x
 /// `CUSTODY_CONFIRMATION_SWEEP_INTERVAL`, so one missed sweep round (a
 /// transient peer hiccup, a slow round-trip) doesn't immediately flip a
-/// genuinely-protected group to `DurabilityUnknown`. Deliberately NOT
+/// genuinely-protected group to `Unknown`. Deliberately NOT
 /// unbounded: past this bound the evidence is old enough that "was
 /// protected" stops standing in for "is protected now" — see this module's
 /// M4 durability-model doc for why stale evidence must never be reported as
@@ -129,7 +129,7 @@ fn default_custody_confirmation_sweep_interval() -> Duration {
 /// has_ever_been_custody_swept`) independent of whether that most recent
 /// round actually confirmed anything — see M4 Codex review #1 findings #1
 /// and #2 for why conflating "never checked yet" with "checked and found
-/// nothing" produced both a false-`Healthy` and a false-`KnownMissing` bug.
+/// nothing" produced both a false-`Protected` and a false-`AtRisk` bug.
 #[derive(Debug, Clone)]
 pub(crate) enum CustodyConfirmationOutcome {
     /// `full_replica_handoff_ready_digest_and_peer` returned `Some`.
@@ -677,8 +677,8 @@ pub struct DaemonState {
     /// recent whole-group peer-confirmed custody evidence, if any, plus an
     /// epoch counter) -- populated by `DurabilityConfirmationJob`'s
     /// periodic sweep. `group_durability_status` only trusts a record here
-    /// as `Healthy` evidence within `CUSTODY_CONFIRMATION_STALENESS_BOUND`
-    /// of its confirmation time -- this is what lets `Healthy` mean "a
+    /// as `Protected` evidence within `CUSTODY_CONFIRMATION_STALENESS_BOUND`
+    /// of its confirmation time -- this is what lets `Protected` mean "a
     /// peer positively confirmed whole-group coverage recently," not "this
     /// device's own local copy looks complete" (the conflation M4's audit
     /// found in the prior derivation). The epoch and the record share ONE
@@ -820,12 +820,12 @@ pub struct DaemonState {
     /// This device's durability confirmation/latch state -- see
     /// `crate::durability_service::DurabilityService`'s own doc comment.
     /// `durability.group_durability_latch`: group_id -> latched
-    /// `DurabilityUnknown` override, set by
+    /// `Unknown` override, set by
     /// [`Self::latch_group_durability_unknown`] whenever a force override
     /// bypasses this daemon's own durability handoff gate for that group.
-    /// A group with NO entry here is not thereby "Healthy" — its status is
+    /// A group with NO entry here is not thereby "Protected" — its status is
     /// still derived live (see [`Self::group_durability_status`]); presence
-    /// here only ever pins a group to `DurabilityUnknown` until a later
+    /// here only ever pins a group to `Unknown` until a later
     /// whole-group handoff re-check clears it. The set is loaded from and
     /// written through `SyncState` so force history survives restart.
     durability: Arc<crate::durability_service::DurabilityService>,
@@ -835,7 +835,7 @@ pub struct DaemonState {
     /// verified list of groups at risk). Since the AT-RISK GROUPS are
     /// themselves unknown, this cannot be expressed as a per-group latch —
     /// it forces every group's `group_durability_status` to
-    /// `DurabilityUnknown` until a reconciliation pass narrows the scope
+    /// `Unknown` until a reconciliation pass narrows the scope
     /// down to real per-group latches and clears this flag. Loaded from
     /// `SyncState` at startup so it survives a restart, matching
     /// `durability_latch_load_failed`'s own persistence.
@@ -1339,7 +1339,7 @@ impl DaemonState {
             durability: Arc::new(crate::durability_service::DurabilityService::new(
                 persisted_durability_latches
                     .into_iter()
-                    .map(|group_id| (group_id, GroupDurabilityStatus::DurabilityUnknown))
+                    .map(|group_id| (group_id, GroupDurabilityStatus::Unknown))
                     .collect(),
             )),
             durability_latch_load_failed: AtomicBool::new(durability_latch_load_failed),
@@ -2065,12 +2065,12 @@ impl DaemonState {
         self.links.degraded_info(local_path)
     }
 
-    /// Pins `group_id` to [`GroupDurabilityStatus::DurabilityUnknown`],
+    /// Pins `group_id` to [`GroupDurabilityStatus::Unknown`],
     /// overriding whatever it would otherwise derive to. The one call site
     /// today is `control_socket::ensure_unlink_keeps_a_full_replica`'s
     /// `--force` bypass: once this device's own durability handoff gate has
     /// been overridden for a group, the group's remaining local replica
-    /// must not be able to report `Healthy` again until a real re-check
+    /// must not be able to report `Protected` again until a real re-check
     /// says so, even if, moment to moment, its files happen to look fully
     /// materialized. Idempotent — latching an already-latched group is a
     /// no-op.
@@ -2085,7 +2085,7 @@ impl DaemonState {
         Ok(())
     }
 
-    /// Clears a previously-latched `DurabilityUnknown` override for
+    /// Clears a previously-latched `Unknown` override for
     /// `group_id`, if any — meant to be called once a positive
     /// whole-group handoff re-confirmation is observed for it (today:
     /// [`Self::full_replica_handoff_ready`]'s own success path calls this
@@ -2132,7 +2132,7 @@ impl DaemonState {
     /// Whether this daemon currently has any daemon-wide or group-scoped
     /// reason to distrust its own evidence for `group_id` -- the exact
     /// same fact set `group_durability_status` folds into its own
-    /// fail-closed `DurabilityUnknown` branch, exposed separately so
+    /// fail-closed `Unknown` branch, exposed separately so
     /// OTHER derivations that must fail closed the same way (M4 Pass 2:
     /// `FetchAvailability`) can reuse it instead of re-deriving an
     /// equivalent-but-possibly-drifting copy of the same precedence.
@@ -2146,7 +2146,7 @@ impl DaemonState {
                 .unwrap_or(true)
             || self.is_group_policy_stale(group_id)
             // The per-group post-`--force` latch (`durability.is_latched_unknown`)
-            // is folded into `group_durability_status`'s own `DurabilityUnknown`
+            // is folded into `group_durability_status`'s own `Unknown`
             // branch via `DurabilityService::classify` (not visible in this
             // free function's own fact list, since that method fills it in
             // internally) -- it belongs here too: a `--force` override that
@@ -2162,9 +2162,9 @@ impl DaemonState {
     /// above if one is set, otherwise a value derived live from
     /// `custody_confirmation_cache` (a real, periodically-refreshed
     /// peer-confirmed whole-group check -- see `DurabilityConfirmationJob`)
-    /// plus this device's own sync state. `Healthy` requires a fresh cache
+    /// plus this device's own sync state. `Protected` requires a fresh cache
     /// entry; this device's own materialization completeness alone never
-    /// produces it (only `Syncing`, for a full-replica device still
+    /// produces it (only `Protecting`, for a full-replica device still
     /// catching up locally) -- see `crate::durability_service`'s own M4
     /// model doc comment. This method itself never performs a live peer
     /// round-trip (too costly to run on every `status` call); it only ever
@@ -2183,7 +2183,7 @@ impl DaemonState {
         // from its own latch table, which this method never touches
         // directly.
         //
-        // `Healthy` evidence comes ONLY from a fresh `custody_confirmation_
+        // `Protected` evidence comes ONLY from a fresh `custody_confirmation_
         // cache` entry -- a real peer-confirmed whole-group check
         // (`full_replica_handoff_ready`, run periodically by
         // `DurabilityConfirmationJob`, which ALSO covers the vacuous
@@ -2193,11 +2193,11 @@ impl DaemonState {
         // files and would miss retained/trash-restorable durability roots
         // an empty-looking group might still have). This device's OWN
         // materialization completeness (`is_local_full_replica` +
-        // `materialization`) is deliberately kept out of the `Healthy`
-        // path entirely -- it only ever feeds `Syncing`, for the case
+        // `materialization`) is deliberately kept out of the `Protected`
+        // path entirely -- it only ever feeds `Protecting`, for the case
         // where this device itself is a full replica still catching up to
         // head. This is the M4 fix for the prior derivation, which
-        // reported `Healthy` from local materialization alone and never
+        // reported `Protected` from local materialization alone and never
         // consulted any peer.
         let counts = self
             .replica_coordinator
@@ -2212,7 +2212,7 @@ impl DaemonState {
         };
         // Used ONLY to gate a vacuous (no-peer) custody confirmation's
         // freshness -- see `has_fresh_custody_confirmation`'s own doc
-        // comment. Never used as a `Healthy` fact on its own (that's
+        // comment. Never used as a `Protected` fact on its own (that's
         // exactly the conflation this M4 pass fixes).
         let group_currently_empty = matches!(
             &counts,
@@ -2890,13 +2890,13 @@ impl DaemonState {
     /// confirmation specifically -- this device's own current
     /// materialization view of the group still looks empty too. That last
     /// condition is what stops a group that goes empty -> non-empty from
-    /// riding a stale vacuous confirmation as `Healthy` for up to the full
+    /// riding a stale vacuous confirmation as `Protected` for up to the full
     /// staleness bound: a new file's DAG record reaches every group member
     /// well before the next confirmation sweep tick, so this device's own
     /// materialization view moves off "empty" almost immediately, even
     /// though it says nothing about the file's own hydration/custody state
     /// (M4 Codex review #1 follow-up, finding #2). `group_durability_
-    /// status`'s only source of `Healthy` evidence -- see this cache's own
+    /// status`'s only source of `Protected` evidence -- see this cache's own
     /// doc comment for why local materialization state must never
     /// otherwise substitute for it.
     fn has_fresh_custody_confirmation(&self, group_id: &str, group_currently_empty: bool) -> bool {
@@ -2918,7 +2918,7 @@ impl DaemonState {
     /// Whether `group_id` has had at least one `DurabilityConfirmationJob`
     /// sweep round run for it, ever (not staleness-bounded — this only
     /// exists to distinguish "never checked yet" from "checked and found
-    /// nothing," so `classify` doesn't jump straight to `KnownMissing`
+    /// nothing," so `classify` doesn't jump straight to `AtRisk`
     /// during the narrow startup window before the first sweep tick has
     /// even run once — M4 Codex review #1 findings #1/#2).
     fn has_ever_been_custody_swept(&self, group_id: &str) -> bool {
@@ -3001,7 +3001,7 @@ impl DaemonState {
 
     /// Whether any device OTHER than this one is currently recorded
     /// (netmap-derived, content-blind) as an authorized-writer full replica
-    /// of `group_id` — the structural fact that makes `KnownMissing`
+    /// of `group_id` — the structural fact that makes `AtRisk`
     /// (M4's `AtRisk`) a positively-known conclusion rather than merely
     /// "not yet confirmed": with zero such peers configured, no amount of
     /// waiting for `DurabilityConfirmationJob` will ever produce a
@@ -3037,7 +3037,7 @@ impl DaemonState {
     /// M4 Pass 2: whether this group has REAL content-confirmed peer
     /// custody evidence (the same fresh, staleness/generation-bound
     /// `custody_confirmation_cache` entry Pass 1 built for durability's
-    /// `Healthy`) whose confirming peer is ALSO currently reachable.
+    /// `Protected`) whose confirming peer is ALSO currently reachable.
     /// `fetch_availability`'s only source of peer-served `AvailableNow`
     /// evidence for content not already hydrated locally.
     ///
@@ -3449,7 +3449,7 @@ impl DaemonState {
     /// Re-derives `unknown_scope_membership_marker` from the journal —
     /// called after any delete/settle that might have resolved the last
     /// outstanding `Unknown`-durability-scope row, so `group_durability_status`
-    /// stops forcing `DurabilityUnknown` account-wide once every such row is
+    /// stops forcing `Unknown` account-wide once every such row is
     /// resolved.
     fn refresh_unknown_scope_membership_marker(&self) {
         let still_present = self
@@ -4036,7 +4036,7 @@ impl DaemonState {
         // set. Fail closed if the enumeration itself errors.
         let roots = self.durability_roots_for_group(group_id)?;
         // Nothing to hand off — vacuously ready. Deliberately does NOT clear a
-        // post-force `DurabilityUnknown` latch: an empty root set is not a
+        // post-force `Unknown` latch: an empty root set is not a
         // positive coverage confirmation (an all-deleted, retention-expired
         // group looks the same as one that genuinely never had files), so
         // clearing here could hide exactly the uncertainty the latch was set
@@ -4056,7 +4056,7 @@ impl DaemonState {
             }
             if self.peer_holds_entire_group(&peer_id, &session, group_id, &roots.roots).await {
                 // A whole-group handoff target is confirmed again: any
-                // post-force `DurabilityUnknown` latch for this group no
+                // post-force `Unknown` latch for this group no
                 // longer reflects reality, so clear it back toward
                 // whatever the group's live sync state now derives to.
                 if let Err(error) = self.clear_group_durability_latch(group_id) {
@@ -4647,7 +4647,7 @@ mod tests {
     /// A vacuous (no-peer) confirmation only counts as fresh while this
     /// device's own materialization view of the group still looks empty
     /// too -- otherwise a group going empty -> non-empty could ride a
-    /// stale vacuous confirmation as `Healthy` for up to the full
+    /// stale vacuous confirmation as `Protected` for up to the full
     /// staleness bound (M4 Codex review #1 follow-up, finding #2).
     #[tokio::test]
     async fn vacuous_confirmation_requires_group_still_currently_empty() {
@@ -4776,8 +4776,8 @@ mod tests {
     /// under a SECOND `DaemonState` (genuinely fresh in-process fields,
     /// same persisted on-disk state -- not merely a second `DaemonState`
     /// sharing one still-open in-memory connection), must never let a
-    /// group that was `Healthy` under the first process instance keep
-    /// reading `Healthy` under the second before a real post-restart
+    /// group that was `Protected` under the first process instance keep
+    /// reading `Protected` under the second before a real post-restart
     /// confirmation sweep has run. This is the exact invariant Pass 5
     /// requires ("never flash/retain a stale Protected state solely
     /// because the last process said Protected") -- and it holds here
@@ -4788,13 +4788,13 @@ mod tests {
     /// start") cannot silently reintroduce a stale-Protected-across-
     /// restart bug without breaking a named test.
     ///
-    /// Asserts the EXACT expected state (`DurabilityUnknown`), not merely
-    /// `!= Healthy` -- Pass 5 also forbids manufacturing `KnownMissing`
+    /// Asserts the EXACT expected state (`Unknown`), not merely
+    /// `!= Protected` -- Pass 5 also forbids manufacturing `AtRisk`
     /// (AtRisk) purely from the startup uncertainty window, so a
     /// regression landing there must fail this test too (M4 Pass 5 Codex
     /// review follow-up).
     #[tokio::test]
-    async fn restart_never_shows_a_stale_healthy_status() {
+    async fn restart_never_shows_a_stale_protected_status() {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
         let db_dir = tempfile::tempdir().unwrap();
@@ -4804,7 +4804,7 @@ mod tests {
         // a REAL sweep round (`refresh_custody_confirmation`, not a
         // manually-planted cache entry) against a genuinely empty group --
         // `full_replica_handoff_ready` confirms an empty root set
-        // vacuously, without needing a live peer -- and observe Healthy.
+        // vacuously, without needing a live peer -- and observe Protected.
         {
             let coordinator = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
             let first = DaemonState::new("device-a".into(), coordinator, store.clone());
@@ -4816,8 +4816,8 @@ mod tests {
             first.refresh_custody_confirmation("group-1").await;
             assert_eq!(
                 first.group_durability_status("group-1"),
-                GroupDurabilityStatus::Healthy,
-                "sanity check: the first process instance genuinely observes Healthy after \
+                GroupDurabilityStatus::Protected,
+                "sanity check: the first process instance genuinely observes Protected after \
                  a real confirmation sweep"
             );
         } // `first` and its `coordinator` are dropped here -- the DB file
@@ -4830,9 +4830,9 @@ mod tests {
         let second = DaemonState::new("device-a".into(), coordinator, store);
         assert_eq!(
             second.group_durability_status("group-1"),
-            GroupDurabilityStatus::DurabilityUnknown,
-            "a fresh process must report DurabilityUnknown (never Healthy, and never \
-             KnownMissing/AtRisk) for a group before its OWN confirmation sweep has run, \
+            GroupDurabilityStatus::Unknown,
+            "a fresh process must report Unknown (never Protected, and never \
+             AtRisk/AtRisk) for a group before its OWN confirmation sweep has run, \
              even though the prior process instance had just confirmed it"
         );
     }
@@ -5498,7 +5498,7 @@ mod tests {
 
         assert_eq!(
             restarted.group_durability_status("group-1"),
-            GroupDurabilityStatus::DurabilityUnknown,
+            GroupDurabilityStatus::Unknown,
             "force history must remain latched after reopening the durable index"
         );
         restarted.clear_group_durability_latch("group-1").unwrap();

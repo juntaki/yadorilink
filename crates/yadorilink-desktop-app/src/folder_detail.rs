@@ -31,10 +31,10 @@ use yadorilink_ipc_proto::daemonctl::{
 /// connectivity, storage mode, or anything else.
 pub fn data_protection_label(link: &LinkStatus) -> &'static str {
     match link.durability_status() {
-        GroupDurabilityStatus::Healthy => "Protected",
-        GroupDurabilityStatus::Syncing => "Protecting",
-        GroupDurabilityStatus::KnownMissing => "At risk",
-        GroupDurabilityStatus::DurabilityUnknown | GroupDurabilityStatus::Unspecified => {
+        GroupDurabilityStatus::Protected => "Protected",
+        GroupDurabilityStatus::Protecting => "Protecting",
+        GroupDurabilityStatus::AtRisk => "At risk",
+        GroupDurabilityStatus::Unknown | GroupDurabilityStatus::Unspecified => {
             "Status unavailable"
         }
     }
@@ -48,13 +48,13 @@ pub fn data_protection_label(link: &LinkStatus) -> &'static str {
 /// upstream; this function just picks which sentence to show).
 pub fn data_protection_detail(link: &LinkStatus) -> Option<&'static str> {
     match (link.durability_status(), link.fetch_availability()) {
-        (GroupDurabilityStatus::Healthy, FetchAvailability::UnavailableNow) => {
+        (GroupDurabilityStatus::Protected, FetchAvailability::UnavailableNow) => {
             Some("Your data is protected, but no device that holds it is reachable right now.")
         }
-        (GroupDurabilityStatus::KnownMissing, _) => {
+        (GroupDurabilityStatus::AtRisk, _) => {
             Some("No other device is configured to keep a full copy of this folder.")
         }
-        (GroupDurabilityStatus::DurabilityUnknown | GroupDurabilityStatus::Unspecified, _) => {
+        (GroupDurabilityStatus::Unknown | GroupDurabilityStatus::Unspecified, _) => {
             Some("This device cannot currently confirm whether this folder is protected.")
         }
         _ => None,
@@ -195,7 +195,7 @@ mod tests {
         LinkStatus {
             local_path: "/Users/alice/Photos".into(),
             group_id: "group-1".into(),
-            durability_status: GroupDurabilityStatus::Healthy as i32,
+            durability_status: GroupDurabilityStatus::Protected as i32,
             local_storage_state: LocalStorageState::FullCopy as i32,
             fetch_availability: FetchAvailability::AvailableNow as i32,
             ..Default::default()
@@ -214,13 +214,13 @@ mod tests {
     #[test]
     fn data_protection_maps_every_durability_state() {
         let mut link = base_link();
-        link.durability_status = GroupDurabilityStatus::Healthy as i32;
+        link.durability_status = GroupDurabilityStatus::Protected as i32;
         assert_eq!(data_protection_label(&link), "Protected");
-        link.durability_status = GroupDurabilityStatus::Syncing as i32;
+        link.durability_status = GroupDurabilityStatus::Protecting as i32;
         assert_eq!(data_protection_label(&link), "Protecting");
-        link.durability_status = GroupDurabilityStatus::KnownMissing as i32;
+        link.durability_status = GroupDurabilityStatus::AtRisk as i32;
         assert_eq!(data_protection_label(&link), "At risk");
-        link.durability_status = GroupDurabilityStatus::DurabilityUnknown as i32;
+        link.durability_status = GroupDurabilityStatus::Unknown as i32;
         assert_eq!(data_protection_label(&link), "Status unavailable");
         link.durability_status = GroupDurabilityStatus::Unspecified as i32;
         assert_eq!(
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn protected_but_unavailable_gets_the_non_alarmist_detail_line() {
         let mut link = base_link();
-        link.durability_status = GroupDurabilityStatus::Healthy as i32;
+        link.durability_status = GroupDurabilityStatus::Protected as i32;
         link.fetch_availability = FetchAvailability::UnavailableNow as i32;
         assert_eq!(
             data_protection_detail(&link),
@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn healthy_and_available_has_no_detail_line() {
+    fn protected_and_available_has_no_detail_line() {
         let link = base_link();
         assert_eq!(data_protection_detail(&link), None);
     }
@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn durability_is_independent_of_connectivity() {
         let mut link = base_link();
-        link.durability_status = GroupDurabilityStatus::Healthy as i32;
+        link.durability_status = GroupDurabilityStatus::Protected as i32;
         link.fetch_availability = FetchAvailability::UnavailableNow as i32;
         link.full_replica_device_ids = vec!["nas-1".into()];
         let mut peer = base_peer("nas-1");
