@@ -848,7 +848,22 @@ message UnpinResponse {}
 message EvictRequest {
   string absolute_path = 1;
 }
-message EvictResponse {}
+// M4 Pass 4: previously empty -- an `Evict` request that daemon-side
+// silently did nothing (the file was pinned, busy, not yet fully synced,
+// or its on-disk identity changed right before the commit) still returned
+// this bare-success message, so `yadorilink evict` printed "Evicted"
+// regardless of what actually happened. `dehydrated` is the one fact that
+// closes that gap: a client must not claim success without checking it.
+message EvictResponse {
+  // Whether the file was actually reduced to a placeholder. `false` means
+  // nothing was freed -- the file is exactly as it was before the
+  // request, for one of several possible reasons this response does not
+  // further distinguish (pinned, busy, not yet `Hydrated`, or changed on
+  // disk right before the commit).
+  bool dehydrated = 1;
+  uint64 blocks_reclaimed = 2;
+  uint64 bytes_reclaimed = 3;
+}
 
 // A lightweight liveness/health surface,
 // separate from `StatusResponse` (which is about *sync* status —
