@@ -93,7 +93,7 @@ message LinkStatus {
   // group's data right now, from what this daemon can currently confirm."
   // Additive; `GROUP_DURABILITY_STATUS_UNSPECIFIED` (0) on a daemon that
   // predates this field, which a client should treat the same as
-  // `GROUP_DURABILITY_STATUS_DURABILITY_UNKNOWN` rather than assume the
+  // `GROUP_DURABILITY_STATUS_UNKNOWN` rather than assume the
   // group is fine.
   GroupDurabilityStatus durability_status = 26;
   // Whether this daemon currently distrusts this group's policy state: the
@@ -115,6 +115,64 @@ message LinkStatus {
   // this field and on a healthy group.
   bool ambiguous = 28;
   repeated string ambiguous_local_paths = 29;
+  // M4 Pass 2: this device's TRUTHFUL current local storage state --
+  // distinct from `materialization_policy` (the CONFIGURED target), which
+  // only says what this device is trying to become, not what it currently
+  // holds. A client must read this field directly rather than inferring it
+  // from `materialization_policy` plus the hydration counts above.
+  // Additive; `LOCAL_STORAGE_STATE_UNSPECIFIED` (0) on a daemon that
+  // predates this field.
+  LocalStorageState local_storage_state = 30;
+  // M4 Pass 2: whether this link's required current-version content can
+  // actually be obtained right now, locally or through a valid serving
+  // path -- NOT an alias for any peer's `PeerStatus.reachability`. A
+  // client must read this field directly rather than reconstructing it
+  // from peer reachability or materialization counts. Additive;
+  // `FETCH_AVAILABILITY_UNSPECIFIED` (0) on a daemon that predates this
+  // field, which a client should treat the same as
+  // `FETCH_AVAILABILITY_UNKNOWN` rather than assume content is available.
+  FetchAvailability fetch_availability = 31;
+  // M4 Pass 3: device ids of every OTHER device currently recorded
+  // (netmap-derived, content-blind) as an authorized-writer full replica
+  // for this group -- feeds the "Complete copies" per-device list.
+  // Cross-reference against `StatusResponse.peers`'s own `reachability`
+  // for each device's current availability; this field alone says
+  // nothing about whether any of them are online.
+  repeated string full_replica_device_ids = 32;
+}
+
+// See `LinkStatus.local_storage_state`'s own doc comment.
+enum LocalStorageState {
+  LOCAL_STORAGE_STATE_UNSPECIFIED = 0;
+  // Materialization policy is eager AND every current file is recorded
+  // hydrated (DB-recorded state, not a live disk verification -- a file
+  // externally deleted/corrupted after being recorded hydrated still
+  // reads FULL_COPY until the materialization-repair backstop reconciles
+  // it).
+  LOCAL_STORAGE_STATE_FULL_COPY = 1;
+  // Materialization policy is eager, but at least one current file is
+  // still a placeholder or hydrating -- this device intends to become a
+  // full copy but is not one yet. Never reported as `FULL_COPY`.
+  LOCAL_STORAGE_STATE_PARTIALLY_MATERIALIZED = 2;
+  // Materialization policy is on-demand -- placeholders for not-yet-opened
+  // files are this link's normal steady state, not "catching up."
+  LOCAL_STORAGE_STATE_ON_DEMAND = 3;
+}
+
+// See `LinkStatus.fetch_availability`'s own doc comment. Link-level
+// aggregation rule: `AVAILABLE_NOW` requires EVERY current file to be
+// either already hydrated locally or obtainable from a currently-reachable
+// full-replica peer -- a link with even one file that fails both checks
+// reports `UNAVAILABLE_NOW`, never `AVAILABLE_NOW`, so a partially
+// available link can never read as fully available.
+enum FetchAvailability {
+  FETCH_AVAILABILITY_UNSPECIFIED = 0;
+  FETCH_AVAILABILITY_AVAILABLE_NOW = 1;
+  FETCH_AVAILABILITY_UNAVAILABLE_NOW = 2;
+  // This daemon cannot currently vouch for either answer -- the same
+  // daemon-wide "cannot currently confirm" condition that gates
+  // `LinkStatus.durability_status` to `GROUP_DURABILITY_STATUS_UNKNOWN`.
+  FETCH_AVAILABILITY_UNKNOWN = 3;
 }
 
 // This device's local, UI-facing view of a group's durability -- distinct
@@ -122,26 +180,32 @@ message LinkStatus {
 // disk-pressure `degraded` field above. Answers "how safe is my data right
 // now," and must never overstate safety: a status this daemon cannot
 // currently back up with a real confirmation reports
-// `DURABILITY_UNKNOWN`, never `HEALTHY`.
+// `UNKNOWN`, never `PROTECTED`.
 enum GroupDurabilityStatus {
   // Fail-safe default (also what an older daemon that predates this field
-  // always sends): treat exactly like `DURABILITY_UNKNOWN`, never as
-  // `HEALTHY`.
+  // always sends): treat exactly like `UNKNOWN`, never as
+  // `PROTECTED`.
   GROUP_DURABILITY_STATUS_UNSPECIFIED = 0;
-  // This device or a confirmed peer is a whole-group full replica for the
-  // current head.
-  GROUP_DURABILITY_STATUS_HEALTHY = 1;
-  // Configured for this group but still catching up to head (not every
-  // file materialized yet).
-  GROUP_DURABILITY_STATUS_SYNCING = 2;
+  // A peer round-trip has positively confirmed whole-group coverage
+  // recently (or the group is genuinely empty, confirmed the same way) --
+  // never derived from this device's own local materialization state
+  // alone, and never from any peer's current reachability: a full replica
+  // can be perfectly durable and completely offline at the same moment.
+  GROUP_DURABILITY_STATUS_PROTECTED = 1;
+  // This device itself is configured as a full replica for this group but
+  // still catching up to head (not every file materialized yet).
+  GROUP_DURABILITY_STATUS_PROTECTING = 2;
   // Coverage cannot currently be confirmed -- most notably, right after a
   // `--force` override bypassed the durability handoff gate, until a later
   // handoff check positively reconfirms whole-group coverage. Must render
-  // as its own state, never as `HEALTHY`.
-  GROUP_DURABILITY_STATUS_DURABILITY_UNKNOWN = 3;
-  // A current file is confirmed to have no durable holder reachable
-  // anywhere -- a positive negative, not merely "unconfirmed."
-  GROUP_DURABILITY_STATUS_KNOWN_MISSING = 4;
+  // as its own state, never as `PROTECTED`.
+  GROUP_DURABILITY_STATUS_UNKNOWN = 3;
+  // No device other than this one is currently configured (netmap-derived)
+  // as an authorized-writer full replica for this group -- a structural,
+  // content-blind fact, independent of any peer's current reachability:
+  // this state answers "does a durable holder exist," never "is one
+  // reachable right now."
+  GROUP_DURABILITY_STATUS_AT_RISK = 4;
 }
 
 // One in-flight file transfer's
@@ -248,6 +312,40 @@ message PeerStatus {
   // `PEER_REACHABILITY_UNREACHABLE`; `UNREACHABLE_CATEGORY_UNSPECIFIED`
   // otherwise.
   UnreachableCategory unreachable_category = 6;
+  // M4 Pass 3: which kind of path `reachability == PEER_REACHABILITY_
+  // CONNECTED` is over -- `ROUTE_KIND_UNSPECIFIED` whenever `reachability`
+  // is anything other than `CONNECTED` (there is no path to classify).
+  // This is the wire contract gap a prior M3 pass's own comment flagged
+  // ("Pass 6 is the right place to extend this... once a route other than
+  // Direct can actually occur") and never filled in once relay routes
+  // actually shipped -- a client could not previously distinguish a
+  // direct connection from a relayed one at all.
+  RouteKind route_kind = 7;
+  // M4 Pass 3: whether THIS peer has declared itself able to act as a
+  // relay for OTHER peers' traffic -- a device-level self-declared
+  // capability (`crate::route::RelayCapability`), independent of
+  // `route_kind` above (which describes THIS device's own connection TO
+  // this peer) and independent of the peer's storage role. Per the
+  // `Durability != Connectivity` invariant, this must never be read as
+  // implying anything about whether the peer durably holds any group's
+  // data.
+  RelayCapability relay_capability = 8;
+}
+
+// See `PeerStatus.route_kind`'s own doc comment, mirroring
+// `yadorilink_daemon::route::RouteKind`.
+enum RouteKind {
+  ROUTE_KIND_UNSPECIFIED = 0;
+  ROUTE_KIND_DIRECT = 1;
+  ROUTE_KIND_RELAY = 2;
+}
+
+// See `PeerStatus.relay_capability`'s own doc comment, mirroring
+// `yadorilink_daemon::route::RelayCapability`.
+enum RelayCapability {
+  RELAY_CAPABILITY_UNSPECIFIED = 0;
+  RELAY_CAPABILITY_CAPABLE = 1;
+  RELAY_CAPABILITY_DISABLED = 2;
 }
 
 // Which side of the crash-safe create/join enrollment protocol a
@@ -600,7 +698,7 @@ message CheckFullReplicaHandoffReadyExcludingResponse {
   repeated string not_ready_group_ids = 2;
 }
 
-// Pins `group_id`'s local durability status to `DurabilityUnknown` on this
+// Pins `group_id`'s local durability status to `Unknown` on this
 // daemon, mirroring what the daemon-side forced-unlink path already does to
 // itself (`control_socket`'s `ensure_unlink_keeps_a_full_replica`, its
 // `--force` branch). The CLI-orchestrated force paths -- `yadorilink share
@@ -755,7 +853,22 @@ message UnpinResponse {}
 message EvictRequest {
   string absolute_path = 1;
 }
-message EvictResponse {}
+// M4 Pass 4: previously empty -- an `Evict` request that daemon-side
+// silently did nothing (the file was pinned, busy, not yet fully synced,
+// or its on-disk identity changed right before the commit) still returned
+// this bare-success message, so `yadorilink evict` printed "Evicted"
+// regardless of what actually happened. `dehydrated` is the one fact that
+// closes that gap: a client must not claim success without checking it.
+message EvictResponse {
+  // Whether the file was actually reduced to a placeholder. `false` means
+  // nothing was freed -- the file is exactly as it was before the
+  // request, for one of several possible reasons this response does not
+  // further distinguish (pinned, busy, not yet `Hydrated`, or changed on
+  // disk right before the commit).
+  bool dehydrated = 1;
+  uint64 blocks_reclaimed = 2;
+  uint64 bytes_reclaimed = 3;
+}
 
 // A lightweight liveness/health surface,
 // separate from `StatusResponse` (which is about *sync* status —

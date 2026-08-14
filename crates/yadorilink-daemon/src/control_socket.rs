@@ -21,13 +21,13 @@ use yadorilink_ipc_proto::daemonctl::{
     CheckFullReplicaHandoffReadyExcludingResponse, CheckFullReplicaHandoffReadyResponse,
     ConnectionAttemptTrace, ConnectivityDoctorCategory, ConnectivityDoctorResponse,
     CreateAndLinkCommandResponse, DaemonControlRequest, DaemonControlResponse,
-    EnrollmentCommandOutcome, EvictResponse, FileVersionInfo, GcResponse, GroupDurabilityStatus,
-    HandoffResult, HealthResponse, HeldFile, HydrateResponse, JoinAndLinkCommandResponse,
-    LatchGroupDurabilityUnknownResponse, LimitsSetResponse, LimitsShowResponse, LinkRequest,
-    LinkResponse, LinkStatus, ListConnectionTracesResponse, ListLinksResponse,
-    ListQueueItemsResponse, ListRecoveryOperationsResponse, ListTrashResponse,
-    ListVersionsResponse, MembershipHandoffResult, ObtainHandoffTicketResponse, PauseResponse,
-    PeerStatus, PendingEnrollmentKind, PinResponse, QueueItem, RecentSyncError,
+    EnrollmentCommandOutcome, EvictResponse, FetchAvailability, FileVersionInfo, GcResponse,
+    GroupDurabilityStatus, HandoffResult, HealthResponse, HeldFile, HydrateResponse,
+    JoinAndLinkCommandResponse, LatchGroupDurabilityUnknownResponse, LimitsSetResponse,
+    LimitsShowResponse, LinkRequest, LinkResponse, LinkStatus, ListConnectionTracesResponse,
+    ListLinksResponse, ListQueueItemsResponse, ListRecoveryOperationsResponse, ListTrashResponse,
+    ListVersionsResponse, LocalStorageState, MembershipHandoffResult, ObtainHandoffTicketResponse,
+    PauseResponse, PeerStatus, PendingEnrollmentKind, PinResponse, QueueItem, RecentSyncError,
     ReleaseHandoffTicketResponse, RemoveDeviceCommandResponse, RemovePendingEnrollmentResponse,
     ReplicaMembershipCommandOutcome, ReportingConsentState, ReportingStatusResponse,
     RequestHandoffLeaseResponse, RestoreTrashResponse, RestoreVersionResponse, ResumeResponse,
@@ -420,7 +420,11 @@ async fn handle_request(
             Some((group_id, path)) => {
                 let application = context.application.clone();
                 match application.materialization.evict(&group_id, &path) {
-                    Ok(()) => RespPayload::Evict(EvictResponse {}),
+                    Ok(outcome) => RespPayload::Evict(EvictResponse {
+                        dehydrated: outcome.dehydrated,
+                        blocks_reclaimed: outcome.blocks_reclaimed,
+                        bytes_reclaimed: outcome.bytes_reclaimed,
+                    }),
                     Err(e) => RespPayload::Error(e.to_string()),
                 }
             }
@@ -1123,20 +1127,35 @@ fn trashed_file_view_to_proto(
 /// Maps the daemon's internal reachability into the control-socket wire
 /// enums (`PeerStatus.reachability` / `unreachable_category`). The category
 /// is `Unspecified` whenever the peer is not unreachable.
+/// M4 Pass 3: the third element is this connection's `RouteKind` (only
+/// meaningful, i.e. non-`Unspecified`, when the reachability itself is
+/// `Connected`) -- fills the exact wire-contract gap a prior M3 pass's own
+/// comment flagged here ("Pass 6 is the right place to extend this... once
+/// a route other than Direct can actually occur") and never filled in
+/// once relay routes actually shipped.
 fn reachability_to_proto(
     reachability: crate::peer_registry::PeerReachability,
 ) -> (
     yadorilink_ipc_proto::daemonctl::PeerReachability,
     yadorilink_ipc_proto::daemonctl::UnreachableCategory,
+    yadorilink_ipc_proto::daemonctl::RouteKind,
 ) {
     use crate::peer_registry::{PeerReachability as Daemon, UnreachableCategory as DaemonCat};
     use yadorilink_ipc_proto::daemonctl::{
-        PeerReachability as Wire, UnreachableCategory as WireCat,
+        PeerReachability as Wire, RouteKind as WireRoute, UnreachableCategory as WireCat,
     };
     match reachability {
-        Daemon::Connecting => (Wire::Connecting, WireCat::Unspecified),
-        Daemon::Connected => (Wire::Connected, WireCat::Unspecified),
-        Daemon::ProtocolIncompatible => (Wire::ProtocolIncompatible, WireCat::Unspecified),
+        Daemon::Connecting => (Wire::Connecting, WireCat::Unspecified, WireRoute::Unspecified),
+        Daemon::Connected(route) => {
+            let wire_route = match route {
+                crate::route::RouteKind::Direct => WireRoute::Direct,
+                crate::route::RouteKind::Relay => WireRoute::Relay,
+            };
+            (Wire::Connected, WireCat::Unspecified, wire_route)
+        }
+        Daemon::ProtocolIncompatible => {
+            (Wire::ProtocolIncompatible, WireCat::Unspecified, WireRoute::Unspecified)
+        }
         Daemon::Unreachable(category) => {
             let wire_category = match category {
                 DaemonCat::NoCandidates => WireCat::NoCandidates,
@@ -1144,8 +1163,18 @@ fn reachability_to_proto(
                 DaemonCat::UdpBlocked => WireCat::UdpBlocked,
                 DaemonCat::HandshakeRefused => WireCat::HandshakeRefused,
             };
-            (Wire::Unreachable, wire_category)
+            (Wire::Unreachable, wire_category, WireRoute::Unspecified)
         }
+    }
+}
+
+fn relay_capability_to_proto(
+    capability: crate::route::RelayCapability,
+) -> yadorilink_ipc_proto::daemonctl::RelayCapability {
+    use yadorilink_ipc_proto::daemonctl::RelayCapability as Wire;
+    match capability {
+        crate::route::RelayCapability::Capable => Wire::Capable,
+        crate::route::RelayCapability::Disabled => Wire::Disabled,
     }
 }
 
@@ -1156,10 +1185,32 @@ fn durability_status_to_proto(
 ) -> GroupDurabilityStatus {
     use crate::durability_service::GroupDurabilityStatus as Daemon;
     match status {
-        Daemon::Healthy => GroupDurabilityStatus::Healthy,
-        Daemon::Syncing => GroupDurabilityStatus::Syncing,
-        Daemon::DurabilityUnknown => GroupDurabilityStatus::DurabilityUnknown,
-        Daemon::KnownMissing => GroupDurabilityStatus::KnownMissing,
+        Daemon::Protected => GroupDurabilityStatus::Protected,
+        Daemon::Protecting => GroupDurabilityStatus::Protecting,
+        Daemon::Unknown => GroupDurabilityStatus::Unknown,
+        Daemon::AtRisk => GroupDurabilityStatus::AtRisk,
+    }
+}
+
+fn local_storage_state_to_proto(
+    state: crate::queries::link_status::LocalStorageState,
+) -> LocalStorageState {
+    use crate::queries::link_status::LocalStorageState as Domain;
+    match state {
+        Domain::FullCopy => LocalStorageState::FullCopy,
+        Domain::PartiallyMaterialized => LocalStorageState::PartiallyMaterialized,
+        Domain::OnDemand => LocalStorageState::OnDemand,
+    }
+}
+
+fn fetch_availability_to_proto(
+    availability: crate::queries::link_status::FetchAvailability,
+) -> FetchAvailability {
+    use crate::queries::link_status::FetchAvailability as Domain;
+    match availability {
+        Domain::AvailableNow => FetchAvailability::AvailableNow,
+        Domain::UnavailableNow => FetchAvailability::UnavailableNow,
+        Domain::Unknown => FetchAvailability::Unknown,
     }
 }
 
@@ -1191,11 +1242,13 @@ fn encode_runtime_status(
         .peers
         .into_iter()
         .map(|peer| {
-            let (reachability, category) = reachability_to_proto(peer.reachability);
+            let (reachability, category, route_kind) = reachability_to_proto(peer.reachability);
             PeerStatus {
                 device_id: peer.device_id,
                 reachability: reachability as i32,
                 unreachable_category: category as i32,
+                route_kind: route_kind as i32,
+                relay_capability: relay_capability_to_proto(peer.relay_capability) as i32,
             }
         })
         .collect();
@@ -1308,6 +1361,9 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
         // involved so the remedy (unlink all but one) is actionable.
         ambiguous: view.ambiguous_local_paths.len() > 1,
         ambiguous_local_paths: view.ambiguous_local_paths,
+        local_storage_state: local_storage_state_to_proto(view.local_storage_state) as i32,
+        fetch_availability: fetch_availability_to_proto(view.fetch_availability) as i32,
+        full_replica_device_ids: view.full_replica_device_ids,
     }
 }
 
@@ -1345,25 +1401,62 @@ impl OverallState {
 /// established discipline), and guarantees the rollup can never disagree
 /// with the detail fields sitting right next to it in the same message.
 ///
-/// Precedence (highest first): any link `degraded` or any volume
-/// `state == "critical"` -> `Degraded` (spec: a low-disk condition on a
-/// linked folder needs attention; a *critical* one is actively blocking
-/// sync, same severity split `VolumeFreeSpace.state`'s own `"low"` vs
-/// `"critical"` already draws). Otherwise any conflict, held file, a
-/// `"low"` volume, a disconnected peer, a non-empty recent-error feed, or a
-/// recorded update failure -> `Attention`. A merely-`paused` link is
-/// *not* by itself attention-worthy (spec's "Sync is healthy" scenario:
-/// "caught up or idle *without errors*" says nothing about pause being an
-/// error state — pausing is a deliberate user action, matching
-/// `status.rs`'s own `held_summary_suffix`-style "only surface what's
-/// actionable" discipline). Otherwise `Healthy`, with no reasons.
+/// Precedence (highest first): any link `degraded`, any link whose
+/// `durability_status` is `AT_RISK` (a positively-known "no durable copy
+/// exists anywhere" fact -- the M4 durability axis's own most severe
+/// state), or any volume `state == "critical"` -> `Degraded` (spec: a
+/// low-disk condition on a linked folder needs attention; a *critical*
+/// one is actively blocking sync, same severity split
+/// `VolumeFreeSpace.state`'s own `"low"` vs `"critical"` already draws).
+/// Otherwise any conflict, held file, a `"low"` volume, a disconnected
+/// peer, a link whose `durability_status` cannot currently be confirmed
+/// (`UNKNOWN`/`UNSPECIFIED`) or whose `fetch_availability` is
+/// `UNAVAILABLE_NOW`/`UNKNOWN`/`UNSPECIFIED` (an unconfirmed fetch
+/// availability must never silently read as `AVAILABLE_NOW` any more than
+/// an unconfirmed durability status may silently read as `PROTECTED` --
+/// same fail-safe discipline, applied to both M4 axes uniformly), a
+/// non-empty recent-error feed, or a recorded update failure ->
+/// `Attention`. A merely-`paused` link is *not* by itself
+/// attention-worthy (spec's "Sync is healthy" scenario: "caught up or idle
+/// *without errors*" says nothing about pause being an error state --
+/// pausing is a deliberate user action, matching `status.rs`'s own
+/// `held_summary_suffix`-style "only surface what's actionable"
+/// discipline). Otherwise `Healthy`, with no reasons.
+///
+/// Folding in `durability_status`/`fetch_availability` here is required by
+/// this function's own doc comment above: it claims the rollup "can never
+/// disagree with the detail fields sitting right next to it in the same
+/// message," and before M4 added those two fields this function never
+/// read them at all -- a group with zero durable copies anywhere
+/// (`AtRisk`) could read `Overall: healthy` (M4 Pass 7 Codex/independent
+/// review finding).
 fn overall_status(response: &StatusResponse) -> (OverallState, Vec<String>) {
+    use yadorilink_ipc_proto::daemonctl::{FetchAvailability, GroupDurabilityStatus};
+
     let mut degraded_reasons = Vec::new();
     let mut attention_reasons = Vec::new();
 
     for link in &response.links {
         if link.degraded {
             degraded_reasons.push(format!("degraded:{}", link.group_id));
+        }
+        match link.durability_status() {
+            GroupDurabilityStatus::AtRisk => {
+                degraded_reasons.push(format!("durability_at_risk:{}", link.group_id));
+            }
+            GroupDurabilityStatus::Unknown | GroupDurabilityStatus::Unspecified => {
+                attention_reasons.push(format!("durability_unknown:{}", link.group_id));
+            }
+            GroupDurabilityStatus::Protected | GroupDurabilityStatus::Protecting => {}
+        }
+        match link.fetch_availability() {
+            FetchAvailability::UnavailableNow => {
+                attention_reasons.push(format!("fetch_unavailable:{}", link.group_id));
+            }
+            FetchAvailability::Unknown | FetchAvailability::Unspecified => {
+                attention_reasons.push(format!("fetch_availability_unknown:{}", link.group_id));
+            }
+            FetchAvailability::AvailableNow => {}
         }
         if link.conflict_count > 0 {
             attention_reasons.push(format!("conflict:{}", link.group_id));
@@ -1407,6 +1500,27 @@ fn overall_status(response: &StatusResponse) -> (OverallState, Vec<String>) {
 mod overall_status_tests {
     use super::*;
 
+    /// A link with every M4 axis in its healthiest state (`Protected`,
+    /// `AvailableNow`) and nothing else wrong -- the baseline every test
+    /// below that isn't specifically exercising `durability_status`/
+    /// `fetch_availability` starts from, so those two axes' own new
+    /// `overall_status` contribution doesn't leak into an unrelated test's
+    /// expected reasons. A bare `LinkStatus::default()` would NOT do this:
+    /// its zero-value `durability_status`/`fetch_availability` are
+    /// `Unspecified` -- deliberately treated as attention-worthy (an older
+    /// daemon that predates the field must not read as fine), so it would
+    /// contribute its own reason to every test that used it.
+    fn protected_link(group_id: &str) -> LinkStatus {
+        LinkStatus {
+            group_id: group_id.to_string(),
+            durability_status: yadorilink_ipc_proto::daemonctl::GroupDurabilityStatus::Protected
+                as i32,
+            fetch_availability: yadorilink_ipc_proto::daemonctl::FetchAvailability::AvailableNow
+                as i32,
+            ..Default::default()
+        }
+    }
+
     /// spec "Sync is healthy": no links/volumes/peers/errors at all (the
     /// zero-value default) is healthy with no reasons — matches this
     /// file's/`status.rs`'s "additive, empty/zero unless applicable"
@@ -1423,7 +1537,7 @@ mod overall_status_tests {
     #[test]
     fn paused_link_alone_is_still_healthy() {
         let response = StatusResponse {
-            links: vec![LinkStatus { paused: true, ..Default::default() }],
+            links: vec![LinkStatus { paused: true, ..protected_link("group-1") }],
             ..Default::default()
         };
         let (state, reasons) = overall_status(&response);
@@ -1436,16 +1550,94 @@ mod overall_status_tests {
     #[test]
     fn conflict_is_attention() {
         let response = StatusResponse {
-            links: vec![LinkStatus {
-                group_id: "group-1".into(),
-                conflict_count: 1,
-                ..Default::default()
-            }],
+            links: vec![LinkStatus { conflict_count: 1, ..protected_link("group-1") }],
             ..Default::default()
         };
         let (state, reasons) = overall_status(&response);
         assert_eq!(state, OverallState::Attention);
         assert_eq!(reasons, vec!["conflict:group-1".to_string()]);
+    }
+
+    /// A link the daemon has positively confirmed has no durable copy
+    /// anywhere (`AtRisk`) is `Degraded`, not `Healthy` -- this is the
+    /// exact overstatement an M4 Pass 7 review found: the rollup used to
+    /// never read `durability_status` at all, so a folder with zero
+    /// durable copies could still read `Overall: healthy`.
+    #[test]
+    fn at_risk_durability_is_degraded() {
+        let response = StatusResponse {
+            links: vec![LinkStatus {
+                durability_status: yadorilink_ipc_proto::daemonctl::GroupDurabilityStatus::AtRisk
+                    as i32,
+                ..protected_link("group-1")
+            }],
+            ..Default::default()
+        };
+        let (state, reasons) = overall_status(&response);
+        assert_eq!(state, OverallState::Degraded);
+        assert_eq!(reasons, vec!["durability_at_risk:group-1".to_string()]);
+    }
+
+    /// A link whose durability cannot currently be confirmed (`Unknown`,
+    /// or `Unspecified` from an older daemon that predates the field) is
+    /// `Attention`, never silently `Healthy` -- fail-safe, matching every
+    /// other "cannot currently confirm" surface in this daemon.
+    #[test]
+    fn unknown_durability_is_attention() {
+        let response = StatusResponse {
+            links: vec![LinkStatus {
+                durability_status: yadorilink_ipc_proto::daemonctl::GroupDurabilityStatus::Unknown
+                    as i32,
+                ..protected_link("group-1")
+            }],
+            ..Default::default()
+        };
+        let (state, reasons) = overall_status(&response);
+        assert_eq!(state, OverallState::Attention);
+        assert_eq!(reasons, vec!["durability_unknown:group-1".to_string()]);
+    }
+
+    /// A link that is durably `Protected` but cannot currently be fetched
+    /// is `Attention` -- "cannot fetch right now" is real and actionable,
+    /// but must never escalate to `Degraded`: the data itself is not at
+    /// risk, matching "Durability != Connectivity."
+    #[test]
+    fn unavailable_fetch_with_protected_durability_is_attention_not_degraded() {
+        let response = StatusResponse {
+            links: vec![LinkStatus {
+                fetch_availability:
+                    yadorilink_ipc_proto::daemonctl::FetchAvailability::UnavailableNow as i32,
+                ..protected_link("group-1")
+            }],
+            ..Default::default()
+        };
+        let (state, reasons) = overall_status(&response);
+        assert_eq!(state, OverallState::Attention);
+        assert_eq!(reasons, vec!["fetch_unavailable:group-1".to_string()]);
+    }
+
+    /// A link that is durably `Protected` but whose `fetch_availability`
+    /// cannot currently be confirmed (`Unknown`, or `Unspecified` from an
+    /// older daemon) is `Attention`, never silently `Healthy` -- an
+    /// unconfirmed fetch availability must fail closed exactly like an
+    /// unconfirmed durability status does (an M4 Pass 7 independent
+    /// review follow-up finding: an earlier version of this fold-in only
+    /// checked `UnavailableNow`, so `Unknown`/`Unspecified` fetch
+    /// availability paired with `Protected` durability silently read as
+    /// fully `Healthy`).
+    #[test]
+    fn unknown_fetch_availability_with_protected_durability_is_attention() {
+        let response = StatusResponse {
+            links: vec![LinkStatus {
+                fetch_availability: yadorilink_ipc_proto::daemonctl::FetchAvailability::Unknown
+                    as i32,
+                ..protected_link("group-1")
+            }],
+            ..Default::default()
+        };
+        let (state, reasons) = overall_status(&response);
+        assert_eq!(state, OverallState::Attention);
+        assert_eq!(reasons, vec!["fetch_availability_unknown:group-1".to_string()]);
     }
 
     /// spec "Sync needs attention": a `"low"` volume needs attention; a
@@ -1500,8 +1692,8 @@ mod overall_status_tests {
     fn degraded_link_outranks_but_still_reports_attention_reasons() {
         let response = StatusResponse {
             links: vec![
-                LinkStatus { group_id: "group-1".into(), degraded: true, ..Default::default() },
-                LinkStatus { group_id: "group-2".into(), conflict_count: 1, ..Default::default() },
+                LinkStatus { degraded: true, ..protected_link("group-1") },
+                LinkStatus { conflict_count: 1, ..protected_link("group-2") },
             ],
             ..Default::default()
         };
@@ -1787,8 +1979,8 @@ mod migration_safety_tests {
     }
 
     /// `--force` bypassing the readiness gate latches the group's local
-    /// durability status to `DurabilityUnknown`: the UI must not be able to
-    /// keep reporting the group Healthy/"synced" after an override that may
+    /// durability status to `Unknown`: the UI must not be able to
+    /// keep reporting the group Protected/"synced" after an override that may
     /// have just discarded its only complete copy.
     #[tokio::test]
     async fn forced_unlink_latches_group_durability_unknown() {
@@ -1808,9 +2000,9 @@ mod migration_safety_tests {
 
         assert_eq!(
             state.group_durability_status("group-1"),
-            crate::durability_service::GroupDurabilityStatus::DurabilityUnknown,
-            "a force override must latch the group to DurabilityUnknown, never leave it \
-             reporting Healthy"
+            crate::durability_service::GroupDurabilityStatus::Unknown,
+            "a force override must latch the group to Unknown, never leave it \
+             reporting Protected"
         );
     }
 
@@ -1835,9 +2027,14 @@ mod migration_safety_tests {
             .await
             .expect("nothing to hand off, so unlink is vacuously allowed");
 
+        // M4: `Protected`/non-Unknown now requires a fresh peer-confirmed (or
+        // vacuous-empty, still peer-round-trip-confirmed) sweep round --
+        // force one so this assertion tests the latch, not the unrelated
+        // "never swept yet" default.
+        state.refresh_custody_confirmation("group-1").await;
         assert_ne!(
             state.group_durability_status("group-1"),
-            crate::durability_service::GroupDurabilityStatus::DurabilityUnknown,
+            crate::durability_service::GroupDurabilityStatus::Unknown,
             "an unforced unlink must never latch the group's durability status"
         );
     }
@@ -1921,17 +2118,20 @@ mod migration_safety_tests {
     /// `LatchGroupDurabilityUnknownRequest` -- the control request the
     /// CLI-orchestrated force paths (`durability_force.rs`) send for each
     /// group actually forced past the readiness gate, so `status` reports
-    /// `DurabilityUnknown` for it exactly like the daemon-side forced-unlink
+    /// `Unknown` for it exactly like the daemon-side forced-unlink
     /// path's own latch already does. Exercised through `handle_request`
     /// (the real dispatch a control-socket connection runs through), not the
     /// pub `latch_group_durability_unknown` method directly.
     #[tokio::test]
     async fn latch_group_durability_unknown_request_latches_the_group() {
         let state = test_state();
+        // M4: Protected now requires at least one confirmation sweep round
+        // (real or vacuous-empty) to have run -- force one.
+        state.refresh_custody_confirmation("group-1").await;
         assert_eq!(
             state.group_durability_status("group-1"),
-            crate::durability_service::GroupDurabilityStatus::Healthy,
-            "sanity check: an untouched group with no files derives Healthy"
+            crate::durability_service::GroupDurabilityStatus::Protected,
+            "sanity check: an untouched group with no files derives Protected"
         );
 
         let req = DaemonControlRequest {
@@ -1955,7 +2155,7 @@ mod migration_safety_tests {
 
         assert_eq!(
             state.group_durability_status("group-1"),
-            crate::durability_service::GroupDurabilityStatus::DurabilityUnknown,
+            crate::durability_service::GroupDurabilityStatus::Unknown,
             "the latch must take effect through the real request-dispatch path"
         );
     }
@@ -4665,5 +4865,57 @@ mod migration_safety_tests {
             assert_eq!(server.request_count(), 1, "exactly one Worker GET, no automatic retry");
             server.assert_clean("RoleLoss race");
         }
+    }
+
+    /// M4 Pass 3: `route_kind` is only meaningful when the connection is
+    /// actually `Connected` -- every other reachability reports
+    /// `RouteKind::Unspecified`, and `Connected` itself maps `Direct`/
+    /// `Relay` exactly (the gap a prior M3 pass's own comment flagged and
+    /// never filled in).
+    #[test]
+    fn reachability_to_proto_only_carries_route_kind_when_connected() {
+        use yadorilink_ipc_proto::daemonctl::{PeerReachability as Wire, RouteKind as WireRoute};
+
+        let (reachability, _, route) = super::reachability_to_proto(
+            crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Direct),
+        );
+        assert_eq!(reachability, Wire::Connected);
+        assert_eq!(route, WireRoute::Direct);
+
+        let (reachability, _, route) = super::reachability_to_proto(
+            crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Relay),
+        );
+        assert_eq!(reachability, Wire::Connected);
+        assert_eq!(route, WireRoute::Relay);
+
+        let (_, _, route) =
+            super::reachability_to_proto(crate::peer_registry::PeerReachability::Connecting);
+        assert_eq!(route, WireRoute::Unspecified);
+
+        let (_, _, route) = super::reachability_to_proto(
+            crate::peer_registry::PeerReachability::ProtocolIncompatible,
+        );
+        assert_eq!(route, WireRoute::Unspecified);
+
+        let (_, _, route) =
+            super::reachability_to_proto(crate::peer_registry::PeerReachability::Unreachable(
+                crate::peer_registry::UnreachableCategory::NoResponse,
+            ));
+        assert_eq!(route, WireRoute::Unspecified);
+    }
+
+    /// M4 Pass 3: `relay_capability` maps exactly, independent of any
+    /// connection state -- it's a device-level self-declared fact.
+    #[test]
+    fn relay_capability_to_proto_maps_exactly() {
+        use yadorilink_ipc_proto::daemonctl::RelayCapability as Wire;
+        assert_eq!(
+            super::relay_capability_to_proto(crate::route::RelayCapability::Capable),
+            Wire::Capable
+        );
+        assert_eq!(
+            super::relay_capability_to_proto(crate::route::RelayCapability::Disabled),
+            Wire::Disabled
+        );
     }
 }

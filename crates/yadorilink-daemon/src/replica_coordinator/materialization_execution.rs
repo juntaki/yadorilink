@@ -242,6 +242,60 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .map_err(SyncError::from)?)
     }
 
+    fn get_recorded_placeholder_identity(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<
+        Option<(yadorilink_local_storage::PlaceholderDiskIdentity, String)>,
+        MaterializationExecutionError,
+    > {
+        Ok(self
+            .materialization_state_repository()
+            .get_recorded_placeholder_identity(group_id, path)
+            .map_err(SyncError::from)?
+            .map(|recorded| (recorded.identity, recorded.provider_kind)))
+    }
+
+    #[cfg(windows)]
+    fn dehydrate_windows_placeholder(
+        &self,
+        path: &str,
+        out_path: &Path,
+        expected_generation: Option<u64>,
+    ) -> Result<(), MaterializationExecutionError> {
+        let absolute_path = out_path.to_string_lossy().to_string();
+        crate::placeholder_dehydrate_windows::dehydrate_via_cfapi_host_blocking(
+            &absolute_path,
+            expected_generation,
+        )
+        .map_err(|e| {
+            // `Io`/`Timeout`: the round trip to `cfapi-host` did not
+            // complete, so whether `CfDehydratePlaceholder` itself ran
+            // (and possibly succeeded) before the failure is genuinely
+            // unknown -- `dehydrate_server` performs the real call BEFORE
+            // writing its response. `Rejected`: a coherent
+            // `DehydrateResponse` was received, so `cfapi-host`'s own
+            // logic ran to completion and its answer is trusted. See
+            // `MaterializationExecutionError::EvictionOutcomeAmbiguous`'s
+            // own doc comment for why the caller must handle these two
+            // differently.
+            match e {
+                crate::placeholder_dehydrate_windows::DehydrateError::Io(_)
+                | crate::placeholder_dehydrate_windows::DehydrateError::Timeout => {
+                    MaterializationExecutionError::EvictionOutcomeAmbiguous(format!(
+                        "{path}: native Windows dehydrate outcome unconfirmed: {e}"
+                    ))
+                }
+                crate::placeholder_dehydrate_windows::DehydrateError::Rejected(_) => {
+                    MaterializationExecutionError::EvictionRejected(format!(
+                        "{path}: native Windows dehydrate failed: {e}"
+                    ))
+                }
+            }
+        })
+    }
+
     fn list_placeholder_paths_missing_generation(
         &self,
         group_id: &str,
@@ -1205,6 +1259,54 @@ mod tests {
         .unwrap();
 
         assert_eq!(repo.get_placeholder_generation("group-1", "doc.txt").unwrap(), None);
+    }
+
+    /// M2-3b: the opposite property from the test above, on the OTHER
+    /// accessor -- `get_recorded_placeholder_identity` must keep exposing
+    /// a row's identity after it leaves `Placeholder` for `Hydrated`,
+    /// since Windows eviction reads a `Hydrated` file's still-recorded
+    /// generation as the expected identity for its native dehydrate call.
+    /// If this ever regressed to also gating on `materialization_state =
+    /// 'placeholder'` (e.g. by accidentally sharing `get_placeholder_
+    /// generation`'s query), `evict_to_placeholder`'s Windows arm would
+    /// treat every genuinely-placeholdered `Hydrated` file as having "no
+    /// recorded identity" and refuse to evict it at all.
+    #[test]
+    fn recorded_placeholder_identity_survives_the_hydrated_transition() {
+        let (state, permit) = setup_placeholder_file("group-1", "doc.txt");
+        let identity = yadorilink_local_storage::PlaceholderDiskIdentity { dev: 0, ino: 7 };
+        let repo = state.materialization_state_repository();
+        repo.record_placeholder_generation(
+            "group-1",
+            "doc.txt",
+            identity,
+            "windows-cfapi-generation",
+            &permit,
+        )
+        .unwrap();
+
+        repo.set_materialization_state(
+            "group-1",
+            "doc.txt",
+            MaterializationState::Hydrated,
+            &permit,
+        )
+        .unwrap();
+
+        // The dirty-detection accessor hides it (previous test) ...
+        assert_eq!(repo.get_placeholder_generation("group-1", "doc.txt").unwrap(), None);
+        // ... but the eviction accessor still sees it.
+        assert_eq!(
+            repo.get_recorded_placeholder_identity("group-1", "doc.txt").unwrap(),
+            Some(yadorilink_sync_sqlite::RecordedPlaceholderGeneration {
+                identity,
+                provider_kind: "windows-cfapi-generation".to_owned(),
+            })
+        );
+        assert_eq!(
+            state.get_recorded_placeholder_identity("group-1", "doc.txt").unwrap(),
+            Some((identity, "windows-cfapi-generation".to_owned()))
+        );
     }
 
     /// A newer placeholder write's identity must fully replace an older

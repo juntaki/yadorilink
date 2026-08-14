@@ -46,6 +46,87 @@ fn disk_identity(path: &Path) -> Result<DiskIdentity, MaterializationExecutionEr
     Ok(yadorilink_peer_session::peer_session::disk_race_fingerprint(path))
 }
 
+/// Reduces the already-`Hydrated` file at `out_path` to a placeholder.
+///
+/// Non-Windows: unchanged from before M2-3b -- `create_or_defer_placeholder`
+/// via `write_placeholder`, which IS the disk truth, so minting a fresh
+/// on-disk identity on every eviction is correct.
+///
+/// Windows: deliberately does NOT call `create_or_defer_placeholder`.
+/// That function's Windows arm always MINTS A FRESH generation, which is
+/// right for CREATING a placeholder that doesn't exist yet (M2-3a), but
+/// wrong here: this file's placeholder object already exists on disk (it
+/// went `Placeholder` -> `Hydrated` at some point), and
+/// `CfDehydratePlaceholder` does not reassign `FileIdentity` -- minting a
+/// new generation here would record an identity in the index that no
+/// longer matches what's actually on disk, breaking the same ABA guard
+/// M2-2's dirty detection and this call's own `expected_generation` check
+/// both depend on staying accurate. Instead this reads the identity
+/// ALREADY recorded for this row (unchanged by dehydration) and confirms
+/// real on-disk dehydration via `MaterializationExecutionPort::
+/// dehydrate_windows_placeholder` before returning.
+///
+/// If no identity is recorded at all (a legacy/never-cfapi-created
+/// `Hydrated` row, or one whose recorded provider isn't the Windows CfAPI
+/// generation provider), there is no existing placeholder object to
+/// dehydrate -- creating a fresh one here would reopen the exact bug
+/// M2-3a's whole design closed: `sync_placeholders` (cfapi-host's poll
+/// loop) skips any path that already `exists()` on disk, so a
+/// `Placeholder` row with no real placeholder object underneath it would
+/// sit stranded, permanently claiming to be dehydrated while the real
+/// file stays fully materialized. Fails closed instead (`EvictionRejected`),
+/// which the caller's existing placeholder-write-error branch already
+/// rolls back to `Hydrated` for.
+///
+/// Actual commit order on Windows is `Evicting -> native dehydrate
+/// confirmed -> Placeholder -> identity re-affirmed -> blocks reclaimed`
+/// (the `Placeholder` transition happens before the returned
+/// `RecordOverwrite` is applied by `evict_file`'s caller, not after) --
+/// safe only because the value `RecordOverwrite` carries is READ before
+/// dehydration and never changes, so there is no window where the row
+/// could read as `Placeholder` with a wrong or absent identity.
+fn evict_to_placeholder(
+    state: &dyn MaterializationExecutionPort,
+    group_id: &str,
+    path: &str,
+    out_path: &Path,
+    size: u64,
+    mtime_unix_nanos: i64,
+) -> Result<yadorilink_local_storage::PlaceholderIdentityToRecord, MaterializationExecutionError> {
+    #[cfg(windows)]
+    {
+        let _ = (size, mtime_unix_nanos);
+        let recorded = state.get_recorded_placeholder_identity(group_id, path)?;
+        let Some((identity, provider_kind)) = recorded else {
+            return Err(MaterializationExecutionError::EvictionRejected(format!(
+                "{path} has no recorded Windows placeholder identity to dehydrate; refusing to \
+                 evict rather than strand a Placeholder row with no real placeholder object \
+                 underneath it"
+            )));
+        };
+        if provider_kind != yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND {
+            return Err(MaterializationExecutionError::EvictionRejected(format!(
+                "{path}'s recorded placeholder identity is provider {provider_kind:?}, not \
+                 {:?}; refusing to evict",
+                yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND
+            )));
+        }
+        state.dehydrate_windows_placeholder(path, out_path, Some(identity.ino))?;
+        // Identity is unchanged by dehydration -- re-affirmed, not
+        // replaced, since `CfDehydratePlaceholder` never reassigns
+        // `FileIdentity`.
+        Ok(yadorilink_local_storage::PlaceholderIdentityToRecord::RecordOverwrite {
+            identity,
+            provider_kind: yadorilink_local_storage::WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (state, group_id, path);
+        Ok(yadorilink_local_storage::create_or_defer_placeholder(out_path, size, mtime_unix_nanos)?)
+    }
+}
+
 /// What one [`evict_file`] call did. The materialized file is always reduced
 /// to a placeholder; whether its cached blocks were reclaimed (freeing real
 /// space) depends on full-replica custody, and never happens on a full
@@ -259,14 +340,41 @@ pub fn evict_file(
                     "{path} changed before placeholder commit"
                 )));
             }
-            Ok(yadorilink_local_storage::create_or_defer_placeholder(
+            evict_to_placeholder(
+                state,
+                group_id,
+                path,
                 &out_path,
                 record.size,
                 record.mtime_unix_nanos,
-            )?)
+            )
         });
     let placeholder_outcome = match placeholder_result {
         Ok(outcome) => outcome,
+        Err(MaterializationExecutionError::EvictionOutcomeAmbiguous(reason)) => {
+            // A Codex-review finding on M2-3b: unlike every other error
+            // here, this one does NOT mean "the file is still fully
+            // materialized" -- the native dehydrate call's outcome could
+            // not be confirmed (see the variant's own doc comment), so it
+            // may have already succeeded on disk. Rolling back to
+            // `Hydrated` here would be actively wrong in that case (a
+            // dehydrated placeholder mislabeled `Hydrated`, no longer
+            // reconciled by anything). Leave the row in `Evicting` instead
+            // -- the SAME state a mid-eviction crash leaves it in, which
+            // `reset_stale_evicting_to_placeholder`'s startup recovery
+            // already resolves safely regardless of which outcome actually
+            // happened (M2-3b's design never mints a fresh identity on
+            // eviction, so the already-recorded one stays correct either
+            // way).
+            tracing::warn!(
+                group_id,
+                path = %path,
+                reason = %reason,
+                "eviction dehydrate outcome unconfirmed; leaving the row in the transient \
+                 Evicting state for startup recovery to resolve, rather than assuming Hydrated"
+            );
+            return Err(MaterializationExecutionError::EvictionOutcomeAmbiguous(reason));
+        }
         Err(error) => {
             // The placeholder write failed, so the file is still fully materialized
             // on disk. Roll the row back out of the transient `Evicting` state to

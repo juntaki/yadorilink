@@ -5,6 +5,8 @@
 //! `src/main.rs`) for the identical reason.
 pub mod account;
 pub mod actions;
+pub mod folder_detail;
+pub mod folder_status_window;
 pub mod google_login;
 pub mod ipc_client;
 pub mod login_item;

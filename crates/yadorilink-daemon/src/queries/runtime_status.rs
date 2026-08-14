@@ -20,6 +20,20 @@ use yadorilink_peer_session::rate_limiter::RateLimiters;
 pub(crate) struct PeerStatusView {
     pub(crate) device_id: String,
     pub(crate) reachability: PeerReachability,
+    /// M4 Pass 3: see `crate::route::RelayCapability`'s own doc comment --
+    /// a device-level self-declared capability, independent of
+    /// `reachability`'s own route kind and of storage role.
+    pub(crate) relay_capability: crate::route::RelayCapability,
+}
+
+/// M4 Pass 3: narrow port for `RelayCapability` lookups by device --
+/// `peer_netmap_metadata` (where this fact actually lives) is
+/// `DaemonState`-private, and this query service deliberately holds only
+/// narrow ports/types, not `DaemonState` itself (see this module's own
+/// doc comment). Implemented directly by `DaemonState` in
+/// `adapters/mod.rs`'s construction site.
+pub(crate) trait RelayCapabilityPort: Send + Sync {
+    fn relay_capability(&self, device_id: &str) -> crate::route::RelayCapability;
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +89,7 @@ pub(crate) struct RuntimeStatusQueryService {
     link_status: Arc<LinkStatusQueryService>,
     update_status: Arc<UpdateStatusQueryService>,
     peers: Arc<PeerRegistry>,
+    relay_capability: Arc<dyn RelayCapabilityPort>,
     telemetry: Arc<RuntimeTelemetry>,
     governance: Arc<GovernanceConfigStore>,
     block_store: Arc<dyn BlockStore + Send + Sync>,
@@ -88,6 +103,7 @@ impl RuntimeStatusQueryService {
         link_status: Arc<LinkStatusQueryService>,
         update_status: Arc<UpdateStatusQueryService>,
         peers: Arc<PeerRegistry>,
+        relay_capability: Arc<dyn RelayCapabilityPort>,
         telemetry: Arc<RuntimeTelemetry>,
         governance: Arc<GovernanceConfigStore>,
         block_store: Arc<dyn BlockStore + Send + Sync>,
@@ -97,6 +113,7 @@ impl RuntimeStatusQueryService {
         Self {
             link_status,
             update_status,
+            relay_capability,
             peers,
             telemetry,
             governance,
@@ -114,10 +131,11 @@ impl RuntimeStatusQueryService {
             .into_iter()
             .map(|snapshot| {
                 let mut reachability = snapshot.reachability;
-                if reachability == PeerReachability::Connected && snapshot.protocol_incompatible {
+                if reachability.is_connected() && snapshot.protocol_incompatible {
                     reachability = PeerReachability::ProtocolIncompatible;
                 }
-                PeerStatusView { device_id: snapshot.device_id, reachability }
+                let relay_capability = self.relay_capability.relay_capability(&snapshot.device_id);
+                PeerStatusView { device_id: snapshot.device_id, reachability, relay_capability }
             })
             .collect();
         let governance = self.governance.load_or_default();

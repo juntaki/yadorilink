@@ -301,6 +301,33 @@ fn poll_once(backend: &mut impl SyncRootBackend, known_roots: &mut HashSet<PathB
     }
 }
 
+/// M2-3b: runs `dehydrate_server::serve` for the lifetime of this process
+/// on a dedicated OS thread with its own single-threaded Tokio runtime --
+/// `main`'s own poll loop (below) is plain synchronous code with no
+/// runtime of its own (see `ipc_client.rs`'s doc comment on why ITS calls
+/// instead use a lazily-started runtime blocked on per-call), so the
+/// dehydrate server, which must stay accepting connections continuously
+/// rather than running once per call, needs a runtime of its own. A
+/// crashed/panicked server thread does not bring down the whole process --
+/// `poll_once`'s placeholder-creation path keeps working even if eviction
+/// confirmation becomes unavailable; a daemon eviction attempt would
+/// simply see every `DehydrateRequest` connection attempt fail closed
+/// (connection refused), which `materialization_eviction.rs`'s Windows
+/// path already treats as "leave the file Hydrated, retry later".
+fn spawn_dehydrate_server() {
+    let pipe_name = yadorilink_shell_ext::dehydrate_server::pipe_name();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to start the dehydrate pipe server's Tokio runtime");
+        if let Err(e) = runtime.block_on(yadorilink_shell_ext::dehydrate_server::serve(&pipe_name))
+        {
+            eprintln!("yadorilink-cfapi-host: dehydrate pipe server exited: {e}");
+        }
+    });
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--unregister-all") {
@@ -309,6 +336,7 @@ fn main() {
     }
 
     println!("yadorilink-cfapi-host: starting (poll interval {POLL_INTERVAL:?})");
+    spawn_dehydrate_server();
     let mut known_roots = HashSet::new();
     let mut backend = RealSyncRootBackend;
     loop {

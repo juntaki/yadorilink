@@ -701,6 +701,10 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             // task binds the shared hub, so the hub's MAC1 initiation gate is
             // keyed on this device from the first bind.
             state.set_device_static_public(keypair.public_bytes());
+            // M3 Pass 2: closes the O(N^2) handshake-fan-in cost measured
+            // by `handshake_fan_in.rs` -- see `DaemonState::
+            // set_device_static_secret`'s own doc comment.
+            state.set_device_static_secret(keypair.secret.clone());
 
             #[cfg(not(madsim))]
             {

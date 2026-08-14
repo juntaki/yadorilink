@@ -23,6 +23,7 @@ pub mod gc;
 pub mod gc_state;
 pub mod governance_config;
 pub mod hydration;
+pub mod hydration_single_flight;
 pub mod link_registry;
 pub mod link_runtime;
 pub(crate) mod local_session_channel;
@@ -46,6 +47,17 @@ pub mod recovery;
 pub mod recovery_diagnosis;
 pub mod recovery_evidence;
 pub mod recovery_snapshot;
+pub mod relay_carrier;
+pub mod relay_forwarder;
+// Rust 1.97's doc_lazy_continuation lint treats explanatory paragraphs after
+// numbered security-review lists as malformed list continuations. These two
+// M3 relay modules intentionally keep those review notes as prose; scope the
+// compatibility allowance here rather than weakening the workspace lint gate.
+#[allow(clippy::doc_lazy_continuation)]
+pub mod relay_grant;
+#[allow(clippy::doc_lazy_continuation)]
+pub mod relay_session;
+pub mod relay_session_handler;
 /// `ReplicaCoordinator` (Phase 7D-10.2) -- see that module's own doc
 /// comment for what it is and why it is additive alongside `SyncState`,
 /// not a replacement for it, in this sub-phase.
@@ -54,6 +66,7 @@ pub mod reporting;
 pub mod reporting_ipc;
 pub mod reporting_retry;
 pub mod root_commit_authority;
+pub mod route;
 pub mod runtime_telemetry;
 pub mod sync_runtime;
 // Exclusive OS locks on the block-store root and sync-state database. Not built
@@ -61,6 +74,8 @@ pub mod sync_runtime;
 // isolated per-instance paths and must not contend on real filesystem locks.
 #[cfg(windows)]
 pub mod placeholder_backend_windows;
+#[cfg(windows)]
+pub mod placeholder_dehydrate_windows;
 #[cfg(windows)]
 pub mod placeholder_inspect_windows;
 #[cfg(not(madsim))]

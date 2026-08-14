@@ -39,6 +39,9 @@ struct DeviceInfo {
     endpoint: String,
     groups: HashSet<String>,
     full_replica_groups: HashSet<String>,
+    /// M3 Pass 4: device-scoped (not group-scoped, unlike
+    /// `full_replica_groups`) -- see `crate::route::RelayCapability`.
+    relay_capable: bool,
 }
 
 #[derive(Default)]
@@ -92,6 +95,14 @@ impl FakeCoordination {
         self.inner.lock().unwrap().policy_service_key = Some(SigningKey::from_bytes(&[42u8; 32]));
     }
 
+    /// The service signing key `enable_signed_policy` installed, for a
+    /// test that needs to sign something (e.g. a `RelayGrant`) itself the
+    /// same way this fake's own `issue_relay_grant` does, rather than
+    /// going through that method's own candidate-search logic.
+    pub fn policy_signing_key(&self) -> Option<SigningKey> {
+        self.inner.lock().unwrap().policy_service_key.clone()
+    }
+
     /// Takes the coordination plane down completely, as a chaos test needs:
     /// aborts the accept loop (freeing the listener, so the bound port stops
     /// answering and any daemon reconnect attempt fails) and drops every live
@@ -127,6 +138,7 @@ impl FakeCoordination {
             endpoint,
             groups: groups.iter().map(|g| g.to_string()).collect(),
             full_replica_groups: HashSet::new(),
+            relay_capable: false,
         };
         self.inner.lock().unwrap().devices.insert(device_id.to_string(), info);
         self.push();
@@ -146,6 +158,88 @@ impl FakeCoordination {
             }
         }
         self.push();
+    }
+
+    /// M3 Pass 4: declares (or clears) a device's own relay capability --
+    /// mirrored onto peers' `relayCapable`. Deliberately independent of
+    /// `set_full_replica`: never coupled, never inferred from one another
+    /// (see `crate::route`'s own doc comment).
+    #[allow(dead_code)]
+    pub fn set_relay_capable(&self, device_id: &str, relay_capable: bool) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(dev) = inner.devices.get_mut(device_id) {
+                dev.relay_capable = relay_capable;
+            }
+        }
+        self.push();
+    }
+
+    /// M3 Pass 5: synthesizes and signs a `RelayGrant` the way the real
+    /// coordination plane would, per this pass's own security spec: finds
+    /// a group ALL THREE of (`source_device_id`, some relay-capable
+    /// device, `destination_device_id`) are CURRENTLY members of, and
+    /// issues a grant scoped to exactly that one group -- never a relay
+    /// whose only shared group with the source differs from its only
+    /// shared group with the destination (that would bridge two
+    /// otherwise-disjoint groups, exactly what `relay_session::
+    /// admit_relay_open`'s own group-membership re-verification exists to
+    /// refuse regardless of what a grant claims). Returns `None` if no
+    /// such group/relay candidate exists, or if `enable_signed_policy`
+    /// was never called (no signing key to issue with -- this fake never
+    /// issues an unsigned or forged-key grant, matching the real plane's
+    /// own contract).
+    ///
+    /// A plain synchronous method, not an HTTP round trip -- this fake's
+    /// own HTTP layer only ever implements the netmap subscription itself
+    /// (see this file's own module doc comment); every other
+    /// coordination interaction this test suite exercises (`set_full_
+    /// replica`, `set_relay_capable`, and now this) is synthesized
+    /// directly, matching that established convention, since there is no
+    /// real coordination-worker in this repo to test a genuine
+    /// POST/response cycle against.
+    pub fn issue_relay_grant(
+        &self,
+        source_device_id: &str,
+        destination_device_id: &str,
+        ttl_seconds: i64,
+    ) -> Option<yadorilink_daemon::relay_grant::RelayGrant> {
+        let inner = self.inner.lock().unwrap();
+        let signing_key = inner.policy_service_key.clone()?;
+        let source_groups = inner.devices.get(source_device_id)?.groups.clone();
+        let dest_groups = inner.devices.get(destination_device_id)?.groups.clone();
+        let shared_groups: Vec<String> =
+            source_groups.intersection(&dest_groups).cloned().collect();
+        let mut candidate = None;
+        'outer: for group_id in &shared_groups {
+            for (relay_id, dev) in &inner.devices {
+                if relay_id == source_device_id || relay_id == destination_device_id {
+                    continue;
+                }
+                if dev.relay_capable && dev.groups.contains(group_id) {
+                    candidate = Some((relay_id.clone(), group_id.clone()));
+                    break 'outer;
+                }
+            }
+        }
+        let (relay_device_id, group_id) = candidate?;
+        let issued_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+        let now = issued_at.as_secs() as i64;
+        let grant_id =
+            format!("grant-{source_device_id}-{destination_device_id}-{}", issued_at.as_nanos());
+        let grant = yadorilink_daemon::relay_grant::RelayGrant {
+            version: 1,
+            grant_id,
+            group_id,
+            source_device_id: source_device_id.to_string(),
+            relay_device_id,
+            destination_device_id: destination_device_id.to_string(),
+            not_before_unix: now - 5,
+            expires_at_unix: now + ttl_seconds,
+            max_session_bytes: None,
+            signature: Vec::new(),
+        };
+        Some(yadorilink_daemon::relay_grant::sign_relay_grant(grant, &signing_key))
     }
 
     /// Revokes a device's access to one group and pushes the new netmap — the
@@ -210,6 +304,7 @@ fn netmap_frame_for(inner: &mut Inner, subscriber_id: &str) -> String {
             "endpoints": [ { "address": dev.endpoint } ],
             "sharedGroupIds": shared,
             "fullReplicaGroupIds": full_replica,
+            "relayCapable": dev.relay_capable,
         }));
     }
     inner.snapshot_generation += 1;

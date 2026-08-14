@@ -42,7 +42,9 @@ yadorilink-ipc-proto = { path = "../../crates/yadorilink-ipc-proto" }
 # `macros` (for `#[tokio::test]`) is only exercised by this crate's own
 # tests but declared here rather than a dev-dependency override, matching
 # `shell-ext/macos/fileprovider-core/Cargo.toml`'s own reasoning.
-tokio = { version = "1", features = ["net", "rt", "time", "io-util", "macros"] }
+# `sync` is required by the production dehydrate server's bounded
+# `tokio::sync::Semaphore` admission gate.
+tokio = { version = "1", features = ["net", "rt", "time", "io-util", "macros", "sync"] }
 prost = "0.14.4"
 # The `#[implement]` macro's generated code references `windows_core::...`
 # at the crate root directly, not through `windows::core` — an explicit
@@ -79,6 +81,31 @@ features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_CorrelationVector",
+]
+
+# M2-3b: `yadorilink-daemon`'s own Windows-only cfapi/named-pipe-server code
+# (`placeholder_inspect_windows.rs`, `windows_pipe_security.rs`) uses
+# `windows-sys` (raw FFI, manual HRESULT/`GetLastError` checks), not the
+# higher-level `windows` crate above -- and that code has actually been
+# exercised against real cfapi on a Windows 11 VM (see those modules' own
+# doc comments), unlike any `windows`-crate-idiomatic binding for
+# `CfGetPlaceholderInfo`/`CfDehydratePlaceholder`, which nothing in this
+# codebase has ever called through the `windows` crate before. The new
+# dehydrate pipe server (`dehydrate_server.rs`) and its `CfGetPlaceholderInfo`/
+# `CfDehydratePlaceholder` calls (`cfapi.rs`) reuse the SAME already-proven
+# `windows-sys` patterns verbatim rather than gambling on unverified
+# `windows`-crate signatures for functions this crate has never bound.
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_CloudFilters",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
 ]
 
 [profile.release]

@@ -78,20 +78,59 @@ impl PlaceholderCapability {
 ///    `chunker::write_placeholder` (an ordinary sparse file with none of the
 ///    above properties — see that function's own doc comment).
 ///
-/// None of the four exist yet anywhere in this codebase's runtime path —
-/// `write_placeholder` is still what every `OnDemand` materialization call
-/// site (`peer_session::materialize`, `materialization::run_eviction_sweep`,
-/// `materialization::evict_file`, ...) actually calls. This is therefore
-/// unconditionally `false`, regardless of what any single backend's own
-/// `PlaceholderBackend::probe` would report for the current OS/filesystem: a
-/// theoretically-available OS provider (`WindowsCfApiBackend::probe`
-/// returning `Supported` on a real Windows box, say) is a claim about OS
-/// capability, not about whether THIS daemon build's materialization code
-/// actually routes through it. `yadorilink-daemon`'s `finish_link_setup` and
-/// `set_storage_mode` gate every `OnDemand` request on this function rather
-/// than on a platform check or a backend's own `probe`, so wiring up the
-/// four pieces above is what re-enables `OnDemand` in production — not a
-/// second place needing to change.
+/// This is still unconditionally `false` in production, but as of M2's
+/// Windows CfAPI work (M2-0 through M2-6, Pass 4 of the "windows-ondemand-
+/// complete" branch) that is no longer because none of the four conditions
+/// hold at all — it's because Windows satisfies some of them through a
+/// DIFFERENT mechanism than this doc originally envisioned (direct CfAPI
+/// calls and a daemon<->`cfapi-host.exe` cross-process split, not
+/// `PlaceholderBackend` trait dispatch), and the remaining ones are
+/// genuinely still open. Per-condition status, current as of Pass 4:
+///
+/// - **(1) persistent per-link session**: still NOT held as an explicit
+///   object anywhere in the daemon — `cfapi-host.exe`, a separate
+///   long-lived process, functionally plays this role for its own
+///   `CfConnectSyncRoot` connection, but nothing in the daemon holds or
+///   tracks a session handle the way this condition describes.
+/// - **(2) persisted generation surviving restart**: MET for Windows.
+///   `WINDOWS_CFAPI_GENERATION_PROVIDER_KIND` identities are persisted via
+///   `record_placeholder_generation`/`record_placeholder_generation_
+///   if_absent` (M2-0/M2-2/M2-3a) and read back by
+///   `get_recorded_placeholder_identity` (M2-3b) — ordinary SQLite state,
+///   survives a daemon restart the same as every other index row.
+/// - **(3) dirty detection via a real provider query**: MET for Windows.
+///   `local_change.rs`'s Windows branch of `untouched_placeholder_verdict`
+///   calls `LocalMutationStore::inspect_windows_placeholder`, which on
+///   Windows is a REAL `CfGetPlaceholderInfo` call
+///   (`placeholder_inspect_windows::inspect_placeholder`, M2-2) — not the
+///   size/mtime heuristic this condition was written to replace.
+/// - **(4) placeholder-create/hydrate/evict routed through `PlaceholderBackend`
+///   trait methods**: NOT met in the literal sense this doc describes —
+///   production never calls `PlaceholderBackend::{create,hydrate}` at all.
+///   Windows creation and eviction ARE real and OS-transparent (M2-3a's
+///   `create_or_defer_placeholder` + `cfapi-host`'s poll-driven
+///   `CfCreatePlaceholders`; M2-3b's `dehydrate_windows_placeholder` RPC
+///   to a real `CfDehydratePlaceholder` call), just through direct calls
+///   and a cross-process split, not this trait. Windows hydration IS
+///   OS-triggered (a real `CF_CALLBACK_TYPE_FETCH_DATA` callback,
+///   `shell-ext/windows/src/cfapi.rs::fetch_data_callback`), but nothing
+///   in `materialization.rs` calls `PlaceholderBackend::hydrate` either —
+///   the callback drives the daemon's existing `hydration::hydrate`
+///   directly over shell-IPC.
+///
+/// None of the above is verified against real Windows hardware (this
+/// codebase's own established convention: every Windows-only module this
+/// gate's conditions touch flags that honestly in its own doc comment —
+/// see `placeholder_inspect_windows.rs`'s "UNVERIFIED against real Windows
+/// hardware" section for the sharpest example). That verification, plus
+/// deciding what a genuinely accurate replacement gate should actually
+/// check now that the trait-routed model this function was written against
+/// isn't the architecture that got built, is real-hardware-acceptance work
+/// (M2-7), not something this function should be flipped ahead of.
+/// `yadorilink-daemon`'s `finish_link_setup` and `set_storage_mode` gate
+/// every `OnDemand` request on this function rather than on a platform
+/// check or a backend's own `probe`, so that decision is still the one
+/// place controlling whether `OnDemand` is honored in production.
 ///
 /// Test code that specifically exercises OnDemand-gated behavior (a
 /// disk-pressure eviction sweep actually reclaiming a candidate, say) uses
@@ -232,9 +271,12 @@ mod tests {
     fn on_demand_pipeline_is_not_yet_connected() {
         assert!(
             !on_demand_pipeline_is_connected(),
-            "flip this only once a live provider session, persisted generation, \
-             PlaceholderStatus-based dirty detection, and a PlaceholderBackend-routed \
-             hydrate/evict path are all actually wired -- see this function's own doc comment"
+            "flip this only after real-Windows-hardware acceptance (M2-7) confirms every \
+             condition this function's own doc comment lists -- some are already met for \
+             Windows (persisted generation, real dirty detection), others still aren't (no \
+             persistent per-link session object; nothing routes through the \
+             PlaceholderBackend trait itself), and NONE of it has been verified against real \
+             hardware yet"
         );
     }
 

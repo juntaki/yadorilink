@@ -22,7 +22,8 @@ pub use frame::{
     HandoffTicketGrantFrame, HandoffTicketReleaseFrame, HandoffTicketReleaseOutboundFrame,
     HandoffTicketRequestFrame, HeadsAnnounceFrame, HeadsAnnounceOutboundFrame, InboundFrame,
     OutboundFrame, RebootstrapSnapshotRequestFrame, RebootstrapSnapshotResponseFrame,
-    VersionPresentAckFrame, VersionPresentAckOutboundFrame, VersionPresentQueryFrame,
+    RelayCloseFrame, RelayDataFrame, RelayOpenFrame, RelayOpenedFrame, VersionPresentAckFrame,
+    VersionPresentAckOutboundFrame, VersionPresentQueryFrame,
 };
 pub use protobuf::ProtobufPeerWireCodec;
 
