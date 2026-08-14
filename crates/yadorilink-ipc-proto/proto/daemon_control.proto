@@ -692,7 +692,7 @@ message CheckFullReplicaHandoffReadyExcludingResponse {
   repeated string not_ready_group_ids = 2;
 }
 
-// Pins `group_id`'s local durability status to `DurabilityUnknown` on this
+// Pins `group_id`'s local durability status to `Unknown` on this
 // daemon, mirroring what the daemon-side forced-unlink path already does to
 // itself (`control_socket`'s `ensure_unlink_keeps_a_full_replica`, its
 // `--force` branch). The CLI-orchestrated force paths -- `yadorilink share
