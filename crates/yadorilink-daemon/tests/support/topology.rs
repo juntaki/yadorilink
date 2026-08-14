@@ -93,6 +93,28 @@ pub struct TopologyNode {
 }
 
 fn new_node(device_id: &str) -> TopologyNode {
+    // Suffixed with a per-process-unique counter: `ensure_isolated_config_
+    // dir` gives each TEST BINARY (process) its own isolated pin-file
+    // directory, but a test binary with more than one `#[tokio::test]`
+    // function runs them CONCURRENTLY in that SAME process by default --
+    // two such tests both calling `stand_up_canonical_topology` would
+    // otherwise mint the exact same literal device ids
+    // ("topology-n-nas"/etc.) with DIFFERENT randomly-generated keys, and
+    // race each other writing the SAME shared `peer_keys.json`/`signing_
+    // keys.json` pin files, corrupting whichever one loses the race with
+    // a "key changed from pinned value; refusing connection" error --
+    // confirmed as the actual cause of `m_restart_recovers_and_resyncs_
+    // with_both_peers`/`w_restart_...`/`n_restart_...` all failing when
+    // this file grew from one `#[tokio::test]` to three. No other file
+    // using this module has more than one test function per binary
+    // (each of those is its own separate process), so this was never
+    // triggered until now; suffixing here (rather than serializing the
+    // tests) keeps them running concurrently, matching this crate's
+    // established convention elsewhere.
+    static NODE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = NODE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let device_id = format!("{device_id}-{unique}");
+    let device_id = device_id.as_str();
     let store_dir = tempfile::tempdir().unwrap();
     let db_dir = tempfile::tempdir().unwrap();
     let db_path = db_dir.path().join("index.db");
