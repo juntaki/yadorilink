@@ -1215,6 +1215,8 @@ pub struct PeerSyncSessionOneTimeDeps {
     pub rebootstrap_handler: Arc<dyn RebootstrapHandler>,
     pub block_write_activity_provider: Arc<dyn BlockWriteActivityProvider>,
     pub handoff_ticket_responder: Arc<dyn HandoffTicketResponder>,
+    /// M3 Pass 5: see `RelaySessionHandler`'s own doc comment.
+    pub relay_session_handler: Arc<dyn RelaySessionHandler>,
     /// Unlike the other 7 fields, has no universal non-`None` default --
     /// see the `change_emitter` field's own doc comment.
     pub change_emitter: Option<Arc<yadorilink_replica_domain::admission::ChangeEmitter>>,
@@ -1235,6 +1237,7 @@ impl PeerSyncSessionOneTimeDeps {
             rebootstrap_handler: Arc::new(DeniedRebootstrapHandler),
             block_write_activity_provider: Arc::new(DeniedBlockWriteActivityProvider),
             handoff_ticket_responder: Arc::new(DeniedHandoffTicketResponder),
+            relay_session_handler: Arc::new(DeniedRelaySessionHandler),
             change_emitter: None,
         }
     }
@@ -1302,6 +1305,122 @@ pub trait HandoffLeaseResponder: Send + Sync {
         group_id: &'a str,
         lease_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
+/// M3 Pass 5: handles this device's own role as a Peer Relay ("B") for
+/// `RelayOpen`/`RelayData`/`RelayClose` arriving on an established
+/// `PeerSyncSession`. `Pin<Box<dyn Future<...>>>` for the same object-
+/// safety reason as `HandoffLeaseResponder`, right above.
+///
+/// This crate has no admission logic, session bookkeeping, or forwarding
+/// actor of its own -- see `yadorilink-daemon`'s `relay_grant`/`relay_
+/// session`/`relay_forwarder` for that (this crate deliberately does not
+/// and should not depend on `yadorilink-daemon`, the same reasoning
+/// `ChangeAuthenticator` and every other injected port here already
+/// follows). `PeerSyncSessionDeps::standalone()`'s default implementation
+/// denies every `RelayOpen` and no-ops on data/close, matching every
+/// other `Deny*`/`Noop*` default in this same file.
+pub trait RelaySessionHandler: Send + Sync {
+    /// `authenticated_peer_device_id` is this session's OWN `peer_device_
+    /// id` -- the identity of the ALREADY-AUTHENTICATED channel `open`
+    /// arrived on, passed explicitly (rather than left for the
+    /// implementation to somehow re-derive) so it is unambiguous which
+    /// identity `relay_session::admit_relay_open` must check `open`'s own
+    /// claimed `source_device_id` against.
+    fn handle_relay_open<'a>(
+        &'a self,
+        open: yadorilink_sync_wire::RelayOpenFrame,
+        authenticated_peer_device_id: &'a str,
+        reply_sink: Arc<dyn RelayReplySink>,
+    ) -> Pin<Box<dyn Future<Output = yadorilink_sync_wire::RelayOpenedFrame> + Send + 'a>>;
+
+    /// `authenticated_peer_device_id`: same reasoning as `handle_relay_
+    /// open`'s own -- independent-review finding H1: without this, a
+    /// session id is a device-global, guessable counter any authenticated
+    /// peer of this device could present to inject datagrams into a
+    /// session it never opened. The implementation must verify this
+    /// matches whatever identity actually opened `data.session_id`.
+    fn handle_relay_data<'a>(
+        &'a self,
+        data: yadorilink_sync_wire::RelayDataFrame,
+        authenticated_peer_device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    /// Same ownership requirement as `handle_relay_data`'s own -- an
+    /// unauthenticated-for-this-session `RelayClose` must not close a
+    /// session belonging to a different peer.
+    fn handle_relay_close<'a>(
+        &'a self,
+        close: yadorilink_sync_wire::RelayCloseFrame,
+        authenticated_peer_device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    /// M3 Pass 6: the reply leg of `send_relay_open` -- arrives on THIS
+    /// SAME session once the peer this device asked to relay for it
+    /// (`authenticated_peer_device_id`, playing role "B" here, the mirror
+    /// of `handle_relay_open`'s caller playing role "B" for someone else)
+    /// finishes admission. This crate has no pending-request bookkeeping
+    /// of its own (the same reasoning as this trait's own doc comment) --
+    /// an implementation with no outstanding request for `opened.grant_id`
+    /// simply has nothing to do with it.
+    fn handle_relay_opened<'a>(
+        &'a self,
+        opened: yadorilink_sync_wire::RelayOpenedFrame,
+        authenticated_peer_device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
+/// Where a `RelaySessionHandler` implementation sends bytes it receives
+/// FROM the relay session's destination, and how it reports the session
+/// closing -- implemented by the `PeerSyncSession` that owns the channel
+/// the original `RelayOpen` arrived on, so these push straight back out
+/// as `RelayData`/`RelayClose` on that same channel.
+pub trait RelayReplySink: Send + Sync {
+    fn send_relay_data(&self, session_id: u64, payload: Vec<u8>);
+    fn send_relay_close(&self, session_id: u64, reason: &str);
+}
+
+struct DeniedRelaySessionHandler;
+
+impl RelaySessionHandler for DeniedRelaySessionHandler {
+    fn handle_relay_open<'a>(
+        &'a self,
+        open: yadorilink_sync_wire::RelayOpenFrame,
+        _authenticated_peer_device_id: &'a str,
+        _reply_sink: Arc<dyn RelayReplySink>,
+    ) -> Pin<Box<dyn Future<Output = yadorilink_sync_wire::RelayOpenedFrame> + Send + 'a>> {
+        Box::pin(async move {
+            yadorilink_sync_wire::RelayOpenedFrame {
+                grant_id: open.grant_id,
+                granted: false,
+                session_id: 0,
+            }
+        })
+    }
+
+    fn handle_relay_data<'a>(
+        &'a self,
+        _data: yadorilink_sync_wire::RelayDataFrame,
+        _authenticated_peer_device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+
+    fn handle_relay_close<'a>(
+        &'a self,
+        _close: yadorilink_sync_wire::RelayCloseFrame,
+        _authenticated_peer_device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+
+    fn handle_relay_opened<'a>(
+        &'a self,
+        _opened: yadorilink_sync_wire::RelayOpenedFrame,
+        _authenticated_peer_device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
 }
 
 /// A prepared re-bootstrap response, ready to sign into the wire message: the
@@ -2421,6 +2540,14 @@ pub struct PeerSyncSession {
     /// deny-by-default implementation, so an incoming `HandoffLeaseRequest`
     /// answers `granted = false` rather than panic or hang.
     handoff_lease_responder: Arc<dyn HandoffLeaseResponder>,
+    /// M3 Pass 5: this session's caller-injected bridge to the daemon's
+    /// own relay admission/forwarding machinery -- see
+    /// `RelaySessionHandler`'s doc comment. Set once at construction; a
+    /// caller with no real handler passes a deny-by-default
+    /// implementation, so an incoming `RelayOpen` answers `granted =
+    /// false` rather than panic or hang, matching every other injected
+    /// port in this file.
+    relay_session_handler: Arc<dyn RelaySessionHandler>,
     /// Correlates outstanding `RebootstrapSnapshotRequest`s to the oneshot
     /// `request_rebootstrap_snapshot_from_peer` awaits: request_id ->
     /// reply sender. Mirrors `pending_handoff_lease` exactly.
@@ -2474,6 +2601,28 @@ pub struct PeerSyncSession {
     /// fail-closed contract `link_manager::ensure_initial_change_history`
     /// already applies to a registered device with no signing key.
     change_emitter: Option<Arc<yadorilink_replica_domain::admission::ChangeEmitter>>,
+}
+
+/// M3 Pass 5: `try_send_frame`, not `send_frame` -- a relayed datagram is,
+/// by construction, exactly as loss-tolerant as the raw UDP send it stands
+/// in for (see `relay_forwarder`'s own doc comment on why this whole
+/// mechanism is deliberately "dumb" opaque forwarding); blocking this
+/// session's own outbound path on a full or backed-up queue would let ONE
+/// slow relayed session stall this device's entire channel to the peer
+/// relaying for it, including its own unrelated sync traffic over that
+/// SAME channel.
+impl RelayReplySink for PeerSyncSession {
+    fn send_relay_data(&self, session_id: u64, payload: Vec<u8>) {
+        self.try_send_frame(yadorilink_sync_wire::OutboundFrame::RelayData(
+            yadorilink_sync_wire::RelayDataFrame { session_id, payload },
+        ));
+    }
+
+    fn send_relay_close(&self, session_id: u64, reason: &str) {
+        self.try_send_frame(yadorilink_sync_wire::OutboundFrame::RelayClose(
+            yadorilink_sync_wire::RelayCloseFrame { session_id, reason: reason.to_string() },
+        ));
+    }
 }
 
 impl PeerSyncSession {
@@ -2654,6 +2803,7 @@ impl PeerSyncSession {
             pending_handoff_lease: StdMutex::new(HashMap::new()),
             next_handoff_lease_request_id: std::sync::atomic::AtomicU64::new(1),
             handoff_lease_responder: one_time_deps.handoff_lease_responder,
+            relay_session_handler: one_time_deps.relay_session_handler,
             pending_rebootstrap_snapshot: StdMutex::new(HashMap::new()),
             next_rebootstrap_snapshot_request_id: std::sync::atomic::AtomicU64::new(1),
             rebootstrap_handler: one_time_deps.rebootstrap_handler,
@@ -3619,6 +3769,23 @@ impl PeerSyncSession {
         }
     }
 
+    /// M3 Pass 5: sends a `RelayOpen` over this channel -- the requester
+    /// ("A") side of the relay protocol. The peer on the other end of
+    /// THIS channel is the one being asked to relay ("B"); its own
+    /// `RelaySessionHandler` decides whether to grant it and, if so,
+    /// replies with `RelayOpened` (dispatched by `handle_message`'s own
+    /// `RelayOpened` arm -- currently a no-op there, since this crate has
+    /// no requester-side session bookkeeping of its own; correlating a
+    /// sent grant_id to its eventual `RelayOpened`/subsequent `RelayData`
+    /// is the caller's job today, via whatever `RelaySessionHandler` it
+    /// installed on ITS OWN session for the reply direction).
+    pub async fn send_relay_open(
+        &self,
+        open: yadorilink_sync_wire::RelayOpenFrame,
+    ) -> Result<(), PeerSessionError> {
+        self.send_frame(yadorilink_sync_wire::OutboundFrame::RelayOpen(open)).await
+    }
+
     /// Pairs `record` with its own symlink/exec-bit/authoring metadata for
     /// the local materialization-repair path (`reconcile_local_
     /// materialization_audit` / `rematerialize_local_records`): `record`
@@ -3795,6 +3962,10 @@ impl PeerSyncSession {
 
     fn handoff_lease_responder(&self) -> Arc<dyn HandoffLeaseResponder> {
         self.handoff_lease_responder.clone()
+    }
+
+    fn relay_session_handler(&self) -> Arc<dyn RelaySessionHandler> {
+        self.relay_session_handler.clone()
     }
 
     fn rebootstrap_handler(&self) -> Arc<dyn RebootstrapHandler> {
@@ -5850,6 +6021,46 @@ impl PeerSyncSession {
             }
             InboundFrame::RebootstrapSnapshotResponse(resp) => {
                 self.handle_rebootstrap_snapshot_response(resp);
+                Ok(())
+            }
+            // M3 Pass 5: dispatched to `self.relay_session_handler()` --
+            // the daemon-side adapter owns admission (`relay_grant`/
+            // `relay_session`) and forwarding (`relay_forwarder`), which
+            // this crate deliberately does not and should not depend on.
+            // `self.clone()` is handed in as the `RelayReplySink` (see
+            // `impl RelayReplySink for PeerSyncSession` below) so bytes
+            // the forwarder later receives FROM the destination push
+            // straight back out over THIS same channel as `RelayData`/
+            // `RelayClose`, without the handler needing any other way to
+            // reach this session.
+            InboundFrame::RelayOpen(open) => {
+                let opened = self
+                    .relay_session_handler()
+                    .handle_relay_open(open, &self.peer_device_id, self.clone())
+                    .await;
+                self.send_frame(yadorilink_sync_wire::OutboundFrame::RelayOpened(opened)).await
+            }
+            InboundFrame::RelayData(data) => {
+                self.relay_session_handler().handle_relay_data(data, &self.peer_device_id).await;
+                Ok(())
+            }
+            InboundFrame::RelayClose(close) => {
+                self.relay_session_handler().handle_relay_close(close, &self.peer_device_id).await;
+                Ok(())
+            }
+            // M3 Pass 6: dispatched exactly like the other three relay
+            // frames above -- `PeerSyncSession` still keeps no
+            // pending-request table of its own (unlike e.g. `pending_
+            // rebootstrap_snapshot`); the daemon-side adapter's own
+            // correlation table (keyed by `opened.grant_id`) lives entirely
+            // on the other side of this same seam. An `opened` this device
+            // has no outstanding request for (already timed out, or never
+            // sent) is simply a no-op there -- see `RelaySessionHandler::
+            // handle_relay_opened`'s own doc comment.
+            InboundFrame::RelayOpened(opened) => {
+                self.relay_session_handler()
+                    .handle_relay_opened(opened, &self.peer_device_id)
+                    .await;
                 Ok(())
             }
             // Covers a genuinely empty `SyncMessage.payload` oneof, a peer

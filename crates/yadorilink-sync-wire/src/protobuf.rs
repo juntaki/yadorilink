@@ -21,7 +21,8 @@ use super::frame::{
     HandoffTicketGrantFrame, HandoffTicketReleaseFrame, HandoffTicketReleaseOutboundFrame,
     HandoffTicketRequestFrame, HeadsAnnounceFrame, HeadsAnnounceOutboundFrame, InboundFrame,
     OutboundFrame, RebootstrapSnapshotRequestFrame, RebootstrapSnapshotResponseFrame,
-    VersionPresentAckFrame, VersionPresentAckOutboundFrame, VersionPresentQueryFrame,
+    RelayCloseFrame, RelayDataFrame, RelayOpenFrame, RelayOpenedFrame, VersionPresentAckFrame,
+    VersionPresentAckOutboundFrame, VersionPresentQueryFrame,
 };
 
 impl TryFrom<proto::VersionPresentQuery> for VersionPresentQueryFrame {
@@ -256,6 +257,49 @@ impl TryFrom<proto::RebootstrapSnapshotRequest> for RebootstrapSnapshotRequestFr
     }
 }
 
+impl TryFrom<proto::RelayOpen> for RelayOpenFrame {
+    type Error = WireError;
+
+    fn try_from(value: proto::RelayOpen) -> Result<Self, Self::Error> {
+        Ok(Self {
+            version: value.version,
+            grant_id: value.grant_id,
+            group_id: value.group_id,
+            source_device_id: value.source_device_id,
+            relay_device_id: value.relay_device_id,
+            destination_device_id: value.destination_device_id,
+            not_before_unix: value.not_before_unix,
+            expires_at_unix: value.expires_at_unix,
+            max_session_bytes: value.max_session_bytes,
+            signature: value.signature,
+        })
+    }
+}
+
+impl TryFrom<proto::RelayOpened> for RelayOpenedFrame {
+    type Error = WireError;
+
+    fn try_from(value: proto::RelayOpened) -> Result<Self, Self::Error> {
+        Ok(Self { grant_id: value.grant_id, granted: value.granted, session_id: value.session_id })
+    }
+}
+
+impl TryFrom<proto::RelayData> for RelayDataFrame {
+    type Error = WireError;
+
+    fn try_from(value: proto::RelayData) -> Result<Self, Self::Error> {
+        Ok(Self { session_id: value.session_id, payload: value.payload })
+    }
+}
+
+impl TryFrom<proto::RelayClose> for RelayCloseFrame {
+    type Error = WireError;
+
+    fn try_from(value: proto::RelayClose) -> Result<Self, Self::Error> {
+        Ok(Self { session_id: value.session_id, reason: value.reason })
+    }
+}
+
 /// `PeerWireCodec` implementation backed by this crate's existing
 /// protobuf schema. See `peer_wire/mod.rs`'s own doc comment for exactly
 /// which message families are wired through so far -- every other message
@@ -316,6 +360,18 @@ impl PeerWireCodec for ProtobufPeerWireCodec {
             }
             Some(proto::sync_message::Payload::RebootstrapSnapshotResponse(resp)) => {
                 Ok(InboundFrame::RebootstrapSnapshotResponse(resp.try_into()?))
+            }
+            Some(proto::sync_message::Payload::RelayOpen(open)) => {
+                Ok(InboundFrame::RelayOpen(open.try_into()?))
+            }
+            Some(proto::sync_message::Payload::RelayOpened(opened)) => {
+                Ok(InboundFrame::RelayOpened(opened.try_into()?))
+            }
+            Some(proto::sync_message::Payload::RelayData(data)) => {
+                Ok(InboundFrame::RelayData(data.try_into()?))
+            }
+            Some(proto::sync_message::Payload::RelayClose(close)) => {
+                Ok(InboundFrame::RelayClose(close.try_into()?))
             }
             // Every other still-unmigrated payload variant, and a genuinely
             // empty oneof (an old peer, or a forward-incompatible message
@@ -474,6 +530,39 @@ impl PeerWireCodec for ProtobufPeerWireCodec {
             }
             OutboundFrame::RebootstrapSnapshotResponse(resp) => {
                 proto::sync_message::Payload::RebootstrapSnapshotResponse(resp.into())
+            }
+            OutboundFrame::RelayOpen(open) => {
+                proto::sync_message::Payload::RelayOpen(proto::RelayOpen {
+                    version: open.version,
+                    grant_id: open.grant_id,
+                    group_id: open.group_id,
+                    source_device_id: open.source_device_id,
+                    relay_device_id: open.relay_device_id,
+                    destination_device_id: open.destination_device_id,
+                    not_before_unix: open.not_before_unix,
+                    expires_at_unix: open.expires_at_unix,
+                    max_session_bytes: open.max_session_bytes,
+                    signature: open.signature,
+                })
+            }
+            OutboundFrame::RelayOpened(opened) => {
+                proto::sync_message::Payload::RelayOpened(proto::RelayOpened {
+                    grant_id: opened.grant_id,
+                    granted: opened.granted,
+                    session_id: opened.session_id,
+                })
+            }
+            OutboundFrame::RelayData(data) => {
+                proto::sync_message::Payload::RelayData(proto::RelayData {
+                    session_id: data.session_id,
+                    payload: data.payload,
+                })
+            }
+            OutboundFrame::RelayClose(close) => {
+                proto::sync_message::Payload::RelayClose(proto::RelayClose {
+                    session_id: close.session_id,
+                    reason: close.reason,
+                })
             }
         };
         Ok(proto::SyncMessage { payload: Some(payload) }.encode_to_vec())
@@ -1140,6 +1229,74 @@ mod tests {
         match decoded {
             InboundFrame::HandoffLeaseGrant(grant) => assert_eq!(grant, original),
             other => panic!("expected HandoffLeaseGrant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_open_round_trips_through_the_wire() {
+        let codec = ProtobufPeerWireCodec;
+        let original = RelayOpenFrame {
+            version: 1,
+            grant_id: "grant-1".to_string(),
+            group_id: "group-1".to_string(),
+            source_device_id: "device-a".to_string(),
+            relay_device_id: "device-b".to_string(),
+            destination_device_id: "device-c".to_string(),
+            not_before_unix: 1_700_000_000,
+            expires_at_unix: 1_700_000_300,
+            max_session_bytes: 0,
+            signature: vec![0xCD; 64],
+        };
+
+        let bytes = codec.encode(OutboundFrame::RelayOpen(original.clone())).unwrap();
+        let decoded = codec.decode(&bytes).unwrap();
+
+        match decoded {
+            InboundFrame::RelayOpen(open) => assert_eq!(open, original),
+            other => panic!("expected RelayOpen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_opened_round_trips_through_the_wire() {
+        let codec = ProtobufPeerWireCodec;
+        let original =
+            RelayOpenedFrame { grant_id: "grant-1".to_string(), granted: true, session_id: 42 };
+
+        let bytes = codec.encode(OutboundFrame::RelayOpened(original.clone())).unwrap();
+        let decoded = codec.decode(&bytes).unwrap();
+
+        match decoded {
+            InboundFrame::RelayOpened(opened) => assert_eq!(opened, original),
+            other => panic!("expected RelayOpened, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_data_round_trips_through_the_wire() {
+        let codec = ProtobufPeerWireCodec;
+        let original = RelayDataFrame { session_id: 42, payload: vec![1, 2, 3, 4, 5] };
+
+        let bytes = codec.encode(OutboundFrame::RelayData(original.clone())).unwrap();
+        let decoded = codec.decode(&bytes).unwrap();
+
+        match decoded {
+            InboundFrame::RelayData(data) => assert_eq!(data, original),
+            other => panic!("expected RelayData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_close_round_trips_through_the_wire() {
+        let codec = ProtobufPeerWireCodec;
+        let original = RelayCloseFrame { session_id: 42, reason: "idle_timeout".to_string() };
+
+        let bytes = codec.encode(OutboundFrame::RelayClose(original.clone())).unwrap();
+        let decoded = codec.decode(&bytes).unwrap();
+
+        match decoded {
+            InboundFrame::RelayClose(close) => assert_eq!(close, original),
+            other => panic!("expected RelayClose, got {other:?}"),
         }
     }
 

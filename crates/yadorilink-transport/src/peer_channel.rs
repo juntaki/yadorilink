@@ -3,14 +3,21 @@
 //! direct candidates (LAN, NAT-traversed public, or one learned later via
 //! local broadcast discovery) ended up carrying the WireGuard session.
 //!
-//! Sync data travels exclusively over direct peer-to-peer paths this
-//! device establishes itself; there is no operator-run forwarding path. A
-//! peer for which no candidate ever yields an authenticated path is
-//! reported as [`PeerReachability::Unreachable`] with a failure category
-//! rather than being routed anywhere else.
+//! Sync data travels over direct peer-to-peer paths this device
+//! establishes itself, or -- M3 Pass 6 -- opportunistically over a
+//! [`RelayCarrier`] the caller injects, when direct is not currently
+//! available; there is no operator-run forwarding path, and every relay
+//! hop is itself just another peer this device already shares a group
+//! with (see `yadorilink-daemon::relay_forwarder`'s own doc comment). A
+//! peer for which no candidate ever yields an authenticated path, and no
+//! relay carries traffic either, is reported as
+//! [`PeerReachability::Unreachable`] with a failure category rather than
+//! being routed anywhere else.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -48,6 +55,20 @@ const DIRECT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(20);
 /// candidate but short enough that a genuinely unreachable peer surfaces
 /// quickly.
 const CANDIDATE_RACE_TIMEOUT: Duration = Duration::from_secs(20);
+/// M3 Pass 6 (independent-review finding): how long a relay-routed path
+/// can go without any relay-delivered traffic before it's treated as
+/// dead. Deliberately LONGER than `DIRECT_LIVENESS_TIMEOUT` (20s) even
+/// though the underlying idea is the same -- unlike a confirmed direct
+/// path, a relay path has no independent `DIRECT_PROBE_INTERVAL` probe
+/// keeping it warm (`should_probe`'s probes only ever race `direct_
+/// candidates`, never go through the relay), so the ONLY thing refreshing
+/// this is WireGuard's own ~25s keepalive (`tunn_wrapper::KEEPALIVE_
+/// SECS`) riding over the relay. A 20s timeout shorter than that
+/// keepalive interval would deterministically time out a perfectly
+/// healthy, merely-idle relay path on every cycle, bouncing it through a
+/// full `CANDIDATE_RACE_TIMEOUT` (another 20s) before relay could even
+/// resume -- a real, reproducible ~40s flap, not a theoretical one.
+const RELAY_LIVENESS_TIMEOUT: Duration = Duration::from_secs(35);
 const MAX_OUTBOUND_BATCH: usize = 16;
 const MAX_DIRECT_RECV_BATCH: usize = 16;
 /// How often the actor checks for a due standalone ack and/or a due
@@ -176,6 +197,64 @@ fn classify_endpoint(addr: SocketAddr) -> CandidateClass {
     }
 }
 
+/// Bound on the requester-side relay-inbound queue (`PeerChannel::
+/// deliver_relay_datagram`) -- mirrors `outbound_tx`'s own capacity (64).
+/// A relay reply is only ever pushed here by this device's own daemon-layer
+/// relay-session bookkeeping (see `RelayCarrier`'s own doc comment), never
+/// by an untrusted peer directly, so this bound exists purely as ordinary
+/// backpressure, not a security boundary.
+const RELAY_INBOUND_QUEUE_DEPTH: usize = 64;
+
+/// M3 Pass 6: the seam a caller (the daemon layer, which alone knows about
+/// relay grants, sessions, and which peers are relay-capable) injects into
+/// [`PeerChannel::connect_with_relay`] so this channel's actor can fall
+/// back to sending its WireGuard datagrams via a relaying peer when no
+/// direct path is currently available -- see this module's own doc comment
+/// for why that fallback never weakens `Sync data travels ... over direct
+/// peer-to-peer paths ... or opportunistically over a relay`.
+///
+/// `yadorilink-transport` cannot depend on `yadorilink-daemon` (where
+/// relay grants/sessions/forwarding actually live), so -- exactly like
+/// `yadorilink_peer_session::peer_session::RelaySessionHandler` in the
+/// sibling crate -- this port is defined here and implemented there,
+/// injected downward at construction time.
+///
+/// Deliberately fire-and-forget/best-effort: a `false` return (or the
+/// relay simply staying unavailable) is reported nowhere beyond a debug
+/// log, exactly like today's unconfirmed-direct-candidate racing in
+/// [`send_batch_direct`] -- WireGuard's own retransmission and this
+/// actor's periodic ticks are what make an occasional dropped datagram
+/// harmless.
+pub trait RelayCarrier: Send + Sync {
+    /// Attempts to forward one already-WireGuard-encrypted datagram to
+    /// `peer_public` via a relay. Returns whether it was actually handed
+    /// off (a live or newly-opened relay session accepted it) -- `false`
+    /// means no relay path is available right now and the datagram is
+    /// simply dropped.
+    fn send_via_relay<'a>(
+        &'a self,
+        peer_public: &'a [u8; 32],
+        datagram: Bytes,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+}
+
+/// Deny-by-default [`RelayCarrier`] -- every existing [`PeerChannel::
+/// connect`] caller (production and the many test call sites that predate
+/// Pass 6) gets this via `connect`'s own delegation to `connect_with_relay`,
+/// so relay fallback is opt-in per caller, not a behavior change for
+/// anything that doesn't explicitly wire up a real carrier.
+struct DeniedRelayCarrier;
+
+impl RelayCarrier for DeniedRelayCarrier {
+    fn send_via_relay<'a>(
+        &'a self,
+        _peer_public: &'a [u8; 32],
+        _datagram: Bytes,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async { false })
+    }
+}
+
 /// Why a peer could not be reached after a full candidate race.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnreachableCategory {
@@ -208,6 +287,19 @@ pub enum PeerReachability {
     /// An authenticated direct path is confirmed, over an endpoint of the
     /// given class.
     Connected { path: CandidateClass },
+    /// M3 Pass 6: authenticated WireGuard traffic is flowing, but not from
+    /// any address this device knows as a direct candidate for this peer
+    /// -- the only way that happens is genuine encrypted traffic arriving
+    /// by way of a relaying peer's own forwarding socket (spoofing a
+    /// source address cannot forge a valid WireGuard session). Reported
+    /// distinctly from `Connected` so callers never mistake a relay hop
+    /// for a confirmed direct path -- `confirmed_direct_addr` itself is
+    /// never set from this state. Direct candidates keep racing/probing in
+    /// the background exactly as in `Connecting`
+    /// ([`should_probe`]); an authenticated reply from a genuine candidate
+    /// promotes straight to `Connected`, the same immediate-promotion
+    /// policy every other transition in this state machine already uses.
+    ConnectedRelay,
     /// Every known candidate was exhausted without an authenticated path.
     /// Bounded-backoff re-attempts continue; `next_retry` is when the next
     /// race is due (a newly learned candidate re-races immediately
@@ -279,6 +371,28 @@ pub struct PeerChannel {
     ///
     /// [`enable_reliable_delivery`]: PeerChannel::enable_reliable_delivery
     reliable_enabled: Arc<AtomicBool>,
+    /// M3 Pass 5: mirrors the actor's own `ActorState::confirmed_direct_addr`
+    /// (same shared-`Arc` pattern as `revoked`) so a caller outside the
+    /// actor -- specifically, this device acting as a Peer Relay, which
+    /// needs C's real address to open its own dedicated forwarding socket
+    /// -- can read the confirmed direct address without a message round
+    /// trip through the actor. `None` whenever no direct path is
+    /// confirmed, exactly mirroring `confirmed_direct_addr` itself.
+    confirmed_addr_shared: Arc<std::sync::Mutex<Option<SocketAddr>>>,
+    /// M3 Pass 6: where a caller (the daemon layer, on the relay-
+    /// *requesting* side) pushes a datagram that arrived over a relay
+    /// session rather than this device's own UDP socket -- see
+    /// [`deliver_relay_datagram`](Self::deliver_relay_datagram).
+    relay_inbound_tx: mpsc::Sender<Vec<u8>>,
+    /// M3 Pass 6: this peer's WireGuard static public key, exposed so a
+    /// caller holding a `direct_channels`-style `device_id -> PeerChannel`
+    /// map (see `DaemonState`) can go the other way -- match a
+    /// `RelayCarrier::send_via_relay` call's `peer_public` back to the
+    /// device_id that owns this channel, without a second synchronized
+    /// side table to keep in lockstep. Immutable for the channel's whole
+    /// lifetime, unlike `confirmed_addr_shared`, so a plain field is
+    /// enough -- no `Arc`/lock needed.
+    peer_public_bytes: [u8; 32],
 }
 
 impl PeerChannel {
@@ -307,19 +421,49 @@ impl PeerChannel {
         direct_candidates: Vec<SocketAddr>,
         shared: Arc<TransportHub>,
     ) -> Result<Self, TransportError> {
+        Self::connect_with_relay(
+            local_secret,
+            peer_public,
+            session_index,
+            direct_candidates,
+            shared,
+            Arc::new(DeniedRelayCarrier),
+        )
+        .await
+    }
+
+    /// Identical to [`connect`](Self::connect), plus a [`RelayCarrier`]
+    /// this channel's actor falls back to when no direct path is currently
+    /// available -- see that trait's own doc comment. `connect` itself
+    /// delegates here with a deny-by-default carrier so every pre-Pass-6
+    /// caller (including the many existing test call sites) keeps its
+    /// exact current behavior unchanged; only a caller that actually wants
+    /// relay fallback needs to switch to this method.
+    pub async fn connect_with_relay(
+        local_secret: StaticSecret,
+        peer_public: PublicKey,
+        session_index: u32,
+        direct_candidates: Vec<SocketAddr>,
+        shared: Arc<TransportHub>,
+        relay_carrier: Arc<dyn RelayCarrier>,
+    ) -> Result<Self, TransportError> {
         let peer_public_bytes = peer_public.to_bytes();
 
         // Register with the peer's known candidate addresses so the hub can
         // order handshake-initiation trials by source endpoint.
-        let inbound_demux_rx = shared.register_channel(session_index, &direct_candidates);
+        let inbound_demux_rx =
+            shared.register_channel(session_index, &direct_candidates, peer_public);
 
         let tunn = WgTunnel::new(local_secret, peer_public, session_index);
         let (outbound_tx, outbound_rx) = mpsc::channel::<Bytes>(64);
         let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(64);
         let (candidate_tx, candidate_rx) = mpsc::channel::<CandidateUpdate>(16);
+        let (relay_inbound_tx, relay_inbound_rx) =
+            mpsc::channel::<Vec<u8>>(RELAY_INBOUND_QUEUE_DEPTH);
         let revoked = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(Notify::new());
         let reliable_enabled = Arc::new(AtomicBool::new(false));
+        let confirmed_addr_shared = Arc::new(std::sync::Mutex::new(None));
 
         // candidates supplied here come from the caller's
         // coordination-plane netmap (see the doc comment on `connect`'s
@@ -355,9 +499,13 @@ impl PeerChannel {
             shared,
             session_index,
             inbound_demux_rx,
+            relay_inbound_rx,
+            relay_carrier,
             direct_candidates: bounded_candidates,
             confirmed_direct_addr: None,
             last_direct_rx: None,
+            last_relay_rx: None,
+            confirmed_relay_addr: None,
             outbound_rx,
             candidate_rx,
             inbound_tx,
@@ -371,6 +519,7 @@ impl PeerChannel {
             reliable_enabled: reliable_enabled.clone(),
             reliable_send: ReliableSend::new(),
             reliable_recv: ReliableRecv::new(),
+            confirmed_addr_shared: confirmed_addr_shared.clone(),
         });
 
         Ok(Self {
@@ -381,7 +530,27 @@ impl PeerChannel {
             revoked,
             shutdown,
             reliable_enabled,
+            confirmed_addr_shared,
+            relay_inbound_tx,
+            peer_public_bytes,
         })
+    }
+
+    /// Delivers a datagram that arrived over a relay session (rather than
+    /// this device's own UDP socket) into this channel's ordinary
+    /// WireGuard-decapsulation pipeline -- the requester side of M3 Pass
+    /// 6's relay integration (the provider/forwarding side never needs
+    /// this: a forwarded datagram arrives at the destination over genuine
+    /// UDP and is demultiplexed exactly like any other inbound packet, see
+    /// `handle_datagram`'s own doc comment). The caller (daemon-layer
+    /// relay-session bookkeeping) is responsible for knowing this
+    /// datagram belongs to THIS peer's session in the first place --
+    /// nothing here re-derives that. Returns whether it was accepted; a
+    /// `false` means the actor's relay-inbound queue is full or the
+    /// channel has already been torn down, and the datagram is dropped
+    /// exactly like any other best-effort delivery in this actor.
+    pub fn deliver_relay_datagram(&self, data: Vec<u8>) -> bool {
+        self.relay_inbound_tx.try_send(data).is_ok()
     }
 
     /// Called once `peer_session.rs`'s `ClusterConfig` handshake confirms
@@ -438,6 +607,21 @@ impl PeerChannel {
     /// to changes rather than poll [`reachability`](Self::reachability).
     pub fn reachability_watch(&self) -> watch::Receiver<PeerReachability> {
         self.reachability_rx.clone()
+    }
+
+    /// M3 Pass 5: the actual confirmed direct `SocketAddr` for this peer,
+    /// if one is currently confirmed -- `None` whenever `reachability()`
+    /// is not `Connected`. See `confirmed_addr_shared`'s own doc comment
+    /// for why this exists (Peer Relay needs a real address to open its
+    /// own dedicated forwarding socket toward this peer).
+    pub fn confirmed_direct_addr(&self) -> Option<SocketAddr> {
+        *self.confirmed_addr_shared.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// This peer's WireGuard static public key -- see `peer_public_bytes`'s
+    /// own doc comment.
+    pub fn peer_public(&self) -> [u8; 32] {
+        self.peer_public_bytes
     }
 
     /// Adds a newly-learned direct candidate at runtime — e.g.
@@ -498,6 +682,13 @@ struct ActorState {
     /// channel — transport-data/handshake-response/cookie packets by receiver
     /// index, plus handshake-initiation probes offered to every channel.
     inbound_demux_rx: mpsc::Receiver<InboundDatagram>,
+    /// M3 Pass 6: datagrams pushed by [`PeerChannel::deliver_relay_datagram`]
+    /// -- the requester side of relay integration; see that method's own
+    /// doc comment.
+    relay_inbound_rx: mpsc::Receiver<Vec<u8>>,
+    /// M3 Pass 6: where [`send_batch_direct`] falls back to when no direct
+    /// path is available -- see [`RelayCarrier`]'s own doc comment.
+    relay_carrier: Arc<dyn RelayCarrier>,
     /// All known direct candidates for this peer, raced concurrently until
     /// one is confirmed. Bounded at [`MAX_DIRECT_CANDIDATES`] and
     /// provenance-ranked — always insert via
@@ -512,6 +703,29 @@ struct ActorState {
     /// socket. `None` means never — used to detect a gone-quiet confirmed
     /// path and trigger re-traversal.
     last_direct_rx: Option<Instant>,
+    /// M3 Pass 6 (independent-review finding): when the last authenticated
+    /// relay-attributed datagram arrived -- deliberately SEPARATE from
+    /// `last_direct_rx`. Before this field existed, `handle_relay_inbound`
+    /// bumped `last_direct_rx` directly, which meant continuing
+    /// relay-delivered traffic silently kept a DEAD confirmed direct path
+    /// looking alive forever (the `Connected` liveness check in `evaluate_
+    /// reachability` never saw it go stale, so outbound traffic stayed
+    /// pinned to the dead direct address and never reached relay
+    /// fallback) -- exactly backwards from the intended failover. `None`
+    /// means never — consulted only by `evaluate_reachability`'s
+    /// `ConnectedRelay` arm.
+    last_relay_rx: Option<Instant>,
+    /// M3 Pass 6 (independent-review finding): the address authenticated
+    /// relay-delivered traffic most recently arrived from over the real
+    /// UDP socket (never set by `handle_relay_inbound`'s synthetic,
+    /// address-less requester-side path) -- lets a REPLY (e.g. this
+    /// device's own WireGuard handshake response to an initiation that
+    /// arrived via a relay) go straight back to the exact relay socket
+    /// that delivered the request, without this device needing its own
+    /// `RelayCarrier`/grant just to answer. Never added to `direct_
+    /// candidates` and never promotes to `Connected` -- see
+    /// `send_batch_direct`'s own doc comment for how this is used.
+    confirmed_relay_addr: Option<SocketAddr>,
     outbound_rx: mpsc::Receiver<Bytes>,
     candidate_rx: mpsc::Receiver<CandidateUpdate>,
     inbound_tx: mpsc::Sender<Vec<u8>>,
@@ -548,6 +762,12 @@ struct ActorState {
     /// Receive-side dedup/ack state, owned solely by this actor task
     /// (see `reliable.rs`).
     reliable_recv: ReliableRecv,
+    /// See [`PeerChannel::confirmed_addr_shared`]'s own doc comment --
+    /// written every place this actor mutates its own `confirmed_direct_
+    /// addr` (never read back from here; this actor's own logic always
+    /// uses its local `confirmed_direct_addr` directly, this shared copy
+    /// exists purely for outside readers).
+    confirmed_addr_shared: Arc<std::sync::Mutex<Option<SocketAddr>>>,
 }
 
 /// Whether one `run_one_io_turn` call decided the actor loop must end.
@@ -628,6 +848,10 @@ async fn run_one_io_turn(
         Some(inbound) = state.inbound_demux_rx.recv() => {
             handle_inbound(state, inbound).await;
             drain_ready_direct_datagrams(state).await;
+        }
+
+        Some(relayed) = state.relay_inbound_rx.recv() => {
+            handle_relay_inbound(state, relayed).await;
         }
 
         // Gated so a reliable-negotiated channel whose unacked buffer
@@ -712,16 +936,64 @@ async fn run_one_io_turn(
 
 /// Handles one demultiplexed inbound datagram, updating direct-path liveness.
 /// A [`DatagramKind::Direct`] datagram was routed here by WireGuard receiver
-/// index, so it unquestionably belongs to this channel and refreshes liveness
-/// regardless of whether it decrypted (a keepalive that fails to decrypt still
-/// proves the peer is sending to us on this path). A
-/// [`DatagramKind::HandshakeProbe`] was offered to every channel, so it only
-/// counts as ours — and only refreshes liveness — if it authenticated.
+/// index, so it unquestionably belongs to this channel's SESSION and refreshes
+/// liveness regardless of whether it decrypted (a keepalive that fails to
+/// decrypt still proves the peer is sending to us on this path) -- but ONLY
+/// while no direct address is confirmed yet. A [`DatagramKind::HandshakeProbe`]
+/// was offered to every channel, so it only counts as ours -- and only
+/// refreshes liveness -- if it authenticated.
+///
+/// M3 Pass 8 (final-gate review finding, High): once a direct path IS
+/// confirmed, liveness refreshes ONLY from traffic that actually arrived
+/// FROM that confirmed address specifically -- receiver-index demux routes
+/// a datagram to this channel by SESSION, not by source address, so a
+/// relay-forwarded datagram for this same peer (genuinely arriving via
+/// ordinary UDP from a relaying peer's forwarding socket, exactly like
+/// `ConnectedRelay`'s own doc comment describes) would otherwise ALSO
+/// satisfy `kind == DatagramKind::Direct` and silently keep a DEAD direct
+/// path looking alive forever, permanently masking failover in this
+/// direction -- the destination side's own equivalent of the requester-side
+/// bug `last_relay_rx` was split out to fix.
 async fn handle_inbound(state: &mut ActorState, inbound: InboundDatagram) {
     let InboundDatagram { data, from, kind } = inbound;
-    let authenticated = handle_datagram(state, &data, Some(from)).await;
-    if kind == DatagramKind::Direct || authenticated {
+    // M3 Pass 8 closeout: `kind == DatagramKind::Relay` means the demux
+    // itself already proved this datagram arrived via a relay envelope
+    // (`unwrap_relay_envelope`), regardless of its outer UDP source
+    // address -- passed straight through to `handle_datagram`'s confirm
+    // gate so it can NEVER be treated as direct-confirmable, closing the
+    // address-collision gap `from_addr`-only matching had (see
+    // `DatagramKind::Relay`'s own doc comment).
+    let via_relay = kind == DatagramKind::Relay;
+    let authenticated = handle_datagram(state, &data, Some(from), via_relay).await;
+    if via_relay {
+        if authenticated {
+            state.last_relay_rx = Some(Instant::now());
+        }
+        return;
+    }
+    let refreshes_confirmed_direct_liveness = match state.confirmed_direct_addr {
+        Some(confirmed) => from == confirmed,
+        None => kind == DatagramKind::Direct || authenticated,
+    };
+    if refreshes_confirmed_direct_liveness {
         state.last_direct_rx = Some(Instant::now());
+    }
+}
+
+/// Handles one datagram delivered by [`PeerChannel::deliver_relay_datagram`]
+/// -- the requester side of M3 Pass 6's relay integration. Runs through the
+/// exact same WireGuard decapsulation as a direct-socket datagram
+/// (`handle_datagram`, called with `from_addr: None`), so the confirm gate
+/// there can never mistake it for a genuine direct candidate address --
+/// `None` fails both of that gate's `from_addr` checks by construction.
+/// Bumps `last_relay_rx`, NEVER `last_direct_rx` (independent-review
+/// finding: this used to bump `last_direct_rx`, which meant continuing
+/// relay traffic silently kept a DEAD confirmed direct path looking
+/// alive forever -- see `last_relay_rx`'s own doc comment).
+async fn handle_relay_inbound(state: &mut ActorState, data: Vec<u8>) {
+    let authenticated = handle_datagram(state, &data, None, true).await;
+    if authenticated {
+        state.last_relay_rx = Some(Instant::now());
     }
 }
 
@@ -856,6 +1128,7 @@ async fn handle_datagram(
     state: &mut ActorState,
     datagram: &[u8],
     from_addr: Option<SocketAddr>,
+    via_relay: bool,
 ) -> bool {
     // A revoked channel refuses to process anything further, including
     // a datagram that would otherwise be a perfectly valid WireGuard
@@ -916,19 +1189,59 @@ async fn handle_datagram(
         // — authenticated traffic alone, from an address we never
         // solicited or learned of, isn't enough to adopt as the direct
         // endpoint.
-        if let Some(addr) =
+        //
+        // M3 Pass 8 closeout: `via_relay` short-circuits this to `None`
+        // BEFORE address matching is even attempted -- the demux itself
+        // (`DatagramKind::Relay`, or the synthetic requester-side
+        // injection path) already proved this datagram arrived via a
+        // relay, so its outer UDP source address is never consulted at
+        // all, regardless of whether it happens to coincidentally equal
+        // a known direct candidate for this peer. Closes the address-
+        // collision gap the previous from_addr-only matching had: a
+        // relay-forwarded datagram can no longer be confirmed as direct
+        // just because its relay's ephemeral forwarding-socket address
+        // happened to match an entry in `direct_candidates`.
+        let candidate_match = if via_relay {
+            None
+        } else {
             from_addr.filter(|a| state.direct_candidates.iter().any(|c| c.addr == *a))
-        {
+        };
+        if let Some(addr) = candidate_match {
             tracing::debug!(%addr, "direct candidate confirmed");
             state.confirmed_direct_addr = Some(addr);
+            *state.confirmed_addr_shared.lock().unwrap_or_else(|p| p.into_inner()) = Some(addr);
             state.attempt = 0;
             state.race_started_at = None;
             set_reachability(state, PeerReachability::Connected { path: classify_endpoint(addr) });
-        } else if let Some(addr) = from_addr {
-            tracing::debug!(
-                %addr,
-                "authenticated direct traffic from an address that is not a known candidate; not confirming"
-            );
+        } else {
+            // M3 Pass 6: authenticated traffic that either has no socket
+            // address at all (relay-delivered, see `handle_relay_inbound`)
+            // or arrived from a real address that isn't a known direct
+            // candidate for this peer can only be genuine WireGuard
+            // traffic relayed through another peer's forwarding socket --
+            // spoofing a source address doesn't forge a valid session.
+            // `confirmed_direct_addr` is deliberately left untouched: this
+            // device still doesn't know a usable direct address for this
+            // peer, only that *some* path, direct or not, is carrying
+            // real traffic.
+            state.last_relay_rx = Some(Instant::now());
+            if let Some(addr) = from_addr {
+                tracing::debug!(
+                    %addr,
+                    "authenticated traffic from an address that is not a known direct candidate; treating as relay-routed"
+                );
+                // M3 Pass 6 (independent-review finding): remembered so a
+                // REPLY this device generates (e.g. its own WireGuard
+                // handshake response) can be sent straight back to the
+                // exact relay socket that delivered the request -- see
+                // `confirmed_relay_addr`'s own doc comment. Deliberately
+                // NOT added to `direct_candidates` and never promotes to
+                // `Connected` from this branch alone.
+                state.confirmed_relay_addr = Some(addr);
+            } else {
+                tracing::debug!("authenticated relay-delivered traffic");
+            }
+            set_reachability(state, PeerReachability::ConnectedRelay);
         }
     }
 
@@ -990,6 +1303,7 @@ fn replace_coordination_candidates(state: &mut ActorState, candidates: Vec<Socke
         .is_some_and(|confirmed| !state.direct_candidates.iter().any(|c| c.addr == confirmed))
     {
         state.confirmed_direct_addr = None;
+        *state.confirmed_addr_shared.lock().unwrap_or_else(|p| p.into_inner()) = None;
         state.last_direct_rx = None;
     }
     state.attempt = 0;
@@ -1028,6 +1342,10 @@ fn set_reachability(state: &mut ActorState, next: PeerReachability) {
                 ?path,
                 "peer reachability: connected"
             ),
+            PeerReachability::ConnectedRelay => tracing::info!(
+                peer = %hex::encode(state.peer_public_bytes),
+                "peer reachability: connected via relay"
+            ),
             PeerReachability::Unreachable { category, .. } => tracing::warn!(
                 peer = %hex::encode(state.peer_public_bytes),
                 ?category,
@@ -1047,7 +1365,14 @@ fn should_probe(state: &ActorState) -> bool {
     !state.direct_candidates.is_empty()
         && matches!(
             state.reachability,
-            PeerReachability::Connecting { .. } | PeerReachability::Connected { .. }
+            PeerReachability::Connecting { .. }
+                | PeerReachability::Connected { .. }
+                // M3 Pass 6: keep probing direct candidates while
+                // relay-connected too, so a recovered direct path is
+                // noticed and promoted -- see `ConnectedRelay`'s own doc
+                // comment on why this is the same immediate-promotion
+                // policy the rest of this state machine already uses.
+                | PeerReachability::ConnectedRelay
         )
 }
 
@@ -1104,6 +1429,30 @@ fn evaluate_reachability(state: &mut ActorState) {
             // candidate that just proved unreliable, and start a fresh
             // race with the backoff reset.
             state.confirmed_direct_addr = None;
+            *state.confirmed_addr_shared.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            state.attempt = 0;
+            state.race_started_at = Some(now);
+            set_reachability(state, PeerReachability::Connecting { attempt: 0 });
+        }
+        // M3 Pass 6: same liveness-timeout SHAPE as `Connected` above, its
+        // own SEPARATE field and (independent-review finding) a LONGER
+        // timeout -- see `last_relay_rx`/`RELAY_LIVENESS_TIMEOUT`'s own
+        // doc comments for why reusing `last_direct_rx`/`DIRECT_LIVENESS_
+        // TIMEOUT` was wrong (relay traffic corrupting direct's own
+        // liveness) and why 20s is too short here (no independent probe
+        // keeps a relay path warm the way `DIRECT_PROBE_INTERVAL` does
+        // for direct). There is no `confirmed_direct_addr` to clear here
+        // -- `ConnectedRelay` never sets one.
+        PeerReachability::ConnectedRelay => {
+            let Some(last_rx) = state.last_relay_rx else { return };
+            if last_rx.elapsed() < RELAY_LIVENESS_TIMEOUT {
+                return;
+            }
+            tracing::warn!(
+                peer = %hex::encode(state.peer_public_bytes),
+                elapsed_secs = last_rx.elapsed().as_secs(),
+                "relay-routed path liveness lost; re-racing direct candidates"
+            );
             state.attempt = 0;
             state.race_started_at = Some(now);
             set_reachability(state, PeerReachability::Connecting { attempt: 0 });
@@ -1187,19 +1536,60 @@ async fn send_batch_direct(state: &ActorState, datagrams: Vec<Vec<u8>>) {
     if datagrams.is_empty() {
         return;
     }
-    match state.confirmed_direct_addr {
+    if let Some(addr) = state.confirmed_direct_addr {
         // Once a candidate has proven reachable, stop racing and
         // send only there.
-        Some(addr) => {
-            let _ = state.shared.send_batch(&datagrams, addr).await;
-        }
-        // Not yet confirmed: race every candidate with this
-        // datagram too, not just probes, so app data isn't stuck
-        // waiting for a separate probe round-trip to finish first.
-        None => {
-            for candidate in &state.direct_candidates {
-                let _ = state.shared.send_batch(&datagrams, candidate.addr).await;
-            }
+        let _ = state.shared.send_batch(&datagrams, addr).await;
+        return;
+    }
+
+    // Not yet confirmed: race every candidate with this datagram too, not
+    // just probes, so app data isn't stuck waiting for a separate probe
+    // round-trip to finish first.
+    for candidate in &state.direct_candidates {
+        let _ = state.shared.send_batch(&datagrams, candidate.addr).await;
+    }
+
+    // M3 Pass 6 (independent-review finding H1): reply straight back to
+    // the exact relay socket that most recently delivered authenticated
+    // traffic FROM this peer, if this device has one -- closes the loop
+    // for a relay-only WireGuard handshake. Without this, this device's
+    // own response to an initiation that arrived via a relay had NO path
+    // back to the relay's forwarding socket at all: that address is
+    // deliberately never added to `direct_candidates` (see `confirmed_
+    // relay_addr`'s own doc comment), so the race above never reaches
+    // it, and `RelayCarrier::send_via_relay` below is the REQUESTER-side
+    // open-a-NEW-session mechanism, not a way to reply to an address this
+    // device already has independent, already-authenticated evidence
+    // for. Raw UDP, the same trust level as the direct-candidate confirm
+    // gate above: this address is only ever set from ALREADY-
+    // authenticated inbound traffic. Tried before the `RelayCarrier`
+    // fallback, and regardless of `state.reachability` (unlike that
+    // fallback) -- a stale value here is harmless (a silently-dropped
+    // send, same as any other best-effort path), and this is the ONLY
+    // way a relay-arrived request's own reply ever gets back to its
+    // sender at all.
+    if let Some(relay_addr) = state.confirmed_relay_addr {
+        let _ = state.shared.send_batch(&datagrams, relay_addr).await;
+        return;
+    }
+
+    // Still nothing to reply through directly: this device is the relay
+    // REQUESTER for this peer. Reached for ONLY once this peer has
+    // already given up on direct for now (`Unreachable`) or is already
+    // using relay (`ConnectedRelay`, kept flowing while direct reprobes
+    // in the background via `should_probe`). Never attempted while still
+    // mid-race (`Connecting`) -- see `RelayCarrier`'s own doc comment for
+    // why this is deliberately best-effort/fire-and-forget.
+    if matches!(
+        state.reachability,
+        PeerReachability::Unreachable { .. } | PeerReachability::ConnectedRelay
+    ) {
+        for datagram in datagrams {
+            let _ = state
+                .relay_carrier
+                .send_via_relay(&state.peer_public_bytes, Bytes::from(datagram))
+                .await;
         }
     }
 }
@@ -1236,16 +1626,21 @@ mod tests {
         let (reachability_tx, _reachability_rx) = watch::channel(reachability);
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let shared = TransportHub::from_socket(socket, None);
-        let inbound_demux_rx = shared.register_channel(0, &[]);
+        let inbound_demux_rx = shared.register_channel(0, &[], peer_public);
+        let (_relay_inbound_tx, relay_inbound_rx) = mpsc::channel::<Vec<u8>>(1);
         ActorState {
             tunn,
             peer_public_bytes: peer_public.to_bytes(),
             shared,
             session_index: 0,
             inbound_demux_rx,
+            relay_inbound_rx,
+            relay_carrier: Arc::new(DeniedRelayCarrier),
             direct_candidates: candidates,
             confirmed_direct_addr: confirmed,
             last_direct_rx: None,
+            last_relay_rx: None,
+            confirmed_relay_addr: None,
             outbound_rx,
             candidate_rx,
             inbound_tx,
@@ -1259,6 +1654,7 @@ mod tests {
             reliable_enabled: Arc::new(AtomicBool::new(false)),
             reliable_send: ReliableSend::new(),
             reliable_recv: ReliableRecv::new(),
+            confirmed_addr_shared: Arc::new(std::sync::Mutex::new(confirmed)),
         }
     }
 
@@ -1298,6 +1694,7 @@ mod tests {
         // `make_state`'s use of `shared.register_channel`, so it can push
         // inbound datagrams directly with no real peer/socket traffic.
         let (demux_tx, inbound_demux_rx) = mpsc::channel::<InboundDatagram>(1024);
+        let (_relay_inbound_tx, relay_inbound_rx) = mpsc::channel::<Vec<u8>>(1);
 
         let mut state = ActorState {
             tunn,
@@ -1305,9 +1702,13 @@ mod tests {
             shared,
             session_index: 0,
             inbound_demux_rx,
+            relay_inbound_rx,
+            relay_carrier: Arc::new(DeniedRelayCarrier),
             direct_candidates: Vec::new(),
             confirmed_direct_addr: None,
             last_direct_rx: None,
+            last_relay_rx: None,
+            confirmed_relay_addr: None,
             outbound_rx,
             candidate_rx,
             inbound_tx,
@@ -1321,6 +1722,7 @@ mod tests {
             reliable_enabled: Arc::new(AtomicBool::new(true)),
             reliable_send: ReliableSend::new(),
             reliable_recv: ReliableRecv::new(),
+            confirmed_addr_shared: Arc::new(std::sync::Mutex::new(None)),
         };
         // Prime a pending ack so `reliable_tick`'s guard is satisfied and
         // `reliable_send_due` has something concrete to send -- observed
@@ -1562,6 +1964,107 @@ mod tests {
         assert!(state.confirmed_direct_addr.is_none());
     }
 
+    /// Same liveness-timeout policy, `ConnectedRelay` side: a relay
+    /// session gone quiet re-races direct candidates exactly like a dead
+    /// direct path does.
+    #[tokio::test]
+    async fn connected_relay_liveness_loss_triggers_retraversal() {
+        let mut state = make_state(
+            PeerReachability::ConnectedRelay,
+            vec![coordination_candidate(peer_addr())],
+            None,
+        )
+        .await;
+        state.last_relay_rx = Some(Instant::now() - Duration::from_secs(40));
+
+        evaluate_reachability(&mut state);
+
+        assert!(matches!(state.reachability, PeerReachability::Connecting { attempt: 0 }));
+        assert!(state.confirmed_direct_addr.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_probe_keeps_racing_direct_candidates_while_connected_via_relay() {
+        let state = make_state(
+            PeerReachability::ConnectedRelay,
+            vec![coordination_candidate(peer_addr())],
+            None,
+        )
+        .await;
+        assert!(should_probe(&state));
+    }
+
+    /// Spy [`RelayCarrier`] recording every peer/datagram it was asked to
+    /// forward, for asserting `send_batch_direct`'s fallback trigger
+    /// without any real relay session machinery.
+    struct SpyRelayCarrier {
+        calls: std::sync::Mutex<Vec<([u8; 32], Vec<u8>)>>,
+    }
+
+    impl SpyRelayCarrier {
+        fn new() -> Self {
+            Self { calls: std::sync::Mutex::new(Vec::new()) }
+        }
+    }
+
+    impl RelayCarrier for SpyRelayCarrier {
+        fn send_via_relay<'a>(
+            &'a self,
+            peer_public: &'a [u8; 32],
+            datagram: Bytes,
+        ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+            self.calls.lock().unwrap().push((*peer_public, datagram.to_vec()));
+            Box::pin(async { true })
+        }
+    }
+
+    #[tokio::test]
+    async fn send_batch_direct_falls_back_to_relay_when_unreachable() {
+        let mut state = make_state(
+            PeerReachability::Unreachable {
+                category: UnreachableCategory::NoResponse,
+                next_retry: Instant::now(),
+            },
+            Vec::new(),
+            None,
+        )
+        .await;
+        let spy = Arc::new(SpyRelayCarrier::new());
+        state.relay_carrier = spy.clone();
+
+        send_batch_direct(&state, vec![vec![1, 2, 3]]).await;
+
+        assert_eq!(spy.calls.lock().unwrap().len(), 1);
+        assert_eq!(spy.calls.lock().unwrap()[0].1, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn send_batch_direct_falls_back_to_relay_when_already_connected_via_relay() {
+        let mut state = make_state(PeerReachability::ConnectedRelay, Vec::new(), None).await;
+        let spy = Arc::new(SpyRelayCarrier::new());
+        state.relay_carrier = spy.clone();
+
+        send_batch_direct(&state, vec![vec![9]]).await;
+
+        assert_eq!(spy.calls.lock().unwrap().len(), 1);
+    }
+
+    /// While a candidate race is still in progress (`Connecting`), a
+    /// relay session must not be opened for every transient reconnect --
+    /// only once direct has actually been given up on, or is already in
+    /// use.
+    #[tokio::test]
+    async fn send_batch_direct_does_not_use_relay_while_still_racing_direct_candidates() {
+        let mut state =
+            make_state(PeerReachability::Connecting { attempt: 0 }, Vec::new(), None).await;
+        let spy = Arc::new(SpyRelayCarrier::new());
+        state.relay_carrier = spy.clone();
+
+        send_batch_direct(&state, vec![vec![9]]).await;
+
+        assert!(spy.calls.lock().unwrap().is_empty());
+    }
+
     // --- Confirm-gate tests ------------------------------------------
 
     /// A junk datagram — not a valid WireGuard
@@ -1578,7 +2081,7 @@ mod tests {
         )
         .await;
 
-        handle_datagram(&mut state, &[0xAAu8; 200], Some(peer_addr())).await;
+        handle_datagram(&mut state, &[0xAAu8; 200], Some(peer_addr()), false).await;
 
         assert!(state.confirmed_direct_addr.is_none());
         assert!(matches!(state.reachability, PeerReachability::Connecting { .. }));
@@ -1586,10 +2089,14 @@ mod tests {
 
     /// Even a datagram that *does* decrypt (a genuine handshake
     /// initiation) from an address that isn't a known candidate must not
-    /// be confirmed — regression guard against dropping the
-    /// candidate-membership check.
+    /// be confirmed as a direct path — regression guard against dropping
+    /// the candidate-membership check. M3 Pass 6: it IS now reported as
+    /// `ConnectedRelay` rather than left stuck `Connecting`, since real
+    /// authenticated traffic from an unrecognized address can only be
+    /// relay-routed (see `ConnectedRelay`'s own doc comment) — this is the
+    /// exact behavior change this pass exists to make.
     #[tokio::test]
-    async fn authenticated_traffic_from_unknown_address_does_not_confirm() {
+    async fn authenticated_traffic_from_unknown_address_confirms_relay_not_direct() {
         let local_secret = StaticSecret::from([1u8; 32]);
         let local_public = PublicKey::from(&local_secret);
         let peer_secret = StaticSecret::from([2u8; 32]);
@@ -1599,10 +2106,156 @@ mod tests {
         // No candidates at all — the source address is not among them.
         let mut state = make_state(PeerReachability::Connecting { attempt: 0 }, vec![], None).await;
 
-        handle_datagram(&mut state, &init, Some(peer_addr())).await;
+        handle_datagram(&mut state, &init, Some(peer_addr()), false).await;
 
         assert!(state.confirmed_direct_addr.is_none());
-        assert!(matches!(state.reachability, PeerReachability::Connecting { .. }));
+        assert_eq!(state.reachability, PeerReachability::ConnectedRelay);
+    }
+
+    /// M3 Pass 8 closeout: the address-collision scenario the final-gate
+    /// review's own "opaque forwarding is provably indistinguishable from
+    /// direct" concern was about -- a relay's ephemeral forwarding-socket
+    /// address coincidentally matching an address ALREADY in this peer's
+    /// own `direct_candidates` list. Before `DatagramKind::Relay`/
+    /// `via_relay` existed, this was indistinguishable from a genuine
+    /// direct arrival at the SAME code path, purely by address matching:
+    /// this test deliberately puts the colliding address in `direct_
+    /// candidates` (unlike the test above, which used no candidates at
+    /// all) and proves that a datagram explicitly tagged `via_relay` is
+    /// STILL never confirmed as direct, even though its `from_addr`
+    /// WOULD otherwise satisfy the candidate-membership check.
+    #[tokio::test]
+    async fn relay_tagged_datagram_from_a_colliding_known_candidate_stays_relay() {
+        let local_secret = StaticSecret::from([1u8; 32]);
+        let local_public = PublicKey::from(&local_secret);
+        let peer_secret = StaticSecret::from([2u8; 32]);
+        let mut peer_tunnel = WgTunnel::new(peer_secret, local_public, 1);
+        let init = peer_tunnel.probe().expect("fresh tunnel produces a handshake initiation");
+
+        // The "colliding" address IS a known direct candidate -- this is
+        // exactly what would have wrongly confirmed direct before this
+        // fix, since address-matching alone used to be the only signal.
+        let mut state = make_state(
+            PeerReachability::Connecting { attempt: 0 },
+            vec![coordination_candidate(peer_addr())],
+            None,
+        )
+        .await;
+
+        handle_datagram(&mut state, &init, Some(peer_addr()), true).await;
+
+        assert!(
+            state.confirmed_direct_addr.is_none(),
+            "a relay-tagged datagram must never confirm a direct address, even from a known candidate"
+        );
+        assert_eq!(state.reachability, PeerReachability::ConnectedRelay);
+    }
+
+    /// The requester-side relay-inbound path (`handle_relay_inbound`, no
+    /// socket address at all) hits the exact same confirm gate and must
+    /// land in `ConnectedRelay` too, never `Connected` — proving
+    /// `handle_relay_inbound`'s `from_addr: None` can never accidentally
+    /// satisfy the direct-candidate-membership check.
+    #[tokio::test]
+    async fn relay_delivered_datagram_confirms_relay_reachability() {
+        let local_secret = StaticSecret::from([1u8; 32]);
+        let local_public = PublicKey::from(&local_secret);
+        let peer_secret = StaticSecret::from([2u8; 32]);
+        let mut peer_tunnel = WgTunnel::new(peer_secret, local_public, 1);
+        let init = peer_tunnel.probe().expect("fresh tunnel produces a handshake initiation");
+
+        let mut state = make_state(
+            PeerReachability::Connecting { attempt: 0 },
+            vec![coordination_candidate(peer_addr())],
+            None,
+        )
+        .await;
+
+        handle_relay_inbound(&mut state, init).await;
+
+        assert!(state.confirmed_direct_addr.is_none());
+        assert_eq!(state.reachability, PeerReachability::ConnectedRelay);
+        assert!(state.last_relay_rx.is_some());
+        assert!(state.last_direct_rx.is_none());
+    }
+
+    /// Independent-review finding (H3): relay-delivered traffic must
+    /// never refresh a CONFIRMED DIRECT path's own liveness clock -- a
+    /// dead direct path that keeps "looking alive" because relay traffic
+    /// for the same peer happens to also be arriving would stay pinned to
+    /// that dead address forever and never reach relay fallback,
+    /// backwards from the intended failover.
+    #[tokio::test]
+    async fn relay_inbound_never_refreshes_confirmed_direct_liveness() {
+        let local_secret = StaticSecret::from([1u8; 32]);
+        let local_public = PublicKey::from(&local_secret);
+        let peer_secret = StaticSecret::from([2u8; 32]);
+        let mut peer_tunnel = WgTunnel::new(peer_secret, local_public, 1);
+        let init = peer_tunnel.probe().expect("fresh tunnel produces a handshake initiation");
+
+        let mut state = make_state(
+            PeerReachability::Connected { path: CandidateClass::Lan },
+            vec![coordination_candidate(peer_addr())],
+            Some(peer_addr()),
+        )
+        .await;
+        let stale = Instant::now() - Duration::from_secs(25);
+        state.last_direct_rx = Some(stale);
+
+        handle_relay_inbound(&mut state, init).await;
+
+        assert_eq!(state.last_direct_rx, Some(stale), "direct liveness must be untouched");
+        assert!(state.last_relay_rx.is_some());
+        assert_eq!(state.confirmed_direct_addr, Some(peer_addr()), "still confirmed direct");
+    }
+
+    /// Independent-review finding (H1): once this device has learned a
+    /// relay's forwarding-socket address from genuinely-authenticated
+    /// inbound traffic, its own reply (e.g. a WireGuard handshake
+    /// response) must go straight back to that exact address -- otherwise
+    /// a relay-only WireGuard handshake can never complete at all (the
+    /// relay's forwarding socket is deliberately never added to `direct_
+    /// candidates`, so the ordinary candidate race would never reach it).
+    #[tokio::test]
+    async fn send_batch_direct_replies_to_the_confirmed_relay_address() {
+        let mut state = make_state(PeerReachability::ConnectedRelay, Vec::new(), None).await;
+        state.confirmed_relay_addr = Some(peer_addr());
+        let spy = Arc::new(SpyRelayCarrier::new());
+        state.relay_carrier = spy.clone();
+
+        send_batch_direct(&state, vec![vec![7]]).await;
+
+        // The RelayCarrier (open-a-NEW-session mechanism) must not be
+        // invoked when a known relay reply address is already available --
+        // that would open a needless new session just to answer a reply
+        // this device already knows exactly where to send.
+        assert!(spy.calls.lock().unwrap().is_empty());
+    }
+
+    /// While already `ConnectedRelay`, a subsequent authenticated
+    /// handshake from a genuine known candidate address must still
+    /// promote to `Connected` (direct) -- relay never blocks recovering
+    /// direct, the whole point of `should_probe` continuing to race
+    /// candidates in this state.
+    #[tokio::test]
+    async fn direct_confirmation_promotes_over_connected_relay() {
+        let local_secret = StaticSecret::from([1u8; 32]);
+        let local_public = PublicKey::from(&local_secret);
+        let peer_secret = StaticSecret::from([2u8; 32]);
+        let mut peer_tunnel = WgTunnel::new(peer_secret, local_public, 1);
+        let init = peer_tunnel.probe().expect("fresh tunnel produces a handshake initiation");
+
+        let mut state = make_state(
+            PeerReachability::ConnectedRelay,
+            vec![coordination_candidate(peer_addr())],
+            None,
+        )
+        .await;
+
+        handle_datagram(&mut state, &init, Some(peer_addr()), false).await;
+
+        assert_eq!(state.confirmed_direct_addr, Some(peer_addr()));
+        assert!(matches!(state.reachability, PeerReachability::Connected { .. }));
     }
 
     /// Positive control: a genuine handshake initiation from the correct
@@ -1624,7 +2277,7 @@ mod tests {
         )
         .await;
 
-        handle_datagram(&mut state, &init, Some(peer_addr())).await;
+        handle_datagram(&mut state, &init, Some(peer_addr()), false).await;
 
         assert_eq!(state.confirmed_direct_addr, Some(peer_addr()));
         assert!(matches!(state.reachability, PeerReachability::Connected { .. }));
@@ -1650,7 +2303,7 @@ mod tests {
         .await;
         state.revoked.store(true, Ordering::Relaxed);
 
-        handle_datagram(&mut state, &init, Some(peer_addr())).await;
+        handle_datagram(&mut state, &init, Some(peer_addr()), false).await;
 
         assert!(state.confirmed_direct_addr.is_none());
         assert!(matches!(state.reachability, PeerReachability::Connecting { .. }));

@@ -596,7 +596,7 @@ pub struct MembershipOperation {
     /// review this separation implements: "Remote outcomeとdurability
     /// scopeは別概念として扱います".
     pub durability_scope: MembershipDurabilityScope,
-    /// Folder groups to latch [`GroupDurabilityStatus::DurabilityUnknown`]
+    /// Folder groups to latch [`GroupDurabilityStatus::Unknown`]
     /// once (and only once) this operation's remote mutation is CONFIRMED
     /// committed -- never latched pre-commit, so a definitely-rejected or
     /// conflicting mutation never leaves a false-positive latch behind.

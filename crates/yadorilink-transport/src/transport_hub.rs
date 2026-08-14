@@ -39,11 +39,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use boringtun::noise::handshake::parse_handshake_anon;
 use boringtun::noise::rate_limiter::RateLimiter;
 use boringtun::noise::{Packet, Tunn, TunnResult};
-use boringtun::x25519::PublicKey;
+use boringtun::x25519::{PublicKey, StaticSecret};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
@@ -67,18 +68,145 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100;
 /// response is accepted only if it answers a request we actually sent.
 const STUN_PENDING_DEPTH: usize = 64;
 
+/// M3 Pass 2: how many MAC1-verified handshake initiations may queue
+/// waiting for a worker before the surplus is dropped -- the same
+/// tolerates-loss reasoning as `DEMUX_QUEUE_DEPTH`, sized the same. This
+/// queue exists so `recv_loop` NEVER performs the identity-resolution
+/// crypto step itself (see `identify_and_route_initiation`'s own doc
+/// comment) -- a flood of otherwise-valid initiations can only ever back
+/// up behind this one bounded queue, never stall the single shared
+/// receive loop that every OTHER peer's data/control traffic also
+/// depends on.
+const HANDSHAKE_INGRESS_QUEUE_DEPTH: usize = 256;
+
+/// M3 Pass 2: fixed worker pool size draining the handshake-ingress
+/// queue. Small and fixed (not spawned per-packet, not scaled with N
+/// registered peers) -- unbounded/per-packet spawning was exactly the
+/// kind of amplification this pass exists to close, just one layer up
+/// (worker count instead of decapsulate-attempt count).
+const HANDSHAKE_WORKER_COUNT: usize = 4;
+
 /// Whether an inbound datagram was demultiplexed to its owning channel by
-/// WireGuard receiver index (definitely for that channel) or offered to a
+/// WireGuard receiver index (definitely for that channel), offered to a
 /// channel as a handshake-initiation probe (for that channel only if its
-/// static key authenticates it).
+/// static key authenticates it), or unwrapped from a relay envelope --
+/// M3 Pass 8 closeout: route provenance that survives all the way to
+/// `PeerChannel`'s own confirm gate, so a relay-delivered datagram can
+/// NEVER be interpreted as evidence of a direct route, regardless of
+/// whether its outer source address happens to coincide with a known
+/// direct candidate (see `unwrap_relay_envelope`'s own doc comment for
+/// the wire format this is threaded from).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatagramKind {
-    /// Routed by receiver index: this datagram belongs to the receiving
-    /// channel's WireGuard session.
+    /// Routed by receiver index, from a datagram that arrived as genuine
+    /// raw UDP (no relay envelope): this datagram belongs to the
+    /// receiving channel's WireGuard session AND physically arrived over
+    /// this device's own direct network path.
     Direct,
     /// A MAC1-verified handshake initiation offered to authorized channels;
     /// only the channel whose static key decapsulates it is the recipient.
+    /// Also only ever produced from genuine raw (non-relay-wrapped) UDP --
+    /// see `Relay`'s own doc comment for the relay-wrapped counterpart.
     HandshakeProbe,
+    /// Unwrapped from a relay envelope (`unwrap_relay_envelope`) -- the
+    /// opaque WireGuard bytes inside are cryptographically exactly as
+    /// meaningful as `Direct`/`HandshakeProbe` traffic (same `Tunn::
+    /// decapsulate` call, same authentication), but the ENVELOPE itself
+    /// proves this arrived via a relaying peer's own forwarding socket,
+    /// not this device's real address. `PeerChannel`'s confirm gate must
+    /// never promote traffic of this kind to a confirmed direct path,
+    /// no matter what its outer UDP source address happens to be.
+    Relay,
+}
+
+/// M3 Pass 8 closeout: the relay envelope's own fixed marker -- a `u32`
+/// value no genuine WireGuard packet can ever produce as its own leading
+/// 4 bytes (every real WireGuard message type -- handshake init/response/
+/// cookie-reply/transport-data -- starts with a small `u32` LE
+/// discriminant, 1 through 4; boringtun's own `Tunn::parse_incoming_
+/// packet` rejects anything else as unparseable). Using an unreachable
+/// discriminant value means envelope detection can never collide with,
+/// misinterpret, or be confused for a genuine WireGuard packet -- the two
+/// wire formats are unambiguous by construction, checked in the fixed
+/// order `unwrap_relay_envelope` then `Tunn::parse_incoming_packet`.
+/// M3 Pass 8 closeout: whether a datagram being routed through the demux
+/// arrived wrapped in a relay envelope or not -- threaded through every
+/// routing function so the `DatagramKind` an `InboundDatagram` is finally
+/// tagged with always reflects it, regardless of which specific routing
+/// path (receiver-index, handshake-probe broadcast, or identified
+/// initiation) it takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutedKind {
+    Direct,
+    Relay,
+}
+
+impl RoutedKind {
+    /// The `DatagramKind` for a receiver-index-routed datagram.
+    fn direct_kind(self) -> DatagramKind {
+        match self {
+            RoutedKind::Direct => DatagramKind::Direct,
+            RoutedKind::Relay => DatagramKind::Relay,
+        }
+    }
+    /// The `DatagramKind` for a handshake-initiation offered/identified
+    /// this way. Deliberately collapses to the SAME `DatagramKind::Relay`
+    /// a receiver-index-routed relay datagram gets -- no separate
+    /// "relay handshake probe" variant exists, because everything that
+    /// matters to a consumer (`PeerChannel`'s confirm gate, its liveness
+    /// bump) is simply "did this arrive via a relay", not which specific
+    /// routing path identified it.
+    fn probe_kind(self) -> DatagramKind {
+        match self {
+            RoutedKind::Direct => DatagramKind::HandshakeProbe,
+            RoutedKind::Relay => DatagramKind::Relay,
+        }
+    }
+}
+
+const RELAY_ENVELOPE_MARKER: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
+const RELAY_ENVELOPE_HEADER_LEN: usize = RELAY_ENVELOPE_MARKER.len() + 8;
+
+/// M3 Pass 8 closeout: `yadorilink-daemon`'s `relay_forwarder.rs` wraps
+/// every datagram it forwards toward a relay session's destination in
+/// this envelope (`RELAY_ENVELOPE_MARKER` + little-endian `u64` relay
+/// session id + the opaque WireGuard bytes verbatim) BEFORE sending it
+/// raw over its own dedicated forwarding socket -- rather than sending
+/// those WireGuard bytes completely unwrapped, indistinguishable from
+/// genuine direct UDP the way earlier passes did. `B` (the relay) still
+/// never decrypts or inspects the WireGuard payload itself -- opaque
+/// PAYLOAD forwarding is preserved exactly as designed -- this envelope
+/// only wraps the OUTER transport framing, which is not, and never was,
+/// required to be opaque: `B` already knows a relay session exists (it
+/// admitted it), the session id, and the destination it's forwarding to;
+/// this envelope reveals nothing to any observer that admission didn't
+/// already require `B` to know.
+///
+/// Returns the session id and the inner opaque bytes if `datagram` has a
+/// valid envelope header, `None` otherwise (too short, or the marker
+/// doesn't match -- i.e., this is ordinary, non-relay-wrapped traffic).
+fn unwrap_relay_envelope(datagram: &[u8]) -> Option<(u64, &[u8])> {
+    if datagram.len() < RELAY_ENVELOPE_HEADER_LEN {
+        return None;
+    }
+    if datagram[..RELAY_ENVELOPE_MARKER.len()] != RELAY_ENVELOPE_MARKER {
+        return None;
+    }
+    let session_id_bytes: [u8; 8] =
+        datagram[RELAY_ENVELOPE_MARKER.len()..RELAY_ENVELOPE_HEADER_LEN].try_into().ok()?;
+    Some((u64::from_le_bytes(session_id_bytes), &datagram[RELAY_ENVELOPE_HEADER_LEN..]))
+}
+
+/// The sibling of [`unwrap_relay_envelope`] -- wraps opaque WireGuard
+/// bytes for a relay session's forwarding send. `pub` (not `pub(crate)`):
+/// called from `yadorilink-daemon`'s `relay_forwarder.rs`, a different
+/// crate.
+pub fn wrap_relay_envelope(relay_session_id: u64, opaque_wg_bytes: &[u8]) -> Vec<u8> {
+    let mut wrapped = Vec::with_capacity(RELAY_ENVELOPE_HEADER_LEN + opaque_wg_bytes.len());
+    wrapped.extend_from_slice(&RELAY_ENVELOPE_MARKER);
+    wrapped.extend_from_slice(&relay_session_id.to_le_bytes());
+    wrapped.extend_from_slice(opaque_wg_bytes);
+    wrapped
 }
 
 /// One inbound datagram delivered to a channel's demux queue.
@@ -89,21 +217,32 @@ pub struct InboundDatagram {
     pub kind: DatagramKind,
 }
 
-/// A registered channel: where to deliver its datagrams, and the source IPs
-/// (from its known candidates) used to order initiation trials.
+/// A registered channel: where to deliver its datagrams, the source IPs
+/// (from its known candidates) used to order initiation trials (kept for
+/// the back-compat broadcast fallback -- see `offer_initiation`'s own doc
+/// comment), and the peer's own static public key (M3 Pass 2) for O(1)
+/// exact dispatch once an initiation's sender is identified.
 struct ChannelEntry {
     sender: mpsc::Sender<InboundDatagram>,
     candidate_ips: HashSet<IpAddr>,
+    peer_public: [u8; 32],
 }
 
 /// A raw inbound datagram handed to whoever is currently registered to
 /// receive STUN replies (`(payload, sender address)`).
 type StunDatagram = (Vec<u8>, SocketAddr);
 
-/// The demux routing table, shared between [`TransportHub`] and its receive
-/// loop.
+/// The demux routing table, shared between [`TransportHub`], its receive
+/// loop, and (M3 Pass 2) its handshake-identification worker pool.
 struct DemuxRegistry {
     channels: Mutex<HashMap<u32, ChannelEntry>>,
+    /// M3 Pass 2: peer static public key bytes -> session index, the O(1)
+    /// exact-dispatch index `identify_and_route_initiation` uses once
+    /// `parse_handshake_anon` reveals an initiation's real sender. Kept as
+    /// a SEPARATE map from `channels` (not folded into `ChannelEntry`
+    /// itself) so a lookup here never needs to hold `channels`' own lock
+    /// for longer than the immediate follow-up `get`.
+    by_peer_public: Mutex<HashMap<[u8; 32], u32>>,
     stun_tx: Mutex<Option<mpsc::Sender<StunDatagram>>>,
     /// Transaction ids of binding requests sent but not yet answered (bounded
     /// ring; a response with an unknown id is dropped).
@@ -113,51 +252,147 @@ struct DemuxRegistry {
     /// initiation gate then falls back to offering initiations to every
     /// authorized channel without the cheap MAC1 pre-reject.
     rate_limiter: Option<RateLimiter>,
+    /// M3 Pass 2: this device's own WireGuard static keypair, set once via
+    /// [`TransportHub::set_device_identity`] -- NOT required at
+    /// construction (`bind`/`from_socket` keep their existing
+    /// `device_public`-only signatures, unchanged for every existing
+    /// caller). While unset, `identify_and_route_initiation` falls back to
+    /// `offer_initiation`'s broadcast-to-every-channel behavior (still
+    /// off the receive loop, via the bounded worker pool -- see that
+    /// function's own doc comment); every real production caller DOES
+    /// call `set_device_identity`, closing the O(N^2) cost this pass
+    /// exists to eliminate. `StaticSecret` is held here the same way
+    /// every registered channel's own `Tunn` already holds an identical
+    /// copy of this same device secret -- not a new class of exposure,
+    /// just one more copy of already-in-process key material.
+    device_identity: OnceLock<(StaticSecret, PublicKey)>,
+    /// M3 Pass 2: where `handle_initiation` enqueues a MAC1-verified
+    /// initiation for the worker pool to identify and route -- set once
+    /// at construction (`DemuxRegistry::new`), never `None` after that
+    /// (unlike `rate_limiter`/`device_identity`, this is unconditional:
+    /// every hub gets bounded ingress + a worker pool, whether or not it
+    /// ever calls `set_device_identity`).
+    handshake_ingress_tx: mpsc::Sender<(Vec<u8>, SocketAddr, RoutedKind)>,
 }
 
 impl DemuxRegistry {
-    fn new(device_public: Option<PublicKey>) -> Self {
-        Self {
+    /// Returns the registry and the receiving half of its handshake-
+    /// ingress queue -- the caller (`TransportHub::assemble`) is
+    /// responsible for spawning the worker pool that drains it, the same
+    /// way it's responsible for spawning `recv_loop` itself.
+    fn new(
+        device_public: Option<PublicKey>,
+    ) -> (Self, mpsc::Receiver<(Vec<u8>, SocketAddr, RoutedKind)>) {
+        let (handshake_ingress_tx, handshake_ingress_rx) =
+            mpsc::channel(HANDSHAKE_INGRESS_QUEUE_DEPTH);
+        let registry = Self {
             channels: Mutex::new(HashMap::new()),
+            by_peer_public: Mutex::new(HashMap::new()),
             stun_tx: Mutex::new(None),
             stun_pending: Mutex::new(VecDeque::with_capacity(STUN_PENDING_DEPTH)),
             rate_limiter: device_public.map(|pk| RateLimiter::new(&pk, HANDSHAKE_RATE_LIMIT)),
-        }
+            device_identity: OnceLock::new(),
+            handshake_ingress_tx,
+        };
+        (registry, handshake_ingress_rx)
     }
 
     /// Routes one received datagram. Returns a datagram to send back (a
     /// WireGuard cookie reply produced by the MAC1 gate when under load),
     /// which the receive loop is responsible for delivering.
+    ///
+    /// M3 Pass 8 closeout: checks for a relay envelope FIRST -- see
+    /// `unwrap_relay_envelope`'s own doc comment -- before attempting to
+    /// parse `datagram` as a raw WireGuard packet, so a relay-wrapped
+    /// datagram is routed with `DatagramKind::Relay`/`RelayHandshakeProbe`
+    /// throughout, never `Direct`/`HandshakeProbe`, regardless of its
+    /// outer UDP source address. A cookie reply produced while handling
+    /// relay-wrapped traffic still goes back to the OUTER `from` (the
+    /// relay's own forwarding socket) -- WireGuard cookie replies are
+    /// themselves opaque protocol bytes the relay is already expected to
+    /// forward onward, exactly like everything else in this session.
     fn route(&self, datagram: &[u8], from: SocketAddr) -> Option<(Vec<u8>, SocketAddr)> {
+        if let Some((_relay_session_id, inner)) = unwrap_relay_envelope(datagram) {
+            return self.route_kind(inner, from, RoutedKind::Relay);
+        }
+        self.route_kind(datagram, from, RoutedKind::Direct)
+    }
+
+    fn route_kind(
+        &self,
+        datagram: &[u8],
+        from: SocketAddr,
+        routed: RoutedKind,
+    ) -> Option<(Vec<u8>, SocketAddr)> {
         match Tunn::parse_incoming_packet(datagram) {
-            Ok(Packet::HandshakeInit(_)) => return self.handle_initiation(datagram, from),
-            Ok(Packet::HandshakeResponse(p)) => self.route_by_index(p.receiver_idx, datagram, from),
-            Ok(Packet::PacketCookieReply(p)) => self.route_by_index(p.receiver_idx, datagram, from),
-            Ok(Packet::PacketData(p)) => self.route_by_index(p.receiver_idx, datagram, from),
-            Err(_) => self.maybe_route_stun(datagram, from),
+            Ok(Packet::HandshakeInit(_)) => return self.handle_initiation(datagram, from, routed),
+            Ok(Packet::HandshakeResponse(p)) => {
+                self.route_by_index(p.receiver_idx, datagram, from, routed)
+            }
+            Ok(Packet::PacketCookieReply(p)) => {
+                self.route_by_index(p.receiver_idx, datagram, from, routed)
+            }
+            Ok(Packet::PacketData(p)) => {
+                self.route_by_index(p.receiver_idx, datagram, from, routed)
+            }
+            // STUN is this device's OWN local NAT discovery -- never
+            // meaningful relayed (a relay envelope only ever wraps
+            // WireGuard bytes; `relay_forwarder.rs` never wraps STUN).
+            Err(_) if routed == RoutedKind::Direct => self.maybe_route_stun(datagram, from),
+            Err(_) => {}
         }
         None
     }
 
-    fn route_by_index(&self, receiver_idx: u32, datagram: &[u8], from: SocketAddr) {
+    fn route_by_index(
+        &self,
+        receiver_idx: u32,
+        datagram: &[u8],
+        from: SocketAddr,
+        routed: RoutedKind,
+    ) {
         let session_index = receiver_idx >> 8;
         let channels = self.channels.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = channels.get(&session_index) {
-            let _ = entry.sender.try_send(InboundDatagram {
-                data: datagram.to_vec(),
-                from,
-                kind: DatagramKind::Direct,
-            });
+            // M3 Pass 1: was `let _ = ...`, silently discarding a full-queue
+            // drop with no signal anywhere -- a real observability gap the
+            // handshake fan-in reproducer's own review flagged (it could
+            // only measure wasted decapsulate attempts, not whether queue
+            // saturation was ALSO contributing). Log-only, no behavior
+            // change: `try_send`'s drop-on-full semantics are unchanged.
+            // Matched specifically on `Full`, not any error: the
+            // channel's own actor task exiting (`Closed`) is a completely
+            // different condition (the channel is gone, not merely busy)
+            // and a Codex review caught an earlier version of this fix
+            // conflating the two under one "queue full" message.
+            if let Err(mpsc::error::TrySendError::Full(_)) =
+                entry.sender.try_send(InboundDatagram {
+                    data: datagram.to_vec(),
+                    from,
+                    kind: routed.direct_kind(),
+                })
+            {
+                tracing::debug!(
+                    session_index,
+                    "dropped inbound datagram: channel demux queue full"
+                );
+            }
         }
     }
 
-    /// Handles a handshake initiation per the normative rules: MAC1 gate, then
-    /// source-narrowed offering to authorized channels for bounded trial
-    /// decapsulation. Returns a cookie reply to send if the gate produced one.
+    /// Handles a handshake initiation per the normative rules: a cheap MAC1
+    /// gate stays HERE, inline in the receive loop's own call stack (a
+    /// single Blake2s MAC check -- no asymmetric crypto, cheap enough that
+    /// moving it off the hot path would only add latency for no real
+    /// liveness benefit). Everything past the gate -- identifying the real
+    /// sender and dispatching to its channel, M3 Pass 2's whole point -- is
+    /// handed to the bounded handshake-ingress queue instead of being done
+    /// here. Returns a cookie reply to send if the gate produced one.
     fn handle_initiation(
         &self,
         datagram: &[u8],
         from: SocketAddr,
+        routed: RoutedKind,
     ) -> Option<(Vec<u8>, SocketAddr)> {
         if let Some(limiter) = self.rate_limiter.as_ref() {
             // A cookie reply is at most COOKIE_REPLY_SZ (64) bytes.
@@ -172,26 +407,138 @@ impl DemuxRegistry {
                 Err(_) => return None,
             }
         }
-        self.offer_initiation(datagram, from);
+        // Bounded, drop-on-full -- the same tolerates-loss semantics as
+        // every other demux path in this file. A full queue here means
+        // the worker pool is genuinely saturated (not merely "many peers
+        // registered", which M3 Pass 2's whole point is to make no longer
+        // matter) -- WireGuard's own retry timers cover a dropped
+        // initiation the same way they already cover any other lost
+        // packet.
+        if self.handshake_ingress_tx.try_send((datagram.to_vec(), from, routed)).is_err() {
+            tracing::debug!("dropped handshake initiation: ingress queue full");
+        }
         None
     }
 
-    /// Offers a MAC1-verified initiation to every authorized channel, ordering
-    /// those whose known candidates match the source endpoint first. Only the
-    /// channel whose static key decapsulates it adopts the exchange.
-    fn offer_initiation(&self, datagram: &[u8], from: SocketAddr) {
+    /// M3 Pass 2: runs in a worker pool, OFF the single shared receive
+    /// loop -- see `handle_initiation`'s own doc comment for why
+    /// everything past the MAC1 gate lives here instead.
+    ///
+    /// The algorithmic fix this pass exists to land: `boringtun` already
+    /// exposes exactly the seam WireGuard's own Noise IK handshake design
+    /// makes possible -- `parse_handshake_anon` decrypts message-1's
+    /// `encrypted_static` field using ONLY this device's own static
+    /// private key and the packet's own (plaintext) ephemeral public key,
+    /// revealing the real initiator's static public key with ONE
+    /// Diffie-Hellman + ONE AEAD decrypt, REGARDLESS of how many peers
+    /// this device has registered -- no candidate-key trial-decryption
+    /// required (see boringtun's own `noise::handshake::parse_handshake_
+    /// anon`/`HalfHandshake`, and its `device` module's own reference
+    /// demux, which uses exactly this pattern). Once identified, a single
+    /// hash-map lookup (`by_peer_public`) finds the ONE channel to
+    /// dispatch to -- that channel's own actor still runs the real,
+    /// full, session-establishing `Tunn::decapsulate` on ITS OWN tunnel
+    /// exactly as before (a Codex-review clarification: `handle_incoming`
+    /// (`tunn_wrapper.rs`) calls `decapsulate` a second time with an
+    /// empty datagram per boringtun's own documented drain contract --
+    /// still O(1) work on the ONE correctly-identified channel's tunnel,
+    /// not a second trial against a different peer), but now against
+    /// ONE channel per initiation, not every REGISTERED PEER's channel
+    /// per initiation. This is what actually closes the O(N^2) cost the
+    /// `handshake_fan_in.rs` reproducer measured (M3 Pass 1) -- a bounded
+    /// queue and worker pool alone (M3 Pass 2's OTHER half, above and in
+    /// `TransportHub::assemble`) only bounds concurrency; it does not
+    /// reduce the total crypto work, which is what this function does.
+    ///
+    /// Falls back to the OLD broadcast-to-every-channel behavior
+    /// (`offer_initiation`) only when [`Self::device_identity`] was never
+    /// set -- every real production caller DOES set it (see
+    /// `TransportHub::set_device_identity`'s own doc comment); this
+    /// fallback exists purely for backward compatibility with existing
+    /// callers/tests that construct a hub without a device identity at
+    /// all, not as a normal operating mode.
+    fn identify_and_route_initiation(&self, datagram: &[u8], from: SocketAddr, routed: RoutedKind) {
+        let Ok(Packet::HandshakeInit(parsed)) = Tunn::parse_incoming_packet(datagram) else {
+            // Re-parses (recv_loop already parsed this once to route it
+            // here at all) -- cheap, structural-only, and avoids needing
+            // to thread a borrowed, buffer-lifetime-tied parse result
+            // through the ingress queue's owned `Vec<u8>` item.
+            return;
+        };
+        let Some((device_secret, device_public)) = self.device_identity.get() else {
+            self.offer_initiation(datagram, from, routed);
+            return;
+        };
+        match parse_handshake_anon(device_secret, device_public, &parsed) {
+            Ok(half) => {
+                let session_index = {
+                    let by_peer_public =
+                        self.by_peer_public.lock().unwrap_or_else(|p| p.into_inner());
+                    by_peer_public.get(&half.peer_static_public).copied()
+                };
+                let Some(session_index) = session_index else {
+                    // Identified, but no locally-registered channel for
+                    // that public key -- an unrecognized/unauthorized
+                    // initiator. Correct WireGuard behavior is to drop,
+                    // not to fall back to trying every channel: identity
+                    // resolution already succeeded, it just didn't match
+                    // anyone we know.
+                    return;
+                };
+                let channels = self.channels.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(entry) = channels.get(&session_index) {
+                    if let Err(mpsc::error::TrySendError::Full(_)) =
+                        entry.sender.try_send(InboundDatagram {
+                            data: datagram.to_vec(),
+                            from,
+                            kind: routed.probe_kind(),
+                        })
+                    {
+                        tracing::debug!(
+                            session_index,
+                            "dropped identified handshake initiation: channel demux queue full"
+                        );
+                    }
+                }
+            }
+            // Malformed, replayed, or otherwise not a genuine message-1
+            // -- drop. Never falls back to the broadcast path: a packet
+            // that fails identity resolution isn't an ambiguous case
+            // needing trial-decryption against every peer, it's simply
+            // not a valid initiation.
+            Err(_) => {
+                tracing::debug!("dropped handshake initiation: identity resolution failed");
+            }
+        }
+    }
+
+    /// The back-compat fallback path (see `identify_and_route_initiation`'s
+    /// own doc comment for when this actually runs): offers a MAC1-
+    /// verified initiation to every authorized channel, ordering those
+    /// whose known candidates match the source endpoint first. Only the
+    /// channel whose static key decapsulates it adopts the exchange. This
+    /// is the ORIGINAL, pre-M3-Pass-2 behavior, preserved unconditionally
+    /// for any caller that never provides a device identity.
+    fn offer_initiation(&self, datagram: &[u8], from: SocketAddr, routed: RoutedKind) {
         let channels = self.channels.lock().unwrap_or_else(|p| p.into_inner());
         let src_ip = from.ip();
         // `false` (source-matching) sorts before `true`, so matching channels
         // are offered the initiation first.
         let mut ordered: Vec<&ChannelEntry> = channels.values().collect();
         ordered.sort_by_key(|entry| !entry.candidate_ips.contains(&src_ip));
+        // M3 Pass 1: was `let _ = ...`, same silent-drop gap as
+        // `route_by_index` above -- log-only, no behavior change. Matched
+        // specifically on `Full`, same reasoning as `route_by_index`.
         for entry in ordered {
-            let _ = entry.sender.try_send(InboundDatagram {
-                data: datagram.to_vec(),
-                from,
-                kind: DatagramKind::HandshakeProbe,
-            });
+            if let Err(mpsc::error::TrySendError::Full(_)) =
+                entry.sender.try_send(InboundDatagram {
+                    data: datagram.to_vec(),
+                    from,
+                    kind: routed.probe_kind(),
+                })
+            {
+                tracing::debug!("dropped handshake-initiation probe: channel demux queue full");
+            }
         }
     }
 
@@ -329,13 +676,21 @@ pub struct TransportHub {
     local_addr: SocketAddr,
     registry: Arc<DemuxRegistry>,
     recv_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// M3 Pass 2: the fixed handshake-identification worker pool draining
+    /// `registry`'s ingress queue -- see `identify_and_route_initiation`'s
+    /// own doc comment. Aborted on drop the same as `recv_tasks`.
+    handshake_worker_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for TransportHub {
     fn drop(&mut self) {
-        // Stop the receive loops when the last handle goes away rather than
-        // leaving them parked on `recv_from` holding the sockets open.
+        // Stop the receive loops and handshake workers when the last
+        // handle goes away rather than leaving them parked holding the
+        // sockets/queue open.
         for task in &self.recv_tasks {
+            task.abort();
+        }
+        for task in &self.handshake_worker_tasks {
             task.abort();
         }
     }
@@ -391,8 +746,10 @@ impl TransportHub {
         Self::assemble(v4, v6, local_addr, device_public)
     }
 
-    /// Builds the hub from whichever address-family sockets are present and
-    /// spawns one receive loop per socket, all feeding the shared demux.
+    /// Builds the hub from whichever address-family sockets are present,
+    /// spawns one receive loop per socket, and (M3 Pass 2) spawns the
+    /// fixed handshake-identification worker pool draining the registry's
+    /// ingress queue.
     fn assemble(
         v4: Option<Arc<UdpSocket>>,
         v6: Option<Arc<UdpSocket>>,
@@ -404,13 +761,24 @@ impl TransportHub {
             v6: v6.clone(),
             batching: UdpBatchingSupport::detect(),
         });
-        let registry = Arc::new(DemuxRegistry::new(device_public));
+        let (registry, handshake_ingress_rx) = DemuxRegistry::new(device_public);
+        let registry = Arc::new(registry);
         let recv_tasks = [v4, v6]
             .into_iter()
             .flatten()
             .map(|sock| tokio::spawn(recv_loop(sock, endpoint.clone(), registry.clone())))
             .collect();
-        Arc::new(Self { endpoint, local_addr, registry, recv_tasks })
+        // A single receiver shared across a fixed worker pool via
+        // `tokio::sync::Mutex` -- `mpsc::Receiver` has no built-in
+        // multi-consumer support, and this queue's throughput needs are
+        // modest (handshake initiations only, not the data plane), so the
+        // lock contention this adds is negligible next to the crypto work
+        // each worker actually does per item.
+        let handshake_ingress_rx = Arc::new(tokio::sync::Mutex::new(handshake_ingress_rx));
+        let handshake_worker_tasks = (0..HANDSHAKE_WORKER_COUNT)
+            .map(|_| tokio::spawn(handshake_worker(handshake_ingress_rx.clone(), registry.clone())))
+            .collect();
+        Arc::new(Self { endpoint, local_addr, registry, recv_tasks, handshake_worker_tasks })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -421,22 +789,51 @@ impl TransportHub {
         self.local_addr.port()
     }
 
+    /// M3 Pass 2: provides this device's own WireGuard static keypair so
+    /// `identify_and_route_initiation` can resolve an incoming
+    /// initiation's real sender in O(1) crypto work instead of falling
+    /// back to trial-broadcasting it to every registered channel -- see
+    /// that function's own doc comment for the full mechanism. Optional
+    /// and idempotent (a second call is a silent no-op, matching this
+    /// codebase's own `OnceLock::set`-and-discard convention elsewhere,
+    /// e.g. `DaemonState::set_device_static_public`): every EXISTING
+    /// caller that never calls this keeps working exactly as before
+    /// (the pre-M3-Pass-2 broadcast fallback), so this is purely additive
+    /// -- real production callers should call it once, right after
+    /// constructing the hub, with the same static secret every
+    /// `PeerChannel::connect` call for this device already uses.
+    pub fn set_device_identity(&self, secret: StaticSecret) {
+        let public = PublicKey::from(&secret);
+        let _ = self.registry.device_identity.set((secret, public));
+    }
+
     /// Registers a channel under its WireGuard session index and returns the
     /// receiver for datagrams the demultiplexer routes to it. `candidates`
-    /// seed the source-narrowing used to order initiation trials. Datagrams
-    /// for an unregistered index are dropped.
+    /// seed the source-narrowing used to order initiation trials (the
+    /// back-compat broadcast fallback's own ordering -- see
+    /// `offer_initiation`'s doc comment). `peer_public` is this channel's
+    /// peer's own static public key (M3 Pass 2), indexed for O(1) exact
+    /// dispatch once `identify_and_route_initiation` resolves an
+    /// initiation's real sender. Datagrams for an unregistered index are
+    /// dropped.
     pub fn register_channel(
         &self,
         session_index: u32,
         candidates: &[SocketAddr],
+        peer_public: PublicKey,
     ) -> mpsc::Receiver<InboundDatagram> {
         let (tx, rx) = mpsc::channel(DEMUX_QUEUE_DEPTH);
         let candidate_ips = candidates.iter().map(|a| a.ip()).collect();
+        let peer_public_bytes = peer_public.to_bytes();
+        self.registry.channels.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            session_index,
+            ChannelEntry { sender: tx, candidate_ips, peer_public: peer_public_bytes },
+        );
         self.registry
-            .channels
+            .by_peer_public
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(session_index, ChannelEntry { sender: tx, candidate_ips });
+            .insert(peer_public_bytes, session_index);
         rx
     }
 
@@ -452,7 +849,21 @@ impl TransportHub {
 
     /// Removes a channel's demux registration (on teardown/revocation).
     pub fn unregister_channel(&self, session_index: u32) {
-        self.registry.channels.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_index);
+        let removed =
+            self.registry.channels.lock().unwrap_or_else(|p| p.into_inner()).remove(&session_index);
+        if let Some(entry) = removed {
+            // Removes by VALUE match, not merely by the key a caller
+            // happens to supply: if a session index were ever reused
+            // across channels (not expected today, but this is cheap
+            // insurance), an unregister for the OLD channel must never
+            // evict a DIFFERENT, newer channel that happens to now sit at
+            // the same public-key entry.
+            let mut by_peer_public =
+                self.registry.by_peer_public.lock().unwrap_or_else(|p| p.into_inner());
+            if by_peer_public.get(&entry.peer_public) == Some(&session_index) {
+                by_peer_public.remove(&entry.peer_public);
+            }
+        }
     }
 
     /// Registers the STUN prober's receiver for recognized binding responses.
@@ -499,6 +910,38 @@ async fn recv_loop(
                 tracing::debug!(error = %e, "transport hub receive error");
                 tokio::task::yield_now().await;
             }
+        }
+    }
+}
+
+/// M3 Pass 2: one member of the fixed handshake-identification worker
+/// pool -- drains `ingress_rx` (shared with its sibling workers behind a
+/// `tokio::sync::Mutex`, since `mpsc::Receiver` has no built-in multi-
+/// consumer support) and calls `identify_and_route_initiation` for each
+/// item. See that function's own doc comment for the actual work done
+/// here; this loop is just the plumbing that keeps it off `recv_loop`.
+async fn handshake_worker(
+    ingress_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr, RoutedKind)>>>,
+    registry: Arc<DemuxRegistry>,
+) {
+    loop {
+        // The lock is held only long enough to pull one item off the
+        // queue -- `identify_and_route_initiation` (the actual crypto/
+        // lookup work) runs after releasing it, so a slow identification
+        // never blocks a sibling worker from picking up the NEXT queued
+        // item.
+        let next = { ingress_rx.lock().await.recv().await };
+        match next {
+            Some((datagram, from, routed)) => {
+                registry.identify_and_route_initiation(&datagram, from, routed)
+            }
+            // The sender half (owned by `DemuxRegistry`, itself owned by
+            // the `Arc<TransportHub>` this worker's own task holds a
+            // clone of) is gone -- structurally unreachable while this
+            // task is still running, since the task would already have
+            // been aborted by `TransportHub::drop` first. Exit cleanly
+            // rather than spin.
+            None => break,
         }
     }
 }
@@ -581,7 +1024,14 @@ mod tests {
     }
 
     fn registry_without_gate() -> DemuxRegistry {
-        DemuxRegistry::new(None)
+        // These unit tests exercise `DemuxRegistry` directly (no
+        // `TransportHub`/worker pool spawned), so the ingress-queue
+        // receiver half is unused here -- routing a handshake initiation
+        // in these tests goes through `offer_initiation` directly (or, if
+        // exercising `route()` itself, only cares about its enqueue-vs-
+        // drop behavior, not what a worker would later do with it).
+        let (registry, _handshake_ingress_rx) = DemuxRegistry::new(None);
+        registry
     }
 
     #[test]
@@ -589,16 +1039,14 @@ mod tests {
         let registry = registry_without_gate();
         let (tx_a, mut rx_a) = mpsc::channel(8);
         let (tx_b, mut rx_b) = mpsc::channel(8);
-        registry
-            .channels
-            .lock()
-            .unwrap()
-            .insert(7, ChannelEntry { sender: tx_a, candidate_ips: HashSet::new() });
-        registry
-            .channels
-            .lock()
-            .unwrap()
-            .insert(9, ChannelEntry { sender: tx_b, candidate_ips: HashSet::new() });
+        registry.channels.lock().unwrap().insert(
+            7,
+            ChannelEntry { sender: tx_a, candidate_ips: HashSet::new(), peer_public: [7u8; 32] },
+        );
+        registry.channels.lock().unwrap().insert(
+            9,
+            ChannelEntry { sender: tx_b, candidate_ips: HashSet::new(), peer_public: [9u8; 32] },
+        );
 
         assert!(registry.route(&wg_data_packet((7 << 8) | 3), addr("203.0.113.1:5000")).is_none());
 
@@ -607,15 +1055,64 @@ mod tests {
         assert!(rx_b.try_recv().is_err(), "session 9 must not receive session 7's data");
     }
 
+    /// M3 Pass 8 closeout: the SAME opaque WireGuard bytes, wrapped in a
+    /// relay envelope (`wrap_relay_envelope`, exactly as `yadorilink-
+    /// daemon`'s `relay_forwarder.rs` does before its own raw socket send),
+    /// route to the SAME channel by the SAME receiver index -- but tagged
+    /// `DatagramKind::Relay`, not `Direct`. This is the demux-level half
+    /// of the address-collision fix: even though the ENVELOPE's own
+    /// carrier arrives at this exact function with an outer source
+    /// address that could coincidentally match a known direct candidate
+    /// (irrelevant here, since `route`/`route_kind` never even look at
+    /// candidate lists -- that happens one layer up, in `PeerChannel`),
+    /// the KIND alone is what proves provenance from this point on.
+    #[test]
+    fn relay_enveloped_datagram_routes_with_relay_kind() {
+        let registry = registry_without_gate();
+        let (tx_a, mut rx_a) = mpsc::channel(8);
+        registry.channels.lock().unwrap().insert(
+            7,
+            ChannelEntry { sender: tx_a, candidate_ips: HashSet::new(), peer_public: [7u8; 32] },
+        );
+
+        let inner = wg_data_packet((7 << 8) | 3);
+        let enveloped = wrap_relay_envelope(42, &inner);
+        assert!(registry.route(&enveloped, addr("203.0.113.9:9999")).is_none());
+
+        let to_a = rx_a.try_recv().expect("session 7 receives the unwrapped relay data");
+        assert_eq!(to_a.kind, DatagramKind::Relay);
+        assert_eq!(to_a.data, inner, "the envelope header must not leak into the inner data");
+    }
+
+    /// The relay-envelope marker (`0xFFFFFFFF`) is deliberately a value no
+    /// real WireGuard message type ever produces -- if it were EVER
+    /// misparsed as genuine WireGuard traffic instead, that would be a
+    /// route-provenance hole of its own. Bytes that merely start with the
+    /// marker but are too short to carry a full envelope header must
+    /// simply fail to route (dropped), never partially unwrap.
+    #[test]
+    fn a_short_datagram_that_only_looks_like_an_envelope_header_is_dropped() {
+        let registry = registry_without_gate();
+        let (tx_a, mut rx_a) = mpsc::channel(8);
+        registry.channels.lock().unwrap().insert(
+            7,
+            ChannelEntry { sender: tx_a, candidate_ips: HashSet::new(), peer_public: [7u8; 32] },
+        );
+
+        let mut too_short = RELAY_ENVELOPE_MARKER.to_vec();
+        too_short.extend_from_slice(&[0u8; 3]); // short of the full u64 session id
+        assert!(registry.route(&too_short, addr("203.0.113.9:9999")).is_none());
+        assert!(rx_a.try_recv().is_err());
+    }
+
     #[test]
     fn data_for_an_unregistered_index_is_dropped() {
         let registry = registry_without_gate();
         let (tx, mut rx) = mpsc::channel(8);
-        registry
-            .channels
-            .lock()
-            .unwrap()
-            .insert(1, ChannelEntry { sender: tx, candidate_ips: HashSet::new() });
+        registry.channels.lock().unwrap().insert(
+            1,
+            ChannelEntry { sender: tx, candidate_ips: HashSet::new(), peer_public: [1u8; 32] },
+        );
         assert!(registry.route(&wg_data_packet((42 << 8) | 1), addr("203.0.113.1:5000")).is_none());
         assert!(rx.try_recv().is_err());
     }
@@ -643,30 +1140,92 @@ mod tests {
 
     #[test]
     fn initiation_without_gate_is_offered_source_matching_channel_first() {
+        // Exercises `offer_initiation` directly, not through `route()` --
+        // M3 Pass 2 moved everything past the (here, absent) MAC1 gate off
+        // `route()`'s own call stack into a bounded ingress queue a worker
+        // pool drains asynchronously, so a synchronous `route()` call can
+        // no longer observe the routing outcome inline the way this test
+        // (and its own name) needs to. `offer_initiation` is exactly the
+        // ordering logic under test here, called with no `TransportHub`/
+        // workers involved at all -- same coverage, no longer coupled to
+        // the (now-async, elsewhere-tested) ingress-queue plumbing.
         let registry = registry_without_gate();
         let (tx_match, mut rx_match) = mpsc::channel(8);
         let (tx_other, mut rx_other) = mpsc::channel(8);
         let mut match_ips = HashSet::new();
         match_ips.insert(addr("198.51.100.4:41641").ip());
-        registry
-            .channels
-            .lock()
-            .unwrap()
-            .insert(1, ChannelEntry { sender: tx_match, candidate_ips: match_ips });
-        registry
-            .channels
-            .lock()
-            .unwrap()
-            .insert(2, ChannelEntry { sender: tx_other, candidate_ips: HashSet::new() });
+        registry.channels.lock().unwrap().insert(
+            1,
+            ChannelEntry { sender: tx_match, candidate_ips: match_ips, peer_public: [1u8; 32] },
+        );
+        registry.channels.lock().unwrap().insert(
+            2,
+            ChannelEntry {
+                sender: tx_other,
+                candidate_ips: HashSet::new(),
+                peer_public: [2u8; 32],
+            },
+        );
 
         // A 148-byte handshake initiation (type in the first four bytes).
         let mut init = Vec::new();
         init.extend_from_slice(&1u32.to_le_bytes());
         init.extend_from_slice(&[0u8; 144]);
-        registry.route(&init, addr("198.51.100.4:41641"));
+        registry.offer_initiation(&init, addr("198.51.100.4:41641"), RoutedKind::Direct);
 
         assert_eq!(rx_match.try_recv().unwrap().kind, DatagramKind::HandshakeProbe);
         assert_eq!(rx_other.try_recv().unwrap().kind, DatagramKind::HandshakeProbe);
+    }
+
+    /// M3 Pass 8 closeout (route-provenance review, Low): the sibling of
+    /// `initiation_without_gate_is_offered_source_matching_channel_first`
+    /// above, proving `RoutedKind::Relay` threads through the SAME
+    /// broadcast-fallback path just as correctly as `RoutedKind::Direct`
+    /// does -- a relay-enveloped handshake initiation (this device has no
+    /// identity set, so `identify_and_route_initiation` falls back to
+    /// `offer_initiation` exactly like the no-identity case above) must
+    /// still be tagged `DatagramKind::Relay`, never `HandshakeProbe`.
+    #[test]
+    fn relay_routed_initiation_without_gate_is_offered_as_relay_kind() {
+        let registry = registry_without_gate();
+        let (tx, mut rx) = mpsc::channel(8);
+        registry.channels.lock().unwrap().insert(
+            1,
+            ChannelEntry { sender: tx, candidate_ips: HashSet::new(), peer_public: [1u8; 32] },
+        );
+
+        let mut init = Vec::new();
+        init.extend_from_slice(&1u32.to_le_bytes());
+        init.extend_from_slice(&[0u8; 144]);
+        registry.offer_initiation(&init, addr("198.51.100.4:41641"), RoutedKind::Relay);
+
+        assert_eq!(rx.try_recv().unwrap().kind, DatagramKind::Relay);
+    }
+
+    /// M3 Pass 8 closeout (route-provenance review, Low): the queue-send
+    /// half of the SAME gap -- `route()` itself, given a relay-enveloped
+    /// handshake initiation, must enqueue it onto `handshake_ingress_tx`
+    /// tagged `RoutedKind::Relay`, not silently default back to `Direct`.
+    /// Doesn't need a running worker: `handshake_ingress_rx` is peeked
+    /// directly, exercising exactly the one hop the review flagged as
+    /// untested (`route`/`route_kind`/`handle_initiation`'s own queue
+    /// send), independent of `identify_and_route_initiation`/`offer_
+    /// initiation`, both already covered by their own dedicated tests.
+    #[test]
+    fn route_enqueues_a_relay_enveloped_initiation_tagged_as_relay() {
+        let (registry, mut ingress_rx) = DemuxRegistry::new(None);
+
+        let mut init = Vec::new();
+        init.extend_from_slice(&1u32.to_le_bytes());
+        init.extend_from_slice(&[0u8; 144]);
+        let enveloped = wrap_relay_envelope(7, &init);
+
+        assert!(registry.route(&enveloped, addr("198.51.100.4:41641")).is_none());
+
+        let (queued_datagram, _from, routed) =
+            ingress_rx.try_recv().expect("a relay-enveloped initiation must reach the queue");
+        assert_eq!(queued_datagram, init, "the envelope header must not leak into the queued item");
+        assert_eq!(routed, RoutedKind::Relay);
     }
 
     #[tokio::test]
@@ -702,11 +1261,10 @@ mod tests {
     fn junk_datagram_is_dropped() {
         let registry = registry_without_gate();
         let (tx, mut rx) = mpsc::channel(8);
-        registry
-            .channels
-            .lock()
-            .unwrap()
-            .insert(1, ChannelEntry { sender: tx, candidate_ips: HashSet::new() });
+        registry.channels.lock().unwrap().insert(
+            1,
+            ChannelEntry { sender: tx, candidate_ips: HashSet::new(), peer_public: [1u8; 32] },
+        );
         let (stun_tx, mut stun_rx) = mpsc::channel(8);
         *registry.stun_tx.lock().unwrap() = Some(stun_tx);
 

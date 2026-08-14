@@ -170,6 +170,15 @@ pub enum SyncError {
     #[error("cannot evict {0:?}: it is pinned")]
     EvictionRejected(String),
 
+    /// M2-3b: mirrors `MaterializationExecutionError::
+    /// EvictionOutcomeAmbiguous`'s own doc comment exactly -- a Windows
+    /// native dehydrate call's outcome could not be confirmed (transport
+    /// failure after the real call may have already succeeded), so unlike
+    /// `EvictionRejected` this must NOT be treated as "the file is still
+    /// materialized".
+    #[error("eviction outcome for {0:?} could not be confirmed")]
+    EvictionOutcomeAmbiguous(String),
+
     /// defense-in-depth: after resolving a peer-advertised path
     /// under a folder group's sync root, canonicalizing the resolved
     /// parent directory landed outside that root — most likely because a
@@ -353,6 +362,7 @@ impl SyncError {
             SyncError::HydrationFailed(_) => "peer_unreachable",
             SyncError::VersionContentUnavailable(_) => "peer_unreachable",
             SyncError::EvictionRejected(_) => "policy",
+            SyncError::EvictionOutcomeAmbiguous(_) => "policy",
             SyncError::PathEscapesRoot(_) => "permission",
             SyncError::DiskPressure { .. } => "disk_pressure",
             SyncError::UnsupportedSchemaDowngrade { .. } => "storage",
@@ -587,6 +597,7 @@ impl From<SyncError>
             SyncError::NotFound(msg) => E::NotFound(msg),
             SyncError::CorruptState(msg) => E::CorruptState(msg),
             SyncError::EvictionRejected(msg) => E::EvictionRejected(msg),
+            SyncError::EvictionOutcomeAmbiguous(msg) => E::EvictionOutcomeAmbiguous(msg),
             SyncError::PathEscapesRoot(msg) => E::PathEscapesRoot(msg),
             SyncError::DiskPressure { path, volume, available_bytes, headroom_bytes } => {
                 E::DiskPressure { path, volume, available_bytes, headroom_bytes }
@@ -615,6 +626,7 @@ impl From<yadorilink_filesystem_sync::materialization_execution::Materialization
             E::NotFound(msg) => SyncError::NotFound(msg),
             E::CorruptState(msg) => SyncError::CorruptState(msg),
             E::EvictionRejected(msg) => SyncError::EvictionRejected(msg),
+            E::EvictionOutcomeAmbiguous(msg) => SyncError::EvictionOutcomeAmbiguous(msg),
             E::PolicyUnavailable => SyncError::PolicyUnavailable,
             E::PathEscapesRoot(msg) => SyncError::PathEscapesRoot(msg),
             E::DiskPressure { path, volume, available_bytes, headroom_bytes } => {

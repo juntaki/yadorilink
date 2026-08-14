@@ -186,6 +186,7 @@ pub(crate) fn build_query_services(state: Arc<DaemonState>) -> Arc<QueryServices
         link_status.clone(),
         update_status.clone(),
         state.peers.clone(),
+        state.clone() as Arc<dyn crate::queries::runtime_status::RelayCapabilityPort>,
         state.telemetry.clone(),
         state.governance_config.clone(),
         state.block_store.clone(),

@@ -121,6 +121,29 @@ pub enum MaterializationExecutionError {
     #[error("eviction of {0:?} was rejected")]
     EvictionRejected(String),
 
+    /// M2-3b: a `dehydrate_windows_placeholder` call's outcome could not be
+    /// determined -- a Codex-review finding on this method's own doc
+    /// comment claiming "every returned error means dehydration did NOT
+    /// happen" was false as originally written: `dehydrate_server`
+    /// performs the real `CfDehydratePlaceholder` call BEFORE writing its
+    /// response, so a transport-level failure (timeout, a dropped pipe,
+    /// the response never arriving) can happen AFTER the native dehydrate
+    /// already succeeded server-side -- the daemon genuinely cannot tell
+    /// the two apart from a bare I/O error or timeout. Unlike
+    /// `EvictionRejected` (a coherent response was received, so the
+    /// server's own logic ran to completion and its answer is trusted),
+    /// this variant must NOT be treated as "the file is still fully
+    /// materialized" -- `evict_file`'s caller must leave the row in
+    /// `Evicting` rather than roll it back to `Hydrated`, since `Evicting`
+    /// is the state `reset_stale_evicting_to_placeholder`'s startup
+    /// recovery already safely resolves regardless of which of the two
+    /// real outcomes actually happened (see that function's own doc
+    /// comment; M2-3b's design never mints a fresh identity on eviction,
+    /// which is exactly what makes resolving to `Placeholder` safe in
+    /// both cases).
+    #[error("eviction outcome for {0:?} could not be confirmed")]
+    EvictionOutcomeAmbiguous(String),
+
     /// The group's policy has not loaded this run, so a change-emitting
     /// write withheld its emission rather than stamp a placeholder-auth
     /// change. See `yadorilink_replica_domain::change::PolicyUnavailable`.
@@ -334,6 +357,62 @@ pub trait MaterializationExecutionPort: Send + Sync {
         path: &str,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), MaterializationExecutionError>;
+
+    /// The identity currently recorded on `(group_id, path)`'s row,
+    /// regardless of its current `materialization_state` -- unlike
+    /// [`Self::record_placeholder_generation`]'s read counterpart in
+    /// `MaterializationStateRepository::get_placeholder_generation` (gated to
+    /// `materialization_state = 'placeholder'`, so it deliberately returns
+    /// nothing once a row has hydrated), no production call site clears
+    /// `placeholder_dev`/`placeholder_ino`/`placeholder_provider_kind` on the
+    /// `Placeholder` -> `Hydrated` transition -- they are simply left in
+    /// place until an explicit [`Self::clear_placeholder_generation`] call.
+    /// M2-3b's Windows eviction path relies on exactly that: it reads a
+    /// `Hydrated` file's still-recorded generation here as the expected
+    /// identity to pass into the native dehydrate call -- an extra
+    /// defense-in-depth check on top of the disk-content revalidation
+    /// `evict_file` already performs, not a substitute for it.
+    fn get_recorded_placeholder_identity(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<(PlaceholderDiskIdentity, String)>, MaterializationExecutionError>;
+
+    /// M2-3b: asks the real Windows CfAPI provider process
+    /// (`yadorilink-cfapi-host.exe`) to natively dehydrate the placeholder
+    /// at `out_path` (an absolute path), blocking until it confirms
+    /// success or failure. `expected_generation`: the generation
+    /// [`Self::get_recorded_placeholder_identity`] returned for this row,
+    /// passed through as a defense-in-depth ABA guard (see
+    /// `shell-ext/windows/src/cfapi.rs::dehydrate_placeholder`'s own doc
+    /// comment) -- `None` skips that guard. `materialization_eviction::
+    /// evict_to_placeholder`'s Windows arm gates the `Placeholder`
+    /// transition and block reclamation on this call's success; its
+    /// non-Windows arm never calls it at all.
+    ///
+    /// An implementor MUST return
+    /// [`MaterializationExecutionError::EvictionOutcomeAmbiguous`], never
+    /// [`MaterializationExecutionError::EvictionRejected`], for any
+    /// failure mode that cannot positively rule out the native dehydrate
+    /// having actually succeeded (a transport timeout, a dropped
+    /// connection, a response that never arrived) -- see that variant's
+    /// own doc comment for why `evict_file`'s caller handles the two
+    /// differently.
+    ///
+    /// The default implementation (used by every platform except Windows,
+    /// where nothing calls this) fails closed with `EvictionRejected` --
+    /// there is no real provider to ask at all, so there is no ambiguity:
+    /// dehydration definitely did not happen.
+    fn dehydrate_windows_placeholder(
+        &self,
+        _path: &str,
+        _out_path: &Path,
+        _expected_generation: Option<u64>,
+    ) -> Result<(), MaterializationExecutionError> {
+        Err(MaterializationExecutionError::EvictionRejected(
+            "native Windows placeholder dehydration is not supported on this platform".to_string(),
+        ))
+    }
 
     /// Every still-`Placeholder` path in `group_id` with no recorded
     /// identity -- see `MaterializationStateRepository::

@@ -22,6 +22,11 @@ pub mod nat;
 mod peer_channel;
 mod reliable;
 mod supervise;
+// The handshake ingress worker intentionally shares a bounded mpsc receiver
+// behind Arc<tokio::sync::Mutex<_>> so a fixed worker pool can drain one
+// queue without duplicating ownership. Keep the concrete type visible at the
+// implementation seam; only suppress Clippy's cosmetic complexity warning.
+#[allow(clippy::type_complexity)]
 mod transport_hub;
 mod tunn_wrapper;
 mod udp_batching;
@@ -44,7 +49,10 @@ pub use nat::{
     Candidate, CandidateClass, CandidateSink, NatObservations, ObservationLog, PortMappingStatus,
 };
 pub use peer_channel::{
-    diff_netmap, NetmapDiff, NetmapSnapshot, PeerChannel, PeerReachability, UnreachableCategory,
+    diff_netmap, NetmapDiff, NetmapSnapshot, PeerChannel, PeerReachability, RelayCarrier,
+    UnreachableCategory,
 };
-pub use transport_hub::{DatagramKind, HubStunSocket, InboundDatagram, TransportHub};
+pub use transport_hub::{
+    wrap_relay_envelope, DatagramKind, HubStunSocket, InboundDatagram, TransportHub,
+};
 pub use tunn_wrapper::{IncomingResult, WireGuardEngine};

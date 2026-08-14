@@ -246,6 +246,153 @@ fn encode_generation_identity(generation: u64) -> [u8; 9] {
     buf
 }
 
+/// Inverse of [`encode_generation_identity`]. Duplicated from
+/// `yadorilink_daemon::placeholder_inspect_windows::decode_generation_identity`
+/// rather than shared (this crate must not depend on `yadorilink-daemon` --
+/// see `windows_pipe_security.rs`'s own doc comment for the same
+/// reasoning); kept byte-for-byte identical to that copy since both decode
+/// the same wire format this module's own `encode_generation_identity`
+/// defines.
+fn decode_generation_identity(bytes: &[u8]) -> Option<u64> {
+    const VERSION_TAG: u8 = 1;
+    if bytes.len() != 9 || bytes[0] != VERSION_TAG {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[1..9]);
+    Some(u64::from_le_bytes(buf))
+}
+
+/// M2-3b: native Windows eviction. If `expected_generation` is `Some`,
+/// first verifies the placeholder currently at `path` still carries that
+/// exact generation (an ABA guard against dehydrating a placeholder that
+/// was deleted and replaced by an unrelated one at the same path since the
+/// daemon last read its index -- same defense-in-depth reasoning as
+/// `placeholder_inspect_windows::inspect_placeholder`'s own identity
+/// check), then calls `CfDehydratePlaceholder` to discard the placeholder's
+/// local content while leaving the placeholder object (and its identity)
+/// in place. This is the Windows counterpart to `write_placeholder` on
+/// Unix, except the real on-disk dehydration happens HERE, synchronously,
+/// in THIS process (the one actually connected to the sync root) --
+/// unlike M2-3a's placeholder CREATION, which is deferred to a future
+/// `sync_placeholders` poll, eviction cannot be fire-and-forget: the
+/// caller (`dehydrate_server`) only reports success back to the daemon
+/// once this function has actually confirmed the dehydrate call
+/// succeeded, and the daemon gates block reclamation on that confirmation.
+/// Runs in `yadorilink-cfapi-host.exe`.
+///
+/// Uses `windows-sys` rather than the `windows` crate the rest of this
+/// file uses -- see `Cargo.toml`'s doc comment on the `windows-sys`
+/// dependency for why: `CfGetPlaceholderInfo`/`CfDehydratePlaceholder`
+/// have never been called through the `windows` crate anywhere in this
+/// codebase, but the SAME `windows-sys` incantations this function reuses
+/// (open a `FILE_FLAG_OPEN_REPARSE_POINT` handle, `CfGetPlaceholderInfo`
+/// with a headroom buffer, raw HRESULT checks) are already proven working
+/// against real cfapi on a Windows 11 VM in `yadorilink-daemon::
+/// placeholder_inspect_windows`/`placeholder_backend_windows`.
+pub fn dehydrate_placeholder(path: &Path, expected_generation: Option<u64>) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::CloudFilters::{
+        CfDehydratePlaceholder, CfGetPlaceholderInfo, CF_DEHYDRATE_FLAG_NONE,
+        CF_PLACEHOLDER_BASIC_INFO, CF_PLACEHOLDER_INFO_BASIC,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let wide_path = wide(&path.to_string_lossy());
+    // SAFETY: `wide_path` is a valid NUL-terminated UTF-16 buffer for the
+    // duration of this call. `GENERIC_READ | GENERIC_WRITE`: dehydrating
+    // mutates the placeholder's population state, unlike a read-only
+    // identity/in-sync query (which only needs `FILE_READ_ATTRIBUTES`, see
+    // `placeholder_inspect_windows::open_reparse_handle_read_attributes`).
+    // `FILE_FLAG_OPEN_REPARSE_POINT` so opening an already-partially-
+    // dehydrated placeholder never itself triggers a hydration.
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() || handle as isize == -1 {
+        return Err(format!(
+            "CreateFileW failed opening {} for dehydration: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let close = || unsafe {
+        CloseHandle(handle);
+    };
+
+    if let Some(expected) = expected_generation {
+        const IDENTITY_HEADROOM: usize = 64;
+        let mut buf =
+            vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_BASIC_INFO>() + IDENTITY_HEADROOM];
+        let mut returned: u32 = 0;
+        // SAFETY: `handle` is a valid, open handle; `buf` is sized to hold
+        // at least a full `CF_PLACEHOLDER_BASIC_INFO` plus headroom for
+        // the trailing identity bytes -- mirrors `placeholder_inspect_
+        // windows::read_placeholder_identity` exactly.
+        let hr = unsafe {
+            CfGetPlaceholderInfo(
+                handle,
+                CF_PLACEHOLDER_INFO_BASIC,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+                &mut returned,
+            )
+        };
+        if hr < 0 {
+            close();
+            return Err(format!(
+                "CfGetPlaceholderInfo failed for {} before dehydrate: HRESULT {hr:#x}",
+                path.display()
+            ));
+        }
+        // SAFETY: the call above reported success, so at least
+        // `size_of::<CF_PLACEHOLDER_BASIC_INFO>()` bytes of `buf` are
+        // valid; `read_unaligned` does not require alignment.
+        let info: CF_PLACEHOLDER_BASIC_INFO =
+            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const CF_PLACEHOLDER_BASIC_INFO) };
+        let identity_offset = std::mem::offset_of!(CF_PLACEHOLDER_BASIC_INFO, FileIdentity);
+        let len = info.FileIdentityLength as usize;
+        let decoded = identity_offset
+            .checked_add(len)
+            .filter(|&end| end <= buf.len())
+            .and_then(|_| decode_generation_identity(&buf[identity_offset..identity_offset + len]));
+        if decoded != Some(expected) {
+            close();
+            return Err(format!(
+                "{} identity mismatch before dehydrate: expected generation {expected}, found {decoded:?}",
+                path.display()
+            ));
+        }
+    }
+
+    // SAFETY: `handle` is a valid, open, writable handle to the
+    // placeholder at `path`. `StartingOffset: 0, Length: i64::MAX`
+    // dehydrates the entire file -- this MVP's `Hydration: FULL` policy
+    // (module doc) means there is never a partial range to preserve.
+    let hr = unsafe {
+        CfDehydratePlaceholder(handle, 0, i64::MAX, CF_DEHYDRATE_FLAG_NONE, std::ptr::null_mut())
+    };
+    close();
+    if hr < 0 {
+        return Err(format!(
+            "CfDehydratePlaceholder failed for {}: HRESULT {hr:#x}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Creates a cfapi placeholder for one file. `relative_path`
 /// is forward-slash-separated (matching the shell-IPC wire format);
 /// converted to backslashes here. The immediate parent directory is
@@ -476,6 +623,30 @@ pub fn sync_placeholders(root: &Path, entries: &[yadorilink_ipc_proto::shellipc:
 
 #[cfg(test)]
 mod tests {
+    use super::decode_generation_identity;
+
+    #[test]
+    fn decode_generation_identity_round_trips_through_encode() {
+        for generation in [0u64, 1, 42, u64::MAX] {
+            let encoded = super::encode_generation_identity(generation);
+            assert_eq!(decode_generation_identity(&encoded), Some(generation));
+        }
+    }
+
+    #[test]
+    fn decode_generation_identity_rejects_wrong_length() {
+        assert_eq!(decode_generation_identity(&[1u8; 8]), None);
+        assert_eq!(decode_generation_identity(&[1u8; 10]), None);
+        assert_eq!(decode_generation_identity(&[]), None);
+    }
+
+    #[test]
+    fn decode_generation_identity_rejects_wrong_version_tag() {
+        let mut bytes = vec![0u8];
+        bytes.extend_from_slice(&42u64.to_le_bytes());
+        assert_eq!(decode_generation_identity(&bytes), None);
+    }
+
     /// Manual diagnostic only (matches `registration.rs`'s
     /// `debug_register_all` pattern): exercises the real
     /// `CfRegisterSyncRoot`/`CfConnectSyncRoot`/`CfCreatePlaceholders`/

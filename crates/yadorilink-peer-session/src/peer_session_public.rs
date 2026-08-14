@@ -34,8 +34,8 @@ pub use crate::peer_session_impl::{
     disk_race_fingerprint, BlockWriteActivityProvider, ChangeAuthenticator, HandoffLeaseResponder,
     HandoffTicketResponder, HydrationOutcome, PeerHandoffLeaseGrant, PeerHandoffTicketGrant,
     PendingLocalChangeFlush, PendingLocalFlushOutcome, PreparedRebootstrap, ProjectionAttempt,
-    RebootstrapHandler, RootCommitAuthorityProvider, DEFAULT_HYDRATION_TIMEOUT,
-    DEFAULT_MAINTENANCE_RECONCILE_INTERVAL,
+    RebootstrapHandler, RelayReplySink, RelaySessionHandler, RootCommitAuthorityProvider,
+    DEFAULT_HYDRATION_TIMEOUT, DEFAULT_MAINTENANCE_RECONCILE_INTERVAL,
 };
 
 use crate::peer_session_impl::PeerSyncSession as InnerPeerSyncSession;
@@ -57,6 +57,8 @@ pub struct PeerSyncSessionDeps {
     pub block_write_activity_provider: Arc<dyn BlockWriteActivityProvider>,
     pub handoff_ticket_responder: Arc<dyn HandoffTicketResponder>,
     pub root_commit_authority_provider: Arc<dyn RootCommitAuthorityProvider>,
+    /// M3 Pass 5: see `RelaySessionHandler`'s own doc comment.
+    pub relay_session_handler: Arc<dyn RelaySessionHandler>,
     /// Lets this session author a captured change for content its own
     /// materialize path displaces during custody transfer (see
     /// `PeerSyncSession::set_change_emitter`'s doc comment). A device that
@@ -87,11 +89,12 @@ impl PeerSyncSessionDeps {
             block_write_activity_provider: Arc::new(NoopBlockWriteActivityProvider),
             handoff_ticket_responder: Arc::new(DenyHandoffTicketResponder),
             root_commit_authority_provider: Arc::new(DenyRootCommitAuthorityProvider),
+            relay_session_handler: Arc::new(DenyRelaySessionHandler),
             change_emitter: None,
         }
     }
 
-    /// This session's 8 one-time, construction-only capability injections,
+    /// This session's one-time, construction-only capability injections,
     /// in the shape `InnerPeerSyncSession::new_with_forwarding` takes them.
     fn one_time_deps(&self) -> PeerSyncSessionOneTimeDeps {
         PeerSyncSessionOneTimeDeps {
@@ -102,6 +105,7 @@ impl PeerSyncSessionDeps {
             rebootstrap_handler: self.rebootstrap_handler.clone(),
             block_write_activity_provider: self.block_write_activity_provider.clone(),
             handoff_ticket_responder: self.handoff_ticket_responder.clone(),
+            relay_session_handler: self.relay_session_handler.clone(),
             change_emitter: self.change_emitter.clone(),
         }
     }
@@ -267,6 +271,31 @@ impl PeerSyncSession {
         self.inner.set_full_index_resync_interval(value);
     }
 
+    /// M3 Pass 5: sends a `RelayOpen` over this channel, asking the peer
+    /// on the other end to act as relay -- see `InnerPeerSyncSession::
+    /// send_relay_open`'s own doc comment.
+    pub async fn send_relay_open(
+        &self,
+        open: yadorilink_sync_wire::RelayOpenFrame,
+    ) -> Result<(), PeerSessionError> {
+        self.inner.send_relay_open(open).await
+    }
+
+    /// M3 Pass 5: sends a `RelayData` over this channel -- used by BOTH
+    /// directions of the relay protocol: the requester ("A") sending a
+    /// datagram toward the destination through this relay, and (via
+    /// `RelayReplySink`, `self.inner`'s own trait impl) the relay itself
+    /// forwarding a reply back. Exposed on the wrapper so a requester can
+    /// drive its own outbound side directly, symmetric with `send_relay_
+    /// open` above.
+    pub fn send_relay_data(&self, session_id: u64, payload: Vec<u8>) {
+        RelayReplySink::send_relay_data(&*self.inner, session_id, payload);
+    }
+
+    pub fn send_relay_close(&self, session_id: u64, reason: &str) {
+        RelayReplySink::send_relay_close(&*self.inner, session_id, reason);
+    }
+
     fn validate_exact_peer_config(
         config: &yadorilink_sync_wire::ClusterConfigFrame,
     ) -> Result<(), PeerSessionError> {
@@ -323,6 +352,10 @@ impl PeerSyncSession {
             InboundFrame::HandoffTicketRelease(_) => "HandoffTicketRelease",
             InboundFrame::RebootstrapSnapshotRequest(_) => "RebootstrapSnapshotRequest",
             InboundFrame::RebootstrapSnapshotResponse(_) => "RebootstrapSnapshotResponse",
+            InboundFrame::RelayOpen(_) => "RelayOpen",
+            InboundFrame::RelayOpened(_) => "RelayOpened",
+            InboundFrame::RelayData(_) => "RelayData",
+            InboundFrame::RelayClose(_) => "RelayClose",
             InboundFrame::Unknown { .. } => "Unknown",
         }
     }
@@ -648,6 +681,49 @@ impl ChangeAuthenticator for DenyAllChangeAuthenticator {
         _auth: ChangeAuth,
     ) -> bool {
         false
+    }
+}
+
+struct DenyRelaySessionHandler;
+
+impl RelaySessionHandler for DenyRelaySessionHandler {
+    fn handle_relay_open<'a>(
+        &'a self,
+        open: yadorilink_sync_wire::RelayOpenFrame,
+        _authenticated_peer_device_id: &'a str,
+        _reply_sink: Arc<dyn RelayReplySink>,
+    ) -> Pin<Box<dyn Future<Output = yadorilink_sync_wire::RelayOpenedFrame> + Send + 'a>> {
+        Box::pin(async move {
+            yadorilink_sync_wire::RelayOpenedFrame {
+                grant_id: open.grant_id,
+                granted: false,
+                session_id: 0,
+            }
+        })
+    }
+
+    fn handle_relay_data<'a>(
+        &'a self,
+        _data: yadorilink_sync_wire::RelayDataFrame,
+        _authenticated_peer_device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+
+    fn handle_relay_close<'a>(
+        &'a self,
+        _close: yadorilink_sync_wire::RelayCloseFrame,
+        _authenticated_peer_device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+
+    fn handle_relay_opened<'a>(
+        &'a self,
+        _opened: yadorilink_sync_wire::RelayOpenedFrame,
+        _authenticated_peer_device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
     }
 }
 
