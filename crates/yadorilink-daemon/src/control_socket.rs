@@ -21,10 +21,11 @@ use yadorilink_ipc_proto::daemonctl::{
     CheckFullReplicaHandoffReadyExcludingResponse, CheckFullReplicaHandoffReadyResponse,
     ConnectionAttemptTrace, ConnectivityDoctorCategory, ConnectivityDoctorResponse,
     CreateAndLinkCommandResponse, DaemonControlRequest, DaemonControlResponse,
-    EnrollmentCommandOutcome, EvictResponse, FileVersionInfo, GcResponse, GroupDurabilityStatus,
-    HandoffResult, HealthResponse, HeldFile, HydrateResponse, JoinAndLinkCommandResponse,
-    LatchGroupDurabilityUnknownResponse, LimitsSetResponse, LimitsShowResponse, LinkRequest,
-    LinkResponse, LinkStatus, ListConnectionTracesResponse, ListLinksResponse,
+    EnrollmentCommandOutcome, EvictResponse, FetchAvailability, FileVersionInfo, GcResponse,
+    GroupDurabilityStatus, HandoffResult, HealthResponse, HeldFile, HydrateResponse,
+    JoinAndLinkCommandResponse, LatchGroupDurabilityUnknownResponse, LimitsSetResponse,
+    LimitsShowResponse, LinkRequest, LinkResponse, LinkStatus, ListConnectionTracesResponse,
+    ListLinksResponse, LocalStorageState,
     ListQueueItemsResponse, ListRecoveryOperationsResponse, ListTrashResponse,
     ListVersionsResponse, MembershipHandoffResult, ObtainHandoffTicketResponse, PauseResponse,
     PeerStatus, PendingEnrollmentKind, PinResponse, QueueItem, RecentSyncError,
@@ -1168,6 +1169,28 @@ fn durability_status_to_proto(
     }
 }
 
+fn local_storage_state_to_proto(
+    state: crate::queries::link_status::LocalStorageState,
+) -> LocalStorageState {
+    use crate::queries::link_status::LocalStorageState as Domain;
+    match state {
+        Domain::FullCopy => LocalStorageState::FullCopy,
+        Domain::PartiallyMaterialized => LocalStorageState::PartiallyMaterialized,
+        Domain::OnDemand => LocalStorageState::OnDemand,
+    }
+}
+
+fn fetch_availability_to_proto(
+    availability: crate::queries::link_status::FetchAvailability,
+) -> FetchAvailability {
+    use crate::queries::link_status::FetchAvailability as Domain;
+    match availability {
+        Domain::AvailableNow => FetchAvailability::AvailableNow,
+        Domain::UnavailableNow => FetchAvailability::UnavailableNow,
+        Domain::Unknown => FetchAvailability::Unknown,
+    }
+}
+
 /// `HealthView` (`crate::queries::health`, DaemonState-independent) -> the
 /// IPC wire type.
 pub(crate) fn encode_health(view: crate::queries::health::HealthView) -> HealthResponse {
@@ -1313,6 +1336,8 @@ pub(crate) fn encode_link_status(view: crate::queries::link_status::LinkStatusVi
         // involved so the remedy (unlink all but one) is actionable.
         ambiguous: view.ambiguous_local_paths.len() > 1,
         ambiguous_local_paths: view.ambiguous_local_paths,
+        local_storage_state: local_storage_state_to_proto(view.local_storage_state) as i32,
+        fetch_availability: fetch_availability_to_proto(view.fetch_availability) as i32,
     }
 }
 
