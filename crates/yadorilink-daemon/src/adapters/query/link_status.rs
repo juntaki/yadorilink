@@ -218,10 +218,10 @@ mod tests {
     use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
     use yadorilink_replica_domain::session_state::{MaterializationPolicy, MaterializationState};
 
-    const GROUP: &str = "group-1";
-    const PATH: &str = "/tmp/photos";
+    pub(super) const GROUP: &str = "group-1";
+    pub(super) const PATH: &str = "/tmp/photos";
 
-    fn test_state() -> Arc<DaemonState> {
+    pub(super) fn test_state() -> Arc<DaemonState> {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
         let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
@@ -233,7 +233,7 @@ mod tests {
     /// -- explicitly overridden to `Placeholder` when `hydrated` is
     /// `false`, to simulate a record synced in from a peer whose content
     /// hasn't been fetched yet.
-    fn upsert_file(state: &DaemonState, path: &str, hydrated: bool) {
+    pub(super) fn upsert_file(state: &DaemonState, path: &str, hydrated: bool) {
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
         state
             .replica_coordinator
@@ -265,7 +265,7 @@ mod tests {
     /// check, so tests that plant a confirmation directly (rather than
     /// through a real peer round-trip) need the real value, not an
     /// arbitrary placeholder.
-    fn real_digest(state: &DaemonState) -> [u8; 32] {
+    pub(super) fn real_digest(state: &DaemonState) -> [u8; 32] {
         state.durability_roots_for_group(GROUP).unwrap().digest
     }
 
@@ -582,5 +582,517 @@ mod tests {
 
         let views = reader_for(state).list_links().unwrap();
         assert_eq!(views[0].fetch_availability, FetchAvailability::Unknown);
+    }
+}
+
+/// M4 Pass 6: the full acceptance matrix -- 12 named scenarios (A-L) the
+/// directive requires, automated at this domain/read-model level. Each
+/// test asserts the FULL cross-dimension tuple (durability_status,
+/// local_storage_state, fetch_availability, and where relevant the peer
+/// connection/relay facts) for its scenario, not just one field in
+/// isolation -- the point of this matrix is proving the dimensions stay
+/// correctly independent/correctly coupled exactly where each scenario
+/// requires, not re-testing any single formula already covered above.
+/// H (last safe-copy removal attempt -> backend rejects) and L (restart
+/// with stale cached Protected -> no false green before revalidation) are
+/// NOT duplicated here -- they're already covered by dedicated,
+/// already-reviewed suites (`tests/unlink_and_removal_durability.rs`'s 10
+/// tests and `control_socket.rs`'s `forced_unlink_latches_group_
+/// durability_unknown`/friends for H; `daemon_state.rs`'s
+/// `restart_never_shows_a_stale_healthy_status` for L) -- each doc
+/// comment below says so explicitly rather than re-deriving weaker
+/// coverage under a new name.
+#[cfg(test)]
+mod m4_acceptance_matrix {
+    use super::tests::{real_digest, test_state, upsert_file, GROUP, PATH};
+    use super::*;
+    use crate::durability_service::GroupDurabilityStatus;
+    use yadorilink_replica_domain::session_state::MaterializationPolicy;
+
+    fn reader_for(state: std::sync::Arc<DaemonState>) -> DaemonLinkStatusReader {
+        DaemonLinkStatusReader::new(state)
+    }
+
+    /// Scenario A: verified full replica online + On-Demand client online
+    /// + direct route -> Protected / OnDemand / Available.
+    #[tokio::test]
+    async fn scenario_a_confirmed_direct_peer_is_protected_ondemand_available() {
+        let state = test_state();
+        state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .set_materialization_policy(PATH, MaterializationPolicy::OnDemand)
+            .unwrap();
+        upsert_file(&state, "a.bin", false);
+        // The confirming peer must genuinely hold the writer + full-replica
+        // role -- a confirmation for a peer with no such role is a state
+        // production can never reach (M4 Pass 6 Codex review follow-up
+        // finding #1).
+        state.set_peer_group_writer("nas", GROUP, true);
+        state.set_peer_group_full_replica("nas", GROUP, true);
+        state.peers.set_reachability(
+            "nas".to_string(),
+            crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Direct),
+        );
+        assert_eq!(
+            state.peers.reachability("nas"),
+            Some(crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Direct)),
+            "sanity check: this is genuinely a direct route"
+        );
+        let digest = real_digest(&state);
+        state.record_custody_confirmation_outcome(
+            GROUP,
+            crate::daemon_state::CustodyConfirmationOutcome::Confirmed {
+                peer_device_id: Some("nas".into()),
+                digest,
+            },
+            state.membership_generation(),
+            0,
+        );
+
+        let views = reader_for(state).list_links().unwrap();
+        assert_eq!(views[0].durability_status, GroupDurabilityStatus::Healthy, "A: Protected");
+        assert_eq!(views[0].local_storage_state, LocalStorageState::OnDemand, "A: OnDemand");
+        assert_eq!(views[0].fetch_availability, FetchAvailability::AvailableNow, "A: Available");
+        assert_eq!(
+            views[0].full_replica_device_ids,
+            vec!["nas".to_string()],
+            "A: the confirmed peer's real full-replica role is reflected in the read model"
+        );
+    }
+
+    /// Scenario B: identical to A, but the confirming peer is reachable
+    /// ONLY via relay -- still Protected/OnDemand/Available (the peer
+    /// round-trip that produced the confirmation already succeeded
+    /// through whatever route was live at confirmation time; content
+    /// confirmation and current reachability are route-agnostic by
+    /// design -- `fetch_available_via_confirmed_peer` calls `is_connected()`,
+    /// which is true for `Connected(Direct)` and `Connected(Relay)` alike).
+    /// Relay routing must NEVER be read as ITSELF implying durability --
+    /// pinned by scenario I below (a relay-capable, non-full-replica peer
+    /// has zero effect on durability_status).
+    #[tokio::test]
+    async fn scenario_b_confirmed_relay_only_peer_is_still_protected_ondemand_available() {
+        let state = test_state();
+        state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .set_materialization_policy(PATH, MaterializationPolicy::OnDemand)
+            .unwrap();
+        upsert_file(&state, "a.bin", false);
+        state.set_peer_group_writer("nas", GROUP, true);
+        state.set_peer_group_full_replica("nas", GROUP, true);
+        state.peers.set_reachability(
+            "nas".to_string(),
+            crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Relay),
+        );
+        // Sanity check the setup is genuinely a RELAY route (proves this
+        // test isn't accidentally identical to A's direct-route setup --
+        // M4 Pass 6 Codex review follow-up finding #3).
+        assert_eq!(
+            state.peers.reachability("nas"),
+            Some(crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Relay)),
+            "sanity check: this is genuinely a relay-only route, not direct"
+        );
+        let digest = real_digest(&state);
+        state.record_custody_confirmation_outcome(
+            GROUP,
+            crate::daemon_state::CustodyConfirmationOutcome::Confirmed {
+                peer_device_id: Some("nas".into()),
+                digest,
+            },
+            state.membership_generation(),
+            0,
+        );
+
+        let views = reader_for(state).list_links().unwrap();
+        assert_eq!(views[0].durability_status, GroupDurabilityStatus::Healthy, "B: Protected");
+        assert_eq!(views[0].local_storage_state, LocalStorageState::OnDemand, "B: OnDemand");
+        assert_eq!(
+            views[0].full_replica_device_ids,
+            vec!["nas".to_string()],
+            "B: the confirmed peer's real full-replica role is reflected in the read model"
+        );
+        assert_eq!(
+            views[0].fetch_availability,
+            FetchAvailability::AvailableNow,
+            "B: Available via relay-connected peer"
+        );
+    }
+
+    /// Scenario C: the confirming peer is now UNREACHABLE, but the
+    /// confirmation itself is still fresh (within the staleness bound,
+    /// current membership generation, matching root digest) -- durability
+    /// stays whatever the still-valid evidence justifies (Healthy),
+    /// while fetch_availability is separately, honestly `UnavailableNow`.
+    /// This is the exact `Durability != Connectivity` pairing the M4
+    /// directive singles out: "protected but currently unreachable" must
+    /// never read as data loss.
+    #[tokio::test]
+    async fn scenario_c_confirmed_but_now_unreachable_peer_stays_protected_but_unavailable() {
+        let state = test_state();
+        state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .set_materialization_policy(PATH, MaterializationPolicy::OnDemand)
+            .unwrap();
+        upsert_file(&state, "a.bin", false);
+        state.set_peer_group_writer("nas", GROUP, true);
+        state.set_peer_group_full_replica("nas", GROUP, true);
+        let digest = real_digest(&state);
+        state.record_custody_confirmation_outcome(
+            GROUP,
+            crate::daemon_state::CustodyConfirmationOutcome::Confirmed {
+                peer_device_id: Some("nas".into()),
+                digest,
+            },
+            state.membership_generation(),
+            0,
+        );
+        // The peer has since gone offline -- no reachability recorded at
+        // all (equally valid: an explicit Unreachable would produce the
+        // same fetch_availability outcome).
+
+        let views = reader_for(state).list_links().unwrap();
+        assert_eq!(
+            views[0].durability_status,
+            GroupDurabilityStatus::Healthy,
+            "C: durability reflects the still-valid confirmation, not current reachability"
+        );
+        assert_eq!(
+            views[0].fetch_availability,
+            FetchAvailability::UnavailableNow,
+            "C: cannot fetch right now -- a separate, honest claim from durability"
+        );
+    }
+
+    /// Scenario D: no verified required custody -- structurally, no other
+    /// full-replica peer is configured at all -- even though SOME peer is
+    /// reachable. AtRisk (KnownMissing) despite connectivity: reachability
+    /// of a peer that isn't even a full-replica writer proves nothing.
+    #[tokio::test]
+    async fn scenario_d_no_full_replica_peer_configured_is_at_risk_despite_a_reachable_peer() {
+        let state = test_state();
+        state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+        // NOT locally hydrated, so `fetch_availability` genuinely exercises
+        // the peer-dependent path too, not just local content.
+        upsert_file(&state, "a.bin", false);
+        // "peer" is reachable but never declared writer/full-replica for
+        // this group at all.
+        state.peers.set_reachability(
+            "peer".to_string(),
+            crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Direct),
+        );
+        state.refresh_custody_confirmation(GROUP).await; // establishes ever_confirmation_swept
+
+        let views = reader_for(state).list_links().unwrap();
+        assert_eq!(
+            views[0].durability_status,
+            GroupDurabilityStatus::KnownMissing,
+            "D: AtRisk -- structurally no full-replica peer exists, connectivity is irrelevant"
+        );
+        assert_eq!(
+            views[0].fetch_availability,
+            FetchAvailability::UnavailableNow,
+            "D: connectivity to a non-role peer does not grant fetch access either"
+        );
+    }
+
+    /// Scenario E: a full-replica peer IS configured and reachable, but
+    /// custody has never actually been confirmed -- Unknown despite
+    /// connectivity (distinct from D: here the ROLE is real, just
+    /// unconfirmed; in D there is no role at all).
+    ///
+    /// This device's OWN policy is On-Demand (not eager) so the local
+    /// "still catching up" `Syncing` branch never fires here -- if this
+    /// device were itself an eager full replica with a placeholder still
+    /// pending, the correct/distinct answer would be `Syncing`
+    /// (scenario F), not `Unknown`; using an on-demand local policy is
+    /// what genuinely isolates "peer configured+reachable+unconfirmed" as
+    /// the ONLY fact in play.
+    #[tokio::test]
+    async fn scenario_e_configured_but_unconfirmed_peer_is_unknown_despite_connectivity() {
+        let state = test_state();
+        state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .set_materialization_policy(PATH, MaterializationPolicy::OnDemand)
+            .unwrap();
+        // NOT locally hydrated, so `fetch_availability` genuinely exercises
+        // the peer-dependent path too, not just local content.
+        upsert_file(&state, "a.bin", false);
+        state.set_peer_group_writer("nas", GROUP, true);
+        state.set_peer_group_full_replica("nas", GROUP, true);
+        state.peers.set_reachability(
+            "nas".to_string(),
+            crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Direct),
+        );
+        // Sweep runs, but never actually confirms (no real custody
+        // round-trip infrastructure in this unit test -- the point is
+        // "declared, reachable, never confirmed").
+        state.refresh_custody_confirmation(GROUP).await;
+
+        let views = reader_for(state).list_links().unwrap();
+        assert_eq!(
+            views[0].durability_status,
+            GroupDurabilityStatus::DurabilityUnknown,
+            "E: Unknown -- a real role exists but was never actually confirmed"
+        );
+        assert_eq!(
+            views[0].fetch_availability,
+            FetchAvailability::UnavailableNow,
+            "E: reachability to a never-confirmed peer does not grant fetch access either"
+        );
+    }
+
+    /// Scenario F: this device itself is a full replica still catching up
+    /// (a "protection operation running") -> Protecting (Syncing).
+    #[tokio::test]
+    async fn scenario_f_local_full_replica_still_catching_up_is_protecting() {
+        let state = test_state();
+        state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+        // Eager (the default materialization policy) + a peer full
+        // replica configured (so the structural AtRisk check doesn't
+        // preempt Syncing) + still-partial local hydration.
+        state.set_peer_group_writer("nas", GROUP, true);
+        state.set_peer_group_full_replica("nas", GROUP, true);
+        upsert_file(&state, "a.bin", false);
+        state.refresh_custody_confirmation(GROUP).await;
+
+        let views = reader_for(state).list_links().unwrap();
+        assert_eq!(
+            views[0].durability_status,
+            GroupDurabilityStatus::Syncing,
+            "F: Protecting -- this device is still becoming a full replica"
+        );
+    }
+
+    /// Scenario G: this device holds a full local copy, but the group's
+    /// durability policy is otherwise insufficient (no OTHER full-replica
+    /// peer is configured/confirmed at all) -- must NOT infer stronger
+    /// group protection than the policy actually proves. This is the
+    /// exact conflation M4 Pass 1 fixed: `LocalStorageState::FullCopy`
+    /// (a true statement about THIS device) must not leak into
+    /// `durability_status` (a claim about the GROUP).
+    #[tokio::test]
+    async fn scenario_g_local_full_copy_alone_does_not_imply_group_protection() {
+        let state = test_state();
+        state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+        upsert_file(&state, "a.bin", true); // fully hydrated locally
+        state.refresh_custody_confirmation(GROUP).await; // no peer -> not confirmed
+
+        let views = reader_for(state).list_links().unwrap();
+        assert_eq!(
+            views[0].local_storage_state,
+            LocalStorageState::FullCopy,
+            "G: this device genuinely does hold a full local copy"
+        );
+        assert_eq!(
+            views[0].durability_status,
+            GroupDurabilityStatus::KnownMissing,
+            "G: but group-wide protection is NOT inferred from local completeness alone"
+        );
+    }
+
+    /// Scenario I: a relay ANCHOR (`RelayCapability::Capable` --
+    /// independent of, and not to be confused with, `RouteKind::Relay`
+    /// which describes a specific connection's path, not a peer's own
+    /// declared capability) is available, but holds no storage role for
+    /// this group at all (never declared writer/full-replica) --
+    /// connectivity benefit only. Establishes a genuine Healthy BASELINE
+    /// first (a real confirmed full-replica peer), then adds the relay
+    /// anchor and proves durability_status is unchanged -- proving "zero
+    /// effect" against an established baseline, not merely re-observing
+    /// the already-KnownMissing default a group with zero peers at all
+    /// would trivially show regardless (M4 Pass 6 Codex review follow-up
+    /// finding #2).
+    #[tokio::test]
+    async fn scenario_i_relay_anchor_without_storage_role_has_zero_durability_effect() {
+        let state = test_state();
+        state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+        upsert_file(&state, "a.bin", false);
+        state.set_peer_group_writer("nas", GROUP, true);
+        state.set_peer_group_full_replica("nas", GROUP, true);
+        state.peers.set_reachability(
+            "nas".to_string(),
+            crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Direct),
+        );
+        let digest = real_digest(&state);
+        state.record_custody_confirmation_outcome(
+            GROUP,
+            crate::daemon_state::CustodyConfirmationOutcome::Confirmed {
+                peer_device_id: Some("nas".into()),
+                digest,
+            },
+            state.membership_generation(),
+            0,
+        );
+        let baseline = reader_for(state.clone()).list_links().unwrap();
+        assert_eq!(
+            baseline[0].durability_status,
+            GroupDurabilityStatus::Healthy,
+            "sanity check: a genuine Healthy baseline is established before adding the anchor"
+        );
+        assert_eq!(
+            baseline[0].fetch_availability,
+            FetchAvailability::AvailableNow,
+            "sanity check: a genuine AvailableNow baseline is established before adding the \
+             anchor, so the post-anchor assertion below actually proves \"unchanged\", not \
+             merely \"happens to also be AvailableNow\""
+        );
+
+        // Now add a relay ANCHOR (declared capability, not just a route
+        // kind) with NO storage role for this group at all.
+        state.replace_peer_netmap_metadata(
+            "relay-anchor",
+            None,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            true,
+        );
+        state.peers.set_reachability(
+            "relay-anchor".to_string(),
+            crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Relay),
+        );
+        assert_eq!(
+            state.peer_relay_capability("relay-anchor"),
+            crate::route::RelayCapability::Capable,
+            "sanity check: the anchor's relay capability is genuinely declared"
+        );
+
+        let views = reader_for(state).list_links().unwrap();
+        assert_eq!(
+            views[0].durability_status,
+            GroupDurabilityStatus::Healthy,
+            "I: adding a relay anchor with no storage role leaves the established Healthy \
+             baseline completely unchanged -- zero durability effect"
+        );
+        assert_eq!(
+            views[0].fetch_availability,
+            FetchAvailability::AvailableNow,
+            "I: fetch availability is unaffected too -- it was already available via the \
+             REAL storage peer \"nas\", and the relay anchor with no storage role provides \
+             zero benefit for THIS group's content -- \"connectivity benefit only\" means it \
+             not that it can serve this group's content"
+        );
+    }
+
+    /// Scenario J: a confirmed full-replica peer is available, but its
+    /// own relay CAPABILITY is disabled -- storage benefit only, and this
+    /// must not gate or reduce durability/fetch_availability at all
+    /// (`relay_capability` describes whether a peer can forward OTHER
+    /// peers' traffic, not whether it holds this group's data).
+    #[tokio::test]
+    async fn scenario_j_full_replica_with_relay_disabled_still_provides_full_storage_benefit() {
+        let state = test_state();
+        state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .set_materialization_policy(PATH, MaterializationPolicy::OnDemand)
+            .unwrap();
+        upsert_file(&state, "a.bin", false);
+        state.set_peer_group_writer("nas", GROUP, true);
+        state.set_peer_group_full_replica("nas", GROUP, true);
+        state.peers.set_reachability(
+            "nas".to_string(),
+            crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Direct),
+        );
+        // relay_capable is never set for "nas" -- Disabled by default.
+        let digest = real_digest(&state);
+        state.record_custody_confirmation_outcome(
+            GROUP,
+            crate::daemon_state::CustodyConfirmationOutcome::Confirmed {
+                peer_device_id: Some("nas".into()),
+                digest,
+            },
+            state.membership_generation(),
+            0,
+        );
+
+        assert_eq!(
+            state.peer_relay_capability("nas"),
+            crate::route::RelayCapability::Disabled,
+            "sanity check: relay capability is genuinely disabled"
+        );
+        let views = reader_for(state).list_links().unwrap();
+        assert_eq!(views[0].durability_status, GroupDurabilityStatus::Healthy, "J: still Protected");
+        assert_eq!(
+            views[0].full_replica_device_ids,
+            vec!["nas".to_string()],
+            "J: the confirmed peer's real full-replica role is reflected in the read model"
+        );
+        assert_eq!(
+            views[0].fetch_availability,
+            FetchAvailability::AvailableNow,
+            "J: still Available -- relay incapability of the STORAGE peer is irrelevant"
+        );
+    }
+
+    /// Scenario K: a confirmed peer's route changes (direct -> relay ->
+    /// unreachable) across three snapshots -- fetch_availability tracks
+    /// each transition, but durability_status stays Healthy throughout
+    /// (unchanged custody evidence), never flickering with connectivity.
+    #[tokio::test]
+    async fn scenario_k_route_transitions_change_availability_never_durability() {
+        let state = test_state();
+        state.replica_coordinator.link_repository().add_link(PATH, GROUP).unwrap();
+        state
+            .replica_coordinator
+            .link_repository()
+            .set_materialization_policy(PATH, MaterializationPolicy::OnDemand)
+            .unwrap();
+        upsert_file(&state, "a.bin", false);
+        state.set_peer_group_writer("nas", GROUP, true);
+        state.set_peer_group_full_replica("nas", GROUP, true);
+        let digest = real_digest(&state);
+        state.record_custody_confirmation_outcome(
+            GROUP,
+            crate::daemon_state::CustodyConfirmationOutcome::Confirmed {
+                peer_device_id: Some("nas".into()),
+                digest,
+            },
+            state.membership_generation(),
+            0,
+        );
+
+        for (reachability, expected_fetch) in [
+            (
+                crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Direct),
+                FetchAvailability::AvailableNow,
+            ),
+            (
+                crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Relay),
+                FetchAvailability::AvailableNow,
+            ),
+            (
+                crate::peer_registry::PeerReachability::Unreachable(
+                    crate::peer_registry::UnreachableCategory::NoResponse,
+                ),
+                FetchAvailability::UnavailableNow,
+            ),
+        ] {
+            state.peers.set_reachability("nas".to_string(), reachability);
+            // Prove each iteration's setup is genuinely distinct (M4 Pass 6
+            // Codex review follow-up finding #3: an earlier version never
+            // asserted the actual route/reachability transition itself,
+            // only its downstream fetch_availability effect).
+            assert_eq!(
+                state.peers.reachability("nas"),
+                Some(reachability),
+                "K sanity check: this iteration's route/reachability is genuinely set"
+            );
+            let views = DaemonLinkStatusReader::new(state.clone()).list_links().unwrap();
+            assert_eq!(
+                views[0].durability_status,
+                GroupDurabilityStatus::Healthy,
+                "K: durability must never change across a pure connectivity transition"
+            );
+            assert_eq!(views[0].fetch_availability, expected_fetch, "K: availability tracks route");
+        }
     }
 }
