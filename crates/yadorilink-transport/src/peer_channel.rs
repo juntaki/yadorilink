@@ -514,6 +514,7 @@ impl PeerChannel {
             backoff,
             attempt,
             race_started_at,
+            recovering_from_liveness_loss: false,
             revoked: revoked.clone(),
             shutdown: shutdown.clone(),
             reliable_enabled: reliable_enabled.clone(),
@@ -741,6 +742,35 @@ struct ActorState {
     /// the backoff input and the `Connecting`/`Unreachable` attempt count.
     /// Reset to 0 whenever a path confirms or a fresh candidate is learned.
     attempt: u32,
+    /// Set when a previously-`Connected` path loses liveness and this
+    /// actor re-races candidates to try to recover it -- cleared once a
+    /// fresh direct candidate actually confirms (back to `Connected`).
+    /// Deliberately NOT reset by a newly-learned candidate (unlike
+    /// `attempt`, whose backoff-timing reset is fine for that): this
+    /// flag exists to bound how many EPOCHS of retry this specific
+    /// recovery episode gets, and a promising-looking new candidate that
+    /// still fails to authenticate must still count toward that bound,
+    /// not reset it indefinitely. See `enter_unreachable`'s own doc
+    /// comment for what happens once this flag is set and a race still
+    /// fails: this channel's underlying `WgTunnel` session state is for
+    /// the OLD peer process instance -- if that peer restarted (not just
+    /// moved network paths), no amount of address re-racing on the SAME
+    /// `WgTunnel` will ever re-authenticate, because `WgTunnel::probe`
+    /// on an already-"established" session emits a stale-session
+    /// keepalive DATA packet, never a fresh `HandshakeInitiation` (a
+    /// restarted peer's own fresh `WgTunnel` has no session to answer
+    /// those with, and cannot decrypt them). One bounded in-place
+    /// recovery attempt is given the benefit of the doubt (a genuine
+    /// transient network blip, not a peer restart); if THAT fails too,
+    /// this channel retires itself (`IoTurnOutcome::Break`, NOT
+    /// `revoke()` -- see that distinction's own doc comment on
+    /// `retire_epoch`) so the owning reconnect supervisor
+    /// (`peer_orchestrator::spawn_peer_session`) spawns a genuinely
+    /// fresh generation: fresh `PeerChannel`, fresh `WgTunnel`, fresh
+    /// crypto/session epoch, capable of actually completing a real
+    /// handshake against whatever the peer's current process instance
+    /// is.
+    recovering_from_liveness_loss: bool,
     /// When the current `Connecting` candidate race began, for the
     /// [`CANDIDATE_RACE_TIMEOUT`] exhaustion check. `None` outside a race.
     race_started_at: Option<Instant>,
@@ -881,7 +911,9 @@ async fn run_one_io_turn(
             if let Some(dgram) = state.tunn.tick() {
                 send_batch_direct(state, vec![dgram]).await;
             }
-            evaluate_reachability(state);
+            if evaluate_reachability(state) {
+                return IoTurnOutcome::Break;
+            }
         }
 
         // Gated so a connection that never negotiates reliable
@@ -1212,6 +1244,45 @@ async fn handle_datagram(
             *state.confirmed_addr_shared.lock().unwrap_or_else(|p| p.into_inner()) = Some(addr);
             state.attempt = 0;
             state.race_started_at = None;
+            // This device's own `WgTunnel` just successfully decrypted
+            // real traffic from this candidate -- proof the session is
+            // genuinely alive, whether this is a fresh handshake or an
+            // existing one. Any bounded-recovery episode is over.
+            //
+            // A stale-ARQ-epoch concern was raised and investigated here
+            // (M5-A Pass 5 Codex review): if the peer's own process
+            // restarted, its `ReliableSend`/`ReliableRecv` sequence
+            // numbering also reset, but THIS side's does not just from
+            // clearing `recovering_from_liveness_loss`. An attempted fix
+            // (unconditionally resetting ARQ state on recovery) was
+            // reverted: `WgTunnel`'s own `TunnResult::WriteToNetwork`
+            // (handshake control message) vs `WriteToTunnelV4/V6`
+            // (ordinary data) distinguishes "a WireGuard-level handshake
+            // just completed" from "ordinary data on an existing
+            // session," but a WireGuard REKEY (periodic, transparent,
+            // same peer PROCESS never restarted) also produces
+            // `WriteToNetwork` -- so that signal conflates "WG session
+            // rekeyed" with "peer's application process restarted,"
+            // which are different layers: this application's own ARQ
+            // sequence numbers are independent of WireGuard's internal
+            // nonce/session index and must not be reset just because WG
+            // itself rekeyed underneath a still-alive peer process.
+            // Resetting unconditionally (the reverted attempt) broke the
+            // more common "same session, brief blip" recovery case
+            // instead (unconfirmed with the peer, this side's own
+            // sequence space would restart while the peer's does not).
+            // The APPLICATION layer already has its own, correctly-
+            // scoped defense against exactly this ambiguity:
+            // `peer_session.rs`'s "exact-generation handshake" protocol
+            // requires a fresh `ClusterConfig` as the first message of
+            // every session and rejects/retries a mismatch (observed
+            // firsthand in this investigation's own traces). Resolving
+            // this cleanly at the transport layer -- if still needed
+            // once the application-layer protocol's own coverage is
+            // verified -- is real, separate follow-up scope requiring a
+            // genuine peer-to-peer ARQ epoch handshake, not a
+            // same-side-only heuristic.
+            state.recovering_from_liveness_loss = false;
             set_reachability(state, PeerReachability::Connected { path: classify_endpoint(addr) });
         } else {
             // M3 Pass 6: authenticated traffic that either has no socket
@@ -1241,6 +1312,12 @@ async fn handle_datagram(
             } else {
                 tracing::debug!("authenticated relay-delivered traffic");
             }
+            // Same reasoning as the direct-confirmed branch above: real
+            // authenticated traffic just proved this session alive
+            // (the ARQ-reset question has the same answer here -- see
+            // that branch's own doc comment for why it's deliberately
+            // NOT reset here either).
+            state.recovering_from_liveness_loss = false;
             set_reachability(state, PeerReachability::ConnectedRelay);
         }
     }
@@ -1378,8 +1455,23 @@ fn should_probe(state: &ActorState) -> bool {
 
 /// Enters the unreachable state with a bounded-backoff `next_retry`,
 /// choosing the failure category from what the race actually saw
-/// (no candidates at all vs. candidates that stayed silent).
-fn enter_unreachable(state: &mut ActorState, now: Instant) {
+/// (no candidates at all vs. candidates that stayed silent). Returns
+/// `true` if this channel must retire instead (see
+/// `recovering_from_liveness_loss`'s own doc comment): a candidate race
+/// that fails while recovering from a lost-liveness `Connected` state
+/// gets no further backoff-and-retry within this same generation --
+/// this device's own `WgTunnel` session state cannot be trusted to
+/// still be valid for the peer that (may have) restarted, so more
+/// retries on it would just repeat the same doomed stale-session probe.
+fn enter_unreachable(state: &mut ActorState, now: Instant) -> bool {
+    if state.recovering_from_liveness_loss {
+        tracing::warn!(
+            peer = %hex::encode(state.peer_public_bytes),
+            "bounded in-place recovery attempt after lost liveness failed; retiring this \
+             channel for a fresh reconnect generation"
+        );
+        return true;
+    }
     let category = if state.direct_candidates.is_empty() {
         UnreachableCategory::NoCandidates
     } else {
@@ -1389,35 +1481,40 @@ fn enter_unreachable(state: &mut ActorState, now: Instant) {
     state.attempt = state.attempt.saturating_add(1);
     state.race_started_at = None;
     set_reachability(state, PeerReachability::Unreachable { category, next_retry: now + delay });
+    false
 }
 
 /// Drives the reachability state machine on each `TICK_INTERVAL`:
 /// a stalled candidate race lands in `Unreachable`; a confirmed path gone
 /// quiet re-races (re-traversal); and an `Unreachable` peer re-races once
-/// its backoff elapses.
-fn evaluate_reachability(state: &mut ActorState) {
+/// its backoff elapses. Returns `true` if the caller must retire this
+/// channel now (`enter_unreachable`'s own doc comment) -- the caller is
+/// responsible for actually tearing the actor down
+/// (`IoTurnOutcome::Break`); this function only ever mutates state and
+/// reports the decision.
+fn evaluate_reachability(state: &mut ActorState) -> bool {
     let now = Instant::now();
     match state.reachability {
         PeerReachability::Connecting { .. } => {
             // Confirmation is handled synchronously in `handle_datagram`;
             // here we only detect a race that ran out of time.
             if state.confirmed_direct_addr.is_some() {
-                return;
+                return false;
             }
             if state.direct_candidates.is_empty() {
-                enter_unreachable(state, now);
+                return enter_unreachable(state, now);
             } else if let Some(started) = state.race_started_at {
                 if now.duration_since(started) >= CANDIDATE_RACE_TIMEOUT {
-                    enter_unreachable(state, now);
+                    return enter_unreachable(state, now);
                 }
             } else {
                 state.race_started_at = Some(now);
             }
         }
         PeerReachability::Connected { .. } => {
-            let Some(last_rx) = state.last_direct_rx else { return };
+            let Some(last_rx) = state.last_direct_rx else { return false };
             if last_rx.elapsed() < DIRECT_LIVENESS_TIMEOUT {
-                return;
+                return false;
             }
             tracing::warn!(
                 peer = %hex::encode(state.peer_public_bytes),
@@ -1427,11 +1524,16 @@ fn evaluate_reachability(state: &mut ActorState) {
             // Forget the confirmed address so a later successful direct
             // receive re-confirms from scratch rather than trusting a
             // candidate that just proved unreliable, and start a fresh
-            // race with the backoff reset.
+            // race with the backoff reset. One bounded recovery attempt
+            // (`recovering_from_liveness_loss`'s own doc comment) --
+            // if THIS race also fails to authenticate, this channel
+            // retires rather than continuing to retry a possibly-stale
+            // session.
             state.confirmed_direct_addr = None;
             *state.confirmed_addr_shared.lock().unwrap_or_else(|p| p.into_inner()) = None;
             state.attempt = 0;
             state.race_started_at = Some(now);
+            state.recovering_from_liveness_loss = true;
             set_reachability(state, PeerReachability::Connecting { attempt: 0 });
         }
         // M3 Pass 6: same liveness-timeout SHAPE as `Connected` above, its
@@ -1442,11 +1544,14 @@ fn evaluate_reachability(state: &mut ActorState) {
         // liveness) and why 20s is too short here (no independent probe
         // keeps a relay path warm the way `DIRECT_PROBE_INTERVAL` does
         // for direct). There is no `confirmed_direct_addr` to clear here
-        // -- `ConnectedRelay` never sets one.
+        // -- `ConnectedRelay` never sets one. Same bounded-recovery rule
+        // as `Connected` above applies once relay traffic itself goes
+        // quiet: a peer that restarted while relay was the active route
+        // must not preserve an obsolete session epoch forever either.
         PeerReachability::ConnectedRelay => {
-            let Some(last_rx) = state.last_relay_rx else { return };
+            let Some(last_rx) = state.last_relay_rx else { return false };
             if last_rx.elapsed() < RELAY_LIVENESS_TIMEOUT {
-                return;
+                return false;
             }
             tracing::warn!(
                 peer = %hex::encode(state.peer_public_bytes),
@@ -1455,15 +1560,19 @@ fn evaluate_reachability(state: &mut ActorState) {
             );
             state.attempt = 0;
             state.race_started_at = Some(now);
+            state.recovering_from_liveness_loss = true;
             set_reachability(state, PeerReachability::Connecting { attempt: 0 });
         }
         PeerReachability::Unreachable { next_retry, .. } => {
             if now < next_retry {
-                return;
+                return false;
             }
             if state.direct_candidates.is_empty() {
                 // Nothing to race; re-arm the backoff timer and stay
-                // NoCandidates until a candidate is learned.
+                // NoCandidates until a candidate is learned. Not reached
+                // while `recovering_from_liveness_loss` -- that path
+                // retires on the FIRST failed race rather than ever
+                // reaching a standing `Unreachable` state.
                 let delay = state.backoff.next(state.attempt);
                 state.attempt = state.attempt.saturating_add(1);
                 set_reachability(
@@ -1479,6 +1588,7 @@ fn evaluate_reachability(state: &mut ActorState) {
             }
         }
     }
+    false
 }
 
 /// Inserts `addr` into `candidates` if not already present, enforcing
@@ -1649,6 +1759,7 @@ mod tests {
             backoff: BackoffConfig::RECONNECT,
             attempt: 0,
             race_started_at: None,
+            recovering_from_liveness_loss: false,
             revoked: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(Notify::new()),
             reliable_enabled: Arc::new(AtomicBool::new(false)),
@@ -1717,6 +1828,7 @@ mod tests {
             backoff: BackoffConfig::RECONNECT,
             attempt: 0,
             race_started_at: None,
+            recovering_from_liveness_loss: false,
             revoked: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(Notify::new()),
             reliable_enabled: Arc::new(AtomicBool::new(true)),
@@ -1981,6 +2093,164 @@ mod tests {
 
         assert!(matches!(state.reachability, PeerReachability::Connecting { attempt: 0 }));
         assert!(state.confirmed_direct_addr.is_none());
+    }
+
+    /// M5-A restart-convergence fix, regression B: a liveness-loss
+    /// re-race that actually reconnects (the common transient-blip case)
+    /// must self-heal in place -- never retire the channel, and must
+    /// clear `recovering_from_liveness_loss` once real authenticated
+    /// traffic proves the session alive again. Directly exercises the
+    /// exact sequence `confirmed_path_liveness_loss_triggers_retraversal`
+    /// above starts, carried one step further to the successful-recovery
+    /// outcome.
+    #[tokio::test]
+    async fn liveness_loss_recovery_that_reconnects_does_not_retire() {
+        let mut state = make_state(
+            PeerReachability::Connected { path: CandidateClass::Lan },
+            vec![coordination_candidate(peer_addr())],
+            Some(peer_addr()),
+        )
+        .await;
+        state.last_direct_rx = Some(Instant::now() - Duration::from_secs(25));
+
+        let retire = evaluate_reachability(&mut state);
+        assert!(!retire, "the FIRST bounded recovery attempt must not retire the channel");
+        assert!(state.recovering_from_liveness_loss, "must be in a bounded recovery episode now");
+
+        // The re-race succeeds: real authenticated traffic arrives from
+        // the (still valid) confirmed candidate, exactly like
+        // `handle_datagram`'s own candidate-confirmed branch.
+        state.confirmed_direct_addr = Some(peer_addr());
+        state.recovering_from_liveness_loss = false; // handle_datagram's own clear
+        set_reachability(&mut state, PeerReachability::Connected { path: CandidateClass::Lan });
+
+        assert!(
+            !state.recovering_from_liveness_loss,
+            "a successful recovery must clear the bounded-recovery flag"
+        );
+        assert!(matches!(state.reachability, PeerReachability::Connected { .. }));
+    }
+
+    /// M5-A Pass 5 Codex review: a stale-ARQ-epoch concern was raised
+    /// against a peer restart scenario, and an initial fix attempt
+    /// (unconditionally resetting `reliable_send`/`reliable_recv` on
+    /// every confirmed liveness-loss recovery) was itself found unsafe
+    /// on re-review and reverted -- see the `Connected` confirmation
+    /// branch's own doc comment in `handle_datagram` for the full
+    /// reasoning (WireGuard rekey vs peer-process-restart are different
+    /// layers this signal can't disambiguate one-sidedly). This test
+    /// pins the REVERTED behavior directly, so a future change doesn't
+    /// silently reintroduce the same one-sided reset: recovering from a
+    /// liveness-loss episode via real authenticated traffic must NOT
+    /// touch ARQ state, preserving the common "same session, brief
+    /// blip" case's in-flight sequence continuity.
+    #[tokio::test]
+    async fn recovered_liveness_loss_does_not_reset_arq_state() {
+        let local_secret = StaticSecret::from([1u8; 32]);
+        let local_public = PublicKey::from(&local_secret);
+        let peer_secret = StaticSecret::from([2u8; 32]);
+        let mut peer_tunnel = WgTunnel::new(peer_secret, local_public, 1);
+        let init = peer_tunnel.probe().expect("fresh tunnel produces a handshake initiation");
+
+        let mut state = make_state(
+            PeerReachability::Connecting { attempt: 0 },
+            vec![coordination_candidate(peer_addr())],
+            None,
+        )
+        .await;
+        // Matches exactly what `evaluate_reachability`'s liveness-loss
+        // arm does on a real `Connected -> Connecting` transition: clears
+        // `confirmed_direct_addr` (so `handle_datagram`'s own confirm
+        // gate, `authenticated && confirmed_direct_addr.is_none()`, fires
+        // on the next authenticated packet) and sets the bounded-recovery
+        // flag. Simulates pre-existing ARQ progress from before the
+        // liveness loss (the common "same session, brief blip" case).
+        state.recovering_from_liveness_loss = true;
+        state.reliable_send.wrap_and_track(b"in-flight payload", 0, 0);
+        state.reliable_recv.observe(1); // real seqs start at 1; contiguous from the start
+        assert_eq!(state.reliable_send.unacked_len(), 1, "sanity check: ARQ has prior progress");
+        assert_eq!(
+            state.reliable_recv.highest_contiguous(),
+            1,
+            "sanity check: ARQ has prior progress"
+        );
+
+        // Real authenticated traffic confirms recovery.
+        handle_datagram(&mut state, &init, Some(peer_addr()), false).await;
+
+        assert!(matches!(state.reachability, PeerReachability::Connected { .. }));
+        assert!(
+            !state.recovering_from_liveness_loss,
+            "recovery must be considered complete once authenticated traffic arrives"
+        );
+        assert_eq!(
+            state.reliable_send.unacked_len(),
+            1,
+            "ARQ send state must survive a liveness-loss recovery unchanged -- resetting it \
+             would desync the sequence space from a peer that never actually restarted"
+        );
+        assert_eq!(
+            state.reliable_recv.highest_contiguous(),
+            1,
+            "ARQ receive state must survive a liveness-loss recovery unchanged"
+        );
+    }
+
+    /// M5-A restart-convergence fix, regression C/D: if the bounded
+    /// recovery race ALSO fails (the peer genuinely restarted, or is
+    /// still down), the channel must retire exactly once -- `enter_
+    /// unreachable` (reached via the race-timeout path) returns `true`,
+    /// never falling through to the ordinary `Unreachable`+backoff cycle
+    /// a first-ever connection failure would use.
+    #[tokio::test]
+    async fn liveness_loss_recovery_that_fails_retires_the_channel() {
+        let mut state = make_state(
+            PeerReachability::Connected { path: CandidateClass::Lan },
+            vec![coordination_candidate(peer_addr())],
+            Some(peer_addr()),
+        )
+        .await;
+        state.last_direct_rx = Some(Instant::now() - Duration::from_secs(25));
+        let retire = evaluate_reachability(&mut state);
+        assert!(!retire, "first re-race attempt alone must not retire yet");
+        assert!(matches!(state.reachability, PeerReachability::Connecting { attempt: 0 }));
+
+        // The bounded re-race times out without ever reconfirming --
+        // simulate CANDIDATE_RACE_TIMEOUT elapsed with no response.
+        state.race_started_at = Some(Instant::now() - Duration::from_secs(25));
+        let retire = evaluate_reachability(&mut state);
+        assert!(
+            retire,
+            "a failed bounded recovery attempt must retire the channel, never loop into \
+             ordinary Unreachable backoff on a possibly-stale session"
+        );
+    }
+
+    /// M5-A restart-convergence fix, regression E: a peer that has NEVER
+    /// yet connected (a fresh channel's very first candidate race) must
+    /// use the ordinary `Unreachable`+backoff path, never the bounded
+    /// recovery-then-retire path -- `recovering_from_liveness_loss` is
+    /// only ever set by the `Connected`/`ConnectedRelay` liveness-loss
+    /// arms, which a channel that was never `Connected` can't reach.
+    #[tokio::test]
+    async fn initial_connection_failure_does_not_use_the_bounded_recovery_path() {
+        let mut state = make_state(
+            PeerReachability::Connecting { attempt: 0 },
+            vec![coordination_candidate(peer_addr())],
+            None,
+        )
+        .await;
+        assert!(!state.recovering_from_liveness_loss, "sanity check: a fresh channel starts here");
+        state.race_started_at = Some(Instant::now() - Duration::from_secs(25));
+
+        let retire = evaluate_reachability(&mut state);
+
+        assert!(
+            !retire,
+            "an ordinary first-connection failure must back off and retry, not retire -- \
+             there is no prior session to be stale, so no reason to force a fresh generation"
+        );
+        assert!(matches!(state.reachability, PeerReachability::Unreachable { .. }));
     }
 
     #[tokio::test]

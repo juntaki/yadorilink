@@ -1093,6 +1093,46 @@ mod ws_netmap {
             let retained_group_validation_cache: std::sync::Mutex<HashMap<String, bool>> =
                 std::sync::Mutex::new(HashMap::new());
 
+            // M5-A Pass 5 (restart-convergence), round 2: peer processing is
+            // genuinely two-phase now. Phase 1 (admission) below runs EVERY
+            // peer's existing WireGuard-key and signing-key pin checks --
+            // exactly as before, teardown-and-skip on any failure -- but
+            // does not publish anything into `peer_netmap_metadata` or run
+            // any authorization validation yet. Only once every peer in
+            // this pass has been fully admitted (or rejected) does Phase 2
+            // seed the admitted peers' signing keys and then run
+            // authorization validation / session management.
+            //
+            // A single combined pass (an earlier version of this fix) could
+            // not do this safely: peer A's `validate_retained_group` for a
+            // shared group can need peer B's signing key (a retained change
+            // in that group authored by B), and that check's `true`/`false`
+            // result is cached for the rest of the pass
+            // (`retained_group_validation_cache`) to avoid re-walking a
+            // group shared by many peers. Publishing each peer's raw,
+            // not-yet-pin-checked key as soon as it was decoded (rather
+            // than after admission) opened a real trust-boundary race: if
+            // B's key had actually CHANGED from its pinned value (a
+            // `PeerKeyDecision::Mismatch`, which is correctly rejected a
+            // few lines later), an earlier single-pass version could still
+            // let A's validation run against that about-to-be-rejected key
+            // in the gap before B's own rejection ran, cache `true` for the
+            // shared group, and publish A's authorization on that basis --
+            // B's later rejection only clears B's own metadata, not the
+            // already-cached group result or A's already-published
+            // authorization. Doing admission for every peer FIRST, and only
+            // publishing/validating with the admitted, pin-checked key
+            // set, removes that window entirely.
+            struct AdmittedPeer {
+                device_id: String,
+                signing_key: Option<[u8; 32]>,
+                peer_public: boringtun::x25519::PublicKey,
+                candidate_endpoints: Vec<WsEndpoint>,
+                authorized_groups: HashSet<String>,
+                full_replica_groups: HashSet<String>,
+                relay_capable: bool,
+            }
+            let mut admitted: Vec<AdmittedPeer> = Vec::new();
             for peer in update.peers {
                 let Ok(public_key_bytes) = base64::engine::general_purpose::STANDARD
                     .decode(&peer.wireguard_public_key_base64)
@@ -1153,17 +1193,55 @@ mod ws_netmap {
                     teardown_peer(state, diff_state, &peer.device_id);
                     continue;
                 }
+                admitted.push(AdmittedPeer {
+                    device_id: peer.device_id,
+                    signing_key: signing_key_bytes
+                        .as_deref()
+                        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()),
+                    peer_public,
+                    candidate_endpoints: peer.endpoints,
+                    authorized_groups,
+                    full_replica_groups,
+                    relay_capable: peer.relay_capable,
+                });
+            }
+
+            // Phase 2: every peer admitted this pass has already passed its
+            // WireGuard-key and signing-key pin checks, so it is now safe
+            // to settle ALL of their CURRENT signing-key state (present or
+            // absent) before validating ANY of their shared groups -- no
+            // admitted peer's retained-history check can ever race an
+            // admitted peer's own not-yet-settled key, and no rejected
+            // peer's key is ever published at all. Settling `None` too
+            // (not just seeding `Some`) matters: a peer that stopped
+            // advertising a signing key this pass must have any STALE
+            // previously-recorded key removed here, before an earlier-
+            // processed peer's group validation could otherwise still
+            // validate against that stale key and cache a wrong `true` for
+            // the shared group (a Codex review finding on an earlier
+            // version of this fix, which only handled `Some`).
+            for peer in &admitted {
+                match peer.signing_key {
+                    Some(key) => state.record_peer_signing_key(&peer.device_id, key),
+                    None => state.forget_peer_signing_key(&peer.device_id),
+                }
+            }
+
+            for peer in admitted {
+                let candidates: Vec<SocketAddr> = peer
+                    .candidate_endpoints
+                    .iter()
+                    .filter_map(|e| e.address.parse().ok())
+                    .collect();
                 let effective_authorized_groups = apply_authoritative_peer_metadata(
                     state,
                     &peer.device_id,
-                    signing_key_bytes.as_deref().and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()),
-                    &authorized_groups,
-                    &full_replica_groups,
+                    peer.signing_key,
+                    &peer.authorized_groups,
+                    &peer.full_replica_groups,
                     peer.relay_capable,
                     &retained_group_validation_cache,
                 );
-                let candidates: Vec<SocketAddr> =
-                    peer.endpoints.iter().filter_map(|e| e.address.parse().ok()).collect();
                 let mut effective_group_ids: Vec<String> =
                     effective_authorized_groups.into_iter().collect();
                 effective_group_ids.sort();
@@ -1179,7 +1257,7 @@ mod ws_netmap {
                     .insert(
                         peer.device_id.clone(),
                         PeerConnectSpec {
-                            peer_public,
+                            peer_public: peer.peer_public,
                             candidates: candidates.clone(),
                             effective_group_ids: effective_group_ids.clone(),
                         },
