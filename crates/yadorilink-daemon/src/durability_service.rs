@@ -423,7 +423,10 @@ mod tests {
         // latch_load_failed / scope_unknown / recovery_blocked / latched_unknown
         // each win outright, regardless of every other fact.
         assert_eq!(
-            classify(&DurabilityFacts { latch_load_failed: true, ..protected_full_replica_facts() }),
+            classify(&DurabilityFacts {
+                latch_load_failed: true,
+                ..protected_full_replica_facts()
+            }),
             GroupDurabilityStatus::Unknown
         );
         assert_eq!(
@@ -442,13 +445,19 @@ mod tests {
         // fresh, current-generation peer confirmation -- an untrusted
         // authorization snapshot invalidates any confirmation it produced.
         assert_eq!(
-            classify(&DurabilityFacts { group_policy_stale: true, ..protected_full_replica_facts() }),
+            classify(&DurabilityFacts {
+                group_policy_stale: true,
+                ..protected_full_replica_facts()
+            }),
             GroupDurabilityStatus::Unknown
         );
         // Unreadable materialization wins outright too, even with an
         // otherwise-confirmed peer.
         assert_eq!(
-            classify(&DurabilityFacts { materialization: unreadable, ..protected_full_replica_facts() }),
+            classify(&DurabilityFacts {
+                materialization: unreadable,
+                ..protected_full_replica_facts()
+            }),
             GroupDurabilityStatus::Unknown
         );
 
@@ -512,7 +521,10 @@ mod tests {
         // has no fresh peer confirmation is Unknown, not Protected -- local
         // completeness alone never proves group-wide coverage.
         assert_eq!(
-            classify(&DurabilityFacts { peer_confirmed_custody: false, ..protected_full_replica_facts() }),
+            classify(&DurabilityFacts {
+                peer_confirmed_custody: false,
+                ..protected_full_replica_facts()
+            }),
             GroupDurabilityStatus::Unknown
         );
     }

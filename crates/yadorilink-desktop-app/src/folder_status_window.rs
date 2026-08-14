@@ -217,7 +217,10 @@ impl FolderStatusApp {
             // stronger than this daemon can back up (M4 Pass 3 Codex
             // review #3 follow-up) -- mirrors `yadorilink-cli`'s own
             // already-reviewed "configured full copy" wording exactly.
-            ui.label(dim(egui::RichText::new("Devices configured to keep a full copy:").weak().small(), stale));
+            ui.label(dim(
+                egui::RichText::new("Devices configured to keep a full copy:").weak().small(),
+                stale,
+            ));
             for row in &copies {
                 ui.label(dim(
                     format!("  {}  —  configured full copy ({})", row.device_id, row.state.label())

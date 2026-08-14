@@ -25,10 +25,9 @@ use yadorilink_ipc_proto::daemonctl::{
     GroupDurabilityStatus, HandoffResult, HealthResponse, HeldFile, HydrateResponse,
     JoinAndLinkCommandResponse, LatchGroupDurabilityUnknownResponse, LimitsSetResponse,
     LimitsShowResponse, LinkRequest, LinkResponse, LinkStatus, ListConnectionTracesResponse,
-    ListLinksResponse, LocalStorageState,
-    ListQueueItemsResponse, ListRecoveryOperationsResponse, ListTrashResponse,
-    ListVersionsResponse, MembershipHandoffResult, ObtainHandoffTicketResponse, PauseResponse,
-    PeerStatus, PendingEnrollmentKind, PinResponse, QueueItem, RecentSyncError,
+    ListLinksResponse, ListQueueItemsResponse, ListRecoveryOperationsResponse, ListTrashResponse,
+    ListVersionsResponse, LocalStorageState, MembershipHandoffResult, ObtainHandoffTicketResponse,
+    PauseResponse, PeerStatus, PendingEnrollmentKind, PinResponse, QueueItem, RecentSyncError,
     ReleaseHandoffTicketResponse, RemoveDeviceCommandResponse, RemovePendingEnrollmentResponse,
     ReplicaMembershipCommandOutcome, ReportingConsentState, ReportingStatusResponse,
     RequestHandoffLeaseResponse, RestoreTrashResponse, RestoreVersionResponse, ResumeResponse,
@@ -1568,8 +1567,8 @@ mod overall_status_tests {
     fn at_risk_durability_is_degraded() {
         let response = StatusResponse {
             links: vec![LinkStatus {
-                durability_status:
-                    yadorilink_ipc_proto::daemonctl::GroupDurabilityStatus::AtRisk as i32,
+                durability_status: yadorilink_ipc_proto::daemonctl::GroupDurabilityStatus::AtRisk
+                    as i32,
                 ..protected_link("group-1")
             }],
             ..Default::default()
@@ -1587,8 +1586,8 @@ mod overall_status_tests {
     fn unknown_durability_is_attention() {
         let response = StatusResponse {
             links: vec![LinkStatus {
-                durability_status:
-                    yadorilink_ipc_proto::daemonctl::GroupDurabilityStatus::Unknown as i32,
+                durability_status: yadorilink_ipc_proto::daemonctl::GroupDurabilityStatus::Unknown
+                    as i32,
                 ..protected_link("group-1")
             }],
             ..Default::default()
@@ -4875,27 +4874,22 @@ mod migration_safety_tests {
     /// never filled in).
     #[test]
     fn reachability_to_proto_only_carries_route_kind_when_connected() {
-        use yadorilink_ipc_proto::daemonctl::{
-            PeerReachability as Wire, RouteKind as WireRoute,
-        };
+        use yadorilink_ipc_proto::daemonctl::{PeerReachability as Wire, RouteKind as WireRoute};
 
-        let (reachability, _, route) =
-            super::reachability_to_proto(crate::peer_registry::PeerReachability::Connected(
-                crate::route::RouteKind::Direct,
-            ));
+        let (reachability, _, route) = super::reachability_to_proto(
+            crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Direct),
+        );
         assert_eq!(reachability, Wire::Connected);
         assert_eq!(route, WireRoute::Direct);
 
-        let (reachability, _, route) =
-            super::reachability_to_proto(crate::peer_registry::PeerReachability::Connected(
-                crate::route::RouteKind::Relay,
-            ));
+        let (reachability, _, route) = super::reachability_to_proto(
+            crate::peer_registry::PeerReachability::Connected(crate::route::RouteKind::Relay),
+        );
         assert_eq!(reachability, Wire::Connected);
         assert_eq!(route, WireRoute::Relay);
 
-        let (_, _, route) = super::reachability_to_proto(
-            crate::peer_registry::PeerReachability::Connecting,
-        );
+        let (_, _, route) =
+            super::reachability_to_proto(crate::peer_registry::PeerReachability::Connecting);
         assert_eq!(route, WireRoute::Unspecified);
 
         let (_, _, route) = super::reachability_to_proto(

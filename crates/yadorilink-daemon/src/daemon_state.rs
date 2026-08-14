@@ -1685,7 +1685,10 @@ impl DaemonState {
     /// one -- used by the relay-admission path to confirm a direct route
     /// exists and to read its confirmed address (see `PeerChannel::
     /// confirmed_direct_addr`).
-    pub(crate) fn direct_channel(&self, device_id: &str) -> Option<Arc<yadorilink_transport::PeerChannel>> {
+    pub(crate) fn direct_channel(
+        &self,
+        device_id: &str,
+    ) -> Option<Arc<yadorilink_transport::PeerChannel>> {
         self.direct_channels.lock().unwrap_or_else(|p| p.into_inner()).get(device_id).cloned()
     }
 
@@ -2389,9 +2392,8 @@ impl DaemonState {
         // spuriously fail an unrelated in-flight durability confirmation,
         // exactly the connectivity/durability coupling `crate::route`'s
         // own doc comment says this model must never introduce.
-        let changed = key_changed
-            || before_writers != *authorized_groups
-            || before_replicas != next_replicas;
+        let changed =
+            key_changed || before_writers != *authorized_groups || before_replicas != next_replicas;
         if changed {
             self.bump_membership_generation();
         }
@@ -2853,11 +2855,10 @@ impl DaemonState {
         }
         if matches!(outcome, CustodyConfirmationOutcome::NotConfirmed) {
             if let Some(existing) = &entry.record {
-                let still_fresh = matches!(
-                    existing.outcome,
-                    CustodyConfirmationOutcome::Confirmed { .. }
-                ) && existing.confirmed_at.elapsed() <= CUSTODY_CONFIRMATION_STALENESS_BOUND
-                    && existing.membership_generation == current_membership_generation;
+                let still_fresh =
+                    matches!(existing.outcome, CustodyConfirmationOutcome::Confirmed { .. })
+                        && existing.confirmed_at.elapsed() <= CUSTODY_CONFIRMATION_STALENESS_BOUND
+                        && existing.membership_generation == current_membership_generation;
                 if still_fresh {
                     return;
                 }
@@ -2982,7 +2983,12 @@ impl DaemonState {
                 None => CustodyConfirmationOutcome::NotConfirmed,
             }
         };
-        self.record_custody_confirmation_outcome(group_id, outcome, generation_before, epoch_before);
+        self.record_custody_confirmation_outcome(
+            group_id,
+            outcome,
+            generation_before,
+            epoch_before,
+        );
     }
 
     /// Drops `group_id`'s cached custody confirmation, if any, and bumps
@@ -4779,7 +4785,10 @@ mod tests {
         let generation = state.membership_generation();
         state.record_custody_confirmation_outcome(
             "group-1",
-            CustodyConfirmationOutcome::Confirmed { peer_device_id: Some("peer-b".into()), digest: [3u8; 32] },
+            CustodyConfirmationOutcome::Confirmed {
+                peer_device_id: Some("peer-b".into()),
+                digest: [3u8; 32],
+            },
             generation,
             0,
         );
@@ -4817,7 +4826,10 @@ mod tests {
 
         state.record_custody_confirmation_outcome(
             "group-1",
-            CustodyConfirmationOutcome::Confirmed { peer_device_id: Some("peer-b".into()), digest: [9u8; 32] },
+            CustodyConfirmationOutcome::Confirmed {
+                peer_device_id: Some("peer-b".into()),
+                digest: [9u8; 32],
+            },
             generation,
             epoch_before,
         );

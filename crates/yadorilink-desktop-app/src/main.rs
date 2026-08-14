@@ -157,11 +157,8 @@ fn requested_window() -> Option<WindowKind> {
         Some("onboarding") => Some(WindowKind::Onboarding),
         Some("account") => Some(WindowKind::Account),
         Some("folder-status") => {
-            let path = args
-                .iter()
-                .position(|a| a == "--path")
-                .and_then(|i| args.get(i + 1))
-                .cloned()?;
+            let path =
+                args.iter().position(|a| a == "--path").and_then(|i| args.get(i + 1)).cloned()?;
             Some(WindowKind::FolderStatus(path))
         }
         _ => None,
