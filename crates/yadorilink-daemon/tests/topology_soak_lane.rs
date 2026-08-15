@@ -18,19 +18,34 @@
 //! After the soak window, all currently-joined devices are given a
 //! bounded settle window, then four invariants are checked using only
 //! introspection that already exists in production (no new instrumentation
-//! added for this test):
+//! added for this test). An M5-A Pass 11 adversarial review found the
+//! first version of each of these four checks was vacuous or blind to the
+//! exact failure class it claimed to catch -- see each check's own inline
+//! comment for what was wrong and why the current shape actually catches
+//! it:
 //! - **no silent corruption**: every currently-online device's hydrated
-//!   content, hashed file-by-file, agrees exactly on every path all
-//!   online devices share (deleted/conflict-copy paths are not compared
-//!   -- monkey_chaos.rs's own established scope);
-//! - **no leaked sessions**: `PeerRegistry::all_sessions()` never shows
-//!   more than one live session for the same peer device id;
+//!   content, hashed file-by-file, is compared over the UNION of paths
+//!   any two devices hold (not just the intersection -- a path entirely
+//!   missing on one side is a mismatch, not a skip), plus a check that
+//!   real content was observed at all (not every device empty the whole
+//!   run) -- deleted/conflict-copy paths are still not compared,
+//!   matching `monkey_chaos.rs`'s own established scope;
+//! - **no leaked sessions**: every session `pre_restart_sessions`
+//!   captured immediately before a node's restart must have been
+//!   replaced (`!Arc::ptr_eq`) by settle time -- `PeerRegistry` is keyed
+//!   by device id and can never actually hold a "duplicate", so the
+//!   original per-registry duplicate check could never fail;
 //! - **no stuck Protecting**: `DaemonState::group_durability_status`
-//!   never reads `Protecting` once the settle window has elapsed;
-//! - **no stale route**: for every pair both sides currently consider
-//!   `Connected`, both sides' own `PeerReachability` for each other
-//!   settle to agreement (neither stuck on a stale route the other side
-//!   has already moved past) within the settle window.
+//!   never reads `Protecting` on any currently-online node once the
+//!   settle window has elapsed -- `op_device_join` marks the spare a
+//!   second coordination-plane full-replica candidate specifically so
+//!   this state is structurally reachable in this topology (with only N
+//!   as a full replica, `durability_service.rs` never even reaches the
+//!   `Protecting` arm);
+//! - **no stale route**: for every pair, both sides' own `RouteKind`
+//!   (not just connectedness, which collapses Direct and Relay into the
+//!   same value) must agree, retried across the same settle window
+//!   invariant 1 uses rather than checked once.
 //!
 //! "Reconnect/handshake queue depth" (named in the Pass 9 task
 //! description) has no introspection API in production today (confirmed:
@@ -58,6 +73,8 @@ use support::{register_with_fake, wait_until_with_context};
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::durability_service::GroupDurabilityStatus;
 use yadorilink_daemon::peer_registry::PeerReachability;
+use yadorilink_daemon::route::RouteKind;
+use yadorilink_peer_session::peer_session::PeerSyncSession;
 
 const DEFAULT_SOAK_DURATION_SECS: u64 = 20;
 /// Generous relative to `DEFAULT_SOAK_DURATION_SECS`: real convergence
@@ -210,6 +227,20 @@ struct SoakWorld {
     handles: TopologyHandles,
     real_w_endpoint: String,
     w_route_broken: bool,
+    /// Pre-restart session identities, captured immediately before each
+    /// `RestartNode` op: `(observer_device_id, restarted_device_id,
+    /// old_session_arc)` for every OTHER currently-online node's session
+    /// with the node about to restart. `PeerRegistry` is keyed by device
+    /// id, so it can never hold two live entries for the same peer --
+    /// checking it for "duplicates" proves nothing about a leak. The
+    /// real leak this soak cares about (a restarted node's old detached
+    /// per-peer supervisors, and the `Arc<DaemonState>`/`PeerSyncSession`
+    /// they keep alive, per `spawn_orchestrator`'s own doc comment)
+    /// shows up as a surviving OLD `Arc` -- `!Arc::ptr_eq(old, new)` is
+    /// the same session-freshness oracle `topology_restart_convergence.
+    /// rs` already established as correct, applied here after the fact
+    /// against everything the soak's own restarts produced.
+    pre_restart_sessions: Vec<(String, String, Arc<PeerSyncSession>)>,
 }
 
 impl SoakWorld {
@@ -304,10 +335,34 @@ impl SoakWorld {
         self.w_route_broken = false;
     }
 
+    /// Captures every other currently-online node's live session with
+    /// `restarted_device_id` (if any) before that node's restart begins,
+    /// feeding the leaked-session check (see `pre_restart_sessions`'s own
+    /// doc).
+    fn snapshot_sessions_with(&mut self, restarted_device_id: &str) {
+        let mut observers = vec![&self.n, &self.m, &self.w];
+        if let Some(spare) = &self.spare {
+            observers.push(spare);
+        }
+        for observer in observers {
+            if observer.device_id == restarted_device_id {
+                continue;
+            }
+            if let Some(session) = observer.state.peers.session(restarted_device_id) {
+                self.pre_restart_sessions.push((
+                    observer.device_id.clone(),
+                    restarted_device_id.to_string(),
+                    session,
+                ));
+            }
+        }
+    }
+
     async fn op_restart_node(&mut self, rng: &mut StdRng) {
         let targets = ["n", "m", "w"];
         match targets[rng.random_range(0..targets.len())] {
             "n" => {
+                self.snapshot_sessions_with(&self.n.device_id.clone());
                 self.handles.take_and_shutdown(&self.n.device_id).await;
                 let restarted =
                     restart_node(std::mem::replace(&mut self.n, placeholder_node())).await;
@@ -325,6 +380,7 @@ impl SoakWorld {
                 self.n = restarted;
             }
             "m" => {
+                self.snapshot_sessions_with(&self.m.device_id.clone());
                 self.handles.take_and_shutdown(&self.m.device_id).await;
                 let restarted =
                     restart_node(std::mem::replace(&mut self.m, placeholder_node())).await;
@@ -342,6 +398,7 @@ impl SoakWorld {
                 self.m = restarted;
             }
             _ => {
+                self.snapshot_sessions_with(&self.w.device_id.clone());
                 self.handles.take_and_shutdown(&self.w.device_id).await;
                 let restarted =
                     restart_node(std::mem::replace(&mut self.w, placeholder_node())).await;
@@ -379,6 +436,17 @@ impl SoakWorld {
         )
         .await;
         wire_relay_grant_source(&self.fake, &spare.state, &spare.device_id);
+        // Coordination-plane-declared full-replica, matching `restore_n_
+        // canonical_role`'s own pattern -- WITHOUT this, N is
+        // structurally the only full-replica peer this topology ever
+        // has, and `durability_service.rs`'s own `classify` returns
+        // `AtRisk` before the `Protecting` arm is ever reached (see its
+        // own doc comment: "a lone full replica with no peer never
+        // reports Protecting"), making the soak's own "no stuck
+        // Protecting" invariant unable to observe anything. A second
+        // full-replica candidate makes that state machine's other arms
+        // structurally reachable during this soak.
+        self.fake.set_full_replica(&spare.device_id, &self.group_id, true);
         let runtime = spawn_orchestrator(self.fake.addr(), &spare);
         self.handles.insert(spare.device_id.clone(), runtime);
         self.spare = Some(spare);
@@ -460,6 +528,7 @@ async fn run_soak(seed: u64) {
         handles,
         real_w_endpoint,
         w_route_broken: false,
+        pre_restart_sessions: Vec::new(),
     };
 
     let deadline = Instant::now() + duration;
@@ -550,13 +619,31 @@ async fn run_soak(seed: u64) {
         let mut all_digests = digests.clone();
         all_digests.push((world.n.device_id.clone(), n_digest));
         mismatches.clear();
+        // Compares the UNION of paths seen on either side, not just the
+        // intersection: a path present on A and entirely absent on B
+        // (the exact shape of the false-tombstone/file-disappearance bug
+        // this branch's production fix addresses) must count as a
+        // mismatch, not be silently skipped -- an earlier version of
+        // this check only compared values for paths present on BOTH
+        // sides, so a node that lost every file passed this invariant
+        // instantly (a real finding from an M5-A Pass 11 adversarial
+        // review).
         for (i, (id_a, digest_a)) in all_digests.iter().enumerate() {
             for (id_b, digest_b) in &all_digests[i + 1..] {
-                for (path, hash_a) in digest_a {
-                    if let Some(hash_b) = digest_b.get(path) {
-                        if hash_a != hash_b {
+                let all_paths: std::collections::BTreeSet<&String> =
+                    digest_a.keys().chain(digest_b.keys()).collect();
+                for path in all_paths {
+                    match (digest_a.get(path), digest_b.get(path)) {
+                        (Some(hash_a), Some(hash_b)) if hash_a != hash_b => {
                             mismatches.push(format!("{path}: {id_a}={hash_a} != {id_b}={hash_b}"));
                         }
+                        (Some(_), None) => {
+                            mismatches.push(format!("{path}: present on {id_a}, absent on {id_b}"));
+                        }
+                        (None, Some(_)) => {
+                            mismatches.push(format!("{path}: present on {id_b}, absent on {id_a}"));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -567,59 +654,122 @@ async fn run_soak(seed: u64) {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     assert!(mismatches.is_empty(), "soak lane found silent content divergence: {mismatches:#?}");
+    // A convergence check that never observed any real content is not a
+    // pass -- it's every device starting and staying empty, e.g. because
+    // the watcher or hydration path was silently broken the whole run.
+    assert!(
+        {
+            let n_digest = tree_digest(world.n.root.path());
+            !n_digest.is_empty()
+                || online_ondemand.iter().any(|node| !tree_digest(node.root.path()).is_empty())
+        },
+        "soak lane never observed any real synced content on any online device -- the corruption \
+         check above would have passed vacuously"
+    );
 
-    // Invariant 2: no leaked sessions -- no online node has more than one
-    // live session for the same peer device id.
+    // Invariant 2: no leaked sessions -- every session `pre_restart_
+    // sessions` captured immediately before its node's restart must have
+    // been replaced by now. `PeerRegistry` is keyed by device id, so it
+    // structurally cannot hold two live entries for the same peer --
+    // checking it for "duplicates" (an earlier version of this check)
+    // can never fail and proves nothing. The real leak this soak cares
+    // about is a restarted node's OLD detached per-peer supervisors (and
+    // the `Arc<DaemonState>`/`PeerSyncSession` they keep alive) still
+    // running after the restart -- observable only by comparing session
+    // IDENTITY across the restart, which `pre_restart_sessions` records.
     let mut all_nodes = vec![&world.n, &world.m, &world.w];
     if let Some(spare) = &world.spare {
         all_nodes.push(spare);
     }
-    for node in &all_nodes {
-        let sessions = node.state.peers.all_sessions();
-        let mut seen = std::collections::HashSet::new();
-        let mut duplicates = Vec::new();
-        for (peer_id, _) in &sessions {
-            if !seen.insert(peer_id.clone()) {
-                duplicates.push(peer_id.clone());
+    let node_by_id = |device_id: &str| all_nodes.iter().find(|n| n.device_id == device_id).copied();
+    let mut leaked = Vec::new();
+    for (observer_id, restarted_id, old_session) in &world.pre_restart_sessions {
+        let Some(observer) = node_by_id(observer_id) else { continue };
+        if let Some(current) = observer.state.peers.session(restarted_id) {
+            if Arc::ptr_eq(&current, old_session) {
+                leaked.push(format!(
+                    "{observer_id}'s session with {restarted_id} was never replaced across its \
+                     restart"
+                ));
             }
         }
-        assert!(
-            duplicates.is_empty(),
-            "{} has leaked duplicate sessions for peers: {duplicates:?}",
-            node.device_id
-        );
     }
+    assert!(leaked.is_empty(), "soak lane found leaked pre-restart sessions: {leaked:#?}");
 
-    // Invariant 3: no stuck Protecting -- once settled, N's durability
-    // status must not still be mid-transition.
-    let status = world.n.state.group_durability_status(&world.group_id);
-    assert_ne!(
-        status,
-        GroupDurabilityStatus::Protecting,
-        "N's group durability status was still Protecting {:?} after the settle window",
+    // Invariant 3: no stuck Protecting -- once settled, no currently-
+    // online node's durability status is still mid-transition. Reachable
+    // for real in this soak (unlike an earlier version of this check,
+    // which asserted only on N against a topology where N is
+    // structurally the ONLY full-replica peer -- durability_service.rs's
+    // own doc says a lone full replica with no peer never even reaches
+    // the Protecting arm, so that assertion could never fail) because
+    // `op_device_join` now marks the spare a second coordination-plane
+    // full-replica candidate whenever it's present.
+    let mut stuck = Vec::new();
+    for node in &all_nodes {
+        let status = node.state.group_durability_status(&world.group_id);
+        if status == GroupDurabilityStatus::Protecting {
+            stuck.push(node.device_id.clone());
+        }
+    }
+    assert!(
+        stuck.is_empty(),
+        "soak lane found durability status still Protecting {:?} after the settle window on: \
+         {stuck:?}",
         settle_start.elapsed()
     );
 
-    // Invariant 4: no stale route -- for every pair, both sides' own view
-    // of the other agrees on Connected-ness (neither stuck seeing the
-    // other as Connected after the other side has already moved on, or
-    // vice versa).
-    let pairs = [(&world.n, &world.m), (&world.n, &world.w), (&world.m, &world.w)];
-    for (a, b) in pairs {
-        let a_sees_b_connected = matches!(
-            a.state.peers.reachability(&b.device_id),
-            Some(PeerReachability::Connected(_))
-        );
-        let b_sees_a_connected = matches!(
-            b.state.peers.reachability(&a.device_id),
-            Some(PeerReachability::Connected(_))
-        );
-        assert_eq!(
-            a_sees_b_connected, b_sees_a_connected,
-            "stale route: {} sees {} connected={a_sees_b_connected} but {} sees {} connected={b_sees_a_connected}",
-            a.device_id, b.device_id, b.device_id, a.device_id
-        );
+    // Invariant 4: no stale route -- retries (like invariant 1) rather
+    // than checking once, since a route transition triggered by the
+    // soak's very last ops can still be in flight right after the
+    // settle wait above (which only checks connectivity relative to N,
+    // not every pair). For every pair, requires BOTH sides to agree not
+    // just on connectedness but on the SAME `RouteKind` -- an earlier
+    // version of this check only compared connectedness, which collapses
+    // `Connected(Direct)` and `Connected(Relay)` into the same value and
+    // also accepted "both sides see each other as unreachable" as
+    // healthy.
+    let mut all_pairs: Vec<(&TopologyNode, &TopologyNode)> =
+        vec![(&world.n, &world.m), (&world.n, &world.w), (&world.m, &world.w)];
+    if let Some(spare) = &world.spare {
+        all_pairs.push((&world.n, spare));
+        all_pairs.push((&world.m, spare));
+        all_pairs.push((&world.w, spare));
     }
+    let route_kind =
+        |peers: &yadorilink_daemon::peer_registry::PeerRegistry, peer_id: &str| match peers
+            .reachability(peer_id)
+        {
+            Some(PeerReachability::Connected(kind)) => Some(kind),
+            _ => None,
+        };
+    let mut route_mismatches = Vec::new();
+    let route_deadline = Instant::now() + SETTLE_TIMEOUT;
+    loop {
+        route_mismatches.clear();
+        for (a, b) in &all_pairs {
+            let a_view = route_kind(&a.state.peers, &b.device_id);
+            let b_view = route_kind(&b.state.peers, &a.device_id);
+            match (a_view, b_view) {
+                (Some(RouteKind::Direct), Some(RouteKind::Direct)) => {}
+                (Some(RouteKind::Relay), Some(RouteKind::Relay)) => {}
+                _ => {
+                    route_mismatches.push(format!(
+                        "{}<->{}: {} sees {:?}, {} sees {:?}",
+                        a.device_id, b.device_id, a.device_id, a_view, b.device_id, b_view
+                    ));
+                }
+            }
+        }
+        if route_mismatches.is_empty() || Instant::now() >= route_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        route_mismatches.is_empty(),
+        "soak lane found stale/disagreeing routes after the settle window: {route_mismatches:#?}"
+    );
 
     world.handles.shutdown();
 }
