@@ -39,6 +39,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use boringtun::noise::handshake::parse_handshake_anon;
@@ -680,6 +681,19 @@ pub struct TransportHub {
     /// `registry`'s ingress queue -- see `identify_and_route_initiation`'s
     /// own doc comment. Aborted on drop the same as `recv_tasks`.
     handshake_worker_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Raw UDP payload byte counters for this hub's bound socket(s) —
+    /// every datagram this hub sends or receives, regardless of whether the
+    /// demux ultimately routes it to a channel, the STUN prober, or drops
+    /// it. Exists for the M6 benchmark harness's "wire bytes" metric, which
+    /// needs a ground truth the harness itself never had (see
+    /// `crates/yadorilink-bench/DESIGN.md`); nothing in production reads
+    /// these today.
+    tx_bytes: Arc<AtomicU64>,
+    rx_bytes: Arc<AtomicU64>,
+    /// Datagram counts alongside the byte counters above, for a
+    /// packets/sec metric.
+    tx_packets: Arc<AtomicU64>,
+    rx_packets: Arc<AtomicU64>,
 }
 
 impl Drop for TransportHub {
@@ -763,10 +777,20 @@ impl TransportHub {
         });
         let (registry, handshake_ingress_rx) = DemuxRegistry::new(device_public);
         let registry = Arc::new(registry);
+        let rx_bytes = Arc::new(AtomicU64::new(0));
+        let rx_packets = Arc::new(AtomicU64::new(0));
         let recv_tasks = [v4, v6]
             .into_iter()
             .flatten()
-            .map(|sock| tokio::spawn(recv_loop(sock, endpoint.clone(), registry.clone())))
+            .map(|sock| {
+                tokio::spawn(recv_loop(
+                    sock,
+                    endpoint.clone(),
+                    registry.clone(),
+                    rx_bytes.clone(),
+                    rx_packets.clone(),
+                ))
+            })
             .collect();
         // A single receiver shared across a fixed worker pool via
         // `tokio::sync::Mutex` -- `mpsc::Receiver` has no built-in
@@ -778,7 +802,17 @@ impl TransportHub {
         let handshake_worker_tasks = (0..HANDSHAKE_WORKER_COUNT)
             .map(|_| tokio::spawn(handshake_worker(handshake_ingress_rx.clone(), registry.clone())))
             .collect();
-        Arc::new(Self { endpoint, local_addr, registry, recv_tasks, handshake_worker_tasks })
+        Arc::new(Self {
+            endpoint,
+            local_addr,
+            registry,
+            recv_tasks,
+            handshake_worker_tasks,
+            tx_bytes: Arc::new(AtomicU64::new(0)),
+            rx_bytes,
+            tx_packets: Arc::new(AtomicU64::new(0)),
+            rx_packets,
+        })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -881,12 +915,51 @@ impl TransportHub {
 
     /// Sends a batch of datagrams to one address through the hub's endpoint.
     pub async fn send_batch(&self, datagrams: &[Vec<u8>], addr: SocketAddr) -> io::Result<usize> {
-        self.endpoint.send_batch(datagrams, addr).await
+        let result = self.endpoint.send_batch(datagrams, addr).await;
+        // `send_batch_fallback` returns `Ok` only once every datagram in the
+        // slice has been individually sent (see its own doc comment) -- an
+        // error aborts before returning, so there is no partial-success
+        // count to reconcile against.
+        if result.is_ok() {
+            let sent: u64 = datagrams.iter().map(|d| d.len() as u64).sum();
+            self.tx_bytes.fetch_add(sent, Ordering::Relaxed);
+            self.tx_packets.fetch_add(datagrams.len() as u64, Ordering::Relaxed);
+        }
+        result
     }
 
     /// Sends a single datagram through the hub's endpoint.
     pub async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
-        self.endpoint.send_to(buf, addr).await
+        let result = self.endpoint.send_to(buf, addr).await;
+        if result.is_ok() {
+            self.tx_bytes.fetch_add(buf.len() as u64, Ordering::Relaxed);
+            self.tx_packets.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Total raw UDP payload bytes this hub has sent, across every channel,
+    /// STUN probe, and cookie reply sharing its socket(s) -- see the
+    /// `tx_bytes` field doc for why this exists.
+    pub fn wire_bytes_sent(&self) -> u64 {
+        self.tx_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Total raw UDP payload bytes this hub has received, counted at the
+    /// socket regardless of how the demux subsequently routes (or drops)
+    /// each datagram -- see the `rx_bytes` field doc for why this exists.
+    pub fn wire_bytes_received(&self) -> u64 {
+        self.rx_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Datagram counts to pair with `wire_bytes_sent`/`wire_bytes_received`
+    /// for a packets/sec metric.
+    pub fn wire_packets_sent(&self) -> u64 {
+        self.tx_packets.load(Ordering::Relaxed)
+    }
+
+    pub fn wire_packets_received(&self) -> u64 {
+        self.rx_packets.load(Ordering::Relaxed)
     }
 }
 
@@ -894,11 +967,15 @@ async fn recv_loop(
     recv_socket: Arc<UdpSocket>,
     endpoint: Arc<UdpEndpoint>,
     registry: Arc<DemuxRegistry>,
+    rx_bytes: Arc<AtomicU64>,
+    rx_packets: Arc<AtomicU64>,
 ) {
     let mut buf = vec![0u8; MAX_WIREGUARD_DATAGRAM_LEN];
     loop {
         match recv_socket.recv_from(&mut buf).await {
             Ok((n, from)) => {
+                rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                rx_packets.fetch_add(1, Ordering::Relaxed);
                 // A cookie reply goes back out the family-matched socket.
                 if let Some((reply, dst)) = registry.route(&buf[..n], from) {
                     let _ = endpoint.send_to(&reply, dst).await;
