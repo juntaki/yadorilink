@@ -9321,12 +9321,6 @@ impl PeerSyncSession {
                     MaterializationState::Placeholder,
                     &root_commit_permit,
                 )?;
-                // A `Placeholder` is not an in-progress write -- clear the
-                // intent now (mirrors the sibling arm and repair's own
-                // placeholder handling), before the placeholder disk write
-                // below, so even a failure writing it cannot leave a stale
-                // intent.
-                intent_guard.clear()?;
                 let out_path = self.local_file_path(group_id, &record.path)?;
                 self.verify_write_target(group_id, &out_path)?;
                 match create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)?
@@ -9356,6 +9350,12 @@ impl PeerSyncSession {
                     )?,
                 }
                 apply_exec_bit(&out_path, self.state.get_exec_bit(group_id, &record.path)?)?;
+                // Clear the intent only now, after the placeholder is
+                // durably on disk (M5-A Pass 11 finding, correcting an
+                // earlier version of this fix that cleared BEFORE `create_
+                // or_defer_placeholder` -- see the OnDemand branch below
+                // for the full reasoning, identical here).
+                intent_guard.clear()?;
                 // Eager/pinned wanted real content but not every block was
                 // available -- this is a retriable Placeholder, not a
                 // settled outcome (the confirmed bug this type exists to
@@ -9481,13 +9481,6 @@ impl PeerSyncSession {
                     MaterializationState::Placeholder,
                     &root_commit_permit,
                 )?;
-                // A `Placeholder` is not an in-progress write — clear the intent
-                // now (mirrors repair's placeholder arms). Cleared before the
-                // placeholder disk write below so that even a failure writing
-                // the placeholder cannot leave a stale intent: the row is already
-                // `Placeholder`, which repair skips, and a later offline delete
-                // of this path must not be misread as a crash to reconstruct.
-                intent_guard.clear()?;
                 self.verify_write_target(group_id, &out_path)?;
                 match create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)?
                 {
@@ -9516,6 +9509,12 @@ impl PeerSyncSession {
                     )?,
                 }
                 apply_exec_bit(&out_path, self.state.get_exec_bit(group_id, &record.path)?)?;
+                // Clear the intent only now, after the placeholder is
+                // durably on disk (M5-A Pass 11 finding, correcting an
+                // earlier version of this fix that cleared BEFORE `create_
+                // or_defer_placeholder` -- see the OnDemand branch below
+                // for the full reasoning, identical here).
+                intent_guard.clear()?;
                 // Reconstruct never actually succeeded despite the blocks
                 // being fetched -- demoted to a retriable Placeholder, not
                 // a settled outcome (same reasoning as the `!all_present`
@@ -9586,11 +9585,6 @@ impl PeerSyncSession {
                 MaterializationState::Placeholder,
                 &root_commit_permit,
             )?;
-            // A `Placeholder` is not an in-progress write -- clear the
-            // intent now, before the placeholder disk write below, so even
-            // a failure writing it cannot leave a stale intent (mirrors
-            // the eager/pinned branches above).
-            intent_guard.clear()?;
             let out_path = self.local_file_path(group_id, &record.path)?;
             // defense-in-depth — see the comment above.
             self.verify_write_target(group_id, &out_path)?;
@@ -9628,6 +9622,23 @@ impl PeerSyncSession {
             // access, it did not want the blocks now and fail to get
             // them.
             apply_exec_bit(&out_path, self.state.get_exec_bit(group_id, &record.path)?)?;
+            // Clear the intent only now, after the placeholder is
+            // durably on disk (M5-A Pass 11 finding, correcting an
+            // earlier version of this fix): clearing BEFORE `create_or_
+            // defer_placeholder` traded a benign outcome (a stale intent
+            // left open past a later failure -- `materialization_repair.
+            // rs`'s own doc says repair treats an open intent as safe,
+            // deferring rather than tombstoning) for a harmful one
+            // (row committed as non-deleted Placeholder, no file on
+            // disk, no intent -- exactly what the startup reconciliation
+            // scan reads as an offline deletion). This is the ordinary
+            // on-demand-receive path, so the window's frequency was far
+            // higher than on the eager/pinned branches this pattern was
+            // copied from. An early `?` return on any step above still
+            // drops the guard without clearing, which is the safe
+            // (defer-the-delete) failure mode, matching the eager/pinned
+            // `Hydrated` branch's own established ordering.
+            intent_guard.clear()?;
             Ok(MaterializeResult::Settled)
         }
     }

@@ -274,17 +274,21 @@ async fn relay_anchor_restart_mid_session() {
     // hydrates -- an earlier version of this test read M's placeholder
     // (same final size, but not yet real content) directly and failed
     // on a content mismatch that was a TEST bug, not a production one.
+    // M5-A finding (see destination_restart_mid_relay_session's own
+    // comment for the full writeup): `!f.deleted` alone is satisfied by
+    // the DAG-admission bootstrap scaffold row, not proof the real
+    // record has landed -- `has_real_current_row` is this codebase's own
+    // documented distinguishing check.
     wait_until_with_context(
         || {
             m.state
                 .replica_coordinator
                 .file_index_repository()
-                .list_files(group_id)
-                .map(|files| files.iter().any(|f| f.path == "relayed-by-w.bin" && !f.deleted))
+                .has_real_current_row(group_id, "relayed-by-w.bin")
                 .unwrap_or(false)
         },
         Duration::from_secs(150),
-        || "M never saw relayed-by-w.bin's DAG record after N's restart".to_string(),
+        || "M never saw relayed-by-w.bin's real DAG record after N's restart".to_string(),
     )
     .await;
     hydrate_with_retries(&m.state, group_id, "relayed-by-w.bin").await;
@@ -307,15 +311,13 @@ async fn relay_anchor_restart_mid_session() {
             m.state
                 .replica_coordinator
                 .file_index_repository()
-                .list_files(group_id)
-                .map(|files| {
-                    files.iter().any(|f| f.path == "after-anchor-restart.txt" && !f.deleted)
-                })
+                .has_real_current_row(group_id, "after-anchor-restart.txt")
                 .unwrap_or(false)
         },
         Duration::from_secs(90),
         || {
-            "M never saw W's fresh post-restart write's DAG record over the restored relay anchor"
+            "M never saw W's fresh post-restart write's real DAG record over the restored relay \
+             anchor"
                 .to_string()
         },
     )
@@ -408,15 +410,12 @@ async fn requester_restart_mid_relay_session() {
             m.state
                 .replica_coordinator
                 .file_index_repository()
-                .list_files(group_id)
-                .map(|files| {
-                    files.iter().any(|f| f.path == "mid-relay-requester.bin" && !f.deleted)
-                })
+                .has_real_current_row(group_id, "mid-relay-requester.bin")
                 .unwrap_or(false)
         },
         Duration::from_secs(150),
         || {
-            "M never saw mid-relay-requester.bin's DAG record after the requester's restart"
+            "M never saw mid-relay-requester.bin's real DAG record after the requester's restart"
                 .to_string()
         },
     )
@@ -433,60 +432,49 @@ async fn requester_restart_mid_relay_session() {
     handles.shutdown();
 }
 
-// M5-A Pass 8 finding, tracked for follow-up: this scenario still fails
-// intermittently (~20% of isolated runs, confirmed both serialized and
-// unserialized) with the restarted W's re-synced record showing
-// `deleted: true` for a file that was never actually deleted locally or
-// remotely. Root-caused so far: `peer_session.rs::materialize()` had TWO
-// call sites (the eager-incomplete `!all_present` branch and the
-// OnDemand-not-pinned "no block fetch at all" branch -- the one THIS
-// scenario's W-side ingest actually takes) that committed a fresh index
-// row via `persist_materialized_record` before either demoting the
-// record to `MaterializationState::Placeholder` or creating the on-disk
-// placeholder object, with no `MaterializationIntentGuard` bracketing
-// unlike the sibling "demoted after failed reconstruct" branch that
-// already had it. Both call sites have been fixed to open the intent
-// guard before `persist_materialized_record` and clear it only after
-// `create_or_defer_placeholder` succeeds -- this measurably improved the
-// failure rate (roughly 30%+ before, ~20% after) but did not eliminate
-// it, even under this file's own full in-process serialization.
+// M5-A completion pass: this scenario's false-tombstone flake (the
+// restarted W's re-synced record showing `deleted: true` for a file
+// that was never actually deleted) is RESOLVED -- three distinct real
+// bugs stacked together to produce it, each fixed in turn and validated
+// with 60+ isolated runs at 0 recurrence after the final fix (previously
+// ~20-30%):
 //
-// The existing "group startup barrier" in `local_change.rs` (see its
-// `startup_barrier_prevents_stale_overwrite_of_concurrent_peer_change`
-// test) protects a DIFFERENT race shape -- a peer write landing
-// concurrently with the startup scan's snapshot-to-commit window -- not
-// this one, where the record and its (now-cleared) intent were already
-// durably committed by an earlier, fully-completed `materialize()` call
-// before the scan ever runs. `scan_existing_files_with_ignore`'s own doc
-// comment confirms every restart's link-start runs this `ReconcileMode::
-// Full { emit_tombstones: true }` scan unconditionally (not gated on any
-// crash-vs-clean-shutdown heuristic).
+// 1. `peer_session.rs::materialize()` had two call sites (the
+//    eager-incomplete `!all_present` branch and the OnDemand-not-pinned
+//    "no block fetch at all" branch) that committed a fresh index row
+//    before either demoting to `MaterializationState::Placeholder` or
+//    creating the on-disk placeholder, with no `MaterializationIntentGuard`
+//    bracketing. Fixed by opening the guard before the row commit and
+//    clearing it only after the placeholder write durably lands.
+// 2. The startup reconciliation scan (`local_change.rs`) only checked
+//    `has_materialization_intent` before tombstoning a locally-missing
+//    path -- but a path can have a durably-committed, non-deleted index
+//    row whose materialization JOB is still queued (`Pending`/`Backoff`),
+//    with no intent ever opened for it yet. Fixed by also checking
+//    `has_pending_materialization_job`.
+// 3. The actual proximate cause of most of the residual: `get_file`/
+//    `list_files` cannot distinguish a real content-bearing row from
+//    `apply_incoming_wire_metadata`'s own `version_seq == 0` bootstrap
+//    scaffold row (`file_index.rs::ensure_bootstrap_row_for_metadata`)
+//    -- a deliberate, documented placeholder written for a newly-admitted
+//    path BEFORE `materialize`/`materialize_dag_content_head` has run at
+//    all. Both this test's own `!f.deleted`-only wait conditions AND
+//    `hydration.rs::hydrate_inner`'s "already hydrated" fast path trusted
+//    that ambiguous state -- the fast path in particular could report
+//    success for a genuinely-empty scaffold, silently handing back zero
+//    bytes. Fixed by using the codebase's own existing, documented
+//    distinguishing check, `has_real_current_row`, in both places.
 //
-// Ruled out: placeholder-write durability vs. the scan's disk walk. On
-// this platform (Unix), `create_or_defer_placeholder` (`yadorilink-
-// local-storage/src/materialize_write.rs:366-406`) `fsync`s the temp
-// file, then atomically renames it into place, BEFORE returning to the
-// caller -- there is no window where the async caller has moved on but
-// the file isn't yet durably visible under its real path. The scan's
-// `walkdir` walk (`local_change.rs`, `seen_paths.insert` around line
-// 774) matches on the identical root-relative path with no placeholder-
-// specific filter (no extension/xattr/zero-byte special-casing) -- a
-// placeholder is walked exactly like any other file. So the gap is NOT
-// a disk-write-visibility race on this platform; the remaining
-// candidates are cross-subsystem timing between `LinkRuntimeController::
-// stop()`'s drain of in-flight peer-session work and the startup scan's
-// own scheduling relative to the peer_orchestrator's fresh-session
-// reconnection -- this needs live tracing (add targeted logging around
-// the scan's snapshot point and the intent-guard clear, then reproduce
-// under load) to pin down precisely, and was not resolved before this
-// suite needed to land. Left `#[ignore]` rather than either hidden or
-// landed flaky; run directly with
-// `cargo test -p yadorilink-daemon --test topology_relay_role_restart_matrix \
-// destination_restart_mid_relay_session -- --ignored` to reproduce.
-#[ignore = "M5-A Pass 8: known ~20% intermittent false-tombstone residual, see comment above"]
+// See `hydration.rs::hydrate_inner`'s own comments at both fixed
+// checkpoints for the production-side detail, and project memory
+// `m5a-pass9-link-runtime-stop-fence-gap`'s Pass-11 addendum (a
+// DIFFERENT, still-open bug this investigation also surfaced but did
+// not need to touch to close this one) for what's still tracked
+// separately.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn destination_restart_mid_relay_session() {
     let _serialize = SERIALIZE_HEAVY_TESTS.lock().await;
+    init_tracing();
     let group_id = "topology-destination-restart-mid-relay-group";
     let (n, m, mut w, mut handles, fake) = stand_up_with_w_relayed(group_id).await;
 
@@ -502,19 +490,28 @@ async fn destination_restart_mid_relay_session() {
     // retrieval has started, not mid-completed-transfer.
     let payload = lcg_payload(8 * 1024 * 1024, 0x243F_6A88_85A3_08D3);
     std::fs::write(m.root.path().join("mid-relay-destination.bin"), &payload).unwrap();
+    // M5-A finding: `list_files`'s `!f.deleted` alone is satisfied by
+    // `apply_incoming_wire_metadata`'s own `version_seq == 0` bootstrap
+    // scaffold row -- a real, if usually brief, admitted-but-not-yet-
+    // projected state, NOT proof the real record (real size/blocks
+    // metadata, still legitimately un-hydrated for OnDemand -- that part
+    // of this scenario's own intent is unaffected) has actually landed.
+    // `has_real_current_row` is this codebase's own documented
+    // distinguishing check for exactly this ambiguity.
     wait_until_with_context(
         || {
             w.state
                 .replica_coordinator
                 .file_index_repository()
-                .list_files(group_id)
-                .map(|files| {
-                    files.iter().any(|f| f.path == "mid-relay-destination.bin" && !f.deleted)
-                })
+                .has_real_current_row(group_id, "mid-relay-destination.bin")
                 .unwrap_or(false)
         },
         Duration::from_secs(60),
-        || "W (pre-restart) never saw mid-relay-destination.bin's DAG record".to_string(),
+        || {
+            "W (pre-restart) never saw mid-relay-destination.bin's real DAG record (only ever \
+             the bootstrap scaffold, if anything)"
+                .to_string()
+        },
     )
     .await;
 
@@ -564,15 +561,19 @@ async fn destination_restart_mid_relay_session() {
     // must eventually see the DAG record again and hydrate the EXACT
     // content -- proving the restarted destination doesn't get stuck
     // never resuming its own relay-carried fetch.
+    // Same `has_real_current_row` distinction as the pre-restart wait
+    // above: a fresh post-restart scaffold row (re-admitted metadata
+    // whose real projection hasn't run yet) must not be mistaken for the
+    // real record either, or the immediately-following `hydrate` below
+    // can be handed a genuinely-empty scaffold and (correctly, for that
+    // record) reconstruct zero bytes -- confirmed as the actual
+    // mechanism behind this scenario's residual flake.
     wait_until_with_context(
         || {
             w.state
                 .replica_coordinator
                 .file_index_repository()
-                .list_files(group_id)
-                .map(|files| {
-                    files.iter().any(|f| f.path == "mid-relay-destination.bin" && !f.deleted)
-                })
+                .has_real_current_row(group_id, "mid-relay-destination.bin")
                 .unwrap_or(false)
         },
         // Wider than the other similar post-restart DAG-record waits in
@@ -589,8 +590,9 @@ async fn destination_restart_mid_relay_session() {
                     |files| files.iter().map(|f| (f.path.clone(), f.deleted)).collect::<Vec<_>>(),
                 );
             format!(
-                "restarted W never saw the DAG record over its fresh relay-routed session -- \
-                 list_files query_result={query_result:?}"
+                "restarted W never saw the REAL DAG record (only the bootstrap scaffold, if \
+                 anything) over its fresh relay-routed session -- list_files \
+                 query_result={query_result:?}"
             )
         },
     )

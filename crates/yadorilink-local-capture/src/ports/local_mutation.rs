@@ -67,6 +67,26 @@ pub trait LocalMutationStore: Send + Sync {
         path: &str,
     ) -> Result<bool, SyncSqliteError>;
 
+    /// Whether `(group_id, path)` has a non-terminal (not `Completed`/
+    /// `Superseded`) row in the materialization job queue -- distinct from
+    /// `has_materialization_intent` above, which only covers the narrower
+    /// window a `MaterializationIntentGuard` protects (a `materialize()`
+    /// call already in flight). A path can have a durably-committed,
+    /// non-deleted index row with a QUEUED job that has not yet reached
+    /// `materialize()` at all (e.g. still `Pending`/`Backoff` after a
+    /// transient dispatch failure) -- no intent has ever been opened for
+    /// it, but it is just as much "we know about this file and are still
+    /// placing it locally" as an in-flight intent is. An M5-A finding: the
+    /// startup reconciliation scan's own `has_materialization_intent` check
+    /// alone is not enough to protect this state; a newly-arrived DAG
+    /// record whose materialization job is still queued when a restart's
+    /// scan runs was silently tombstoned before this check existed.
+    fn has_pending_materialization_job(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, SyncSqliteError>;
+
     /// Bulk placeholder-identity lookup for a whole group -- used by
     /// `scan_existing_files` for the same reason as
     /// `list_materialization_states`: one query for the whole scan instead
