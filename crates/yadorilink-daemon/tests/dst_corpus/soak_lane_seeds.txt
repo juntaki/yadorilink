@@ -1,0 +1,14 @@
+# Seeds that reproduce the tracked LinkRuntimeController::stop() /
+# root-lease-acquisition fence-gap race (see the comment above
+# randomized_soak_converges_with_no_leaks_or_stuck_state in
+# topology_soak_lane.rs, and project memory
+# m5a-pass9-link-runtime-stop-fence-gap). Six other seeds this file
+# originally recorded (2161428897323102524, 5933415811506858446,
+# 4655336840175398945, 11736987582047533951, 7043491690845385788,
+# 6263760059660724191) were false positives from an initial
+# SETTLE_TIMEOUT that was too short for this soak's heavier chaos mix to
+# genuinely converge in -- all six pass cleanly now that SETTLE_TIMEOUT
+# is 240s, confirmed by re-running each individually, so they were
+# removed rather than kept as noise.
+922972317807886136
+16612994462990444375

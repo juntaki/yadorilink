@@ -92,7 +92,7 @@ pub struct TopologyNode {
     signing_key: ed25519_dalek::SigningKey,
 }
 
-fn new_node(device_id: &str) -> TopologyNode {
+pub fn new_node(device_id: &str) -> TopologyNode {
     // Suffixed with a per-process-unique counter: `ensure_isolated_config_
     // dir` gives each TEST BINARY (process) its own isolated pin-file
     // directory, but a test binary with more than one `#[tokio::test]`
@@ -238,7 +238,7 @@ fn link_eager(node: &TopologyNode, group_id: &str) {
 /// function's own synchronous, one-time-at-link-start call site (not
 /// re-checked on every hydration operation), so it does not need to
 /// cover the multi-threaded tokio runtime's worker threads.
-fn link_on_demand(node: &TopologyNode, group_id: &str) {
+pub fn link_on_demand(node: &TopologyNode, group_id: &str) {
     let _override = yadorilink_filesystem_sync::placeholder_backend::OverrideForTest::enable();
     let local_path = node.root.path().to_string_lossy().to_string();
     node.state.replica_coordinator.link_repository().add_link(&local_path, group_id).unwrap();
