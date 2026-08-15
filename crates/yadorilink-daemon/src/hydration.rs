@@ -1008,6 +1008,26 @@ async fn hydrate_inner(
     if current.deleted || current != initial_record {
         return Err(SyncError::HydrationFailed(path.to_string()));
     }
+    // M5-A finding: `get_file`/`list_files` cannot by themselves
+    // distinguish a real, content-bearing current row from
+    // `apply_incoming_wire_metadata`'s own `version_seq == 0` bootstrap
+    // scaffold row (`file_index.rs::ensure_bootstrap_row_for_metadata`)
+    // -- a deliberate, documented placeholder (`size: 0, blocks: [],
+    // deleted: false`) written for a newly-admitted path BEFORE
+    // `materialize`/`materialize_dag_content_head` has run at all, meant
+    // to be superseded the moment real content lands. `has_real_current_
+    // row`'s own doc comment already names this exact hazard. Confirmed
+    // live: a restart landing in the (real, if usually brief) window
+    // between the scaffold write and the real projection leaves this
+    // scaffold stranded -- `hydrate` on it previously reconstructed a
+    // genuinely-correct-for-THAT-record zero-byte file (its `blocks` is
+    // legitimately empty), silently reporting success for content that
+    // was simply never asked for yet. Fail closed and retriable instead:
+    // this is exactly the shape `hydrate_with_retries`-style callers
+    // already handle by design.
+    if !state.replica_coordinator.file_index_repository().has_real_current_row(group_id, path)? {
+        return Err(SyncError::HydrationFailed(path.to_string()));
+    }
     // Only a regular `File` ever goes through the placeholder/hydrate
     // cycle at all -- a symlink or directory record is always eagerly
     // materialized in full the moment it's adopted
@@ -1047,11 +1067,37 @@ async fn hydrate_inner(
     // content is not re-derived here; an already-`Hydrated` row is this
     // function's signal that there is nothing left for it to do, exactly
     // as `pin`'s own `already_hydrated` short-circuit already treats it).
+    // M5-A finding: this shortcut's own reasoning above assumes the file
+    // is PRESENT (possibly with unsynced local edits) -- it never
+    // anticipated the file being entirely ABSENT despite the row already
+    // reading `Hydrated`. Confirmed live via a restart-mid-relay-sync
+    // integration test: under real timing pressure (a slow post-restart
+    // handshake stalling this device's own materialization pipeline for
+    // many seconds), a path can end up `Hydrated` in the index with no
+    // corresponding file ever landing on disk. Trusting the index alone
+    // in that case makes `hydrate` silently report success for a file
+    // that was never actually retrievable -- the destination is left
+    // permanently missing the content with no error anywhere. A cheap
+    // existence check preserves the shortcut's original intent (skip
+    // re-fetch, never clobber a locally-edited file that IS present) but
+    // falls through to the real fetch/reconstruct path below for the
+    // genuinely-missing case the original check never considered.
+    // A bare `.exists()` check is not enough either: a placeholder or an
+    // empty artifact left behind by an earlier failed/interrupted
+    // materialization attempt also "exists" at this path, and reading it
+    // back as if it were the real content silently returns wrong (not
+    // missing) data -- confirmed live: `left: []` (a genuinely empty
+    // file) at this exact shortcut. Real `Hydrated` content is always
+    // exactly `current.size` bytes; anything else at this path is not
+    // the real thing yet, regardless of what the index row claims.
+    let has_real_content_on_disk =
+        out_path.metadata().map(|metadata| metadata.len() == current.size).unwrap_or(false);
     if state
         .replica_coordinator
         .materialization_state_repository()
         .get_materialization_state(group_id, path)?
         == Some(MaterializationState::Hydrated)
+        && has_real_content_on_disk
     {
         return Ok(());
     }

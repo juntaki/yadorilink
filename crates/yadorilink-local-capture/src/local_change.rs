@@ -936,6 +936,30 @@ impl LocalChangeProcessor {
                 if self.state.has_materialization_intent(group_id, path)? {
                     continue;
                 }
+                // M5-A finding: an open intent alone is not enough. A
+                // path can have a durably-committed, non-deleted index
+                // row whose materialization JOB is still queued (e.g.
+                // `Pending`/`Backoff` after a transient dispatch
+                // failure right after the DAG record was admitted) --
+                // no intent has ever been opened for it (that only
+                // happens once `materialize()` itself actually runs),
+                // but it is exactly as "not yet known to be deleted" as
+                // an in-flight intent is. Without this check, a restart
+                // landing between DAG-record admission and that job's
+                // first successful `materialize()` attempt reads this
+                // as an offline deletion and tombstones a file the
+                // device never even finished receiving once. Same
+                // fail-closed contract as the intent check above: an
+                // errored lookup propagates via `?`.
+                if self.state.has_pending_materialization_job(group_id, path)? {
+                    continue;
+                }
+                tracing::info!(
+                    group_id,
+                    path,
+                    "startup reconciliation scan is tombstoning a locally-missing path (no open \
+                     intent, no pending materialization job) as an offline deletion"
+                );
                 let mut tombstone = existing.clone();
                 tombstone.deleted = true;
                 records.push(tombstone);

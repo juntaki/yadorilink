@@ -147,6 +147,23 @@ impl LocalMutationStore for ReplicaCoordinator {
         self.materialization_job_repository().has_materialization_intent(group_id, path)
     }
 
+    fn has_pending_materialization_job(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, SyncSqliteError> {
+        Ok(self
+            .materialization_job_repository()
+            .materialization_get_job(group_id, path)?
+            .is_some_and(|job| {
+                !matches!(
+                    job.state,
+                    yadorilink_sync_sqlite::MaterializationJobState::Completed
+                        | yadorilink_sync_sqlite::MaterializationJobState::Superseded
+                )
+            }))
+    }
+
     fn get_record_kind(
         &self,
         group_id: &str,

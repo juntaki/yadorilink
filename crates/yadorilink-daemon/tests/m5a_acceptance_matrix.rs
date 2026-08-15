@@ -21,8 +21,8 @@
 //!
 //! Every scenario below is deterministic (fixed small topology, no
 //! seeded/randomized fault injection) and fast enough to run on every
-//! change -- this is the set `cargo test -p yadorilink-daemon` runs by
-//! default (`--ignored` scenarios excluded; see the one flagged below).
+//! change -- this is the full set `cargo test -p yadorilink-daemon` runs
+//! by default (none of the 20 are `#[ignore]`d).
 //!
 //! 1. Direct happy-path convergence + hydration --
 //!    `topology_n_m_w.rs::happy_path_direct_convergence_and_hydration`
@@ -50,10 +50,7 @@
 //!     session --
 //!     `topology_relay_role_restart_matrix.rs::requester_restart_mid_relay_session`
 //! 13. destination-restart-mid-relay: W (receiver) restarts mid relay-carried
-//!     session -- **known ~20% intermittent flake, left `#[ignore]`d; see
-//!     that test's own inline writeup and
-//!     `m5a-pass8-destination-restart-tombstone-residual` in project memory
-//!     for the full root-cause trail** --
+//!     session --
 //!     `topology_relay_role_restart_matrix.rs::destination_restart_mid_relay_session`
 //! 14. Fan-in survives repeated connectivity flapping --
 //!     `topology_relay_fan_in_reconnect_chaos.rs::fan_in_survives_repeated_connectivity_flapping`
