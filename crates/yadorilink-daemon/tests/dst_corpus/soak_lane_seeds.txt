@@ -12,3 +12,19 @@
 # removed rather than kept as noise.
 922972317807886136
 16612994462990444375
+#
+# Seeds below were found by the M5-A Pass 11 fixes to the previously-
+# vacuous invariant checks (see project memory
+# m5a-pass9-link-runtime-stop-fence-gap for the fuller writeup, which
+# this entry extends) -- NOT yet root-caused, not yet fixed, left
+# #[ignore]d alongside the seeds above per the same "record only" call:
+# - 14049118026691592637, 17132986931368163713: the "no stale route"
+#   check finds N and M still see W's route as Relay while W itself
+#   already sees its route to N as Direct, after RestoreWRoute -- an
+#   asymmetric route-classification disagreement that persists past the
+#   240s settle window.
+# - 12552500466593081697: the "no leaked sessions" check finds N's (and
+#   the spare's) session with W was never replaced across a W restart.
+14049118026691592637
+12552500466593081697
+17132986931368163713
