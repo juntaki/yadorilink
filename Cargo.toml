@@ -17,6 +17,8 @@ members = [
     "crates/yadorilink-ipc-proto",
     "crates/yadorilink-reporting",
     "crates/yadorilink-desktop-app",
+    # M6-0 competitive benchmark harness.
+    "crates/yadorilink-bench",
     # DST replay + lane runner.
     "xtask",
 ]

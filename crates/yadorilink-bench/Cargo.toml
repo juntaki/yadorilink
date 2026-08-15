@@ -1,0 +1,34 @@
+# M6-0 competitive benchmark harness. Drives real `DaemonState` instances
+# (the same production types the daemon binary uses, not a mock) through
+# scenario runners and reports real, measured metrics. See DESIGN.md.
+[package]
+name = "yadorilink-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "yadorilink-bench"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1"
+yadorilink-daemon = { path = "../yadorilink-daemon" }
+yadorilink-transport = { path = "../yadorilink-transport" }
+yadorilink-local-storage = { path = "../yadorilink-local-storage" }
+yadorilink-peer-session = { path = "../yadorilink-peer-session" }
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sha2.workspace = true
+boringtun = { version = "=0.7.1", default-features = false }
+rand = "0.10.2"
+tempfile = "3"
+hex = "0.4"
+# Peak RSS / CPU-seconds via `getrusage(2)` -- already a dependency
+# elsewhere in this workspace (yadorilink-filesystem-sync,
+# yadorilink-root-authority, yadorilink-desktop-app) for the same
+# "call a libc syscall directly, no wrapper crate" reason.
+libc = "0.2"

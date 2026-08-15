@@ -7754,6 +7754,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "yadorilink-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "boringtun",
+ "hex",
+ "libc",
+ "rand 0.10.2",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "yadorilink-daemon",
+ "yadorilink-local-storage",
+ "yadorilink-peer-session",
+ "yadorilink-transport",
+]
+
+[[package]]
 name = "yadorilink-cli"
 version = "0.1.0"
 dependencies = [
