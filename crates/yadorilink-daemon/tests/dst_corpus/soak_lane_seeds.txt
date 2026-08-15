@@ -1,30 +1,21 @@
-# Seeds that reproduce the tracked LinkRuntimeController::stop() /
-# root-lease-acquisition fence-gap race (see the comment above
-# randomized_soak_converges_with_no_leaks_or_stuck_state in
-# topology_soak_lane.rs, and project memory
-# m5a-pass9-link-runtime-stop-fence-gap). Six other seeds this file
-# originally recorded (2161428897323102524, 5933415811506858446,
+# The LinkRuntimeController::stop() / root-lease-acquisition fence-gap
+# race (see project memory m5a-pass9-link-runtime-stop-fence-gap) is
+# FIXED (bounded retry + graceful fallback in link_runtime_controller.rs,
+# matching graceful_shutdown's established pattern). Six other seeds this
+# file originally recorded (2161428897323102524, 5933415811506858446,
 # 4655336840175398945, 11736987582047533951, 7043491690845385788,
 # 6263760059660724191) were false positives from an initial
-# SETTLE_TIMEOUT that was too short for this soak's heavier chaos mix to
-# genuinely converge in -- all six pass cleanly now that SETTLE_TIMEOUT
-# is 240s, confirmed by re-running each individually, so they were
-# removed rather than kept as noise.
+# SETTLE_TIMEOUT that was too short -- all six pass cleanly at 240s.
+#
+# Seeds below are kept because they ALSO exercise three still-open
+# findings from the M5-A soak-closure investigation (session leak, stale
+# route, durability stuck Protecting -- see the tracked comment above
+# randomized_soak_converges_with_no_leaks_or_stuck_state and project
+# memory m5a-pass9-link-runtime-stop-fence-gap for the classification
+# trail). Not the fence-gap panic anymore -- confirmed via repeated
+# isolated runs after the fence-gap fix landed.
 922972317807886136
 16612994462990444375
-#
-# Seeds below were found by the M5-A Pass 11 fixes to the previously-
-# vacuous invariant checks (see project memory
-# m5a-pass9-link-runtime-stop-fence-gap for the fuller writeup, which
-# this entry extends) -- NOT yet root-caused, not yet fixed, left
-# #[ignore]d alongside the seeds above per the same "record only" call:
-# - 14049118026691592637, 17132986931368163713: the "no stale route"
-#   check finds N and M still see W's route as Relay while W itself
-#   already sees its route to N as Direct, after RestoreWRoute -- an
-#   asymmetric route-classification disagreement that persists past the
-#   240s settle window.
-# - 12552500466593081697: the "no leaked sessions" check finds N's (and
-#   the spare's) session with W was never replaced across a W restart.
 14049118026691592637
 12552500466593081697
 17132986931368163713
