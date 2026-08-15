@@ -9282,6 +9282,32 @@ impl PeerSyncSession {
             // (`eager_live_record_needs_rehydrate`) and recovery never
             // clobbers it. Reuses the not-admitted branch's placeholder path.
             if !all_present {
+                // Same journaled-write seam the sibling "demoted after a
+                // failed reconstruct" arm below uses, and for the identical
+                // reason (M5-A Pass 8 finding): `persist_materialized_
+                // record`'s underlying `upsert_file_with_origin` INSERTs a
+                // fresh row that DEFAULTS to `Hydrated` before the explicit
+                // `set_materialization_state(..., Placeholder, ...)` below
+                // runs, and even once demoted, `create_or_defer_
+                // placeholder` (the actual on-disk write) has not run yet
+                // either. A crash/restart in EITHER window leaves an
+                // indexed, not-deleted row with no local file and no
+                // protecting intent -- exactly what the startup "full
+                // reconciliation" scan (`local_change.rs`'s `reconcile_
+                // disk_with_ignore`) reads as an offline deletion, silently
+                // tombstoning a file this device never actually lost.
+                // Reproduced live via a real restart-mid-relay-sync
+                // integration test. Opening the guard before the row commit
+                // and clearing it right before the placeholder disk write
+                // (mirroring the sibling arm exactly) closes both windows.
+                let intent_target_hash =
+                    yadorilink_local_storage::intent_target_hash(&record.blocks);
+                let intent_guard = self.state.open_materialization_intent_guard(
+                    group_id,
+                    &record.path,
+                    &intent_target_hash,
+                    &root_commit_permit,
+                )?;
                 self.persist_materialized_record(
                     group_id,
                     record,
@@ -9295,6 +9321,12 @@ impl PeerSyncSession {
                     MaterializationState::Placeholder,
                     &root_commit_permit,
                 )?;
+                // A `Placeholder` is not an in-progress write -- clear the
+                // intent now (mirrors the sibling arm and repair's own
+                // placeholder handling), before the placeholder disk write
+                // below, so even a failure writing it cannot leave a stale
+                // intent.
+                intent_guard.clear()?;
                 let out_path = self.local_file_path(group_id, &record.path)?;
                 self.verify_write_target(group_id, &out_path)?;
                 match create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)?
@@ -9518,6 +9550,29 @@ impl PeerSyncSession {
             }
             // OnDemand and not pinned: no block fetch at all — the whole
             // point of a placeholder is deferring that until access.
+            //
+            // Same journaled-write seam the eager/pinned branches above use
+            // (M5-A Pass 8 finding, reproduced live via a real
+            // restart-mid-relay-sync integration test): this is the actual
+            // ORDINARY on-demand-receive path -- the one a plain On-Demand
+            // device takes for every normal incoming file -- and it was
+            // committing the fresh (briefly-`Hydrated`-by-default, per
+            // `persist_materialized_record`'s own doc comment) index row
+            // with NO protecting intent, before either the explicit
+            // demotion to `Placeholder` or the actual on-disk placeholder
+            // write. A crash/restart in either window left an indexed,
+            // not-deleted row with no local file and no intent -- exactly
+            // what the startup "full reconciliation" scan
+            // (`local_change.rs`'s `reconcile_disk_with_ignore`) reads as
+            // an offline deletion, silently tombstoning a file this device
+            // never actually lost.
+            let intent_target_hash = yadorilink_local_storage::intent_target_hash(&record.blocks);
+            let intent_guard = self.state.open_materialization_intent_guard(
+                group_id,
+                &record.path,
+                &intent_target_hash,
+                &root_commit_permit,
+            )?;
             self.persist_materialized_record(
                 group_id,
                 record,
@@ -9531,6 +9586,11 @@ impl PeerSyncSession {
                 MaterializationState::Placeholder,
                 &root_commit_permit,
             )?;
+            // A `Placeholder` is not an in-progress write -- clear the
+            // intent now, before the placeholder disk write below, so even
+            // a failure writing it cannot leave a stale intent (mirrors
+            // the eager/pinned branches above).
+            intent_guard.clear()?;
             let out_path = self.local_file_path(group_id, &record.path)?;
             // defense-in-depth — see the comment above.
             self.verify_write_target(group_id, &out_path)?;
