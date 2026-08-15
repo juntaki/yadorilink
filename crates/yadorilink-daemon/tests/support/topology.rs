@@ -158,7 +158,32 @@ fn new_node(device_id: &str) -> TopologyNode {
 pub async fn restart_node(node: TopologyNode) -> TopologyNode {
     LinkRuntimeController::new(node.state.clone()).stop(&node.root.path().to_string_lossy()).await;
     let store = Arc::new(FsBlockStore::new(node.store_dir.path()).unwrap());
-    let sync_state = Arc::new(ReplicaCoordinator::open(&node.db_path).unwrap());
+    // Bounded retry: the OLD generation's SQLite connection pool can still
+    // be mid-close (a genuine, if narrow, race between `stop()` above
+    // returning and its underlying `r2d2` pool actually releasing its file
+    // lock) -- observed as a real, reproducible "database is locked" error
+    // reopening the SAME db path here, worse under concurrent CPU load
+    // when several tests each restart a node at once. Retrying a few times
+    // with a short backoff closes that harness-only race without masking
+    // a genuine, persistent failure (still panics with the real error if
+    // it never clears).
+    let mut open_attempts = 0;
+    let sync_state = loop {
+        match ReplicaCoordinator::open(&node.db_path) {
+            Ok(coordinator) => break Arc::new(coordinator),
+            Err(error) if open_attempts < 10 => {
+                open_attempts += 1;
+                tracing::warn!(
+                    %error,
+                    open_attempts,
+                    "restart_node: reopening the index DB failed, retrying (likely the old \
+                     generation's connection pool still closing)"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(error) => panic!("restart_node: could not reopen the index DB: {error}"),
+        }
+    };
     let state = DaemonState::new(node.device_id.clone(), sync_state, store);
     // Re-apply the SAME signing identity `signing_key`'s own doc comment
     // explains why: a real restart reloads this from persistent storage,
