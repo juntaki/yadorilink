@@ -24,7 +24,7 @@ hex = "0.4"
 prost = "0.14.4"
 if-addrs = "0.15"
 zeroize = "1"
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 # RFC 8489 binding-message codec only (encode a binding request, parse the
 # mapped address out of a success response). Pure Rust, no networking of its
 # own, so it is madsim-safe and shared across real and simulated builds; the
