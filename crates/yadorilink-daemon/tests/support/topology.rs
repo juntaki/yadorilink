@@ -207,9 +207,34 @@ pub async fn restart_node(node: TopologyNode) -> TopologyNode {
     let links = state.replica_coordinator.link_repository().list_links().unwrap();
     for link in links.iter().filter(|l| !l.orphaned) {
         let _override = yadorilink_filesystem_sync::placeholder_backend::OverrideForTest::enable();
-        LinkRuntimeController::new(state.clone())
-            .start(link.local_path.clone(), link.group_id.clone())
-            .unwrap();
+        // Bounded retry, same shape and reason as the DB-reopen retry
+        // above: `stop()`'s own bounded retry (`link_runtime_
+        // controller.rs`'s fence-gap fix) can still exhaust its attempts
+        // and fall back to abort-only teardown under load, which doesn't
+        // release the root-lock sidecar file as promptly as a graceful
+        // stop would -- observed live as a real, reproducible "sync root
+        // ... is already in use by another YadoriLink process" panic
+        // here under the soak's own rapid-repeated-restart chaos. Still
+        // panics with the real error if it never clears.
+        let mut start_attempts = 0;
+        loop {
+            match LinkRuntimeController::new(state.clone())
+                .start(link.local_path.clone(), link.group_id.clone())
+            {
+                Ok(()) => break,
+                Err(error) if start_attempts < 20 => {
+                    start_attempts += 1;
+                    tracing::warn!(
+                        %error,
+                        start_attempts,
+                        "restart_node: restarting a link's watcher failed, retrying (likely the \
+                         old generation's root-lock sidecar file still being released)"
+                    );
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(error) => panic!("restart_node: could not restart link watcher: {error}"),
+            }
+        }
     }
     TopologyNode {
         device_id: node.device_id,

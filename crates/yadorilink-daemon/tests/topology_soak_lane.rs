@@ -916,57 +916,51 @@ async fn run_soak(seed: u64) {
 // shutdown`'s established pattern), confirmed via 0/10 recurrence on the
 // corpus-recorded seed plus repeated soak reruns since.
 //
-// Of the soak-closure investigation's three follow-on findings, session
-// leak and stale route are ALSO fixed (see `tests/dst_corpus/soak_lane_
-// seeds.txt`'s own header for the classification trail). Durability
-// stuck Protecting is NOT: still open, real, and reproducible --
-// confirmed on TWO independent fresh random seeds (3746878857549989852
-// here; a prior run separately) even under a generous 3000s external
-// bound, well past this test's own already-generous 600s internal
-// settle retry, which genuinely exhausted without recovering. Traced
-// (via a `tracing::debug!` added to `DaemonState::group_durability_
-// status` logging its full `DurabilityFacts`) to: the stuck device's
-// local materialization stays `Partial` indefinitely, with ZERO
-// hydration-retry activity for the entire stuck window -- not a slow
-// retry loop, a retry that never fires again, even though there IS a
-// production-wired periodic repair mechanism that should be retrying it
-// (`maintenance::materialization_repair::MaterializationRepairJob`, a
-// `MaintenanceTrigger::Interval` task spawned by `maintenance_
-// coordinator.rs`, sweeping every `MATERIALIZATION_REPAIR_SWEEP_
-// INTERVAL` = 90s -- well within the 600s settle window, so this isn't
-// simply "never got a chance to run").
+// The soak-closure investigation's three follow-on findings (session
+// leak, stale route, durability stuck Protecting) are ALL fixed -- see
+// `tests/dst_corpus/soak_lane_seeds.txt`'s own header for the full
+// classification trail on each. Durability stuck Protecting's root
+// cause: a full-replica device's `Placeholder` row can legitimately have
+// NO obtainable holder among current membership -- its sole
+// provenance-verified holder left the group, and every other current
+// peer explicitly refuses the fetch (`FetchOutcome::Rejected`, "no
+// verified group provenance"), not merely times out. `materialization:
+// Partial` alone cannot distinguish "still trying, may yet succeed" from
+// "genuinely, permanently gone", so `classify` stayed at `Protecting`
+// forever. Fixed via a new `DurabilityFacts::known_unobtainable_
+// required_content` fact (backed by a durable `block_fetch_refusals`
+// table, written only on an EXPLICIT peer refusal, never a transient
+// miss) that routes to the EXISTING `AtRisk` variant -- no new
+// `GroupDurabilityStatus` variant. The record itself is never
+// auto-retired: an unobtainable record may be a user's only surviving
+// edit, and silently deleting the metadata would turn real data loss
+// into apparent convergence. See `crates/yadorilink-daemon/tests/
+// durability_unobtainable_content.rs` for the full root-cause writeup
+// and its own deterministic regression (10/10 green).
 //
-// Traced one level deeper: `MaterializationRepairJob::run_once` round-
-// robins across this device's peer sessions for the group and asks each
-// one, in turn, to `PeerSyncSession::reconcile_local_materialization_
-// audit` -- but STOPS at the first session whose call returns `Ok(_)`
-// (`materialization_repair.rs`: `Ok(_) => { last_error = None; break; }`),
-// trying a DIFFERENT peer only on an `Err`. `reconcile_local_
-// materialization_audit` returns `Ok(true)` even when the underlying
-// `rematerialize_one_record`/`materialize` outcome is `MaterializeResult::
-// RetryRequired` (still `Ok`, not an `Err`) -- so a sweep that happens to
-// round-robin onto a peer session whose own attempt doesn't actually fix
-// the record (e.g. that specific peer also doesn't hold the needed
-// block) is treated as a completed, successful sweep for the whole
-// group, and no OTHER peer is tried until the cursor comes back around
-// on a LATER sweep. Two live candidates, not yet distinguished:
-// (a) real bug -- the round-robin's success signal doesn't actually mean
-// "repaired", so a persistently-unhelpful peer at the front of the
-// rotation could starve every other candidate indefinitely; (b) the
-// soak's own device-join/leave chaos genuinely orphaned this specific
-// block (its only past holder left the topology), which is content this
-// device can never recover from ANY peer -- a real, unrecoverable
-// "at risk" case the `classify` precedence doesn't currently have a path
-// out of `Protecting` for (an `AtRisk`-shaped situation is masked behind
-// `any_other_full_replica_peer_configured: true`, since a peer being
-// CONFIGURED as a candidate says nothing about whether it actually holds
-// this specific content). Distinguishing (a) from (b) -- and fixing
-// whichever it is -- needs real investigation into which peer sessions
-// actually get asked and what each one's own attempt outcome was, not a
-// rushed fix here -- deferred, matching this file's own established
-// pattern for the fence-gap above. Left `#[ignore]`d until it's
-// resolved.
-#[ignore = "M5-A soak-closure: durability-stuck-Protecting is real and unresolved, see comment above"]
+// A FOURTH, distinct durability-stuck-Protecting finding surfaced later
+// in full-suite validation (same corpus seed, 12552500466593081697,
+// failing again with `known_unobtainable_required_content: false`):
+// `MaterializationRepairJob::run_once` (materialization_repair.rs)
+// stopped its per-sweep round-robin at the first peer whose audit
+// returned `Ok(_)`, but `Ok(_)` there only means "the audit ran without
+// an outer I/O error", not "materialization is now complete" (a
+// per-file `RetryRequired` is intentionally folded into `Ok(())` --
+// re-candidacy is driven by DB state, not this return value). Under
+// spare-device churn, the live candidate list's length fluctuates
+// sweep to sweep, which collapses the modular round-robin cursor back
+// to the same starting peer repeatedly -- so a full-replica device
+// could ask the SAME peer (itself only partially materialized, with
+// nothing to contribute) every single sweep for the entire soak run,
+// never once trying its other live peers. Fixed by asking every live
+// candidate every sweep instead of stopping at the first success --
+// bounded by the group's live session count, same as before, and makes
+// the fix independent of the cursor's exact value. See `tests/
+// dst_corpus/soak_lane_seeds.txt`'s own header for the verification
+// trail (this exact seed replays clean; durability_unobtainable_
+// content.rs still 3/3).
+//
+// Both tests below are UNIGNORED.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn randomized_soak_converges_with_no_leaks_or_stuck_state() {
     let _serial_guard = SOAK_LANE_SERIAL_GUARD.lock().await;
@@ -986,11 +980,7 @@ async fn randomized_soak_converges_with_no_leaks_or_stuck_state() {
 /// with the SAME (default, CI-safe) duration budget -- a no-op while the
 /// corpus is empty, and a permanent regression check for every seed a
 /// heat-run ever found failing, matching `monkey_chaos.rs::replay_known_
-/// failing_seeds`'s established idiom. Left `#[ignore]`d for the same
-/// tracked, not-yet-fixed reason as the test directly above (durability
-/// stuck Protecting) -- one corpus seed (3746878857549989852) reproduces
-/// it.
-#[ignore = "M5-A soak-closure: durability-stuck-Protecting is real and unresolved, see the comment on randomized_soak_converges_with_no_leaks_or_stuck_state above"]
+/// failing_seeds`'s established idiom.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn replay_known_failing_seeds() {
     let _serial_guard = SOAK_LANE_SERIAL_GUARD.lock().await;
