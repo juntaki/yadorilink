@@ -62,16 +62,12 @@ use std::time::Duration;
 use support::fake_coordination::FakeCoordination;
 use support::topology::{stand_up_canonical_topology, TopologyNode};
 use support::wait_until_with_context;
-use tokio::net::UnixStream;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
-use yadorilink_ipc_proto::daemonctl::{
-    DaemonControlRequest, DaemonControlResponse, SetStorageModeRequest,
-};
-use yadorilink_ipc_proto::framing::{read_message, write_message};
+use yadorilink_ipc_proto::daemonctl::SetStorageModeRequest;
 use yadorilink_replica_domain::session_state::MaterializationPolicy;
 
 /// A `tracing` writer that both prints (visible under `--nocapture`, same
@@ -136,47 +132,6 @@ fn init_tracing() -> Arc<std::sync::Mutex<Vec<u8>>> {
     buf
 }
 
-/// Starts the real control socket for `state` -- the SAME real
-/// request-handling loop the CLI actually talks to, matching
-/// `storage_mode_orchestration.rs`'s own established pattern (test files
-/// cannot `use` each other directly, only shared `tests/support/` modules,
-/// so this small helper is duplicated here rather than factored out).
-async fn serve_control_socket(
-    state: Arc<DaemonState>,
-    root: &std::path::Path,
-) -> std::path::PathBuf {
-    let socket_path = root.join("daemon.sock");
-    let serve_path = socket_path.clone();
-    tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
-            &serve_path,
-            std::sync::Arc::new(yadorilink_daemon::control_context::ControlContext::from_state(
-                state,
-            )),
-        )
-        .await;
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    socket_path
-}
-
-async fn send_over_socket(
-    socket_path: &std::path::Path,
-    payload: ReqPayload,
-) -> DaemonControlResponse {
-    let mut stream = UnixStream::connect(socket_path).await.unwrap();
-    write_message(
-        &mut stream,
-        &DaemonControlRequest {
-            payload: Some(payload),
-            protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
-        },
-    )
-    .await
-    .unwrap();
-    read_message::<DaemonControlResponse>(&mut stream).await.unwrap().unwrap()
-}
-
 fn policy_of(state: &DaemonState, group_id: &str) -> MaterializationPolicy {
     state
         .replica_coordinator
@@ -216,9 +171,9 @@ async fn promote_to_eager_via_real_api(node: &TopologyNode, group_id: &str, serv
         .mount(server)
         .await;
     node.state.set_coordination_client_config(server.uri(), "test-access-token".to_string());
-    let socket_path = serve_control_socket(node.state.clone(), node.root.path()).await;
-    let resp = send_over_socket(
-        &socket_path,
+    let handle = support::control_socket_client::start(node.state.clone()).await;
+    let resp = support::control_socket_client::send(
+        &handle,
         ReqPayload::SetStorageMode(SetStorageModeRequest {
             group_id: group_id.to_string(),
             on_demand: false,
@@ -343,9 +298,9 @@ async fn safe_demotion_succeeds_when_a_real_peer_durably_holds_everything() {
     // matching `storage_mode_orchestration.rs`'s own established use of
     // this exact override for its own demoting device.
     n.state.set_test_placeholder_pipeline_connected(true);
-    let socket_path = serve_control_socket(n.state.clone(), n.root.path()).await;
-    let resp = send_over_socket(
-        &socket_path,
+    let handle = support::control_socket_client::start(n.state.clone()).await;
+    let resp = support::control_socket_client::send(
+        &handle,
         ReqPayload::SetStorageMode(SetStorageModeRequest {
             group_id: group_id.to_string(),
             on_demand: true,
@@ -545,10 +500,10 @@ async fn version_change_during_lease_issuance_refuses_the_demotion() {
     n.state.set_coordination_client_config(server.uri(), "test-access-token-n".to_string());
 
     n.state.set_test_placeholder_pipeline_connected(true);
-    let socket_path = serve_control_socket(n.state.clone(), n.root.path()).await;
+    let handle = support::control_socket_client::start(n.state.clone()).await;
     let log_offset_before_demotion = log_capture.lock().unwrap_or_else(|p| p.into_inner()).len();
-    let resp = send_over_socket(
-        &socket_path,
+    let resp = support::control_socket_client::send(
+        &handle,
         ReqPayload::SetStorageMode(SetStorageModeRequest {
             group_id: group_id.to_string(),
             on_demand: true,
