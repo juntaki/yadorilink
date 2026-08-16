@@ -505,6 +505,28 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
         );
         CREATE INDEX IF NOT EXISTS idx_enrollment_operations_state
             ON enrollment_operations(state);
+        -- M5-A soak-closure durability investigation: durable record of a
+        -- peer EXPLICITLY, definitively refusing a whole-path block
+        -- request (`FetchOutcome::Rejected`, e.g. "no verified group
+        -- provenance for this block") -- deliberately distinct from a
+        -- transient miss (`NotFound`/`TimedOut`/`Busy`), which never
+        -- writes a row here. This is the evidence
+        -- `known_unobtainable_required_content` (`DurabilityFacts`) needs
+        -- to positively confirm no CURRENTLY authorized peer can serve a
+        -- path's content, rather than merely inferring it from
+        -- connectivity/timing. One row per `(group_id, path, peer_
+        -- device_id)`; a fresh rejection overwrites the previous one via
+        -- `INSERT ... ON CONFLICT`. A new additive table, so a bare
+        -- `CREATE TABLE IF NOT EXISTS` is the whole migration, like
+        -- `materialization_intents`/`enrollment_operations` above.
+        CREATE TABLE IF NOT EXISTS block_fetch_refusals (
+            group_id              TEXT NOT NULL,
+            path                  TEXT NOT NULL,
+            peer_device_id        TEXT NOT NULL,
+            reason                TEXT NOT NULL,
+            refused_at_unix_nanos INTEGER NOT NULL,
+            PRIMARY KEY (group_id, path, peer_device_id)
+        );
         "#,
     )?;
     // Lightweight migrations (on-demand-sync): `CREATE TABLE IF NOT

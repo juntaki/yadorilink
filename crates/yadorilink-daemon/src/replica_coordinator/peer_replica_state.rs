@@ -418,6 +418,26 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
+    fn record_block_fetch_refusal(
+        &self,
+        group_id: &str,
+        path: &str,
+        peer_device_id: &str,
+        reason: &str,
+        refused_at_unix_nanos: i64,
+    ) -> Result<(), PeerSessionError> {
+        self.materialization_state_repository()
+            .record_block_fetch_refusal(
+                group_id,
+                path,
+                peer_device_id,
+                reason,
+                refused_at_unix_nanos,
+            )
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
     fn dag_group_heads(&self, group_id: &str) -> Result<Vec<ChangeHash>, PeerSessionError> {
         self.sqlite()
             .dag_group_heads(group_id)

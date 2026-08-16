@@ -309,6 +309,23 @@ pub trait PeerReplicaStatePort: Send + Sync {
         block_hashes: &[Vec<u8>],
     ) -> Result<(), PeerSessionError>;
 
+    /// Records that `peer_device_id` EXPLICITLY, definitively refused a
+    /// whole-path block request (`FetchOutcome::Rejected`) -- deliberately
+    /// distinct from a transient miss (`NotFound`/`TimedOut`/`Busy`),
+    /// which must never call this. M5-A soak-closure durability
+    /// investigation: this is the evidence `DurabilityFacts::known_
+    /// unobtainable_required_content` needs to positively confirm no
+    /// currently-authorized peer can serve a path's content, rather than
+    /// inferring it from connectivity/timing alone.
+    fn record_block_fetch_refusal(
+        &self,
+        group_id: &str,
+        path: &str,
+        peer_device_id: &str,
+        reason: &str,
+        refused_at_unix_nanos: i64,
+    ) -> Result<(), PeerSessionError>;
+
     fn dag_group_heads(&self, group_id: &str) -> Result<Vec<ChangeHash>, PeerSessionError>;
 
     /// Paths represented anywhere in this group's retained history — used to

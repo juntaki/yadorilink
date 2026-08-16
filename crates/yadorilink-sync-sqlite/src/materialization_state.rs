@@ -472,6 +472,60 @@ impl MaterializationStateRepository {
         })
     }
 
+    /// Records that `peer_device_id` EXPLICITLY, definitively refused a
+    /// whole-path block request (`FetchOutcome::Rejected`) -- see
+    /// `block_fetch_refusals`'s own schema doc comment for why this is
+    /// deliberately distinct from a transient miss (never recorded here).
+    /// Idempotent per `(group_id, path, peer_device_id)`: a fresh
+    /// rejection overwrites whatever was recorded before.
+    pub fn record_block_fetch_refusal(
+        &self,
+        group_id: &str,
+        path: &str,
+        peer_device_id: &str,
+        reason: &str,
+        now_unix_nanos: i64,
+    ) -> Result<(), SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            conn.execute(
+                "INSERT INTO block_fetch_refusals \
+                     (group_id, path, peer_device_id, reason, refused_at_unix_nanos) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(group_id, path, peer_device_id) DO UPDATE SET \
+                     reason = excluded.reason, \
+                     refused_at_unix_nanos = excluded.refused_at_unix_nanos",
+                rusqlite::params![group_id, path, peer_device_id, reason, now_unix_nanos],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Every peer device id that has EXPLICITLY refused `path` (not merely
+    /// never been asked, and not a transient miss) -- the evidence
+    /// `known_unobtainable_required_content` cross-references against the
+    /// group's current authorized-writer set to positively confirm no
+    /// currently-reachable peer can serve this content, rather than
+    /// inferring it from connectivity/timing alone.
+    pub fn refusing_peers_for_path(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<std::collections::HashSet<String>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT peer_device_id FROM block_fetch_refusals \
+                 WHERE group_id = ?1 AND path = ?2",
+            )?;
+            let rows =
+                stmt.query_map(rusqlite::params![group_id, path], |r| r.get::<_, String>(0))?;
+            let mut out = std::collections::HashSet::new();
+            for row in rows {
+                out.insert(row?);
+            }
+            Ok(out)
+        })
+    }
+
     /// Bare `files`-table live set, with no `dag_retention_roots`
     /// contribution — kept for callers (this module's own tests, an
     /// explicit per-group check) that want exactly that. Physical

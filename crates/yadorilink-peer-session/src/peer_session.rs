@@ -4221,18 +4221,42 @@ impl PeerSyncSession {
         }
 
         let paths = self.state.list_materialization_repair_candidates(group_id)?;
+        // M5-A soak-closure durability investigation: names every candidate
+        // path this device's own audit considered repair-eligible this
+        // attempt -- see the tracked comment on `randomized_soak_converges_
+        // with_no_leaks_or_stuck_state` in `topology_soak_lane.rs`.
+        tracing::debug!(
+            local_device_id = %self.local_device_id,
+            group_id,
+            audit_attempt_id,
+            ?paths,
+            "materialization audit: repair-candidate paths"
+        );
         if paths.is_empty() {
             return Ok(true);
         }
 
         let files = self.state.get_files_by_paths(group_id, &paths)?;
+        let fetched_count = files.len();
         let mut file_infos = Vec::with_capacity(files.len());
+        let mut dropped_as_deleted = Vec::new();
         for record in files.into_values() {
             if record.deleted {
+                dropped_as_deleted.push(record.path.clone());
                 continue;
             }
             file_infos.push(self.file_info_for_record(group_id, record)?);
         }
+        tracing::debug!(
+            local_device_id = %self.local_device_id,
+            group_id,
+            audit_attempt_id,
+            candidate_count = paths.len(),
+            fetched_count,
+            file_infos_count = file_infos.len(),
+            ?dropped_as_deleted,
+            "materialization audit: candidate paths resolved to files"
+        );
         if file_infos.is_empty() {
             return Ok(true);
         }
@@ -7695,6 +7719,28 @@ impl PeerSyncSession {
                             reason,
                             "peer rejected this block request; not retrying"
                         );
+                        // M5-A soak-closure durability investigation:
+                        // durable record of this EXPLICIT, definitive
+                        // refusal -- see `DurabilityFacts::known_
+                        // unobtainable_required_content`'s own doc
+                        // comment for why this (not a transient
+                        // NotFound/TimedOut/Busy miss) is the evidence
+                        // that fact needs.
+                        if let Err(e) = self.state.record_block_fetch_refusal(
+                            group_id,
+                            file_path,
+                            &self.peer_device_id,
+                            reason,
+                            now_unix_nanos(),
+                        ) {
+                            tracing::warn!(
+                                local_device_id = %self.local_device_id,
+                                candidate_peer_id = %self.peer_device_id,
+                                file_path,
+                                error = %e,
+                                "failed to record a block fetch refusal"
+                            );
+                        }
                         break None;
                     }
                     FetchOutcome::NotFound
@@ -8140,6 +8186,20 @@ impl PeerSyncSession {
                     local.path
                 ))
             })?;
+        // M5-A soak-closure durability investigation: unconditional trace
+        // of the dispatch decision itself, since the eager-rehydrate arms
+        // below only log when they actually attempt a hydrate -- see the
+        // tracked comment on `randomized_soak_converges_with_no_leaks_or_
+        // stuck_state` in `topology_soak_lane.rs`.
+        tracing::debug!(
+            local_device_id = %self.local_device_id,
+            group_id,
+            path = %local.path,
+            peer = %self.peer_device_id,
+            ?ordering,
+            needs_rehydrate = ?self.eager_live_record_needs_rehydrate(group_id, &local, policy),
+            "materialization audit: apply_locked_record dispatch"
+        );
 
         match ordering {
             ChangeOrdering::Equal => {
@@ -8217,12 +8277,31 @@ impl PeerSyncSession {
                     // `hydrate_file_with_timeout_locked`'s own doc
                     // comment for why the lock-acquiring public wrapper
                     // would deadlock here.
-                    self.hydrate_file_with_timeout_locked(
+                    //
+                    // M5-A soak-closure durability investigation: this
+                    // outcome used to be discarded entirely -- `Held`
+                    // (blocks fetched, physical write withheld by a
+                    // filename hazard) was treated identically to
+                    // `Hydrated`, unconditionally reporting `Settled`
+                    // below even though the row is still `Placeholder`.
+                    // See the tracked comment on `randomized_soak_
+                    // converges_with_no_leaks_or_stuck_state` in
+                    // `topology_soak_lane.rs`.
+                    let outcome = self
+                        .hydrate_file_with_timeout_locked(
+                            group_id,
+                            &local.path,
+                            DEFAULT_HYDRATION_TIMEOUT,
+                        )
+                        .await?;
+                    tracing::debug!(
+                        local_device_id = %self.local_device_id,
                         group_id,
-                        &local.path,
-                        DEFAULT_HYDRATION_TIMEOUT,
-                    )
-                    .await?;
+                        path = %local.path,
+                        peer = %self.peer_device_id,
+                        ?outcome,
+                        "materialization audit: eager rehydrate outcome (Equal arm)"
+                    );
                 }
                 Ok(LockedRecordOutcome::Settled)
             }
@@ -8234,12 +8313,21 @@ impl PeerSyncSession {
                     // `hydrate_file_with_timeout_locked`'s own doc
                     // comment for why the lock-acquiring public wrapper
                     // would deadlock here.
-                    self.hydrate_file_with_timeout_locked(
+                    let outcome = self
+                        .hydrate_file_with_timeout_locked(
+                            group_id,
+                            &local.path,
+                            DEFAULT_HYDRATION_TIMEOUT,
+                        )
+                        .await?;
+                    tracing::debug!(
+                        local_device_id = %self.local_device_id,
                         group_id,
-                        &local.path,
-                        DEFAULT_HYDRATION_TIMEOUT,
-                    )
-                    .await?;
+                        path = %local.path,
+                        peer = %self.peer_device_id,
+                        ?outcome,
+                        "materialization audit: eager rehydrate outcome (After arm)"
+                    );
                 }
                 Ok(LockedRecordOutcome::Settled)
             }
@@ -8508,6 +8596,14 @@ impl PeerSyncSession {
         // stale state.
         let path_lock = self.state.path_lock(group_id, &incoming.path);
         let _guard = path_lock.lock().await;
+        // M5-A soak-closure durability investigation: captured before
+        // `incoming` is moved into `apply_locked_record` below, so the
+        // `RetryRequired` arm can name exactly which path/version didn't
+        // settle -- see the tracked comment on `randomized_soak_converges_
+        // with_no_leaks_or_stuck_state` in `topology_soak_lane.rs`.
+        let audited_path = incoming.path.clone();
+        let audited_size = incoming.size;
+        let audited_block_count = incoming.blocks.len();
         match self.apply_locked_record(group_id, incoming, meta, policy).await? {
             LockedRecordOutcome::Settled => Ok(()),
             // Not silently folded into `Ok(())` as `Settled` was before:
@@ -8520,8 +8616,12 @@ impl PeerSyncSession {
             // indistinguishable from one that actually completed.
             LockedRecordOutcome::RetryRequired => {
                 tracing::debug!(
+                    local_device_id = %self.local_device_id,
                     group_id,
                     peer = %self.peer_device_id,
+                    path = %audited_path,
+                    audited_size,
+                    audited_block_count,
                     "materialization audit re-drive did not settle this record this attempt; \
                      it stays a repair candidate for the next audit tick"
                 );
