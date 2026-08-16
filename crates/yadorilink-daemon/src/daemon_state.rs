@@ -526,6 +526,11 @@ pub struct DaemonState {
     /// destination`'s own doc comment for why that check specifically
     /// forbids relay chaining).
     direct_channels: Mutex<HashMap<String, Arc<yadorilink_transport::PeerChannel>>>,
+    /// M5-A review follow-up (blocker #55): device_id -> the highest
+    /// generation that has ever successfully published into
+    /// `direct_channels` for that peer -- see `set_direct_channel`'s own
+    /// doc comment for the ABA race this independently closes.
+    direct_channel_generations: Mutex<HashMap<String, u32>>,
     /// M3 Pass 5: session id -> the full authorization tuple it was
     /// admitted under -- see `record_relay_session`'s own doc comment for
     /// why (per-datagram revalidation, closing H2/M3 in the independent
@@ -1299,6 +1304,7 @@ impl DaemonState {
             relay_forwarder: Arc::new(crate::relay_forwarder::RelayForwarder::new()),
             relay_replay_guard: crate::relay_session::RelayReplayGuard::new(),
             direct_channels: Mutex::new(HashMap::new()),
+            direct_channel_generations: Mutex::new(HashMap::new()),
             active_relay_sessions: Mutex::new(HashMap::new()),
             requester_relay_sessions: Mutex::new(HashMap::new()),
             pending_relay_opens: Mutex::new(HashMap::new()),
@@ -1545,12 +1551,74 @@ impl DaemonState {
 
     /// M3 Pass 5: records `device_id`'s live direct channel -- see
     /// `direct_channels`'s own doc comment for why this mirror exists.
+    ///
+    /// M5-A review follow-up (blocker #55): `generation` is the SAME
+    /// per-attempt counter the caller also passes to `peer_orchestrator::
+    /// NetmapDiffState::insert_channel_revoking_superseded` -- rejects
+    /// (does nothing, no insert, no revoke) if a generation `>=` this one
+    /// has already published for `device_id` into THIS mirror
+    /// specifically. Deliberately independent of the primary map's own
+    /// accept/reject decision (not gated on it): the two maps are
+    /// updated by two separate lock acquisitions at the call site, so an
+    /// even-newer generation could win the primary map's race in the gap
+    /// between them -- each map converging on its own highest-seen
+    /// generation, rather than one blindly trusting the other's stale
+    /// verdict, is what keeps the final state consistent regardless of
+    /// call order. See `insert_channel_revoking_superseded`'s own doc
+    /// comment for the full ABA scenario this closes.
     pub(crate) fn set_direct_channel(
         &self,
         device_id: String,
         channel: Arc<yadorilink_transport::PeerChannel>,
+        generation: u32,
     ) {
-        self.direct_channels.lock().unwrap_or_else(|p| p.into_inner()).insert(device_id, channel);
+        // M5-A soak-closure finding: this mirror had the identical
+        // silent-overwrite gap `peer_orchestrator::NetmapDiffState::
+        // insert_channel_revoking_superseded`'s own doc comment
+        // describes for the primary map this mirrors -- a bare `insert`
+        // here discarded whatever `Arc<PeerChannel>` was previously
+        // registered for this peer without revoking it. `PeerChannel`
+        // has no `Drop` impl (see `revoke`'s own doc comment), so that
+        // discarded channel stayed alive and registered in the transport
+        // hub's demux with nothing left anywhere to ever revoke it --
+        // and unlike the primary map (fixed to always call `revoke` on
+        // replacement), this SEPARATE mirror is consulted independently
+        // by `RelaySessionHandler`'s own direct-route check, so leaving
+        // it unfixed here could keep judging a route "confirmed direct"
+        // through a channel that no longer answers real traffic.
+        // M5-A review follow-up (blocker #55, second round): the lock
+        // used to be dropped here, BEFORE the `direct_channels` insert
+        // below -- leaving a real, if narrow, window where two
+        // concurrent `set_direct_channel` calls for the SAME device_id
+        // (generations N and N+1) could both pass the guard above, both
+        // record their own generation, and then apply their
+        // `direct_channels.insert` in the REVERSE order: the stale N
+        // ends up registered last and revokes N+1's genuinely live
+        // channel -- the exact ABA outcome this fix exists to close.
+        // Holding `generations` across the `direct_channels` insert too
+        // makes the whole check-record-insert-revoke sequence atomic
+        // against a concurrent call to this same method, matching
+        // `NetmapDiffState::insert_channel_revoking_superseded`'s own
+        // (already-correct) shape. `direct_channel_generations` has no
+        // other lock site anywhere in this file, so nesting the
+        // `direct_channels` lock inside it here cannot introduce a
+        // lock-ordering cycle.
+        let mut generations =
+            self.direct_channel_generations.lock().unwrap_or_else(|p| p.into_inner());
+        if generations.get(&device_id).is_some_and(|&recorded| recorded >= generation) {
+            return;
+        }
+        generations.insert(device_id.clone(), generation);
+        let superseded = self
+            .direct_channels
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(device_id, channel.clone());
+        if let Some(superseded) = superseded {
+            if !Arc::ptr_eq(&superseded, &channel) {
+                superseded.revoke();
+            }
+        }
     }
 
     pub(crate) fn remove_direct_channel(&self, device_id: &str) {
@@ -2229,8 +2297,138 @@ impl DaemonState {
                 .any_other_full_replica_peer_configured(group_id),
             peer_confirmed_custody: self.has_fresh_custody_confirmation(group_id),
             ever_confirmation_swept: self.has_ever_been_custody_swept(group_id),
+            known_unobtainable_required_content: self
+                .has_known_unobtainable_required_content(group_id),
         };
+        tracing::debug!(
+            local_device_id = %self.device_id,
+            %group_id,
+            ?facts,
+            "group_durability_status computed"
+        );
         self.durability.classify(group_id, facts)
+    }
+
+    /// Issue #58 diagnostic: everything `group_durability_status` computed
+    /// or consulted, formatted for a human/log reader, captured at ONE
+    /// instant -- built so a caller stuck watching `Protecting` doesn't
+    /// have to re-derive `DurabilityFacts` from scattered `tracing::debug!`
+    /// output or wait through another multi-hundred-second soak run to see
+    /// it again. Mirrors `group_durability_status`'s own fact-gathering and
+    /// `has_known_unobtainable_required_content`'s own per-path walk, but
+    /// keeps going over EVERY repair-candidate path (rather than
+    /// short-circuiting on the first `true`) and records the per-path
+    /// reasoning it would otherwise discard.
+    pub fn dump_durability_diagnostics(&self, group_id: &str) -> String {
+        use std::fmt::Write as _;
+        let counts = self
+            .replica_coordinator
+            .materialization_state_repository()
+            .materialization_counts(group_id);
+        let materialization = match &counts {
+            Ok(counts) if counts.placeholder == 0 && counts.hydrating == 0 => {
+                Ok(crate::durability_service::MaterializationHealth::FullyLocal)
+            }
+            Ok(_) => Ok(crate::durability_service::MaterializationHealth::Partial),
+            Err(_) => Err(()),
+        };
+        let facts = crate::durability_service::DurabilityFacts {
+            latch_load_failed: self.durability_latch_load_failed.load(Ordering::SeqCst),
+            scope_unknown: self.unknown_scope_membership_marker.load(Ordering::SeqCst),
+            recovery_blocked: self
+                .replica_coordinator
+                .membership_operation_repository()
+                .has_recovery_blocked_membership_operation()
+                .unwrap_or(true),
+            latched_unknown: self.durability.is_latched_unknown(group_id),
+            group_policy_stale: self.is_group_policy_stale(group_id),
+            materialization,
+            is_local_full_replica: self.is_local_full_replica(group_id),
+            any_other_full_replica_peer_configured: self
+                .any_other_full_replica_peer_configured(group_id),
+            peer_confirmed_custody: self.has_fresh_custody_confirmation(group_id),
+            ever_confirmation_swept: self.has_ever_been_custody_swept(group_id),
+            known_unobtainable_required_content: self
+                .has_known_unobtainable_required_content(group_id),
+        };
+        let status = self.durability.classify(group_id, facts.clone());
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "== durability diagnostics device={} group={group_id} status={status:?} ==",
+            self.device_id
+        );
+        let _ = writeln!(out, "facts: {facts:?}");
+        let _ = writeln!(out, "materialization_counts: {counts:?}");
+        let current_writers = self.current_group_writers(group_id);
+        let _ = writeln!(out, "current_group_writers: {current_writers:?}");
+        let paths = self
+            .replica_coordinator
+            .materialization_state_repository()
+            .list_materialization_repair_candidates(group_id)
+            .unwrap_or_default();
+        let _ = writeln!(out, "repair_candidate_paths ({}): {paths:?}", paths.len());
+        let file_index = self.replica_coordinator.file_index_repository();
+        let materialization_repo = self.replica_coordinator.materialization_state_repository();
+        for path in &paths {
+            let _ = writeln!(out, "-- path={path:?} --");
+            let mat_state = materialization_repo.get_materialization_state(group_id, path);
+            let _ = writeln!(out, "   materialization_state: {mat_state:?}");
+            let origin_device_id = file_index.get_origin_device_id(group_id, path);
+            let _ = writeln!(out, "   origin_device_id: {origin_device_id:?}");
+            let record = file_index.get_file(group_id, path);
+            let record_kind = file_index.get_record_kind(group_id, path);
+            let exec_bit = file_index.get_exec_bit(group_id, path);
+            let symlink_target = file_index.get_symlink_target(group_id, path);
+            let (Ok(Some(record)), Ok(record_kind), Ok(exec_bit), Ok(symlink_target)) =
+                (&record, &record_kind, &exec_bit, &symlink_target)
+            else {
+                let _ = writeln!(
+                    out,
+                    "   (could not load index row: record={record:?} kind={record_kind:?} \
+                     exec_bit={exec_bit:?} symlink_target={symlink_target:?})"
+                );
+                continue;
+            };
+            let current_version_hash =
+                yadorilink_replica_domain::file::FileVersion::from_index_row(
+                    record.blocks.clone(),
+                    record.size,
+                    record.mtime_unix_nanos,
+                    record_kind.unwrap_or_default(),
+                    *exec_bit,
+                    symlink_target.clone(),
+                )
+                .version_hash
+                .to_hex();
+            let _ = writeln!(out, "   current_version_hash: {current_version_hash}");
+            let block_hashes: Vec<_> = record.blocks.iter().map(|b| hex::encode(&b.hash)).collect();
+            let local_present = self.block_store.present_blocks(&block_hashes);
+            let _ = writeln!(
+                out,
+                "   block_hashes ({}): {block_hashes:?} locally_present: {local_present:?}",
+                block_hashes.len()
+            );
+            let refusers =
+                materialization_repo.refusing_peers_for_path(group_id, path, &current_version_hash);
+            let _ = writeln!(out, "   refusing_peers (exact version): {refusers:?}");
+            // Mirrors `has_known_unobtainable_required_content`'s fixed
+            // Fact 4 (issue #58): origin is no longer carved out here --
+            // if it's present and hasn't refused, Fact 3 already exempts
+            // the whole path before this ever runs.
+            let unaccounted: Vec<_> = current_writers
+                .iter()
+                .filter(|id| {
+                    id.as_str() != self.device_id
+                        && !refusers.as_ref().map(|r| r.contains(*id)).unwrap_or(false)
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "   writers_unaccounted_for (not self, not a recorded refuser): {unaccounted:?}"
+            );
+        }
+        out
     }
 
     /// re-checks free space for every Degraded link whose backoff
@@ -2326,6 +2524,22 @@ impl DaemonState {
             .unwrap_or_else(|p| p.into_inner())
             .signing_keys
             .insert(device_id.to_string(), key);
+    }
+
+    /// Removes a peer's pinned signing key without touching its authorized
+    /// groups/full-replica/relay-capable state (unlike `clear_peer_netmap_
+    /// metadata`, which wipes all of it) -- for a netmap-update pass that
+    /// needs every admitted peer's CURRENT signing-key state (present or
+    /// absent) settled before validating ANY peer's shared groups, so a
+    /// peer that stopped advertising a signing key this pass cannot leave
+    /// a stale key behind for another peer's retained-history check to
+    /// validate against.
+    pub fn forget_peer_signing_key(&self, device_id: &str) {
+        self.peer_netmap_metadata
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .signing_keys
+            .remove(device_id);
     }
 
     /// The pinned Ed25519 signing key for `device_id`, if one is known.
@@ -3025,6 +3239,135 @@ impl DaemonState {
         metadata.full_replicas.iter().any(|(device_id, gid)| {
             gid == group_id && metadata.writers.contains(&(device_id.clone(), gid.clone()))
         })
+    }
+
+    /// Every device id currently netmap-authorized as a WRITER (any
+    /// storage mode, not just full-replica) for `group_id` -- the
+    /// authoritative "who could theoretically still hold this group's
+    /// content" candidate set `known_unobtainable_required_content`
+    /// checks membership departure against. Unlike `full_replica_
+    /// devices_for_group`, not filtered to full replicas: an OnDemand
+    /// device that authored a conflict copy is still its origin, and
+    /// still a current member until it genuinely leaves.
+    fn current_group_writers(&self, group_id: &str) -> HashSet<String> {
+        let metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
+        metadata
+            .writers
+            .iter()
+            .filter(|(_, gid)| gid == group_id)
+            .map(|(device_id, _)| device_id.clone())
+            .collect()
+    }
+
+    /// M5-A soak-closure durability investigation: positively confirms
+    /// (never merely infers from connectivity) that at least one of this
+    /// group's currently-required (repair-candidate) paths has no
+    /// obtainable/durable holder among current membership -- see
+    /// `DurabilityFacts::known_unobtainable_required_content`'s own doc
+    /// comment for the full definition and the four facts this proves
+    /// before returning `true`. Only meaningful for a local full replica:
+    /// an OnDemand device's own `Placeholder` rows are its ordinary
+    /// steady state, not a durability signal.
+    fn has_known_unobtainable_required_content(&self, group_id: &str) -> bool {
+        if !self.is_local_full_replica(group_id) {
+            return false;
+        }
+        let Ok(paths) = self
+            .replica_coordinator
+            .materialization_state_repository()
+            .list_materialization_repair_candidates(group_id)
+        else {
+            return false;
+        };
+        if paths.is_empty() {
+            return false;
+        }
+        let current_writers = self.current_group_writers(group_id);
+        for path in &paths {
+            // Facts 1+2 (still DAG-justified, missing locally) are
+            // implied by `path` being a repair candidate at all --
+            // `list_materialization_repair_candidates`'s own WHERE
+            // clause already requires `state = 'current'`, `deleted = 0`,
+            // and `placeholder`/`hydrating`.
+            let Ok(Some(origin_device_id)) = self
+                .replica_coordinator
+                .file_index_repository()
+                .get_origin_device_id(group_id, path)
+            else {
+                continue;
+            };
+            // Refusal evidence is gathered up front now (issue #58 fix --
+            // see the note on Fact 3 below for why the origin device's own
+            // refusal status has to be known before that check runs).
+            let file_index = self.replica_coordinator.file_index_repository();
+            let (Ok(Some(record)), Ok(record_kind), Ok(exec_bit), Ok(symlink_target)) = (
+                file_index.get_file(group_id, path),
+                file_index.get_record_kind(group_id, path),
+                file_index.get_exec_bit(group_id, path),
+                file_index.get_symlink_target(group_id, path),
+            ) else {
+                continue;
+            };
+            let current_version_hash =
+                yadorilink_replica_domain::file::FileVersion::from_index_row(
+                    record.blocks,
+                    record.size,
+                    record.mtime_unix_nanos,
+                    record_kind.unwrap_or_default(),
+                    exec_bit,
+                    symlink_target,
+                )
+                .version_hash
+                .to_hex();
+            let Ok(refusers) = self
+                .replica_coordinator
+                .materialization_state_repository()
+                .refusing_peers_for_path(group_id, path, &current_version_hash)
+            else {
+                continue;
+            };
+            // Fact 3: the presumed sole holder (this path's origin) has
+            // left authoritative membership, OR has itself explicitly
+            // refused this exact version. Issue #58: the original form of
+            // this check exempted the origin from Fact 4 purely on
+            // still-current-writer membership, with no way for it to ever
+            // become "accounted for" -- a path could sit in `Protecting`
+            // forever once the origin device itself was the (sole)
+            // recorded refuser. That's reachable in real production, not
+            // just in a harness: `apply_locked_record`'s `incoming_origin`
+            // falls back to attributing origin to the RELAYING peer
+            // whenever that peer's own `get_origin_device_id` lookup for
+            // the path came back empty -- so a relayed conflict copy can
+            // end up with `origin_device_id` pointing at a peer that never
+            // actually held the content, while the true original author
+            // has already left the group and is invisible to this check
+            // entirely. Still a current writer AND has never refused =>
+            // still a plausible holder => never AtRisk from this path
+            // alone. Still a current writer but HAS refused => no longer
+            // exempt; falls through to Fact 4 below, where it's already
+            // correctly counted via `refusers.contains`.
+            if current_writers.contains(&origin_device_id) && !refusers.contains(&origin_device_id)
+            {
+                continue;
+            }
+            // Fact 4: every OTHER current writer has EXPLICITLY,
+            // definitively refused this EXACT version of this path (never
+            // inferred from an untried/offline writer's silence, and
+            // never conflated with a refusal recorded against some OTHER
+            // version this path once had -- see `block_fetch_refusals`'s
+            // own schema doc comment for why refusal evidence is bound to
+            // `version_hash`, not just `path`). The origin device is no
+            // longer exempted here (issue #58): if it's still present, it
+            // only reached this point because it explicitly refused too
+            // (the check above), so `refusers.contains` already accounts
+            // for it correctly without a separate carve-out.
+            let unaccounted_for =
+                current_writers.iter().any(|id| id != &self.device_id && !refusers.contains(id));
+            if !unaccounted_for {
+                return true;
+            }
+        }
+        false
     }
 
     /// M4 Pass 3: every device OTHER than this one currently recorded

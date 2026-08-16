@@ -1,0 +1,130 @@
+# The LinkRuntimeController::stop() / root-lease-acquisition fence-gap
+# race (see project memory m5a-pass9-link-runtime-stop-fence-gap) is
+# FIXED (bounded retry + graceful fallback in link_runtime_controller.rs,
+# matching graceful_shutdown's established pattern). Six other seeds this
+# file originally recorded (2161428897323102524, 5933415811506858446,
+# 4655336840175398945, 11736987582047533951, 7043491690845385788,
+# 6263760059660724191) were false positives from an initial
+# SETTLE_TIMEOUT that was too short -- all six pass cleanly at 240s.
+#
+# All three of the M5-A soak-closure investigation's findings are FIXED:
+# - session leak: real production zombie-channel bug
+#   (`NetmapDiffState::channels`/`DaemonState::direct_channels` silently
+#   discarding a superseded `Arc<PeerChannel>` without `revoke()`), fixed
+#   at both call sites -- PLUS the soak's own invariant 2 assumed
+#   recovery always means session-Arc replacement, which is false
+#   (`PeerChannel` can heal an existing session in place via its own
+#   `DIRECT_LIVENESS_TIMEOUT` re-race); invariant fixed to check
+#   functional health instead.
+# - stale route: pure test-harness bug, not reachable in production --
+#   `op_restore_w_route` restored w's coordination-plane endpoint from a
+#   value captured once at stand-up, but `restart_node` binds a fresh
+#   ephemeral port every time; fixed to read w's current endpoint live.
+# - durability stuck Protecting: a full-replica device's `Placeholder`
+#   row can legitimately have NO obtainable holder among current
+#   membership -- its sole provenance-verified holder left the group,
+#   and every other current peer explicitly refuses the fetch
+#   (`FetchOutcome::Rejected`, "no verified group provenance"), not
+#   merely times out. Fixed via a new `DurabilityFacts::known_
+#   unobtainable_required_content` fact (backed by a durable `block_
+#   fetch_refusals` table, written only on an EXPLICIT peer refusal,
+#   never a transient miss) that routes to the EXISTING `AtRisk` variant
+#   -- no new `GroupDurabilityStatus` variant, and the record itself is
+#   never auto-retired. See `crates/yadorilink-daemon/tests/durability_
+#   unobtainable_content.rs` for the full root-cause writeup and its own
+#   deterministic regression.
+#
+# Two separate, unrelated findings also fixed during this investigation:
+# - `cargo test`'s default parallelism ran this file's two heavy
+#   `worker_threads = 8` tests concurrently, which could genuinely starve
+#   convergence past SETTLE_TIMEOUT purely from CPU contention (confirmed:
+#   the exact seed that failed under default parallelism passed cleanly
+#   both in isolation and fully serialized). `SOAK_LANE_SERIAL_GUARD` in
+#   `topology_soak_lane.rs` now forces these two tests to never run
+#   concurrently, regardless of test-runner parallelism.
+# - `support::topology::restart_node` had no bounded retry around
+#   re-starting a link's watcher (`LinkRuntimeController::start`), unlike
+#   the DB-reopen step right above it in the same function -- under the
+#   soak's rapid-repeated-restart chaos, the fence-gap fix's OWN
+#   abort-only fallback path (`link_runtime_controller.rs`'s "Arc<
+#   LinkRuntime> still shared after removal... falling back to
+#   abort-only teardown") doesn't release the root-lock sidecar file as
+#   promptly as a graceful stop would, so an immediate restart could hit
+#   "sync root ... is already in use by another YadoriLink process" and
+#   panic (seed 11103395572848290591). Fixed with the same bounded-retry
+#   shape already used for the DB reopen immediately above it.
+#
+# A FOURTH soak-closure finding surfaced in later full-suite validation,
+# after the three above were already fixed: seed 12552500466593081697
+# (already in this corpus) started failing again with durability stuck
+# Protecting but `known_unobtainable_required_content: false` -- a
+# DIFFERENT bug from the conflict-copy-refusal case above. Root cause:
+# `MaterializationRepairJob::run_once` (materialization_repair.rs)
+# round-robins live peer sessions but stopped at the first `Ok(_)`
+# result, and `reconcile_local_materialization_audit` returns `Ok(true)`
+# for "the audit ran without an outer I/O error", not "this device's
+# materialization is now complete" (a per-file `RetryRequired` is
+# intentionally folded into `Ok(())`, since re-candidacy is driven by
+# `list_materialization_repair_candidates`'s own DB state, not this
+# return value -- see `rematerialize_one_record`'s doc comment). Live
+# trace showed a full-replica device's sweep landing on the SAME
+# first-in-list peer every single sweep for the whole ~690s run (spare
+# device churn made `candidates.len()` fluctuate sweep to sweep, which
+# collapses the modular round-robin cursor back to the same start
+# repeatedly) -- that peer's own audit reliably returned `Ok(_)` (it was
+# itself only partially materialized, so it had nothing to contribute),
+# and the sweep broke immediately without ever trying the OTHER two live
+# peers, one of which may have actually held the missing content. Fixed
+# by asking every live candidate every sweep instead of stopping at the
+# first success -- bounded by this group's live session count, same as
+# before, and makes the fix independent of the cursor's exact value.
+# Verified: this exact seed, previously failing, now passes cleanly
+# (corpus replay, `replay_known_failing_seeds`), and
+# `durability_unobtainable_content.rs` still passes 3/3 (that test's own
+# M/W-both-refuse scenario now converges faster, since both are asked in
+# the same sweep instead of one per sweep).
+#
+# Issue #58 (a FIFTH soak-closure finding, surfaced after the four above
+# were already fixed): seed 6046481562379271917 failed with durability
+# stuck `Protecting` on a full-replica device (N) for two conflict-copy
+# placeholder paths, ~694s past the settle window, with `known_
+# unobtainable_required_content: false` -- reproduced locally with a
+# new `DaemonState::dump_durability_diagnostics` capture (added
+# specifically so this class of finding never again needs a blind
+# multi-hundred-second rerun to diagnose) on the 10th of 15 local
+# attempts, confirming this is timing-sensitive but not a rare tail
+# flake at that hit rate. Root cause: `has_known_unobtainable_required_
+# content`'s Fact 3 exempted a path's recorded `origin_device_id` from
+# ever needing to explicitly refuse, purely on still being a current
+# writer -- with no way for that exemption to ever lift. The diagnostic
+# dump showed the recorded origin (M) WAS present in that exact path's
+# `refusing_peers_for_path` evidence (an explicit `FetchOutcome::
+# Rejected`), yet Fact 3's blanket exemption never looked. This is
+# reachable in real production: `apply_locked_record`'s `incoming_
+# origin` falls back to attributing origin to the RELAYING peer
+# whenever that peer's own `get_origin_device_id` lookup for the path
+# came back empty, so a relayed conflict copy can end up with `origin_
+# device_id` pointing at a peer that never actually held the content --
+# while the true original author (encoded in the conflict-copy
+# filename, here a spare device that had since left the group) is
+# invisible to this check entirely, since only the netmap-current-
+# writer set is ever consulted. Fixed by gathering refusal evidence
+# before the Fact 3 check and only exempting the origin when it is BOTH
+# a current writer AND has not itself explicitly refused; Fact 4's
+# separate origin carve-out is removed too, since a present-but-refused
+# origin is already correctly counted via `refusers.contains`. Ground
+# truth cross-check (every OTHER in-process node's own `block_store`,
+# captured in the same diagnostic dump) confirmed no peer anywhere
+# actually held the blocks -- this was a genuine, permanent
+# unobtainable-content case that the fixed check now correctly routes
+# to `AtRisk` instead of leaving stuck at `Protecting` forever.
+#
+# Kept as permanent regression coverage now that all findings are fixed.
+922972317807886136
+16612994462990444375
+14049118026691592637
+12552500466593081697
+17132986931368163713
+3746878857549989852
+11103395572848290591
+6046481562379271917

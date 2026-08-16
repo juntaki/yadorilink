@@ -91,6 +91,13 @@ struct NetmapDiffState {
     /// `DaemonState::sessions`' own insert-on-connect,
     /// removed-on-session-end lifecycle).
     channels: Arc<StdMutex<HashMap<String, Arc<PeerChannel>>>>,
+    /// M5-A review follow-up (blocker #55): device_id -> the highest
+    /// `session_index`-derived generation that has ever successfully
+    /// published into `channels` for that peer -- see
+    /// `insert_channel_revoking_superseded`'s own doc comment for why an
+    /// out-of-order (older) generation publishing SECOND must be
+    /// rejected outright, not merely revoked after the fact.
+    channel_generations: Arc<StdMutex<HashMap<String, u32>>>,
     /// device_id -> the `JoinHandle` for its `spawn_peer_session` task, so
     /// a whole-device revocation can abort the in-flight
     /// `PeerSyncSession::run` (and whatever it's mid-request on)
@@ -198,11 +205,76 @@ impl NetmapDiffState {
         matches
     }
 
+    /// Registers `channel` as `device_id`'s current channel, revoking
+    /// whatever this replaces (M5-A soak-closure finding).
+    /// `channels.insert` alone silently discards any previous entry --
+    /// and per `PeerChannel::revoke`'s own doc comment, dropping every
+    /// `Arc` clone of a channel is NOT enough to stop its actor: an
+    /// un-revoked replaced channel stays permanently registered in the
+    /// transport hub's demux, still answering every future handshake
+    /// initiation for this peer under its own stale session index, with
+    /// no `Arc` left anywhere to ever revoke it again. This is the exact
+    /// zombie-channel class `remove_channel_if_current`'s own doc
+    /// comment already names above -- reachable in production the same
+    /// way that ABA race is: two supervisor generations for one peer
+    /// briefly coexisting (a new one connecting while the old one's
+    /// `teardown_peer` abort or natural session end hasn't been cleaned
+    /// up yet), confirmed live via the soak lane's rapid repeated-
+    /// restart chaos leaving a peer's session permanently stuck, unable
+    /// to ever re-handshake.
+    ///
+    /// M5-A review follow-up (blocker #55): `generation` is
+    /// `spawn_peer_session`'s own `session_index`-derived per-attempt
+    /// counter (monotonically increasing DAEMON-WIDE, not per-peer, but
+    /// still a valid real-time ordering signal for any one peer's own
+    /// sequence of attempts). Returns `false` -- doing nothing at all,
+    /// no insert, no revoke -- if a generation `>=` this one has already
+    /// published for `device_id`, closing the ABA window an earlier
+    /// version of this fix left open: two overlapping supervisor
+    /// generations for the same peer, where the OLDER one's publish
+    /// lands SECOND in real time (a plausible ordering under real
+    /// restart/reconnect chaos, not just a theoretical race) used to let
+    /// the stale generation win outright, revoking the genuinely live,
+    /// newer channel. `DaemonState::set_direct_channel`'s own mirror
+    /// independently applies the SAME `generation` guard against its own
+    /// `direct_channel_generations` map -- deliberately not made to
+    /// depend on this method's own accept/reject outcome, since the two
+    /// maps are updated by two separate lock acquisitions at the call
+    /// site and an even-newer generation could win the primary map's
+    /// race in the gap between them; each map converging independently
+    /// on the highest generation it has ever seen is what makes the
+    /// final state consistent regardless of call order.
+    fn insert_channel_revoking_superseded(
+        &self,
+        device_id: String,
+        channel: Arc<PeerChannel>,
+        generation: u32,
+    ) -> bool {
+        let mut generations =
+            self.channel_generations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if generations.get(&device_id).is_some_and(|&recorded| recorded >= generation) {
+            return false;
+        }
+        generations.insert(device_id.clone(), generation);
+        let superseded = self
+            .channels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(device_id, channel.clone());
+        if let Some(superseded) = superseded {
+            if !Arc::ptr_eq(&superseded, &channel) {
+                superseded.revoke();
+            }
+        }
+        true
+    }
+
     fn new() -> Self {
         Self {
             previous: Arc::new(StdMutex::new(HashMap::new())),
             last_snapshot_generation: Arc::new(StdMutex::new(None)),
             channels: Arc::new(StdMutex::new(HashMap::new())),
+            channel_generations: Arc::new(StdMutex::new(HashMap::new())),
             session_tasks: Arc::new(StdMutex::new(HashMap::new())),
             punch_limiter: Arc::new(StdMutex::new(PunchLimiter::new(PunchConfig::default()))),
             desired_peers: Arc::new(StdMutex::new(HashMap::new())),
@@ -1093,6 +1165,46 @@ mod ws_netmap {
             let retained_group_validation_cache: std::sync::Mutex<HashMap<String, bool>> =
                 std::sync::Mutex::new(HashMap::new());
 
+            // M5-A Pass 5 (restart-convergence), round 2: peer processing is
+            // genuinely two-phase now. Phase 1 (admission) below runs EVERY
+            // peer's existing WireGuard-key and signing-key pin checks --
+            // exactly as before, teardown-and-skip on any failure -- but
+            // does not publish anything into `peer_netmap_metadata` or run
+            // any authorization validation yet. Only once every peer in
+            // this pass has been fully admitted (or rejected) does Phase 2
+            // seed the admitted peers' signing keys and then run
+            // authorization validation / session management.
+            //
+            // A single combined pass (an earlier version of this fix) could
+            // not do this safely: peer A's `validate_retained_group` for a
+            // shared group can need peer B's signing key (a retained change
+            // in that group authored by B), and that check's `true`/`false`
+            // result is cached for the rest of the pass
+            // (`retained_group_validation_cache`) to avoid re-walking a
+            // group shared by many peers. Publishing each peer's raw,
+            // not-yet-pin-checked key as soon as it was decoded (rather
+            // than after admission) opened a real trust-boundary race: if
+            // B's key had actually CHANGED from its pinned value (a
+            // `PeerKeyDecision::Mismatch`, which is correctly rejected a
+            // few lines later), an earlier single-pass version could still
+            // let A's validation run against that about-to-be-rejected key
+            // in the gap before B's own rejection ran, cache `true` for the
+            // shared group, and publish A's authorization on that basis --
+            // B's later rejection only clears B's own metadata, not the
+            // already-cached group result or A's already-published
+            // authorization. Doing admission for every peer FIRST, and only
+            // publishing/validating with the admitted, pin-checked key
+            // set, removes that window entirely.
+            struct AdmittedPeer {
+                device_id: String,
+                signing_key: Option<[u8; 32]>,
+                peer_public: boringtun::x25519::PublicKey,
+                candidate_endpoints: Vec<WsEndpoint>,
+                authorized_groups: HashSet<String>,
+                full_replica_groups: HashSet<String>,
+                relay_capable: bool,
+            }
+            let mut admitted: Vec<AdmittedPeer> = Vec::new();
             for peer in update.peers {
                 let Ok(public_key_bytes) = base64::engine::general_purpose::STANDARD
                     .decode(&peer.wireguard_public_key_base64)
@@ -1153,17 +1265,55 @@ mod ws_netmap {
                     teardown_peer(state, diff_state, &peer.device_id);
                     continue;
                 }
+                admitted.push(AdmittedPeer {
+                    device_id: peer.device_id,
+                    signing_key: signing_key_bytes
+                        .as_deref()
+                        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()),
+                    peer_public,
+                    candidate_endpoints: peer.endpoints,
+                    authorized_groups,
+                    full_replica_groups,
+                    relay_capable: peer.relay_capable,
+                });
+            }
+
+            // Phase 2: every peer admitted this pass has already passed its
+            // WireGuard-key and signing-key pin checks, so it is now safe
+            // to settle ALL of their CURRENT signing-key state (present or
+            // absent) before validating ANY of their shared groups -- no
+            // admitted peer's retained-history check can ever race an
+            // admitted peer's own not-yet-settled key, and no rejected
+            // peer's key is ever published at all. Settling `None` too
+            // (not just seeding `Some`) matters: a peer that stopped
+            // advertising a signing key this pass must have any STALE
+            // previously-recorded key removed here, before an earlier-
+            // processed peer's group validation could otherwise still
+            // validate against that stale key and cache a wrong `true` for
+            // the shared group (a Codex review finding on an earlier
+            // version of this fix, which only handled `Some`).
+            for peer in &admitted {
+                match peer.signing_key {
+                    Some(key) => state.record_peer_signing_key(&peer.device_id, key),
+                    None => state.forget_peer_signing_key(&peer.device_id),
+                }
+            }
+
+            for peer in admitted {
+                let candidates: Vec<SocketAddr> = peer
+                    .candidate_endpoints
+                    .iter()
+                    .filter_map(|e| e.address.parse().ok())
+                    .collect();
                 let effective_authorized_groups = apply_authoritative_peer_metadata(
                     state,
                     &peer.device_id,
-                    signing_key_bytes.as_deref().and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()),
-                    &authorized_groups,
-                    &full_replica_groups,
+                    peer.signing_key,
+                    &peer.authorized_groups,
+                    &peer.full_replica_groups,
                     peer.relay_capable,
                     &retained_group_validation_cache,
                 );
-                let candidates: Vec<SocketAddr> =
-                    peer.endpoints.iter().filter_map(|e| e.address.parse().ok()).collect();
                 let mut effective_group_ids: Vec<String> =
                     effective_authorized_groups.into_iter().collect();
                 effective_group_ids.sort();
@@ -1179,7 +1329,7 @@ mod ws_netmap {
                     .insert(
                         peer.device_id.clone(),
                         PeerConnectSpec {
-                            peer_public,
+                            peer_public: peer.peer_public,
                             candidates: candidates.clone(),
                             effective_group_ids: effective_group_ids.clone(),
                         },
@@ -1902,14 +2052,22 @@ async fn run_one_peer_session_attempt(
     // enough to stop the actor (see `PeerChannel::revoke`'s doc
     // comment), so `teardown_peer` needs a live reference, not just
     // to out-live every other clone.
-    diff_state
-        .channels
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(peer_device_id.to_string(), channel.clone());
+    //
+    // M5-A soak-closure finding: see `insert_channel_revoking_
+    // superseded`'s own doc comment for why a plain `insert` here is
+    // unsafe -- confirmed live via the soak lane's rapid repeated-
+    // restart chaos leaving a peer's session permanently stuck.
+    diff_state.insert_channel_revoking_superseded(
+        peer_device_id.to_string(),
+        channel.clone(),
+        session_index,
+    );
     // M3 Pass 5: mirrors the insert above onto `DaemonState` -- see
-    // `DaemonState::set_direct_channel`'s own doc comment.
-    state.set_direct_channel(peer_device_id.to_string(), channel.clone());
+    // `DaemonState::set_direct_channel`'s own doc comment. Independently
+    // generation-guarded (blocker #55), not gated on the primary
+    // insert's own accept/reject result -- see that method's doc comment
+    // for why.
+    state.set_direct_channel(peer_device_id.to_string(), channel.clone(), session_index);
 
     // Reflect the channel's live reachability into status: it starts
     // `Connecting` while candidates race, becomes `Connected` once a
@@ -2465,11 +2623,13 @@ async fn run_one_direct_peer_session_attempt(
         }
     };
 
-    diff_state
-        .channels
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(peer_device_id.to_string(), channel.clone());
+    // See `insert_channel_revoking_superseded`'s own doc comment (M5-A
+    // soak-closure finding) for why a plain `insert` here is unsafe.
+    diff_state.insert_channel_revoking_superseded(
+        peer_device_id.to_string(),
+        channel.clone(),
+        session_index,
+    );
 
     // Reflect the channel's live reachability into status: it starts
     // `Connecting` while candidates race, becomes `Connected` once a
@@ -3539,16 +3699,30 @@ mod tests {
         let old_channel = fake_channel().await;
         let new_channel = fake_channel().await;
 
-        diff_state
-            .channels
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert("device-b".to_string(), old_channel.clone());
-        diff_state
-            .channels
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert("device-b".to_string(), new_channel.clone());
+        // `insert_channel_revoking_superseded`, the SAME method both real
+        // `spawn_peer_session` call sites use -- exercising this test
+        // against the plain `HashMap`/`insert` directly (as it read
+        // before the M5-A soak-closure fix) would make this test pass
+        // for a bug production no longer has.
+        assert!(diff_state.insert_channel_revoking_superseded(
+            "device-b".to_string(),
+            old_channel.clone(),
+            1
+        ));
+        assert!(diff_state.insert_channel_revoking_superseded(
+            "device-b".to_string(),
+            new_channel.clone(),
+            2
+        ));
+        assert!(
+            old_channel.is_revoked(),
+            "a channel silently replaced by a newer generation's insert must be revoked -- \
+             otherwise it stays registered in the transport hub's demux forever, still able to \
+             answer a handshake initiation for this peer under its own stale session index, with \
+             no Arc anywhere left to ever revoke it again (confirmed live via the soak lane's \
+             rapid repeated-restart chaos: this exact gap left W's/N's sessions with a rapidly-\
+             restarted peer permanently stuck, unable to ever re-handshake)"
+        );
 
         let removed = diff_state.remove_channel_if_current("device-b", &old_channel);
         assert!(!removed, "cleanup keyed to the OLD generation's channel must not report removal");
@@ -3575,6 +3749,73 @@ mod tests {
                 .get("device-b")
                 .is_none(),
             "the entry must actually be gone once the current generation's own cleanup runs"
+        );
+    }
+
+    /// M5-A review follow-up (blocker #55): the ABA race an earlier version
+    /// of the zombie-channel fix left open -- the primary map
+    /// (`NetmapDiffState::channels`) and its mirror (`DaemonState::
+    /// direct_channels`) are updated by two SEPARATE lock acquisitions, so
+    /// a stale (older) generation's publish landing SECOND in real time
+    /// could win the mirror's own revoke-superseded race even after having
+    /// already lost the primary map's. Sequence: A publishes (generation
+    /// 1) to the primary map; B publishes (generation 2) to the primary
+    /// map, correctly superseding A there; B's own mirror publish lands;
+    /// finally A's STALE mirror publish arrives late (its own generation 1
+    /// again, now well behind the mirror's already-recorded generation 2)
+    /// -- must be rejected outright (no insert, no revoke), not silently
+    /// win because the mirror is a separate map with no memory of what the
+    /// primary map already decided.
+    #[tokio::test]
+    async fn stale_generation_publish_cannot_revoke_a_newer_channel_in_either_map() {
+        let state = test_state();
+        let diff_state = NetmapDiffState::new();
+        let a_channel = fake_channel().await;
+        let b_channel = fake_channel().await;
+
+        // A primary publish.
+        assert!(diff_state.insert_channel_revoking_superseded(
+            "device-b".to_string(),
+            a_channel.clone(),
+            1
+        ));
+        // B primary publish -- correctly supersedes A in the primary map.
+        assert!(diff_state.insert_channel_revoking_superseded(
+            "device-b".to_string(),
+            b_channel.clone(),
+            2
+        ));
+        // B mirror publish.
+        state.set_direct_channel("device-b".to_string(), b_channel.clone(), 2);
+        // A stale mirror publish -- must be rejected by the mirror's own
+        // independent generation guard.
+        state.set_direct_channel("device-b".to_string(), a_channel.clone(), 1);
+
+        assert!(
+            !b_channel.is_revoked(),
+            "B must remain live -- a stale generation's publish must never revoke the current \
+             channel in either map"
+        );
+        assert!(
+            a_channel.is_revoked(),
+            "A was correctly superseded (and revoked) by B's own primary-map publish -- this is \
+             the pre-existing, already-correct half of the fix"
+        );
+        assert_eq!(
+            diff_state
+                .channels
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get("device-b")
+                .map(|c| Arc::ptr_eq(c, &b_channel)),
+            Some(true),
+            "the primary map must still hold B"
+        );
+        assert_eq!(
+            state.direct_channel("device-b").map(|c| Arc::ptr_eq(&c, &b_channel)),
+            Some(true),
+            "the mirror (the direct-route view RelaySessionHandler consults) must still hold B \
+             too -- A's stale publish must not have replaced it, and the two maps must agree"
         );
     }
 

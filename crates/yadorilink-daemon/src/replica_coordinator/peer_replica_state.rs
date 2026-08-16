@@ -209,6 +209,19 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
+    fn record_materialized_fingerprint(
+        &self,
+        group_id: &str,
+        path: &str,
+        fingerprint: Option<yadorilink_sync_sqlite::MaterializedFingerprint>,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), PeerSessionError> {
+        self.materialization_state_repository()
+            .record_materialized_fingerprint(group_id, path, fingerprint, permit)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
     fn record_placeholder_generation(
         &self,
         group_id: &str,
@@ -414,6 +427,41 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
     ) -> Result<(), PeerSessionError> {
         self.change_history_repository()
             .record_group_block_provenance(group_id, block_hashes)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
+    fn record_block_fetch_refusal(
+        &self,
+        group_id: &str,
+        path: &str,
+        version_hash: &str,
+        peer_device_id: &str,
+        reason: &str,
+        refused_at_unix_nanos: i64,
+    ) -> Result<(), PeerSessionError> {
+        self.materialization_state_repository()
+            .record_block_fetch_refusal(
+                group_id,
+                path,
+                version_hash,
+                peer_device_id,
+                reason,
+                refused_at_unix_nanos,
+            )
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
+    fn clear_block_fetch_refusal(
+        &self,
+        group_id: &str,
+        path: &str,
+        version_hash: &str,
+        peer_device_id: &str,
+    ) -> Result<(), PeerSessionError> {
+        self.materialization_state_repository()
+            .clear_block_fetch_refusal(group_id, path, version_hash, peer_device_id)
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)
     }

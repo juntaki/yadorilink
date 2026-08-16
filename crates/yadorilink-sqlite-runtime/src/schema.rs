@@ -505,6 +505,42 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
         );
         CREATE INDEX IF NOT EXISTS idx_enrollment_operations_state
             ON enrollment_operations(state);
+        -- M5-A soak-closure durability investigation: durable record of a
+        -- peer EXPLICITLY, definitively refusing a fetch for lack of
+        -- verified provenance on the EXACT current version
+        -- (`FetchOutcome::Rejected { reason: NoVerifiedProvenance }`) --
+        -- deliberately distinct both from a transient miss
+        -- (`NotFound`/`TimedOut`/`Busy`) and from any OTHER rejection
+        -- reason (unauthorized, malformed request, etc.), neither of
+        -- which writes a row here: only a rejection that specifically
+        -- proves "this peer does not hold this exact version's bytes" is
+        -- evidence of unobtainability. This is keyed by `version_hash`,
+        -- not just `path`: a refusal recorded against an OLDER version
+        -- must never be read as evidence about a NEWER version that
+        -- superseded it (a stale-refusal false positive an M5-A review
+        -- caught -- `path` alone conflates every version a file has ever
+        -- had). This is the evidence `known_unobtainable_required_
+        -- content` (`DurabilityFacts`) needs to positively confirm no
+        -- CURRENTLY authorized peer can serve the CURRENT version's
+        -- content, rather than merely inferring it from
+        -- connectivity/timing. One row per `(group_id, path, version_
+        -- hash, peer_device_id)`; a fresh rejection overwrites the
+        -- previous one via `INSERT ... ON CONFLICT`, and a later
+        -- successful fetch of the SAME version from the SAME peer
+        -- deletes any prior refusal row for it (see `ensure_blocks_
+        -- present`'s success arm) -- old evidence never outlives being
+        -- proven wrong. A new additive table, so a bare `CREATE TABLE IF
+        -- NOT EXISTS` is the whole migration, like `materialization_
+        -- intents`/`enrollment_operations` above.
+        CREATE TABLE IF NOT EXISTS block_fetch_refusals (
+            group_id              TEXT NOT NULL,
+            path                  TEXT NOT NULL,
+            version_hash          TEXT NOT NULL,
+            peer_device_id        TEXT NOT NULL,
+            reason                TEXT NOT NULL,
+            refused_at_unix_nanos INTEGER NOT NULL,
+            PRIMARY KEY (group_id, path, version_hash, peer_device_id)
+        );
         "#,
     )?;
     // Lightweight migrations (on-demand-sync): `CREATE TABLE IF NOT
@@ -661,6 +697,34 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
         "ALTER TABLE files ADD COLUMN placeholder_dev INTEGER",
         "ALTER TABLE files ADD COLUMN placeholder_ino INTEGER",
         "ALTER TABLE files ADD COLUMN placeholder_provider_kind TEXT",
+        // M5-A review follow-up (blocker #56): the already-`Hydrated`
+        // fast path in `hydrate_inner` used to infer "still the real
+        // materialization, safe to skip" from a bare `metadata.len() > 0`
+        // check -- indistinguishable from a genuine local edit that
+        // truncates the file to zero bytes before the watcher journals
+        // it, silently destroying that edit. A size-only OR even a
+        // size+mtime check cannot fix this either: BOTH a real edit and a
+        // genuinely-missing/corrupted leftover artifact look the same
+        // from a stateless filesystem observation alone -- the only sound
+        // discriminator is remembering, from this process's OWN last
+        // successful write, what the disk object looked like right after
+        // that write completed, then comparing NOW against THAT specific
+        // snapshot rather than re-deriving an expectation from the index
+        // alone. Reuses `peer_session::disk_race_fingerprint`'s own
+        // `(len, mtime, ctime, ctime_nsec)` shape -- the exact tuple
+        // already used elsewhere in this codebase to detect "did this
+        // path change since I last looked" -- captured immediately after
+        // a successful `reconstruct_file` call and persisted alongside
+        // the `Hydrated` transition. All four NULLable with no default,
+        // same "NULL means not proven, fail closed" discipline as
+        // `placeholder_dev`/`placeholder_ino` above: every pre-existing
+        // `Hydrated` row gets NULL, so hydrate_inner's shortcut falls
+        // through to a real re-verification for it rather than trusting
+        // an identity that was never actually captured.
+        "ALTER TABLE files ADD COLUMN materialized_fingerprint_len INTEGER",
+        "ALTER TABLE files ADD COLUMN materialized_fingerprint_mtime_nanos INTEGER",
+        "ALTER TABLE files ADD COLUMN materialized_fingerprint_ctime INTEGER",
+        "ALTER TABLE files ADD COLUMN materialized_fingerprint_ctime_nsec INTEGER",
     ] {
         match conn.execute(stmt, []) {
             Ok(_) => {}

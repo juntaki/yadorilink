@@ -71,6 +71,11 @@ impl MaterializationRepairJob {
             state.backfill_missing_change_history(&group_id).await;
             let candidates = state.peers.sessions_for_group(&group_id);
             if candidates.is_empty() {
+                tracing::debug!(
+                    local_device_id = %state.device_id,
+                    group_id,
+                    "materialization repair: no live peer sessions for this group this sweep"
+                );
                 continue;
             }
             let start = {
@@ -81,14 +86,55 @@ impl MaterializationRepairJob {
                 *cursor = (start + 1) % candidates.len();
                 start
             };
+            // M5-A soak-closure durability investigation: full per-sweep
+            // trace (ordered candidate list, cursor start, which peer got
+            // asked, and that peer's own result) to distinguish real
+            // round-robin starvation from genuinely unrepairable content --
+            // see the tracked comment on `randomized_soak_converges_with_
+            // no_leaks_or_stuck_state` in `topology_soak_lane.rs`.
+            let ordered_candidates: Vec<&str> =
+                candidates.iter().map(|(id, _)| id.as_str()).collect();
+            tracing::debug!(
+                local_device_id = %state.device_id,
+                group_id,
+                ?ordered_candidates,
+                start,
+                "materialization repair: sweep starting"
+            );
+            // M5-A soak-closure durability investigation: stopping at the
+            // first `Ok(_)` was a real starvation bug, not just an
+            // efficiency choice -- `reconcile_local_materialization_audit`
+            // returns `Ok(true)` for "the audit ran without an outer I/O
+            // error", not "this device's materialization is now complete"
+            // (a per-file `RetryRequired` is intentionally folded into
+            // `Ok(())` inside `rematerialize_one_record`, since
+            // re-candidacy is driven by `list_materialization_repair_
+            // candidates`'s own DB state, not this return value). Soak
+            // logs (seed 12552500466593081697) showed a full-replica
+            // device asking the same first-in-list peer every sweep for
+            // the entire run and never once trying its other two live
+            // peers, because that first peer's audit reliably returned
+            // `Ok(_)` (itself only partially materialized, so it had
+            // nothing to contribute) and the loop broke immediately. Every
+            // live candidate is now asked every sweep -- bounded by this
+            // group's live session count, same as before -- so a peer that
+            // actually holds the missing content is never starved out by
+            // an earlier peer's no-op success.
+            let mut any_ok = false;
             let mut last_error = None;
             for offset in 0..candidates.len() {
                 let (peer_id, session) = &candidates[(start + offset) % candidates.len()];
-                match session.clone().reconcile_local_materialization_audit(&group_id).await {
-                    Ok(_) => {
-                        last_error = None;
-                        break;
-                    }
+                let result = session.clone().reconcile_local_materialization_audit(&group_id).await;
+                tracing::debug!(
+                    local_device_id = %state.device_id,
+                    group_id,
+                    peer = %peer_id,
+                    offset,
+                    ok = result.is_ok(),
+                    "materialization repair: peer attempt finished"
+                );
+                match result {
+                    Ok(_) => any_ok = true,
                     Err(e) => {
                         tracing::warn!(
                             group_id,
@@ -100,12 +146,20 @@ impl MaterializationRepairJob {
                     }
                 }
             }
-            if let Some(e) = last_error {
-                tracing::warn!(
-                    group_id,
-                    error = %e,
-                    "materialization repair failed for every available peer"
-                );
+            tracing::debug!(
+                local_device_id = %state.device_id,
+                group_id,
+                any_ok,
+                "materialization repair: sweep finished"
+            );
+            if !any_ok {
+                if let Some(e) = last_error {
+                    tracing::warn!(
+                        group_id,
+                        error = %e,
+                        "materialization repair failed for every available peer"
+                    );
+                }
             }
         }
     }

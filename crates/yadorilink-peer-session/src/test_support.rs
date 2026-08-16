@@ -51,7 +51,7 @@ use yadorilink_replica_domain::session_state::{
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 
 use crate::error::PeerSessionError;
-use crate::ports::{OpenMaterializationIntent, PeerReplicaStatePort};
+use crate::ports::{MaterializedFingerprint, OpenMaterializationIntent, PeerReplicaStatePort};
 
 /// Per-`(group_id, path)` bookkeeping this fake tracks -- every column
 /// `PeerReplicaStatePort` exposes a getter/setter for, flattened into one
@@ -590,6 +590,18 @@ impl PeerReplicaStatePort for FakeReplicaState {
         Ok(true)
     }
 
+    fn record_materialized_fingerprint(
+        &self,
+        _group_id: &str,
+        _path: &str,
+        _fingerprint: Option<MaterializedFingerprint>,
+        _permit: &RootCommitPermit<'_>,
+    ) -> Result<(), PeerSessionError> {
+        // No fake-state consumer needs this yet -- mirrors this mock's
+        // existing footprint for other write-only accessors.
+        Ok(())
+    }
+
     fn record_placeholder_generation(
         &self,
         group_id: &str,
@@ -860,6 +872,33 @@ impl PeerReplicaStatePort for FakeReplicaState {
         for hash in block_hashes {
             group.block_provenance.insert(hash.clone());
         }
+        Ok(())
+    }
+
+    fn record_block_fetch_refusal(
+        &self,
+        _group_id: &str,
+        _path: &str,
+        _version_hash: &str,
+        _peer_device_id: &str,
+        _reason: &str,
+        _refused_at_unix_nanos: i64,
+    ) -> Result<(), PeerSessionError> {
+        // No fake-state consumer needs this yet -- the real, persistent
+        // implementation lives in `yadorilink-daemon`'s `ReplicaCoordinator`
+        // (see `DurabilityFacts::known_unobtainable_required_content`'s own
+        // doc comment). A no-op here matches this mock's existing footprint.
+        Ok(())
+    }
+
+    fn clear_block_fetch_refusal(
+        &self,
+        _group_id: &str,
+        _path: &str,
+        _version_hash: &str,
+        _peer_device_id: &str,
+    ) -> Result<(), PeerSessionError> {
+        // Same rationale as `record_block_fetch_refusal` above.
         Ok(())
     }
 

@@ -368,18 +368,61 @@ impl LinkRuntimeController {
         // peeked, never removed and re-inserted, until it resolves) that used
         // to live here.
         let Some(runtime) = state.links.wait_and_take_ready(local_path).await else { return };
-        // `link_runtimes` was the only place this `Arc` was ever cloned from,
-        // so removing it there leaves exactly one strong reference: this one.
-        // Unwrapping it gives owned access to `tasks` (needed to await each
-        // handle by value below) while keeping `root_lock` alive, still held,
-        // until this whole function returns.
-        let runtime = Arc::try_unwrap(runtime).unwrap_or_else(|shared| {
-            panic!(
-                "stop: Arc<LinkRuntime> for {local_path} unexpectedly still shared \
-                 ({} refs) after removal from link_runtimes",
-                Arc::strong_count(&shared)
-            )
-        });
+        // `link_runtimes` was the only place this `Arc` was ever
+        // DURABLY cloned from, so removing it there leaves exactly one
+        // strong reference in the steady state -- but a genuine, narrow
+        // exception exists: `RootCommitAuthorityProvider::root_lease_for`
+        // (`root_commit_authority.rs`) does `self.links.runtime(&local_
+        // path).map(|runtime| runtime.root_lease().clone())` -- a bare,
+        // unfenced PEEK at the same registry entry, entirely outside the
+        // `begin_stopping`/`wait_drained` sequencing above. That peek's
+        // own `Arc<LinkRuntime>` clone is dropped the instant the
+        // closure returns (no `.await` inside `root_lease_for`, so
+        // nothing can suspend mid-peek) -- but on a real multi-threaded
+        // runtime, that whole synchronous peek can genuinely be
+        // in-flight on a DIFFERENT OS thread at the exact instant this
+        // function's own removal-then-unwrap runs on this one, which is
+        // an ordinary, expected data race on the refcount, not a fence
+        // bug (M5-A finding, confirmed live via `topology_soak_lane.rs`'s
+        // `RestartNode` op racing concurrent `hydrate`/`evict` calls --
+        // see project memory `m5a-pass9-link-runtime-stop-fence-gap` for
+        // the full trail). The window is microsecond-scale by
+        // construction, so a few bounded, near-immediate retries let it
+        // clear on its own almost every time, keeping this function on
+        // its normal clean-shutdown path; only a genuinely persistent
+        // failure (a real bug elsewhere holding the Arc across an await,
+        // which retrying cannot fix) falls through to the same graceful
+        // degraded fallback `app.rs::graceful_shutdown` already
+        // establishes as correct for an unexpectedly-shared Arc here --
+        // log loudly and abort tasks directly rather than panic the
+        // whole link-stop caller over what is, in that case, still a
+        // real anomaly worth knowing about but not worth taking the
+        // daemon down for.
+        const MAX_UNWRAP_RETRIES: u32 = 20;
+        const UNWRAP_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(5);
+        let mut candidate = runtime;
+        let mut attempt = 0;
+        let runtime = loop {
+            match Arc::try_unwrap(candidate) {
+                Ok(runtime) => break runtime,
+                Err(shared) if attempt < MAX_UNWRAP_RETRIES => {
+                    attempt += 1;
+                    tokio::time::sleep(UNWRAP_RETRY_BACKOFF).await;
+                    candidate = shared;
+                }
+                Err(shared) => {
+                    tracing::error!(
+                        local_path,
+                        refs = Arc::strong_count(&shared),
+                        attempts = attempt,
+                        "stop: Arc<LinkRuntime> still shared after removal from link_runtimes \
+                         and every retry; falling back to abort-only teardown"
+                    );
+                    shared.abort_tasks();
+                    return;
+                }
+            }
+        };
 
         // begin_stopping -> abort+await tasks -> wait_drained -> drop root_lock,
         // in that order -- see `LinkRuntime::shutdown`'s own doc for why.

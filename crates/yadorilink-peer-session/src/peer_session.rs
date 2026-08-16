@@ -541,6 +541,17 @@ mod projection_attempt_tests {
     }
 }
 
+/// The exact `Rejected` reason `send_block_request_rejected` sends when a
+/// peer has no verified group provenance for a block -- the ONLY rejection
+/// reason `ensure_blocks_present` treats as evidence a peer positively does
+/// not hold a version's content (see `block_fetch_refusals`'s own schema
+/// doc comment). Every other `Rejected` reason (unauthorized, malformed
+/// request, size mismatch) is a real hard denial but proves nothing about
+/// content possession, so it must never be recorded as unobtainability
+/// evidence. Shared as one constant, not duplicated string literals, so the
+/// emit site and the check site can never silently drift apart.
+const NO_VERIFIED_PROVENANCE_REASON: &str = "no verified group provenance for this block";
+
 #[derive(Clone, Debug)]
 enum FetchOutcome {
     Found(Bytes),
@@ -4221,18 +4232,42 @@ impl PeerSyncSession {
         }
 
         let paths = self.state.list_materialization_repair_candidates(group_id)?;
+        // M5-A soak-closure durability investigation: names every candidate
+        // path this device's own audit considered repair-eligible this
+        // attempt -- see the tracked comment on `randomized_soak_converges_
+        // with_no_leaks_or_stuck_state` in `topology_soak_lane.rs`.
+        tracing::debug!(
+            local_device_id = %self.local_device_id,
+            group_id,
+            audit_attempt_id,
+            ?paths,
+            "materialization audit: repair-candidate paths"
+        );
         if paths.is_empty() {
             return Ok(true);
         }
 
         let files = self.state.get_files_by_paths(group_id, &paths)?;
+        let fetched_count = files.len();
         let mut file_infos = Vec::with_capacity(files.len());
+        let mut dropped_as_deleted = Vec::new();
         for record in files.into_values() {
             if record.deleted {
+                dropped_as_deleted.push(record.path.clone());
                 continue;
             }
             file_infos.push(self.file_info_for_record(group_id, record)?);
         }
+        tracing::debug!(
+            local_device_id = %self.local_device_id,
+            group_id,
+            audit_attempt_id,
+            candidate_count = paths.len(),
+            fetched_count,
+            file_infos_count = file_infos.len(),
+            ?dropped_as_deleted,
+            "materialization audit: candidate paths resolved to files"
+        );
         if file_infos.is_empty() {
             return Ok(true);
         }
@@ -6225,10 +6260,7 @@ impl PeerSyncSession {
                 "refusing block request without verified group provenance"
             );
             drop(examination_permits);
-            let _ = self.try_send_block_request_rejected(
-                &req,
-                "no verified group provenance for this block",
-            );
+            let _ = self.try_send_block_request_rejected(&req, NO_VERIFIED_PROVENANCE_REASON);
             return Ok(());
         }
         // Every check above (authorization, reference, provenance) is
@@ -7603,8 +7635,9 @@ impl PeerSyncSession {
         &self,
         group_id: &str,
         file_path: &str,
-        blocks: &[BlockInfo],
+        record: &FileRecord,
     ) -> Result<bool, PeerSessionError> {
+        let blocks = &record.blocks;
         // Batched presence check rather than probing one
         // hash at a time — most of a hydration's blocks are typically
         // already-known-missing (that's the point of a placeholder), so
@@ -7612,6 +7645,25 @@ impl PeerSyncSession {
         // calls interleaved with network fetches into one upfront query.
         let hashes: Vec<_> = blocks.iter().map(|b| hex::encode(&b.hash)).collect();
         let present = self.store.present_blocks(&hashes)?;
+        // M5-A soak-closure durability investigation, review follow-up:
+        // `block_fetch_refusals` evidence must be bound to the EXACT
+        // current version, not just the path -- a refusal recorded
+        // against an older version must never be read as evidence about a
+        // newer one that superseded it. Computed once here (cheap: hashes
+        // only the small metadata envelope, not block bytes) rather than
+        // per-block, and safe to compute from `record` plus these three
+        // getters even though they are separate calls: the caller holds
+        // `path_lock` for this whole attempt, so nothing can mutate this
+        // path's index row concurrently.
+        let current_version_hash = FileVersion::from_index_row(
+            record.blocks.clone(),
+            record.size,
+            record.mtime_unix_nanos,
+            self.state.get_record_kind(group_id, file_path)?.unwrap_or_default(),
+            self.state.get_exec_bit(group_id, file_path)?,
+            self.state.get_symlink_target(group_id, file_path)?,
+        )
+        .version_hash;
 
         let mut all_present = true;
         for (block, already_present) in blocks.iter().zip(present) {
@@ -7695,6 +7747,42 @@ impl PeerSyncSession {
                             reason,
                             "peer rejected this block request; not retrying"
                         );
+                        // M5-A soak-closure durability investigation,
+                        // review follow-up: durable record of this
+                        // EXPLICIT, definitive refusal -- but ONLY when
+                        // `reason` is specifically `NO_VERIFIED_
+                        // PROVENANCE_REASON`. Every other `Rejected`
+                        // reason (unauthorized, malformed request, size
+                        // mismatch) is a real denial but proves nothing
+                        // about whether the peer actually holds this
+                        // version's bytes, so recording it here would let
+                        // e.g. an authorization failure be misread as
+                        // "content unobtainable" evidence. See
+                        // `DurabilityFacts::known_unobtainable_required_
+                        // content`'s own doc comment for why this (not a
+                        // transient NotFound/TimedOut/Busy miss, and not
+                        // any other rejection reason) is the evidence
+                        // that fact needs, and `block_fetch_refusals`'s
+                        // schema doc for why it is bound to the exact
+                        // current version, not just the path.
+                        if reason == NO_VERIFIED_PROVENANCE_REASON {
+                            if let Err(e) = self.state.record_block_fetch_refusal(
+                                group_id,
+                                file_path,
+                                &current_version_hash.to_hex(),
+                                &self.peer_device_id,
+                                reason,
+                                now_unix_nanos(),
+                            ) {
+                                tracing::warn!(
+                                    local_device_id = %self.local_device_id,
+                                    candidate_peer_id = %self.peer_device_id,
+                                    file_path,
+                                    error = %e,
+                                    "failed to record a block fetch refusal"
+                                );
+                            }
+                        }
                         break None;
                     }
                     FetchOutcome::NotFound
@@ -7724,10 +7812,33 @@ impl PeerSyncSession {
                     let store = self.store.clone();
                     let put_result = spawn_blocking(move || store.put(&data)).await;
                     match put_result {
-                        Ok(Ok(_hash)) => self.state.record_group_block_provenance(
-                            group_id,
-                            std::slice::from_ref(&block.hash),
-                        )?,
+                        Ok(Ok(_hash)) => {
+                            self.state.record_group_block_provenance(
+                                group_id,
+                                std::slice::from_ref(&block.hash),
+                            )?;
+                            // M5-A soak-closure durability investigation,
+                            // review follow-up: this peer just proved it
+                            // DOES hold this exact version's content, so
+                            // any prior refusal recorded against it for
+                            // this path/version can never be read as
+                            // still-current evidence again.
+                            if let Err(e) = self.state.clear_block_fetch_refusal(
+                                group_id,
+                                file_path,
+                                &current_version_hash.to_hex(),
+                                &self.peer_device_id,
+                            ) {
+                                tracing::warn!(
+                                    local_device_id = %self.local_device_id,
+                                    candidate_peer_id = %self.peer_device_id,
+                                    file_path,
+                                    error = %e,
+                                    "failed to clear a stale block fetch refusal after a \
+                                     successful fetch"
+                                );
+                            }
+                        }
                         Ok(Err(e)) => return Err(e.into()),
                         Err(join_err) => {
                             return Err(PeerSessionError::from(std::io::Error::other(format!(
@@ -7885,11 +7996,9 @@ impl PeerSyncSession {
             committed: false,
         };
 
-        let outcome = tokio::time::timeout(
-            timeout,
-            self.ensure_blocks_present(group_id, path, &record.blocks),
-        )
-        .await;
+        let outcome =
+            tokio::time::timeout(timeout, self.ensure_blocks_present(group_id, path, &record))
+                .await;
 
         let all_present = match outcome {
             Ok(Ok(all_present)) => all_present,
@@ -7969,6 +8078,17 @@ impl PeerSyncSession {
         // `preflight_disk_headroom`'s doc comment.
         self.preflight_disk_headroom(group_id, &out_path, record.size)?;
         reconstruct_file(self.store.as_ref(), &out_path, &record.blocks, record.mtime_unix_nanos)?;
+        // M5-A review follow-up (blocker #56): captured immediately after
+        // this device's own write -- see `MaterializationStateRepository::
+        // record_materialized_fingerprint`'s own doc comment for what the
+        // daemon's already-`Hydrated` fast path
+        // (`hydration.rs::hydrate_inner`) needs this for.
+        self.state.record_materialized_fingerprint(
+            group_id,
+            path,
+            disk_race_fingerprint(&out_path),
+            &root_commit_permit,
+        )?;
         // Apply the owner-executable bit
         // currently recorded for this path (POSIX: real chmod; no-op,
         // no error, on Windows) — hydration is a materialization path
@@ -8140,6 +8260,20 @@ impl PeerSyncSession {
                     local.path
                 ))
             })?;
+        // M5-A soak-closure durability investigation: unconditional trace
+        // of the dispatch decision itself, since the eager-rehydrate arms
+        // below only log when they actually attempt a hydrate -- see the
+        // tracked comment on `randomized_soak_converges_with_no_leaks_or_
+        // stuck_state` in `topology_soak_lane.rs`.
+        tracing::debug!(
+            local_device_id = %self.local_device_id,
+            group_id,
+            path = %local.path,
+            peer = %self.peer_device_id,
+            ?ordering,
+            needs_rehydrate = ?self.eager_live_record_needs_rehydrate(group_id, &local, policy),
+            "materialization audit: apply_locked_record dispatch"
+        );
 
         match ordering {
             ChangeOrdering::Equal => {
@@ -8217,12 +8351,31 @@ impl PeerSyncSession {
                     // `hydrate_file_with_timeout_locked`'s own doc
                     // comment for why the lock-acquiring public wrapper
                     // would deadlock here.
-                    self.hydrate_file_with_timeout_locked(
+                    //
+                    // M5-A soak-closure durability investigation: this
+                    // outcome used to be discarded entirely -- `Held`
+                    // (blocks fetched, physical write withheld by a
+                    // filename hazard) was treated identically to
+                    // `Hydrated`, unconditionally reporting `Settled`
+                    // below even though the row is still `Placeholder`.
+                    // See the tracked comment on `randomized_soak_
+                    // converges_with_no_leaks_or_stuck_state` in
+                    // `topology_soak_lane.rs`.
+                    let outcome = self
+                        .hydrate_file_with_timeout_locked(
+                            group_id,
+                            &local.path,
+                            DEFAULT_HYDRATION_TIMEOUT,
+                        )
+                        .await?;
+                    tracing::debug!(
+                        local_device_id = %self.local_device_id,
                         group_id,
-                        &local.path,
-                        DEFAULT_HYDRATION_TIMEOUT,
-                    )
-                    .await?;
+                        path = %local.path,
+                        peer = %self.peer_device_id,
+                        ?outcome,
+                        "materialization audit: eager rehydrate outcome (Equal arm)"
+                    );
                 }
                 Ok(LockedRecordOutcome::Settled)
             }
@@ -8234,12 +8387,21 @@ impl PeerSyncSession {
                     // `hydrate_file_with_timeout_locked`'s own doc
                     // comment for why the lock-acquiring public wrapper
                     // would deadlock here.
-                    self.hydrate_file_with_timeout_locked(
+                    let outcome = self
+                        .hydrate_file_with_timeout_locked(
+                            group_id,
+                            &local.path,
+                            DEFAULT_HYDRATION_TIMEOUT,
+                        )
+                        .await?;
+                    tracing::debug!(
+                        local_device_id = %self.local_device_id,
                         group_id,
-                        &local.path,
-                        DEFAULT_HYDRATION_TIMEOUT,
-                    )
-                    .await?;
+                        path = %local.path,
+                        peer = %self.peer_device_id,
+                        ?outcome,
+                        "materialization audit: eager rehydrate outcome (After arm)"
+                    );
                 }
                 Ok(LockedRecordOutcome::Settled)
             }
@@ -8508,6 +8670,14 @@ impl PeerSyncSession {
         // stale state.
         let path_lock = self.state.path_lock(group_id, &incoming.path);
         let _guard = path_lock.lock().await;
+        // M5-A soak-closure durability investigation: captured before
+        // `incoming` is moved into `apply_locked_record` below, so the
+        // `RetryRequired` arm can name exactly which path/version didn't
+        // settle -- see the tracked comment on `randomized_soak_converges_
+        // with_no_leaks_or_stuck_state` in `topology_soak_lane.rs`.
+        let audited_path = incoming.path.clone();
+        let audited_size = incoming.size;
+        let audited_block_count = incoming.blocks.len();
         match self.apply_locked_record(group_id, incoming, meta, policy).await? {
             LockedRecordOutcome::Settled => Ok(()),
             // Not silently folded into `Ok(())` as `Settled` was before:
@@ -8520,8 +8690,12 @@ impl PeerSyncSession {
             // indistinguishable from one that actually completed.
             LockedRecordOutcome::RetryRequired => {
                 tracing::debug!(
+                    local_device_id = %self.local_device_id,
                     group_id,
                     peer = %self.peer_device_id,
+                    path = %audited_path,
+                    audited_size,
+                    audited_block_count,
                     "materialization audit re-drive did not settle this record this attempt; \
                      it stays a repair candidate for the next audit tick"
                 );
@@ -9116,7 +9290,7 @@ impl PeerSyncSession {
             // delayed even while both buckets are saturated" precedent.
             let all_present = tokio::time::timeout(
                 DEFAULT_HYDRATION_TIMEOUT,
-                self.ensure_blocks_present(group_id, &record.path, &record.blocks),
+                self.ensure_blocks_present(group_id, &record.path, record),
             )
             .await
             .map_err(|_elapsed| PeerSessionError::HydrationFailed(record.path.clone()))??;
@@ -9282,6 +9456,32 @@ impl PeerSyncSession {
             // (`eager_live_record_needs_rehydrate`) and recovery never
             // clobbers it. Reuses the not-admitted branch's placeholder path.
             if !all_present {
+                // Same journaled-write seam the sibling "demoted after a
+                // failed reconstruct" arm below uses, and for the identical
+                // reason (M5-A Pass 8 finding): `persist_materialized_
+                // record`'s underlying `upsert_file_with_origin` INSERTs a
+                // fresh row that DEFAULTS to `Hydrated` before the explicit
+                // `set_materialization_state(..., Placeholder, ...)` below
+                // runs, and even once demoted, `create_or_defer_
+                // placeholder` (the actual on-disk write) has not run yet
+                // either. A crash/restart in EITHER window leaves an
+                // indexed, not-deleted row with no local file and no
+                // protecting intent -- exactly what the startup "full
+                // reconciliation" scan (`local_change.rs`'s `reconcile_
+                // disk_with_ignore`) reads as an offline deletion, silently
+                // tombstoning a file this device never actually lost.
+                // Reproduced live via a real restart-mid-relay-sync
+                // integration test. Opening the guard before the row commit
+                // and clearing it right before the placeholder disk write
+                // (mirroring the sibling arm exactly) closes both windows.
+                let intent_target_hash =
+                    yadorilink_local_storage::intent_target_hash(&record.blocks);
+                let intent_guard = self.state.open_materialization_intent_guard(
+                    group_id,
+                    &record.path,
+                    &intent_target_hash,
+                    &root_commit_permit,
+                )?;
                 self.persist_materialized_record(
                     group_id,
                     record,
@@ -9324,6 +9524,12 @@ impl PeerSyncSession {
                     )?,
                 }
                 apply_exec_bit(&out_path, self.state.get_exec_bit(group_id, &record.path)?)?;
+                // Clear the intent only now, after the placeholder is
+                // durably on disk (M5-A Pass 11 finding, correcting an
+                // earlier version of this fix that cleared BEFORE `create_
+                // or_defer_placeholder` -- see the OnDemand branch below
+                // for the full reasoning, identical here).
+                intent_guard.clear()?;
                 // Eager/pinned wanted real content but not every block was
                 // available -- this is a retriable Placeholder, not a
                 // settled outcome (the confirmed bug this type exists to
@@ -9449,13 +9655,6 @@ impl PeerSyncSession {
                     MaterializationState::Placeholder,
                     &root_commit_permit,
                 )?;
-                // A `Placeholder` is not an in-progress write — clear the intent
-                // now (mirrors repair's placeholder arms). Cleared before the
-                // placeholder disk write below so that even a failure writing
-                // the placeholder cannot leave a stale intent: the row is already
-                // `Placeholder`, which repair skips, and a later offline delete
-                // of this path must not be misread as a crash to reconstruct.
-                intent_guard.clear()?;
                 self.verify_write_target(group_id, &out_path)?;
                 match create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)?
                 {
@@ -9484,12 +9683,30 @@ impl PeerSyncSession {
                     )?,
                 }
                 apply_exec_bit(&out_path, self.state.get_exec_bit(group_id, &record.path)?)?;
+                // Clear the intent only now, after the placeholder is
+                // durably on disk (M5-A Pass 11 finding, correcting an
+                // earlier version of this fix that cleared BEFORE `create_
+                // or_defer_placeholder` -- see the OnDemand branch below
+                // for the full reasoning, identical here).
+                intent_guard.clear()?;
                 // Reconstruct never actually succeeded despite the blocks
                 // being fetched -- demoted to a retriable Placeholder, not
                 // a settled outcome (same reasoning as the `!all_present`
                 // branch above).
                 return Ok(MaterializeResult::RetryRequired);
             }
+            // M5-A review follow-up (blocker #56): captured immediately
+            // after this device's own successful reconstruct -- see
+            // `MaterializationStateRepository::record_materialized_
+            // fingerprint`'s own doc comment for what the daemon's
+            // already-`Hydrated` fast path (`hydration.rs::hydrate_inner`)
+            // needs this for.
+            self.state.record_materialized_fingerprint(
+                group_id,
+                &record.path,
+                disk_race_fingerprint(&out_path),
+                &root_commit_permit,
+            )?;
             // The temp-write-then-rename completed durably — clear the intent
             // NOW, before the post-write metadata touch below. Clearing only
             // after `apply_exec_bit` would leak the intent whenever reading or
@@ -9518,6 +9735,29 @@ impl PeerSyncSession {
             }
             // OnDemand and not pinned: no block fetch at all — the whole
             // point of a placeholder is deferring that until access.
+            //
+            // Same journaled-write seam the eager/pinned branches above use
+            // (M5-A Pass 8 finding, reproduced live via a real
+            // restart-mid-relay-sync integration test): this is the actual
+            // ORDINARY on-demand-receive path -- the one a plain On-Demand
+            // device takes for every normal incoming file -- and it was
+            // committing the fresh (briefly-`Hydrated`-by-default, per
+            // `persist_materialized_record`'s own doc comment) index row
+            // with NO protecting intent, before either the explicit
+            // demotion to `Placeholder` or the actual on-disk placeholder
+            // write. A crash/restart in either window left an indexed,
+            // not-deleted row with no local file and no intent -- exactly
+            // what the startup "full reconciliation" scan
+            // (`local_change.rs`'s `reconcile_disk_with_ignore`) reads as
+            // an offline deletion, silently tombstoning a file this device
+            // never actually lost.
+            let intent_target_hash = yadorilink_local_storage::intent_target_hash(&record.blocks);
+            let intent_guard = self.state.open_materialization_intent_guard(
+                group_id,
+                &record.path,
+                &intent_target_hash,
+                &root_commit_permit,
+            )?;
             self.persist_materialized_record(
                 group_id,
                 record,
@@ -9568,6 +9808,23 @@ impl PeerSyncSession {
             // access, it did not want the blocks now and fail to get
             // them.
             apply_exec_bit(&out_path, self.state.get_exec_bit(group_id, &record.path)?)?;
+            // Clear the intent only now, after the placeholder is
+            // durably on disk (M5-A Pass 11 finding, correcting an
+            // earlier version of this fix): clearing BEFORE `create_or_
+            // defer_placeholder` traded a benign outcome (a stale intent
+            // left open past a later failure -- `materialization_repair.
+            // rs`'s own doc says repair treats an open intent as safe,
+            // deferring rather than tombstoning) for a harmful one
+            // (row committed as non-deleted Placeholder, no file on
+            // disk, no intent -- exactly what the startup reconciliation
+            // scan reads as an offline deletion). This is the ordinary
+            // on-demand-receive path, so the window's frequency was far
+            // higher than on the eager/pinned branches this pattern was
+            // copied from. An early `?` return on any step above still
+            // drops the guard without clearing, which is the safe
+            // (defer-the-delete) failure mode, matching the eager/pinned
+            // `Hydrated` branch's own established ordering.
+            intent_guard.clear()?;
             Ok(MaterializeResult::Settled)
         }
     }
