@@ -45,7 +45,7 @@ rand = "0.10.2"
 [dev-dependencies]
 tempfile = "3"
 # Signs test fixture changes.
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 boringtun = { version = "0.7", default-features = false }
 # This crate's own #[cfg(test)] tests need `RootCommitPermit::for_tests`/
 # `RootLease::for_tests` (both `#[cfg(any(test, feature = "test-support"))]`
