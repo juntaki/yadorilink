@@ -2097,12 +2097,16 @@ mod tests {
 
     /// M5-A restart-convergence fix, regression B: a liveness-loss
     /// re-race that actually reconnects (the common transient-blip case)
-    /// must self-heal in place -- never retire the channel, and must
-    /// clear `recovering_from_liveness_loss` once real authenticated
-    /// traffic proves the session alive again. Directly exercises the
-    /// exact sequence `confirmed_path_liveness_loss_triggers_retraversal`
-    /// above starts, carried one step further to the successful-recovery
-    /// outcome.
+    /// must self-heal in place -- never retire the channel. Directly
+    /// exercises the exact sequence `confirmed_path_liveness_loss_
+    /// triggers_retraversal` above starts, carried one step further to
+    /// the successful-recovery outcome -- but only through `evaluate_
+    /// reachability`; the flag-clearing half of recovery (`recovering_
+    /// from_liveness_loss` going back to `false` once real authenticated
+    /// traffic proves the session alive) is simulated here, not exercised
+    /// through the real `handle_datagram` path -- see the inline comment
+    /// at that line for why, and `recovered_liveness_loss_does_not_reset_
+    /// arq_state` for the sibling test that does drive the real path.
     #[tokio::test]
     async fn liveness_loss_recovery_that_reconnects_does_not_retire() {
         let mut state = make_state(
@@ -2117,11 +2121,16 @@ mod tests {
         assert!(!retire, "the FIRST bounded recovery attempt must not retire the channel");
         assert!(state.recovering_from_liveness_loss, "must be in a bounded recovery episode now");
 
-        // The re-race succeeds: real authenticated traffic arrives from
-        // the (still valid) confirmed candidate, exactly like
-        // `handle_datagram`'s own candidate-confirmed branch.
+        // Simulates the re-race succeeding: real authenticated traffic
+        // arrives from the (still valid) confirmed candidate, exactly like
+        // `handle_datagram`'s own candidate-confirmed branch would do --
+        // this test does NOT call `handle_datagram` itself (its sibling,
+        // `recovered_liveness_loss_does_not_reset_arq_state`, exercises
+        // that real path instead), so it manually reproduces `handle_
+        // datagram`'s two observable effects (clearing the flag, setting
+        // `Connected`) rather than proving the clear itself still fires.
         state.confirmed_direct_addr = Some(peer_addr());
-        state.recovering_from_liveness_loss = false; // handle_datagram's own clear
+        state.recovering_from_liveness_loss = false;
         set_reachability(&mut state, PeerReachability::Connected { path: CandidateClass::Lan });
 
         assert!(
