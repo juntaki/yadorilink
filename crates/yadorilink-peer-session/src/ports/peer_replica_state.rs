@@ -21,6 +21,14 @@ use yadorilink_replica_domain::session_state::{
 };
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 
+/// Duplicated from `yadorilink_sync_sqlite::MaterializedFingerprint` rather
+/// than depending on that crate from production code solely for this type
+/// alias (that dependency is dev-only here) -- same "duplicate small leaf
+/// types rather than force an awkward dependency" precedent this crate's
+/// own `ContentHash`/`yadorilink-sync-sqlite::materialization_state::
+/// ContentHash` pair already established independently of each other.
+pub type MaterializedFingerprint = (u64, Option<std::time::SystemTime>, i64, i64);
+
 /// An open, durably-recorded materialization intent for one path, returned
 /// by [`PeerReplicaStatePort::open_materialization_intent_guard`]. Opaque
 /// here (the concrete guard is `yadorilink-sync-core`'s own
@@ -153,6 +161,22 @@ pub trait PeerReplicaStatePort: Send + Sync {
         expected_authoring_hash: Option<&ChangeHash>,
         next: MaterializationState,
     ) -> Result<bool, PeerSessionError>;
+
+    /// M5-A review follow-up (blocker #56): records the disk identity of
+    /// the exact bytes this device just wrote via a successful
+    /// `reconstruct_file`, alongside that same call's `Hydrated`
+    /// transition -- always called right after `reconstruct_file`
+    /// succeeds. See `yadorilink_sync_sqlite::materialization_state::
+    /// MaterializationStateRepository::record_materialized_fingerprint`'s
+    /// own doc comment for the full reasoning and the fail-closed `None`
+    /// semantics.
+    fn record_materialized_fingerprint(
+        &self,
+        group_id: &str,
+        path: &str,
+        fingerprint: Option<MaterializedFingerprint>,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), PeerSessionError>;
 
     /// Records the identity of the exact on-disk object a `write_placeholder`
     /// call just created for `(group_id, path)` (M1-2) -- always called

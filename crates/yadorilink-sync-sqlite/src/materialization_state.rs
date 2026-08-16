@@ -30,6 +30,13 @@ use yadorilink_sqlite_runtime::SyncDatabase;
 /// independently of each other.
 pub type ContentHash = String;
 
+/// Mirrors `peer_session::disk_race_fingerprint`'s own `(len, mtime, ctime,
+/// ctime_nsec)` return shape as a plain tuple, so this lower-level crate
+/// doesn't need a dependency on `yadorilink-peer-session` just for a type
+/// alias -- see [`MaterializationStateRepository::record_materialized_
+/// fingerprint`]'s own doc comment for what this identifies.
+pub type MaterializedFingerprint = (u64, Option<std::time::SystemTime>, i64, i64);
+
 /// Counts of non-deleted files in a group by materialization state --
 /// `yadorilink status`'s per-folder summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1029,6 +1036,89 @@ impl MaterializationStateRepository {
             )?;
             let rows = stmt.query_map([group_id], |r| r.get::<_, String>(0))?;
             Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// M5-A review follow-up (blocker #56): records the disk identity
+    /// (`peer_session::disk_race_fingerprint`'s own `(len, mtime, ctime,
+    /// ctime_nsec)` shape, passed here as a plain tuple to avoid this
+    /// lower-level crate depending on `yadorilink-peer-session`) of the
+    /// exact bytes this process JUST wrote via a successful
+    /// `reconstruct_file`, alongside that same call's `Hydrated`
+    /// transition. `None` (this platform/moment could not produce a
+    /// fingerprint, or the just-written file's own `metadata()` call
+    /// failed) clears every column to NULL rather than leaving a stale
+    /// prior fingerprint behind -- same "never trust a fingerprint this
+    /// exact write didn't itself confirm" discipline as `write_placeholder`
+    /// returning `None` clearing `placeholder_dev`/`placeholder_ino`.
+    pub fn record_materialized_fingerprint(
+        &self,
+        group_id: &str,
+        path: &str,
+        fingerprint: Option<MaterializedFingerprint>,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), SyncSqliteError> {
+        let (len, mtime_nanos, ctime, ctime_nsec) = match fingerprint {
+            Some((len, mtime, ctime, ctime_nsec)) => (
+                Some(len as i64),
+                mtime.and_then(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_nanos() as i64)
+                }),
+                Some(ctime),
+                Some(ctime_nsec),
+            ),
+            None => (None, None, None, None),
+        };
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            permit.verify()?;
+            conn.execute(
+                "UPDATE files SET materialized_fingerprint_len = ?1, \
+                 materialized_fingerprint_mtime_nanos = ?2, materialized_fingerprint_ctime = ?3, \
+                 materialized_fingerprint_ctime_nsec = ?4 \
+                 WHERE group_id = ?5 AND path = ?6 AND state = 'current'",
+                rusqlite::params![len, mtime_nanos, ctime, ctime_nsec, group_id, path],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The materialized-content fingerprint recorded for `group_id`/`path`,
+    /// if any -- `None` if no fingerprint was ever recorded (a pre-existing
+    /// row from before this column existed, or a `Hydrated` row this
+    /// device reached some other way than a verified `reconstruct_file`
+    /// completing) OR the row is not currently `Hydrated`. Every caller
+    /// must treat `None` as "not proven, do not trust the file's current
+    /// bytes as untouched" -- the same fail-closed discipline
+    /// [`Self::get_placeholder_generation`] documents for its own
+    /// identical `materialization_state`-gated shape.
+    pub fn get_materialized_fingerprint(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<MaterializedFingerprint>, SyncSqliteError> {
+        type RawFingerprintRow = (Option<i64>, Option<i64>, Option<i64>, Option<i64>);
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let row: Option<RawFingerprintRow> = conn
+                .query_row(
+                    "SELECT materialized_fingerprint_len, materialized_fingerprint_mtime_nanos, \
+                     materialized_fingerprint_ctime, materialized_fingerprint_ctime_nsec \
+                     FROM files \
+                     WHERE group_id = ?1 AND path = ?2 AND state = 'current' \
+                       AND materialization_state = 'hydrated'",
+                    rusqlite::params![group_id, path],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            Ok(row.and_then(|(len, mtime_nanos, ctime, ctime_nsec)| {
+                let (len, ctime, ctime_nsec) = match (len, ctime, ctime_nsec) {
+                    (Some(len), Some(ctime), Some(ctime_nsec)) => (len, ctime, ctime_nsec),
+                    _ => return None,
+                };
+                let mtime = mtime_nanos.map(|nanos| {
+                    std::time::UNIX_EPOCH + std::time::Duration::from_nanos(nanos as u64)
+                });
+                Some((len as u64, mtime, ctime, ctime_nsec))
+            }))
         })
     }
 }

@@ -1089,22 +1089,39 @@ async fn hydrate_inner(
     // missing) data -- confirmed live: `left: []` (a genuinely empty
     // file) at this exact shortcut.
     //
-    // Non-empty, NOT an exact `current.size` match -- an earlier version
-    // of this check required `metadata.len() == current.size`, which
-    // reintroduced the exact clobber this shortcut exists to prevent: a
-    // local edit that changes the file's LENGTH (the overwhelmingly
-    // common case -- most edits aren't same-size in-place overwrites) no
-    // longer matches the stale indexed size, so the "genuinely missing"
-    // branch below would run and silently discard the edit, caught live
-    // by `hydrate_of_an_already_hydrated_path_is_a_no_op_and_never_
-    // touches_disk`. The only failure mode this shortcut actually needs
-    // to rule out is the empty-leftover-artifact case above, which
-    // `len() > 0` already excludes -- a legitimately zero-byte `Hydrated`
-    // file falling through to a harmless redundant reconstruct (writing
-    // the same empty content back) is an acceptable trade against
-    // destroying real edited content.
-    let has_real_content_on_disk =
-        out_path.metadata().map(|metadata| metadata.len() > 0).unwrap_or(false);
+    // Neither a bare size check (`len() > 0`) nor a size+mtime check
+    // (`len() == current.size`) can distinguish that empty-leftover-
+    // artifact case from a genuine local edit that changes the file's
+    // length OR truncates it to zero bytes before the watcher journals
+    // it -- BOTH look identical to a stateless filesystem observation:
+    // some bytes (or none) that don't match the indexed blocks. Two
+    // earlier versions of this check each closed one of those cases while
+    // reopening the other (see `hydrate_of_an_already_hydrated_path_is_a_
+    // no_op_and_never_touches_disk` for the edit-clobber regression, and
+    // this shortcut's own M5-A finding above for the missing-content
+    // regression). The only sound discriminator is remembering whether
+    // THIS device ever actually, verifiably wrote real bytes here at all
+    // (`record_materialized_fingerprint`, alongside every commit that
+    // materializes content) -- NOT comparing against the current disk
+    // state's exact value, which is deliberately irrelevant to this
+    // decision:
+    // - no fingerprint was ever recorded (a pre-existing row, or a
+    //   `Hydrated` row this device reached some other way than a
+    //   verified reconstruct) -- never proven, fall through and
+    //   re-verify/reconstruct for real;
+    // - a fingerprint WAS recorded -- this device proved it wrote real
+    //   content here at least once, so whatever is on disk NOW (still
+    //   that exact write, OR a local edit of any kind including a
+    //   truncate to zero bytes, OR even a local delete) must never be
+    //   touched by this shortcut -- any further change since then is
+    //   exactly what the local watcher/dirty-detection pipeline exists
+    //   to notice and adopt on its own, not something `hydrate` should
+    //   ever second-guess or "fix".
+    let has_real_content_on_disk = state
+        .replica_coordinator
+        .materialization_state_repository()
+        .get_materialized_fingerprint(group_id, path)?
+        .is_some();
     if state
         .replica_coordinator
         .materialization_state_repository()
@@ -1199,6 +1216,20 @@ async fn hydrate_inner(
                 &record.blocks,
                 record.mtime_unix_nanos,
             )?;
+            // M5-A review follow-up (blocker #56): captured immediately
+            // after the write this device itself just performed --
+            // exactly what the already-`Hydrated` fast path above needs
+            // to recognize "still my own untouched write" later,
+            // regardless of what the file's size/content happen to be.
+            state
+                .replica_coordinator
+                .materialization_state_repository()
+                .record_materialized_fingerprint(
+                    group_id,
+                    path,
+                    disk_identity(&out_path)?,
+                    &root_commit_permit,
+                )?;
             // Apply the owner-executable bit currently recorded for this
             // path (POSIX: real chmod; no-op, no error, on Windows) --
             // hydration is a materialization path just like sync-core's
@@ -2391,8 +2422,156 @@ mod tests {
     /// blocks, silently overwriting any content an editor wrote to disk
     /// after the row was last hydrated but before its own watcher event
     /// reached the index.
+    /// Shared setup for the already-Hydrated-fast-path regressions below:
+    /// links `group-1` at a fresh root, seeds one block, indexes `doc.txt`
+    /// referencing it, and performs a REAL `hydrate_inner` call to
+    /// legitimately reach `Hydrated` -- unlike fabricating the row via a
+    /// direct `set_materialization_state(Hydrated)` call (this test's own
+    /// prior version), going through the real reconstruct path is what
+    /// actually records `record_materialized_fingerprint`'s snapshot,
+    /// without which the fast path always (correctly) falls through as
+    /// "unproven". Returns `(state, sync_state, root_dir, indexed_content)`.
+    async fn setup_legitimately_hydrated_doc(
+    ) -> (Arc<DaemonState>, Arc<ReplicaCoordinator>, tempfile::TempDir, &'static [u8]) {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let root_dir = tempfile::tempdir().unwrap();
+        sync_state
+            .link_repository()
+            .add_link(&root_dir.path().to_string_lossy(), "group-1")
+            .unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            root_dir.path(),
+            "group-1",
+            sync_state.as_ref(),
+        )
+        .unwrap();
+
+        let indexed_content: &'static [u8] = b"indexed content from the last real hydration";
+        let hash = Sha256::digest(indexed_content).to_vec();
+        store.put(indexed_content).unwrap();
+        sync_state
+            .change_history_repository()
+            .record_group_block_provenance("group-1", std::slice::from_ref(&hash))
+            .unwrap();
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        sync_state
+            .file_index_repository()
+            .upsert_file(
+                "group-1",
+                &yadorilink_replica_domain::file::FileRecord {
+                    path: "doc.txt".into(),
+                    size: indexed_content.len() as u64,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![BlockInfo { hash, offset: 0, size: indexed_content.len() as u32 }],
+                    deleted: false,
+                },
+                &permit,
+            )
+            .unwrap();
+        sync_state
+            .materialization_state_repository()
+            .set_materialization_state(
+                "group-1",
+                "doc.txt",
+                MaterializationState::Placeholder,
+                &permit,
+            )
+            .unwrap();
+
+        let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
+        state.install_test_root_commit_authority("group-1");
+        hydrate_inner(&state, "group-1", "doc.txt").await.unwrap();
+        assert_eq!(
+            std::fs::read(root_dir.path().join("doc.txt")).unwrap(),
+            indexed_content,
+            "setup's own real hydrate must have landed the indexed content first"
+        );
+        (state, sync_state, root_dir, indexed_content)
+    }
+
     #[tokio::test]
     async fn hydrate_of_an_already_hydrated_path_is_a_no_op_and_never_touches_disk() {
+        let (state, sync_state, root_dir, _indexed_content) =
+            setup_legitimately_hydrated_doc().await;
+
+        // An unnoticed local edit: disk now differs from the indexed
+        // blocks, but nothing has reprocessed this path through the local
+        // watcher yet. A stray `HydrateRequest` for this same path must
+        // not touch it.
+        let edited_content = b"an editor's unsaved-by-the-index-yet edit";
+        std::fs::write(root_dir.path().join("doc.txt"), edited_content).unwrap();
+
+        hydrate_inner(&state, "group-1", "doc.txt").await.unwrap();
+
+        assert_eq!(
+            std::fs::read(root_dir.path().join("doc.txt")).unwrap(),
+            edited_content,
+            "an already-Hydrated row must never be reconstructed from its indexed blocks"
+        );
+        assert_eq!(
+            sync_state
+                .materialization_state_repository()
+                .get_materialization_state("group-1", "doc.txt")
+                .unwrap(),
+            Some(MaterializationState::Hydrated),
+            "the row's state must be left exactly as it was"
+        );
+    }
+
+    /// M5-A review follow-up (blocker #56): the specific failure mode a
+    /// bare `len() > 0`/`len() == indexed size` check cannot catch -- a
+    /// local edit that truncates the file to EXACTLY ZERO bytes before the
+    /// watcher journals it. Both prior versions of this shortcut treated
+    /// zero bytes as "not real content" and reconstructed over it,
+    /// silently destroying the truncation. The persisted-fingerprint
+    /// check must recognize the file was legitimately hydrated once and
+    /// has since been touched (regardless of its new size, including
+    /// zero) and refuse to touch it again.
+    #[tokio::test]
+    async fn hydrate_never_overwrites_a_local_edit_that_truncates_the_file_to_zero_bytes() {
+        let (state, sync_state, root_dir, _indexed_content) =
+            setup_legitimately_hydrated_doc().await;
+
+        // The local edit: truncate to zero bytes, exactly as a `truncate`/
+        // `ftruncate`/editor-clear-and-not-yet-saved sequence would leave
+        // it -- WITHOUT updating the indexed version, simulating the
+        // window before the local watcher/debounce pipeline has caught up.
+        std::fs::write(root_dir.path().join("doc.txt"), b"").unwrap();
+
+        hydrate_inner(&state, "group-1", "doc.txt").await.unwrap();
+
+        assert_eq!(
+            std::fs::read(root_dir.path().join("doc.txt")).unwrap(),
+            b"",
+            "a zero-byte local edit must never be silently overwritten with the stale indexed \
+             content"
+        );
+        assert_eq!(
+            sync_state
+                .materialization_state_repository()
+                .get_materialization_state("group-1", "doc.txt")
+                .unwrap(),
+            Some(MaterializationState::Hydrated),
+            "the row's state must be left exactly as it was -- local capture picks this edit up \
+             normally on its own next pass, exactly like any other local edit"
+        );
+    }
+
+    /// The companion invariant blocker #56 also requires retained: a
+    /// `Hydrated` row whose bytes were never actually, legitimately
+    /// written by this device (no fingerprint was ever recorded for it --
+    /// the exact "restart-mid-relay-sync" race the ORIGINAL M5-A finding
+    /// this shortcut exists to fix) must still fall through to a real
+    /// reconstruct, not be mistaken for an untouchable local edit. Unlike
+    /// the two regressions above, this deliberately does NOT go through
+    /// `setup_legitimately_hydrated_doc`'s real hydrate call -- it
+    /// fabricates exactly the row shape that call never produces (Hydrated
+    /// with no recorded fingerprint), the same way the original version of
+    /// this test file's setup used to.
+    #[tokio::test]
+    async fn hydrate_reconstructs_a_hydrated_row_with_no_recorded_fingerprint() {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
         let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
@@ -2430,6 +2609,10 @@ mod tests {
                 &permit,
             )
             .unwrap();
+        // Directly marked Hydrated with NO reconstruct ever having run --
+        // no fingerprint gets recorded this way, matching the real race
+        // this simulates: the index believes this row is Hydrated, but
+        // this device never actually, verifiably wrote the bytes itself.
         sync_state
             .materialization_state_repository()
             .set_materialization_state(
@@ -2439,13 +2622,10 @@ mod tests {
                 &permit,
             )
             .unwrap();
-
-        // An unnoticed local edit: disk now differs from the indexed
-        // blocks, but nothing has reprocessed this path through the local
-        // watcher yet. A stray `HydrateRequest` for this same path must
-        // not touch it.
-        let edited_content = b"an editor's unsaved-by-the-index-yet edit";
-        std::fs::write(root_dir.path().join("doc.txt"), edited_content).unwrap();
+        // A genuinely empty leftover artifact, exactly like the confirmed
+        // restart-mid-relay-sync race this shortcut was originally built
+        // to fix.
+        std::fs::write(root_dir.path().join("doc.txt"), b"").unwrap();
 
         let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
         state.install_test_root_commit_authority("group-1");
@@ -2453,16 +2633,9 @@ mod tests {
 
         assert_eq!(
             std::fs::read(root_dir.path().join("doc.txt")).unwrap(),
-            edited_content,
-            "an already-Hydrated row must never be reconstructed from its indexed blocks"
-        );
-        assert_eq!(
-            sync_state
-                .materialization_state_repository()
-                .get_materialization_state("group-1", "doc.txt")
-                .unwrap(),
-            Some(MaterializationState::Hydrated),
-            "the row's state must be left exactly as it was"
+            indexed_content,
+            "a Hydrated row with no proven fingerprint must fall through and actually \
+             reconstruct the real content, not be mistaken for an untouchable local edit"
         );
     }
 

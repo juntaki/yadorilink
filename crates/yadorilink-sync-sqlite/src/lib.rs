@@ -55,7 +55,7 @@ pub use error::SyncSqliteError;
 pub use handoff_lease::HandoffLeaseRepository;
 pub use materialization_job_repository::MaterializationJobRepository;
 pub use materialization_state::{
-    ContentHash, MaterializationCounts, MaterializationStateRepository,
+    ContentHash, MaterializationCounts, MaterializationStateRepository, MaterializedFingerprint,
     RecordedPlaceholderGeneration,
 };
 pub use materialization_state_port::{
