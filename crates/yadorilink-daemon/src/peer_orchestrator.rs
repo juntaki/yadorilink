@@ -91,6 +91,13 @@ struct NetmapDiffState {
     /// `DaemonState::sessions`' own insert-on-connect,
     /// removed-on-session-end lifecycle).
     channels: Arc<StdMutex<HashMap<String, Arc<PeerChannel>>>>,
+    /// M5-A review follow-up (blocker #55): device_id -> the highest
+    /// `session_index`-derived generation that has ever successfully
+    /// published into `channels` for that peer -- see
+    /// `insert_channel_revoking_superseded`'s own doc comment for why an
+    /// out-of-order (older) generation publishing SECOND must be
+    /// rejected outright, not merely revoked after the fact.
+    channel_generations: Arc<StdMutex<HashMap<String, u32>>>,
     /// device_id -> the `JoinHandle` for its `spawn_peer_session` task, so
     /// a whole-device revocation can abort the in-flight
     /// `PeerSyncSession::run` (and whatever it's mid-request on)
@@ -215,7 +222,40 @@ impl NetmapDiffState {
     /// up yet), confirmed live via the soak lane's rapid repeated-
     /// restart chaos leaving a peer's session permanently stuck, unable
     /// to ever re-handshake.
-    fn insert_channel_revoking_superseded(&self, device_id: String, channel: Arc<PeerChannel>) {
+    ///
+    /// M5-A review follow-up (blocker #55): `generation` is
+    /// `spawn_peer_session`'s own `session_index`-derived per-attempt
+    /// counter (monotonically increasing DAEMON-WIDE, not per-peer, but
+    /// still a valid real-time ordering signal for any one peer's own
+    /// sequence of attempts). Returns `false` -- doing nothing at all,
+    /// no insert, no revoke -- if a generation `>=` this one has already
+    /// published for `device_id`, closing the ABA window an earlier
+    /// version of this fix left open: two overlapping supervisor
+    /// generations for the same peer, where the OLDER one's publish
+    /// lands SECOND in real time (a plausible ordering under real
+    /// restart/reconnect chaos, not just a theoretical race) used to let
+    /// the stale generation win outright, revoking the genuinely live,
+    /// newer channel. `DaemonState::set_direct_channel`'s own mirror
+    /// independently applies the SAME `generation` guard against its own
+    /// `direct_channel_generations` map -- deliberately not made to
+    /// depend on this method's own accept/reject outcome, since the two
+    /// maps are updated by two separate lock acquisitions at the call
+    /// site and an even-newer generation could win the primary map's
+    /// race in the gap between them; each map converging independently
+    /// on the highest generation it has ever seen is what makes the
+    /// final state consistent regardless of call order.
+    fn insert_channel_revoking_superseded(
+        &self,
+        device_id: String,
+        channel: Arc<PeerChannel>,
+        generation: u32,
+    ) -> bool {
+        let mut generations =
+            self.channel_generations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if generations.get(&device_id).is_some_and(|&recorded| recorded >= generation) {
+            return false;
+        }
+        generations.insert(device_id.clone(), generation);
         let superseded = self
             .channels
             .lock()
@@ -226,6 +266,7 @@ impl NetmapDiffState {
                 superseded.revoke();
             }
         }
+        true
     }
 
     fn new() -> Self {
@@ -233,6 +274,7 @@ impl NetmapDiffState {
             previous: Arc::new(StdMutex::new(HashMap::new())),
             last_snapshot_generation: Arc::new(StdMutex::new(None)),
             channels: Arc::new(StdMutex::new(HashMap::new())),
+            channel_generations: Arc::new(StdMutex::new(HashMap::new())),
             session_tasks: Arc::new(StdMutex::new(HashMap::new())),
             punch_limiter: Arc::new(StdMutex::new(PunchLimiter::new(PunchConfig::default()))),
             desired_peers: Arc::new(StdMutex::new(HashMap::new())),
@@ -2015,10 +2057,17 @@ async fn run_one_peer_session_attempt(
     // superseded`'s own doc comment for why a plain `insert` here is
     // unsafe -- confirmed live via the soak lane's rapid repeated-
     // restart chaos leaving a peer's session permanently stuck.
-    diff_state.insert_channel_revoking_superseded(peer_device_id.to_string(), channel.clone());
+    diff_state.insert_channel_revoking_superseded(
+        peer_device_id.to_string(),
+        channel.clone(),
+        session_index,
+    );
     // M3 Pass 5: mirrors the insert above onto `DaemonState` -- see
-    // `DaemonState::set_direct_channel`'s own doc comment.
-    state.set_direct_channel(peer_device_id.to_string(), channel.clone());
+    // `DaemonState::set_direct_channel`'s own doc comment. Independently
+    // generation-guarded (blocker #55), not gated on the primary
+    // insert's own accept/reject result -- see that method's doc comment
+    // for why.
+    state.set_direct_channel(peer_device_id.to_string(), channel.clone(), session_index);
 
     // Reflect the channel's live reachability into status: it starts
     // `Connecting` while candidates race, becomes `Connected` once a
@@ -2576,7 +2625,11 @@ async fn run_one_direct_peer_session_attempt(
 
     // See `insert_channel_revoking_superseded`'s own doc comment (M5-A
     // soak-closure finding) for why a plain `insert` here is unsafe.
-    diff_state.insert_channel_revoking_superseded(peer_device_id.to_string(), channel.clone());
+    diff_state.insert_channel_revoking_superseded(
+        peer_device_id.to_string(),
+        channel.clone(),
+        session_index,
+    );
 
     // Reflect the channel's live reachability into status: it starts
     // `Connecting` while candidates race, becomes `Connected` once a
@@ -3651,8 +3704,16 @@ mod tests {
         // against the plain `HashMap`/`insert` directly (as it read
         // before the M5-A soak-closure fix) would make this test pass
         // for a bug production no longer has.
-        diff_state.insert_channel_revoking_superseded("device-b".to_string(), old_channel.clone());
-        diff_state.insert_channel_revoking_superseded("device-b".to_string(), new_channel.clone());
+        assert!(diff_state.insert_channel_revoking_superseded(
+            "device-b".to_string(),
+            old_channel.clone(),
+            1
+        ));
+        assert!(diff_state.insert_channel_revoking_superseded(
+            "device-b".to_string(),
+            new_channel.clone(),
+            2
+        ));
         assert!(
             old_channel.is_revoked(),
             "a channel silently replaced by a newer generation's insert must be revoked -- \
@@ -3688,6 +3749,73 @@ mod tests {
                 .get("device-b")
                 .is_none(),
             "the entry must actually be gone once the current generation's own cleanup runs"
+        );
+    }
+
+    /// M5-A review follow-up (blocker #55): the ABA race an earlier version
+    /// of the zombie-channel fix left open -- the primary map
+    /// (`NetmapDiffState::channels`) and its mirror (`DaemonState::
+    /// direct_channels`) are updated by two SEPARATE lock acquisitions, so
+    /// a stale (older) generation's publish landing SECOND in real time
+    /// could win the mirror's own revoke-superseded race even after having
+    /// already lost the primary map's. Sequence: A publishes (generation
+    /// 1) to the primary map; B publishes (generation 2) to the primary
+    /// map, correctly superseding A there; B's own mirror publish lands;
+    /// finally A's STALE mirror publish arrives late (its own generation 1
+    /// again, now well behind the mirror's already-recorded generation 2)
+    /// -- must be rejected outright (no insert, no revoke), not silently
+    /// win because the mirror is a separate map with no memory of what the
+    /// primary map already decided.
+    #[tokio::test]
+    async fn stale_generation_publish_cannot_revoke_a_newer_channel_in_either_map() {
+        let state = test_state();
+        let diff_state = NetmapDiffState::new();
+        let a_channel = fake_channel().await;
+        let b_channel = fake_channel().await;
+
+        // A primary publish.
+        assert!(diff_state.insert_channel_revoking_superseded(
+            "device-b".to_string(),
+            a_channel.clone(),
+            1
+        ));
+        // B primary publish -- correctly supersedes A in the primary map.
+        assert!(diff_state.insert_channel_revoking_superseded(
+            "device-b".to_string(),
+            b_channel.clone(),
+            2
+        ));
+        // B mirror publish.
+        state.set_direct_channel("device-b".to_string(), b_channel.clone(), 2);
+        // A stale mirror publish -- must be rejected by the mirror's own
+        // independent generation guard.
+        state.set_direct_channel("device-b".to_string(), a_channel.clone(), 1);
+
+        assert!(
+            !b_channel.is_revoked(),
+            "B must remain live -- a stale generation's publish must never revoke the current \
+             channel in either map"
+        );
+        assert!(
+            a_channel.is_revoked(),
+            "A was correctly superseded (and revoked) by B's own primary-map publish -- this is \
+             the pre-existing, already-correct half of the fix"
+        );
+        assert_eq!(
+            diff_state
+                .channels
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get("device-b")
+                .map(|c| Arc::ptr_eq(c, &b_channel)),
+            Some(true),
+            "the primary map must still hold B"
+        );
+        assert_eq!(
+            state.direct_channel("device-b").map(|c| Arc::ptr_eq(&c, &b_channel)),
+            Some(true),
+            "the mirror (the direct-route view RelaySessionHandler consults) must still hold B \
+             too -- A's stale publish must not have replaced it, and the two maps must agree"
         );
     }
 
