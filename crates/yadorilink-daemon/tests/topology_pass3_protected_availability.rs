@@ -29,7 +29,7 @@
 
 mod support;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use support::fake_coordination::FakeCoordination;
 use support::topology::stand_up_topology_two_full_replicas_one_on_demand;
@@ -126,57 +126,7 @@ async fn protected_and_available_now_reflect_a_confirmed_remote_holder_not_local
         Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder),
         "W must still be unhydrated at the moment fetch_availability is asserted"
     );
-    let socket_dir = tempfile::tempdir().unwrap();
-    let control_socket_path = socket_dir.path().join("w-daemon.sock");
-    let serve_path = control_socket_path.clone();
-    let w_state_for_serve = w.state.clone();
-    tokio::spawn(async move {
-        let _ = yadorilink_daemon::control_socket::unix_transport::serve(
-            &serve_path,
-            std::sync::Arc::new(yadorilink_daemon::control_context::ControlContext::from_state(
-                w_state_for_serve,
-            )),
-        )
-        .await;
-    });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !control_socket_path.exists() {
-        if Instant::now() >= deadline {
-            panic!("w's control socket never came up within 10s");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    let mut stream = tokio::net::UnixStream::connect(&control_socket_path).await.unwrap();
-    yadorilink_ipc_proto::framing::write_message(
-        &mut stream,
-        &yadorilink_ipc_proto::daemonctl::DaemonControlRequest {
-            payload: Some(
-                yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload::Status(
-                    yadorilink_ipc_proto::daemonctl::StatusRequest {},
-                ),
-            ),
-            protocol_version: yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION,
-        },
-    )
-    .await
-    .unwrap();
-    let resp = yadorilink_ipc_proto::framing::read_message::<
-        yadorilink_ipc_proto::daemonctl::DaemonControlResponse,
-    >(&mut stream)
-    .await
-    .unwrap()
-    .unwrap();
-    let Some(yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload::Status(status)) =
-        resp.payload
-    else {
-        panic!("expected a Status response, got {:?}", resp.payload);
-    };
-    let w_link = status
-        .links
-        .iter()
-        .find(|l| l.group_id == group_id)
-        .expect("W's real control socket must report the shared group");
+    let w_link = support::control_socket_client::query_link_status(w.state.clone(), group_id).await;
 
     assert_eq!(
         w_link.local_storage_state(),
