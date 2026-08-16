@@ -84,6 +84,41 @@
 # M/W-both-refuse scenario now converges faster, since both are asked in
 # the same sweep instead of one per sweep).
 #
+# Issue #58 (a FIFTH soak-closure finding, surfaced after the four above
+# were already fixed): seed 6046481562379271917 failed with durability
+# stuck `Protecting` on a full-replica device (N) for two conflict-copy
+# placeholder paths, ~694s past the settle window, with `known_
+# unobtainable_required_content: false` -- reproduced locally with a
+# new `DaemonState::dump_durability_diagnostics` capture (added
+# specifically so this class of finding never again needs a blind
+# multi-hundred-second rerun to diagnose) on the 10th of 15 local
+# attempts, confirming this is timing-sensitive but not a rare tail
+# flake at that hit rate. Root cause: `has_known_unobtainable_required_
+# content`'s Fact 3 exempted a path's recorded `origin_device_id` from
+# ever needing to explicitly refuse, purely on still being a current
+# writer -- with no way for that exemption to ever lift. The diagnostic
+# dump showed the recorded origin (M) WAS present in that exact path's
+# `refusing_peers_for_path` evidence (an explicit `FetchOutcome::
+# Rejected`), yet Fact 3's blanket exemption never looked. This is
+# reachable in real production: `apply_locked_record`'s `incoming_
+# origin` falls back to attributing origin to the RELAYING peer
+# whenever that peer's own `get_origin_device_id` lookup for the path
+# came back empty, so a relayed conflict copy can end up with `origin_
+# device_id` pointing at a peer that never actually held the content --
+# while the true original author (encoded in the conflict-copy
+# filename, here a spare device that had since left the group) is
+# invisible to this check entirely, since only the netmap-current-
+# writer set is ever consulted. Fixed by gathering refusal evidence
+# before the Fact 3 check and only exempting the origin when it is BOTH
+# a current writer AND has not itself explicitly refused; Fact 4's
+# separate origin carve-out is removed too, since a present-but-refused
+# origin is already correctly counted via `refusers.contains`. Ground
+# truth cross-check (every OTHER in-process node's own `block_store`,
+# captured in the same diagnostic dump) confirmed no peer anywhere
+# actually held the blocks -- this was a genuine, permanent
+# unobtainable-content case that the fixed check now correctly routes
+# to `AtRisk` instead of leaving stuck at `Protecting` forever.
+#
 # Kept as permanent regression coverage now that all findings are fixed.
 922972317807886136
 16612994462990444375
@@ -92,3 +127,4 @@
 17132986931368163713
 3746878857549989852
 11103395572848290591
+6046481562379271917

@@ -835,6 +835,13 @@ async fn run_soak(seed: u64) {
     // above, since durability confirmation depends on the same peer
     // traffic that invariant 2 waits on.
     let mut stuck = Vec::new();
+    // Issue #58: transition history of `dump_durability_diagnostics` for
+    // every currently-stuck node, sampled at coarse (10s) intervals rather
+    // than every 500ms poll -- fine enough to see the fact set actually
+    // change over the settle window, coarse enough not to drown the final
+    // failure output in near-duplicate snapshots.
+    let mut diagnostic_history: Vec<String> = Vec::new();
+    let mut last_snapshot_at: Option<Instant> = None;
     let stuck_deadline = Instant::now() + SETTLE_TIMEOUT;
     loop {
         stuck.clear();
@@ -844,10 +851,79 @@ async fn run_soak(seed: u64) {
                 stuck.push(node.device_id.clone());
             }
         }
-        if stuck.is_empty() || Instant::now() >= stuck_deadline {
+        let past_deadline = Instant::now() >= stuck_deadline;
+        let should_snapshot = !stuck.is_empty()
+            && (past_deadline
+                || last_snapshot_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)));
+        if should_snapshot {
+            last_snapshot_at = Some(Instant::now());
+            for node in &all_nodes {
+                if stuck.contains(&node.device_id) {
+                    diagnostic_history.push(format!(
+                        "[t={:?} past_deadline={past_deadline}]\n{}",
+                        settle_start.elapsed(),
+                        node.state.dump_durability_diagnostics(&world.group_id)
+                    ));
+                }
+            }
+        }
+        if stuck.is_empty() || past_deadline {
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if !stuck.is_empty() {
+        // Issue #58 ground truth: for every path a stuck node is still
+        // treating as a repair candidate, does ANY currently-online OTHER
+        // node's block store actually hold the required blocks? All nodes
+        // are in-process here, so this is checkable directly rather than
+        // inferred from `block_fetch_refusals` evidence alone.
+        for stuck_id in &stuck {
+            let Some(stuck_node) = all_nodes.iter().find(|n| &n.device_id == stuck_id) else {
+                continue;
+            };
+            let paths = stuck_node
+                .state
+                .replica_coordinator
+                .materialization_state_repository()
+                .list_materialization_repair_candidates(&world.group_id)
+                .unwrap_or_default();
+            for path in &paths {
+                let Ok(Some(record)) = stuck_node
+                    .state
+                    .replica_coordinator
+                    .file_index_repository()
+                    .get_file(&world.group_id, path)
+                else {
+                    continue;
+                };
+                let hashes: Vec<_> = record.blocks.iter().map(|b| hex::encode(&b.hash)).collect();
+                let mut holders = Vec::new();
+                for other in &all_nodes {
+                    if &other.device_id == stuck_id {
+                        continue;
+                    }
+                    if let Ok(present) = other.state.block_store.present_blocks(&hashes) {
+                        if present.iter().all(|p| *p) {
+                            holders.push(other.device_id.clone());
+                        }
+                    }
+                }
+                diagnostic_history.push(format!(
+                    "[ground truth] {stuck_id}'s candidate path {path:?} \
+                     ({} blocks): fully held by: {holders:?}",
+                    hashes.len()
+                ));
+            }
+        }
+        eprintln!(
+            "=== issue #58 durability diagnostics ({} snapshots) ===",
+            diagnostic_history.len()
+        );
+        for snapshot in &diagnostic_history {
+            eprintln!("{snapshot}");
+        }
+        eprintln!("=== end issue #58 durability diagnostics ===");
     }
     assert!(
         stuck.is_empty(),
