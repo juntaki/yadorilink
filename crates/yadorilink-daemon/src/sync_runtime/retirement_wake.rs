@@ -42,7 +42,10 @@ impl RetirementWake {
     /// one re-evaluation, exactly the coalescing behavior a retirement
     /// audit storm needs.
     pub fn mark_dirty(&self, group_id: &str) {
-        self.dirty.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(group_id.to_string());
+        self.dirty
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(group_id.to_string());
         self.notify.notify_one();
     }
 
