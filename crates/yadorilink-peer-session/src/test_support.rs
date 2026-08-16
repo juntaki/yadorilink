@@ -51,7 +51,7 @@ use yadorilink_replica_domain::session_state::{
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 
 use crate::error::PeerSessionError;
-use crate::ports::{OpenMaterializationIntent, PeerReplicaStatePort};
+use crate::ports::{MaterializedFingerprint, OpenMaterializationIntent, PeerReplicaStatePort};
 
 /// Per-`(group_id, path)` bookkeeping this fake tracks -- every column
 /// `PeerReplicaStatePort` exposes a getter/setter for, flattened into one
@@ -588,6 +588,18 @@ impl PeerReplicaStatePort for FakeReplicaState {
         }
         row.materialization_state = Some(next);
         Ok(true)
+    }
+
+    fn record_materialized_fingerprint(
+        &self,
+        _group_id: &str,
+        _path: &str,
+        _fingerprint: Option<MaterializedFingerprint>,
+        _permit: &RootCommitPermit<'_>,
+    ) -> Result<(), PeerSessionError> {
+        // No fake-state consumer needs this yet -- mirrors this mock's
+        // existing footprint for other write-only accessors.
+        Ok(())
     }
 
     fn record_placeholder_generation(

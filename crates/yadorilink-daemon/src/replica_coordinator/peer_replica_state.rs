@@ -209,6 +209,19 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
             .map_err(PeerSessionError::from)
     }
 
+    fn record_materialized_fingerprint(
+        &self,
+        group_id: &str,
+        path: &str,
+        fingerprint: Option<yadorilink_sync_sqlite::MaterializedFingerprint>,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), PeerSessionError> {
+        self.materialization_state_repository()
+            .record_materialized_fingerprint(group_id, path, fingerprint, permit)
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
     fn record_placeholder_generation(
         &self,
         group_id: &str,

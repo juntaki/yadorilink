@@ -697,6 +697,34 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
         "ALTER TABLE files ADD COLUMN placeholder_dev INTEGER",
         "ALTER TABLE files ADD COLUMN placeholder_ino INTEGER",
         "ALTER TABLE files ADD COLUMN placeholder_provider_kind TEXT",
+        // M5-A review follow-up (blocker #56): the already-`Hydrated`
+        // fast path in `hydrate_inner` used to infer "still the real
+        // materialization, safe to skip" from a bare `metadata.len() > 0`
+        // check -- indistinguishable from a genuine local edit that
+        // truncates the file to zero bytes before the watcher journals
+        // it, silently destroying that edit. A size-only OR even a
+        // size+mtime check cannot fix this either: BOTH a real edit and a
+        // genuinely-missing/corrupted leftover artifact look the same
+        // from a stateless filesystem observation alone -- the only sound
+        // discriminator is remembering, from this process's OWN last
+        // successful write, what the disk object looked like right after
+        // that write completed, then comparing NOW against THAT specific
+        // snapshot rather than re-deriving an expectation from the index
+        // alone. Reuses `peer_session::disk_race_fingerprint`'s own
+        // `(len, mtime, ctime, ctime_nsec)` shape -- the exact tuple
+        // already used elsewhere in this codebase to detect "did this
+        // path change since I last looked" -- captured immediately after
+        // a successful `reconstruct_file` call and persisted alongside
+        // the `Hydrated` transition. All four NULLable with no default,
+        // same "NULL means not proven, fail closed" discipline as
+        // `placeholder_dev`/`placeholder_ino` above: every pre-existing
+        // `Hydrated` row gets NULL, so hydrate_inner's shortcut falls
+        // through to a real re-verification for it rather than trusting
+        // an identity that was never actually captured.
+        "ALTER TABLE files ADD COLUMN materialized_fingerprint_len INTEGER",
+        "ALTER TABLE files ADD COLUMN materialized_fingerprint_mtime_nanos INTEGER",
+        "ALTER TABLE files ADD COLUMN materialized_fingerprint_ctime INTEGER",
+        "ALTER TABLE files ADD COLUMN materialized_fingerprint_ctime_nsec INTEGER",
     ] {
         match conn.execute(stmt, []) {
             Ok(_) => {}

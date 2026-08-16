@@ -8078,6 +8078,17 @@ impl PeerSyncSession {
         // `preflight_disk_headroom`'s doc comment.
         self.preflight_disk_headroom(group_id, &out_path, record.size)?;
         reconstruct_file(self.store.as_ref(), &out_path, &record.blocks, record.mtime_unix_nanos)?;
+        // M5-A review follow-up (blocker #56): captured immediately after
+        // this device's own write -- see `MaterializationStateRepository::
+        // record_materialized_fingerprint`'s own doc comment for what the
+        // daemon's already-`Hydrated` fast path
+        // (`hydration.rs::hydrate_inner`) needs this for.
+        self.state.record_materialized_fingerprint(
+            group_id,
+            path,
+            disk_race_fingerprint(&out_path),
+            &root_commit_permit,
+        )?;
         // Apply the owner-executable bit
         // currently recorded for this path (POSIX: real chmod; no-op,
         // no error, on Windows) — hydration is a materialization path
@@ -9684,6 +9695,18 @@ impl PeerSyncSession {
                 // branch above).
                 return Ok(MaterializeResult::RetryRequired);
             }
+            // M5-A review follow-up (blocker #56): captured immediately
+            // after this device's own successful reconstruct -- see
+            // `MaterializationStateRepository::record_materialized_
+            // fingerprint`'s own doc comment for what the daemon's
+            // already-`Hydrated` fast path (`hydration.rs::hydrate_inner`)
+            // needs this for.
+            self.state.record_materialized_fingerprint(
+                group_id,
+                &record.path,
+                disk_race_fingerprint(&out_path),
+                &root_commit_permit,
+            )?;
             // The temp-write-then-rename completed durably — clear the intent
             // NOW, before the post-write metadata touch below. Clearing only
             // after `apply_exec_bit` would leak the intent whenever reading or
