@@ -9279,7 +9279,7 @@ impl PeerSyncSession {
             // delayed even while both buckets are saturated" precedent.
             let all_present = tokio::time::timeout(
                 DEFAULT_HYDRATION_TIMEOUT,
-                self.ensure_blocks_present(group_id, &record.path, &record),
+                self.ensure_blocks_present(group_id, &record.path, record),
             )
             .await
             .map_err(|_elapsed| PeerSessionError::HydrationFailed(record.path.clone()))??;
