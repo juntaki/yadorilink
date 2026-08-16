@@ -532,7 +532,11 @@ fn placeholder_node() -> TopologyNode {
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    // sha2 0.11's `finalize()` output type no longer implements
+    // `std::fmt::LowerHex` directly (it did on 0.10) -- `hex::encode`
+    // works for any `AsRef<[u8]>`, matching how this crate already
+    // hex-encodes every other hash everywhere else.
+    hex::encode(hasher.finalize())
 }
 
 /// Hashes every regular file directly under `root` (this soak's candidate
