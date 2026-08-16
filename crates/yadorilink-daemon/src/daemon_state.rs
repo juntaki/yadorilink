@@ -2252,6 +2252,8 @@ impl DaemonState {
                 .any_other_full_replica_peer_configured(group_id),
             peer_confirmed_custody: self.has_fresh_custody_confirmation(group_id),
             ever_confirmation_swept: self.has_ever_been_custody_swept(group_id),
+            known_unobtainable_required_content: self
+                .has_known_unobtainable_required_content(group_id),
         };
         tracing::debug!(
             local_device_id = %self.device_id,
@@ -3070,6 +3072,89 @@ impl DaemonState {
         metadata.full_replicas.iter().any(|(device_id, gid)| {
             gid == group_id && metadata.writers.contains(&(device_id.clone(), gid.clone()))
         })
+    }
+
+    /// Every device id currently netmap-authorized as a WRITER (any
+    /// storage mode, not just full-replica) for `group_id` -- the
+    /// authoritative "who could theoretically still hold this group's
+    /// content" candidate set `known_unobtainable_required_content`
+    /// checks membership departure against. Unlike `full_replica_
+    /// devices_for_group`, not filtered to full replicas: an OnDemand
+    /// device that authored a conflict copy is still its origin, and
+    /// still a current member until it genuinely leaves.
+    fn current_group_writers(&self, group_id: &str) -> HashSet<String> {
+        let metadata = self.peer_netmap_metadata.lock().unwrap_or_else(|p| p.into_inner());
+        metadata
+            .writers
+            .iter()
+            .filter(|(_, gid)| gid == group_id)
+            .map(|(device_id, _)| device_id.clone())
+            .collect()
+    }
+
+    /// M5-A soak-closure durability investigation: positively confirms
+    /// (never merely infers from connectivity) that at least one of this
+    /// group's currently-required (repair-candidate) paths has no
+    /// obtainable/durable holder among current membership -- see
+    /// `DurabilityFacts::known_unobtainable_required_content`'s own doc
+    /// comment for the full definition and the four facts this proves
+    /// before returning `true`. Only meaningful for a local full replica:
+    /// an OnDemand device's own `Placeholder` rows are its ordinary
+    /// steady state, not a durability signal.
+    fn has_known_unobtainable_required_content(&self, group_id: &str) -> bool {
+        if !self.is_local_full_replica(group_id) {
+            return false;
+        }
+        let Ok(paths) = self
+            .replica_coordinator
+            .materialization_state_repository()
+            .list_materialization_repair_candidates(group_id)
+        else {
+            return false;
+        };
+        if paths.is_empty() {
+            return false;
+        }
+        let current_writers = self.current_group_writers(group_id);
+        for path in &paths {
+            // Facts 1+2 (still DAG-justified, missing locally) are
+            // implied by `path` being a repair candidate at all --
+            // `list_materialization_repair_candidates`'s own WHERE
+            // clause already requires `state = 'current'`, `deleted = 0`,
+            // and `placeholder`/`hydrating`.
+            let Ok(Some(origin_device_id)) = self
+                .replica_coordinator
+                .file_index_repository()
+                .get_origin_device_id(group_id, path)
+            else {
+                continue;
+            };
+            // Fact 3: the presumed sole holder (this path's origin) has
+            // left authoritative membership -- a real departure, not
+            // mere offline-ness. Still a current writer => still a
+            // plausible holder => never AtRisk from this path alone.
+            if current_writers.contains(&origin_device_id) {
+                continue;
+            }
+            // Fact 4: every OTHER current writer has EXPLICITLY,
+            // definitively refused this exact path (never inferred from
+            // an untried/offline writer's silence -- see
+            // `block_fetch_refusals`'s own schema doc comment).
+            let Ok(refusers) = self
+                .replica_coordinator
+                .materialization_state_repository()
+                .refusing_peers_for_path(group_id, path)
+            else {
+                continue;
+            };
+            let unaccounted_for = current_writers.iter().any(|id| {
+                id != &self.device_id && id != &origin_device_id && !refusers.contains(id)
+            });
+            if !unaccounted_for {
+                return true;
+            }
+        }
+        false
     }
 
     /// M4 Pass 3: every device OTHER than this one currently recorded

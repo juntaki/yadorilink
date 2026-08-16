@@ -863,6 +863,21 @@ impl PeerReplicaStatePort for FakeReplicaState {
         Ok(())
     }
 
+    fn record_block_fetch_refusal(
+        &self,
+        _group_id: &str,
+        _path: &str,
+        _peer_device_id: &str,
+        _reason: &str,
+        _refused_at_unix_nanos: i64,
+    ) -> Result<(), PeerSessionError> {
+        // No fake-state consumer needs this yet -- the real, persistent
+        // implementation lives in `yadorilink-daemon`'s `ReplicaCoordinator`
+        // (see `DurabilityFacts::known_unobtainable_required_content`'s own
+        // doc comment). A no-op here matches this mock's existing footprint.
+        Ok(())
+    }
+
     fn dag_group_heads(&self, group_id: &str) -> Result<Vec<ChangeHash>, PeerSessionError> {
         Ok(self.lock().groups.get(group_id).map(|g| g.heads.clone()).unwrap_or_default())
     }

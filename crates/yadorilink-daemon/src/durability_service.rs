@@ -188,6 +188,27 @@ pub struct DurabilityFacts {
     /// before the very first sweep has even had a chance to run (M4 Codex
     /// review #1 findings #1/#2, most visible right after daemon startup).
     pub ever_confirmation_swept: bool,
+    /// M5-A soak-closure durability investigation: positively confirmed,
+    /// not merely inferred from connectivity/timing, that at least one
+    /// currently-required path's content has NO obtainable/durable holder
+    /// among this group's CURRENT authoritative membership -- distinct
+    /// from `materialization`'s bare "still Partial locally", which alone
+    /// cannot tell "still trying, may yet succeed" apart from "genuinely,
+    /// permanently gone". Computed by `DaemonState::group_durability_
+    /// status` from real evidence for each locally-required (repair-
+    /// candidate) path: (1) it is still DAG-justified and (2) missing
+    /// locally -- both implied by being a repair candidate at all; (3) its
+    /// origin device is no longer a netmap-authorized writer for this
+    /// group (a real membership departure, not mere offline-ness); and
+    /// (4) every OTHER currently-authorized writer has EXPLICITLY,
+    /// definitively refused a fetch for this exact path
+    /// (`block_fetch_refusals`, written only on `FetchOutcome::Rejected`,
+    /// never on a transient `NotFound`/`TimedOut`/`Busy` miss). An
+    /// offline-but-still-authorized writer that has simply never been
+    /// asked leaves this `false` (Unknown/Protecting territory, not
+    /// AtRisk) -- see `classify`'s own doc comment for why this must
+    /// never be inferred from connectivity alone.
+    pub known_unobtainable_required_content: bool,
 }
 
 /// Derives a group's durability status from `facts` alone, in the exact
@@ -208,9 +229,16 @@ pub struct DurabilityFacts {
 ///    known insufficient, checked before falling back to "still catching
 ///    up" so a lone full replica with no peer never reports `Protecting` as
 ///    if a peer confirmation were merely pending).
-/// 5. This device is itself a full replica still catching up locally ->
+/// 5. `known_unobtainable_required_content` -> `AtRisk` (M5-A soak-closure:
+///    positively confirmed, not inferred from connectivity alone, that
+///    some currently-required content has no obtainable holder among
+///    current membership -- checked before falling back to `Protecting`
+///    for the identical reason as step 4: this is a known-insufficient
+///    conclusion, not a "still catching up" one, even though local
+///    materialization is also `Partial` in this case).
+/// 6. This device is itself a full replica still catching up locally ->
 ///    `Protecting`.
-/// 6. Otherwise -> `Unknown` (a peer full replica is configured
+/// 7. Otherwise -> `Unknown` (a peer full replica is configured
 ///    but no fresh confirmation exists yet — e.g. an On-Demand device
 ///    waiting on the next confirmation sweep).
 ///
@@ -234,6 +262,9 @@ pub fn classify(facts: &DurabilityFacts) -> GroupDurabilityStatus {
         return GroupDurabilityStatus::Unknown;
     }
     if !facts.any_other_full_replica_peer_configured {
+        return GroupDurabilityStatus::AtRisk;
+    }
+    if facts.known_unobtainable_required_content {
         return GroupDurabilityStatus::AtRisk;
     }
     if facts.is_local_full_replica
@@ -390,6 +421,7 @@ mod tests {
             any_other_full_replica_peer_configured,
             peer_confirmed_custody,
             ever_confirmation_swept,
+            known_unobtainable_required_content: false,
         }
     }
 
@@ -518,6 +550,24 @@ mod tests {
             }),
             GroupDurabilityStatus::Protecting
         );
+        // M5-A soak-closure: the SAME still-catching-up-locally facts as
+        // just above, but with content POSITIVELY confirmed unobtainable
+        // from current membership -- must be AtRisk, not Protecting. This
+        // is the precedence step that closes the soak's durability-stuck-
+        // Protecting finding: `Partial` materialization alone cannot tell
+        // "still trying, may yet succeed" apart from "genuinely,
+        // permanently gone", but `known_unobtainable_required_content`
+        // can.
+        assert_eq!(
+            classify(&DurabilityFacts {
+                peer_confirmed_custody: false,
+                is_local_full_replica: true,
+                materialization: partial,
+                known_unobtainable_required_content: true,
+                ..protected_full_replica_facts()
+            }),
+            GroupDurabilityStatus::AtRisk
+        );
         // A full-replica device that's ALREADY fully caught up locally but
         // has no fresh peer confirmation is Unknown, not Protected -- local
         // completeness alone never proves group-wide coverage.
@@ -547,6 +597,7 @@ mod tests {
             any_other_full_replica_peer_configured: true,
             peer_confirmed_custody: true,
             ever_confirmation_swept: true,
+            known_unobtainable_required_content: false,
         };
         assert_eq!(
             classify(&facts),
