@@ -9,14 +9,17 @@ name: Soak nightly
 # separately instead. This lane is scheduled nightly plus available on
 # demand, never blocking an ordinary PR/push.
 #
-# Both soak tests are currently `#[ignore]`d in source (a real, tracked,
-# not-yet-fixed production race in LinkRuntimeController::stop() -- see
-# the doc comment on randomized_soak_converges_with_no_leaks_or_stuck_state
-# in topology_soak_lane.rs). This lane deliberately still runs them via
-# --ignored: a nightly monitoring lane is exactly the right place for an
-# honest, non-blocking "still broken" signal, and replay_known_failing_
-# seeds will flip green on its own once that bug is actually fixed --
-# silencing it here would just hide the regression check.
+# Both soak tests were UNIGNORED once the soak-closure investigation's
+# findings (session leak, stale route, durability-stuck x2) were all
+# fixed and verified -- see the tracked comment on
+# randomized_soak_converges_with_no_leaks_or_stuck_state in
+# topology_soak_lane.rs. Both steps below therefore run WITHOUT
+# `--ignored`: that flag runs *only* ignored tests, so leaving it on a
+# no-longer-ignored test matches zero tests and silently exits 0 --
+# exactly the kind of "always green" nightly this lane exists to
+# prevent. If either test ever needs to go back to `#[ignore]` for a
+# real, tracked reason, this workflow's own invocation must be updated
+# in the SAME change, not left stale.
 on:
   schedule:
     - cron: "0 3 * * *"
@@ -61,10 +64,10 @@ jobs:
       - name: Randomized soak (fresh seed)
         env:
           SOAK_DURATION_SECS: ${{ github.event.inputs.soak_duration_secs || '1800' }}
-        run: cargo test -p yadorilink-daemon --test topology_soak_lane randomized_soak -- --ignored --nocapture
+        run: cargo test -p yadorilink-daemon --test topology_soak_lane randomized_soak -- --nocapture
       - name: Replay known-failing corpus seeds
         if: always()
-        run: cargo test -p yadorilink-daemon --test topology_soak_lane replay_known_failing_seeds -- --ignored --nocapture
+        run: cargo test -p yadorilink-daemon --test topology_soak_lane replay_known_failing_seeds -- --nocapture
       - name: Upload corpus if it changed
         # A failing run appends a fresh seed to tests/dst_corpus/soak_lane_seeds.txt
         # locally in the runner's checkout -- surface it as an artifact so a
