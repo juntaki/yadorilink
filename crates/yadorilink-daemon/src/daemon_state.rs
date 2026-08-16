@@ -1586,13 +1586,29 @@ impl DaemonState {
         // by `RelaySessionHandler`'s own direct-route check, so leaving
         // it unfixed here could keep judging a route "confirmed direct"
         // through a channel that no longer answers real traffic.
+        // M5-A review follow-up (blocker #55, second round): the lock
+        // used to be dropped here, BEFORE the `direct_channels` insert
+        // below -- leaving a real, if narrow, window where two
+        // concurrent `set_direct_channel` calls for the SAME device_id
+        // (generations N and N+1) could both pass the guard above, both
+        // record their own generation, and then apply their
+        // `direct_channels.insert` in the REVERSE order: the stale N
+        // ends up registered last and revokes N+1's genuinely live
+        // channel -- the exact ABA outcome this fix exists to close.
+        // Holding `generations` across the `direct_channels` insert too
+        // makes the whole check-record-insert-revoke sequence atomic
+        // against a concurrent call to this same method, matching
+        // `NetmapDiffState::insert_channel_revoking_superseded`'s own
+        // (already-correct) shape. `direct_channel_generations` has no
+        // other lock site anywhere in this file, so nesting the
+        // `direct_channels` lock inside it here cannot introduce a
+        // lock-ordering cycle.
         let mut generations =
             self.direct_channel_generations.lock().unwrap_or_else(|p| p.into_inner());
         if generations.get(&device_id).is_some_and(|&recorded| recorded >= generation) {
             return;
         }
         generations.insert(device_id.clone(), generation);
-        drop(generations);
         let superseded = self
             .direct_channels
             .lock()

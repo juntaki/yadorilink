@@ -200,6 +200,14 @@ impl From<yadorilink_local_storage::StorageError> for MaterializationExecutionEr
 /// subset of `yadorilink-sync-core::ports::MaterializationStatePort`'s
 /// wider surface (see this module's own doc comment for why the wider trait
 /// itself does not move).
+/// Duplicated from `yadorilink_sync_sqlite::MaterializedFingerprint` rather
+/// than adding a dependency on that crate solely for this alias -- same
+/// "duplicate small leaf types rather than force an awkward dependency"
+/// precedent this trait's own `PlaceholderDiskIdentity`-adjacent methods
+/// already follow, and matches `yadorilink-peer-session`'s own independent
+/// duplication of the identical alias.
+pub type MaterializedFingerprint = (u64, Option<std::time::SystemTime>, i64, i64);
+
 pub trait MaterializationExecutionPort: Send + Sync {
     fn get_exec_bit(
         &self,
@@ -309,6 +317,24 @@ pub trait MaterializationExecutionPort: Send + Sync {
         next: MaterializationState,
         permit: &RootCommitPermit<'_>,
     ) -> Result<bool, MaterializationExecutionError>;
+
+    /// M5-A review follow-up (blocker #56, second round): records the disk
+    /// identity of the exact bytes this device just wrote via a successful
+    /// `reconstruct_file`, alongside that same call's `Hydrated`
+    /// transition -- always called right after `reconstruct_file_
+    /// journaled` succeeds in this module's own repair path, exactly like
+    /// the live peer materialize/hydrate paths already do at their own
+    /// equivalent call sites. See `yadorilink_sync_sqlite::
+    /// materialization_state::MaterializationStateRepository::
+    /// record_materialized_fingerprint`'s own doc comment for the full
+    /// reasoning.
+    fn record_materialized_fingerprint(
+        &self,
+        group_id: &str,
+        path: &str,
+        fingerprint: Option<MaterializedFingerprint>,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), MaterializationExecutionError>;
 
     /// Records the identity of the exact on-disk object a `write_placeholder`
     /// call just created for `(group_id, path)` (M1-2) -- always called
