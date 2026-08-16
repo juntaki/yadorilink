@@ -2309,6 +2309,129 @@ impl DaemonState {
         self.durability.classify(group_id, facts)
     }
 
+    /// Issue #58 diagnostic: everything `group_durability_status` computed
+    /// or consulted, formatted for a human/log reader, captured at ONE
+    /// instant -- built so a caller stuck watching `Protecting` doesn't
+    /// have to re-derive `DurabilityFacts` from scattered `tracing::debug!`
+    /// output or wait through another multi-hundred-second soak run to see
+    /// it again. Mirrors `group_durability_status`'s own fact-gathering and
+    /// `has_known_unobtainable_required_content`'s own per-path walk, but
+    /// keeps going over EVERY repair-candidate path (rather than
+    /// short-circuiting on the first `true`) and records the per-path
+    /// reasoning it would otherwise discard.
+    pub fn dump_durability_diagnostics(&self, group_id: &str) -> String {
+        use std::fmt::Write as _;
+        let counts =
+            self.replica_coordinator.materialization_state_repository().materialization_counts(group_id);
+        let materialization = match &counts {
+            Ok(counts) if counts.placeholder == 0 && counts.hydrating == 0 => {
+                Ok(crate::durability_service::MaterializationHealth::FullyLocal)
+            }
+            Ok(_) => Ok(crate::durability_service::MaterializationHealth::Partial),
+            Err(_) => Err(()),
+        };
+        let facts = crate::durability_service::DurabilityFacts {
+            latch_load_failed: self.durability_latch_load_failed.load(Ordering::SeqCst),
+            scope_unknown: self.unknown_scope_membership_marker.load(Ordering::SeqCst),
+            recovery_blocked: self
+                .replica_coordinator
+                .membership_operation_repository()
+                .has_recovery_blocked_membership_operation()
+                .unwrap_or(true),
+            latched_unknown: self.durability.is_latched_unknown(group_id),
+            group_policy_stale: self.is_group_policy_stale(group_id),
+            materialization,
+            is_local_full_replica: self.is_local_full_replica(group_id),
+            any_other_full_replica_peer_configured: self
+                .any_other_full_replica_peer_configured(group_id),
+            peer_confirmed_custody: self.has_fresh_custody_confirmation(group_id),
+            ever_confirmation_swept: self.has_ever_been_custody_swept(group_id),
+            known_unobtainable_required_content: self
+                .has_known_unobtainable_required_content(group_id),
+        };
+        let status = self.durability.classify(group_id, facts.clone());
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "== durability diagnostics device={} group={group_id} status={status:?} ==",
+            self.device_id
+        );
+        let _ = writeln!(out, "facts: {facts:?}");
+        let _ = writeln!(out, "materialization_counts: {counts:?}");
+        let current_writers = self.current_group_writers(group_id);
+        let _ = writeln!(out, "current_group_writers: {current_writers:?}");
+        let paths = self
+            .replica_coordinator
+            .materialization_state_repository()
+            .list_materialization_repair_candidates(group_id)
+            .unwrap_or_default();
+        let _ = writeln!(out, "repair_candidate_paths ({}): {paths:?}", paths.len());
+        let file_index = self.replica_coordinator.file_index_repository();
+        let materialization_repo = self.replica_coordinator.materialization_state_repository();
+        for path in &paths {
+            let _ = writeln!(out, "-- path={path:?} --");
+            let mat_state = materialization_repo.get_materialization_state(group_id, path);
+            let _ = writeln!(out, "   materialization_state: {mat_state:?}");
+            let origin_device_id = file_index.get_origin_device_id(group_id, path);
+            let _ = writeln!(out, "   origin_device_id: {origin_device_id:?}");
+            let record = file_index.get_file(group_id, path);
+            let record_kind = file_index.get_record_kind(group_id, path);
+            let exec_bit = file_index.get_exec_bit(group_id, path);
+            let symlink_target = file_index.get_symlink_target(group_id, path);
+            let (Ok(Some(record)), Ok(record_kind), Ok(exec_bit), Ok(symlink_target)) =
+                (&record, &record_kind, &exec_bit, &symlink_target)
+            else {
+                let _ = writeln!(
+                    out,
+                    "   (could not load index row: record={record:?} kind={record_kind:?} \
+                     exec_bit={exec_bit:?} symlink_target={symlink_target:?})"
+                );
+                continue;
+            };
+            let current_version_hash = yadorilink_replica_domain::file::FileVersion::from_index_row(
+                record.blocks.clone(),
+                record.size,
+                record.mtime_unix_nanos,
+                record_kind.unwrap_or_default(),
+                *exec_bit,
+                symlink_target.clone(),
+            )
+            .version_hash
+            .to_hex();
+            let _ = writeln!(out, "   current_version_hash: {current_version_hash}");
+            let block_hashes: Vec<_> =
+                record.blocks.iter().map(|b| hex::encode(&b.hash)).collect();
+            let local_present = self.block_store.present_blocks(&block_hashes);
+            let _ = writeln!(
+                out,
+                "   block_hashes ({}): {block_hashes:?} locally_present: {local_present:?}",
+                block_hashes.len()
+            );
+            let refusers = materialization_repo.refusing_peers_for_path(
+                group_id,
+                path,
+                &current_version_hash,
+            );
+            let _ = writeln!(out, "   refusing_peers (exact version): {refusers:?}");
+            // Mirrors `has_known_unobtainable_required_content`'s fixed
+            // Fact 4 (issue #58): origin is no longer carved out here --
+            // if it's present and hasn't refused, Fact 3 already exempts
+            // the whole path before this ever runs.
+            let unaccounted: Vec<_> = current_writers
+                .iter()
+                .filter(|id| {
+                    id.as_str() != self.device_id
+                        && !refusers.as_ref().map(|r| r.contains(*id)).unwrap_or(false)
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "   writers_unaccounted_for (not self, not a recorded refuser): {unaccounted:?}"
+            );
+        }
+        out
+    }
+
     /// re-checks free space for every Degraded link whose backoff
     /// window has elapsed, clearing it ("cleared once a
     /// subsequent headroom check for that link's volume succeeds") once
@@ -3174,20 +3297,9 @@ impl DaemonState {
             else {
                 continue;
             };
-            // Fact 3: the presumed sole holder (this path's origin) has
-            // left authoritative membership -- a real departure, not
-            // mere offline-ness. Still a current writer => still a
-            // plausible holder => never AtRisk from this path alone.
-            if current_writers.contains(&origin_device_id) {
-                continue;
-            }
-            // Fact 4: every OTHER current writer has EXPLICITLY,
-            // definitively refused this EXACT version of this path (never
-            // inferred from an untried/offline writer's silence, and
-            // never conflated with a refusal recorded against some OTHER
-            // version this path once had -- see `block_fetch_refusals`'s
-            // own schema doc comment for why refusal evidence is bound to
-            // `version_hash`, not just `path`).
+            // Refusal evidence is gathered up front now (issue #58 fix --
+            // see the note on Fact 3 below for why the origin device's own
+            // refusal status has to be known before that check runs).
             let file_index = self.replica_coordinator.file_index_repository();
             let (Ok(Some(record)), Ok(record_kind), Ok(exec_bit), Ok(symlink_target)) = (
                 file_index.get_file(group_id, path),
@@ -3215,9 +3327,43 @@ impl DaemonState {
             else {
                 continue;
             };
-            let unaccounted_for = current_writers.iter().any(|id| {
-                id != &self.device_id && id != &origin_device_id && !refusers.contains(id)
-            });
+            // Fact 3: the presumed sole holder (this path's origin) has
+            // left authoritative membership, OR has itself explicitly
+            // refused this exact version. Issue #58: the original form of
+            // this check exempted the origin from Fact 4 purely on
+            // still-current-writer membership, with no way for it to ever
+            // become "accounted for" -- a path could sit in `Protecting`
+            // forever once the origin device itself was the (sole)
+            // recorded refuser. That's reachable in real production, not
+            // just in a harness: `apply_locked_record`'s `incoming_origin`
+            // falls back to attributing origin to the RELAYING peer
+            // whenever that peer's own `get_origin_device_id` lookup for
+            // the path came back empty -- so a relayed conflict copy can
+            // end up with `origin_device_id` pointing at a peer that never
+            // actually held the content, while the true original author
+            // has already left the group and is invisible to this check
+            // entirely. Still a current writer AND has never refused =>
+            // still a plausible holder => never AtRisk from this path
+            // alone. Still a current writer but HAS refused => no longer
+            // exempt; falls through to Fact 4 below, where it's already
+            // correctly counted via `refusers.contains`.
+            if current_writers.contains(&origin_device_id) && !refusers.contains(&origin_device_id)
+            {
+                continue;
+            }
+            // Fact 4: every OTHER current writer has EXPLICITLY,
+            // definitively refused this EXACT version of this path (never
+            // inferred from an untried/offline writer's silence, and
+            // never conflated with a refusal recorded against some OTHER
+            // version this path once had -- see `block_fetch_refusals`'s
+            // own schema doc comment for why refusal evidence is bound to
+            // `version_hash`, not just `path`). The origin device is no
+            // longer exempted here (issue #58): if it's still present, it
+            // only reached this point because it explicitly refused too
+            // (the check above), so `refusers.contains` already accounts
+            // for it correctly without a separate carve-out.
+            let unaccounted_for =
+                current_writers.iter().any(|id| id != &self.device_id && !refusers.contains(id));
             if !unaccounted_for {
                 return true;
             }
