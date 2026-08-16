@@ -2321,8 +2321,10 @@ impl DaemonState {
     /// reasoning it would otherwise discard.
     pub fn dump_durability_diagnostics(&self, group_id: &str) -> String {
         use std::fmt::Write as _;
-        let counts =
-            self.replica_coordinator.materialization_state_repository().materialization_counts(group_id);
+        let counts = self
+            .replica_coordinator
+            .materialization_state_repository()
+            .materialization_counts(group_id);
         let materialization = match &counts {
             Ok(counts) if counts.placeholder == 0 && counts.hydrating == 0 => {
                 Ok(crate::durability_service::MaterializationHealth::FullyLocal)
@@ -2388,30 +2390,27 @@ impl DaemonState {
                 );
                 continue;
             };
-            let current_version_hash = yadorilink_replica_domain::file::FileVersion::from_index_row(
-                record.blocks.clone(),
-                record.size,
-                record.mtime_unix_nanos,
-                record_kind.unwrap_or_default(),
-                *exec_bit,
-                symlink_target.clone(),
-            )
-            .version_hash
-            .to_hex();
+            let current_version_hash =
+                yadorilink_replica_domain::file::FileVersion::from_index_row(
+                    record.blocks.clone(),
+                    record.size,
+                    record.mtime_unix_nanos,
+                    record_kind.unwrap_or_default(),
+                    *exec_bit,
+                    symlink_target.clone(),
+                )
+                .version_hash
+                .to_hex();
             let _ = writeln!(out, "   current_version_hash: {current_version_hash}");
-            let block_hashes: Vec<_> =
-                record.blocks.iter().map(|b| hex::encode(&b.hash)).collect();
+            let block_hashes: Vec<_> = record.blocks.iter().map(|b| hex::encode(&b.hash)).collect();
             let local_present = self.block_store.present_blocks(&block_hashes);
             let _ = writeln!(
                 out,
                 "   block_hashes ({}): {block_hashes:?} locally_present: {local_present:?}",
                 block_hashes.len()
             );
-            let refusers = materialization_repo.refusing_peers_for_path(
-                group_id,
-                path,
-                &current_version_hash,
-            );
+            let refusers =
+                materialization_repo.refusing_peers_for_path(group_id, path, &current_version_hash);
             let _ = writeln!(out, "   refusing_peers (exact version): {refusers:?}");
             // Mirrors `has_known_unobtainable_required_content`'s fixed
             // Fact 4 (issue #58): origin is no longer carved out here --
