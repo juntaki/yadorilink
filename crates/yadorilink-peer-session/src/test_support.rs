@@ -867,6 +867,7 @@ impl PeerReplicaStatePort for FakeReplicaState {
         &self,
         _group_id: &str,
         _path: &str,
+        _version_hash: &str,
         _peer_device_id: &str,
         _reason: &str,
         _refused_at_unix_nanos: i64,
@@ -875,6 +876,17 @@ impl PeerReplicaStatePort for FakeReplicaState {
         // implementation lives in `yadorilink-daemon`'s `ReplicaCoordinator`
         // (see `DurabilityFacts::known_unobtainable_required_content`'s own
         // doc comment). A no-op here matches this mock's existing footprint.
+        Ok(())
+    }
+
+    fn clear_block_fetch_refusal(
+        &self,
+        _group_id: &str,
+        _path: &str,
+        _version_hash: &str,
+        _peer_device_id: &str,
+    ) -> Result<(), PeerSessionError> {
+        // Same rationale as `record_block_fetch_refusal` above.
         Ok(())
     }
 
