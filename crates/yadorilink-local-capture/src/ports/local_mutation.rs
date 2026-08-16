@@ -168,6 +168,30 @@ pub trait LocalMutationStore: Send + Sync {
 
     fn get_exec_bit(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError>;
 
+    /// M5-A review follow-up (blocker #56, second round): records the disk
+    /// identity of the exact bytes a locally-authored commit just verified
+    /// are on disk RIGHT NOW for this path -- called right after a
+    /// successful local-edit commit (`upsert_file_emitting_change`/
+    /// `upsert_files_batch`/their batch siblings), using the same fresh
+    /// `disk_race_fingerprint` stat this scan already paid for. Without
+    /// this, a version bump from an ordinary local edit silently drops the
+    /// row back to "Hydrated with no proven fingerprint" -- the exact
+    /// unproven state `hydrate_inner`'s already-Hydrated shortcut treats
+    /// as safe to reconstruct over, reopening the clobber this fix exists
+    /// to close for every file that has ever been locally edited even
+    /// once. See `yadorilink_sync_sqlite::materialization_state::
+    /// MaterializationStateRepository::record_materialized_fingerprint`'s
+    /// own doc comment for the full reasoning.
+    fn record_materialized_fingerprint(
+        &self,
+        group_id: &str,
+        path: &str,
+        fingerprint: Option<
+            yadorilink_filesystem_sync::materialization_execution::MaterializedFingerprint,
+        >,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), SyncSqliteError>;
+
     fn set_exec_bit(
         &self,
         group_id: &str,

@@ -212,6 +212,23 @@ impl LocalMutationStore for ReplicaCoordinator {
         self.file_index_repository().get_exec_bit(group_id, path)
     }
 
+    fn record_materialized_fingerprint(
+        &self,
+        group_id: &str,
+        path: &str,
+        fingerprint: Option<
+            yadorilink_filesystem_sync::materialization_execution::MaterializedFingerprint,
+        >,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), SyncSqliteError> {
+        self.materialization_state_repository().record_materialized_fingerprint(
+            group_id,
+            path,
+            fingerprint,
+            permit,
+        )
+    }
+
     fn set_exec_bit(
         &self,
         group_id: &str,

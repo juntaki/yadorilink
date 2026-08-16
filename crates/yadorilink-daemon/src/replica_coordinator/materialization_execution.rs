@@ -195,6 +195,21 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .map_err(SyncError::from)?)
     }
 
+    fn record_materialized_fingerprint(
+        &self,
+        group_id: &str,
+        path: &str,
+        fingerprint: Option<
+            yadorilink_filesystem_sync::materialization_execution::MaterializedFingerprint,
+        >,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), MaterializationExecutionError> {
+        Ok(self
+            .materialization_state_repository()
+            .record_materialized_fingerprint(group_id, path, fingerprint, permit)
+            .map_err(SyncError::from)?)
+    }
+
     fn record_placeholder_generation(
         &self,
         group_id: &str,
