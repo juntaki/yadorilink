@@ -67,7 +67,7 @@ tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }
 tempfile = "3"
 # Signs test fixture changes (`ensure_initial_import`'s `ChangeEmitter`
 # construction in this crate's own tests).
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 rand = "0.10.2"
 # `materialization_local_capture.rs` (moved here from
 # `yadorilink-sync-core/tests/` in Phase 7D-10.4) decodes a block hash from
