@@ -86,9 +86,28 @@ const DEFAULT_SOAK_DURATION_SECS: u64 = 20;
 /// being deliberately generous (180s+30s) for the same underlying reason.
 /// A tighter bound here would misreport slow-but-healthy convergence as
 /// the "silent corruption"/"stuck" invariants this soak exists to catch.
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(240);
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(600);
 const CANDIDATE_FILE_COUNT: usize = 6;
 const OP_JITTER_MAX_MS: u64 = 120;
+
+/// M5-A soak-closure finding: this file's two tests
+/// (`randomized_soak_converges_with_no_leaks_or_stuck_state`, `replay_
+/// known_failing_seeds`) each spin up a real multi-node topology with
+/// real orchestrators, real UDP sockets, and real WireGuard handshakes
+/// across `flavor = "multi_thread", worker_threads = 8` -- genuinely
+/// CPU-heavy. `cargo test`'s default parallelism runs both `#[test]`s in
+/// this binary concurrently, which reproducibly starved convergence
+/// (a `durability_service` sweep, or a peer reconnect) past even
+/// `SETTLE_TIMEOUT`'s already-generous 600s bound on a loaded machine --
+/// confirmed live: the exact seed that failed under default parallelism
+/// passed cleanly both in isolation and with every test in this binary
+/// serialized (`--test-threads=1`, 0/2 failures). This guard reproduces
+/// that serialization unconditionally, so `cargo test`'s own default
+/// parallelism can never again silently reintroduce this false-failure
+/// class -- a bounded/acceptable transient the tests were, until this
+/// lock, waiting for incorrectly (Classification D: real resource
+/// contention this test binary itself creates, not a production bug).
+static SOAK_LANE_SERIAL_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct FakeGrantSource {
     fake: FakeCoordination,
@@ -225,7 +244,6 @@ struct SoakWorld {
     w: TopologyNode,
     spare: Option<TopologyNode>,
     handles: TopologyHandles,
-    real_w_endpoint: String,
     w_route_broken: bool,
     /// Pre-restart session identities, captured immediately before each
     /// `RestartNode` op: `(observer_device_id, restarted_device_id,
@@ -331,7 +349,34 @@ impl SoakWorld {
         if !self.w_route_broken {
             return;
         }
-        self.fake.update_endpoint(&self.w.device_id, self.real_w_endpoint.clone());
+        // M5-A soak-closure finding: read w's CURRENT real endpoint live,
+        // not a value captured once at stand-up -- `restart_node` binds a
+        // fresh ephemeral port every time (`DaemonState::ensure_shared_
+        // socket` always binds port 0), so a `RestartNode` op between
+        // `op_break_w_route` and this op leaves any pre-captured endpoint
+        // stale and dead. Restoring to a stale port left every OTHER
+        // node's channel to w stuck on Relay forever (correctly -- that
+        // port genuinely doesn't work), while w's OWN view stayed Direct
+        // (w always reaches the never-restarted n/m at their stable
+        // addresses) -- exactly the soak's observed stale-route asymmetry.
+        // Confirmed as the root cause via a dedicated repro
+        // (`topology_rapid_restart_repro::
+        // rapid_restart_while_relayed_converges_route_kind`, 5/5): a real
+        // peer restart always re-registers its own current endpoint with
+        // the coordination plane, so this was never reachable in
+        // production, purely a test-harness bug (Classification C).
+        let current_w_endpoint = self
+            .w
+            .state
+            .shared_socket()
+            .expect(
+                "w's shared transport socket must already be bound by the time its route is \
+                     restored -- its orchestrator has been running (and attempting connections, \
+                     which unconditionally bind the socket) since well before this op can fire",
+            )
+            .local_addr()
+            .to_string();
+        self.fake.update_endpoint(&self.w.device_id, current_w_endpoint);
         self.w_route_broken = false;
     }
 
@@ -360,7 +405,9 @@ impl SoakWorld {
 
     async fn op_restart_node(&mut self, rng: &mut StdRng) {
         let targets = ["n", "m", "w"];
-        match targets[rng.random_range(0..targets.len())] {
+        let target = targets[rng.random_range(0..targets.len())];
+        tracing::info!(target, "soak op: restarting node");
+        match target {
             "n" => {
                 self.snapshot_sessions_with(&self.n.device_id.clone());
                 self.handles.take_and_shutdown(&self.n.device_id).await;
@@ -461,8 +508,23 @@ impl SoakWorld {
 
 /// A dummy, never-linked node used only as a `std::mem::replace` swap
 /// target while a real node is mid-restart (its own state briefly moves
-/// into `restart_node`, which consumes it by value) -- discarded
-/// immediately, never observed by anything.
+/// into `restart_node`, which consumes it by value) -- never registered
+/// with `FakeCoordination`, never observed by any real node in this
+/// soak. NOT actually inert, though (an earlier version of this comment
+/// claimed it was): `DaemonState::new` unconditionally spawns its
+/// maintenance coordinator (the convergence engine among other loops),
+/// matching real production startup, so every placeholder leaks one
+/// harmless, permanently-orphaned background task polling an isolated,
+/// never-again-touched temp DB for the rest of the process's life --
+/// confirmed via trace logs (`local_device_id=soak-restart-swap-
+/// placeholder-N` ticking indefinitely) while investigating an
+/// unrelated soak-closure finding. Genuinely harmless (no shared state,
+/// no registration, cannot affect any invariant this soak checks) but
+/// real: fixing it properly needs `SoakWorld`'s `n`/`m`/`w` fields
+/// `Option`-wrapped so `.take()` replaces the swap-and-discard pattern
+/// entirely, which is a larger change than this specific investigation
+/// warrants -- left as a known, tracked, low-priority test-cleanliness
+/// item rather than fixed here.
 fn placeholder_node() -> TopologyNode {
     new_node("soak-restart-swap-placeholder")
 }
@@ -504,7 +566,18 @@ fn tree_digest(root: &std::path::Path) -> BTreeMap<String, String> {
     out
 }
 
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("yadorilink_daemon=debug")),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
 async fn run_soak(seed: u64) {
+    init_tracing();
     support::ensure_isolated_config_dir();
     eprintln!("SOAK_SEED={seed} (reproduce with: SOAK_SEED={seed} cargo test -p yadorilink-daemon --test topology_soak_lane -- --nocapture)");
     let duration = duration_from_env_or_default();
@@ -516,7 +589,6 @@ async fn run_soak(seed: u64) {
     let (n, m, w, handles) = stand_up_canonical_topology(&fake, group_id).await;
     wire_relay_grant_source(&fake, &m.state, &m.device_id);
     wire_relay_grant_source(&fake, &w.state, &w.device_id);
-    let real_w_endpoint = w.state.shared_socket().unwrap().local_addr().to_string();
 
     let mut world = SoakWorld {
         fake,
@@ -526,7 +598,6 @@ async fn run_soak(seed: u64) {
         w,
         spare: None,
         handles,
-        real_w_endpoint,
         w_route_broken: false,
         pre_restart_sessions: Vec::new(),
     };
@@ -668,31 +739,78 @@ async fn run_soak(seed: u64) {
     );
 
     // Invariant 2: no leaked sessions -- every session `pre_restart_
-    // sessions` captured immediately before its node's restart must have
-    // been replaced by now. `PeerRegistry` is keyed by device id, so it
-    // structurally cannot hold two live entries for the same peer --
-    // checking it for "duplicates" (an earlier version of this check)
-    // can never fail and proves nothing. The real leak this soak cares
-    // about is a restarted node's OLD detached per-peer supervisors (and
-    // the `Arc<DaemonState>`/`PeerSyncSession` they keep alive) still
-    // running after the restart -- observable only by comparing session
-    // IDENTITY across the restart, which `pre_restart_sessions` records.
+    // sessions` captured immediately before its node's restart must
+    // either have been replaced by now, OR still be the exact same,
+    // currently-healthy `PeerSyncSession`. `PeerRegistry` is keyed by
+    // device id, so it structurally cannot hold two live entries for the
+    // same peer -- checking it for "duplicates" (an earlier version of
+    // this check) can never fail and proves nothing. An earlier version
+    // of THIS check also flagged an unreplaced-but-healthy session as a
+    // leak (M5-A soak-closure investigation, `topology_rapid_restart_
+    // repro.rs`): `PeerChannel` can heal an existing session's transport
+    // in place across a peer restart -- its own `DIRECT_LIVENESS_TIMEOUT`
+    // (`yadorilink_transport::peer_channel`'s own doc comment) re-races
+    // candidates and re-handshakes over the SAME channel/session object
+    // once the restarted peer's new endpoint is learned, with no new
+    // `PeerSyncSession` ever created -- confirmed live: a 6x-rapid-restart
+    // repro reproducibly left `Arc::ptr_eq` true while `peer_handshake_
+    // received()`/`change_dag_negotiated()` were both true and both
+    // sides' reachability was `Connected(Direct)`, a fully recovered
+    // session that was never replaced because it never needed to be. The
+    // real leak this soak cares about is a restarted node's OLD detached
+    // per-peer supervisor whose session never resumes handshaking at
+    // all -- observable as the SAME session identity that stays
+    // unhealthy (no fresh handshake, not reachable) for the entire
+    // settle window, not merely as unreplaced identity.
     let mut all_nodes = vec![&world.n, &world.m, &world.w];
     if let Some(spare) = &world.spare {
         all_nodes.push(spare);
     }
     let node_by_id = |device_id: &str| all_nodes.iter().find(|n| n.device_id == device_id).copied();
+    // Retried across the settle window, like invariants 1 and 4: an
+    // earlier version of this check ran exactly once, right after the
+    // fully_connected wait above -- which only proves N/M/W are
+    // currently REACHABLE again, not that every OTHER observer's own
+    // reconnect supervisor has finished ITS OWN independent, backoff-
+    // bound recovery for a DIFFERENT, earlier restart in this soak's own
+    // history. `spawn_peer_session`'s reconnect backoff can legitimately
+    // ratchet toward its 45s cap under repeated quick-failing
+    // generations (exactly what several rapid restarts of the same peer
+    // in a short window produce), so a single immediate check can fire
+    // before recovery that is already correctly, if slowly, in
+    // progress.
     let mut leaked = Vec::new();
-    for (observer_id, restarted_id, old_session) in &world.pre_restart_sessions {
-        let Some(observer) = node_by_id(observer_id) else { continue };
-        if let Some(current) = observer.state.peers.session(restarted_id) {
-            if Arc::ptr_eq(&current, old_session) {
-                leaked.push(format!(
-                    "{observer_id}'s session with {restarted_id} was never replaced across its \
-                     restart"
-                ));
+    let leak_deadline = Instant::now() + SETTLE_TIMEOUT;
+    loop {
+        leaked.clear();
+        for (observer_id, restarted_id, old_session) in &world.pre_restart_sessions {
+            let Some(observer) = node_by_id(observer_id) else { continue };
+            if let Some(current) = observer.state.peers.session(restarted_id) {
+                if !Arc::ptr_eq(&current, old_session) {
+                    continue;
+                }
+                let healthy = current.peer_handshake_received()
+                    && current.change_dag_negotiated()
+                    && matches!(
+                        observer.state.peers.reachability(restarted_id),
+                        Some(PeerReachability::Connected(_))
+                    );
+                if !healthy {
+                    leaked.push(format!(
+                        "{observer_id}'s session with {restarted_id} was never replaced across \
+                         its restart, and is not currently healthy (handshake_received={}, \
+                         dag_negotiated={}, reachability={:?})",
+                        current.peer_handshake_received(),
+                        current.change_dag_negotiated(),
+                        observer.state.peers.reachability(restarted_id)
+                    ));
+                }
             }
         }
+        if leaked.is_empty() || Instant::now() >= leak_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
     assert!(leaked.is_empty(), "soak lane found leaked pre-restart sessions: {leaked:#?}");
 
@@ -705,12 +823,27 @@ async fn run_soak(seed: u64) {
     // the Protecting arm, so that assertion could never fail) because
     // `op_device_join` now marks the spare a second coordination-plane
     // full-replica candidate whenever it's present.
+    // Retried across the settle window, like invariants 1, 2, and 4:
+    // `Protecting` is a legitimate, transient state while local
+    // materialization catches up (`classify`'s own doc comment, arm 5) --
+    // a node whose peer session was recovering (invariant 2's own window)
+    // can genuinely still be mid-hydration right after the settle wait
+    // above, since durability confirmation depends on the same peer
+    // traffic that invariant 2 waits on.
     let mut stuck = Vec::new();
-    for node in &all_nodes {
-        let status = node.state.group_durability_status(&world.group_id);
-        if status == GroupDurabilityStatus::Protecting {
-            stuck.push(node.device_id.clone());
+    let stuck_deadline = Instant::now() + SETTLE_TIMEOUT;
+    loop {
+        stuck.clear();
+        for node in &all_nodes {
+            let status = node.state.group_durability_status(&world.group_id);
+            if status == GroupDurabilityStatus::Protecting {
+                stuck.push(node.device_id.clone());
+            }
         }
+        if stuck.is_empty() || Instant::now() >= stuck_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
     assert!(
         stuck.is_empty(),
@@ -774,41 +907,69 @@ async fn run_soak(seed: u64) {
     world.handles.shutdown();
 }
 
-// M5-A Pass 9 finding, tracked for follow-up (NOT this pass's job to
-// fix -- see `m5a-pass9-link-runtime-stop-fence-gap` in project memory):
-// this soak's `RestartNode` op reliably surfaces a genuine PRODUCTION
-// race, not a soak-harness artifact. `LinkRuntimeController::stop()`
-// (`crates/yadorilink-daemon/src/adapters/runtime/link_runtime_
-// controller.rs:376-382`) asserts (panics on failure) that removing the
-// link's `Arc<LinkRuntime>` from the registry leaves exactly one strong
-// reference. `root_commit_authority.rs:62`
-// (`self.links.runtime(&local_path).map(|runtime| runtime.root_lease().
-// clone())`, the root-lease acquisition path `hydrate`/`evict`/local-
-// write processing all go through) peeks a SECOND `Arc<LinkRuntime>`
-// clone via the same registry, OUTSIDE the `LinkOpFence` machinery
-// `stop()`'s own doc comment says protects this exact assumption for
-// flush operations specifically -- root-lease acquisition isn't a flush
-// operation, so it isn't fenced. A `stop()` call (real production paths:
-// `Unlink`, a daemon restart) racing an in-flight root-lease acquisition
-// for the same link can observe the extra refcount and panic. Contrast
-// with `app.rs`'s `graceful_shutdown`, which has the identical "only
-// place this Arc is cloned" comment but treats a shared Arc as an
-// anticipated (if rare) case with a graceful log-and-`abort_tasks()`
-// fallback rather than panicking -- but `graceful_shutdown` uses a
-// simpler, non-fenced drain (`drain_for_shutdown`), so its tolerance for
-// this case isn't necessarily transferable to `stop()`'s more careful,
-// fence-sequenced path without first understanding whether the fence
-// itself has a real, fixable gap (extend it to cover root-lease
-// acquisition too) or whether a soft fallback is genuinely the right
-// answer there as well. That determination needs real investigation
-// before touching this lock/fence-adjacent code, not a rushed fix, so
-// it's deferred rather than attempted here. Both tests below are left
-// `#[ignore]`d until it's resolved: the corpus-recorded seed reproduces
-// it deterministically, and the plain randomized run has real (if lower)
-// odds of hitting the same race within its own default CI-safe duration.
-#[ignore = "M5-A Pass 9: known LinkRuntimeController::stop() / root-lease-acquisition fence gap, see comment above"]
+// M5-A Pass 9 finding (project memory `m5a-pass9-link-runtime-stop-
+// fence-gap`): this soak's `RestartNode` op used to reliably surface a
+// genuine production race in `LinkRuntimeController::stop()` racing an
+// in-flight root-lease acquisition for the same link (real production
+// paths: `Unlink`, a daemon restart) -- FIXED (bounded retry + graceful
+// fallback in `link_runtime_controller.rs`, matching `graceful_
+// shutdown`'s established pattern), confirmed via 0/10 recurrence on the
+// corpus-recorded seed plus repeated soak reruns since.
+//
+// Of the soak-closure investigation's three follow-on findings, session
+// leak and stale route are ALSO fixed (see `tests/dst_corpus/soak_lane_
+// seeds.txt`'s own header for the classification trail). Durability
+// stuck Protecting is NOT: still open, real, and reproducible --
+// confirmed on TWO independent fresh random seeds (3746878857549989852
+// here; a prior run separately) even under a generous 3000s external
+// bound, well past this test's own already-generous 600s internal
+// settle retry, which genuinely exhausted without recovering. Traced
+// (via a `tracing::debug!` added to `DaemonState::group_durability_
+// status` logging its full `DurabilityFacts`) to: the stuck device's
+// local materialization stays `Partial` indefinitely, with ZERO
+// hydration-retry activity for the entire stuck window -- not a slow
+// retry loop, a retry that never fires again, even though there IS a
+// production-wired periodic repair mechanism that should be retrying it
+// (`maintenance::materialization_repair::MaterializationRepairJob`, a
+// `MaintenanceTrigger::Interval` task spawned by `maintenance_
+// coordinator.rs`, sweeping every `MATERIALIZATION_REPAIR_SWEEP_
+// INTERVAL` = 90s -- well within the 600s settle window, so this isn't
+// simply "never got a chance to run").
+//
+// Traced one level deeper: `MaterializationRepairJob::run_once` round-
+// robins across this device's peer sessions for the group and asks each
+// one, in turn, to `PeerSyncSession::reconcile_local_materialization_
+// audit` -- but STOPS at the first session whose call returns `Ok(_)`
+// (`materialization_repair.rs`: `Ok(_) => { last_error = None; break; }`),
+// trying a DIFFERENT peer only on an `Err`. `reconcile_local_
+// materialization_audit` returns `Ok(true)` even when the underlying
+// `rematerialize_one_record`/`materialize` outcome is `MaterializeResult::
+// RetryRequired` (still `Ok`, not an `Err`) -- so a sweep that happens to
+// round-robin onto a peer session whose own attempt doesn't actually fix
+// the record (e.g. that specific peer also doesn't hold the needed
+// block) is treated as a completed, successful sweep for the whole
+// group, and no OTHER peer is tried until the cursor comes back around
+// on a LATER sweep. Two live candidates, not yet distinguished:
+// (a) real bug -- the round-robin's success signal doesn't actually mean
+// "repaired", so a persistently-unhelpful peer at the front of the
+// rotation could starve every other candidate indefinitely; (b) the
+// soak's own device-join/leave chaos genuinely orphaned this specific
+// block (its only past holder left the topology), which is content this
+// device can never recover from ANY peer -- a real, unrecoverable
+// "at risk" case the `classify` precedence doesn't currently have a path
+// out of `Protecting` for (an `AtRisk`-shaped situation is masked behind
+// `any_other_full_replica_peer_configured: true`, since a peer being
+// CONFIGURED as a candidate says nothing about whether it actually holds
+// this specific content). Distinguishing (a) from (b) -- and fixing
+// whichever it is -- needs real investigation into which peer sessions
+// actually get asked and what each one's own attempt outcome was, not a
+// rushed fix here -- deferred, matching this file's own established
+// pattern for the fence-gap above. Left `#[ignore]`d until it's
+// resolved.
+#[ignore = "M5-A soak-closure: durability-stuck-Protecting is real and unresolved, see comment above"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn randomized_soak_converges_with_no_leaks_or_stuck_state() {
+    let _serial_guard = SOAK_LANE_SERIAL_GUARD.lock().await;
     let seed = seed_from_env_or_random();
     let result = std::panic::AssertUnwindSafe(run_soak(seed)).catch_unwind().await;
     if let Err(panic) = result {
@@ -826,11 +987,13 @@ async fn randomized_soak_converges_with_no_leaks_or_stuck_state() {
 /// corpus is empty, and a permanent regression check for every seed a
 /// heat-run ever found failing, matching `monkey_chaos.rs::replay_known_
 /// failing_seeds`'s established idiom. Left `#[ignore]`d for the same
-/// tracked, not-yet-fixed reason as the test directly above -- both
-/// corpus seeds currently reproduce it deterministically.
-#[ignore = "M5-A Pass 9: known LinkRuntimeController::stop() / root-lease-acquisition fence gap, see the comment on randomized_soak_converges_with_no_leaks_or_stuck_state above"]
+/// tracked, not-yet-fixed reason as the test directly above (durability
+/// stuck Protecting) -- one corpus seed (3746878857549989852) reproduces
+/// it.
+#[ignore = "M5-A soak-closure: durability-stuck-Protecting is real and unresolved, see the comment on randomized_soak_converges_with_no_leaks_or_stuck_state above"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn replay_known_failing_seeds() {
+    let _serial_guard = SOAK_LANE_SERIAL_GUARD.lock().await;
     for seed in load_corpus_seeds() {
         eprintln!(
             "SOAK_LANE replaying corpus seed={seed} (reproduce with: SOAK_SEED={seed} cargo test -p \
