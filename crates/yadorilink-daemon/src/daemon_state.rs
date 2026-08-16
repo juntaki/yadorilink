@@ -1550,7 +1550,30 @@ impl DaemonState {
         device_id: String,
         channel: Arc<yadorilink_transport::PeerChannel>,
     ) {
-        self.direct_channels.lock().unwrap_or_else(|p| p.into_inner()).insert(device_id, channel);
+        // M5-A soak-closure finding: this mirror had the identical
+        // silent-overwrite gap `peer_orchestrator::NetmapDiffState::
+        // insert_channel_revoking_superseded`'s own doc comment
+        // describes for the primary map this mirrors -- a bare `insert`
+        // here discarded whatever `Arc<PeerChannel>` was previously
+        // registered for this peer without revoking it. `PeerChannel`
+        // has no `Drop` impl (see `revoke`'s own doc comment), so that
+        // discarded channel stayed alive and registered in the transport
+        // hub's demux with nothing left anywhere to ever revoke it --
+        // and unlike the primary map (fixed to always call `revoke` on
+        // replacement), this SEPARATE mirror is consulted independently
+        // by `RelaySessionHandler`'s own direct-route check, so leaving
+        // it unfixed here could keep judging a route "confirmed direct"
+        // through a channel that no longer answers real traffic.
+        let superseded = self
+            .direct_channels
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(device_id, channel.clone());
+        if let Some(superseded) = superseded {
+            if !Arc::ptr_eq(&superseded, &channel) {
+                superseded.revoke();
+            }
+        }
     }
 
     pub(crate) fn remove_direct_channel(&self, device_id: &str) {
@@ -2230,6 +2253,12 @@ impl DaemonState {
             peer_confirmed_custody: self.has_fresh_custody_confirmation(group_id),
             ever_confirmation_swept: self.has_ever_been_custody_swept(group_id),
         };
+        tracing::debug!(
+            local_device_id = %self.device_id,
+            %group_id,
+            ?facts,
+            "group_durability_status computed"
+        );
         self.durability.classify(group_id, facts)
     }
 

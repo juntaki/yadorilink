@@ -125,6 +125,7 @@ pub enum MaterializationHealth {
 /// status from. `latched_unknown` comes from `DurabilityService`'s own
 /// latch table (so `DurabilityService::classify` fills it in); every other
 /// field comes from `DaemonState`'s own atomics or `SyncState`.
+#[derive(Debug)]
 pub struct DurabilityFacts {
     /// The persisted durability-latch table itself failed to load at
     /// startup -- every group is unknown until that's resolved, since this

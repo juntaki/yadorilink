@@ -198,6 +198,36 @@ impl NetmapDiffState {
         matches
     }
 
+    /// Registers `channel` as `device_id`'s current channel, revoking
+    /// whatever this replaces (M5-A soak-closure finding).
+    /// `channels.insert` alone silently discards any previous entry --
+    /// and per `PeerChannel::revoke`'s own doc comment, dropping every
+    /// `Arc` clone of a channel is NOT enough to stop its actor: an
+    /// un-revoked replaced channel stays permanently registered in the
+    /// transport hub's demux, still answering every future handshake
+    /// initiation for this peer under its own stale session index, with
+    /// no `Arc` left anywhere to ever revoke it again. This is the exact
+    /// zombie-channel class `remove_channel_if_current`'s own doc
+    /// comment already names above -- reachable in production the same
+    /// way that ABA race is: two supervisor generations for one peer
+    /// briefly coexisting (a new one connecting while the old one's
+    /// `teardown_peer` abort or natural session end hasn't been cleaned
+    /// up yet), confirmed live via the soak lane's rapid repeated-
+    /// restart chaos leaving a peer's session permanently stuck, unable
+    /// to ever re-handshake.
+    fn insert_channel_revoking_superseded(&self, device_id: String, channel: Arc<PeerChannel>) {
+        let superseded = self
+            .channels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(device_id, channel.clone());
+        if let Some(superseded) = superseded {
+            if !Arc::ptr_eq(&superseded, &channel) {
+                superseded.revoke();
+            }
+        }
+    }
+
     fn new() -> Self {
         Self {
             previous: Arc::new(StdMutex::new(HashMap::new())),
@@ -1980,11 +2010,12 @@ async fn run_one_peer_session_attempt(
     // enough to stop the actor (see `PeerChannel::revoke`'s doc
     // comment), so `teardown_peer` needs a live reference, not just
     // to out-live every other clone.
-    diff_state
-        .channels
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(peer_device_id.to_string(), channel.clone());
+    //
+    // M5-A soak-closure finding: see `insert_channel_revoking_
+    // superseded`'s own doc comment for why a plain `insert` here is
+    // unsafe -- confirmed live via the soak lane's rapid repeated-
+    // restart chaos leaving a peer's session permanently stuck.
+    diff_state.insert_channel_revoking_superseded(peer_device_id.to_string(), channel.clone());
     // M3 Pass 5: mirrors the insert above onto `DaemonState` -- see
     // `DaemonState::set_direct_channel`'s own doc comment.
     state.set_direct_channel(peer_device_id.to_string(), channel.clone());
@@ -2543,11 +2574,9 @@ async fn run_one_direct_peer_session_attempt(
         }
     };
 
-    diff_state
-        .channels
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(peer_device_id.to_string(), channel.clone());
+    // See `insert_channel_revoking_superseded`'s own doc comment (M5-A
+    // soak-closure finding) for why a plain `insert` here is unsafe.
+    diff_state.insert_channel_revoking_superseded(peer_device_id.to_string(), channel.clone());
 
     // Reflect the channel's live reachability into status: it starts
     // `Connecting` while candidates race, becomes `Connected` once a
@@ -3617,16 +3646,22 @@ mod tests {
         let old_channel = fake_channel().await;
         let new_channel = fake_channel().await;
 
-        diff_state
-            .channels
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert("device-b".to_string(), old_channel.clone());
-        diff_state
-            .channels
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert("device-b".to_string(), new_channel.clone());
+        // `insert_channel_revoking_superseded`, the SAME method both real
+        // `spawn_peer_session` call sites use -- exercising this test
+        // against the plain `HashMap`/`insert` directly (as it read
+        // before the M5-A soak-closure fix) would make this test pass
+        // for a bug production no longer has.
+        diff_state.insert_channel_revoking_superseded("device-b".to_string(), old_channel.clone());
+        diff_state.insert_channel_revoking_superseded("device-b".to_string(), new_channel.clone());
+        assert!(
+            old_channel.is_revoked(),
+            "a channel silently replaced by a newer generation's insert must be revoked -- \
+             otherwise it stays registered in the transport hub's demux forever, still able to \
+             answer a handshake initiation for this peer under its own stale session index, with \
+             no Arc anywhere left to ever revoke it again (confirmed live via the soak lane's \
+             rapid repeated-restart chaos: this exact gap left W's/N's sessions with a rapidly-\
+             restarted peer permanently stuck, unable to ever re-handshake)"
+        );
 
         let removed = diff_state.remove_channel_if_current("device-b", &old_channel);
         assert!(!removed, "cleanup keyed to the OLD generation's channel must not report removal");
