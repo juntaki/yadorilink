@@ -155,21 +155,94 @@ fn every_named_scenario_file_exists() {
     );
 }
 
+/// Whether a required scenario, as WRITTEN in `source`, actually gates
+/// every change -- `Missing` if no such function exists at all, `Ignored`
+/// if it exists but carries an `#[ignore]`/`#[ignore = "..."]` attribute
+/// (present in the file, but never actually run by a plain `cargo test`),
+/// `Active` only if it exists with no such attribute. Parses `source`'s
+/// real syntax tree (`syn`) rather than a substring search: a plain
+/// `source.contains("fn name(")` can see a function EXISTS but can never
+/// see whether it's `#[ignore]`d, and can also be fooled by the same text
+/// appearing inside a comment or a string literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScenarioStatus {
+    Active,
+    Ignored,
+    Missing,
+}
+
+fn scenario_status(source: &str, function: &str) -> ScenarioStatus {
+    let file = syn::parse_file(source).expect("test source file must be valid Rust syntax");
+    for item in &file.items {
+        let syn::Item::Fn(item_fn) = item else { continue };
+        if item_fn.sig.ident != function {
+            continue;
+        }
+        let ignored = item_fn.attrs.iter().any(|attr| attr.path().is_ident("ignore"));
+        return if ignored { ScenarioStatus::Ignored } else { ScenarioStatus::Active };
+    }
+    ScenarioStatus::Missing
+}
+
 #[test]
 fn every_named_scenario_function_exists_in_its_file() {
     let pointers = scenario_pointers_from_this_file();
     let dir = tests_dir();
     let mut missing = Vec::new();
+    let mut ignored = Vec::new();
     for (file, function) in &pointers {
         let source = std::fs::read_to_string(dir.join(file))
             .unwrap_or_else(|e| panic!("cannot read tests/{file}: {e}"));
-        let needle = format!("fn {function}(");
-        if !source.contains(&needle) {
-            missing.push(format!("{file}::{function}"));
+        match scenario_status(&source, function) {
+            ScenarioStatus::Active => {}
+            ScenarioStatus::Ignored => ignored.push(format!("{file}::{function}")),
+            ScenarioStatus::Missing => missing.push(format!("{file}::{function}")),
         }
     }
     assert!(
         missing.is_empty(),
         "m5a_acceptance_matrix.rs names scenarios that no longer exist as written: {missing:?}"
     );
+    assert!(
+        ignored.is_empty(),
+        "m5a_acceptance_matrix.rs names scenarios that are #[ignore]d, so they are NOT actually \
+         part of the deterministic gate this file's own doc comment claims they are: {ignored:?}"
+    );
+}
+
+#[test]
+fn scenario_status_reports_missing_for_a_function_that_does_not_exist() {
+    let source = "fn something_else() {}\n";
+    assert_eq!(scenario_status(source, "required_scenario"), ScenarioStatus::Missing);
+}
+
+#[test]
+fn scenario_status_reports_ignored_for_a_bare_ignore_attribute() {
+    let source = "#[ignore]\n#[tokio::test]\nasync fn required_scenario() {}\n";
+    assert_eq!(scenario_status(source, "required_scenario"), ScenarioStatus::Ignored);
+}
+
+#[test]
+fn scenario_status_reports_ignored_for_an_ignore_attribute_with_a_reason() {
+    let source = "#[ignore = \"flaky under CI load\"]\n#[test]\nfn required_scenario() {}\n";
+    assert_eq!(scenario_status(source, "required_scenario"), ScenarioStatus::Ignored);
+}
+
+#[test]
+fn scenario_status_reports_active_for_a_plain_test_function() {
+    let source = "#[tokio::test]\nasync fn required_scenario() {}\n";
+    assert_eq!(scenario_status(source, "required_scenario"), ScenarioStatus::Active);
+}
+
+/// The exact false-negative a plain substring search would miss: the
+/// function name appears in a comment, but the real function is
+/// `#[ignore]`d -- a substring check (`source.contains("fn name(")`) sees
+/// the comment's `fn required_scenario(` text and reports "found", never
+/// noticing the actual definition is ignored. The AST-based check must
+/// not be fooled by this.
+#[test]
+fn scenario_status_is_not_fooled_by_a_comment_mentioning_the_function_signature() {
+    let source = "// see also fn required_scenario(x: u32) for context\n\
+                   #[ignore]\n#[test]\nfn required_scenario() {}\n";
+    assert_eq!(scenario_status(source, "required_scenario"), ScenarioStatus::Ignored);
 }

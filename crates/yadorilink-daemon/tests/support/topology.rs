@@ -248,7 +248,7 @@ pub async fn restart_node(node: TopologyNode) -> TopologyNode {
     }
 }
 
-fn link_eager(node: &TopologyNode, group_id: &str) {
+pub fn link_eager(node: &TopologyNode, group_id: &str) {
     let local_path = node.root.path().to_string_lossy().to_string();
     node.state.replica_coordinator.link_repository().add_link(&local_path, group_id).unwrap();
     LinkRuntimeController::new(node.state.clone()).start(local_path, group_id.to_string()).unwrap();
@@ -394,6 +394,72 @@ pub async fn stand_up_canonical_topology(
         || {
             format!(
                 "canonical topology never reached full mesh: n<->m={} n<->w={} m<->w={}",
+                fully_connected(&n.state, &m.device_id),
+                fully_connected(&n.state, &w.device_id),
+                fully_connected(&m.state, &w.device_id),
+            )
+        },
+    )
+    .await;
+
+    (n, m, w, TopologyHandles { orchestrators })
+}
+
+/// Like [`stand_up_canonical_topology`], but M is ALSO a real, production
+/// full replica (`link_eager` plus the matching coordination-plane
+/// declaration -- the exact pairing N already gets there) instead of
+/// On-Demand: N(FullReplica)/M(FullReplica)/W(OnDemand). M5-A Pass 3's
+/// "real `Protected`/`AvailableNow` through a confirmed remote holder"
+/// scenario needs a SECOND real full replica -- `classify()`'s `Protected`
+/// path deliberately requires an OTHER confirmed full-replica peer, never
+/// a device's own local completeness alone, and `fetch_available_via_
+/// confirmed_peer` needs a peer whose custody confirmation is real, not a
+/// `FakeCoordination`-only declaration mismatched against that device's
+/// actual local storage mode (the exact review finding this helper exists
+/// to avoid repeating -- see `durability_unobtainable_content.rs`'s own
+/// module doc for the same lesson learned there).
+pub async fn stand_up_topology_two_full_replicas_one_on_demand(
+    fake: &FakeCoordination,
+    group_id: &str,
+) -> (TopologyNode, TopologyNode, TopologyNode, TopologyHandles) {
+    let n = new_node("topology-n-nas");
+    let m = new_node("topology-m-second-full-replica");
+    let w = new_node("topology-w-windows");
+
+    for node in [&n, &m, &w] {
+        register_with_fake(
+            fake,
+            &node.state,
+            &node.device_id,
+            node.keypair.public_bytes(),
+            &[group_id],
+        )
+        .await;
+    }
+    link_eager(&n, group_id);
+    link_eager(&m, group_id);
+    link_on_demand(&w, group_id);
+
+    fake.set_full_replica(&n.device_id, group_id, true);
+    n.state.set_local_relay_capable(true);
+    fake.set_relay_capable(&n.device_id, true);
+    fake.set_full_replica(&m.device_id, group_id, true);
+
+    let orchestrators: Vec<(String, tokio::runtime::Runtime)> = [&n, &m, &w]
+        .map(|node| (node.device_id.clone(), spawn_orchestrator(fake.addr(), node)))
+        .into_iter()
+        .collect();
+
+    wait_until_with_context(
+        || {
+            fully_connected(&n.state, &m.device_id)
+                && fully_connected(&n.state, &w.device_id)
+                && fully_connected(&m.state, &w.device_id)
+        },
+        Duration::from_secs(60),
+        || {
+            format!(
+                "two-full-replica topology never reached full mesh: n<->m={} n<->w={} m<->w={}",
                 fully_connected(&n.state, &m.device_id),
                 fully_connected(&n.state, &w.device_id),
                 fully_connected(&m.state, &w.device_id),
