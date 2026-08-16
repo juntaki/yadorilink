@@ -3137,13 +3137,36 @@ impl DaemonState {
                 continue;
             }
             // Fact 4: every OTHER current writer has EXPLICITLY,
-            // definitively refused this exact path (never inferred from
-            // an untried/offline writer's silence -- see
-            // `block_fetch_refusals`'s own schema doc comment).
+            // definitively refused this EXACT version of this path (never
+            // inferred from an untried/offline writer's silence, and
+            // never conflated with a refusal recorded against some OTHER
+            // version this path once had -- see `block_fetch_refusals`'s
+            // own schema doc comment for why refusal evidence is bound to
+            // `version_hash`, not just `path`).
+            let file_index = self.replica_coordinator.file_index_repository();
+            let (Ok(Some(record)), Ok(record_kind), Ok(exec_bit), Ok(symlink_target)) = (
+                file_index.get_file(group_id, path),
+                file_index.get_record_kind(group_id, path),
+                file_index.get_exec_bit(group_id, path),
+                file_index.get_symlink_target(group_id, path),
+            ) else {
+                continue;
+            };
+            let current_version_hash =
+                yadorilink_replica_domain::file::FileVersion::from_index_row(
+                    record.blocks,
+                    record.size,
+                    record.mtime_unix_nanos,
+                    record_kind.unwrap_or_default(),
+                    exec_bit,
+                    symlink_target,
+                )
+                .version_hash
+                .to_hex();
             let Ok(refusers) = self
                 .replica_coordinator
                 .materialization_state_repository()
-                .refusing_peers_for_path(group_id, path)
+                .refusing_peers_for_path(group_id, path, &current_version_hash)
             else {
                 continue;
             };

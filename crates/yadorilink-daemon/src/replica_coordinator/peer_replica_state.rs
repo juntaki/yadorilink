@@ -422,6 +422,7 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         &self,
         group_id: &str,
         path: &str,
+        version_hash: &str,
         peer_device_id: &str,
         reason: &str,
         refused_at_unix_nanos: i64,
@@ -430,10 +431,24 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
             .record_block_fetch_refusal(
                 group_id,
                 path,
+                version_hash,
                 peer_device_id,
                 reason,
                 refused_at_unix_nanos,
             )
+            .map_err(SyncError::from)
+            .map_err(PeerSessionError::from)
+    }
+
+    fn clear_block_fetch_refusal(
+        &self,
+        group_id: &str,
+        path: &str,
+        version_hash: &str,
+        peer_device_id: &str,
+    ) -> Result<(), PeerSessionError> {
+        self.materialization_state_repository()
+            .clear_block_fetch_refusal(group_id, path, version_hash, peer_device_id)
             .map_err(SyncError::from)
             .map_err(PeerSessionError::from)
     }

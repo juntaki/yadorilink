@@ -541,6 +541,17 @@ mod projection_attempt_tests {
     }
 }
 
+/// The exact `Rejected` reason `send_block_request_rejected` sends when a
+/// peer has no verified group provenance for a block -- the ONLY rejection
+/// reason `ensure_blocks_present` treats as evidence a peer positively does
+/// not hold a version's content (see `block_fetch_refusals`'s own schema
+/// doc comment). Every other `Rejected` reason (unauthorized, malformed
+/// request, size mismatch) is a real hard denial but proves nothing about
+/// content possession, so it must never be recorded as unobtainability
+/// evidence. Shared as one constant, not duplicated string literals, so the
+/// emit site and the check site can never silently drift apart.
+const NO_VERIFIED_PROVENANCE_REASON: &str = "no verified group provenance for this block";
+
 #[derive(Clone, Debug)]
 enum FetchOutcome {
     Found(Bytes),
@@ -6249,10 +6260,7 @@ impl PeerSyncSession {
                 "refusing block request without verified group provenance"
             );
             drop(examination_permits);
-            let _ = self.try_send_block_request_rejected(
-                &req,
-                "no verified group provenance for this block",
-            );
+            let _ = self.try_send_block_request_rejected(&req, NO_VERIFIED_PROVENANCE_REASON);
             return Ok(());
         }
         // Every check above (authorization, reference, provenance) is
@@ -7627,8 +7635,9 @@ impl PeerSyncSession {
         &self,
         group_id: &str,
         file_path: &str,
-        blocks: &[BlockInfo],
+        record: &FileRecord,
     ) -> Result<bool, PeerSessionError> {
+        let blocks = &record.blocks;
         // Batched presence check rather than probing one
         // hash at a time — most of a hydration's blocks are typically
         // already-known-missing (that's the point of a placeholder), so
@@ -7636,6 +7645,25 @@ impl PeerSyncSession {
         // calls interleaved with network fetches into one upfront query.
         let hashes: Vec<_> = blocks.iter().map(|b| hex::encode(&b.hash)).collect();
         let present = self.store.present_blocks(&hashes)?;
+        // M5-A soak-closure durability investigation, review follow-up:
+        // `block_fetch_refusals` evidence must be bound to the EXACT
+        // current version, not just the path -- a refusal recorded
+        // against an older version must never be read as evidence about a
+        // newer one that superseded it. Computed once here (cheap: hashes
+        // only the small metadata envelope, not block bytes) rather than
+        // per-block, and safe to compute from `record` plus these three
+        // getters even though they are separate calls: the caller holds
+        // `path_lock` for this whole attempt, so nothing can mutate this
+        // path's index row concurrently.
+        let current_version_hash = FileVersion::from_index_row(
+            record.blocks.clone(),
+            record.size,
+            record.mtime_unix_nanos,
+            self.state.get_record_kind(group_id, file_path)?.unwrap_or_default(),
+            self.state.get_exec_bit(group_id, file_path)?,
+            self.state.get_symlink_target(group_id, file_path)?,
+        )
+        .version_hash;
 
         let mut all_present = true;
         for (block, already_present) in blocks.iter().zip(present) {
@@ -7719,27 +7747,41 @@ impl PeerSyncSession {
                             reason,
                             "peer rejected this block request; not retrying"
                         );
-                        // M5-A soak-closure durability investigation:
-                        // durable record of this EXPLICIT, definitive
-                        // refusal -- see `DurabilityFacts::known_
-                        // unobtainable_required_content`'s own doc
-                        // comment for why this (not a transient
-                        // NotFound/TimedOut/Busy miss) is the evidence
-                        // that fact needs.
-                        if let Err(e) = self.state.record_block_fetch_refusal(
-                            group_id,
-                            file_path,
-                            &self.peer_device_id,
-                            reason,
-                            now_unix_nanos(),
-                        ) {
-                            tracing::warn!(
-                                local_device_id = %self.local_device_id,
-                                candidate_peer_id = %self.peer_device_id,
+                        // M5-A soak-closure durability investigation,
+                        // review follow-up: durable record of this
+                        // EXPLICIT, definitive refusal -- but ONLY when
+                        // `reason` is specifically `NO_VERIFIED_
+                        // PROVENANCE_REASON`. Every other `Rejected`
+                        // reason (unauthorized, malformed request, size
+                        // mismatch) is a real denial but proves nothing
+                        // about whether the peer actually holds this
+                        // version's bytes, so recording it here would let
+                        // e.g. an authorization failure be misread as
+                        // "content unobtainable" evidence. See
+                        // `DurabilityFacts::known_unobtainable_required_
+                        // content`'s own doc comment for why this (not a
+                        // transient NotFound/TimedOut/Busy miss, and not
+                        // any other rejection reason) is the evidence
+                        // that fact needs, and `block_fetch_refusals`'s
+                        // schema doc for why it is bound to the exact
+                        // current version, not just the path.
+                        if reason == NO_VERIFIED_PROVENANCE_REASON {
+                            if let Err(e) = self.state.record_block_fetch_refusal(
+                                group_id,
                                 file_path,
-                                error = %e,
-                                "failed to record a block fetch refusal"
-                            );
+                                &current_version_hash.to_hex(),
+                                &self.peer_device_id,
+                                reason,
+                                now_unix_nanos(),
+                            ) {
+                                tracing::warn!(
+                                    local_device_id = %self.local_device_id,
+                                    candidate_peer_id = %self.peer_device_id,
+                                    file_path,
+                                    error = %e,
+                                    "failed to record a block fetch refusal"
+                                );
+                            }
                         }
                         break None;
                     }
@@ -7770,10 +7812,33 @@ impl PeerSyncSession {
                     let store = self.store.clone();
                     let put_result = spawn_blocking(move || store.put(&data)).await;
                     match put_result {
-                        Ok(Ok(_hash)) => self.state.record_group_block_provenance(
-                            group_id,
-                            std::slice::from_ref(&block.hash),
-                        )?,
+                        Ok(Ok(_hash)) => {
+                            self.state.record_group_block_provenance(
+                                group_id,
+                                std::slice::from_ref(&block.hash),
+                            )?;
+                            // M5-A soak-closure durability investigation,
+                            // review follow-up: this peer just proved it
+                            // DOES hold this exact version's content, so
+                            // any prior refusal recorded against it for
+                            // this path/version can never be read as
+                            // still-current evidence again.
+                            if let Err(e) = self.state.clear_block_fetch_refusal(
+                                group_id,
+                                file_path,
+                                &current_version_hash.to_hex(),
+                                &self.peer_device_id,
+                            ) {
+                                tracing::warn!(
+                                    local_device_id = %self.local_device_id,
+                                    candidate_peer_id = %self.peer_device_id,
+                                    file_path,
+                                    error = %e,
+                                    "failed to clear a stale block fetch refusal after a \
+                                     successful fetch"
+                                );
+                            }
+                        }
                         Ok(Err(e)) => return Err(e.into()),
                         Err(join_err) => {
                             return Err(PeerSessionError::from(std::io::Error::other(format!(
@@ -7931,11 +7996,9 @@ impl PeerSyncSession {
             committed: false,
         };
 
-        let outcome = tokio::time::timeout(
-            timeout,
-            self.ensure_blocks_present(group_id, path, &record.blocks),
-        )
-        .await;
+        let outcome =
+            tokio::time::timeout(timeout, self.ensure_blocks_present(group_id, path, &record))
+                .await;
 
         let all_present = match outcome {
             Ok(Ok(all_present)) => all_present,
@@ -9216,7 +9279,7 @@ impl PeerSyncSession {
             // delayed even while both buckets are saturated" precedent.
             let all_present = tokio::time::timeout(
                 DEFAULT_HYDRATION_TIMEOUT,
-                self.ensure_blocks_present(group_id, &record.path, &record.blocks),
+                self.ensure_blocks_present(group_id, &record.path, &record),
             )
             .await
             .map_err(|_elapsed| PeerSessionError::HydrationFailed(record.path.clone()))??;

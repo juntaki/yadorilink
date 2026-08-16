@@ -310,20 +310,37 @@ pub trait PeerReplicaStatePort: Send + Sync {
     ) -> Result<(), PeerSessionError>;
 
     /// Records that `peer_device_id` EXPLICITLY, definitively refused a
-    /// whole-path block request (`FetchOutcome::Rejected`) -- deliberately
-    /// distinct from a transient miss (`NotFound`/`TimedOut`/`Busy`),
-    /// which must never call this. M5-A soak-closure durability
-    /// investigation: this is the evidence `DurabilityFacts::known_
-    /// unobtainable_required_content` needs to positively confirm no
-    /// currently-authorized peer can serve a path's content, rather than
-    /// inferring it from connectivity/timing alone.
+    /// fetch of `path` AT `version_hash` for lack of verified provenance on
+    /// that exact version -- deliberately distinct both from a transient
+    /// miss (`NotFound`/`TimedOut`/`Busy`) and from any OTHER `Rejected`
+    /// reason, neither of which must ever call this. M5-A soak-closure
+    /// durability investigation, review follow-up: this is the evidence
+    /// `DurabilityFacts::known_unobtainable_required_content` needs to
+    /// positively confirm no currently-authorized peer can serve the exact
+    /// CURRENT version's content, rather than inferring it from
+    /// connectivity/timing alone or conflating it with a since-superseded
+    /// version's refusals (why this is keyed by `version_hash`, not just
+    /// `path`).
     fn record_block_fetch_refusal(
         &self,
         group_id: &str,
         path: &str,
+        version_hash: &str,
         peer_device_id: &str,
         reason: &str,
         refused_at_unix_nanos: i64,
+    ) -> Result<(), PeerSessionError>;
+
+    /// Deletes any refusal previously recorded for `peer_device_id` against
+    /// `path` at `version_hash` -- called on a SUCCESSFUL fetch, so a peer
+    /// that once refused a version but has since obtained it can never be
+    /// read as still refusing it.
+    fn clear_block_fetch_refusal(
+        &self,
+        group_id: &str,
+        path: &str,
+        version_hash: &str,
+        peer_device_id: &str,
     ) -> Result<(), PeerSessionError>;
 
     fn dag_group_heads(&self, group_id: &str) -> Result<Vec<ChangeHash>, PeerSessionError>;

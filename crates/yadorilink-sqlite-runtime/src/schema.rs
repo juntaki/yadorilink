@@ -506,26 +506,40 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
         CREATE INDEX IF NOT EXISTS idx_enrollment_operations_state
             ON enrollment_operations(state);
         -- M5-A soak-closure durability investigation: durable record of a
-        -- peer EXPLICITLY, definitively refusing a whole-path block
-        -- request (`FetchOutcome::Rejected`, e.g. "no verified group
-        -- provenance for this block") -- deliberately distinct from a
-        -- transient miss (`NotFound`/`TimedOut`/`Busy`), which never
-        -- writes a row here. This is the evidence
-        -- `known_unobtainable_required_content` (`DurabilityFacts`) needs
-        -- to positively confirm no CURRENTLY authorized peer can serve a
-        -- path's content, rather than merely inferring it from
-        -- connectivity/timing. One row per `(group_id, path, peer_
-        -- device_id)`; a fresh rejection overwrites the previous one via
-        -- `INSERT ... ON CONFLICT`. A new additive table, so a bare
-        -- `CREATE TABLE IF NOT EXISTS` is the whole migration, like
-        -- `materialization_intents`/`enrollment_operations` above.
+        -- peer EXPLICITLY, definitively refusing a fetch for lack of
+        -- verified provenance on the EXACT current version
+        -- (`FetchOutcome::Rejected { reason: NoVerifiedProvenance }`) --
+        -- deliberately distinct both from a transient miss
+        -- (`NotFound`/`TimedOut`/`Busy`) and from any OTHER rejection
+        -- reason (unauthorized, malformed request, etc.), neither of
+        -- which writes a row here: only a rejection that specifically
+        -- proves "this peer does not hold this exact version's bytes" is
+        -- evidence of unobtainability. This is keyed by `version_hash`,
+        -- not just `path`: a refusal recorded against an OLDER version
+        -- must never be read as evidence about a NEWER version that
+        -- superseded it (a stale-refusal false positive an M5-A review
+        -- caught -- `path` alone conflates every version a file has ever
+        -- had). This is the evidence `known_unobtainable_required_
+        -- content` (`DurabilityFacts`) needs to positively confirm no
+        -- CURRENTLY authorized peer can serve the CURRENT version's
+        -- content, rather than merely inferring it from
+        -- connectivity/timing. One row per `(group_id, path, version_
+        -- hash, peer_device_id)`; a fresh rejection overwrites the
+        -- previous one via `INSERT ... ON CONFLICT`, and a later
+        -- successful fetch of the SAME version from the SAME peer
+        -- deletes any prior refusal row for it (see `ensure_blocks_
+        -- present`'s success arm) -- old evidence never outlives being
+        -- proven wrong. A new additive table, so a bare `CREATE TABLE IF
+        -- NOT EXISTS` is the whole migration, like `materialization_
+        -- intents`/`enrollment_operations` above.
         CREATE TABLE IF NOT EXISTS block_fetch_refusals (
             group_id              TEXT NOT NULL,
             path                  TEXT NOT NULL,
+            version_hash          TEXT NOT NULL,
             peer_device_id        TEXT NOT NULL,
             reason                TEXT NOT NULL,
             refused_at_unix_nanos INTEGER NOT NULL,
-            PRIMARY KEY (group_id, path, peer_device_id)
+            PRIMARY KEY (group_id, path, version_hash, peer_device_id)
         );
         "#,
     )?;

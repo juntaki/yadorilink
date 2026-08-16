@@ -473,15 +473,18 @@ impl MaterializationStateRepository {
     }
 
     /// Records that `peer_device_id` EXPLICITLY, definitively refused a
-    /// whole-path block request (`FetchOutcome::Rejected`) -- see
-    /// `block_fetch_refusals`'s own schema doc comment for why this is
-    /// deliberately distinct from a transient miss (never recorded here).
-    /// Idempotent per `(group_id, path, peer_device_id)`: a fresh
-    /// rejection overwrites whatever was recorded before.
+    /// fetch of `path` AT `version_hash` for lack of verified provenance on
+    /// that exact version -- see `block_fetch_refusals`'s own schema doc
+    /// comment for why this is deliberately distinct both from a transient
+    /// miss and from any other rejection reason (never recorded here), and
+    /// why it is bound to the exact version rather than just the path.
+    /// Idempotent per `(group_id, path, version_hash, peer_device_id)`: a
+    /// fresh rejection overwrites whatever was recorded before.
     pub fn record_block_fetch_refusal(
         &self,
         group_id: &str,
         path: &str,
+        version_hash: &str,
         peer_device_id: &str,
         reason: &str,
         now_unix_nanos: i64,
@@ -489,35 +492,69 @@ impl MaterializationStateRepository {
         self.database.write::<_, SyncSqliteError>(|conn| {
             conn.execute(
                 "INSERT INTO block_fetch_refusals \
-                     (group_id, path, peer_device_id, reason, refused_at_unix_nanos) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(group_id, path, peer_device_id) DO UPDATE SET \
+                     (group_id, path, version_hash, peer_device_id, reason, refused_at_unix_nanos) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(group_id, path, version_hash, peer_device_id) DO UPDATE SET \
                      reason = excluded.reason, \
                      refused_at_unix_nanos = excluded.refused_at_unix_nanos",
-                rusqlite::params![group_id, path, peer_device_id, reason, now_unix_nanos],
+                rusqlite::params![
+                    group_id,
+                    path,
+                    version_hash,
+                    peer_device_id,
+                    reason,
+                    now_unix_nanos
+                ],
             )?;
             Ok(())
         })
     }
 
-    /// Every peer device id that has EXPLICITLY refused `path` (not merely
-    /// never been asked, and not a transient miss) -- the evidence
-    /// `known_unobtainable_required_content` cross-references against the
-    /// group's current authorized-writer set to positively confirm no
-    /// currently-reachable peer can serve this content, rather than
-    /// inferring it from connectivity/timing alone.
+    /// Deletes any refusal previously recorded for `peer_device_id` against
+    /// `path` at `version_hash` -- called on a SUCCESSFUL fetch, so a peer
+    /// that once refused a version but has since obtained it can never be
+    /// read as still refusing it. Refusals for OTHER versions of the same
+    /// path are untouched (they were never evidence about this version to
+    /// begin with, since the table is version-scoped).
+    pub fn clear_block_fetch_refusal(
+        &self,
+        group_id: &str,
+        path: &str,
+        version_hash: &str,
+        peer_device_id: &str,
+    ) -> Result<(), SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            conn.execute(
+                "DELETE FROM block_fetch_refusals \
+                 WHERE group_id = ?1 AND path = ?2 AND version_hash = ?3 AND peer_device_id = ?4",
+                rusqlite::params![group_id, path, version_hash, peer_device_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Every peer device id that has EXPLICITLY refused `path` AT the exact
+    /// `version_hash` (not merely never been asked, not a transient miss,
+    /// and not a refusal recorded against some OTHER version of this path)
+    /// -- the evidence `known_unobtainable_required_content` cross-
+    /// references against the group's current authorized-writer set to
+    /// positively confirm no currently-reachable peer can serve the CURRENT
+    /// version's content, rather than inferring it from connectivity/timing
+    /// alone or conflating it with a since-superseded version's refusals.
     pub fn refusing_peers_for_path(
         &self,
         group_id: &str,
         path: &str,
+        version_hash: &str,
     ) -> Result<std::collections::HashSet<String>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT peer_device_id FROM block_fetch_refusals \
-                 WHERE group_id = ?1 AND path = ?2",
+                 WHERE group_id = ?1 AND path = ?2 AND version_hash = ?3",
             )?;
-            let rows =
-                stmt.query_map(rusqlite::params![group_id, path], |r| r.get::<_, String>(0))?;
+            let rows = stmt.query_map(rusqlite::params![group_id, path, version_hash], |r| {
+                r.get::<_, String>(0)
+            })?;
             let mut out = std::collections::HashSet::new();
             for row in rows {
                 out.insert(row?);
@@ -1006,4 +1043,176 @@ impl MaterializationStateRepository {
 pub struct RecordedPlaceholderGeneration {
     pub identity: yadorilink_local_storage::PlaceholderDiskIdentity,
     pub provider_kind: String,
+}
+
+/// M5-A soak-closure durability investigation, review follow-up: a
+/// reviewer's adversarial pass on the `known_unobtainable_required_content`
+/// fix found the ORIGINAL `block_fetch_refusals` table keyed refusal
+/// evidence by `(group_id, path, peer_device_id)` only -- no version
+/// binding at all. That meant a refusal recorded against an OLDER version
+/// of a path could be misread as evidence about a NEWER version that later
+/// superseded it: author writes V1, a peer refuses V1 (recorded), the
+/// author writes V2 (a distinct version, never refused by anyone) and then
+/// leaves the group -- the OLD V1 refusal alone was enough to flip V2 to
+/// `AtRisk`, a false positive with no true evidence behind it. These tests
+/// exercise the fix directly at the repository layer (deterministic, no
+/// topology/network involved) rather than only via the much heavier
+/// full-daemon integration test.
+#[cfg(test)]
+mod block_fetch_refusal_tests {
+    use super::*;
+
+    /// A minimal schema covering only what these tests touch
+    /// (`block_fetch_refusals`) -- `yadorilink_sqlite_runtime::init_schema`
+    /// itself assumes a sibling schema-init call already created `changes`/
+    /// `pruned_changes` (see that function's own doc comment), which these
+    /// tests have no need for. Kept byte-identical to the `CREATE TABLE`
+    /// in `yadorilink-sqlite-runtime/src/schema.rs`.
+    fn open_test_db() -> Arc<SyncDatabase> {
+        Arc::new(
+            SyncDatabase::open_in_memory(|conn| {
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS block_fetch_refusals (
+                        group_id              TEXT NOT NULL,
+                        path                  TEXT NOT NULL,
+                        version_hash          TEXT NOT NULL,
+                        peer_device_id        TEXT NOT NULL,
+                        reason                TEXT NOT NULL,
+                        refused_at_unix_nanos INTEGER NOT NULL,
+                        PRIMARY KEY (group_id, path, version_hash, peer_device_id)
+                    );",
+                )
+                .map_err(yadorilink_sqlite_runtime::DatabaseError::from)
+            })
+            .expect("open in-memory db"),
+        )
+    }
+
+    /// The exact false-positive scenario the reviewer described: a refusal
+    /// recorded against V1 must never show up as evidence when the query is
+    /// asked about V2, even for the same `(group_id, path, peer_device_id)`.
+    #[test]
+    fn refusal_recorded_against_one_version_is_invisible_to_a_different_version() {
+        let repo = MaterializationStateRepository::new(open_test_db());
+        let group_id = "group-1";
+        let path = "foo.txt";
+        let v1 = "version-hash-v1";
+        let v2 = "version-hash-v2";
+        let peer = "peer-m";
+
+        repo.record_block_fetch_refusal(
+            group_id,
+            path,
+            v1,
+            peer,
+            "no verified group provenance for this block",
+            1000,
+        )
+        .unwrap();
+
+        assert_eq!(
+            repo.refusing_peers_for_path(group_id, path, v1).unwrap(),
+            std::collections::HashSet::from([peer.to_string()]),
+            "the refused version must see the refusal"
+        );
+        assert!(
+            repo.refusing_peers_for_path(group_id, path, v2).unwrap().is_empty(),
+            "a DIFFERENT version of the same path must never inherit another version's refusal \
+             evidence"
+        );
+    }
+
+    /// A peer that once refused a version but has since successfully
+    /// delivered it can never be read as still refusing it -- the stale-
+    /// evidence-invalidation half of the fix.
+    #[test]
+    fn clearing_a_refusal_removes_only_that_exact_peer_path_version_row() {
+        let repo = MaterializationStateRepository::new(open_test_db());
+        let group_id = "group-1";
+        let path = "foo.txt";
+        let version = "version-hash-v1";
+        let refusing_peer = "peer-m";
+        let other_refusing_peer = "peer-w";
+
+        repo.record_block_fetch_refusal(
+            group_id,
+            path,
+            version,
+            refusing_peer,
+            "no verified group provenance for this block",
+            1000,
+        )
+        .unwrap();
+        repo.record_block_fetch_refusal(
+            group_id,
+            path,
+            version,
+            other_refusing_peer,
+            "no verified group provenance for this block",
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            repo.refusing_peers_for_path(group_id, path, version).unwrap().len(),
+            2,
+            "both refusals must be visible before either is cleared"
+        );
+
+        // `refusing_peer` later successfully delivers the block.
+        repo.clear_block_fetch_refusal(group_id, path, version, refusing_peer).unwrap();
+
+        let remaining = repo.refusing_peers_for_path(group_id, path, version).unwrap();
+        assert_eq!(
+            remaining,
+            std::collections::HashSet::from([other_refusing_peer.to_string()]),
+            "clearing one peer's refusal must not affect a different peer's still-standing \
+             refusal for the same path/version"
+        );
+    }
+
+    /// Clearing a refusal for one version must never touch a refusal
+    /// recorded against a DIFFERENT version of the same path/peer -- the
+    /// two rows are independent by construction (different primary keys),
+    /// but this pins that invariant explicitly since it is exactly the kind
+    /// of thing a future schema change could silently break.
+    #[test]
+    fn clearing_a_refusal_for_one_version_does_not_affect_a_different_version() {
+        let repo = MaterializationStateRepository::new(open_test_db());
+        let group_id = "group-1";
+        let path = "foo.txt";
+        let v1 = "version-hash-v1";
+        let v2 = "version-hash-v2";
+        let peer = "peer-m";
+
+        repo.record_block_fetch_refusal(
+            group_id,
+            path,
+            v1,
+            peer,
+            "no verified group provenance for this block",
+            1000,
+        )
+        .unwrap();
+        repo.record_block_fetch_refusal(
+            group_id,
+            path,
+            v2,
+            peer,
+            "no verified group provenance for this block",
+            1000,
+        )
+        .unwrap();
+
+        repo.clear_block_fetch_refusal(group_id, path, v1, peer).unwrap();
+
+        assert!(
+            repo.refusing_peers_for_path(group_id, path, v1).unwrap().is_empty(),
+            "v1's refusal must be gone"
+        );
+        assert_eq!(
+            repo.refusing_peers_for_path(group_id, path, v2).unwrap(),
+            std::collections::HashSet::from([peer.to_string()]),
+            "v2's independent refusal must be untouched by clearing v1's"
+        );
+    }
 }
