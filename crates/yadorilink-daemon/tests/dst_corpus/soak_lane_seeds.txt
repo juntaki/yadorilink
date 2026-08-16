@@ -7,15 +7,41 @@
 # 6263760059660724191) were false positives from an initial
 # SETTLE_TIMEOUT that was too short -- all six pass cleanly at 240s.
 #
-# Seeds below are kept because they ALSO exercise three still-open
-# findings from the M5-A soak-closure investigation (session leak, stale
-# route, durability stuck Protecting -- see the tracked comment above
-# randomized_soak_converges_with_no_leaks_or_stuck_state and project
-# memory m5a-pass9-link-runtime-stop-fence-gap for the classification
-# trail). Not the fence-gap panic anymore -- confirmed via repeated
-# isolated runs after the fence-gap fix landed.
+# Of the M5-A soak-closure investigation's three findings:
+# - session leak: FIXED. Real production zombie-channel bug
+#   (`NetmapDiffState::channels`/`DaemonState::direct_channels` silently
+#   discarding a superseded `Arc<PeerChannel>` without `revoke()`), fixed
+#   at both call sites -- PLUS the soak's own invariant 2 assumed
+#   recovery always means session-Arc replacement, which is false
+#   (`PeerChannel` can heal an existing session in place via its own
+#   `DIRECT_LIVENESS_TIMEOUT` re-race); invariant fixed to check
+#   functional health instead.
+# - stale route: FIXED. Pure test-harness bug, not reachable in
+#   production -- `op_restore_w_route` restored w's coordination-plane
+#   endpoint from a value captured once at stand-up, but `restart_node`
+#   binds a fresh ephemeral port every time; fixed to read w's current
+#   endpoint live.
+# - durability stuck Protecting: STILL OPEN, real and reproducible (an
+#   earlier "resolved as a downstream symptom" conclusion in this file
+#   was premature -- corrected after it reproduced independently on two
+#   more fresh random seeds, including 3746878857549989852 below, even
+#   under a 3000s external bound well past this test's own 600s internal
+#   settle retry, which genuinely exhausted). See the tracked comment on
+#   `randomized_soak_converges_with_no_leaks_or_stuck_state` in
+#   `topology_soak_lane.rs` for the full root-cause trace and candidate.
+#   Both soak tests are `#[ignore]`d again for this reason.
+#
+# A separate, unrelated finding also fixed during this investigation:
+# `cargo test`'s default parallelism ran this file's two heavy
+# `worker_threads = 8` tests concurrently, which could genuinely starve
+# convergence past SETTLE_TIMEOUT purely from CPU contention (confirmed:
+# the exact seed that failed under default parallelism passed cleanly
+# both in isolation and fully serialized). `SOAK_LANE_SERIAL_GUARD` in
+# `topology_soak_lane.rs` now forces these two tests to never run
+# concurrently, regardless of test-runner parallelism.
 922972317807886136
 16612994462990444375
 14049118026691592637
 12552500466593081697
 17132986931368163713
+3746878857549989852
