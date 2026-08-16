@@ -1087,11 +1087,24 @@ async fn hydrate_inner(
     // materialization attempt also "exists" at this path, and reading it
     // back as if it were the real content silently returns wrong (not
     // missing) data -- confirmed live: `left: []` (a genuinely empty
-    // file) at this exact shortcut. Real `Hydrated` content is always
-    // exactly `current.size` bytes; anything else at this path is not
-    // the real thing yet, regardless of what the index row claims.
+    // file) at this exact shortcut.
+    //
+    // Non-empty, NOT an exact `current.size` match -- an earlier version
+    // of this check required `metadata.len() == current.size`, which
+    // reintroduced the exact clobber this shortcut exists to prevent: a
+    // local edit that changes the file's LENGTH (the overwhelmingly
+    // common case -- most edits aren't same-size in-place overwrites) no
+    // longer matches the stale indexed size, so the "genuinely missing"
+    // branch below would run and silently discard the edit, caught live
+    // by `hydrate_of_an_already_hydrated_path_is_a_no_op_and_never_
+    // touches_disk`. The only failure mode this shortcut actually needs
+    // to rule out is the empty-leftover-artifact case above, which
+    // `len() > 0` already excludes -- a legitimately zero-byte `Hydrated`
+    // file falling through to a harmless redundant reconstruct (writing
+    // the same empty content back) is an acceptable trade against
+    // destroying real edited content.
     let has_real_content_on_disk =
-        out_path.metadata().map(|metadata| metadata.len() == current.size).unwrap_or(false);
+        out_path.metadata().map(|metadata| metadata.len() > 0).unwrap_or(false);
     if state
         .replica_coordinator
         .materialization_state_repository()
