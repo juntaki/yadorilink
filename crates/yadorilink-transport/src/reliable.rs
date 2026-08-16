@@ -390,6 +390,11 @@ impl ReliableRecv {
         Self { highest_contiguous: 0, out_of_order: HashSet::new(), ack_dirty: false }
     }
 
+    #[cfg(test)]
+    pub(crate) fn highest_contiguous(&self) -> u64 {
+        self.highest_contiguous
+    }
+
     /// Records `seq` as received; returns `true` if this is the first time
     /// (deliver to the application) or `false` if it's a retransmit of an
     /// already-delivered seq (drop the payload, but the caller still acks).

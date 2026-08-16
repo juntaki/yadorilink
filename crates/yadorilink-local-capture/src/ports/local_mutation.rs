@@ -67,6 +67,26 @@ pub trait LocalMutationStore: Send + Sync {
         path: &str,
     ) -> Result<bool, SyncSqliteError>;
 
+    /// Whether `(group_id, path)` has a non-terminal (not `Completed`/
+    /// `Superseded`) row in the materialization job queue -- distinct from
+    /// `has_materialization_intent` above, which only covers the narrower
+    /// window a `MaterializationIntentGuard` protects (a `materialize()`
+    /// call already in flight). A path can have a durably-committed,
+    /// non-deleted index row with a QUEUED job that has not yet reached
+    /// `materialize()` at all (e.g. still `Pending`/`Backoff` after a
+    /// transient dispatch failure) -- no intent has ever been opened for
+    /// it, but it is just as much "we know about this file and are still
+    /// placing it locally" as an in-flight intent is. An M5-A finding: the
+    /// startup reconciliation scan's own `has_materialization_intent` check
+    /// alone is not enough to protect this state; a newly-arrived DAG
+    /// record whose materialization job is still queued when a restart's
+    /// scan runs was silently tombstoned before this check existed.
+    fn has_pending_materialization_job(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, SyncSqliteError>;
+
     /// Bulk placeholder-identity lookup for a whole group -- used by
     /// `scan_existing_files` for the same reason as
     /// `list_materialization_states`: one query for the whole scan instead
@@ -147,6 +167,30 @@ pub trait LocalMutationStore: Send + Sync {
     ) -> Result<(), SyncSqliteError>;
 
     fn get_exec_bit(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError>;
+
+    /// M5-A review follow-up (blocker #56, second round): records the disk
+    /// identity of the exact bytes a locally-authored commit just verified
+    /// are on disk RIGHT NOW for this path -- called right after a
+    /// successful local-edit commit (`upsert_file_emitting_change`/
+    /// `upsert_files_batch`/their batch siblings), using the same fresh
+    /// `disk_race_fingerprint` stat this scan already paid for. Without
+    /// this, a version bump from an ordinary local edit silently drops the
+    /// row back to "Hydrated with no proven fingerprint" -- the exact
+    /// unproven state `hydrate_inner`'s already-Hydrated shortcut treats
+    /// as safe to reconstruct over, reopening the clobber this fix exists
+    /// to close for every file that has ever been locally edited even
+    /// once. See `yadorilink_sync_sqlite::materialization_state::
+    /// MaterializationStateRepository::record_materialized_fingerprint`'s
+    /// own doc comment for the full reasoning.
+    fn record_materialized_fingerprint(
+        &self,
+        group_id: &str,
+        path: &str,
+        fingerprint: Option<
+            yadorilink_filesystem_sync::materialization_execution::MaterializedFingerprint,
+        >,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), SyncSqliteError>;
 
     fn set_exec_bit(
         &self,

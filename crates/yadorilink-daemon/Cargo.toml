@@ -232,6 +232,13 @@ futures-util = "0.3"
 # the daemon-side queue-retry integration tests (mirrors
 # yadorilink-reporting's own use of the same crate).
 wiremock = "0.6"
+# M5-A Pass 8 acceptance-matrix freshness lint (`tests/m5a_acceptance_
+# matrix.rs`): parses each named scenario file's real syntax tree to
+# confirm a required test function exists AND is not `#[ignore]`d, rather
+# than a plain substring search (`source.contains("fn name(")`), which
+# cannot see an ignore attribute at all and could also be fooled by a
+# comment or string literal that happens to contain the same text.
+syn = { version = "2", features = ["full"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

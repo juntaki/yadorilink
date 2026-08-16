@@ -523,7 +523,31 @@ fn repair_interrupted_materializations_inner(
                 target_version_hash: &target_hash,
                 permit,
             }) {
-                Ok(()) => report.reconstructed.push(path),
+                Ok(()) => {
+                    // M5-A review follow-up (blocker #56, second round):
+                    // this repair path reconstructs real content and
+                    // leaves the row `Hydrated` too, exactly like the
+                    // live peer materialize/hydrate paths -- it needs the
+                    // SAME fingerprint recording those do, or every
+                    // repaired row lands in the unprotected "Hydrated +
+                    // no fingerprint" state hydrate_inner's shortcut
+                    // treats as unproven, defeating this fix for any
+                    // file that ever goes through repair.
+                    if let Err(e) = state.record_materialized_fingerprint(
+                        group_id,
+                        &path,
+                        yadorilink_peer_session::peer_session::disk_race_fingerprint(&out_path),
+                        permit,
+                    ) {
+                        tracing::warn!(
+                            group_id,
+                            path = %path,
+                            error = %e,
+                            "failed to record a materialized fingerprint after repair reconstruct"
+                        );
+                    }
+                    report.reconstructed.push(path)
+                }
                 Err(e) => {
                     tracing::warn!(
                         group_id,

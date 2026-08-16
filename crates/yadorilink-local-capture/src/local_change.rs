@@ -47,6 +47,26 @@ fn now_unix_nanos() -> i64 {
         .unwrap_or(0)
 }
 
+/// Duplicated from `yadorilink_peer_session::peer_session::disk_race_
+/// fingerprint` rather than depending on that crate from production code
+/// solely for this one function -- that dependency is dev-only here, same
+/// "duplicate small leaf logic rather than force an awkward dependency"
+/// precedent this session's own `MaterializedFingerprint` type alias
+/// duplication (peer-session/filesystem-sync/here) already established.
+/// See `record_local_commit_fingerprints`'s own doc comment for what this
+/// is used for.
+fn disk_race_fingerprint(path: &Path) -> Option<(u64, Option<std::time::SystemTime>, i64, i64)> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    #[cfg(unix)]
+    let (ctime, ctime_nsec) = {
+        use std::os::unix::fs::MetadataExt as _;
+        (meta.ctime(), meta.ctime_nsec())
+    };
+    #[cfg(not(unix))]
+    let (ctime, ctime_nsec) = (0i64, 0i64);
+    Some((meta.len(), meta.modified().ok(), ctime, ctime_nsec))
+}
+
 /// True when a filesystem `Metadata`'s mtime equals the mtime an index row
 /// recorded (`FileRecord::mtime_unix_nanos`, stored as nanoseconds since the
 /// Unix epoch). Deriving this in one place keeps the "unchanged file" verdict
@@ -936,6 +956,30 @@ impl LocalChangeProcessor {
                 if self.state.has_materialization_intent(group_id, path)? {
                     continue;
                 }
+                // M5-A finding: an open intent alone is not enough. A
+                // path can have a durably-committed, non-deleted index
+                // row whose materialization JOB is still queued (e.g.
+                // `Pending`/`Backoff` after a transient dispatch
+                // failure right after the DAG record was admitted) --
+                // no intent has ever been opened for it (that only
+                // happens once `materialize()` itself actually runs),
+                // but it is exactly as "not yet known to be deleted" as
+                // an in-flight intent is. Without this check, a restart
+                // landing between DAG-record admission and that job's
+                // first successful `materialize()` attempt reads this
+                // as an offline deletion and tombstones a file the
+                // device never even finished receiving once. Same
+                // fail-closed contract as the intent check above: an
+                // errored lookup propagates via `?`.
+                if self.state.has_pending_materialization_job(group_id, path)? {
+                    continue;
+                }
+                tracing::info!(
+                    group_id,
+                    path,
+                    "startup reconciliation scan is tombstoning a locally-missing path (no open \
+                     intent, no pending materialization job) as an offline deletion"
+                );
                 let mut tombstone = existing.clone();
                 tombstone.deleted = true;
                 records.push(tombstone);
@@ -1093,10 +1137,14 @@ impl LocalChangeProcessor {
                         );
                     }
                 }
+                // M5-A review follow-up (blocker #56, second round): see
+                // `record_local_commit_fingerprints`'s own doc comment.
+                self.record_local_commit_fingerprints(group_id, root, &committed);
                 // Broadcast only the chunks that durably entered the DAG; the
                 // withheld tail re-emits via the dirty journal.
                 return Ok(committed);
             }
+            self.record_local_commit_fingerprints(group_id, root, &records);
             Ok(records)
         } else {
             // The group has no change DAG yet (a first link's whole index is
@@ -1126,7 +1174,55 @@ impl LocalChangeProcessor {
                     &self.begin_operation()?.permit(),
                 )?;
             }
+            self.record_local_commit_fingerprints(group_id, root, &records);
             Ok(records)
+        }
+    }
+
+    /// M5-A review follow-up (blocker #56, second round): records, for
+    /// every non-deleted `record` a local commit just durably indexed, the
+    /// disk identity of the exact bytes now on disk at its path -- the
+    /// SAME `disk_race_fingerprint` scheme `hydrate_inner`'s already-
+    /// Hydrated shortcut relies on. Without this, an ordinary local edit's
+    /// version bump silently drops the row back to "Hydrated with no
+    /// proven fingerprint" (a version bump never carries the fingerprint
+    /// columns forward, and a locally-authored version never goes through
+    /// `reconstruct_file`) -- the exact unproven state that shortcut
+    /// treats as safe to reconstruct over, reopening the clobber this
+    /// whole fix exists to close for any file that has ever been edited
+    /// even once. Called with `root` already resolved and each `record`'s
+    /// bytes freshly, durably on disk (this scan read them to build these
+    /// exact records), so the stat here is safe and cheap -- best-effort
+    /// (logged, never propagated): a failure here must not fail the local
+    /// commit that already durably landed; `hydrate_inner`'s own fail-
+    /// closed "no fingerprint -> re-verify" fallback tolerates a missed
+    /// recording safely, just without the fast-path optimization for that
+    /// one row until it's next rewritten.
+    fn record_local_commit_fingerprints(
+        &self,
+        group_id: &str,
+        root: &Path,
+        records: &[FileRecord],
+    ) {
+        for record in records {
+            if record.deleted {
+                continue;
+            }
+            let out_path = root.join(&record.path);
+            let Ok(op) = self.begin_operation() else { return };
+            if let Err(e) = self.state.record_materialized_fingerprint(
+                group_id,
+                &record.path,
+                disk_race_fingerprint(&out_path),
+                &op.permit(),
+            ) {
+                tracing::warn!(
+                    error = %e,
+                    path = %record.path,
+                    group_id,
+                    "failed to record a materialized fingerprint after a local commit"
+                );
+            }
         }
     }
 
@@ -4091,6 +4187,34 @@ mod tests {
             .get_file("group-1", ".yadorilinkignore")
             .unwrap()
             .is_none());
+    }
+
+    /// M5-A review follow-up (blocker #56, second round): a local scan's
+    /// commit must record a materialized fingerprint for every non-deleted
+    /// file it indexes -- without this, `hydration.rs::hydrate_inner`'s
+    /// already-Hydrated shortcut would treat this row as "never proven"
+    /// (a version bump alone never carries the fingerprint columns
+    /// forward from any prior row) and reconstruct over any subsequent,
+    /// not-yet-journaled local edit, exactly the clobber that fix exists
+    /// to prevent.
+    #[test]
+    fn scan_existing_files_records_a_materialized_fingerprint_for_each_indexed_file() {
+        let (proc, state, _store_dir, root_dir) = processor();
+        let root = canonical_root(&root_dir);
+        std::fs::write(root.join("doc.txt"), b"locally authored content").unwrap();
+
+        proc.scan_existing_files("group-1", &root).unwrap();
+
+        assert!(
+            state
+                .materialization_state_repository()
+                .get_materialized_fingerprint("group-1", "doc.txt")
+                .unwrap()
+                .is_some(),
+            "a fresh local scan must record a fingerprint for the file it just indexed, or the \
+             already-Hydrated fast path treats it as unproven and reconstructs over a later, \
+             not-yet-journaled edit"
+        );
     }
 
     #[test]

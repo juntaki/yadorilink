@@ -197,6 +197,23 @@ impl LocalMutationStore for TestReplica {
         self.materialization_job_repository().has_materialization_intent(group_id, path)
     }
 
+    fn has_pending_materialization_job(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, SyncSqliteError> {
+        Ok(self
+            .materialization_job_repository()
+            .materialization_get_job(group_id, path)?
+            .is_some_and(|job| {
+                !matches!(
+                    job.state,
+                    yadorilink_sync_sqlite::MaterializationJobState::Completed
+                        | yadorilink_sync_sqlite::MaterializationJobState::Superseded
+                )
+            }))
+    }
+
     fn get_record_kind(
         &self,
         group_id: &str,
@@ -243,6 +260,23 @@ impl LocalMutationStore for TestReplica {
 
     fn get_exec_bit(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError> {
         self.file_index_repository().get_exec_bit(group_id, path)
+    }
+
+    fn record_materialized_fingerprint(
+        &self,
+        group_id: &str,
+        path: &str,
+        fingerprint: Option<
+            yadorilink_filesystem_sync::materialization_execution::MaterializedFingerprint,
+        >,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), SyncSqliteError> {
+        self.materialization_state_repository().record_materialized_fingerprint(
+            group_id,
+            path,
+            fingerprint,
+            permit,
+        )
     }
 
     fn set_exec_bit(

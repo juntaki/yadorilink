@@ -65,14 +65,19 @@ jobs:
           key: linux-daemon-e2e
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Daemon E2E
-        # The two monkey-chaos cases are private seed/soak coverage. They run
-        # in private beta-heat, while every ordinary daemon integration test
-        # remains in this public, serial correctness lane.
+        # The two monkey-chaos cases and the two topology_soak_lane cases
+        # are private seed/soak coverage. They run in private beta-heat and
+        # in soak-nightly.yml respectively -- see soak-nightly.yml's own
+        # header comment for why a randomized, long-running test must never
+        # be part of this blocking per-push gate -- while every ordinary
+        # daemon integration test remains in this public, serial
+        # correctness lane.
         run: >-
           cargo test -p yadorilink-daemon --tests --
           --test-threads=1
           --skip random_concurrent_operations_converge_to_an_identical_file_set
           --skip replay_known_failing_seeds
+          --skip randomized_soak_converges_with_no_leaks_or_stuck_state
 
   linux-wire-integration:
     runs-on: ubuntu-latest
@@ -165,6 +170,7 @@ jobs:
           --test-threads=1
           --skip random_concurrent_operations_converge_to_an_identical_file_set
           --skip replay_known_failing_seeds
+          --skip randomized_soak_converges_with_no_leaks_or_stuck_state
 
   supply-chain:
     runs-on: ubuntu-latest

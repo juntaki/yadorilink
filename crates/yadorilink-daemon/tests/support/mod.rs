@@ -26,7 +26,9 @@ use yadorilink_local_storage::{BlockStore, ContentHash, FsBlockStore, GcReport, 
 use yadorilink_peer_session::peer_session::{PeerSyncSession, PeerSyncSessionDeps};
 use yadorilink_transport::{public_key_from_bytes, PeerChannel, TransportHub};
 
+pub mod control_socket_client;
 pub mod fake_coordination;
+pub mod topology;
 
 use fake_coordination::FakeCoordination;
 
