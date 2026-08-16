@@ -526,6 +526,11 @@ pub struct DaemonState {
     /// destination`'s own doc comment for why that check specifically
     /// forbids relay chaining).
     direct_channels: Mutex<HashMap<String, Arc<yadorilink_transport::PeerChannel>>>,
+    /// M5-A review follow-up (blocker #55): device_id -> the highest
+    /// generation that has ever successfully published into
+    /// `direct_channels` for that peer -- see `set_direct_channel`'s own
+    /// doc comment for the ABA race this independently closes.
+    direct_channel_generations: Mutex<HashMap<String, u32>>,
     /// M3 Pass 5: session id -> the full authorization tuple it was
     /// admitted under -- see `record_relay_session`'s own doc comment for
     /// why (per-datagram revalidation, closing H2/M3 in the independent
@@ -1299,6 +1304,7 @@ impl DaemonState {
             relay_forwarder: Arc::new(crate::relay_forwarder::RelayForwarder::new()),
             relay_replay_guard: crate::relay_session::RelayReplayGuard::new(),
             direct_channels: Mutex::new(HashMap::new()),
+            direct_channel_generations: Mutex::new(HashMap::new()),
             active_relay_sessions: Mutex::new(HashMap::new()),
             requester_relay_sessions: Mutex::new(HashMap::new()),
             pending_relay_opens: Mutex::new(HashMap::new()),
@@ -1545,10 +1551,26 @@ impl DaemonState {
 
     /// M3 Pass 5: records `device_id`'s live direct channel -- see
     /// `direct_channels`'s own doc comment for why this mirror exists.
+    ///
+    /// M5-A review follow-up (blocker #55): `generation` is the SAME
+    /// per-attempt counter the caller also passes to `peer_orchestrator::
+    /// NetmapDiffState::insert_channel_revoking_superseded` -- rejects
+    /// (does nothing, no insert, no revoke) if a generation `>=` this one
+    /// has already published for `device_id` into THIS mirror
+    /// specifically. Deliberately independent of the primary map's own
+    /// accept/reject decision (not gated on it): the two maps are
+    /// updated by two separate lock acquisitions at the call site, so an
+    /// even-newer generation could win the primary map's race in the gap
+    /// between them -- each map converging on its own highest-seen
+    /// generation, rather than one blindly trusting the other's stale
+    /// verdict, is what keeps the final state consistent regardless of
+    /// call order. See `insert_channel_revoking_superseded`'s own doc
+    /// comment for the full ABA scenario this closes.
     pub(crate) fn set_direct_channel(
         &self,
         device_id: String,
         channel: Arc<yadorilink_transport::PeerChannel>,
+        generation: u32,
     ) {
         // M5-A soak-closure finding: this mirror had the identical
         // silent-overwrite gap `peer_orchestrator::NetmapDiffState::
@@ -1564,6 +1586,13 @@ impl DaemonState {
         // by `RelaySessionHandler`'s own direct-route check, so leaving
         // it unfixed here could keep judging a route "confirmed direct"
         // through a channel that no longer answers real traffic.
+        let mut generations =
+            self.direct_channel_generations.lock().unwrap_or_else(|p| p.into_inner());
+        if generations.get(&device_id).is_some_and(|&recorded| recorded >= generation) {
+            return;
+        }
+        generations.insert(device_id.clone(), generation);
+        drop(generations);
         let superseded = self
             .direct_channels
             .lock()
