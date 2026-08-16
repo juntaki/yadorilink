@@ -30,4 +30,4 @@ hex = "0.4"
 # already a real, non-dev dependency for the identical reason) -- promoted
 # out of `[dev-dependencies]` below, which previously carried it only for
 # `authenticated_history`'s own test fixture signing.
-ed25519-dalek = "2"
+ed25519-dalek = "3"

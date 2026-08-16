@@ -155,7 +155,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # signed payload bytes, matching `yadorilink-transport`'s existing "dalek"
 # family curve/signature crate choice (x25519-dalek) rather than introducing
 # an unrelated crypto library for this one signature scheme.
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
 # Strict semantic-version parsing/comparison for manifest version fields
 # — already present in Cargo.lock as a transitive dependency
 # elsewhere in the workspace; this is its first direct use.

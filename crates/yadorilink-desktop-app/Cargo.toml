@@ -40,7 +40,7 @@ tracing-subscriber.workspace = true
 # platforms), matching this workspace's existing "no Linux desktop target"
 # scope (shell-ext/ is macOS+Windows only too).
 tray-icon = "0.24.2"
-tao = "0.35"
+tao = "0.36"
 # Cross-platform "reveal this path in the native file manager" helper for
 # the Open Folder / reveal-diagnostics-bundle actions -- avoids
 # hand-rolling `open`/`explorer.exe` invocations per platform.
