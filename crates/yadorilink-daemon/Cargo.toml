@@ -238,7 +238,7 @@ wiremock = "0.6"
 # than a plain substring search (`source.contains("fn name(")`), which
 # cannot see an ignore attribute at all and could also be fooled by a
 # comment or string literal that happens to contain the same text.
-syn = { version = "2", features = ["full"] }
+syn = { version = "3", features = ["full"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
