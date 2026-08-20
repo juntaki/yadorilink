@@ -198,7 +198,7 @@ madsim = "0.2"
 # `dst_support/impact_map.toml` / the cargo aliases as TOML. Moved from
 # `yadorilink-sync-core/Cargo.toml`'s identical dev-dependency in Phase
 # 7D-10.4 along with `dst_support/` and its 3 lint guards.
-toml = "0.9"
+toml = "1.1"
 # This crate's own `tests/*.rs` integration binaries link against
 # `yadorilink-daemon` as an ordinary external library, so `#[cfg(test)]` is
 # never active for it there -- `DaemonState::install_test_root_commit_authority`/
