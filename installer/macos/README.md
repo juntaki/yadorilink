@@ -42,13 +42,15 @@ from scratch every run; safe to delete between builds.
 
 ## Signing and notarization
 
-Release builds must sign the outer `.pkg` with a Developer ID Installer
-identity:
+Release builds must codesign the `yadorilink`/`yadorilink-daemon`/
+`yadorilink-status-app` Mach-O binaries with a Developer ID Application
+identity, and sign the outer `.pkg` with a Developer ID Installer identity:
 
 ```bash
 YADORILINK_RELEASE_BUILD=1 \
 YADORILINK_RELEASE_MANIFEST_KEY_ID="yadorilink-release-2026-01" \
 YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX="<64 lowercase hex characters>" \
+YADORILINK_APP_SIGN_IDENTITY="Developer ID Application: Example, Inc. (TEAMID)" \
 YADORILINK_PKG_SIGN_IDENTITY="Developer ID Installer: Example, Inc. (TEAMID)" \
 YADORILINK_NOTARY_PROFILE=yadorilink-notary \
   ./build-pkg.sh
@@ -58,10 +60,17 @@ The manifest values are the identifier and public half of the offline update
 signing key. See `docs/UPDATE_SIGNING.md`. The private half must never be
 present on this build machine.
 
-When `YADORILINK_PKG_SIGN_IDENTITY` is set, the script runs `productsign`,
-optionally submits/staples through `xcrun notarytool` when
+When `YADORILINK_APP_SIGN_IDENTITY` is set, the script codesigns each of the
+three staged binaries individually (`--options runtime --timestamp`, required
+for notarization) and verifies each signature before packaging. When
+`YADORILINK_PKG_SIGN_IDENTITY` is set, the script runs `productsign` on the
+assembled `.pkg`, optionally submits/staples through `xcrun notarytool` when
 `YADORILINK_NOTARY_PROFILE` is set, then verifies the result with
-`pkgutil --check-signature` and `spctl -a -vvv -t install`.
+`pkgutil --check-signature` and `spctl -a -vvv -t install`. Both identities
+are required together for a release build: notarization rejects a `.pkg`
+containing any unsigned executable, so a `productsign`-only `.pkg` whose
+payload binaries were never individually codesigned would fail notarization
+regardless of the outer package signature.
 
 Local/interim unsigned builds are still possible by omitting
 `YADORILINK_RELEASE_BUILD=1`; the script writes

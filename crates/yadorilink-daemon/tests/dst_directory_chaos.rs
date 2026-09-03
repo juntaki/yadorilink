@@ -112,7 +112,6 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use boringtun::x25519::{PublicKey, StaticSecret};
 use dst_support::case_ir::ContentTable;
 use dst_support::clock::HarnessClock;
 use dst_support::oracle::GlobalOracle;
@@ -129,7 +128,6 @@ use yadorilink_peer_session::peer_session::{
     PeerSyncSession, PendingLocalChangeFlush, PendingLocalFlushOutcome,
 };
 use yadorilink_replica_domain::ids::ChangeHash;
-use yadorilink_transport::PeerChannel;
 
 const GROUP_ID: &str = "dst-dir-chaos-group";
 const CANARY_PATH: &str = "startup-canary.bin";
@@ -432,22 +430,6 @@ async fn converge_paths(
     (outcome.converged, outcome.elapsed)
 }
 
-fn gen_keypair(rng: &mut StdRng) -> (StaticSecret, PublicKey) {
-    // Prereq: derive the boringtun secret
-    // from 32 seed-driven bytes rather than `StaticSecret::random_from_rng`,
-    // which no longer type-checks under `--cfg madsim` after the committed rand
-    // 0.10 bump (boringtun 0.7's x25519-dalek 2.0.1 bounds rand_core 0.6 on
-    // `random_from_rng`). `From<[u8; 32]>` needs no rng trait and is equally
-    // deterministic per seed; test-only. `fill` consumes exactly 32 rng bytes
-    // like the old `random_from_rng`'s internal `fill_bytes`, so the per-seed
-    // workload stream is undisturbed (only the ephemeral key value is derived).
-    let mut bytes = [0u8; 32];
-    rng.fill(&mut bytes);
-    let secret = StaticSecret::from(bytes);
-    let public = PublicKey::from(&secret);
-    (secret, public)
-}
-
 async fn connect_sessions(
     rng: &mut StdRng,
     device_a: &Arc<ChaosDevice>,
@@ -457,35 +439,10 @@ async fn connect_sessions(
     state_b: Arc<ReplicaCoordinator>,
     store_b: Arc<FsBlockStore>,
 ) {
-    let (secret_a, public_a) = gen_keypair(rng);
-    let (secret_b, public_b) = gen_keypair(rng);
     let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr_a = socket_a.local_addr().unwrap();
-    let addr_b = socket_b.local_addr().unwrap();
 
-    let channel_a = Arc::new(
-        PeerChannel::connect(
-            secret_a,
-            public_b,
-            0,
-            vec![addr_b],
-            yadorilink_transport::TransportHub::from_socket(socket_a, Some(public_a)),
-        )
-        .await
-        .unwrap(),
-    );
-    let channel_b = Arc::new(
-        PeerChannel::connect(
-            secret_b,
-            public_a,
-            1,
-            vec![addr_a],
-            yadorilink_transport::TransportHub::from_socket(socket_b, Some(public_b)),
-        )
-        .await
-        .unwrap(),
-    );
+    let (channel_a, channel_b) = quic_channel_pair(socket_a, socket_b).await;
 
     // Same DAG propagation as `dst_two_device_chaos.rs`'s `connect_sessions`,
     // for the same reason: each device materializes a conflict copy locally
@@ -2052,4 +2009,38 @@ fn directory_chaos_scenario() {
         skipped < variations,
         "every seed hit BASELINE_TIMEOUT -- nothing was actually exercised"
     );
+}
+
+/// One authenticated QUIC connection between two loopback endpoints, as a
+/// channel on each side. The real transport, so a simulated run exercises
+/// what ships rather than a substitute for it.
+async fn quic_channel_pair(
+    socket_a: tokio::net::UdpSocket,
+    socket_b: tokio::net::UdpSocket,
+) -> (
+    std::sync::Arc<yadorilink_transport::QuicPeerChannel>,
+    std::sync::Arc<yadorilink_transport::QuicPeerChannel>,
+) {
+    use yadorilink_transport::{
+        ConnectRole, DeviceSigningKeyPair, QuicPeerChannel, QuicPeerEndpoint, TransportHub,
+    };
+    let addr_b = socket_b.local_addr().unwrap();
+    let key_a = DeviceSigningKeyPair::generate();
+    let key_b = DeviceSigningKeyPair::generate();
+    let public_a = key_a.public_bytes();
+    let public_b = key_b.public_bytes();
+    let endpoint_a = QuicPeerEndpoint::new(TransportHub::from_socket(socket_a), key_a).unwrap();
+    let endpoint_b = QuicPeerEndpoint::new(TransportHub::from_socket(socket_b), key_b).unwrap();
+    endpoint_a.authorize(public_b);
+    endpoint_b.authorize(public_a);
+    let accepting = {
+        let endpoint_b = endpoint_b.clone();
+        tokio::spawn(async move { endpoint_b.accept(public_a).await })
+    };
+    let dialed = endpoint_a.connect(addr_b, public_b).await.unwrap();
+    let accepted = accepting.await.unwrap().unwrap();
+    (
+        QuicPeerChannel::new(dialed, ConnectRole::Dial),
+        QuicPeerChannel::new(accepted, ConnectRole::Accept),
+    )
 }

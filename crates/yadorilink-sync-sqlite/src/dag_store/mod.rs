@@ -249,6 +249,15 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
             applied      INTEGER NOT NULL,
             received_seq INTEGER NOT NULL
         );
+        -- `insert_orphan`'s own eviction check (`ORDER BY received_seq DESC
+        -- LIMIT -1 OFFSET ORPHAN_BOUND`, run on every single insert) has no
+        -- other way to avoid a full-table sort every time without this --
+        -- with it, skipping past the first `ORPHAN_BOUND` rows is a bounded
+        -- index walk instead of re-sorting the whole (potentially still-
+        -- growing) table from scratch on each of what can be hundreds of
+        -- buffered orphans in one anti-entropy round.
+        CREATE INDEX IF NOT EXISTS orphan_changes_by_received_seq
+            ON orphan_changes(received_seq);
 
         CREATE TABLE IF NOT EXISTS file_versions (
             version_hash BLOB NOT NULL,
@@ -323,6 +332,12 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
     // no-op for a caller that also separately initializes it (every
     // production DB-open path already does, per `index.rs`).
     filesystem_transaction::init_filesystem_transaction_schema(conn)?;
+    // C4-12 Stage 2: this function's own self-heal promotion below (via
+    // `bump_execution_fence_for_promoted`) also bumps the projection-
+    // obligation fence, so that table must exist before it runs too --
+    // same reasoning as `init_filesystem_transaction_schema` immediately
+    // above, and the same harmless-no-op-on-repeat-call shape.
+    crate::projection_obligations::init_projection_obligations_schema(conn)?;
     retained_history_integrity::repair(conn)?;
     orphan_integrity::repair(conn)?;
     // Self-heal: an orphan whose parent is already durably admitted but that
@@ -334,14 +349,27 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
     // startup, not once per admission.
     let self_heal_seeds = orphan_integrity::already_satisfied_parents(conn)?;
     if !self_heal_seeds.is_empty() {
-        let self_healed = orphan_integrity::promote_orphans(conn, &self_heal_seeds)?;
+        // Unlike ordinary admission (whose caller always wraps `admit_change`
+        // in `write_immediate`), nothing wraps this startup sweep: `init_dag_
+        // schema` runs directly on a freshly-opened, plain autocommit
+        // connection (see `SyncDatabase::open`/`open_in_memory`'s
+        // `schema_init(&conn)` call, with no enclosing transaction). Without
+        // this transaction, a crash between `promote_orphans` committing and
+        // `bump_execution_fence_for_promoted` running would leave a change
+        // durably promoted with no corresponding fence bump -- the exact
+        // "DAG holds a change, no fence exists for its paths" crash window
+        // `admit_change`'s own promotion path never has, since it never runs
+        // outside `write_immediate`.
+        let tx = conn.unchecked_transaction()?;
+        let self_healed = orphan_integrity::promote_orphans(&tx, &self_heal_seeds)?;
         // Each of these just moved from buffered to durably admitted, on
         // this very connection -- exactly what `admit_change`'s own
         // promotion step does, and it must be fenced the same way: a
         // reservation recorded before a crash is still in the table across
         // restart, and a plan built against it must not resume as if this
         // newly-promoted change had never happened.
-        bump_execution_fence_for_promoted(conn, &self_healed)?;
+        bump_execution_fence_for_promoted(&tx, &self_healed)?;
+        tx.commit()?;
     }
     frontier_index::repair(conn)?;
     // The checkpoint table is created in the same step as the other DAG
@@ -350,6 +378,22 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
     // reads and writes it. Pure `CREATE TABLE/INDEX IF NOT EXISTS`, so this is
     // idempotent on both a fresh and an already-upgraded database.
     conn.execute_batch(crate::dag_store::CHECKPOINT_TABLE_MIGRATION)?;
+    // One-time upgrade migration -- see `bootstrap_obligations_from_
+    // legacy_unapplied_changes`'s own doc comment. Runs after the
+    // self-heal promotion above
+    // so it observes the post-self-heal `applied = 0` set, not stale
+    // pre-self-heal state; gated by its own marker, so this is a cheap
+    // no-op on every startup after the first. Explicit transaction here
+    // (not left to run on the plain autocommit `conn`, same reasoning as
+    // the self-heal block above) so the marker and every backfilled
+    // obligation this pass produces commit atomically or not at all,
+    // matching what that function's own doc comment already claims.
+    let tx = conn.unchecked_transaction()?;
+    crate::projection_obligations::bootstrap_obligations_from_legacy_unapplied_changes(
+        &tx,
+        now_unix_nanos(),
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -456,7 +500,7 @@ pub fn commit_prune(
 /// where the losing content used to live, not a path this op writes, and
 /// that path's own admission already ran this same accounting when the
 /// losing change itself was admitted.
-fn op_touched_paths(op: &Op) -> Vec<&str> {
+pub(crate) fn op_touched_paths(op: &Op) -> Vec<&str> {
     match op {
         Op::Put { path, .. } | Op::Delete { path } => vec![path.as_str()],
         Op::Move { from, to, .. } => vec![from.as_str(), to.as_str()],
@@ -501,6 +545,14 @@ fn bump_execution_fence_for_change(
 /// [`describe_hash`] (already admitted on this same connection by the time
 /// this runs) rather than trusting the caller to have kept the decoded
 /// `Change` around.
+///
+/// C4-12 Stage 2: also bumps the projection-obligation fence
+/// (`crate::projection_obligations::bump_projection_obligations_for_
+/// touched_paths`) for the same touched paths, off the same decoded
+/// `Change` -- not a second `describe_hash` lookup per hash. The name is
+/// kept as-is (matching this design's own stated intent to add the new
+/// bump ALONGSIDE the existing fence-bump call sites, not invent a new
+/// seam); read this doc comment, not the name alone, for what it does.
 fn bump_execution_fence_for_promoted(
     conn: &Connection,
     promoted: &[ChangeHash],
@@ -509,6 +561,19 @@ fn bump_execution_fence_for_promoted(
         match describe_hash(conn, hash)? {
             DagHashDisposition::Admitted { change, .. } => {
                 bump_execution_fence_for_change(conn, &change)?;
+                // C4-12 Stage 2 (PROJ-1/2/4): the promoted-orphan seam of the
+                // projection-obligation bump, decoded from the SAME
+                // `describe_hash` read `bump_execution_fence_for_change`
+                // above just used -- not a second lookup per hash.
+                let touched: Vec<&str> = change.ops.iter().flat_map(op_touched_paths).collect();
+                if !touched.is_empty() {
+                    crate::projection_obligations::bump_projection_obligations_for_touched_paths(
+                        conn,
+                        change.group_id.as_str(),
+                        &touched,
+                        now_unix_nanos(),
+                    )?;
+                }
             }
             other => {
                 return Err(SyncSqliteError::CorruptState(format!(
@@ -525,6 +590,19 @@ fn bump_execution_fence_for_promoted(
 /// (and any orphans it unblocks are promoted); otherwise it is buffered. The
 /// caller MUST have already run `change::verify_change` — this function
 /// assumes the change is authentic and authorized.
+///
+/// On `Err(SyncSqliteError::CausalAuthViolation)`, the caller MUST call
+/// [`drop_orphan_subtree_for_rejected_change`] for `change.compute_hash()`
+/// in a SEPARATE, already-committed transaction (i.e. after — not inside —
+/// whatever transaction this call itself ran in), or a buffered descendant
+/// of the rejected change (if any) is left stuck forever, reappearing in
+/// every future `missing_ancestor_frontier` walk. Deliberately not done
+/// inside this function: it takes a plain `&Connection` precisely so a
+/// caller can compose it into a larger transaction, and any mutation made
+/// here would roll back right along with an `Err` return the moment that
+/// enclosing transaction aborts. `ChangeHistoryRepository::dag_admit_change[
+/// _with_versions]` already does this correctly — call one of those instead
+/// of this function directly unless there is a specific reason not to.
 pub fn admit_change(
     conn: &Connection,
     change: &Change,
@@ -566,52 +644,151 @@ pub fn admit_change(
         return Err(e);
     }
     serving_authorization_index::validate_referenced_versions(conn, change)?;
-    if retained_history_integrity::validate_present_parent_shape(conn, change)? {
-        // A change's `ConflictCopy` puts claim things about its OWN parent
-        // frontier (see `conflict_authoring::validate_carrier_conflict_copy_ops`'s
-        // doc comment) -- only checkable once its parents are confirmed
-        // present, which `validate_present_parent_shape` above just did.
-        conflict_authoring::validate_carrier_conflict_copy_ops(
-            conn,
-            change.group_id.as_str(),
-            change,
-        )?;
-        retained_history_integrity::append_change(conn, change, applied)?;
-        conflict_authoring::record_conflict_copy_ops_provenance(
-            conn,
-            change.group_id.as_str(),
-            change,
-        )?;
-        // This change just moved the desired state under every path its ops
-        // touch -- fence out any plan a live filesystem transaction already
-        // built against the pre-admission state on one of those paths.
-        bump_execution_fence_for_change(conn, change)?;
-        // The current change lands first, then any orphans its arrival
-        // unblocked. All of them became durable in this call, so the caller
-        // must project and gate every one — return the full set in append
-        // order (current change first).
-        let hash = change.compute_hash();
-        let promoted = orphan_integrity::promote_orphans(conn, &[hash])?;
-        // Every orphan `promote_orphans` just promoted also just moved the
-        // desired state, exactly like the primary change above -- fence out
-        // any plan built on the paths its own ops touch too.
-        bump_execution_fence_for_promoted(conn, &promoted)?;
-        let mut newly_admitted = vec![hash];
-        newly_admitted.extend(promoted);
-        Ok(AdmitResult { outcome: AdmitOutcome::Applied, newly_admitted })
+    let structurally_complete = retained_history_integrity::validate_present_parent_shape(conn, change)?;
+    // Only worth checking once every parent is structurally present --
+    // `check_causal_auth_monotonicity_at_promotion` needs each parent's own
+    // coordinate, which is meaningless to look up for a parent that isn't
+    // even there yet (that case already routes to the orphan branch below
+    // regardless of what this returns).
+    let causal_check = if structurally_complete {
+        retained_history_integrity::check_causal_auth_monotonicity_at_promotion(conn, change)?
     } else {
-        // Record the edges now so `promote_orphans` can test completeness
-        // cheaply once the parents land.
-        let hash = change.compute_hash();
-        for parent in &change.parents {
-            conn.execute(
-                "INSERT OR IGNORE INTO change_parents (child_hash, parent_hash) VALUES (?1, ?2)",
-                rusqlite::params![&hash.0[..], &parent.0[..]],
+        retained_history_integrity::CausalAuthCheck::Unresolvable
+    };
+    match (structurally_complete, causal_check) {
+        (true, retained_history_integrity::CausalAuthCheck::Verified) => {
+            // A change's `ConflictCopy` puts claim things about its OWN parent
+            // frontier (see `conflict_authoring::validate_carrier_conflict_copy_ops`'s
+            // doc comment) -- only checkable once its parents are confirmed
+            // present, which `validate_present_parent_shape` above just did.
+            conflict_authoring::validate_carrier_conflict_copy_ops(
+                conn,
+                change.group_id.as_str(),
+                change,
             )?;
+            let newly_appended =
+                retained_history_integrity::append_change(conn, change, applied)?;
+            conflict_authoring::record_conflict_copy_ops_provenance(
+                conn,
+                change.group_id.as_str(),
+                change,
+            )?;
+            // `append_change` is idempotent -- `false` means this exact hash
+            // was already durably admitted (its `changes` row already
+            // existed), so this call is itself a redelivery reaching
+            // `admit_change` directly rather than being filtered upstream
+            // (the ordinary production path: `handle_change_batch`'s own
+            // `dag_has_change` fast-path never calls this far for a hash it
+            // already has). PROJ-1 ("a Change receipt is not a projection
+            // event") must hold here too, not only at the upstream filter --
+            // both bumps below are therefore gated on genuine, first-time
+            // appendment, not merely on reaching this arm.
+            if newly_appended {
+                // This change just moved the desired state under every path its
+                // ops touch -- fence out any plan a live filesystem transaction
+                // already built against the pre-admission state on one of
+                // those paths.
+                bump_execution_fence_for_change(conn, change)?;
+                // C4-12 Stage 2 (PROJ-1/2/4): the primary-admission seam of the
+                // projection-obligation bump, alongside the execution fence
+                // above. Reuses the same `op_touched_paths` extraction, not a
+                // duplicate of it. Runs inside this call's own transaction (the
+                // caller's `write_immediate` for remote admission), so a crash
+                // here leaves neither the change nor its obligation bump
+                // committed.
+                let touched: Vec<&str> = change.ops.iter().flat_map(op_touched_paths).collect();
+                if !touched.is_empty() {
+                    crate::projection_obligations::bump_projection_obligations_for_touched_paths(
+                        conn,
+                        change.group_id.as_str(),
+                        &touched,
+                        now_unix_nanos(),
+                    )?;
+                }
+            }
+            // The current change lands first, then any orphans its arrival
+            // unblocked. All of them became durable in this call, so the caller
+            // must project and gate every one — return the full set in append
+            // order (current change first).
+            let hash = change.compute_hash();
+            let promoted = orphan_integrity::promote_orphans(conn, &[hash])?;
+            // Every orphan `promote_orphans` just promoted also just moved the
+            // desired state, exactly like the primary change above -- fence out
+            // any plan built on the paths its own ops touch too.
+            // (bump_execution_fence_for_promoted now also bumps the
+            // projection-obligation fence for each promoted hash's touched
+            // paths -- see that function's own doc comment.)
+            bump_execution_fence_for_promoted(conn, &promoted)?;
+            let mut newly_admitted = vec![hash];
+            newly_admitted.extend(promoted);
+            Ok(AdmitResult { outcome: AdmitOutcome::Applied, newly_admitted })
         }
-        orphan_integrity::insert_orphan(conn, change, applied)?;
-        Ok(AdmitResult { outcome: AdmitOutcome::Orphaned, newly_admitted: Vec::new() })
+        (true, retained_history_integrity::CausalAuthCheck::Violated) => {
+            // Permanent and provable -- this change pins an authorization
+            // coordinate older than one of its own causal parents', the
+            // revoked-writer-replay attack `4175e8cd` closed. Deliberately
+            // NOT recorded into `rejected_changes`: that table's permanence
+            // is scoped to `reserved_namespace::RULES_VERSION` (see
+            // `is_change_rejected`'s own doc comment) and re-opens for
+            // re-evaluation whenever those unrelated rules change --
+            // reusing it here would tie an unrelated invariant's
+            // permanence to this one. Matches `check_causal_auth_
+            // monotonicity`'s pre-existing `Rejected` outcome, which never
+            // recorded rejection durably either: re-delivery re-evaluates
+            // the same pure function of the change's own bytes and its
+            // (now-resolvable) parent coordinate, and rejects it again
+            // identically every time.
+            //
+            // Deliberately does NOT clean up any buffered descendant of
+            // this hash here (Codex-caught follow-up to the P1 this
+            // function's own cascade-drop already fixes for `promote_
+            // orphans`): `admit_change` runs inside its caller's own
+            // `write_immediate` transaction, which commits only on `Ok` --
+            // any mutation made here would be rolled back right along with
+            // this `Err`, silently undone. `CausalAuthViolation` is a
+            // distinct error variant specifically so `ChangeHistoryRepository
+            // ::dag_admit_change[_with_versions]` can recognize this exact
+            // case and re-run that cleanup in its OWN, separate, already-
+            // committed transaction afterward -- see those methods' own doc
+            // comments.
+            Err(SyncSqliteError::CausalAuthViolation)
+        }
+        _ => {
+            // Covers two cases: the parent is genuinely, structurally
+            // missing (the ordinary orphan case), or it is structurally
+            // present (live or pruned) but its own causal-auth coordinate
+            // isn't resolvable yet (a pruned parent with no retained
+            // checkpoint-boundary record) -- fail closed for the latter
+            // exactly as `4175e8cd` intended for "missing or unreadable,"
+            // rather than admit on trust. Either way, buffer and retry once
+            // more of the DAG arrives.
+            let hash = change.compute_hash();
+            for parent in &change.parents {
+                conn.execute(
+                    "INSERT OR IGNORE INTO change_parents (child_hash, parent_hash) VALUES (?1, ?2)",
+                    rusqlite::params![&hash.0[..], &parent.0[..]],
+                )?;
+            }
+            orphan_integrity::insert_orphan(conn, change, applied)?;
+            Ok(AdmitResult { outcome: AdmitOutcome::Orphaned, newly_admitted: Vec::new() })
+        }
     }
+}
+
+/// `orphan_integrity` is private to this module -- this is the public seam
+/// onto its `drop_orphan_subtree`, for a caller's own follow-up cleanup
+/// after `admit_change` returns `Err(SyncSqliteError::CausalAuthViolation)`
+/// (see that function's own doc comment for why this can't just happen
+/// inside `admit_change` itself, and why it must be called, in a separate
+/// transaction, by every direct caller of `admit_change` -- not just
+/// `ChangeHistoryRepository::dag_admit_change[_with_versions]`, which is
+/// the only one that exists in this codebase today but not the only one
+/// `admit_change`'s own `pub` visibility permits).
+pub fn drop_orphan_subtree_for_rejected_change(
+    conn: &Connection,
+    change_hash: &ChangeHash,
+) -> Result<(), SyncSqliteError> {
+    orphan_integrity::drop_orphan_subtree(conn, &change_hash.0)
 }
 
 /// Whether a change is already known locally — either durably admitted,
@@ -953,7 +1130,6 @@ pub struct PreparedEmission {
     group_id: String,
     parents: Vec<ChangeHash>,
     all_ops: Vec<Op>,
-    derived_ops: Vec<Op>,
     purpose: ChangePurpose,
     max_parent_lamport: u64,
     applied: bool,
@@ -1006,15 +1182,7 @@ pub fn prepare_emission(
         conn, group_id, &parents, &all_ops, &purpose,
     )?;
 
-    Ok(PreparedEmission {
-        group_id: group_id.to_string(),
-        parents,
-        all_ops,
-        derived_ops,
-        purpose,
-        max_parent_lamport,
-        applied,
-    })
+    Ok(PreparedEmission { group_id: group_id.to_string(), parents, all_ops, purpose, max_parent_lamport, applied })
 }
 
 /// Signs `prepared` under `auth` and appends it with its companion rows.
@@ -1031,15 +1199,7 @@ pub fn admit_prepared_emission(
     auth: ChangeAuth,
     emitter: &ChangeEmitter,
 ) -> Result<Change, SyncSqliteError> {
-    let PreparedEmission {
-        group_id,
-        parents,
-        all_ops,
-        derived_ops,
-        purpose,
-        max_parent_lamport,
-        applied,
-    } = prepared;
+    let PreparedEmission { group_id, parents, all_ops, purpose, max_parent_lamport, applied } = prepared;
     let group_id = group_id.as_str();
 
     let change = match purpose {
@@ -1151,27 +1311,23 @@ pub fn admit_prepared_emission(
     // `emit_retroactive_repair`) and, transitively, `captured_authoring`,
     // which emits through this same split.
     bump_execution_fence_for_change(conn, &change)?;
-    if !derived_ops.is_empty() {
-        let now = now_unix_nanos();
-        // Keyed by the CARRIER's change hash, exactly like the admission-side
-        // enqueue in `handle_change_batch` (its `path_versions` stores the
-        // touching change's hash). A job row keyed by the copy's content
-        // VersionHash here used to race the admission-side re-arm: the two
-        // sites disagreed on `version_hash` for the same `(group, path)`
-        // row, so the engine's Completed transition (guarded by the version
-        // it claimed) could no-op against a row the other site had re-keyed,
-        // leaving a finished job permanently non-terminal.
-        for op in &derived_ops {
-            let Op::Put { path, .. } = op else {
-                unreachable!("derive_required_conflict_copy_ops only ever returns Put ops");
-            };
-            crate::enqueue_pending(
+    // The local-emission seam of the projection-obligation bump, alongside
+    // the execution fence above. Covers every path in `change.ops`, direct
+    // and derived alike (see `bump_execution_fence_for_change`'s own
+    // extraction) -- this is what makes it safe for this function to no
+    // longer also enqueue a separate `materialization_jobs` row for each
+    // derived conflict-copy path: the obligation-driven scheduler claims
+    // off this bump's target directly, so that redundant enqueue (which
+    // used to race the admission-side re-arm over which `version_hash`
+    // won the same `(group, path)` row) has nothing left to feed.
+    {
+        let touched: Vec<&str> = change.ops.iter().flat_map(op_touched_paths).collect();
+        if !touched.is_empty() {
+            crate::projection_obligations::bump_projection_obligations_for_touched_paths(
                 conn,
                 group_id,
-                path.as_str(),
-                &change_hash.0,
-                change.lamport,
-                now,
+                &touched,
+                now_unix_nanos(),
             )?;
         }
     }
@@ -1303,9 +1459,10 @@ mod tests {
             0,
             FileMeta {
                 mtime_unix_nanos: 0,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         )
     }
@@ -1541,9 +1698,10 @@ mod tests {
             7,
             FileMeta {
                 mtime_unix_nanos: 0,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         );
         put_file_version(&c, "group-a", &version).unwrap();
@@ -1578,9 +1736,10 @@ mod tests {
             7,
             FileMeta {
                 mtime_unix_nanos: 0,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         );
         put_file_version(&c, "group-a", &version).unwrap();
@@ -1624,9 +1783,10 @@ mod tests {
             7,
             FileMeta {
                 mtime_unix_nanos: 0,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         );
         let signing = key();
@@ -1666,9 +1826,10 @@ mod tests {
             7,
             FileMeta {
                 mtime_unix_nanos: 0,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         );
         put_file_version(&c, "g", &version).unwrap();
@@ -1711,9 +1872,10 @@ mod tests {
             7,
             FileMeta {
                 mtime_unix_nanos: 0,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         );
         put_file_version(&c, "g", &version).unwrap();
@@ -2014,6 +2176,86 @@ mod tests {
         assert!(missing_ancestor_frontier(&recv, [leaf.compute_hash()]).unwrap().is_empty());
     }
 
+    /// A non-PLACEHOLDER pin, for tests that need to trigger the real
+    /// causal-auth-monotonicity check rather than its PLACEHOLDER exemption.
+    fn real_auth(seq: u64, epoch: u64) -> ChangeAuth {
+        ChangeAuth { auth_seq: seq, auth_epoch: epoch, policy_head_hash: [seq as u8 ^ 0x5A; 32] }
+    }
+
+    /// Codex-caught regression (C4-10 review, first pass): dropping a
+    /// buffered orphan for violating causal-auth monotonicity must also
+    /// drop every OTHER buffered orphan that names it as a (transitive)
+    /// parent -- otherwise those descendants can never promote (their own
+    /// parent will never become durable) and stay in the buffer,
+    /// permanently re-appearing in every future `missing_ancestor_frontier`
+    /// walk, forever.
+    ///
+    /// Exercises `drop_orphan_subtree` directly (mirroring exactly what
+    /// `ChangeHistoryRepository::dag_admit_change_with_versions` now does
+    /// after a bare `admit_change` call rejects with `CausalAuthViolation`
+    /// -- see that method's own doc comment for why `admit_change` itself
+    /// cannot do this cleanup: it runs inside its caller's own
+    /// `write_immediate` transaction, which rolls back on `Err`, taking any
+    /// mutation `admit_change` made with it). `change_history::tests::
+    /// dropping_a_causal_auth_violation_persists_its_descendant_cleanup`
+    /// (Codex review, second pass) is the one that proves this actually
+    /// persists through a real transaction end-to-end; this one is the
+    /// fast, transaction-free check of `drop_orphan_subtree`'s own
+    /// recursive-BFS correctness.
+    #[test]
+    fn dropping_a_causal_auth_violation_also_drops_its_buffered_descendants() {
+        let sender = conn();
+        let em = emitter();
+        // root: a legitimate post-revoke commit under the new grant.
+        let root = emit_local_change(&sender, "g", vec![create_op("a")], real_auth(10, 2), &em)
+            .unwrap();
+        // mid: the revoked writer's replay -- pins the OLD, pre-revoke grant
+        // (seq 3 < root's seq 10) despite descending from `root`.
+        let mid = emit_local_change(&sender, "g", vec![create_op("b")], real_auth(3, 1), &em)
+            .unwrap();
+        // leaf: an innocent further commit built on top of the replay --
+        // its OWN pin is internally consistent with `mid`'s (3 !< 3), so
+        // nothing about leaf's own bytes is invalid; it only becomes
+        // unpromotable because its parent (`mid`) is.
+        let leaf = emit_local_change(&sender, "g", vec![create_op("c")], real_auth(3, 1), &em)
+            .unwrap();
+
+        let recv = conn();
+        seed_test_version(&recv, "g");
+        // Deliver root first (admitted immediately), then leaf and mid out
+        // of order, so both `leaf` and `mid` are genuinely buffered orphans
+        // (not merely held) by the time `mid`'s violation is discovered.
+        assert_eq!(admit_change(&recv, &root, true).unwrap().outcome, AdmitOutcome::Applied);
+        assert_eq!(admit_change(&recv, &leaf, true).unwrap().outcome, AdmitOutcome::Orphaned);
+        assert!(
+            has_change_or_buffered_orphan(&recv, &leaf.compute_hash()).unwrap(),
+            "leaf must be genuinely buffered, not merely held, before mid arrives"
+        );
+
+        // mid arrives: root (its parent) is present, so its causal-auth
+        // coordinate is finally checkable -- and violates monotonicity.
+        // `admit_change` must reject it, not admit or re-buffer it. It no
+        // longer does descendant cleanup itself (see this test's own doc
+        // comment) -- that is now the caller's job, done here directly to
+        // isolate `drop_orphan_subtree`'s own behavior from transaction
+        // semantics.
+        assert!(admit_change(&recv, &mid, true).is_err());
+        assert!(!has_change(&recv, &mid.compute_hash()).unwrap());
+        orphan_integrity::drop_orphan_subtree(&recv, &mid.compute_hash().0).unwrap();
+
+        // The regression: leaf must be dropped too, not left stuck forever
+        // in the buffer waiting on a parent that will never become durable
+        // (leaf itself, correctly, remains genuinely absent -- it descends
+        // from a permanently-invalid change and can never legitimately
+        // sync; what must NOT happen is it wastefully occupying the orphan
+        // buffer, unpromotable, until `ORPHAN_BOUND` eviction happens to
+        // reach it).
+        assert!(
+            !has_change_or_buffered_orphan(&recv, &leaf.compute_hash()).unwrap(),
+            "leaf must not remain buffered once its parent is permanently rejected"
+        );
+    }
+
     #[test]
     fn missing_ancestor_frontier_is_empty_for_a_change_only_waiting_on_an_in_flight_parent() {
         // A single-generation chain: `leaf`'s direct parent `root` simply
@@ -2245,6 +2487,296 @@ mod tests {
         assert!(append_change(&recv, &root, true).unwrap());
         let promoted = promote_orphans(&recv, &[root.compute_hash()]).unwrap();
         assert_eq!(promoted, vec![c1.compute_hash(), c2.compute_hash()]);
+    }
+
+    /// C4-12 Stage 0.5.2/0.5.3: `init_dag_schema`'s startup self-heal sweep
+    /// (`already_satisfied_parents` -> `promote_orphans` ->
+    /// `bump_execution_fence_for_promoted`) now runs inside one explicit
+    /// transaction, closing a real, pre-existing atomicity gap: unlike
+    /// ordinary admission (always wrapped in `write_immediate` by its
+    /// caller), this startup sweep used to run its two mutating steps as
+    /// independent statements on a bare autocommit connection. A failure
+    /// between them (or a process crash) could leave a change durably
+    /// promoted with no corresponding execution-fence bump for its paths --
+    /// exactly the "DAG holds a change, no fence exists for its touched
+    /// paths" window `admit_change`'s own promotion path never has.
+    ///
+    /// This test proves the fix at the mechanism level (mirroring
+    /// `dropping_a_causal_auth_violation_also_drops_its_buffered_
+    /// descendants`'s own "isolate the transaction-free mechanism" style
+    /// above it): build the exact scenario `already_satisfied_parents`
+    /// exists for (a parent landed via bare `append_change`, never through
+    /// `admit_change`, so its buffered child was never promoted), then
+    /// force `bump_execution_fence_for_promoted` to fail immediately after
+    /// `promote_orphans` succeeds, inside the same transaction shape
+    /// `init_dag_schema` now uses. Confirmed genuinely RED against the
+    /// pre-fix (unwrapped, sequential) shape: reverting the `tx`/`commit`
+    /// wrap in `init_dag_schema` and driving the same two calls directly on
+    /// `recv` leaves the promotion committed despite the fence-bump error.
+    #[test]
+    fn startup_self_heal_promotion_and_fence_bump_are_atomic() {
+        let sender = conn();
+        let em = emitter();
+        let root =
+            emit_local_change(&sender, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em)
+                .unwrap();
+        let child =
+            emit_local_change(&sender, "g", vec![create_op("b")], ChangeAuth::PLACEHOLDER, &em)
+                .unwrap();
+
+        let recv = conn();
+        seed_test_version(&recv, "g");
+        // child arrives first: buffered as an orphan (root unseen yet).
+        assert_eq!(admit_change(&recv, &child, true).unwrap().outcome, AdmitOutcome::Orphaned);
+        // root lands via bare `append_change`, not `admit_change` -- exactly
+        // the "crash between append_change and promote_orphans" gap
+        // `already_satisfied_parents`'s own doc comment describes. Nothing
+        // has promoted `child` yet.
+        assert!(append_change(&recv, &root, true).unwrap());
+        assert!(!has_change(&recv, &child.compute_hash()).unwrap());
+
+        let seeds = orphan_integrity::already_satisfied_parents(&recv).unwrap();
+        assert_eq!(seeds, vec![root.compute_hash()], "root must be a self-heal seed");
+
+        // Drive the exact sequence `init_dag_schema`'s self-heal block now
+        // uses, inside one transaction -- but corrupt `child`'s own `changes`
+        // row between the two steps, forcing `bump_execution_fence_for_
+        // promoted`'s `describe_hash` re-read to fail with `CorruptState`
+        // instead of finding it `Admitted`.
+        let tx = recv.unchecked_transaction().unwrap();
+        let promoted = orphan_integrity::promote_orphans(&tx, &seeds).unwrap();
+        assert_eq!(promoted, vec![child.compute_hash()]);
+        tx.execute("DELETE FROM changes WHERE change_hash = ?1", [&child.compute_hash().0[..]])
+            .unwrap();
+        let bump_result = bump_execution_fence_for_promoted(&tx, &promoted);
+        assert!(bump_result.is_err(), "the corrupted row must make the fence bump fail");
+        drop(tx); // never committed -- an uncommitted transaction rolls back on drop, exactly like a crash before `commit()`.
+
+        // GREEN: because promotion and the fence bump shared one
+        // transaction, the promotion rolled back along with the failed
+        // bump -- `child` is still a buffered orphan, never left durably
+        // promoted with a missing fence.
+        assert!(
+            !has_change(&recv, &child.compute_hash()).unwrap(),
+            "a failed fence bump must roll back its own promotion, not leave a promoted-but-unfenced change"
+        );
+        assert!(
+            has_change_or_buffered_orphan(&recv, &child.compute_hash()).unwrap(),
+            "the child must still be recoverable as a buffered orphan after the rollback"
+        );
+    }
+
+    /// Happy-path companion to the atomicity test above: confirms the
+    /// transaction wrap did not break ordinary self-heal. `init_dag_schema`
+    /// is genuinely re-run on the same connection (a restart, not a fresh
+    /// database), matching production's own re-open-on-every-startup shape.
+    #[test]
+    fn startup_self_heal_promotes_a_child_whose_parent_landed_via_append_change_alone() {
+        let sender = conn();
+        let em = emitter();
+        let root =
+            emit_local_change(&sender, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em)
+                .unwrap();
+        let child =
+            emit_local_change(&sender, "g", vec![create_op("b")], ChangeAuth::PLACEHOLDER, &em)
+                .unwrap();
+
+        let recv = conn();
+        seed_test_version(&recv, "g");
+        assert_eq!(admit_change(&recv, &child, true).unwrap().outcome, AdmitOutcome::Orphaned);
+        assert!(append_change(&recv, &root, true).unwrap());
+        assert!(!has_change(&recv, &child.compute_hash()).unwrap());
+
+        // Re-running schema init on the SAME connection is what a restart
+        // does in production (`SyncDatabase::open`'s `schema_init(&conn)`
+        // call, on every open, not just the first).
+        init_dag_schema(&recv).unwrap();
+
+        assert!(
+            has_change(&recv, &child.compute_hash()).unwrap(),
+            "startup self-heal must promote a child whose parent only ever landed via append_change"
+        );
+        assert_eq!(group_heads(&recv, "g").unwrap(), vec![child.compute_hash()]);
+    }
+
+    /// The primary-admission seam bumps `projection_obligations` for
+    /// exactly the admitted change's touched
+    /// paths, no others. Confirmed genuinely RED by temporarily commenting
+    /// out this seam's own bump call (in `admit_change`'s `(true, Verified)`
+    /// arm) and re-running: the obligation row for "a" is never created.
+    #[test]
+    fn primary_admission_bumps_the_projection_obligation_for_exactly_its_touched_paths() {
+        let sender = conn();
+        let em = emitter();
+        let root =
+            emit_local_change(&sender, "g", vec![create_op("a"), create_op("b")], ChangeAuth::PLACEHOLDER, &em)
+                .unwrap();
+
+        let recv = conn();
+        seed_test_version(&recv, "g");
+        assert_eq!(admit_change(&recv, &root, true).unwrap().outcome, AdmitOutcome::Applied);
+
+        let a = crate::projection_obligations::lookup_projection_obligation(&recv, "g", "a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.invalidation_generation, 1);
+        let b = crate::projection_obligations::lookup_projection_obligation(&recv, "g", "b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.invalidation_generation, 1);
+        assert!(
+            crate::projection_obligations::lookup_projection_obligation(&recv, "g", "unrelated")
+                .unwrap()
+                .is_none(),
+            "an untouched path must have no obligation at all"
+        );
+    }
+
+    /// The promoted-orphan seam bumps the obligation for a change that
+    /// becomes durable only as a side effect of
+    /// its parent's own admission, not just for the parent itself. Confirmed
+    /// genuinely RED by temporarily removing the bump call from
+    /// `bump_execution_fence_for_promoted`'s loop body and re-running: the
+    /// orphan's own path ("child-path") is admitted but never obligated.
+    #[test]
+    fn promoted_orphan_admission_bumps_the_projection_obligation_for_its_own_touched_paths() {
+        let sender = conn();
+        let em = emitter();
+        let root =
+            emit_local_change(&sender, "g", vec![create_op("root-path")], ChangeAuth::PLACEHOLDER, &em)
+                .unwrap();
+        let child =
+            emit_local_change(&sender, "g", vec![create_op("child-path")], ChangeAuth::PLACEHOLDER, &em)
+                .unwrap();
+
+        let recv = conn();
+        seed_test_version(&recv, "g");
+        // child arrives first: buffered as an orphan, root unseen.
+        assert_eq!(admit_change(&recv, &child, true).unwrap().outcome, AdmitOutcome::Orphaned);
+        assert!(
+            crate::projection_obligations::lookup_projection_obligation(&recv, "g", "child-path")
+                .unwrap()
+                .is_none(),
+            "a buffered orphan must not bump any obligation until it is actually promoted"
+        );
+        // root lands via the normal admission path -- promotes child too.
+        assert_eq!(admit_change(&recv, &root, true).unwrap().outcome, AdmitOutcome::Applied);
+
+        let root_ob =
+            crate::projection_obligations::lookup_projection_obligation(&recv, "g", "root-path")
+                .unwrap()
+                .unwrap();
+        assert_eq!(root_ob.invalidation_generation, 1);
+        let child_ob =
+            crate::projection_obligations::lookup_projection_obligation(&recv, "g", "child-path")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            child_ob.invalidation_generation, 1,
+            "the promoted orphan's own touched path must be obligated too, not just the parent's"
+        );
+    }
+
+    /// Local emission bumps the obligation for a change this device
+    /// authored itself, not only for remotely-admitted
+    /// changes. Confirmed genuinely RED by temporarily removing the bump
+    /// call from `admit_prepared_emission` and re-running.
+    #[test]
+    fn local_emission_bumps_the_projection_obligation_for_its_touched_paths() {
+        let conn = conn();
+        let em = emitter();
+        seed_test_version(&conn, "g");
+        let change =
+            emit_local_change(&conn, "g", vec![create_op("local-path")], ChangeAuth::PLACEHOLDER, &em)
+                .unwrap();
+        assert!(has_change(&conn, &change.compute_hash()).unwrap());
+
+        let ob = crate::projection_obligations::lookup_projection_obligation(&conn, "g", "local-path")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ob.invalidation_generation, 1);
+    }
+
+    /// Startup self-heal bumps the obligation for a child promoted only
+    /// because `init_dag_schema` re-ran (the parent
+    /// landed via bare `append_change`, never through `admit_change`).
+    /// Confirmed genuinely RED by temporarily removing the bump call this
+    /// seam shares with `bump_execution_fence_for_promoted` and re-running:
+    /// the child is promoted (proven by the existing happy-path test above)
+    /// but never obligated.
+    #[test]
+    fn startup_self_heal_bumps_the_projection_obligation_for_the_promoted_child() {
+        let sender = conn();
+        let em = emitter();
+        let root =
+            emit_local_change(&sender, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em)
+                .unwrap();
+        let child =
+            emit_local_change(&sender, "g", vec![create_op("b")], ChangeAuth::PLACEHOLDER, &em)
+                .unwrap();
+
+        let recv = conn();
+        seed_test_version(&recv, "g");
+        assert_eq!(admit_change(&recv, &child, true).unwrap().outcome, AdmitOutcome::Orphaned);
+        assert!(append_change(&recv, &root, true).unwrap());
+        assert!(
+            crate::projection_obligations::lookup_projection_obligation(&recv, "g", "b")
+                .unwrap()
+                .is_none(),
+            "a buffered orphan must not be obligated before it is actually promoted"
+        );
+
+        init_dag_schema(&recv).unwrap();
+
+        let ob = crate::projection_obligations::lookup_projection_obligation(&recv, "g", "b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ob.invalidation_generation, 1);
+    }
+
+    /// Re-admitting an already-admitted change (the "already known,
+    /// no-op" path inside `admit_change`) must not bump any generation
+    /// and must not create a new obligation row -- this is what makes
+    /// network redelivery a pure no-op on the desired side, independent
+    /// of anything a later batch handler does to `handle_change_batch`
+    /// itself.
+    #[test]
+    fn redelivering_an_already_admitted_change_bumps_no_obligation() {
+        let sender = conn();
+        let em = emitter();
+        let root =
+            emit_local_change(&sender, "g", vec![create_op("a")], ChangeAuth::PLACEHOLDER, &em)
+                .unwrap();
+
+        let recv = conn();
+        seed_test_version(&recv, "g");
+        assert_eq!(admit_change(&recv, &root, true).unwrap().outcome, AdmitOutcome::Applied);
+        let first = crate::projection_obligations::lookup_projection_obligation(&recv, "g", "a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.invalidation_generation, 1);
+
+        // Re-admit the exact same, already-admitted change -- the "already
+        // known" path `admit_change` takes for a hash it has already seen.
+        // `AdmitResult.newly_admitted` always reports the primary hash when
+        // the outcome is `Applied` (pre-existing behavior, unrelated to
+        // this fix) -- what PROJ-1 actually requires is that no durable
+        // side effect happens a second time, checked below via the
+        // obligation's own generation, not via this return value's shape.
+        let second = admit_change(&recv, &root, true).unwrap();
+        assert_eq!(
+            second.outcome,
+            AdmitOutcome::Applied,
+            "re-admitting an already-known change is a no-op success, not an error"
+        );
+
+        let after = crate::projection_obligations::lookup_projection_obligation(&recv, "g", "a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.invalidation_generation, 1,
+            "redelivering an already-admitted change must not bump its generation"
+        );
     }
 
     #[test]
@@ -2736,6 +3268,7 @@ mod tests {
                 "device-A",
                 ChangeContent { ops: vec![create_op("a.txt")], versions: &[] },
                 None,
+                None,
                 yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
                     emitter: &em,
                     permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -2760,6 +3293,7 @@ mod tests {
                 "a.txt",
                 "device-A",
                 2,
+                false,
                 &em,
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )

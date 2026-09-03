@@ -26,7 +26,9 @@
 use std::path::Path;
 
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations;
+use yadorilink_filesystem_sync::materialization_repair::{
+    repair_interrupted_materializations, RepairMode,
+};
 use yadorilink_filesystem_sync::stale_temp_files::cleanup_stale_temp_files;
 use yadorilink_local_storage::BlockContentStore;
 
@@ -51,11 +53,16 @@ pub fn run_self_healing(
 ) -> Vec<Violation> {
     let mut findings = Vec::new();
 
+    // `Live`, not `Startup`: this runs at quiescent points DURING an active
+    // DST scenario (see this file's own module doc comment), the same
+    // "periodic sweep while live edits can be in flight" shape the
+    // production periodic task runs under -- not a one-time boot pass.
     if let Ok(report) = repair_interrupted_materializations(
         state,
         store,
         root,
         group_id,
+        RepairMode::Live,
         &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
     ) {
         for path in report.reconstructed {

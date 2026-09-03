@@ -47,7 +47,6 @@ use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_orchestrator;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_transport::DeviceKeyPair;
 
 // --- shared harness (mirrors reconnect_handshake_stress.rs /
 // chaos_coordination_unreachable.rs; each full-stack test file in this
@@ -57,7 +56,6 @@ use yadorilink_transport::DeviceKeyPair;
 struct TestDaemon {
     device_id: String,
     state: Arc<DaemonState>,
-    keypair: Arc<DeviceKeyPair>,
     _root: tempfile::TempDir,
 }
 
@@ -71,7 +69,6 @@ fn new_test_daemon(device_id: &str) -> TestDaemon {
     TestDaemon {
         device_id: device_id.to_string(),
         state,
-        keypair: Arc::new(DeviceKeyPair::generate()),
         _root: tempfile::tempdir().unwrap(),
     }
 }
@@ -85,7 +82,6 @@ fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
 fn spawn_orchestrator(
     coordination_addr: String,
     device_id: String,
-    keypair: Arc<DeviceKeyPair>,
     state: Arc<DaemonState>,
 ) -> JoinHandle<()> {
     let log_device_id = device_id.clone();
@@ -95,7 +91,7 @@ fn spawn_orchestrator(
         device_id,
     };
     tokio::spawn(async move {
-        if let Err(error) = peer_orchestrator::run(config, keypair, state).await {
+        if let Err(error) = peer_orchestrator::run(config, state).await {
             eprintln!("peer orchestrator for {log_device_id} stopped: {error}");
         }
     })
@@ -138,7 +134,6 @@ async fn spawn_star_mesh(scenario: &str, n_leaves: usize) -> StarMesh {
         &fake,
         &hub.state,
         &hub.device_id,
-        hub.keypair.public_bytes(),
         &hub_group_refs,
     )
     .await;
@@ -157,7 +152,6 @@ async fn spawn_star_mesh(scenario: &str, n_leaves: usize) -> StarMesh {
             &fake,
             &leaf.state,
             &leaf.device_id,
-            leaf.keypair.public_bytes(),
             &[group.as_str()],
         )
         .await;
@@ -165,12 +159,11 @@ async fn spawn_star_mesh(scenario: &str, n_leaves: usize) -> StarMesh {
         leaves.push(leaf);
     }
 
-    spawn_orchestrator(fake.addr(), hub.device_id.clone(), hub.keypair.clone(), hub.state.clone());
+    spawn_orchestrator(fake.addr(), hub.device_id.clone(), hub.state.clone());
     for leaf in &leaves {
         spawn_orchestrator(
             fake.addr(),
             leaf.device_id.clone(),
-            leaf.keypair.clone(),
             leaf.state.clone(),
         );
     }
@@ -186,12 +179,12 @@ async fn wait_for_star_connected(mesh: &StarMesh, timeout: Duration, context: &s
                     .state
                     .peers
                     .session(&leaf.device_id)
-                    .is_some_and(|s| s.peer_handshake_received() && s.change_dag_negotiated())
+                    .is_some_and(|s| s.peer_handshake_received())
                     && leaf
                         .state
                         .peers
                         .session(&mesh.hub.device_id)
-                        .is_some_and(|s| s.peer_handshake_received() && s.change_dag_negotiated())
+                        .is_some_and(|s| s.peer_handshake_received())
             })
         },
         timeout,
@@ -255,7 +248,6 @@ async fn simultaneous_flap_scenario(scenario: &str, n_leaves: usize, timeout: Du
             &mesh.fake,
             &leaf.state,
             &leaf.device_id,
-            leaf.keypair.public_bytes(),
             &[group.as_str()],
         )
         .await;
@@ -306,7 +298,6 @@ async fn reconnect_during_active_sync() {
         &mesh.fake,
         &leaf.state,
         &leaf.device_id,
-        leaf.keypair.public_bytes(),
         &[group.as_str()],
     )
     .await;
@@ -344,9 +335,9 @@ async fn reconnect_after_supervisor_restart() {
     // every scenario in this one test binary.
     let hub = new_test_daemon("restart-hub");
     let leaf = new_test_daemon("restart-leaf-0");
-    register_with_fake(&fake, &hub.state, &hub.device_id, hub.keypair.public_bytes(), &[group])
+    register_with_fake(&fake, &hub.state, &hub.device_id, &[group])
         .await;
-    register_with_fake(&fake, &leaf.state, &leaf.device_id, leaf.keypair.public_bytes(), &[group])
+    register_with_fake(&fake, &leaf.state, &leaf.device_id, &[group])
         .await;
     let hub_root = tempfile::tempdir().unwrap();
     link(&hub.state, hub_root.path(), group);
@@ -355,13 +346,11 @@ async fn reconnect_after_supervisor_restart() {
     let _hub_handle = spawn_orchestrator(
         fake.addr(),
         hub.device_id.clone(),
-        hub.keypair.clone(),
         hub.state.clone(),
     );
     let leaf_handle = spawn_orchestrator(
         fake.addr(),
         leaf.device_id.clone(),
-        leaf.keypair.clone(),
         leaf.state.clone(),
     );
 
@@ -370,7 +359,7 @@ async fn reconnect_after_supervisor_restart() {
             hub.state
                 .peers
                 .session(&leaf.device_id)
-                .is_some_and(|s| s.peer_handshake_received() && s.change_dag_negotiated())
+                .is_some_and(|s| s.peer_handshake_received())
         },
         Duration::from_secs(60),
         || "initial pair did not connect".to_string(),
@@ -402,10 +391,9 @@ async fn reconnect_after_supervisor_restart() {
     let _new_leaf_handle = spawn_orchestrator(
         fake.addr(),
         leaf.device_id.clone(),
-        leaf.keypair.clone(),
         leaf.state.clone(),
     );
-    register_with_fake(&fake, &leaf.state, &leaf.device_id, leaf.keypair.public_bytes(), &[group])
+    register_with_fake(&fake, &leaf.state, &leaf.device_id, &[group])
         .await;
 
     wait_until_with_context(
@@ -413,7 +401,7 @@ async fn reconnect_after_supervisor_restart() {
             hub.state
                 .peers
                 .session(&leaf.device_id)
-                .is_some_and(|s| s.peer_handshake_received() && s.change_dag_negotiated())
+                .is_some_and(|s| s.peer_handshake_received())
         },
         Duration::from_secs(60),
         || {
@@ -445,7 +433,7 @@ async fn pathological_peer_does_not_starve_healthy_peers() {
     let hub = new_test_daemon("pathological-hub");
     let mut hub_groups: Vec<&str> = healthy_groups.iter().map(String::as_str).collect();
     hub_groups.push(pathological_group);
-    register_with_fake(&fake, &hub.state, &hub.device_id, hub.keypair.public_bytes(), &hub_groups)
+    register_with_fake(&fake, &hub.state, &hub.device_id, &hub_groups)
         .await;
 
     let mut hub_roots = Vec::with_capacity(N_HEALTHY + 1);
@@ -465,7 +453,6 @@ async fn pathological_peer_does_not_starve_healthy_peers() {
             &fake,
             &leaf.state,
             &leaf.device_id,
-            leaf.keypair.public_bytes(),
             &[group.as_str()],
         )
         .await;
@@ -500,27 +487,28 @@ async fn pathological_peer_does_not_starve_healthy_peers() {
     // value tracking production's constant precisely.
     const N_PATHOLOGICAL: usize = 4 + 2;
     for i in 0..N_PATHOLOGICAL {
-        let pathological_keypair = DeviceKeyPair::generate();
         // Leaked deliberately: each socket must stay bound (and unread) for
         // the whole test so the hub's initiations keep vanishing into it,
         // not get rebound/reused once this scope's local drops.
         let pathological_socket: &'static std::net::UdpSocket =
             Box::leak(Box::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()));
+        // A distinct key per pathological peer, so each is its own device
+        // as far as the netmap is concerned.
+        let pathological_key = yadorilink_transport::DeviceSigningKeyPair::generate();
         fake.register_device(
             &format!("pathological-peer-{i}"),
-            pathological_keypair.public_bytes(),
-            [0u8; 32],
+            pathological_key.public_bytes(),
+            pathological_key.public_bytes(),
             pathological_socket.local_addr().unwrap().to_string(),
             &[pathological_group],
         );
     }
 
-    spawn_orchestrator(fake.addr(), hub.device_id.clone(), hub.keypair.clone(), hub.state.clone());
+    spawn_orchestrator(fake.addr(), hub.device_id.clone(), hub.state.clone());
     for leaf in &healthy_leaves {
         spawn_orchestrator(
             fake.addr(),
             leaf.device_id.clone(),
-            leaf.keypair.clone(),
             leaf.state.clone(),
         );
     }
@@ -531,7 +519,7 @@ async fn pathological_peer_does_not_starve_healthy_peers() {
                 hub.state
                     .peers
                     .session(&leaf.device_id)
-                    .is_some_and(|s| s.peer_handshake_received() && s.change_dag_negotiated())
+                    .is_some_and(|s| s.peer_handshake_received())
             })
         },
         Duration::from_secs(60),

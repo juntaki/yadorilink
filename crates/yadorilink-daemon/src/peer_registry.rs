@@ -58,8 +58,16 @@ pub enum PeerReachability {
     /// A path to the peer is confirmed and in use -- see `RouteKind` for
     /// which kind.
     Connected(crate::route::RouteKind),
-    /// Transport is up, but sync protocol negotiation completed without the
-    /// mandatory change-DAG capability.
+    /// The peer speaks a different protocol generation.
+    ///
+    /// No longer produced from a connected session, and cannot be: the
+    /// generation rides the ALPN, so a peer of another generation is
+    /// refused inside the TLS handshake and never reaches `Connected` at
+    /// all -- it is reported `Unreachable` instead. The variant is retained
+    /// because it is part of the status vocabulary the CLI and desktop app
+    /// render, and because that is where the signal belongs once the
+    /// connection layer distinguishes an ALPN refusal from an ordinary
+    /// failure to reach the peer.
     ProtocolIncompatible,
     /// The peer cannot currently be reached; carries why.
     Unreachable(UnreachableCategory),
@@ -115,11 +123,6 @@ pub struct PeerSnapshot {
     /// from `reachability`, since a status entry can outlive/precede an
     /// actual session -- e.g. `Connecting` before the session is inserted).
     pub has_session: bool,
-    /// Whether the live session (if any) has completed peer handshake but
-    /// not negotiated the change-DAG capability -- callers combine this
-    /// with `reachability == Connected` to report `ProtocolIncompatible`,
-    /// matching `control_socket.rs`'s existing status-handler override.
-    pub protocol_incompatible: bool,
 }
 
 pub struct PeerRegistry {
@@ -253,9 +256,7 @@ impl PeerRegistry {
     }
 
     /// A snapshot of every peer with a recorded status, each combined with
-    /// whether a session currently exists for it and whether that session
-    /// has negotiated a change-DAG (used by callers to detect the
-    /// `Connected`-but-`ProtocolIncompatible` case). Order is unspecified.
+    /// whether a session currently exists for it. Order is unspecified.
     pub fn snapshot(&self) -> Vec<PeerSnapshot> {
         let statuses = self.lock_statuses();
         let sessions = self.lock_sessions();
@@ -267,9 +268,6 @@ impl PeerRegistry {
                     device_id: device_id.clone(),
                     reachability: info.reachability,
                     has_session: session.is_some(),
-                    protocol_incompatible: session.is_some_and(|session| {
-                        session.peer_handshake_received() && !session.change_dag_negotiated()
-                    }),
                 }
             })
             .collect()

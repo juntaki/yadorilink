@@ -2,7 +2,7 @@
 //! route to a peer is RELAY (not direct) must follow the same
 //! fresh-session-epoch rule the plain direct-path restart tests
 //! (`topology_restart_convergence.rs`) already prove -- relay
-//! reachability must never let an obsolete WireGuard/session epoch
+//! reachability must never let an obsolete session epoch
 //! survive a restart just because the traffic happens to be arriving via
 //! a relay hop instead of directly. Reuses `topology_relay_failover.rs`'s
 //! own established technique for forcing a relay route (`Fake
@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use support::fake_coordination::FakeCoordination;
 use support::topology::{fully_connected, restart_node, stand_up_canonical_topology, TopologyNode};
-use support::{register_with_fake, wait_until_with_context};
+use support::{register_with_fake_at, wait_until_with_context};
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_registry::PeerReachability;
 use yadorilink_daemon::route::RouteKind;
@@ -129,19 +129,30 @@ async fn w_restart_while_relayed_gets_a_fresh_epoch_not_a_stale_one() {
     // Restart W. Its direct endpoint is STILL the forced-broken one at
     // this point (never restored), so its ONLY possible path back is
     // relay again -- proving relay reachability does not let a restarted
-    // peer's obsolete session/WireGuard epoch survive just because the
+    // peer's obsolete session epoch survive just because the
     // traffic keeps arriving via the same relay hop as before, and does
     // not somehow bypass the ordinary fresh-generation reconnect rule.
     handles.take_and_shutdown(&w.device_id).await;
     w = restart_node(w).await;
-    // `register_with_fake` advertises W's own freshly-bound REAL local
-    // endpoint (a fresh `DaemonState` has no shared socket yet, so it
-    // binds a new one) -- which would silently undo the forced-broken
-    // address above and let direct recover immediately, defeating this
-    // test's whole premise. Re-force it broken right after re-
-    // registering, so the ONLY path back for restarted W is still relay.
-    register_with_fake(&fake, &w.state, &w.device_id, w.keypair.public_bytes(), &[group_id]).await;
-    fake.update_endpoint(&w.device_id, "127.0.0.1:1".to_string());
+    // Registered with the broken address directly, never with W's own
+    // freshly-bound real one.
+    //
+    // Registering the real address and breaking it a moment later is two
+    // netmap pushes, and that is a race this test loses intermittently: a
+    // peer that reads the first push has a working address for W and
+    // connects on it, and the second push does not take that back, because
+    // a connection is not torn down merely for being on an address the
+    // plane has stopped advertising while it still works. When that
+    // happened, W came back DIRECT and the scenario -- a restart while
+    // relayed -- silently stopped being the scenario.
+    register_with_fake_at(
+        &fake,
+        &w.state,
+        &w.device_id,
+        &[group_id],
+        "127.0.0.1:1".to_string(),
+    )
+    .await;
     let w_runtime = support::topology::spawn_orchestrator(fake.addr(), &w);
     handles.insert(w.device_id.clone(), w_runtime);
 

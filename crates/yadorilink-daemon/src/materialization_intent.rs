@@ -49,9 +49,9 @@ use crate::sync_error::SyncError;
 /// doc comment (this crate's module doc comment above) for why this is an
 /// independent copy of that trait, not the same one.
 pub trait MaterializationIntentJournal: Sync {
-    fn materialization_job_repository(
+    fn materialization_intent_repository(
         &self,
-    ) -> &yadorilink_sync_sqlite::MaterializationJobRepository;
+    ) -> &yadorilink_sync_sqlite::MaterializationIntentRepository;
 }
 
 /// See `yadorilink_sync_core::materialization::MaterializationIntentGuard`'s
@@ -81,7 +81,7 @@ impl<'a, T: MaterializationIntentJournal> MaterializationIntentGuard<'a, T> {
         target_version_hash: &[u8],
         permit: &'a RootCommitPermit<'a>,
     ) -> Result<Self, yadorilink_sync_sqlite::SyncSqliteError> {
-        state.materialization_job_repository().begin_materialization_intent(
+        state.materialization_intent_repository().begin_materialization_intent(
             group_id,
             path,
             target_version_hash,
@@ -93,7 +93,7 @@ impl<'a, T: MaterializationIntentJournal> MaterializationIntentGuard<'a, T> {
     /// Clears the intent. Call ONLY after the temp-write-then-rename is
     /// durable, or when the write has been abandoned to a `Placeholder`.
     pub fn clear(self) -> Result<(), yadorilink_sync_sqlite::SyncSqliteError> {
-        self.state.materialization_job_repository().clear_materialization_intent(
+        self.state.materialization_intent_repository().clear_materialization_intent(
             self.group_id,
             self.path,
             self.permit,

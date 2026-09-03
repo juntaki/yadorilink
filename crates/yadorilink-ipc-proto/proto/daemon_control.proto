@@ -462,6 +462,11 @@ message FileVersionInfo {
   // a caller that didn't record an origin — see
   // `SyncState::upsert_file`'s doc comment).
   string origin_device_id = 5;
+  // The replicated Unix permission bits (`0..=0o777`), or absent when the
+  // authoring device had no Unix permission model to report (a Windows
+  // peer) — `optional` for real proto3 field presence, since `0` (mode
+  // `0o000`, a real, distinct value) must not be confused with "absent".
+  optional uint32 unix_mode = 6;
 }
 
 // `yadorilink versions <path>`. `absolute_path` (not
@@ -519,6 +524,25 @@ message RestoreTrashRequest {
   string absolute_path = 1;
 }
 message RestoreTrashResponse {}
+
+// `yadorilink conflicts list`. Takes no path, same "no scope needed"
+// shape as `ListTrashRequest` — spans every linked folder at once.
+message ListConflictsRequest {}
+
+// One conflicted-copy file, tagged with which link it belongs to
+// (`local_path`) since `ListConflictsRequest` spans every link at once —
+// a conflicted copy is identified purely by its own path following the
+// "(conflicted copy" naming convention `LinkStatus.conflict_count`
+// already counts by, not a separate schema.
+message ConflictedFileInfo {
+  string local_path = 1;
+  string path = 2;
+  int64 size = 3;
+  int64 mtime_unix_nanos = 4;
+}
+message ListConflictsResponse {
+  repeated ConflictedFileInfo files = 1;
+}
 
 message StatusRequest {}
 message StatusResponse {
@@ -868,6 +892,35 @@ message EvictResponse {
   bool dehydrated = 1;
   uint64 blocks_reclaimed = 2;
   uint64 bytes_reclaimed = 3;
+}
+
+// P0-B: one file's current materialization state and pin flag -- the
+// per-FILE analogue of `LinkStatus`'s aggregate hydrated_count/
+// placeholder_count/hydrating_count counts, which answer "how many files
+// across this whole link" but not "what state is THIS file in right
+// now," the question a `pin`/`unpin`/`evict` caller (CLI, desktop app,
+// or a future GUI) needs answered before deciding what to do next.
+message MaterializationStatusRequest {
+  string absolute_path = 1;
+}
+message MaterializationStatusResponse {
+  // `false` if the daemon has no materialization-state row for this path
+  // at all (the path has never been indexed, or is not under any linked
+  // folder) -- `state`/`pinned` are meaningless when this is `false`,
+  // matching this file's existing convention for other "nothing to
+  // report" cases (e.g. `PeerReachability_UNSPECIFIED`).
+  bool known = 1;
+  MaterializationState state = 2;
+  bool pinned = 3;
+}
+
+// Mirrors `yadorilink_replica_domain::session_state::MaterializationState`.
+enum MaterializationState {
+  MATERIALIZATION_STATE_UNSPECIFIED = 0;
+  MATERIALIZATION_STATE_HYDRATED = 1;
+  MATERIALIZATION_STATE_PLACEHOLDER = 2;
+  MATERIALIZATION_STATE_HYDRATING = 3;
+  MATERIALIZATION_STATE_EVICTING = 4;
 }
 
 // A lightweight liveness/health surface,
@@ -1550,6 +1603,10 @@ message DaemonControlRequest {
     // recovery diagnosis (`show`) -- see the message definitions above.
     ListRecoveryOperationsRequest list_recovery_operations = 62;
     ShowRecoveryOperationRequest show_recovery_operation = 63;
+    // P0-B: per-file materialization state/pin query.
+    MaterializationStatusRequest materialization_status = 64;
+    // C5: `yadorilink conflicts list`.
+    ListConflictsRequest list_conflicts = 65;
   }
   // Field numbers 24-26 were the directional-mode requests (set_mode,
   // override, revert); 40-43 were the directional folder-operation requests
@@ -1644,6 +1701,10 @@ message DaemonControlResponse {
     // recovery diagnosis (`show`) -- see the message definitions above.
     ListRecoveryOperationsResponse list_recovery_operations = 62;
     ShowRecoveryOperationResponse show_recovery_operation = 63;
+    // P0-B: per-file materialization state/pin query.
+    MaterializationStatusResponse materialization_status = 64;
+    // C5: `yadorilink conflicts list`.
+    ListConflictsResponse list_conflicts = 65;
   }
   // Field numbers 25-27 were the directional-mode responses (set_mode,
   // override, revert); 40-43 were the directional folder-operation responses

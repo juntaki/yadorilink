@@ -38,8 +38,15 @@ impl LinkStatusReadPort for DaemonLinkStatusReader {
         for link in links {
             let files =
                 state.replica_coordinator.file_index_repository().list_files(&link.group_id)?;
-            let conflict_count =
-                files.iter().filter(|f| f.path.contains("(conflicted copy")).count() as u64;
+            // Same targeted query `FileHistoryQueryService::list_conflicts` reads
+            // from (not a predicate re-applied to `files` above, which -- unlike
+            // this query -- doesn't filter tombstones), so the two can never
+            // disagree about which paths count.
+            let conflict_count = state
+                .replica_coordinator
+                .file_index_repository()
+                .list_live_conflict_copies(&link.group_id)?
+                .len() as u64;
             let materialization = state
                 .replica_coordinator
                 .materialization_state_repository()

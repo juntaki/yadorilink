@@ -38,7 +38,6 @@ use yadorilink_local_storage::FsBlockStore;
 use yadorilink_replica_domain::change::{Op, PutOrigin};
 use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_sync_sqlite::dag_store::DagHashDisposition;
-use yadorilink_transport::DeviceKeyPair;
 
 const DEVICE_COUNT: usize = 4;
 const CANDIDATE_FILE_COUNT: usize = 8;
@@ -154,8 +153,7 @@ struct TestDevice {
 }
 
 async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
-    let keypair = Arc::new(DeviceKeyPair::generate());
-    let device_id = support::register_device(account, name, keypair.public_bytes()).await;
+    let device_id = support::register_device(account, name, [0u8; 32]).await;
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();

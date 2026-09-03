@@ -18,13 +18,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use boringtun::x25519::{PublicKey, StaticSecret};
 use yadorilink_daemon::change_policy::{verify_group_policy_log, GroupPolicyLog, GroupPolicyState};
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::{BlockStore, ContentHash, FsBlockStore, GcReport, StorageError};
 use yadorilink_peer_session::peer_session::{PeerSyncSession, PeerSyncSessionDeps};
-use yadorilink_transport::{public_key_from_bytes, PeerChannel, TransportHub};
+use yadorilink_transport::{
+    connect_role, ConnectRole, DeviceSigningKeyPair, QuicPeerChannel, QuicPeerEndpoint,
+    TransportHub, TransportError,
+};
 
 pub mod control_socket_client;
 pub mod fake_coordination;
@@ -36,10 +38,11 @@ use fake_coordination::FakeCoordination;
 /// orchestrator test: gives it a change-signing key (before its link watch
 /// starts, so change emission is on), binds its loopback transport socket, and
 /// registers its identity + group membership with the fake so the fake's
-/// netmap advertises it to peers. `transport_public` is the device's real
-/// WireGuard/transport public key — the same one passed to
-/// `peer_orchestrator::run` as its `DeviceKeyPair`'s public bytes — so a peer
-/// dialing the endpoint completes the handshake against a matching key.
+/// netmap advertises it to peers.
+///
+/// A device has one key, so what the fake advertises is that key: peers pin
+/// it, verify this device's signed changes against it, and authenticate its
+/// connections with it.
 ///
 /// Call this before `spawn_orchestrator` and before `LinkRuntimeController::
 /// start_link_watch` for the daemon.
@@ -48,32 +51,44 @@ pub async fn register_with_fake(
     fake: &FakeCoordination,
     state: &Arc<DaemonState>,
     device_id: &str,
-    transport_public: [u8; 32],
     groups: &[&str],
 ) {
+    // Bind the device's shared UDP socket to loopback and advertise that
+    // socket's address as the device's sole endpoint candidate — mirroring
+    // production's `ensure_shared_socket` + endpoint report, but pointed at
+    // the in-process fake.
+    let shared = device_shared_socket(state).await;
+    let endpoint = shared.local_addr().to_string();
+    register_with_fake_at(fake, state, device_id, groups, endpoint).await;
+}
+
+/// Registers a device advertising `endpoint` rather than the address it is
+/// actually listening on.
+///
+/// A test that wants a device to be *unreachable* has to say so at
+/// registration, not immediately afterwards. Registering the real address
+/// and then replacing it is two netmap pushes, and a peer that reads the
+/// first one has a working address in hand: it will connect on it, and the
+/// second push cannot take that back, because nothing tears down a
+/// connection merely for being on an address the plane has stopped
+/// advertising while it still works. The window is small and the race is
+/// therefore intermittent, which is worse than a test that simply fails --
+/// it makes the scenario silently not the scenario.
+///
+/// The socket is still bound, so the device is a real device with a real
+/// address it could be reached at; the coordination plane just never names
+/// it.
+#[allow(dead_code)]
+pub async fn register_with_fake_at(
+    fake: &FakeCoordination,
+    state: &Arc<DaemonState>,
+    device_id: &str,
+    groups: &[&str],
+    endpoint: String,
+) {
     let verifying = ensure_device_signing_key(state);
-    // Bind the device's shared UDP socket to loopback with its real transport
-    // public key installed (so the hub's MAC1 initiation gate is keyed on it),
-    // and advertise that socket's address as the device's sole endpoint
-    // candidate — mirroring production's `ensure_shared_socket` + endpoint
-    // report, but pointed at the in-process fake.
-    state.set_device_static_public(transport_public);
-    let shared = if let Some(existing) = state.shared_socket() {
-        existing
-    } else {
-        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let device_public = public_key_from_bytes(&transport_public).ok();
-        let shared = TransportHub::from_socket(udp, device_public);
-        state.set_shared_socket(shared.clone());
-        shared
-    };
-    fake.register_device(
-        device_id,
-        transport_public,
-        verifying,
-        shared.local_addr().to_string(),
-        groups,
-    );
+    let _ = device_shared_socket(state).await;
+    fake.register_device(device_id, verifying, verifying, endpoint, groups);
 }
 
 /// Test-isolation fix (found investigating a session-wide daemon-test
@@ -282,7 +297,7 @@ pub fn daemon_status_summary(state: &DaemonState) -> String {
 /// wherever a test asserts "exactly/at-least N real files".
 #[allow(dead_code)]
 pub fn real_entry_names(dir: &std::path::Path) -> Vec<String> {
-    std::fs::read_dir(dir)
+    let mut names: Vec<String> = std::fs::read_dir(dir)
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
@@ -299,7 +314,17 @@ pub fn real_entry_names(dir: &std::path::Path) -> Vec<String> {
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // `read_dir` yields entries in whatever order the filesystem stores
+    // them, which two devices' sync roots need not agree on even when they
+    // hold the identical set of files. Callers compare these lists between
+    // devices to decide convergence, so without a total order imposed here
+    // that comparison can fail on ordering alone -- confirmed: a
+    // rename-onto-a-concurrently-created-path scenario timed out for 20s
+    // with both devices already holding exactly `target.txt` plus the same
+    // one conflict copy, listed the other way round.
+    names.sort();
+    names
 }
 
 /// Opens a `SyncState` the same way production does (`SyncState::open` —
@@ -401,10 +426,11 @@ pub async fn connect_two_daemons_with_handles(
 }
 
 /// Like [`connect_two_daemons_with_handles`], but also returns the two
-/// underlying `Arc<PeerChannel>`s so a caller can later call
-/// [`PeerChannel::revoke`] on each to cleanly sever the pairing.
+/// underlying channels so a caller can later drop them to cleanly sever the
+/// pairing.
 ///
-/// `revoke()` is the real disconnect primitive, unlike `JoinHandle::abort()`
+/// Dropping a channel is the real disconnect primitive, unlike
+/// `JoinHandle::abort()`
 /// on the returned session tasks: `PeerSyncSession::run` spawns its own
 /// internal child tasks (`resync_handle`/`handshake_retry_handle`/
 /// `credit_hint_refresh_handle`), which only get torn down by `run`'s own
@@ -412,15 +438,16 @@ pub async fn connect_two_daemons_with_handles(
 /// channel close. Aborting the outer task skips that cleanup and orphans
 /// those child tasks, which keep running and keep re-announcing this
 /// device's DAG state to the (still-live) peer channel -- confirmed,
-/// reproduced (see `exec_bit_metadata_conflict.rs`'s PR #31 review
-/// addendum). `revoke()` makes `recv()` return `None`, which `run()`
-/// already treats as "the session ended," so its real exit path (and the
-/// child-task cleanup it performs) runs normally. A caller that needs a
-/// clean disconnect -- e.g. to construct a genuine, isolated concurrent-
-/// history divergence on a file both devices already share -- should call
-/// this instead of [`connect_two_daemons_with_handles`], hold onto the
-/// returned channels, and `revoke()` both before making any edit meant to
-/// be isolated from the peer.
+/// reproduced (see `unix_mode_metadata_conflict.rs`'s PR #31 review
+/// addendum). Dropping the channel closes the connection, which makes
+/// `recv()` return `None`; `run()` already treats that as "the session
+/// ended", so its real exit path -- and the child-task cleanup it performs
+/// -- runs normally. A caller that needs a clean disconnect -- e.g. to
+/// construct a genuine, isolated concurrent-history divergence on a file
+/// both devices already share -- should call this instead of
+/// [`connect_two_daemons_with_handles`], hold onto the returned channels,
+/// and drop both before making any edit meant to be isolated from the
+/// peer.
 #[allow(dead_code)]
 pub async fn connect_two_daemons_with_channels(
     state_a: &Arc<DaemonState>,
@@ -428,7 +455,7 @@ pub async fn connect_two_daemons_with_channels(
     state_b: &Arc<DaemonState>,
     device_b_id: &str,
     shared_group_ids: &[String],
-) -> ([tokio::task::JoinHandle<()>; 2], [Arc<PeerChannel>; 2]) {
+) -> ([tokio::task::JoinHandle<()>; 2], [Arc<QuicPeerChannel>; 2]) {
     // Direct-pairing tests stand in for the coordination plane, so install the
     // verified empty policy snapshot that plane supplies during a group's
     // bootstrap phase. A linked group is intentionally fail-closed when its
@@ -439,36 +466,33 @@ pub async fn connect_two_daemons_with_channels(
     install_bootstrap_policies(state_a, shared_group_ids);
     install_bootstrap_policies(state_b, shared_group_ids);
 
-    // One shared UDP socket per device, bound once and reused across every
-    // channel that device opens — the production model (the socket lives on
-    // DaemonState). In a mesh this is what lets a device's channels to two
-    // different peers ride the same socket, demultiplexed by session index.
-    let shared_a = device_shared_socket(state_a).await;
-    let shared_b = device_shared_socket(state_b).await;
-    let addr_a = shared_a.local_addr();
-    let addr_b = shared_b.local_addr();
-    // `session_index` must be unique per live channel on a device; the number
-    // of sessions already established on each side is a monotonic, collision-
-    // free choice for the sequential pairing these tests do.
-    let index_a = state_a.peers.session_count() as u32;
-    let index_b = state_b.peers.session_count() as u32;
-
-    // Each side must pin the other's change-signing verifying key so incoming
-    // DAG changes verify (the receiver checks every change's signature against
-    // the author's pinned key before admitting it). The keys are set on each
-    // daemon at setup — before its link watch starts, so change emission is on
-    // from the first edit — via `ensure_device_signing_key`.
+    // Each side must pin the other's key so incoming DAG changes verify (the
+    // receiver checks every change's signature against the author's pinned
+    // key before admitting it) -- and the same key authenticates the
+    // connection. The keys are set on each daemon at setup, before its link
+    // watch starts, via `ensure_device_signing_key`.
     let verifying_a = ensure_device_signing_key(state_a);
     let verifying_b = ensure_device_signing_key(state_b);
 
-    let (secret_a, public_a) = gen_transport_keypair();
-    let (secret_b, public_b) = gen_transport_keypair();
-    let channel_a = Arc::new(
-        PeerChannel::connect(secret_a, public_b, index_a, vec![addr_b], shared_a).await.unwrap(),
-    );
-    let channel_b = Arc::new(
-        PeerChannel::connect(secret_b, public_a, index_b, vec![addr_a], shared_b).await.unwrap(),
-    );
+    // One shared UDP socket and one QUIC endpoint per device, reused across
+    // every peer that device pairs with -- the production model, and what
+    // makes a mesh test share one binding per device rather than one per
+    // pairing.
+    let addr_a = device_shared_socket(state_a).await.local_addr();
+    let addr_b = device_shared_socket(state_b).await.local_addr();
+    let endpoint_a = device_quic_endpoint(state_a).await;
+    let endpoint_b = device_quic_endpoint(state_b).await;
+    let (channel_a, channel_b) = connect_quic_pair(
+        &endpoint_a,
+        device_a_id,
+        verifying_a,
+        &endpoint_b,
+        device_b_id,
+        verifying_b,
+        addr_b,
+        addr_a,
+    )
+    .await;
     let (session_a, handle_a) = spawn_paired_session(
         state_a,
         device_a_id,
@@ -494,7 +518,7 @@ pub async fn connect_two_daemons_with_channels(
     // not expose a session as ready to callers at this seam, so make the direct
     // pairing helper provide the equivalent readiness guarantee explicitly.
     wait_until(
-        || session_a.change_dag_negotiated() && session_b.change_dag_negotiated(),
+        || session_a.peer_handshake_received() && session_b.peer_handshake_received(),
         std::time::Duration::from_secs(10),
     )
     .await;
@@ -590,38 +614,150 @@ pub async fn device_shared_socket(state: &Arc<DaemonState>) -> Arc<TransportHub>
         return existing;
     }
     let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    // `None` for the device static public key disables the hub's MAC1
-    // initiation gate (offer-to-all fallback). These tests use per-channel
-    // throwaway transport keypairs with no single device-wide static key, so
-    // the gate has nothing to key on — correct and fine over loopback.
-    let shared = TransportHub::from_socket(udp, None);
+    let shared = TransportHub::from_socket(udp);
     state.set_shared_socket(shared.clone());
     shared
 }
 
-fn gen_transport_keypair() -> (StaticSecret, PublicKey) {
-    let mut bytes = [0u8; 32];
-    rand::fill(&mut bytes);
-    let secret = StaticSecret::from(bytes);
-    let public = PublicKey::from(&secret);
-    (secret, public)
+/// A channel whose peer never answers: sends are accepted and go nowhere, and
+/// `recv` never resolves.
+///
+/// It stands in for a peer that is connected as far as this device is
+/// concerned but never replies, which is what a per-peer request's own
+/// timeout behavior has to be exercised against. Deliberately not a real
+/// connection to an unreachable address: under QUIC there is no such thing --
+/// a connection either completed a handshake or does not exist -- so
+/// modelling "no answer" means modelling the silence, not the socket.
+#[allow(dead_code)]
+pub struct SilentPeerChannel;
+
+#[async_trait::async_trait]
+impl yadorilink_peer_session::ports::PeerMessageChannel for SilentPeerChannel {
+    async fn send(&self, _payload: Vec<u8>) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    fn try_send(&self, _payload: Vec<u8>) -> bool {
+        true
+    }
+
+    async fn recv(&self) -> Option<Vec<u8>> {
+        std::future::pending().await
+    }
+
+    /// Silent on the block plane too: a stream opens (so a requester really
+    /// does commit to waiting, which is the point of this double) and then
+    /// nothing ever comes back on it.
+    async fn open_block_stream(
+        &self,
+    ) -> Result<Box<dyn yadorilink_peer_session::ports::PeerBlockStream>, TransportError> {
+        Ok(Box::new(SilentBlockStream))
+    }
+
+    async fn accept_block_stream(
+        &self,
+    ) -> Option<Box<dyn yadorilink_peer_session::ports::PeerBlockStream>> {
+        std::future::pending().await
+    }
 }
 
-/// A live `PeerChannel` with no reachable peer on the far end — sending on it
-/// simply queues the datagram (the send half stays open) rather than erroring,
-/// so a caller awaiting a reply always times out rather than failing fast.
-/// Stands in for a peer that never completes any handshake at all, which is
-/// exactly what a session whose `ClusterConfig` negotiation never ran (or ran
-/// with an old peer's defaults) looks like from the querying side — useful for
-/// exercising a per-peer request's own capability-skip/timeout behavior
-/// without standing up a second live daemon.
+/// The block-plane half of [`SilentPeerChannel`]: writes are accepted and
+/// go nowhere, reads never resolve.
 #[allow(dead_code)]
-pub async fn unreachable_channel() -> Arc<PeerChannel> {
-    let (secret, _) = gen_transport_keypair();
-    let (_, peer_public) = gen_transport_keypair();
-    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let hub = TransportHub::from_socket(udp, None);
-    Arc::new(PeerChannel::connect(secret, peer_public, 0, Vec::new(), hub).await.unwrap())
+pub struct SilentBlockStream;
+
+#[async_trait::async_trait]
+impl yadorilink_peer_session::ports::PeerBlockStream for SilentBlockStream {
+    async fn send_message(&mut self, _payload: &[u8]) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    async fn recv_message(&mut self, _max_len: usize) -> Result<Vec<u8>, TransportError> {
+        std::future::pending().await
+    }
+
+    async fn send_body(&mut self, _body: &[u8]) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    async fn recv_body(&mut self, _len: usize) -> Result<Vec<u8>, TransportError> {
+        std::future::pending().await
+    }
+
+    fn finish_send(&mut self) {}
+}
+
+#[allow(dead_code)]
+pub async fn unreachable_channel() -> Arc<SilentPeerChannel> {
+    Arc::new(SilentPeerChannel)
+}
+
+/// One authenticated QUIC connection between two devices' hubs, from
+/// whichever side the device-id ordering names as the dialer -- the same rule
+/// production uses, so a test pairing exercises the shipped one.
+#[allow(dead_code)]
+pub async fn connect_quic_pair(
+    endpoint_a: &Arc<QuicPeerEndpoint>,
+    device_a_id: &str,
+    key_a: [u8; 32],
+    endpoint_b: &Arc<QuicPeerEndpoint>,
+    device_b_id: &str,
+    key_b: [u8; 32],
+    addr_b: std::net::SocketAddr,
+    addr_a: std::net::SocketAddr,
+) -> (Arc<QuicPeerChannel>, Arc<QuicPeerChannel>) {
+    endpoint_a.authorize(key_b);
+    endpoint_b.authorize(key_a);
+    let a_role = connect_role(device_a_id, device_b_id);
+    let (dialer, dial_addr, dial_key, acceptor, accept_key) = match a_role {
+        ConnectRole::Dial => (endpoint_a, addr_b, key_b, endpoint_b, key_a),
+        ConnectRole::Accept => (endpoint_b, addr_a, key_a, endpoint_a, key_b),
+    };
+    let accepting = {
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move { acceptor.accept(accept_key).await })
+    };
+    let dialed = dialer.connect(dial_addr, dial_key).await.expect("the pairing dial must succeed");
+    let accepted = accepting.await.expect("accept task").expect("a connection must arrive");
+    let dialer_channel = QuicPeerChannel::new(dialed, ConnectRole::Dial);
+    let acceptor_channel = QuicPeerChannel::new(accepted, ConnectRole::Accept);
+    match a_role {
+        ConnectRole::Dial => (dialer_channel, acceptor_channel),
+        ConnectRole::Accept => (acceptor_channel, dialer_channel),
+    }
+}
+
+/// This device's QUIC endpoint, built on its shared socket and cached for
+/// the rest of the process.
+///
+/// Keyed by the socket's address rather than kept on `DaemonState`, because
+/// only production owns an endpoint there; a test that pairs one device with
+/// several peers must reuse the one endpoint, since a hub refuses a second.
+#[allow(dead_code)]
+pub async fn device_quic_endpoint(state: &Arc<DaemonState>) -> Arc<QuicPeerEndpoint> {
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+    static ENDPOINTS: std::sync::OnceLock<
+        StdMutex<HashMap<std::net::SocketAddr, Arc<QuicPeerEndpoint>>>,
+    > = std::sync::OnceLock::new();
+
+    let hub = device_shared_socket(state).await;
+    let addr = hub.local_addr();
+    let signing = state
+        .device_signing_key()
+        .expect("a paired test device must have its signing key installed first");
+    let mut endpoints =
+        ENDPOINTS.get_or_init(|| StdMutex::new(HashMap::new())).lock().unwrap_or_else(|p| p.into_inner());
+    endpoints
+        .entry(addr)
+        .or_insert_with(|| {
+            QuicPeerEndpoint::new(
+                hub,
+                DeviceSigningKeyPair { verifying: signing.verifying_key(), signing },
+            )
+            .expect("one QUIC endpoint per test device hub")
+        })
+        .clone()
 }
 
 /// A `BlockStore` that delegates everything to a real `FsBlockStore` except
@@ -725,11 +861,17 @@ pub fn corrupt_stored_block(root: &std::path::Path, hash_hex: &str) {
 /// authenticator). If that production wiring changes, mirror it here too — a
 /// test that pairs sessions differently from production would silently stop
 /// exercising the real behavior.
-fn spawn_paired_session(
+/// `pub` (not just this module's own `connect_two_daemons_with_channels`
+/// helper): a process-isolated pairing test needs each side's session wired
+/// independently -- there is no single in-process caller that can build both
+/// ends' channels and call this once per side the way `connect_two_daemons_
+/// with_channels` does.
+#[allow(dead_code)]
+pub fn spawn_paired_session(
     state: &Arc<DaemonState>,
     local_device_id: &str,
     peer_device_id: &str,
-    channel: Arc<PeerChannel>,
+    channel: Arc<QuicPeerChannel>,
     shared_group_ids: &[String],
     peer_verifying_key: [u8; 32],
 ) -> (Arc<PeerSyncSession>, tokio::task::JoinHandle<()>) {
@@ -797,7 +939,7 @@ fn spawn_paired_session(
     // lossy loopback UDP. Re-announce the DAG frontier at a test cadence so a
     // dropped one-shot HeadsAnnounce is retried within the assertion budget;
     // this is the same anti-entropy mechanism production runs every 90s.
-    session.set_full_index_resync_interval(std::time::Duration::from_secs(1));
+    session.set_maintenance_reconcile_interval(std::time::Duration::from_secs(1));
     // Same rationale, for the daemon-level (not per-session) materialization-
     // repair backstop (`DaemonState::set_materialization_repair_sweep_
     // interval`): a heavy multi-device test can legitimately run out of

@@ -1,22 +1,23 @@
-//! M3 Pass 7 (chaos/convergence): multi-peer relay fan-in over the same
-//! real orchestrator-managed harness `relay_session_e2e.rs` (Pass 5's
-//! provider side) and `relay_failover.rs` (Pass 6's requester side) each
-//! already prove piecemeal -- here, ONE relay device forwarding for
-//! SEVERAL concurrent requester-opened sessions at once, driven through
-//! the exact same `RelayCarrier`/`RelayGrantSource` production wiring
-//! Pass 6b built.
+//! Multi-peer relay fan-in: ONE relay device forwarding for SEVERAL
+//! concurrent requester-opened relay paths at once, over the same real
+//! orchestrator-managed harness `relay_session_e2e.rs` uses for the
+//! provider side.
+//!
+//! This drives the relay layer directly -- open a path per destination and
+//! push a datagram down each -- rather than through a full peer connection
+//! on top. That is deliberate: what is under test here is the relay's own
+//! session isolation and byte accounting, so the datagrams are opaque test
+//! payloads and the assertions are about which session carried which bytes.
+//! `topology_relay_fan_in_reconnect_chaos.rs` covers the other half, a real
+//! QUIC connection running over a relay path while connectivity flaps.
 //!
 //! **Scope note**: this exercises fan-in and session-isolation over real
 //! sockets/sessions, not the full `dst_*.rs` madsim deterministic-
 //! simulation suite (randomized seeds, fault-schedule generators,
 //! network-partition/restart injection) that the rest of this crate's
-//! chaos coverage runs on. No existing `dst_*.rs` scenario drives
-//! `PeerChannel::connect_with_relay`/`RelayCarrier` at all yet (verified
-//! by inspection) -- extending that generator/oracle machinery with
-//! relay-aware fault scenarios (simulated relay-device restart, network
-//! partition specifically severing a relay hop, multi-seed randomized
-//! fan-in) is real, additional scope beyond what this file covers, and is
-//! recorded as a follow-up rather than attempted here piecemeal.
+//! chaos coverage runs on -- extending that generator/oracle machinery with
+//! relay-aware fault scenarios is real, additional scope beyond what this
+//! file covers.
 
 mod support;
 
@@ -30,12 +31,10 @@ use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_orchestrator;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_transport::DeviceKeyPair;
 
 struct TestDaemon {
     device_id: String,
     state: Arc<DaemonState>,
-    keypair: Arc<DeviceKeyPair>,
     _root: tempfile::TempDir,
 }
 
@@ -47,7 +46,6 @@ fn new_test_daemon(device_id: &str) -> TestDaemon {
     TestDaemon {
         device_id: device_id.to_string(),
         state,
-        keypair: Arc::new(DeviceKeyPair::generate()),
         _root: tempfile::tempdir().unwrap(),
     }
 }
@@ -61,7 +59,6 @@ fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
 fn spawn_orchestrator(
     coordination_addr: String,
     device_id: String,
-    keypair: Arc<DeviceKeyPair>,
     state: Arc<DaemonState>,
 ) {
     let log_device_id = device_id.clone();
@@ -71,7 +68,7 @@ fn spawn_orchestrator(
         device_id,
     };
     tokio::spawn(async move {
-        if let Err(error) = peer_orchestrator::run(config, keypair, state).await {
+        if let Err(error) = peer_orchestrator::run(config, state).await {
             eprintln!("peer orchestrator for {log_device_id} stopped: {error}");
         }
     });
@@ -81,7 +78,7 @@ fn fully_connected(state: &Arc<DaemonState>, peer_device_id: &str) -> bool {
     state
         .peers
         .session(peer_device_id)
-        .is_some_and(|s| s.peer_handshake_received() && s.change_dag_negotiated())
+        .is_some_and(|s| s.peer_handshake_received())
 }
 
 /// Same adapter as `relay_session_e2e.rs`'s own `TestGrantSource` --
@@ -139,7 +136,6 @@ async fn multi_peer_fan_in_through_one_relay() {
             &fake,
             &daemon.state,
             &daemon.device_id,
-            daemon.keypair.public_bytes(),
             &[group_id],
         )
         .await;
@@ -148,10 +144,10 @@ async fn multi_peer_fan_in_through_one_relay() {
     b.state.set_local_relay_capable(true);
     fake.set_relay_capable(&b.device_id, true);
 
-    spawn_orchestrator(fake.addr(), a.device_id.clone(), a.keypair.clone(), a.state.clone());
-    spawn_orchestrator(fake.addr(), b.device_id.clone(), b.keypair.clone(), b.state.clone());
+    spawn_orchestrator(fake.addr(), a.device_id.clone(), a.state.clone());
+    spawn_orchestrator(fake.addr(), b.device_id.clone(), b.state.clone());
     for c in &destinations {
-        spawn_orchestrator(fake.addr(), c.device_id.clone(), c.keypair.clone(), c.state.clone());
+        spawn_orchestrator(fake.addr(), c.device_id.clone(), c.state.clone());
     }
 
     wait_until_with_context(
@@ -177,27 +173,50 @@ async fn multi_peer_fan_in_through_one_relay() {
         source_device_id: a.device_id.clone(),
     }));
 
-    // Fan in: open (or, on any retry, reuse) a relay session toward all
-    // three destinations concurrently, each carrying its own distinct
-    // payload.
+    // Fan in: open a relay path toward all three destinations
+    // concurrently, each carrying its own distinct payload.
+    //
+    // The payloads are sent by addressing each path's synthetic address on
+    // A's own transport hub -- exactly what this device's QUIC endpoint
+    // does for a relayed peer, one layer lower. Each is shaped like a QUIC
+    // long-header packet (the fixed bit set in byte 0) because that is what
+    // the destination's demux requires of anything it will route to a relay
+    // path; nothing here depends on the destinations acting on them.
     let payloads: Vec<Vec<u8>> = (0..destinations.len())
-        .map(|i| format!("payload for destination {i}").into_bytes())
+        .map(|i| {
+            let mut payload = vec![0xC0u8];
+            payload.extend_from_slice(format!("payload for destination {i}").as_bytes());
+            payload
+        })
         .collect();
-    let sends = destinations.iter().zip(payloads.iter()).map(|(c, payload)| {
+    let opens = destinations.iter().map(|c| {
         let a_state = a.state.clone();
-        let peer_public = c.keypair.public_bytes();
-        let payload = payload.clone();
+        let device_id = c.device_id.clone();
+        let peer_public =
+            c.state.device_signing_key().expect("destination has a device key").verifying_key().to_bytes();
         async move {
-            yadorilink_transport::RelayCarrier::send_via_relay(
-                &*a_state,
+            yadorilink_daemon::relay_carrier::open_relay_path_for_test(
+                &a_state,
+                &device_id,
                 &peer_public,
-                bytes::Bytes::from(payload),
             )
             .await
         }
     });
-    let results = futures_util::future::join_all(sends).await;
-    assert!(results.iter().all(|sent| *sent), "every destination's send must succeed: {results:?}");
+    let opened: Vec<_> = futures_util::future::join_all(opens).await;
+    assert!(
+        opened.iter().all(|path| path.is_some()),
+        "every destination must get a relay path: {:?}",
+        opened.iter().map(|p| p.is_some()).collect::<Vec<_>>()
+    );
+    let opened: Vec<yadorilink_daemon::relay_carrier::OpenedRelayPath> =
+        opened.into_iter().flatten().collect();
+
+    let hub = a.state.shared_socket().expect("A has a bound transport hub");
+    for (path, payload) in opened.iter().zip(payloads.iter()) {
+        hub.try_send_datagram(payload, path.path.synthetic_addr())
+            .expect("A's hub accepts a datagram addressed to a live relay path");
+    }
 
     wait_until_with_context(
         || b.state.relay_forwarder.active_session_count() == destinations.len(),
@@ -212,19 +231,12 @@ async fn multi_peer_fan_in_through_one_relay() {
     )
     .await;
 
-    // Session isolation: each destination's requester-tracked session id
-    // is DISTINCT (no accidental collapse across different destinations
-    // through the same relay), and each one's forwarded-byte count
-    // matches ONLY its own payload -- proving no cross-talk between
-    // concurrently-open sessions sharing one relay device.
-    let session_ids: Vec<u64> = destinations
-        .iter()
-        .map(|c| {
-            a.state
-                .requester_relay_session_id_for_destination_test(&c.keypair.public_bytes())
-                .expect("A must have recorded a requester session for this destination")
-        })
-        .collect();
+    // Session isolation: each destination's session id is DISTINCT (no
+    // accidental collapse across different destinations through the same
+    // relay), and each one's forwarded-byte count matches ONLY its own
+    // payload -- proving no cross-talk between concurrently-open sessions
+    // sharing one relay device.
+    let session_ids: Vec<u64> = opened.iter().map(|path| path.session_id).collect();
     let mut sorted_ids = session_ids.clone();
     sorted_ids.sort_unstable();
     sorted_ids.dedup();
@@ -254,11 +266,10 @@ async fn multi_peer_fan_in_through_one_relay() {
     // Full lifecycle: closing every session leaves zero stale/leaked
     // entries on B's forwarder.
     for session_id in &session_ids {
-        // No public "close as requester" API exists yet (Pass 7 scope,
-        // not Pass 6's) -- close directly via the forwarder, the same
-        // mechanism `relay_session_handler::handle_relay_close` uses on
-        // the provider side, to prove cleanup itself works even without
-        // a requester-initiated close frame.
+        // Closed on the provider directly, the same mechanism
+        // `relay_session_handler::handle_relay_close` reaches, so this
+        // proves the forwarder's own cleanup rather than the requester's
+        // close frame reaching it.
         b.state.relay_forwarder.close_session(*session_id, "test_complete");
     }
     wait_until_with_context(

@@ -410,4 +410,107 @@ mod tests {
         assert_eq!(result, raw_groups);
         assert_eq!(cache.lock().unwrap().get("group-y").copied(), Some(true));
     }
+
+    /// End-to-end integration proof (not just the underlying `GroupPolicyState`
+    /// primitive) that `NetmapChangeAuthenticator::accepts_change_auth` -- the
+    /// actual peer-to-peer inbound admission gate every real connection runs
+    /// through -- rejects a change from a Viewer-role device, and accepts the
+    /// identical change once the SAME device is re-granted as an Editor. This
+    /// is the real security boundary the coordinator's Phase F sharing-roles
+    /// work exists to establish: a Viewer role is not merely hidden from a
+    /// UI, it is cryptographically rejected by every peer holding this
+    /// group's policy.
+    #[tokio::test]
+    async fn accepts_change_auth_rejects_a_viewer_and_accepts_the_same_device_as_an_editor() {
+        use crate::change_policy::policy_signing::grant_record;
+        use crate::change_policy::{GroupPolicyLog, WriterRole};
+        use ed25519_dalek::SigningKey;
+
+        let authority = SigningKey::from_bytes(&[7u8; 32]);
+        let group_id = "shared-group";
+        let device_fp = [42u8; 32];
+
+        // A single-record chain granting device-b Viewer access only.
+        let viewer_grant = grant_record(
+            &authority,
+            group_id,
+            1,
+            [0u8; 32],
+            "device-b",
+            device_fp,
+            WriterRole::Viewer,
+        );
+        let viewer_head = viewer_grant.record_hash.clone();
+        let viewer_log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 1,
+            current_epoch: 0,
+            policy_head: viewer_head.clone(),
+            records: vec![viewer_grant],
+        };
+        let viewer_policy = crate::change_policy::verify_group_policy_log(
+            &authority.verifying_key().to_bytes(),
+            &viewer_log,
+        )
+        .unwrap();
+
+        let state = test_state();
+        state.replace_group_policy_states(HashMap::from([(group_id.to_string(), viewer_policy)]));
+        let authenticator = NetmapChangeAuthenticator::new(state);
+
+        assert!(
+            !authenticator.accepts_change_auth(
+                "device-b",
+                group_id,
+                device_fp,
+                yadorilink_replica_domain::change::ChangeAuth {
+                    auth_seq: 1,
+                    auth_epoch: 0,
+                    policy_head_hash: viewer_head.as_slice().try_into().unwrap(),
+                },
+            ),
+            "the real peer-admission gate must reject a change authored under a Viewer-only grant"
+        );
+
+        // Re-grant the SAME device as an Editor -- the identical change
+        // shape must now be accepted.
+        let editor_grant = grant_record(
+            &authority,
+            group_id,
+            1,
+            [0u8; 32],
+            "device-b",
+            device_fp,
+            WriterRole::Editor,
+        );
+        let editor_head = editor_grant.record_hash.clone();
+        let editor_log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 1,
+            current_epoch: 0,
+            policy_head: editor_head.clone(),
+            records: vec![editor_grant],
+        };
+        let editor_policy = crate::change_policy::verify_group_policy_log(
+            &authority.verifying_key().to_bytes(),
+            &editor_log,
+        )
+        .unwrap();
+        let state2 = test_state();
+        state2.replace_group_policy_states(HashMap::from([(group_id.to_string(), editor_policy)]));
+        let authenticator2 = NetmapChangeAuthenticator::new(state2);
+        assert!(
+            authenticator2.accepts_change_auth(
+                "device-b",
+                group_id,
+                device_fp,
+                yadorilink_replica_domain::change::ChangeAuth {
+                    auth_seq: 1,
+                    auth_epoch: 0,
+                    policy_head_hash: editor_head.as_slice().try_into().unwrap(),
+                },
+            ),
+            "the same device, now Editor-granted, must be accepted by the real admission gate"
+        );
+    }
 }

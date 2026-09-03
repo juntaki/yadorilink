@@ -18,6 +18,18 @@ pub(crate) struct TrashedFileView {
     pub(crate) trashed: TrashedFile,
 }
 
+/// A live (non-deleted) conflicted-copy file, tagged with its link's
+/// `local_path` -- mirrors `TrashedFileView`'s own per-link tagging shape.
+/// Same underlying set `LinkStatus.conflict_count` counts, by construction
+/// (both read `list_live_conflict_copies`).
+#[derive(Debug, Clone)]
+pub(crate) struct ConflictedFileView {
+    pub(crate) local_path: String,
+    pub(crate) path: String,
+    pub(crate) size: u64,
+    pub(crate) mtime_unix_nanos: i64,
+}
+
 pub(crate) struct FileHistoryQueryService {
     sync_state: Arc<ReplicaCoordinator>,
     paths: Arc<LinkedPathResolver>,
@@ -53,6 +65,29 @@ impl FileHistoryQueryService {
         for link in self.sync_state.link_repository().list_links()? {
             for trashed in self.sync_state.file_index_repository().list_trashed(&link.group_id)? {
                 out.push(TrashedFileView { local_path: link.local_path.clone(), trashed });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every currently-live conflicted-copy file across every linked
+    /// folder, each tagged with its link's own `local_path` -- same
+    /// per-link iteration shape as `list_trash`. Reads
+    /// `list_live_conflict_copies`, the same targeted query
+    /// `LinkStatusReadPort::list_links`'s `conflict_count` reads from, so
+    /// the two can never disagree about which paths count.
+    pub(crate) fn list_conflicts(&self) -> Result<Vec<ConflictedFileView>, SyncError> {
+        let mut out = Vec::new();
+        for link in self.sync_state.link_repository().list_links()? {
+            for file in
+                self.sync_state.file_index_repository().list_live_conflict_copies(&link.group_id)?
+            {
+                out.push(ConflictedFileView {
+                    local_path: link.local_path.clone(),
+                    path: file.path,
+                    size: file.size,
+                    mtime_unix_nanos: file.mtime_unix_nanos,
+                });
             }
         }
         Ok(out)

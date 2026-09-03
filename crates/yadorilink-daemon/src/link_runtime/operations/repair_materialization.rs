@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use crate::sync_error::SyncError;
 use yadorilink_filesystem_sync::materialization_repair::{
-    MaterializationRepairReport, RestoreRecoveryReport,
+    MaterializationRepairReport, RepairMode, RestoreRecoveryReport,
 };
 use yadorilink_local_storage::BlockStore;
 use yadorilink_root_authority::root_commit::RootLease;
@@ -93,6 +93,7 @@ pub(crate) fn repair_interrupted_materializations(
     root_lease: &Arc<RootLease>,
     root: &Path,
     group_id: &str,
+    mode: RepairMode,
 ) -> Result<MaterializationRepairReport, SyncError> {
     let op = root_lease.begin_operation()?;
     // See `reconcile_restore_operations` above for the same error-type note.
@@ -101,6 +102,7 @@ pub(crate) fn repair_interrupted_materializations(
         &crate::adapters::block_store_ports::BlockStorePortsAdapter::new(block_store.clone()),
         root,
         group_id,
+        mode,
         &op.permit(),
     )
     .map_err(SyncError::from)

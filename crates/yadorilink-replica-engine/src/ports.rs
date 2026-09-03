@@ -52,6 +52,25 @@ pub trait ChangeAdmissionPort: Send + Sync {
         change: &Change,
         versions: &[FileVersion],
     ) -> Result<AdmissionStoreResult, AdmissionStoreError>;
+
+    /// Bounded micro-batch sibling of [`Self::admit_unprojected_change`]:
+    /// admits every item in `items`, in order, returning one result per
+    /// item in the same order -- see `yadorilink_sync_sqlite::
+    /// ChangeHistoryRepository::dag_admit_change_batch_with_versions`'s own
+    /// doc comment for the exact per-item guarantees (atomicity, failure
+    /// isolation, ordering) a real implementation must preserve. Default
+    /// implementation just calls [`Self::admit_unprojected_change`] once
+    /// per item -- byte-identical behavior to before this method existed,
+    /// so any implementor that does not override it (today: the test fake
+    /// in `engine::tests`) keeps working unchanged. Only a real storage-
+    /// backed implementor needs to override this for the writer_gate
+    /// benefit; the port's own contract does not require it.
+    fn admit_unprojected_change_batch(
+        &self,
+        items: &[(&Change, &[FileVersion])],
+    ) -> Vec<Result<AdmissionStoreResult, AdmissionStoreError>> {
+        items.iter().map(|(change, versions)| self.admit_unprojected_change(change, versions)).collect()
+    }
 }
 
 pub struct AdmissionStoreResult {

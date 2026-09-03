@@ -60,7 +60,6 @@ use yadorilink_local_storage::FsBlockStore;
 // seconds retrying transient SQLite lock contention. Keep the assertion exact,
 // but give the same convergence budget as the other full-stack DAG tests.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(90);
-use yadorilink_transport::DeviceKeyPair;
 
 struct TestDevice {
     device_id: String,
@@ -77,8 +76,7 @@ struct TestDevice {
 }
 
 async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
-    let keypair = Arc::new(DeviceKeyPair::generate());
-    let device_id = support::register_device(account, name, keypair.public_bytes()).await;
+    let device_id = support::register_device(account, name, [0u8; 32]).await;
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
@@ -201,9 +199,11 @@ fn recursive_snapshot(root: &Path) -> HashMap<String, String> {
 /// event) only registers *future* watches into the newly-appeared
 /// subtree -- it does not walk the subtree and synthesize "here are the
 /// files already inside it" events. Nothing in the daemon's own link-runtime task wiring runs a
-/// periodic full local rescan either (only an ignore-file change or an
-/// event-count burst trigger a `BurstFallback` reconciliation scan, and a
-/// single directory rename is nowhere near that threshold).
+/// periodic full local rescan either (only an ignore-file change or a
+/// genuine watcher-channel overflow trigger a `RescanRequired`
+/// reconciliation scan — a large but fully-known event-count burst no
+/// longer does, see `debounce.rs`'s own doc comment — and a single
+/// directory rename is nowhere near either of those).
 ///
 /// The upshot: whether (and how) the renamed directory's *contents* ever
 /// propagate to the peer at all is a genuinely open question this test

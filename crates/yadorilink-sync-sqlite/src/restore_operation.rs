@@ -65,8 +65,8 @@ impl RestoreOperationRepository {
                   expected_current_version_seq, state, size,
                   mtime_unix_nanos, blocks_json, origin_device_id,
                   authoring_change_hash, created_at_unix_nanos,
-                  record_kind, symlink_target, symlink_out_of_root, exec_bit)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                  record_kind, symlink_target, symlink_out_of_root, unix_mode, xattrs_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 rusqlite::params![
                     operation.operation_id,
                     operation.group_id,
@@ -83,7 +83,8 @@ impl RestoreOperationRepository {
                     operation.meta.record_kind.as_db_str(),
                     operation.meta.symlink_target.as_deref(),
                     operation.meta.symlink_out_of_root,
-                    operation.meta.exec_bit,
+                    crate::file_index::encode_unix_mode_column(operation.meta.unix_mode),
+                    crate::file_index::encode_xattrs_column(&operation.meta.xattrs),
                 ],
             )?;
             Ok(())
@@ -134,8 +135,8 @@ impl RestoreOperationRepository {
                   expected_current_version_seq, state, size, mtime_unix_nanos,
                   blocks_json, origin_device_id,
                   authoring_change_hash, created_at_unix_nanos,
-                  record_kind, symlink_target, symlink_out_of_root, exec_bit)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                  record_kind, symlink_target, symlink_out_of_root, unix_mode, xattrs_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 rusqlite::params![
                     operation.operation_id,
                     operation.group_id,
@@ -152,7 +153,8 @@ impl RestoreOperationRepository {
                     operation.meta.record_kind.as_db_str(),
                     operation.meta.symlink_target.as_deref(),
                     operation.meta.symlink_out_of_root,
-                    operation.meta.exec_bit,
+                    crate::file_index::encode_unix_mode_column(operation.meta.unix_mode),
+                    crate::file_index::encode_xattrs_column(&operation.meta.xattrs),
                 ],
             )?;
             Ok(change_hash)
@@ -183,7 +185,7 @@ impl RestoreOperationRepository {
                 "SELECT operation_id, group_id, path, target_version_seq, state,
                         size, mtime_unix_nanos, blocks_json, origin_device_id,
                         expected_current_version_seq, authoring_change_hash,
-                        record_kind, symlink_target, symlink_out_of_root, exec_bit
+                        record_kind, symlink_target, symlink_out_of_root, unix_mode, xattrs_json
                  FROM restore_operations WHERE group_id = ?1
                  ORDER BY created_at_unix_nanos, operation_id",
             )?;
@@ -212,7 +214,7 @@ impl RestoreOperationRepository {
                     "SELECT operation_id, group_id, path, target_version_seq, state,
                             size, mtime_unix_nanos, blocks_json, origin_device_id,
                             expected_current_version_seq, authoring_change_hash,
-                            record_kind, symlink_target, symlink_out_of_root, exec_bit
+                            record_kind, symlink_target, symlink_out_of_root, unix_mode, xattrs_json
                      FROM restore_operations WHERE operation_id = ?1",
                     [operation_id],
                     restore_operation_from_row,
@@ -333,7 +335,16 @@ pub(crate) fn restore_operation_from_row(
             record_kind: RecordKind::from_db_str(&row.get::<_, String>(11)?),
             symlink_target: row.get(12)?,
             symlink_out_of_root: row.get(13)?,
-            exec_bit: row.get(14)?,
+            unix_mode: crate::file_index::decode_unix_mode_column(row.get(14)?),
+            xattrs: crate::file_index::decode_xattrs_column(&row.get::<_, String>(15)?).map_err(
+                |error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        15,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                },
+            )?,
         },
     })
 }

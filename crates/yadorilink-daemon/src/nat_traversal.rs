@@ -3,8 +3,8 @@
 //! each other without an operator-run relay.
 //!
 //! STUN (server-reflexive discovery) and router port mapping both run over the
-//! device's single shared UDP socket — the same socket every `PeerChannel`
-//! sends and receives WireGuard traffic on. That is what makes the discovered
+//! device's single shared UDP socket — the same socket every peer connection
+//! sends and receives QUIC traffic on. That is what makes the discovered
 //! candidates correct: a NAT mapping is tied to the exact local port packets
 //! left from, so the reflexive/port-mapped address a peer is told to dial is
 //! only reachable because the data answering it flows on that same binding.
@@ -95,6 +95,12 @@ pub async fn run(
         access_token,
         device_id,
         state.nat_candidates.clone(),
+        // Read once at task-spawn time: this flag is only ever set at
+        // daemon startup today (app.rs's own `YADORILINK_RELAY_CAPABLE`
+        // wiring), never toggled at runtime, so there is no live signal to
+        // react to yet. If that changes, this needs its own watch channel
+        // the same way `state.nat_candidates` already is one.
+        state.is_local_relay_capable(),
     );
 
     // All three run concurrently for the daemon's lifetime; the essential-
@@ -151,6 +157,7 @@ async fn report_candidates_on_change(
     access_token: String,
     device_id: String,
     mut candidates_rx: tokio::sync::watch::Receiver<Vec<Candidate>>,
+    relay_capable: bool,
 ) {
     loop {
         let candidates: Vec<EndpointCandidate> = {
@@ -165,6 +172,7 @@ async fn report_candidates_on_change(
             &access_token,
             device_id.clone(),
             &candidates,
+            relay_capable,
         )
         .await;
         if candidates_rx.changed().await.is_err() {

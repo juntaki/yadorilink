@@ -256,12 +256,34 @@ pub fn encoded_op_len(op: &Op) -> usize {
 /// by the initial import and the startup reconcile, the two paths that convert
 /// a bulk offline diff into a chain of changes. A change cannot be wire-split,
 /// so it must fit in one delivered message; the transport rejects any inbound
-/// message larger than `MAX_INBOUND_FRAGMENTS_PER_MESSAGE` (1024) *
-/// `MAX_FRAGMENT_PAYLOAD` (1200 B) ≈ 1.2 MiB. 256 KiB stays well under that —
-/// leaving ample room for the change's fixed header, parents, and signature —
-/// while a pathological run of very long paths is split into a chain rather
-/// than forming one change no wire message could ever carry.
+/// control frame larger than `yadorilink_transport::quic_peer_channel::
+/// MAX_CONTROL_FRAME_BYTES` (2 MiB). 256 KiB stays well under that — leaving
+/// ample room for the change's fixed header, parents, and signature, plus
+/// everything else sharing that same ceiling — while a pathological run of
+/// very long paths is split into a chain rather than forming one change no
+/// wire message could ever carry.
 pub const MAX_CHANGE_OP_BYTES: usize = 256 * 1024;
+
+/// Max encoded payload (changes plus the file versions they reference) packed
+/// into a single anti-entropy page.
+///
+/// Bounding each individual change (above) is not enough: a page carries many
+/// of them plus every referenced `FileVersion`, and the whole page goes out as
+/// ONE control frame. Sized purely by change COUNT, a page of even a handful of
+/// bulk initial-import changes runs past the transport's
+/// `yadorilink_transport::quic_peer_channel::MAX_CONTROL_FRAME_BYTES` (2 MiB)
+/// ceiling and the send fails outright -- and because anti-entropy re-derives
+/// the same delta on every retry, it fails identically forever: the receiver
+/// never gets that history at all. Observed on a 20k-file initial import as a
+/// repeating `message too large: 2854719 bytes` with the peer stuck at zero
+/// files.
+///
+/// 1 MiB leaves the frame roughly 2x headroom for its own envelope. A single
+/// change whose own payload exceeds this is still emitted alone on its own page
+/// rather than being dropped or wire-split -- a change is indivisible, so the
+/// bound can only ever be best-effort for that case, which is exactly why
+/// `MAX_CHANGE_OP_BYTES` keeps individual changes far below the ceiling.
+pub const MAX_ANTI_ENTROPY_PAGE_BYTES: usize = 1024 * 1024;
 
 /// Upper bound on how many operations a single synthesized initial-import or
 /// reconciliation change carries. A very large existing index (or a bulk

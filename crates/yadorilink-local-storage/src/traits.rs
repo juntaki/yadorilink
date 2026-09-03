@@ -1,5 +1,8 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::SystemTime;
+
+use sha2::{Digest, Sha256};
 
 use crate::error::StorageError;
 use crate::free_space::VolumeFreeSpace;
@@ -8,6 +11,93 @@ use crate::free_space::VolumeFreeSpace;
 /// stored blocks (per `local-storage` spec: "content-derived keys, not
 /// user-supplied paths").
 pub type ContentHash = String;
+
+/// The one place block bytes get SHA-256'd for `ContentHash` purposes —
+/// `FsBlockStore::put`/`hash_bytes` and `LocallyHashedBlock::from_bytes`
+/// both call this, so there is exactly one hash implementation to keep in
+/// sync, not two that could silently drift.
+pub fn hash_block_bytes(data: &[u8]) -> ContentHash {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
+
+/// A block this process hashed itself, from bytes it holds directly — the
+/// only ways to construct one are [`from_bytes`](Self::from_bytes) and
+/// [`from_arc_bytes`](Self::from_arc_bytes), which differ only in how the
+/// caller hands over ownership of the buffer and both hash fresh, so a
+/// `LocallyHashedBlock` is always a genuine `(hash, bytes)` pair a caller
+/// cannot spoof by pairing a real hash with different bytes (or vice
+/// versa) through this type's public surface.
+///
+/// M6-2B1.1: exists to hash a freshly-chunked block exactly ONCE and feed
+/// that single `(hash, bytes)` pair to every downstream consumer that
+/// needs it (a per-block callback, `BlockStore::put_prepared`'s
+/// durable commit, `BlockInfo`'s own hash field) — before this type
+/// existed, `chunker.rs`'s CDC loop only had `BlockStore::put`, which
+/// always hashes internally as part of committing, forcing a caller that
+/// needs the hash before that commit finishes (M6-2B1's speculative
+/// a callback) into hashing the same bytes a second time, or serializing
+/// entirely behind the durable commit's own fsync latency. See
+/// `chunk_file_content_defined_with_callback`'s own doc comment for the
+/// real, measured cost this closes.
+///
+/// This type is deliberately NOT constructible from peer-supplied/wire
+/// data — `bytes` field holds content only THIS process has hashed
+/// itself, fresh, in `from_bytes`. Wire-received bytes with a
+/// peer-claimed hash must keep going through the existing independent
+/// verify-then-trust path (this crate's `BlockStore::put`, which
+/// re-derives the hash from the bytes rather than trusting a caller's
+/// claim) — never through this type, which has no verification step of
+/// its own precisely because it doesn't need one: it only ever sees bytes
+/// this process already possesses and hashes on the spot.
+#[derive(Clone)]
+pub struct LocallyHashedBlock {
+    hash: ContentHash,
+    bytes: Arc<[u8]>,
+}
+
+impl LocallyHashedBlock {
+    /// Hashes `bytes` once, right now, and pairs the result with them.
+    /// Like `from_arc_bytes`, there is no way here to build a
+    /// `LocallyHashedBlock` from a hash this process did not just compute
+    /// itself from these exact bytes.
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self::from_arc_bytes(Arc::from(bytes))
+    }
+
+    /// `from_bytes` for a caller that can already produce an `Arc<[u8]>`
+    /// directly — copying a slice straight into the shared allocation
+    /// this type stores, rather than into a `Vec` that `from_bytes` must
+    /// then copy a second time (`Arc<[u8]>: From<Vec<u8>>` reallocates,
+    /// because a `Vec`'s allocation has no room for the refcount header).
+    /// For a 2 MiB block off the wire that second copy is not free.
+    ///
+    /// This weakens nothing: the hash is still computed here, by this
+    /// process, from exactly the bytes being stored, and the caller has
+    /// no way to supply one. `Arc<[u8]>` is immutable, so the bytes
+    /// cannot change out from under the hash afterwards either.
+    pub fn from_arc_bytes(bytes: Arc<[u8]>) -> Self {
+        let hash = hash_block_bytes(&bytes);
+        Self { hash, bytes }
+    }
+
+    pub fn hash(&self) -> &ContentHash {
+        &self.hash
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// A cheap (refcount-bump, not a data copy) handle to the same
+    /// underlying bytes — for a second consumer (e.g. a per-block callback)
+    /// that needs its own owned reference without paying for another
+    /// deep copy of a potentially large block.
+    pub fn bytes_arc(&self) -> Arc<[u8]> {
+        Arc::clone(&self.bytes)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StorageUsage {
@@ -29,6 +119,45 @@ pub trait BlockStore: Send + Sync {
     /// hash already exists is a no-op that still returns the same hash
     /// (identical content is stored once).
     fn put(&self, data: &[u8]) -> Result<ContentHash, StorageError>;
+
+    /// Same effect as `put`, but for a block this caller already hashed
+    /// itself (`LocallyHashedBlock`) — skips re-deriving the hash from
+    /// `data`, so a caller that needs the hash before committing (e.g. to
+    /// hand it to a callback concurrently with the commit) never pays
+    /// for hashing the same bytes twice. The default implementation just
+    /// calls `put` and discards its returned hash (recomputing it, same
+    /// as before this method existed) — correct for any implementor that
+    /// hasn't overridden this, just not the performance win a real
+    /// override (like `FsBlockStore`'s) provides. Discards the hash
+    /// `LocallyHashedBlock` already carries in its default form
+    /// specifically so implementors are never tempted to trust it
+    /// unverified in a context where that would be unsafe; an override
+    /// that skips re-hashing is an explicit, audited opt-in per
+    /// implementor, not something a generic default should do quietly.
+    fn put_prepared(&self, prepared: &LocallyHashedBlock) -> Result<(), StorageError> {
+        self.put(prepared.bytes()).map(|_| ())
+    }
+
+    /// M6-2B2: commits every block in `prepared` as one bulk-durability
+    /// batch instead of `prepared.len()` independent commits — see
+    /// `FsBlockStore::begin_bulk_ingest`/`BulkIngest`'s own doc comment
+    /// for the `staged -> durable -> authoritative` contract a real
+    /// override provides (bounded-concurrency file writes, one shard-
+    /// directory sync per distinct touched shard instead of one per
+    /// block, batch-granularity headroom/usage accounting). The default
+    /// implementation here is exactly what calling `put_prepared` once
+    /// per block, in order, already does — correct for any implementor
+    /// that hasn't overridden this (same fallback shape `put_prepared`
+    /// itself established), just without the durability-barrier-
+    /// coalescing performance win a real per-implementor override (like
+    /// `FsBlockStore`'s) provides. Stops at the first error, same as a
+    /// plain per-block loop would.
+    fn put_prepared_batch(&self, prepared: &[LocallyHashedBlock]) -> Result<(), StorageError> {
+        for block in prepared {
+            self.put_prepared(block)?;
+        }
+        Ok(())
+    }
 
     /// Reads back a block by hash, verifying its checksum. Returns
     /// `StorageError::ChecksumMismatch` if the stored bytes don't hash to

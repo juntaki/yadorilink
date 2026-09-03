@@ -18,9 +18,14 @@ pub struct DeviceConfig {
     /// daemon. The top-level field is required; `NatConfig` itself still uses
     /// defaults so a user can edit only the settings they want to override.
     pub nat: NatConfig,
-    /// Base64-encoded public half of the registered WireGuard/X25519 identity.
+    /// Base64-encoded copy of the registered Ed25519 signing key, stored a
+    /// second time under the field name the coordination plane's
+    /// registration schema still requires for its retired transport-key
+    /// column -- see `commands::device::http::register_device`'s own doc
+    /// comment for why the same key is sent under both names.
     pub wireguard_public_key: String,
-    /// Base64-encoded public half of the registered Ed25519 change-signing key.
+    /// Base64-encoded public half of the registered Ed25519 change-signing
+    /// key -- this device's one real key.
     pub signing_public_key: String,
     /// Exact development config shape. Pre-release builds intentionally do not
     /// migrate older `device.json` revisions; a mismatch must be recreated by

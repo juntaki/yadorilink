@@ -50,7 +50,7 @@ const SIGNATURE_LEN: usize = 64;
 const SERVICE_KEY_LEN: usize = 32;
 
 /// A short-lived, coordination-plane-signed capability: `relay_device_id`
-/// may forward opaque WireGuard datagrams between `source_device_id` and
+/// may forward opaque QUIC datagrams between `source_device_id` and
 /// `destination_device_id`, both members of `group_id`, from `not_before_
 /// unix` until `expires_at_unix`. See this module's own doc comment for
 /// what this does and does not authorize.
@@ -228,6 +228,61 @@ mod tests {
 
     fn other_service_key() -> SigningKey {
         SigningKey::from_bytes(&[11u8; 32])
+    }
+
+    /// Cross-implementation golden vector (P0-A): `coordination-worker`'s
+    /// `canonicalRelayGrantSigningBytes` (src/relay/service.ts) MUST produce
+    /// this exact byte sequence for the identical inputs -- asserted there
+    /// too, in `test/relay-grant.test.ts`. Without this, the HTTP wiring
+    /// between the two can be entirely correct while every issued grant
+    /// still fails signature verification on the relay (B) side, because
+    /// the bytes actually signed over silently disagree between the two
+    /// independent implementations.
+    #[test]
+    fn matches_the_cross_implementation_golden_signing_bytes_vector() {
+        let grant = RelayGrant {
+            version: 1,
+            grant_id: "g1".to_string(),
+            group_id: "g".to_string(),
+            source_device_id: "a".to_string(),
+            relay_device_id: "b".to_string(),
+            destination_device_id: "c".to_string(),
+            not_before_unix: 1000,
+            expires_at_unix: 1060,
+            max_session_bytes: None,
+            signature: Vec::new(),
+        };
+        let bytes = signing_bytes(&grant);
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "796c72656c61793100000001000000026731000000016700000001610000000162000000016300000000000003e8000000000000042400"
+        );
+    }
+
+    /// Same cross-implementation contract, exercising the `Some(bytes)`
+    /// arm of `max_session_bytes`'s encoding -- the golden vector above
+    /// only covers `None`.
+    #[test]
+    fn matches_the_cross_implementation_golden_signing_bytes_vector_with_max_session_bytes() {
+        let grant = RelayGrant {
+            version: 1,
+            grant_id: "g1".to_string(),
+            group_id: "g".to_string(),
+            source_device_id: "a".to_string(),
+            relay_device_id: "b".to_string(),
+            destination_device_id: "c".to_string(),
+            not_before_unix: 1000,
+            expires_at_unix: 1060,
+            max_session_bytes: Some(65536),
+            signature: Vec::new(),
+        };
+        let bytes = signing_bytes(&grant);
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "796c72656c61793100000001000000026731000000016700000001610000000162000000016300000000000003e80000000000000424010000000000010000"
+        );
     }
 
     fn valid_grant(key: &SigningKey, now: i64) -> RelayGrant {

@@ -31,7 +31,6 @@ use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeCo
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::sync_error::SyncError;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_transport::DeviceKeyPair;
 
 struct TestDevice {
     device_id: String,
@@ -46,8 +45,7 @@ struct TestDevice {
 }
 
 async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
-    let keypair = Arc::new(DeviceKeyPair::generate());
-    let device_id = support::register_device(account, name, keypair.public_bytes()).await;
+    let device_id = support::register_device(account, name, [0u8; 32]).await;
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();

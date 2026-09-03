@@ -31,7 +31,7 @@ use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
 /// Heads-announce re-drive cadence. The `run()` loop's periodic frontier
 /// audit re-sends an idempotent `HeadsAnnounce` every
-/// `full_index_resync_interval`; the migrated scenarios shorten it far below
+/// `maintenance_reconcile_interval`; the migrated scenarios shorten it far below
 /// the 90s production default so DAG catch-up stays prompt under packet loss
 /// and heals quickly after a partition window. A test-harness measure (the
 /// production periodic is unchanged), analogous to the scenarios' own short
@@ -147,7 +147,7 @@ pub fn wire_dag_session(
     // site) is re-driven on this cadence and rides through packet loss / a
     // partition window. A test-harness measure; the production periodic is
     // unchanged.
-    session.set_full_index_resync_interval(HEADS_ANNOUNCE_CADENCE);
+    session.set_maintenance_reconcile_interval(HEADS_ANNOUNCE_CADENCE);
     // Under the current protocol a `BlockRequest` with no engine installed
     // fails closed.
     session.set_block_serve_engine(BlockServeEngine::new(u64::MAX, u64::MAX, u64::MAX, 1_000));

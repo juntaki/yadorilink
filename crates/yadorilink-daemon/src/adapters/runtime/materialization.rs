@@ -4,9 +4,13 @@ use std::sync::Arc;
 
 use crate::sync_error::SyncError;
 
-use crate::application::ports::{BoxFuture, EvictOutcome, MaterializationPort};
+use crate::application::ports::{
+    BoxFuture, EvictOutcome, MaterializationPort, MaterializationStateSummary,
+    MaterializationStatusSummary,
+};
 use crate::daemon_state::DaemonState;
 use crate::hydration;
+use yadorilink_replica_domain::session_state::MaterializationState;
 
 pub(crate) struct DaemonMaterializationAdapter {
     state: Arc<DaemonState>,
@@ -45,5 +49,23 @@ impl MaterializationPort for DaemonMaterializationAdapter {
             blocks_reclaimed: outcome.blocks_reclaimed,
             bytes_reclaimed: outcome.bytes_reclaimed,
         })
+    }
+
+    fn status(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<MaterializationStatusSummary>, SyncError> {
+        Ok(hydration::materialization_status(&self.state, group_id, path)?.map(|info| {
+            MaterializationStatusSummary {
+                state: match info.state {
+                    MaterializationState::Hydrated => MaterializationStateSummary::Hydrated,
+                    MaterializationState::Placeholder => MaterializationStateSummary::Placeholder,
+                    MaterializationState::Hydrating => MaterializationStateSummary::Hydrating,
+                    MaterializationState::Evicting => MaterializationStateSummary::Evicting,
+                },
+                pinned: info.pinned,
+            }
+        }))
     }
 }

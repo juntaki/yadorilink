@@ -116,8 +116,8 @@ impl MaterializationStatePort for ReplicaCoordinator {
         self.dirty_path_repository().is_path_dirty(group_id, path)
     }
 
-    fn get_exec_bit(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError> {
-        self.file_index_repository().get_exec_bit(group_id, path)
+    fn get_unix_mode(&self, group_id: &str, path: &str) -> Result<Option<u32>, SyncSqliteError> {
+        self.file_index_repository().get_unix_mode(group_id, path)
     }
 
     fn list_evictable_files(&self, group_id: &str) -> Result<Vec<EvictableFile>, SyncSqliteError> {
@@ -149,7 +149,7 @@ impl MaterializationStatePort for ReplicaCoordinator {
         group_id: &str,
         path: &str,
     ) -> Result<bool, SyncSqliteError> {
-        self.materialization_job_repository().has_materialization_intent(group_id, path)
+        self.materialization_intent_repository().has_materialization_intent(group_id, path)
     }
 
     fn clear_materialization_intent(
@@ -158,7 +158,7 @@ impl MaterializationStatePort for ReplicaCoordinator {
         path: &str,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.materialization_job_repository().clear_materialization_intent(group_id, path, permit)
+        self.materialization_intent_repository().clear_materialization_intent(group_id, path, permit)
     }
 
     fn begin_materialization_intent(
@@ -168,7 +168,7 @@ impl MaterializationStatePort for ReplicaCoordinator {
         target_version_hash: &[u8],
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.materialization_job_repository().begin_materialization_intent(
+        self.materialization_intent_repository().begin_materialization_intent(
             group_id,
             path,
             target_version_hash,
@@ -192,6 +192,7 @@ impl MaterializationStatePort for ReplicaCoordinator {
         path: &str,
         device_id: &str,
         observed_at_unix_nanos: i64,
+        publish_absent_proof: bool,
         emitter: &ChangeEmitter,
         permit: &RootCommitPermit<'_>,
     ) -> Result<ChangeHash, SyncSqliteError> {
@@ -201,6 +202,7 @@ impl MaterializationStatePort for ReplicaCoordinator {
             path,
             device_id,
             observed_at_unix_nanos,
+            publish_absent_proof,
             yadorilink_sync_sqlite::file_index::ChangeEmissionContext { emitter, permit, auth },
         )
     }
@@ -229,14 +231,14 @@ impl MaterializationStatePort for ReplicaCoordinator {
         self.dirty_path_repository().list_dirty_paths(group_id)
     }
 
-    fn set_exec_bit(
+    fn set_unix_mode(
         &self,
         group_id: &str,
         path: &str,
-        exec_bit: bool,
+        unix_mode: Option<u32>,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.file_index_repository().set_exec_bit(group_id, path, exec_bit, permit)
+        self.file_index_repository().set_unix_mode(group_id, path, unix_mode, permit)
     }
 
     fn set_pinned(&self, group_id: &str, path: &str, pinned: bool) -> Result<(), SyncSqliteError> {

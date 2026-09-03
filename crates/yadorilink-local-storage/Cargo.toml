@@ -41,6 +41,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
 ] }
 
+# `chunker::read_replicated_xattrs`'s raw `listxattr`/`getxattr` calls on
+# Linux (C1.2a) -- already a workspace dependency elsewhere (e.g.
+# yadorilink-filesystem-sync, yadorilink-root-authority), not a new one.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 # `chunker`'s CDC tests need pseudo-random content (real byte entropy

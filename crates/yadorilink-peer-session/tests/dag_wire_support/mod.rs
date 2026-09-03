@@ -174,9 +174,10 @@ impl DagProducer {
             size as u64,
             FileMeta {
                 mtime_unix_nanos,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         );
         let op = Op::Put {
@@ -203,6 +204,7 @@ impl DagProducer {
                     versions: std::slice::from_ref(&version),
                 },
                 None,
+                None,
                 yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
                     emitter: &self.emitter,
                     permit: &RootCommitPermit::for_tests(),
@@ -213,8 +215,8 @@ impl DagProducer {
     }
 
     /// Commits an empty (zero-block) file `Create`. The receiving peer needs no
-    /// `BlockRequest` to materialize it, so — unlike [`commit_create`] — this
-    /// one never blocks on a `BlockResponse`. That makes it usable as an
+    /// block request to materialize it, so — unlike [`commit_create`] — this
+    /// one never blocks on a block response. That makes it usable as an
     /// interleaved control signal: a message whose arrival at the index proves
     /// the receiver actually dequeued and handled it.
     pub fn commit_create_empty(
@@ -228,9 +230,10 @@ impl DagProducer {
             0,
             FileMeta {
                 mtime_unix_nanos,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         );
         let op = Op::Put {
@@ -255,6 +258,7 @@ impl DagProducer {
                     versions: std::slice::from_ref(&version),
                 },
                 None,
+                None,
                 yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
                     emitter: &self.emitter,
                     permit: &RootCommitPermit::for_tests(),
@@ -268,7 +272,7 @@ impl DagProducer {
     /// emitted, for a scenario that must inject changes into a peer *by hand*
     /// rather than through a `PeerSyncSession`'s own heads-announce loop —
     /// e.g. one that has to control exactly when (or whether) it answers the
-    /// resulting `BlockRequest`s. Reads back the group's current head, which
+    /// resulting block requests. Reads back the group's current head, which
     /// `commit_create` just advanced to the change it emitted.
     ///
     /// One batch per call, deliberately: a caller wanting N changes to occupy N
@@ -290,9 +294,8 @@ impl DagProducer {
         proto::ChangeBatch {
             folder_group_id: group_id.to_string(),
             changes: vec![change.to_wire_bytes()],
-            compression: proto::Compression::None as i32,
-            compressed_changes: Vec::new(),
             file_versions: vec![version.canonical_encoding()],
+            more: false,
         }
     }
 
@@ -313,9 +316,10 @@ impl DagProducer {
             content.len() as u64,
             FileMeta {
                 mtime_unix_nanos,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         );
         (record, version)

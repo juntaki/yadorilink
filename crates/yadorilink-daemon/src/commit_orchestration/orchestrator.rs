@@ -414,7 +414,7 @@ pub struct PlacementIo<'a> {
     pub live_name: OsString,
     pub prepare_inputs: PlacementInputs<'a>,
     pub expected_content_hash: Option<[u8; 32]>,
-    pub exec_bit: Option<bool>,
+    pub unix_mode: Option<u32>,
     pub object_kind: MaterializedObjectKind,
     pub version: Option<VersionHash>,
     pub causal_basis: Vec<ChangeHash>,
@@ -1001,7 +1001,7 @@ pub(crate) fn run_slice_unchecked(
             artefact_id,
             inputs: io.prepare_inputs,
             expected_content_hash: io.expected_content_hash,
-            exec_bit: io.exec_bit,
+            unix_mode: io.unix_mode,
         };
         let prepare_result =
             yadorilink_filesystem_sync::optimistic_placement::prepare_target(&prepare_request);
@@ -2076,7 +2076,7 @@ mod tests {
                 capabilities,
             },
             expected_content_hash: None,
-            exec_bit: None,
+            unix_mode: None,
             object_kind: MaterializedObjectKind::RegularFile,
             version: Some(version),
             causal_basis: Vec::new(),

@@ -21,6 +21,9 @@ pub enum ReportingStorageError {
 
     #[error("reporting storage entry not found: {0}")]
     NotFound(String),
+
+    #[error("invalid report id: {0}")]
+    InvalidEntryId(String),
 }
 
 pub type ReportingResult<T> = Result<T, ReportingStorageError>;

@@ -24,17 +24,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-06-30
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ${{ matrix.os }}-public-ci
 
@@ -113,17 +113,17 @@ jobs:
   shell-ext-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-06-30
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: shell-ext/windows
 
@@ -146,17 +146,17 @@ jobs:
       matrix:
         crate: [core, fileprovider-core]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-06-30
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: shell-ext/macos/${{ matrix.crate }}
 
@@ -175,24 +175,24 @@ jobs:
   cargo-audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-06-30
-      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
+      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
       - name: Audit
         run: cargo audit
 
   linux-artifacts:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-06-30
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ubuntu-release
 
@@ -250,15 +250,15 @@ jobs:
   windows-build-health:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-06-30
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: windows-release
 
@@ -319,10 +319,10 @@ jobs:
     runs-on: windows-latest
     environment: release-signing
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Download unsigned Windows build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: yadorilink-windows-build-health
           path: unsigned
@@ -335,7 +335,7 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-06-30
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
 
       - name: Require and import code-signing certificate
         shell: pwsh
@@ -375,6 +375,48 @@ jobs:
             -ShellExtDir release-input -Release `
             -SignToolName yadorilink -SignToolCommand $signCmd
 
+      - name: Package signed Windows binary archive
+        shell: pwsh
+        env:
+          YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+        run: |
+          # `build-installer.ps1 -Release` (previous step) just rebuilt the
+          # whole workspace with the `enforce-release-trust-root` feature
+          # into `target\release`. This archive must ship those binaries,
+          # not the ones from the unsigned build-health job downloaded
+          # above -- an ordinary build's daemon still pins the forgeable
+          # development update-manifest trust root, so a real user running
+          # `yadorilink-daemon.exe` straight from this archive (never
+          # through the installer) needs the same enforced binary the
+          # installer bundles, not merely the same zip filename.
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
+          New-Item -ItemType Directory -Force -Path signed-bin | Out-Null
+          Copy-Item target\release\yadorilink.exe,
+                    target\release\yadorilink-daemon.exe,
+                    target\release\yadorilink-status-app.exe -Destination signed-bin
+          # The shell extension isn't part of this workspace and carries no
+          # update-manifest trust root of its own (see shell-ext/windows's
+          # separate build in this workflow) -- reusing the build-health
+          # job's copy here is not a trust-root regression.
+          Copy-Item release-input\yadorilink_shell_ext.dll,
+                    release-input\yadorilink-cfapi-host.exe -Destination signed-bin
+          # Cheap positive confirmation this binary was genuinely built
+          # with the enforced, real trust root: this build's actual
+          # configured public key hex must be present in the binary. NOT
+          # the inverse (checking the placeholder's absence) -- the
+          # placeholder hex also appears unconditionally in a runtime
+          # error-message string this same binary carries regardless of
+          # which key is compiled in, so its mere absence proves nothing.
+          # This is a backstop against a misconfigured build, not the
+          # primary mechanism -- see manifest.rs's own compile-time gate
+          # for that.
+          if (-not (Select-String -Path signed-bin\yadorilink-daemon.exe -Pattern $env:YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX -SimpleMatch -Quiet)) {
+            throw "yadorilink-daemon.exe does not contain the configured update-manifest trust root -- it was not built with enforce-release-trust-root and the real key"
+          }
+          $zipPath = "yadorilink-$version-windows-x86_64-binaries.zip"
+          Compress-Archive -Path signed-bin\* -DestinationPath $zipPath -Force
+          py -3 scripts/ci/generate-release-checksums.py --sidecars $zipPath
+
       - name: Verify and collect signed Windows artifacts
         shell: pwsh
         run: |
@@ -389,7 +431,7 @@ jobs:
 
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"$').Matches[0].Groups[1].Value
           New-Item -ItemType Directory -Force -Path release/windows | Out-Null
-          Copy-Item unsigned/yadorilink-*-windows-x86_64-binaries.zip release/windows
+          Copy-Item "yadorilink-$version-windows-x86_64-binaries.zip", "yadorilink-$version-windows-x86_64-binaries.zip.sha256" release/windows
           Copy-Item $exe, "$exe.sha256" release/windows
           $archive = Get-ChildItem release/windows -Filter 'yadorilink-*-windows-x86_64-binaries.zip' | Select-Object -First 1
           py -3 scripts/ci/generate-release-checksums.py --out release/windows/SHA256SUMS $archive.FullName release/windows/yadorilink-setup.exe
@@ -412,15 +454,15 @@ jobs:
   macos-build-health:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-06-30
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: macos-release
 
@@ -465,15 +507,15 @@ jobs:
     runs-on: macos-latest
     environment: release-signing
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-06-30
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: macos-release-signed
 
@@ -550,6 +592,46 @@ jobs:
           YADORILINK_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
         run: ./installer/macos/build-pkg.sh
 
+      - name: Package binary archive from the trust-root-enforced build
+        env:
+          YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX: ${{ vars.RELEASE_MANIFEST_PUBLIC_KEY_HEX }}
+        run: |
+          set -euo pipefail
+          # build-pkg.sh (previous step, YADORILINK_RELEASE_BUILD=1) just
+          # rebuilt the workspace with the `enforce-release-trust-root`
+          # feature into target/release. This archive must ship those
+          # binaries, not the ones from the unsigned build-health job --
+          # an ordinary build's daemon still pins the forgeable development
+          # update-manifest trust root, so a real user running
+          # yadorilink-daemon straight from this archive (never through the
+          # .pkg) needs the same enforced binary the .pkg bundles.
+          version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          arch="$(uname -m)"
+          mkdir -p release/macos/bin
+          cp target/release/yadorilink \
+             target/release/yadorilink-daemon \
+             target/release/yadorilink-status-app \
+             release/macos/bin/
+          # Cheap positive confirmation this binary was genuinely built
+          # with the enforced, real trust root: this build's actual
+          # configured public key hex must be present in the binary. NOT
+          # the inverse (checking the placeholder's absence) -- the
+          # placeholder hex also appears unconditionally in a runtime
+          # error-message string this same binary carries regardless of
+          # which key is compiled in, so its mere absence proves nothing.
+          # This is a backstop against a misconfigured build, not the
+          # primary mechanism -- see manifest.rs's own compile-time gate
+          # for that.
+          if ! grep -a -q "$YADORILINK_RELEASE_MANIFEST_PUBLIC_KEY_HEX" release/macos/bin/yadorilink-daemon; then
+            echo "yadorilink-daemon does not contain the configured update-manifest trust root -- it was not built with enforce-release-trust-root and the real key" >&2
+            exit 1
+          fi
+          tar -C release/macos -czf "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz" bin
+          rm -rf release/macos/bin
+          python3 scripts/ci/generate-release-checksums.py \
+            --sidecars \
+            "release/macos/yadorilink-${version}-macos-${arch}-binaries.tar.gz"
+
       - name: Collect and verify the signed .pkg
         run: |
           set -euo pipefail
@@ -562,7 +644,8 @@ jobs:
           cp "$pkg" "$pkg.sha256" release/macos/
           python3 scripts/ci/generate-release-checksums.py \
             --out release/macos/SHA256SUMS \
-            "release/macos/yadorilink-${version}.pkg"
+            "release/macos/yadorilink-${version}.pkg" \
+            release/macos/yadorilink-*-macos-*-binaries.tar.gz
 
       - name: Tear down signing material
         if: always()
@@ -597,10 +680,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Download build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: release-assets
 
@@ -610,13 +693,16 @@ jobs:
           mkdir -p dist
           find release-assets/yadorilink-linux-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
           find release-assets/yadorilink-windows-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
-          find release-assets/yadorilink-macos-build-health -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
+          # macos-artifacts (not macos-build-health) is now the sole source
+          # of the published macOS binary archive: it is rebuilt with the
+          # enforce-release-trust-root feature, matching the .pkg it ships
+          # alongside. macos-build-health's tar.gz stays CI-internal
+          # (that job's own README.txt already documents this), never
+          # copied into a real release.
           find release-assets/yadorilink-macos-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
           cp release-assets/yadorilink-linux-artifacts/SHA256SUMS dist/SHA256SUMS-linux
           cp release-assets/yadorilink-windows-artifacts/SHA256SUMS dist/SHA256SUMS-windows
-          cat release-assets/yadorilink-macos-build-health/SHA256SUMS \
-              release-assets/yadorilink-macos-artifacts/SHA256SUMS \
-              > dist/SHA256SUMS-macos
+          cp release-assets/yadorilink-macos-artifacts/SHA256SUMS dist/SHA256SUMS-macos
           cp dist/yadorilink-*-linux-x86_64-binaries.tar.gz dist/yadorilink-linux-x86_64.tar.gz
           cp dist/yadorilink_*_amd64.deb dist/yadorilink-linux-amd64.deb
           cp dist/yadorilink-*-windows-x86_64-binaries.zip dist/yadorilink-windows-x86_64.zip
@@ -683,6 +769,15 @@ jobs:
               --target "$GITHUB_SHA"
           fi
 
+          # README.txt was only ever produced by macos-build-health's tar.gz,
+          # which stopped being published here once macos-artifacts became
+          # the source of the macOS archive -- `gh release upload --clobber`
+          # only adds/overwrites, it never removes an asset that stops being
+          # generated, so a rolling release like `nightly` would otherwise
+          # keep serving this stale, now-inaccurate file forever. Safe to run
+          # every time: a no-op once the asset is already gone.
+          gh release delete-asset nightly README.txt --yes || true
+
           gh release upload nightly dist/* --clobber
 
       - name: Build manifest signer
@@ -747,7 +842,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Resolve tag and enforce immutability
         id: tag
@@ -819,7 +914,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Download build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: release-assets
 
@@ -829,7 +924,9 @@ jobs:
           mkdir -p dist
           find release-assets/yadorilink-linux-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
           find release-assets/yadorilink-windows-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
-          find release-assets/yadorilink-macos-build-health -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
+          # macos-artifacts (not macos-build-health) is the sole source of
+          # the published macOS binary archive -- see the matching comment
+          # in the nightly-release job's Flatten step.
           find release-assets/yadorilink-macos-artifacts -maxdepth 1 -type f ! -name 'SHA256SUMS' -exec cp {} dist/ \;
           cp dist/yadorilink-*-linux-x86_64-binaries.tar.gz dist/yadorilink-linux-x86_64.tar.gz
           cp dist/yadorilink_*_amd64.deb dist/yadorilink-linux-amd64.deb

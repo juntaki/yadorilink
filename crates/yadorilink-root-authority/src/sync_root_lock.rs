@@ -157,7 +157,14 @@ fn verify_sidecar_identity(root: &Path, expected: FileIdentity) -> Result<(), Ro
             ),
         ))
     })?;
-    let granularity = crate::fs_capabilities::probe_birth_time_granularity(root);
+    // Cached, not the raw probe: this function is reached from
+    // `RootLease::begin_operation`, which runs on essentially every local
+    // capture, materialize, and hydration operation -- an uncached probe
+    // here re-pays real file-create/stat/unlink I/O, inside the very sync
+    // root the filesystem watcher is watching, on every single call. See
+    // `cached_probe_birth_time_granularity`'s own doc for the C4 live-burst
+    // measurement that found this.
+    let granularity = crate::fs_capabilities::cached_probe_birth_time_granularity(root);
     match expected.compare(&current, granularity) {
         crate::fs_identity::IdentityComparison::SameObject => Ok(()),
         crate::fs_identity::IdentityComparison::DefinitelyDifferent => {
@@ -849,6 +856,40 @@ mod tests {
         let owner = SyncRootLock::acquire(&root).unwrap();
 
         owner.verify_still_owns().expect("nothing changed -- must still confirm ownership");
+    }
+
+    /// C4 live-burst attribution fix (2026-09-01): proves the real call
+    /// chain -- not just the pure caching decision
+    /// `granularity_cache_reprobes_on_a_different_volume_identity_but_not_
+    /// the_same_one` in `fs_capabilities.rs` already covers -- actually
+    /// stops re-probing. `RootLease::begin_operation` and every
+    /// `LinkOperation::reverify()` (i.e. every `RootCommitPermit::verify()`
+    /// along one operation's path) reach `verify_still_owns` repeatedly;
+    /// before this fix, each call paid a full uncached
+    /// `probe_birth_time_granularity` (real file-create/stat/unlink I/O).
+    /// Confirmed genuinely RED against the pre-fix code (temporarily
+    /// reverting `verify_sidecar_identity` to call the raw, uncached probe):
+    /// this test's second assertion then failed, the count having grown by
+    /// 2 instead of staying flat.
+    #[test]
+    fn repeated_verify_still_owns_calls_probe_at_most_once_per_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let owner = SyncRootLock::acquire(&root).unwrap();
+
+        owner.verify_still_owns().expect("first call must succeed");
+        let count_after_first = crate::fs_capabilities::probe_birth_time_granularity_call_count_for_test();
+
+        owner.verify_still_owns().expect("second call must succeed");
+        owner.verify_still_owns().expect("third call must succeed");
+        let count_after_more = crate::fs_capabilities::probe_birth_time_granularity_call_count_for_test();
+
+        assert_eq!(
+            count_after_more, count_after_first,
+            "repeated verify_still_owns calls for the same volume must not trigger additional \
+             real granularity probes -- only the first call (or a genuine cache miss on a \
+             different volume) may"
+        );
     }
 
     /// THE double-acquisition bug an independent review found: `flock` is

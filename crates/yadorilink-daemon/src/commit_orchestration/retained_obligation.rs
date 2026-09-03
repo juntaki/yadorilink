@@ -504,7 +504,7 @@ mod tests {
     /// hand-built subset of `index.rs`'s real schema, but wide enough to
     /// exercise `verify_durable_representation`'s content-derived leg 2:
     /// `blocks_json`/`size`/`mtime_unix_nanos`/`record_kind`/
-    /// `symlink_target`/`exec_bit` are exactly the columns
+    /// `symlink_target`/`unix_mode` are exactly the columns
     /// `FileVersion::from_index_row` re-derives a version identity from.
     fn create_test_files_table(conn: &Connection) {
         conn.execute_batch(
@@ -518,7 +518,8 @@ mod tests {
                 mtime_unix_nanos    INTEGER NOT NULL DEFAULT 0,
                 record_kind         TEXT NOT NULL DEFAULT 'file',
                 symlink_target      BLOB,
-                exec_bit            INTEGER NOT NULL DEFAULT 0
+                unix_mode            INTEGER NOT NULL DEFAULT 0,
+                xattrs_json         TEXT NOT NULL DEFAULT '[]'
             );",
         )
         .unwrap();
@@ -582,9 +583,10 @@ mod tests {
             4,
             FileMeta {
                 mtime_unix_nanos: 1,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         );
         dag_store::put_file_version(conn, group_id, &version).unwrap();
@@ -618,8 +620,8 @@ mod tests {
         conn.execute(
             "INSERT INTO files \
              (group_id, path, deleted, authoring_change_hash, blocks_json, size, \
-              mtime_unix_nanos, record_kind, symlink_target, exec_bit) \
-             VALUES (?1, 'a/b.txt', 0, ?2, ?3, 4, 1, 'file', NULL, 0)",
+              mtime_unix_nanos, record_kind, symlink_target, unix_mode) \
+             VALUES (?1, 'a/b.txt', 0, ?2, ?3, 4, 1, 'file', NULL, -1)",
             rusqlite::params![group_id, &hash.0[..], blocks_json],
         )
         .unwrap();
@@ -803,9 +805,10 @@ mod tests {
             4,
             FileMeta {
                 mtime_unix_nanos: 1,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         );
         dag_store::put_file_version(&conn, "g", &version).unwrap();
@@ -851,9 +854,10 @@ mod tests {
             4,
             FileMeta {
                 mtime_unix_nanos: 1,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         );
         dag_store::put_file_version(&conn, "g", &version).unwrap();

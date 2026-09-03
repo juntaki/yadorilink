@@ -59,8 +59,8 @@ pub enum SqliteOp {
     UpsertFile,
     GetFile,
     ListFiles,
-    GetExecBit,
-    SetExecBit,
+    GetUnixMode,
+    SetUnixMode,
     SetMaterializationState,
 }
 
@@ -225,9 +225,9 @@ impl<'a> FaultingSyncState<'a> {
         Ok(self.inner.file_index_repository().list_files(group_id)?)
     }
 
-    pub fn get_exec_bit(&self, group_id: &str, path: &str) -> Result<bool, SyncError> {
-        self.guard(SqliteOp::GetExecBit)?;
-        Ok(self.inner.file_index_repository().get_exec_bit(group_id, path)?)
+    pub fn get_unix_mode(&self, group_id: &str, path: &str) -> Result<Option<u32>, SyncError> {
+        self.guard(SqliteOp::GetUnixMode)?;
+        Ok(self.inner.file_index_repository().get_unix_mode(group_id, path)?)
     }
 }
 

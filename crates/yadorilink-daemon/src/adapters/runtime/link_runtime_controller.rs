@@ -35,6 +35,7 @@ use yadorilink_filesystem_sync::watcher::{FolderWatchSource, RealFolderWatchSour
 #[cfg(test)]
 use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
 
+use crate::daemon_state::run_blocking_sweep_offloaded;
 use crate::daemon_state::DaemonState;
 use crate::error::DaemonError;
 use crate::link_registry::LinkRegistry;
@@ -165,16 +166,27 @@ impl LinkRuntimeController {
         // (see this crate's own architecture-boundary checks). Its own
         // logic/closure body is unchanged from before this task-set's
         // construction moved into `LinkRuntimeFactory::build`; only its call
-        // site did. First tick is after one full interval
-        // (`tokio::time::interval`'s default), not immediately, since this same
-        // function's own startup repair pass (inside `LinkRuntimeFactory::build`,
-        // right after acquiring this link's `SyncRootLock`) already just ran
-        // once for this link before its watcher started.
+        // site did. First tick is deliberately delayed a full interval, NOT
+        // immediate -- `tokio::time::interval`'s own first tick fires
+        // immediately (a well-known gotcha, see its docs), which would race
+        // this same function's own startup repair pass (inside
+        // `LinkRuntimeFactory::build`, right after acquiring this link's
+        // `SyncRootLock`) that already just ran once for this link before
+        // its watcher started -- a confirmed, reproduced bug: an
+        // immediate first tick landed microseconds after a fresh restart,
+        // grabbed a just-synced file's path lock before a live incoming
+        // peer edit reached it, read the disk bytes as "diverged," and
+        // quarantined them. `interval_at` with an explicit first deadline
+        // is what actually delays it (plain `interval` does not, despite
+        // what this comment used to claim).
         let repair_state = state.clone();
         let repair_root = PathBuf::from(&local_path);
         let repair_group_id = group_id.clone();
         let repair_handle = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(MATERIALIZATION_REPAIR_INTERVAL);
+            let mut ticker = tokio::time::interval_at(
+                tokio::time::Instant::now() + MATERIALIZATION_REPAIR_INTERVAL,
+                MATERIALIZATION_REPAIR_INTERVAL,
+            );
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
@@ -210,6 +222,7 @@ impl LinkRuntimeController {
                         &root_lease,
                         &root,
                         &group_id,
+                        yadorilink_filesystem_sync::materialization_repair::RepairMode::Live,
                     )
                 })
                 .await;
@@ -221,6 +234,7 @@ impl LinkRuntimeController {
                         &root_lease,
                         &root,
                         &group_id,
+                        yadorilink_filesystem_sync::materialization_repair::RepairMode::Live,
                     );
                 #[cfg(madsim)]
                 let repair_result = Ok::<_, tokio::task::JoinError>(repair_result);
@@ -266,6 +280,7 @@ impl LinkRuntimeController {
         // otherwise leave this infinite-loop task running forever, orphaned,
         // logging "no live root lease for this link" on every tick.
         let repair_abort_handle = repair_handle.abort_handle();
+
         let runtime = match LinkRuntimeFactory::new(deps).build(
             local_path.clone(),
             group_id.clone(),
@@ -615,7 +630,28 @@ impl LinkRuntimeController {
             // returns `None`) once `stop` has called
             // `begin_stopping` for this link.
             let _write_activity = deps.begin_write_activity();
-            let Some(result) = runtime.reconcile_added_files_from_disk(&link.group_id) else {
+            // `reconcile_added_files_from_disk` is synchronous and open-ended:
+            // it loads the link's ignore set from disk, reads the group's whole
+            // index out of SQLite, then `walkdir`s the entire link folder and,
+            // for every path with no index row, reads/chunks/SHA-256s the file
+            // and writes its blocks. That is exactly the work the *initial*
+            // scan already offloads (`link_runtime/tasks.rs`'s `spawn_blocking`
+            // around `scan_existing_files_with_ignore_gated`), and the case
+            // this backstop exists for -- a watcher that never bound, or lost
+            // its events -- is precisely the case where the whole folder is
+            // unindexed, so a single sweep can be arbitrarily long. Run
+            // directly from this task it would hold the polling worker for that
+            // entire pass, per link, every sweep tick.
+            //
+            // The call is plain synchronous (no future to drive), so it needs
+            // no `Handle::block_on` bridge the way `tasks.rs`'s `async`
+            // `process_flush_with_ignore` does -- the shared
+            // `run_blocking_sweep_offloaded` guard is enough, and it carries
+            // the current-thread-runtime and madsim fallbacks with it.
+            let reconciled = run_blocking_sweep_offloaded(|| {
+                runtime.reconcile_added_files_from_disk(&link.group_id)
+            });
+            let Some(result) = reconciled else {
                 continue;
             };
             match result {
@@ -846,6 +882,77 @@ mod tests {
             11,
             "current version plus the ten most recent superseded ones survive"
         );
+    }
+
+    /// C2: retention is a version-count cap (`RETENTION_MAX_VERSIONS =
+    /// 10`) AND an age cap (`RETENTION_MAX_AGE_DAYS = 30`) -- a row is
+    /// pruned only once it is beyond BOTH. The test above already proves
+    /// the sweep removes aged-out SUPERSEDED history; this proves the
+    /// specific boundary this project's own C2 survey flagged as
+    /// untested: a currently-TRASHED path's history prunes the same way,
+    /// without disturbing `list_trashed`'s own visibility of it.
+    ///
+    /// `list_trashed`'s own doc comment is explicit that it always
+    /// surfaces a currently-deleted path's LATEST trashed version, not
+    /// every historical one -- which is exactly why that latest version
+    /// can never itself be the one this sweep prunes (it is always rank
+    /// 1 among this path's `superseded`/`trashed` rows): only OLDER
+    /// history goes away, never the entry `list_trashed`/`trash restore`
+    /// actually needs.
+    #[tokio::test]
+    async fn run_retention_expiry_sweep_prunes_old_history_without_disturbing_a_trashed_paths_visibility()
+    {
+        let state = test_state();
+        state.replica_coordinator.link_repository().add_link("/tmp/photos", "group-1").unwrap();
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+
+        // Eleven versions (v1..v11), each `mtime_unix_nanos: 0` (1970, far
+        // older than the 30-day age bound) -- then a delete, flipping v11
+        // from `current` to `trashed` and inserting a fresh tombstone as
+        // the path's new `current` row. Ten superseded (v1..v10) + one
+        // trashed (v11) = 11 rows in {superseded, trashed}, putting v1
+        // (oldest by version_seq) at rank 11, past RETENTION_MAX_VERSIONS.
+        for size in 1..=11u64 {
+            let mut record = sample_record("gone.jpg");
+            record.size = size;
+            state
+                .replica_coordinator
+                .file_index_repository()
+                .upsert_file_with_origin("group-1", &record, "device-a", &permit)
+                .unwrap();
+        }
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .mark_deleted("group-1", "gone.jpg", "device-a", &permit)
+            .unwrap();
+
+        assert_eq!(
+            state.replica_coordinator.sqlite().dag_list_versions("group-1", "gone.jpg").unwrap().len(),
+            12,
+            "11 upserts plus the delete-created tombstone"
+        );
+        let trashed = state.replica_coordinator.file_index_repository().list_trashed("group-1").unwrap();
+        assert_eq!(trashed.len(), 1, "the deleted path must be visible in trash before the sweep");
+        assert_eq!(trashed[0].path, "gone.jpg");
+
+        let controller = LinkRuntimeController::new(state.clone());
+        controller.run_retention_expiry_sweep();
+
+        let remaining =
+            state.replica_coordinator.sqlite().dag_list_versions("group-1", "gone.jpg").unwrap();
+        assert_eq!(remaining.len(), 11, "exactly the one version beyond the count cap is pruned");
+        assert!(
+            remaining.iter().all(|v| v.size != 1),
+            "specifically the oldest version (size marker 1) must be the one pruned"
+        );
+
+        // The still-relevant trash entry itself must be entirely
+        // unaffected -- expiry prunes stale HISTORY, never the version
+        // `list_trashed`/`trash restore` actually needs.
+        let trashed = state.replica_coordinator.file_index_repository().list_trashed("group-1").unwrap();
+        assert_eq!(trashed.len(), 1, "the trashed path must still be visible after the sweep");
+        assert_eq!(trashed[0].path, "gone.jpg");
     }
 
     /// A link with no superseded/trashed rows to sweep, or no links at
@@ -1163,5 +1270,91 @@ mod tests {
 
         // The non-negotiable: per-GROUP, never per-DATABASE.
         start_watch_and_await_scan(&state, root_c.path(), "group-2").await;
+    }
+
+    /// The disk-reconcile backstop's per-link operation
+    /// (`reconcile_added_files_from_disk`) is synchronous and walks the entire
+    /// linked folder. This pins that the sweep no longer runs it on the worker
+    /// that polls it.
+    ///
+    /// Discriminating by construction: the runtime has exactly one worker
+    /// thread and the sweep runs in a spawned task (not in the test's own
+    /// `block_on` thread, which is not a worker and would therefore never have
+    /// held a core to begin with). A second spawned task tries to tick every
+    /// millisecond throughout. Run inline, the sweep's task owns the only core
+    /// from the moment it starts until it returns, and the ticker records zero
+    /// ticks for that whole window; offloaded, `block_in_place` hands the core
+    /// -- and the ticker queued on it -- to a replacement thread before the
+    /// walk begins, and the ticks keep coming.
+    ///
+    /// The fixture is directories, not files, deliberately. A directory entry
+    /// is skipped outright by the reconcile loop, so the whole tree walk is
+    /// work that stays on the caller: `local_change.rs`'s own
+    /// `run_capture_pass_off_worker` covers the per-file chunk/verify passes,
+    /// which a directory never reaches, so a file-based fixture would measure
+    /// that offload rather than this one. It also keeps the link's own initial
+    /// scan trivial -- there is nothing on disk for it to index.
+    #[cfg(not(madsim))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn the_disk_reconcile_backstop_sweep_does_not_hold_the_worker_that_polls_it() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let state = test_state();
+        let root = tempfile::tempdir().unwrap();
+        let group = "group-1";
+        for outer in 0..200 {
+            let dir = root.path().join(format!("d{outer}"));
+            std::fs::create_dir(&dir).unwrap();
+            for inner in 0..50 {
+                std::fs::create_dir(dir.join(format!("s{inner}"))).unwrap();
+            }
+        }
+        state
+            .replica_coordinator
+            .link_repository()
+            .add_link(&root.path().to_string_lossy(), group)
+            .unwrap();
+        start_watch_and_await_scan(&state, root.path(), group).await;
+
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        // Let the ticker reach its first `sleep` before the sweep starts, so
+        // "no ticks" can only mean the worker was held, never that the ticker
+        // had not been polled even once yet.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let controller = LinkRuntimeController::new(state.clone());
+        let before = ticks.load(Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        tokio::spawn(async move { controller.run_disk_reconcile_backstop_sweep().await })
+            .await
+            .expect("the sweep task must not panic");
+        let elapsed = started.elapsed();
+        let during = ticks.load(Ordering::Relaxed) - before;
+        ticker.abort();
+
+        // Proportional, not `> 0`: a ticker that never gets its worker back
+        // still records the odd tick from the slop either side of the spawn, so
+        // an absolute floor of one does not discriminate. A ticker that keeps
+        // its worker ticks about once per millisecond. An eighth of the elapsed
+        // milliseconds sits far below that and far above the slop, with room
+        // for a loaded machine to stretch the ticker's real period several-fold
+        // -- measured on this fixture: 85 ticks across 183ms offloaded, 1 tick
+        // across 166ms inline.
+        let expected = elapsed.as_millis() as u64 / 8;
+        assert!(
+            during >= expected,
+            "the disk-reconcile backstop's whole-folder walk ran on the worker that polls the \
+             sweep: a 1ms ticker sharing the runtime's only worker managed only {during} ticks \
+             (expected at least {expected}) across the sweep's {elapsed:?}"
+        );
     }
 }

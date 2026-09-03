@@ -20,7 +20,7 @@ pub mod daemonctl {
     /// development builds are not required to interoperate across protocol
     /// generations. A version mismatch should fail clearly rather than select a
     /// backward-compatibility path.
-    pub const CONTROL_PROTOCOL_VERSION: u32 = 6;
+    pub const CONTROL_PROTOCOL_VERSION: u32 = 7;
 }
 
 #[cfg(test)]

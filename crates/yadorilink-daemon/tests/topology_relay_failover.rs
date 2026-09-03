@@ -1,11 +1,11 @@
 //! M5-A Pass 4: direct -> relay -> direct integration on the canonical
 //! N/M/W topology. Real production connection path throughout: real
-//! `peer_orchestrator::run` (which wires `PeerChannel::connect_with_relay`
-//! for its normal, non-test connection setup -- relay fallback is not a
-//! special code path here, it's what production already does), a real
-//! synthesized `RelayGrant` (`FakeCoordination::issue_relay_grant`), and
-//! real DAG sync/hydration traffic (not `RelayCarrier::send_via_relay`'s
-//! raw bytes, unlike `relay_chaos.rs`'s transport-focused fan-in proof).
+//! `peer_orchestrator::run`, which falls back to a relay path when no
+//! direct candidate answers -- relay is not a special code path here, it is
+//! what production already does -- a real synthesized `RelayGrant`
+//! (`FakeCoordination::issue_relay_grant`), and real DAG sync/hydration
+//! traffic over the relayed connection, unlike `relay_chaos.rs`'s
+//! transport-focused fan-in proof.
 //!
 //! **How direct failure is forced**: `FakeCoordination::update_endpoint`
 //! republishes a device's advertised endpoint over the live netmap
@@ -122,10 +122,10 @@ async fn direct_fails_falls_back_to_relay_then_direct_recovers() {
     // own module doc comment on the fake-coordination constraint.
     fake.update_endpoint(&w.device_id, "127.0.0.1:1".to_string());
 
-    // Real production reconnect supervision (not this test) must detect
-    // the failure and fail over to relay through N -- the same
-    // `peer_orchestrator`/`PeerChannel::connect_with_relay` path
-    // production runs, never a test-only shortcut.
+    // Real production connection supervision (not this test) must detect
+    // the failure and fail over to a relay path through N -- the same
+    // `peer_orchestrator` path production runs, never a test-only
+    // shortcut.
     wait_until_with_context(
         || routed_via_relay(&m.state, &w.device_id) || routed_via_relay(&n.state, &w.device_id),
         Duration::from_secs(90),

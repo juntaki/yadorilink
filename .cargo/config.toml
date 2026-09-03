@@ -1,7 +1,0 @@
-[alias]
-dst-replay = "run --quiet -p xtask -- dst-replay"
-dst-lane0 = "run --quiet -p xtask -- dst-lane0"
-dst-lane1 = "run --quiet -p xtask -- dst-lane1"
-dst-lane2 = "run --quiet -p xtask -- dst-lane2"
-dst-targeted = "run --quiet -p xtask -- dst-targeted"
-dst-prune = "run --quiet -p xtask -- dst-prune"

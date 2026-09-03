@@ -15,7 +15,6 @@ use support::{
 };
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 use yadorilink_replica_domain::session_state::MaterializationPolicy;
 
@@ -538,81 +537,17 @@ async fn full_replica_handoff_ready_digest_detects_a_root_set_change_before_comm
     );
 }
 
-/// A peer that never advertised `supports_version_hash_exact` in its
-/// handshake `ClusterConfig` must be skipped for the whole-group
-/// durability-handoff attestation entirely, not queried and trusted on a
-/// block-hash-only answer — the same fail-safe-skip treatment
-/// `custody_version_present.rs`'s `confirm_version_present_skips_a_peer_
-/// that_never_advertised_the_capability` already exercises for `supports_
-/// version_present`. Stands the non-supporting peer's session up on a
-/// channel with no reachable far end (so an unskipped query really would run
-/// out its own per-root timeout rather than fail fast) and asserts
-/// `another_full_replica_is_ready` both returns false AND returns quickly.
+/// Two real daemons, connected: the whole-group durability handoff queries
+/// the peer and genuinely confirms it covers the group's roots.
+///
+/// This used to have a sibling asserting the opposite for a peer that had
+/// not advertised a `supports_version_hash_exact` capability bit. That bit
+/// is gone, and so is the peer it described: the exact-hash check is part of
+/// what this protocol generation IS, and a peer that does not enforce it
+/// cannot complete the TLS handshake, let alone answer a query. What is left
+/// is this end-to-end confirmation that the query path itself works.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn handoff_skips_a_peer_that_never_advertised_version_hash_exact() {
-    support::ensure_isolated_config_dir();
-    let b = new_daemon("device-b");
-
-    let record = record_referencing("solo.bin", vec![9u8; 32], 4);
-    b.state
-        .replica_coordinator
-        .file_index_repository()
-        .upsert_file(
-            GROUP,
-            &record,
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-
-    // A session that never ran a `ClusterConfig` handshake at all — the same
-    // starting state as one that did run it against an old peer that
-    // predates `supports_version_hash_exact` (the field defaults to, and an
-    // old peer leaves it, `false`).
-    let fake_channel = support::unreachable_channel().await;
-    let fake_session = PeerSyncSession::new(
-        fake_channel,
-        "device-b".to_string(),
-        "device-a".to_string(),
-        b.state.replica_coordinator.clone(),
-        std::sync::Arc::new(
-            yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                b.state.block_store.clone(),
-            ),
-        ),
-        vec![GROUP.to_string()],
-        std::collections::HashMap::new(),
-    );
-    assert!(
-        !fake_session.version_hash_exact_negotiated(),
-        "a session that never completed the handshake must default to unsupported"
-    );
-    b.state.peers.register_session("device-a".to_string(), fake_session);
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
-    b.state.set_peer_group_writer("device-a", GROUP, true);
-
-    let start = std::time::Instant::now();
-    let ready = b.state.another_full_replica_is_ready(GROUP).await;
-    let elapsed = start.elapsed();
-
-    assert!(
-        !ready,
-        "the only candidate peer never advertised supports_version_hash_exact, so it must be \
-         skipped rather than trusted, leaving the handoff not ready"
-    );
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "a non-supporting peer must be skipped before ever sending a query, not queried and \
-         waited out (took {elapsed:?})"
-    );
-}
-
-/// The positive counterpart: two real, fully-current-build daemons negotiate
-/// `supports_version_hash_exact` in their live handshake (this build always
-/// advertises it), so the capability check this change adds is satisfied and
-/// the handoff proceeds to genuinely confirm coverage — the capability bit
-/// gates on an old peer's absence, never on a capable one.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn handoff_uses_a_peer_that_advertised_version_hash_exact() {
+async fn handoff_confirms_a_peer_that_durably_holds_the_group() {
     support::ensure_isolated_config_dir();
     let a = new_daemon("device-a");
     let b = new_daemon("device-b");
@@ -643,18 +578,12 @@ async fn handoff_uses_a_peer_that_advertised_version_hash_exact() {
     b.state.set_peer_group_full_replica("device-a", GROUP, true);
     tokio::time::sleep(Duration::from_millis(500)).await; // let the session establish
 
-    {
-        let session = b.state.peers.session("device-a").expect("session with device-a must exist");
-        assert!(
-            session.version_hash_exact_negotiated(),
-            "two current-build daemons must negotiate supports_version_hash_exact in their \
-             live handshake"
-        );
-    }
-
+    assert!(
+        b.state.peers.session("device-a").is_some(),
+        "the handoff query needs a live session with device-a"
+    );
     assert!(
         b.state.another_full_replica_is_ready(GROUP).await,
-        "device-a advertised the capability and durably holds the file, so the handoff must \
-         proceed and confirm readiness"
+        "device-a durably holds the file, so the handoff must proceed and confirm readiness"
     );
 }

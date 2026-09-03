@@ -43,8 +43,10 @@ use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPaylo
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::ConsentAction;
 use yadorilink_ipc_proto::daemonctl::{
-    GenerateLastErrorReportRequest, GenerateUsageReportRequest, ReportingConsentState,
-    ReportingStatusRequest, StatusRequest, SubmitReportRequest, UpdateConsentRequest,
+    DeleteQueueItemRequest, FlushQueueRequest, GenerateLastErrorReportRequest,
+    GenerateUsageReportRequest, ListQueueItemsRequest, QueueItem, ReportingConsentState,
+    ReportingStatusRequest, ShowQueueItemRequest, StatusRequest, SubmitReportRequest,
+    UpdateConsentRequest,
 };
 use yadorilink_reporting::builder::{build_usage_envelope, UsagePayloadBuilder};
 use yadorilink_reporting::consent::ConsentState;
@@ -359,6 +361,86 @@ pub async fn consent_prompts(enabled: bool) -> Result<(), CliError> {
     update_consent(ConsentAction::SetPrompt, Some(enabled), None).await
 }
 
+// -- `yadorilink report queue...` ----------------------------------------
+//
+// The submit-retry queue is daemon-owned runtime state (the same store
+// `report consent status`'s `Queued unsent reports` count already reads,
+// via `context.queries.reporting` on the daemon side) -- every command
+// here requires the daemon, the same way `error --submit` does, rather
+// than falling back to a local reconstruction the way `usage`/`error
+// --last` do for their own CLI-only-safe data.
+
+async fn require_daemon(action: &str) -> Result<(), CliError> {
+    if daemon_available().await {
+        return Ok(());
+    }
+    Err(CliError::ReportingDaemonRequired(format!(
+        "{action} requires the yadorilink daemon (the submit-retry queue is daemon-owned \
+         runtime state) — run `yadorilink daemon start`"
+    )))
+}
+
+fn queue_item_line(item: &QueueItem) -> String {
+    format!(
+        "{}  type={}  queued_at={}  size={}  attempts={}",
+        item.report_id, item.report_type, item.queued_at, item.size_bytes, item.submit_attempts
+    )
+}
+
+pub async fn queue_list() -> Result<(), CliError> {
+    require_daemon("listing the queue").await?;
+    let resp = control_client::send(ReqPayload::ListQueueItems(ListQueueItemsRequest {})).await?;
+    let Some(RespPayload::ListQueueItems(list)) = resp.payload else {
+        return Err(CliError::Other("unexpected daemon response".into()));
+    };
+    if list.items.is_empty() {
+        println!("Queue is empty.");
+        return Ok(());
+    }
+    for item in &list.items {
+        println!("{}", queue_item_line(item));
+    }
+    Ok(())
+}
+
+pub async fn queue_show(report_id: String) -> Result<(), CliError> {
+    require_daemon("showing a queue item").await?;
+    let resp =
+        control_client::send(ReqPayload::ShowQueueItem(ShowQueueItemRequest { report_id })).await?;
+    let Some(RespPayload::ShowQueueItem(r)) = resp.payload else {
+        return Err(CliError::Other("unexpected daemon response".into()));
+    };
+    println!("{}", r.report_json);
+    Ok(())
+}
+
+pub async fn queue_delete(report_id: String) -> Result<(), CliError> {
+    require_daemon("deleting a queue item").await?;
+    let resp = control_client::send(ReqPayload::DeleteQueueItem(DeleteQueueItemRequest {
+        report_id: report_id.clone(),
+    }))
+    .await?;
+    let Some(RespPayload::DeleteQueueItem(r)) = resp.payload else {
+        return Err(CliError::Other("unexpected daemon response".into()));
+    };
+    if r.deleted {
+        println!("Deleted queue item {report_id}");
+    } else {
+        println!("No queue item found with id {report_id}");
+    }
+    Ok(())
+}
+
+pub async fn queue_flush() -> Result<(), CliError> {
+    require_daemon("flushing the queue").await?;
+    let resp = control_client::send(ReqPayload::FlushQueue(FlushQueueRequest {})).await?;
+    let Some(RespPayload::FlushQueue(r)) = resp.payload else {
+        return Err(CliError::Other("unexpected daemon response".into()));
+    };
+    println!("Removed {} queued item(s)", r.removed_count);
+    Ok(())
+}
+
 // -- reportable-error hook -----------------------------------------------
 
 /// Called from `main.rs`'s top-level error path for any command failure
@@ -420,6 +502,21 @@ mod tests {
         assert!(!confirm_with_reader("ok?", false, &mut Cursor::new(b"n\n".to_vec())));
         assert!(!confirm_with_reader("ok?", false, &mut Cursor::new(b"\n".to_vec())));
         assert!(!confirm_with_reader("ok?", false, &mut Cursor::new(b"".to_vec())));
+    }
+
+    #[test]
+    fn queue_item_line_renders_every_field() {
+        let item = QueueItem {
+            report_id: "r-1".into(),
+            report_type: "error".into(),
+            queued_at: "2026-01-01T00:00:00Z".into(),
+            size_bytes: 512,
+            submit_attempts: 3,
+        };
+        assert_eq!(
+            queue_item_line(&item),
+            "r-1  type=error  queued_at=2026-01-01T00:00:00Z  size=512  attempts=3"
+        );
     }
 
     /// `assume_yes` (the CLI's

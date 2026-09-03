@@ -119,7 +119,10 @@ pub struct PrepareRequest<'a> {
     /// to verify content, not something this module infers is safe on its
     /// own.
     pub expected_content_hash: Option<[u8; 32]>,
-    pub exec_bit: Option<bool>,
+    /// The replicated permission bits to apply, or `None` for "no Unix
+    /// permission info to apply" — same `Option<u32>` convention as
+    /// [`yadorilink_replica_domain::file::FileMeta::unix_mode`].
+    pub unix_mode: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -132,7 +135,7 @@ pub enum PrepareError {
     /// A path names a component reserved for transaction artefacts. Mirrors
     /// `yadorilink-sync-core::SyncError::ReservedNamespaceCollision`.
     ReservedNamespaceCollision(String),
-    /// [`finish_staged_file`]'s `apply_exec_bit` call.
+    /// [`finish_staged_file`]'s `apply_unix_mode` call.
     Storage(yadorilink_local_storage::StorageError),
     CreateArtefact(CreateArtefactError),
     ArtefactName(ArtefactNameError),
@@ -270,10 +273,8 @@ fn finish_staged_file(
     request: &PrepareRequest,
     counters: &mut PreparationCounters,
 ) -> Result<(), PrepareError> {
-    if let Some(exec_bit) = request.exec_bit {
-        yadorilink_local_storage::apply_exec_bit(stage_path, exec_bit)
-            .map_err(PrepareError::Storage)?;
-    }
+    yadorilink_local_storage::apply_unix_mode(stage_path, request.unix_mode)
+        .map_err(PrepareError::Storage)?;
     if let Some(expected) = request.expected_content_hash {
         let mut reader = file.try_clone().map_err(PrepareError::Io)?;
         use std::io::{Seek, SeekFrom};
@@ -317,13 +318,13 @@ fn finish_staged_file(
 /// `source`'s bytes, so `request.expected_content_hash`, when supplied, is
 /// honoured the same way as every other path.
 ///
-/// Applying `request.exec_bit` is not safe in general: `source` is a
+/// Applying `request.unix_mode` is not safe in general: `source` is a
 /// [`CloneSource::ImmutableContentStoreObject`], and `chmod`ing the
 /// hardlinked stage path would mutate that same shared inode's permission
 /// bits system-wide, including at every other name it's linked under —
 /// exactly the "never touches an immutable content-store object" property
-/// this fast path exists to preserve. A requested bit that already matches
-/// `source`'s own observed bit needs no mutation and is accepted; one that
+/// this fast path exists to preserve. A requested mode that already matches
+/// `source`'s own observed mode needs no mutation and is accepted; one that
 /// would actually change it is refused rather than either silently applied
 /// (mutating the content store) or silently ignored (this function's own
 /// defect being fixed here).
@@ -350,16 +351,16 @@ fn finish_hardlinked_stage(
             return Err(PrepareError::ContentVerificationFailed);
         }
     }
-    if let Some(requested_exec_bit) = request.exec_bit {
+    if let Some(requested_unix_mode) = request.unix_mode {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            const OWNER_EXEC: u32 = 0o100;
+            const PERMISSION_BITS: u32 = 0o777;
             let mode = fs::metadata(source).map_err(PrepareError::Io)?.permissions().mode();
-            let current_exec_bit = mode & OWNER_EXEC != 0;
-            if current_exec_bit != requested_exec_bit {
+            let current_unix_mode = mode & PERMISSION_BITS;
+            if current_unix_mode != requested_unix_mode {
                 return Err(PrepareError::InvalidInput(format!(
-                    "hardlink fast path cannot set the exec bit to {requested_exec_bit} for {} \
+                    "hardlink fast path cannot set the mode to {requested_unix_mode:#o} for {} \
                      without mutating the shared immutable content-store object's inode at {}; \
                      refusing rather than silently applying or silently ignoring it",
                     stage_path.display(),
@@ -369,11 +370,11 @@ fn finish_hardlinked_stage(
         }
         #[cfg(not(unix))]
         {
-            // No owner-exec permission bit exists off Unix (mirroring
-            // `chunker::apply_exec_bit`'s own no-op there), so there is
+            // No permission-bits model exists off Unix (mirroring
+            // `chunker::apply_unix_mode`'s own no-op there), so there is
             // nothing to refuse or apply. `source` is only read to compare
-            // against that bit, so it is unused here too.
-            let _ = (requested_exec_bit, source);
+            // against those bits, so it is unused here too.
+            let _ = (requested_unix_mode, source);
         }
     }
     Ok(())
@@ -818,7 +819,7 @@ mod tests {
                 capabilities: &capabilities,
             },
             expected_content_hash: Some(hash),
-            exec_bit: None,
+            unix_mode: None,
         };
 
         let prepared = prepare_target(&request).unwrap();
@@ -849,7 +850,7 @@ mod tests {
                 capabilities: &capabilities,
             },
             expected_content_hash: Some(wrong_hash),
-            exec_bit: None,
+            unix_mode: None,
         };
 
         let result = prepare_target(&request);
@@ -881,7 +882,7 @@ mod tests {
                 capabilities: &capabilities,
             },
             expected_content_hash: None,
-            exec_bit: None,
+            unix_mode: None,
         };
 
         let prepared = prepare_target(&request).unwrap();
@@ -907,7 +908,7 @@ mod tests {
                 capabilities: &capabilities,
             },
             expected_content_hash: None,
-            exec_bit: None,
+            unix_mode: None,
         };
         let result = prepare_target(&request);
         assert!(matches!(result, Err(PrepareError::UnimplementedFastPath(_))));
@@ -935,7 +936,7 @@ mod tests {
                 capabilities: &capabilities,
             },
             expected_content_hash: Some(hash),
-            exec_bit: None,
+            unix_mode: None,
         };
         let prepared = prepare_target(&request).unwrap();
         assert_eq!(prepared.fast_path, FastPath::Hardlink);
@@ -966,7 +967,7 @@ mod tests {
                 capabilities: &capabilities,
             },
             expected_content_hash: Some(wrong_hash),
-            exec_bit: None,
+            unix_mode: None,
         };
         let result = prepare_target(&request);
         assert!(matches!(result, Err(PrepareError::ContentVerificationFailed)));
@@ -974,7 +975,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn prepare_hardlink_refuses_an_exec_bit_change_rather_than_mutating_the_shared_inode() {
+    fn prepare_hardlink_refuses_an_unix_mode_change_rather_than_mutating_the_shared_inode() {
         // Regression test for Defect 4's exec-bit half: the hardlinked
         // stage path and `source` are the same inode, so applying a
         // changed exec bit through the stage path would silently mutate
@@ -1001,9 +1002,9 @@ mod tests {
                 capabilities: &capabilities,
             },
             // `source` was just created with mode 0o644 (no exec bit) --
-            // requesting `true` demands an actual change.
+            // requesting 0o744 (adds owner-exec) demands an actual change.
             expected_content_hash: None,
-            exec_bit: Some(true),
+            unix_mode: Some(0o744),
         };
         let result = prepare_target(&request);
         assert!(matches!(result, Err(PrepareError::InvalidInput(_))));
@@ -1011,13 +1012,13 @@ mod tests {
         let mode_after = std::fs::metadata(&source_path).unwrap().permissions().mode();
         assert_eq!(
             mode_before, mode_after,
-            "a refused exec-bit change must not mutate the shared immutable content-store inode"
+            "a refused mode change must not mutate the shared immutable content-store inode"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn prepare_hardlink_accepts_an_exec_bit_that_already_matches_the_source() {
+    fn prepare_hardlink_accepts_an_unix_mode_that_already_matches_the_source() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1037,7 +1038,7 @@ mod tests {
                 capabilities: &capabilities,
             },
             expected_content_hash: None,
-            exec_bit: Some(false),
+            unix_mode: Some(0o644),
         };
         let prepared = prepare_target(&request);
         assert!(prepared.is_ok());

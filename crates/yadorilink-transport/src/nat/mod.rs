@@ -3,7 +3,7 @@
 //!
 //! The transport already does the load-bearing half of connection
 //! establishment — it races every known endpoint candidate concurrently and
-//! treats a candidate as confirmed only once authenticated WireGuard traffic
+//! treats a candidate as confirmed only once authenticated peer traffic
 //! arrives over it (a stronger connectivity check than a STUN binding
 //! success). What that machinery lacks is *candidate gathering* beyond LAN
 //! addresses and *simultaneity* between two NATed peers. This module supplies

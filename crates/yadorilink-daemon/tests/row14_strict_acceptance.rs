@@ -17,9 +17,9 @@
 //!    (not merely whether it crossed the stall-panic threshold) and must
 //!    stay comfortably under it -- "never actually stalled" is a stronger
 //!    claim than "recovered before the watchdog fired."
-//! 3. After convergence, every device's `materialization_jobs` table must
-//!    have zero non-terminal rows left -- nothing stuck in `Planning`/
-//!    `Backoff`/`Pending` forever, invisible only because the strict
+//! 3. After convergence, every device's `projection_obligations` table must
+//!    have zero rows left for this group -- nothing stuck pending (or
+//!    parked `ignore_blocked`) forever, invisible only because the strict
 //!    content-hash comparison happened to pass anyway.
 //! 4. The strict content-hash comparison itself (inherited from the
 //!    ordinary row-14 test) already covers "a path that went through a
@@ -47,7 +47,6 @@ use yadorilink_daemon::daemon_state::{
 use yadorilink_local_storage::FsBlockStore;
 use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_engine::conflict::{resolve_path_heads, PathResolution};
-use yadorilink_transport::DeviceKeyPair;
 
 const ABSOLUTE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(900);
 const STALL_TIMEOUT: Duration = Duration::from_secs(90);
@@ -65,8 +64,7 @@ struct TestDevice {
 }
 
 async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
-    let keypair = Arc::new(DeviceKeyPair::generate());
-    let device_id = support::register_device(account, name, keypair.public_bytes()).await;
+    let device_id = support::register_device(account, name, [0u8; 32]).await;
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
@@ -113,8 +111,8 @@ const PAIR_RECONNECT_BACKOFF: yadorilink_daemon::supervise::BackoffConfig =
 /// ([`spawn_pair_reconnect_supervisor`]). `one_factorization`'s round
 /// batching alone only bounds the *initial* burst: each pair's reconnect
 /// supervisor otherwise reconnects independently, so a burst of
-/// chaos-triggered ARQ teardowns hitting several pairs around the same
-/// moment can still recreate an unbounded concurrent-handshake burst
+/// chaos-triggered QUIC connection teardowns hitting several pairs around
+/// the same moment can still recreate an unbounded concurrent-handshake burst
 /// during the run's steady state, well after the initial mesh formed
 /// cleanly -- confirmed in CI: the *first* handshake failure landed
 /// ~1m50s into a run whose initial mesh (round-batched) had already
@@ -158,18 +156,18 @@ async fn connect_pair_with_bounded_concurrency(
 
 /// Keeps one device pair connected for the rest of the run: whenever
 /// either side's `PeerSyncSession::run` task ends on its own (not driven
-/// by this test -- e.g. `yadorilink-transport`'s ARQ layer tearing a
-/// channel down after exhausting retransmits against a peer this run's
-/// own chaos made transiently unreachable), reconnects both sides fresh.
+/// by this test -- e.g. the QUIC connection idling out against a peer
+/// this run's own chaos made transiently unreachable), reconnects both
+/// sides fresh.
 ///
 /// `support::connect_two_daemons*` itself is deliberately NOT changed to
 /// do this: its own doc comment is explicit that its one-shot,
 /// discard-the-handles shape is the right default for the many other
 /// callers that pair a small, fixed device set once and let the process
 /// exit. This strict acceptance run is the one caller that specifically
-/// needs reconnect resilience (see `yadorilink-transport`'s ARQ hardening
-/// and `peer_orchestrator::spawn_peer_session`'s own doc comment for the
-/// production-side version of the identical reasoning), so the
+/// needs reconnect resilience (see `peer_orchestrator::spawn_peer_session`'s
+/// own doc comment for the production-side version of the identical
+/// reasoning), so the
 /// supervision lives here instead.
 fn spawn_pair_reconnect_supervisor(
     state_i: Arc<DaemonState>,
@@ -228,7 +226,7 @@ fn spawn_pair_reconnect_supervisor(
 /// pushes, existing sessions already up), never as an instantaneous
 /// simultaneous handshake against every peer at once. Connecting all
 /// `n*(n-1)/2` pairs together -- 15 for row14's 6 devices -- means every
-/// device races `n-1` (5) concurrent WireGuard handshakes from the first
+/// device races `n-1` (5) concurrent QUIC handshakes from the first
 /// instant, all competing for the same process's CPU. Under a debug build
 /// on a resource-constrained CI runner, that CPU contention alone can push
 /// genuine handshake completion past its own bounded timeout -- confirmed:
@@ -291,11 +289,7 @@ async fn wait_pair_ready(
             let a_session = state_a.peers.session(device_b_id);
             let b_session = state_b.peers.session(device_a_id);
             if let (Some(a_session), Some(b_session)) = (&a_session, &b_session) {
-                if a_session.peer_handshake_received()
-                    && b_session.peer_handshake_received()
-                    && a_session.change_dag_negotiated()
-                    && b_session.change_dag_negotiated()
-                {
+                if a_session.peer_handshake_received() && b_session.peer_handshake_received() {
                     return;
                 }
             }
@@ -505,32 +499,6 @@ fn dump_conflict_diagnostic_snapshot(
         out.push_str(&format!(
             "device-{i}: dag_group_heads={:?}\n",
             heads.map(|hs| hs.iter().map(|h| hex::encode(h.0)).collect::<Vec<_>>())
-        ));
-        let job = device
-            .state
-            .replica_coordinator
-            .materialization_job_repository()
-            .materialization_get_job(group_id, source_path)
-            .ok()
-            .flatten();
-        let now_nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
-        out.push_str(&format!(
-            "device-{i}: materialization_job({source_path:?}) = {}\n",
-            match job {
-                Some(j) => format!(
-                    "state={:?} attempt={} version_hash={} age_since_updated_at={:?} \
-                     waiting_reason={:?}",
-                    j.state,
-                    j.attempt,
-                    hex::encode(&j.version_hash),
-                    Duration::from_nanos((now_nanos - j.updated_at).max(0) as u64),
-                    j.waiting_reason
-                ),
-                None => "no job row".to_string(),
-            }
         ));
         for (label, hash) in [("winner", winner_hash), ("loser", loser_hash)] {
             let Some(hash) = hash else { continue };
@@ -788,23 +756,30 @@ async fn row14_strict_acceptance() {
         assert_eq!(snap, reference, "row14_strict_acceptance: device-{i} diverged from device-0");
     }
 
-    // Criterion 3: nothing left non-terminal in any device's job table.
-    // Bounded extra wait (distinct from the STALL_TIMEOUT machinery above,
-    // which only tracks visible DISK progress) -- content can converge
-    // correctly while a job row's own bookkeeping simply hasn't caught up
-    // within the fixed 2s settle window yet (a job legitimately still
-    // mid-cycle is not the same claim as "stuck forever"). Genuinely stuck
-    // rows will still be non-empty after this bounded wait; a merely-
-    // lagging bookkeeping write will not.
-    const JOB_TABLE_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(30);
-    let quiescence_deadline = Instant::now() + JOB_TABLE_QUIESCENCE_TIMEOUT;
+    // Criterion 3: nothing left non-terminal in any device's projection-
+    // obligation table. Bounded extra wait (distinct from the STALL_TIMEOUT
+    // machinery above, which only tracks visible DISK progress) -- content
+    // can converge correctly while an obligation's own bookkeeping simply
+    // hasn't caught up within the fixed 2s settle window yet (an obligation
+    // legitimately still mid-cycle is not the same claim as "stuck
+    // forever"). Genuinely stuck rows will still be non-empty after this
+    // bounded wait; a merely-lagging bookkeeping write will not.
+    //
+    // `dag_claim_runnable_obligations` with `now = i64::MAX` reads every row
+    // regardless of its own `next_attempt_at` backoff deadline -- a plain
+    // read (no in-flight state to claim-and-mark), so this is safe to call
+    // repeatedly and never perturbs anything. A settled obligation is
+    // DELETED by its own completion primitive, so any row still present
+    // (pending or parked `ignore_blocked`) means genuinely unfinished work.
+    const OBLIGATION_TABLE_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(30);
+    let quiescence_deadline = Instant::now() + OBLIGATION_TABLE_QUIESCENCE_TIMEOUT;
     loop {
         let all_quiescent = devices.iter().all(|d| {
             d.state
                 .replica_coordinator
-                .materialization_job_repository()
-                .materialization_list_unfinished_jobs()
-                .map(|jobs| jobs.is_empty())
+                .sqlite()
+                .dag_claim_runnable_obligations(i64::MAX, u32::MAX, u32::MAX)
+                .map(|obligations| obligations.iter().all(|o| o.group_id != group_id))
                 .unwrap_or(false)
         });
         if all_quiescent || Instant::now() >= quiescence_deadline {
@@ -814,16 +789,19 @@ async fn row14_strict_acceptance() {
     }
 
     for (i, device) in devices.iter().enumerate() {
-        let unfinished = device
+        let unfinished: Vec<_> = device
             .state
             .replica_coordinator
-            .materialization_job_repository()
-            .materialization_list_unfinished_jobs()
-            .unwrap();
+            .sqlite()
+            .dag_claim_runnable_obligations(i64::MAX, u32::MAX, u32::MAX)
+            .unwrap()
+            .into_iter()
+            .filter(|o| o.group_id == group_id)
+            .collect();
         assert!(
             unfinished.is_empty(),
-            "row14_strict_acceptance: device-{i} has {} non-terminal materialization_jobs row(s) \
-             left after convergence (group={group_id}): {:?}",
+            "row14_strict_acceptance: device-{i} has {} non-terminal projection_obligations \
+             row(s) left after convergence (group={group_id}): {:?}",
             unfinished.len(),
             unfinished
         );

@@ -64,6 +64,13 @@ fn ensure_prune_tombstone_schema(conn: &Connection) -> Result<(), SyncSqliteErro
             encoding_version     INTEGER NOT NULL,
             PRIMARY KEY (group_id, change_hash)
         );
+        -- 2026-09-02 (100k acceptance-run attribution): `is_ancestor`'s
+        -- Lamport pre-check (`lamport_of_including_pruned`) looks up a
+        -- pruned change's lamport by `change_hash` alone, with no
+        -- `group_id` in hand at that call site -- same reasoning as
+        -- `pruned_change_parents_by_child` just below.
+        CREATE INDEX IF NOT EXISTS pruned_changes_by_hash
+            ON pruned_changes(change_hash);
         CREATE TABLE IF NOT EXISTS pruned_change_parents (
             group_id        TEXT NOT NULL,
             child_hash      BLOB NOT NULL,
@@ -73,6 +80,21 @@ fn ensure_prune_tombstone_schema(conn: &Connection) -> Result<(), SyncSqliteErro
         );
         CREATE INDEX IF NOT EXISTS pruned_change_parents_by_parent
             ON pruned_change_parents(group_id, parent_hash);
+        -- 2026-09-02 (100k acceptance-run attribution): `is_ancestor`'s
+        -- per-step ancestry walk looks up parents of a given CHILD hash
+        -- with no group_id in hand at that point (`change_hash` is a
+        -- SHA-256 over an encoding that already includes `group_id`, so a
+        -- cross-group `child_hash` collision is cryptographically
+        -- infeasible -- this table's own PRIMARY KEY leads with `group_id`
+        -- for compaction bookkeeping, not because a lookup needs it to
+        -- disambiguate). Without a `child_hash`-leading index, that lookup
+        -- could not use the `(group_id, child_hash, parent_hash)` primary
+        -- key at all (child_hash is not its leftmost column) and fell back
+        -- to scanning the WHOLE table -- cost proportional to every
+        -- group's total compacted history, not the one group actually
+        -- being walked.
+        CREATE INDEX IF NOT EXISTS pruned_change_parents_by_child
+            ON pruned_change_parents(child_hash);
         CREATE TABLE IF NOT EXISTS active_prune_context (
             group_id        TEXT PRIMARY KEY,
             checkpoint_hash BLOB NOT NULL
@@ -272,6 +294,29 @@ pub fn lamport_of(conn: &Connection, hash: &ChangeHash) -> Result<Option<u64>, S
         .map(|v| v as u64))
 }
 
+/// Like [`lamport_of`], but also checks `pruned_changes` -- a compacted
+/// change's own row is gone from `changes`, but its `lamport` is retained
+/// there specifically so callers like `is_ancestor`'s Lamport pre-check
+/// can still use it. No `group_id` in hand at the call site this backs
+/// (`is_ancestor` doesn't take one either); relies on
+/// `pruned_changes_by_hash` for an indexed lookup.
+fn lamport_of_including_pruned(
+    conn: &Connection,
+    hash: &ChangeHash,
+) -> Result<Option<u64>, SyncSqliteError> {
+    if let Some(l) = lamport_of(conn, hash)? {
+        return Ok(Some(l));
+    }
+    Ok(conn
+        .query_row(
+            "SELECT lamport FROM pruned_changes WHERE change_hash = ?1",
+            [&hash.0[..]],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|v| v as u64))
+}
+
 fn parent_meta(
     conn: &Connection,
     hash: &ChangeHash,
@@ -361,6 +406,103 @@ pub(crate) fn validate_present_parent_shape_parts(
         }
     }
     Ok(all_parents_present)
+}
+
+/// A parent's own `(auth_seq, auth_epoch)` authorization coordinate, for
+/// [`check_causal_auth_monotonicity_at_promotion`]. Prefers the parent's
+/// live `changes` row (decoding its full signed bytes -- this crate does
+/// not store `auth_seq`/`auth_epoch` as their own columns); falls back to
+/// [`crate::rebootstrap_store::compacted_parent_auth`]'s checkpoint-
+/// boundary record for a parent this replica itself pruned. `None` means
+/// neither source has it -- the caller must treat that as "not yet
+/// verifiable," never as "vacuously monotonic."
+fn parent_auth_coordinate(
+    conn: &Connection,
+    group_id: &str,
+    child_hash: &ChangeHash,
+    parent_hash: &ChangeHash,
+) -> Result<Option<(u64, u64)>, SyncSqliteError> {
+    let live: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT encoded FROM changes WHERE change_hash = ?1",
+            [&parent_hash.0[..]],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(encoded) = live {
+        let parent = Change::from_wire_bytes(&encoded).map_err(|error| {
+            SyncSqliteError::CorruptState(format!(
+                "cannot read causal-auth coordinate for parent {}: retained change is corrupt: {error}",
+                parent_hash.to_hex()
+            ))
+        })?;
+        return Ok(Some((parent.auth_seq, parent.auth_epoch)));
+    }
+    crate::rebootstrap_store::compacted_parent_auth(conn, group_id, child_hash, parent_hash)
+}
+
+/// Whether re-verifying `4175e8cd`'s causal-auth-monotonicity invariant (a
+/// change's pinned `(auth_seq, auth_epoch)` must be >= the max pinned by its
+/// DAG parents) against `change` succeeds, fails, or cannot yet be decided.
+///
+/// This is [`super::orphan_integrity::promote_orphans`]'s and
+/// [`super::admit_change`]'s own counterpart to `yadorilink-replica-
+/// engine::engine::PeerReplicaEngine::check_causal_auth_monotonicity`'s
+/// admission-time check: a change whose parent wasn't yet readable at first
+/// contact is now BUFFERED (an `orphan_changes` row), not discarded, so
+/// promotion -- or, for a parent already structurally present via pruning
+/// at first contact, the direct-apply branch of `admit_change` -- is the
+/// first point every parent's authorization coordinate is guaranteed
+/// resolvable. Deferring the check to here (rather than skipping it, which
+/// is what `Hold`-and-discard used to amount to) is what makes buffering
+/// safe: the exact revoked-writer-replay attack `4175e8cd` closed is still
+/// caught, just one step later, at the point admission actually happens
+/// rather than at first contact.
+pub(crate) enum CausalAuthCheck {
+    /// PLACEHOLDER-exempt, or every parent's coordinate is known and the
+    /// invariant holds.
+    Verified,
+    /// A parent's coordinate is known and the invariant is VIOLATED --
+    /// permanent and provable; the caller must reject this change, not
+    /// retry it.
+    Violated,
+    /// At least one parent's coordinate isn't resolvable yet (structurally
+    /// present via a prune with no retained checkpoint-boundary record) --
+    /// fail closed: neither admit nor reject, leave it buffered/held for a
+    /// later attempt.
+    Unresolvable,
+}
+
+pub(crate) fn check_causal_auth_monotonicity_at_promotion(
+    conn: &Connection,
+    change: &Change,
+) -> Result<CausalAuthCheck, SyncSqliteError> {
+    let incoming = (change.auth_seq, change.auth_epoch, change.policy_head_hash);
+    let placeholder = (
+        yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER.auth_seq,
+        yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER.auth_epoch,
+        yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER.policy_head_hash,
+    );
+    if incoming == placeholder {
+        return Ok(CausalAuthCheck::Verified);
+    }
+    let child_hash = change.compute_hash();
+    let mut max_seq = 0u64;
+    let mut max_epoch = 0u64;
+    for parent in &change.parents {
+        match parent_auth_coordinate(conn, change.group_id.as_str(), &child_hash, parent)? {
+            Some((seq, epoch)) => {
+                max_seq = max_seq.max(seq);
+                max_epoch = max_epoch.max(epoch);
+            }
+            None => return Ok(CausalAuthCheck::Unresolvable),
+        }
+    }
+    if change.auth_seq < max_seq || change.auth_epoch < max_epoch {
+        Ok(CausalAuthCheck::Violated)
+    } else {
+        Ok(CausalAuthCheck::Verified)
+    }
 }
 
 /// Re-checks the same parent-group/Lamport invariant for durable retained
@@ -453,32 +595,123 @@ pub fn has_change_or_pruned(
 
 /// Whether `ancestor` is a strict ancestor of `descendant` — reachable by
 /// walking retained parent edges upward from `descendant`, never equal to it.
+///
+/// 2026-09-02 (100k acceptance-run attribution): reads via a `LIMIT 1` on
+/// the outermost statement that consumes the recursive CTE (SQLite's own
+/// documented early-termination mechanism for a recursive query — see
+/// https://www.sqlite.org/lang_with.html's "outlandish recursive query
+/// examples" section — which requires `UNION ALL`, not `UNION`, and no
+/// wrapping `EXISTS`/aggregate around the CTE read) instead of
+/// accumulating the FULL ancestry set of `descendant` before an outer
+/// `EXISTS` filters it. An `EXISTS(SELECT 1 FROM ancestry WHERE hash =
+/// ?2)` wrapper — what this used to be, and what an initial fix attempt
+/// here also tried with a per-row `matched` marker column instead of a
+/// real `LIMIT` — does NOT get pushed into the recursive CTE's own
+/// termination condition in SQLite: both walked every retained ancestor
+/// of `descendant` back to the root on EVERY call, regardless of how
+/// close `ancestor` actually was (confirmed empirically: the `matched`-
+/// column attempt measured identically to the original on
+/// `dag_is_ancestor_scale_benchmark.rs`, not the expected large
+/// improvement).
+///
+/// Reconciliation calls this in a hot per-record loop
+/// (`PeerSyncSession::combined_heads`'s zero-work pre-check), and a real
+/// device's own local emission chains each new change onto the group's
+/// current head (see `dag_group_heads`) -- so a device that has made N
+/// local changes to a group has, structurally, a single chain roughly N
+/// deep, even across N unrelated files. The benchmark against a synthetic
+/// N=100,000 linear chain measured the old shape at ~840ms for an
+/// ancestor 100,000 hops away, and *~260ms even for the immediate
+/// parent* (1 hop away) -- the full backward walk ran regardless of the
+/// true distance. That single-call cost, multiplied across many claimed
+/// obligations and many scheduler ticks, is the dominant mechanism behind
+/// the 100k-scale acceptance failure (see yadorilink-harness `results/
+/// scale_evidence/large.forensic_notes.md`): one recv-loop-adjacent tokio
+/// worker thread pinned near 100% CPU with the rest of the runtime
+/// (including the SQLite connection pool) idle, and a large, never-
+/// shrinking `pending` obligation backlog on both the sender and the
+/// receiver. With this fix, the immediate-parent case above drops to
+/// sub-millisecond; the genuinely-far/absent cases are unchanged (there
+/// is no way to answer "is this far/nonexistent ancestor reachable"
+/// without walking that same distance -- this fixes the common case,
+/// not the asymptotic worst case).
+///
+/// `UNION ALL` (rather than `UNION`) means no per-step dedup and, in a
+/// graph with a cycle, no automatic termination from that alone -- safe
+/// here only because the retained history is a genuine DAG (acyclicity
+/// is an existing, independently-enforced invariant of admission; see
+/// `dag_store::admit_change`'s own structural validation), not something
+/// this function newly assumes. `WHERE edges.child_hash != ancestor` in
+/// the recursive term stops expanding past a node that has already
+/// matched (the common single-parent-chain case this fix targets); it
+/// does not stop OTHER, still-unmatched branches of a genuinely branching
+/// DAG, which is the correct, conservative behavior — a merge's other
+/// parent might still be the real answer.
 pub fn is_ancestor(
     conn: &Connection,
     ancestor: &ChangeHash,
     descendant: &ChangeHash,
 ) -> Result<bool, SyncSqliteError> {
+    // Lamport pre-check (2026-09-02, added after a 30,000-file native
+    // harness reproduction against the recursive-walk fix above still did
+    // not fully converge in a comparable-scaled time budget): a strict
+    // DAG's `lamport` is `max_parent_lamport + 1` at every edge
+    // (`Change::create_signed_with_purpose`), so a true ancestor's lamport
+    // is ALWAYS strictly less than its descendant's. `ancestor.lamport >=
+    // descendant.lamport` is therefore a sound, cheap (two indexed
+    // point lookups by `change_hash`) rejection with no graph walk at
+    // all -- and it is exactly the case the walk-based fix above cannot
+    // help: a "definitely not related" comparison between two far-apart
+    // or same-generation changes still has to walk the full distance
+    // before concluding "not found" (see this function's own doc comment
+    // on the genuinely-far/absent case being unchanged by that fix).
+    // Checks `pruned_changes` too -- a compacted ancestor's own row is
+    // gone from `changes`, but its `lamport` is preserved there for
+    // exactly this kind of query. Skipped (falls through to the walk,
+    // never a wrong answer) if either hash's lamport cannot be determined
+    // at all.
+    if let (Some(ancestor_lamport), Some(descendant_lamport)) = (
+        lamport_of_including_pruned(conn, ancestor)?,
+        lamport_of_including_pruned(conn, descendant)?,
+    ) {
+        if ancestor_lamport >= descendant_lamport {
+            return Ok(false);
+        }
+    }
     // Run the graph walk inside SQLite instead of issuing one query per
-    // visited node. Reconciliation invokes this in a hot per-record loop;
-    // the recursive UNION both deduplicates/cycle-bounds the traversal and
-    // keeps retained + compacted edges in one database round-trip.
-    let found: bool = conn.query_row(
-        "WITH RECURSIVE
-           edges(child_hash, parent_hash) AS (
-             SELECT child_hash, parent_hash FROM change_parents
-             UNION
-             SELECT child_hash, parent_hash FROM pruned_change_parents
-           ),
-           ancestry(hash) AS (
-             SELECT parent_hash FROM edges WHERE child_hash = ?1
-             UNION
-             SELECT edges.parent_hash
-             FROM edges JOIN ancestry ON edges.child_hash = ancestry.hash
-           )
-         SELECT EXISTS(SELECT 1 FROM ancestry WHERE hash = ?2)",
-        rusqlite::params![&descendant.0[..], &ancestor.0[..]],
-        |row| row.get(0),
+    // visited node. Reconciliation invokes this in a hot per-record loop.
+    //
+    // No `edges(child_hash, parent_hash) AS (... UNION ...)` intermediate
+    // CTE: an initial fix attempt kept that shape (unchanged from the
+    // original) and measured no improvement at all despite the `ancestry`
+    // recursion itself being properly LIMIT-bounded -- SQLite materializes
+    // a plain CTE that is referenced from INSIDE a recursive CTE's own
+    // definition eagerly (a temp b-tree holding the full `change_parents
+    // UNION pruned_change_parents` result) before the recursive walk ever
+    // starts, so every call still paid the full O(total edge count) cost
+    // regardless of how quickly the walk itself could otherwise terminate.
+    // Querying `change_parents`/`pruned_change_parents` directly in each
+    // recursive branch instead (two `UNION ALL` arms per level rather than
+    // one pre-unioned `edges` table) lets each step be a real indexed
+    // point lookup, which is what actually let the `LIMIT 1` below start
+    // paying off.
+    let mut stmt = conn.prepare_cached(
+        "WITH RECURSIVE ancestry(hash) AS (
+           SELECT parent_hash FROM change_parents WHERE child_hash = ?1
+           UNION ALL
+           SELECT parent_hash FROM pruned_change_parents WHERE child_hash = ?1
+           UNION ALL
+           SELECT change_parents.parent_hash
+           FROM change_parents JOIN ancestry ON change_parents.child_hash = ancestry.hash
+           WHERE ancestry.hash != ?2
+           UNION ALL
+           SELECT pruned_change_parents.parent_hash
+           FROM pruned_change_parents JOIN ancestry ON pruned_change_parents.child_hash = ancestry.hash
+           WHERE ancestry.hash != ?2
+         )
+         SELECT 1 FROM ancestry WHERE hash = ?2 LIMIT 1",
     )?;
+    let found = stmt.exists(rusqlite::params![&descendant.0[..], &ancestor.0[..]])?;
     Ok(found)
 }
 

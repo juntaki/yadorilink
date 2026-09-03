@@ -10,8 +10,11 @@
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
-    DiagnosticsExportRequest, LimitsSetRequest, PauseRequest, ResumeRequest, ShutdownRequest,
-    UnlinkRequest, UpdateCheckRequest, UpdateInstallRequest,
+    ConflictedFileInfo, DiagnosticsExportRequest, EvictRequest, FileVersionInfo, HydrateRequest,
+    LimitsSetRequest, ListConflictsRequest, ListTrashRequest, ListVersionsRequest,
+    MaterializationStatusRequest, MaterializationStatusResponse, PauseRequest, PinRequest,
+    RestoreTrashRequest, RestoreVersionRequest, ResumeRequest, ShutdownRequest, TrashedFileInfo,
+    UnlinkRequest, UnpinRequest, UpdateCheckRequest, UpdateInstallRequest,
 };
 
 use crate::ipc_client::{self, IpcError};
@@ -48,7 +51,7 @@ async fn list_link_paths() -> Result<Vec<String>, IpcError> {
         Some(RespPayload::ListLinks(list)) => {
             Ok(list.links.into_iter().map(|l| l.local_path).collect())
         }
-        _ => Ok(Vec::new()),
+        _ => Err(IpcError::DaemonError("unexpected daemon response".to_string())),
     }
 }
 
@@ -244,6 +247,135 @@ pub async fn set_bandwidth_limit(preset: BandwidthPreset) -> Result<(), IpcError
     }))
     .await?;
     Ok(())
+}
+
+/// This folder's currently-live conflicted-copy files, filtered down from
+/// `ListConflicts`' own all-links response (mirrors `list_link_paths`'
+/// established "fetch the aggregate request, filter to what this caller
+/// actually needs" shape) -- the folder-status window's Conflicts panel.
+pub async fn list_conflicts_for(local_path: &str) -> Result<Vec<ConflictedFileInfo>, IpcError> {
+    let resp = ipc_client::send(ReqPayload::ListConflicts(ListConflictsRequest {})).await?;
+    match resp.payload {
+        Some(RespPayload::ListConflicts(list)) => {
+            Ok(list.files.into_iter().filter(|f| f.local_path == local_path).collect())
+        }
+        _ => Err(IpcError::DaemonError("unexpected daemon response".to_string())),
+    }
+}
+
+/// This folder's currently-recoverable trashed files, same filtering
+/// shape as `list_conflicts_for` -- the folder-status window's Trash
+/// panel.
+pub async fn list_trash_for(local_path: &str) -> Result<Vec<TrashedFileInfo>, IpcError> {
+    let resp = ipc_client::send(ReqPayload::ListTrash(ListTrashRequest {})).await?;
+    match resp.payload {
+        Some(RespPayload::ListTrash(list)) => {
+            Ok(list.files.into_iter().filter(|f| f.local_path == local_path).collect())
+        }
+        _ => Err(IpcError::DaemonError("unexpected daemon response".to_string())),
+    }
+}
+
+/// Recovers a deleted file's last version before deletion as a new
+/// current version -- identical request `yadorilink trash restore` sends.
+pub async fn restore_trash(absolute_path: String) -> Result<(), IpcError> {
+    ipc_client::send(ReqPayload::RestoreTrash(RestoreTrashRequest { absolute_path })).await?;
+    Ok(())
+}
+
+/// Every retained version of one file, newest first including the
+/// current one -- identical request `yadorilink versions <path>` sends.
+pub async fn list_versions(absolute_path: String) -> Result<Vec<FileVersionInfo>, IpcError> {
+    let resp =
+        ipc_client::send(ReqPayload::ListVersions(ListVersionsRequest { absolute_path })).await?;
+    match resp.payload {
+        Some(RespPayload::ListVersions(list)) => Ok(list.versions),
+        _ => Err(IpcError::DaemonError("unexpected daemon response".to_string())),
+    }
+}
+
+/// Restores one file to a specific prior version (or, when `version_seq`
+/// is `None`, the most recently superseded one) -- identical request
+/// `yadorilink restore <path> [--version <id>]` sends.
+pub async fn restore_version(
+    absolute_path: String,
+    version_seq: Option<i64>,
+) -> Result<(), IpcError> {
+    ipc_client::send(ReqPayload::RestoreVersion(RestoreVersionRequest {
+        absolute_path,
+        version_seq,
+    }))
+    .await?;
+    Ok(())
+}
+
+/// One file's current materialization state and pin flag -- identical
+/// request `yadorilink materialization-status <path>` sends, the
+/// on-demand-sync selective-sync panel's read side.
+pub async fn materialization_status(
+    absolute_path: String,
+) -> Result<MaterializationStatusResponse, IpcError> {
+    let resp = ipc_client::send(ReqPayload::MaterializationStatus(MaterializationStatusRequest {
+        absolute_path,
+    }))
+    .await?;
+    match resp.payload {
+        Some(RespPayload::MaterializationStatus(status)) => Ok(status),
+        _ => Err(IpcError::DaemonError("unexpected daemon response".to_string())),
+    }
+}
+
+/// Force-hydrates a placeholder file and keeps it hydrated -- identical
+/// request `yadorilink pin <path>` sends.
+pub async fn pin_file(absolute_path: String) -> Result<(), IpcError> {
+    ipc_client::send(ReqPayload::Pin(PinRequest { absolute_path })).await?;
+    Ok(())
+}
+
+/// Allows a pinned file to become a placeholder again -- identical
+/// request `yadorilink unpin <path>` sends.
+pub async fn unpin_file(absolute_path: String) -> Result<(), IpcError> {
+    ipc_client::send(ReqPayload::Unpin(UnpinRequest { absolute_path })).await?;
+    Ok(())
+}
+
+/// Fetches a placeholder file's real content -- identical request
+/// `yadorilink hydrate <path>` sends.
+pub async fn hydrate_file(absolute_path: String) -> Result<(), IpcError> {
+    ipc_client::send(ReqPayload::Hydrate(HydrateRequest { absolute_path })).await?;
+    Ok(())
+}
+
+/// Converts a hydrated file back into a placeholder to reclaim local disk
+/// space -- identical request `yadorilink evict <path>` sends. Returns
+/// whether the file was actually dehydrated (mirrors
+/// `commands::materialization::evict`'s own `EvictResponse.dehydrated`
+/// check -- a request that silently did nothing, e.g. the file is
+/// pinned/busy/not fully synced, must never read as success).
+pub async fn evict_file(absolute_path: String) -> Result<bool, IpcError> {
+    let resp = ipc_client::send(ReqPayload::Evict(EvictRequest { absolute_path })).await?;
+    match resp.payload {
+        Some(RespPayload::Evict(evict)) => Ok(evict.dehydrated),
+        _ => Err(IpcError::DaemonError("unexpected daemon response".to_string())),
+    }
+}
+
+/// A native single-file picker scoped to start browsing inside `dir` --
+/// same rationale/platform scope as `pick_folder` above (only the two
+/// shipped desktop platforms; `rfd` has no Linux desktop target here).
+/// Used by the folder-status window's history/restore and selective-sync
+/// panels, which both operate on one file the user picks explicitly
+/// rather than a full in-app file browser (no daemon request exists to
+/// list every indexed path in a folder, and building one would be new
+/// surface, not wiring existing capability).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn pick_file_in(dir: &str) -> Option<std::path::PathBuf> {
+    rfd::FileDialog::new().set_title("Choose a file").set_directory(dir).pick_file()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn pick_file_in(_dir: &str) -> Option<std::path::PathBuf> {
+    None
 }
 
 /// A native folder-picker dialog via

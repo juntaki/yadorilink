@@ -204,6 +204,7 @@ impl LinkRuntimeFactory {
                 &root_lease,
                 Path::new(&local_path),
                 &group_id,
+                yadorilink_filesystem_sync::materialization_repair::RepairMode::Startup,
             ) {
                 Ok(report) => {
                     if !report.is_empty() {

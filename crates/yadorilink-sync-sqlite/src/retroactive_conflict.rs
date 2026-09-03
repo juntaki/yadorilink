@@ -92,8 +92,7 @@ pub fn plan_retroactive_merge(
         }));
     }
 
-    let mut paths: Vec<String> =
-        dag_store::group_history_paths(conn, group_id)?.into_iter().collect();
+    let mut paths = paths_that_can_have_concurrent_heads(conn, group_id, &parents)?;
     paths.sort();
 
     let mut direct_ops = Vec::new();
@@ -212,6 +211,111 @@ pub fn plan_retroactive_merge(
     }))
 }
 
+/// Every path that MIGHT resolve to more than one live head at `frontier`,
+/// found in a single traversal that decodes each reachable change exactly once.
+///
+/// This is a pre-filter for the planning loop above, not a change to what it
+/// decides. A path touched by at most one change reachable from the frontier
+/// can have at most one live path head, and `resolve_path_heads` derives a
+/// conflict copy only *between* two content heads carrying different version
+/// hashes -- with one head there is no "other" class to copy, and with none it
+/// resolves `Absent`. Either way the planning loop would `continue`, so
+/// dropping such a path here cannot change the plan.
+///
+/// Why it matters: `path_heads_at_frontier` below walks the frontier-reachable
+/// DAG once *per path*, decoding (and re-verifying the hash of) every change it
+/// passes. Driving that from the group's full history-path set therefore costs
+/// O(paths * reachable changes * ops per change) -- on a ~100k-file folder,
+/// hours of work, all of it inside the caller's single IMMEDIATE write
+/// transaction and therefore holding the process-wide writer gate for its whole
+/// duration, which starves every other writer in the daemon (measured: 46
+/// planning passes holding the gate for 366 of one 348-second window). Almost
+/// none of that work can find anything: an ordinary folder's paths are touched
+/// by exactly one change each, and only genuinely concurrent branches produce
+/// the multi-head shape this repair exists for. One shared traversal reduces
+/// the common case to O(reachable changes * ops per change).
+fn paths_that_can_have_concurrent_heads(
+    conn: &Connection,
+    group_id: &str,
+    frontier: &[ChangeHash],
+) -> Result<Vec<String>, SyncSqliteError> {
+    // Fast, group-scoped, fully-indexed existence check: this function can
+    // only ever find something if SOME change in this group's retained
+    // history has more than one child (a fork -- the only shape that
+    // produces two live, un-merged branches touching the same path). A
+    // linear chain (every change has at most one child, the overwhelmingly
+    // common shape for an ordinary folder with no concurrent writers) can
+    // never contain a retroactive-repair obligation, full stop -- the walk
+    // below exists only to find WHICH paths a real fork touches, not to
+    // decide WHETHER one exists.
+    //
+    // Uses `changes_by_group` to enumerate this group's own changes and
+    // `change_parents_by_parent` for the per-change child count, so this is
+    // an indexed lookup per change rather than the walk's own `read_change`
+    // (a full `Change::from_wire_bytes` decode of every ops list and
+    // signature) -- the same "stay in SQL, use the index, never decode more
+    // than the walk actually needs" shape as the `is_ancestor` fix. Still
+    // O(this group's retained changes) in the worst case (a real fork
+    // forces the full walk below regardless), but replaces N wire-decodes
+    // with N indexed COUNTs for the fork-free case this repair almost
+    // always runs into -- see this module's own measured cost above
+    // (46 planning passes holding the writer gate for 366 of one 348s
+    // window on a fork-free 30k-file group).
+    let any_fork: bool = conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM changes c
+             WHERE c.group_id = ?1
+               AND (SELECT COUNT(*) FROM change_parents cp WHERE cp.parent_hash = c.change_hash) > 1
+         )",
+        [group_id],
+        |r| r.get(0),
+    )?;
+    if !any_fork {
+        return Ok(Vec::new());
+    }
+
+    // `1` once seen, `2` once seen again -- saturating, since only "more than
+    // one" matters and the count itself is never reported.
+    let mut touch_counts: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+    let mut visited = HashSet::<[u8; 32]>::new();
+    let mut stack = frontier.to_vec();
+
+    while let Some(hash) = stack.pop() {
+        if !visited.insert(hash.0) {
+            continue;
+        }
+        // A compacted parent is a traversal boundary, exactly as in
+        // `path_heads_at_frontier`.
+        let Some(change) = read_change(conn, &hash)? else { continue };
+        // Deduplicated per change, so one change touching a path through
+        // several ops (a `Move` plus a later `Put`, say) still counts once --
+        // repeated touches by the SAME change are one head, not two.
+        let mut touched_by_this_change: HashSet<&str> = HashSet::new();
+        for op in &change.ops {
+            match op {
+                Op::Put { path, .. } | Op::Delete { path } => {
+                    touched_by_this_change.insert(path.as_str());
+                }
+                Op::Move { from, to, .. } => {
+                    touched_by_this_change.insert(from.as_str());
+                    touched_by_this_change.insert(to.as_str());
+                }
+            }
+        }
+        for path in touched_by_this_change.drain() {
+            match touch_counts.get_mut(path) {
+                Some(count) => *count = 2,
+                None => {
+                    touch_counts.insert(path.to_string(), 1);
+                }
+            }
+        }
+        stack.extend(change.parents.iter().copied());
+    }
+
+    Ok(touch_counts.into_iter().filter(|(_, count)| *count > 1).map(|(path, _)| path).collect())
+}
+
 fn path_heads_at_frontier(
     conn: &Connection,
     path: &str,
@@ -300,9 +404,10 @@ mod tests {
             0,
             FileMeta {
                 mtime_unix_nanos: mtime,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         )
     }
@@ -348,9 +453,58 @@ mod tests {
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         dag_store::init_dag_schema(&conn).unwrap();
-        crate::init_materialization_jobs_schema(&conn).unwrap();
         dag_store::init_conflict_copy_provenance_schema(&conn).unwrap();
         conn
+    }
+
+    /// Teeth for `paths_that_can_have_concurrent_heads`: a history where most
+    /// paths are touched exactly once (the shape of an ordinary folder, and of
+    /// every initial import) must still find the one genuinely forked path.
+    /// The pre-filter exists so those single-touch paths never drive a
+    /// per-path DAG walk; it must not also drop the path that needs one.
+    #[test]
+    fn a_single_forked_path_is_still_planned_among_many_single_touch_paths() {
+        let conn = setup();
+        let root_version = version(1);
+        let a_version = version(2);
+        let b_version = version(3);
+        let bystander_version = version(4);
+        for value in [&root_version, &a_version, &b_version, &bystander_version] {
+            dag_store::put_file_version(&conn, GROUP, value).unwrap();
+        }
+
+        let root = put_change(Vec::new(), 0, "root", &root_version, &key(9));
+        admit(&conn, &root);
+        // Many paths that only ever appear once, chained off the root.
+        let mut tip = root.compute_hash();
+        let mut tip_lamport = root.lamport;
+        for i in 0..25 {
+            let change = put_change_at(
+                &format!("bystander-{i:03}.bin"),
+                vec![tip],
+                tip_lamport,
+                "device-a",
+                &bystander_version,
+                &key(1),
+            );
+            admit(&conn, &change);
+            tip = change.compute_hash();
+            tip_lamport = change.lamport;
+        }
+        // Two concurrent writers of the SAME path, neither descending from the
+        // other: the only real obligation in this history.
+        let a = put_change(vec![tip], tip_lamport, "device-a", &a_version, &key(1));
+        admit(&conn, &a);
+        let b = put_change(vec![tip], tip_lamport, "device-b", &b_version, &key(2));
+        admit(&conn, &b);
+
+        let plan = plan_retroactive_merge(&conn, GROUP).unwrap().expect_plan();
+        assert_eq!(
+            plan.source_paths,
+            vec![PATH.to_string()],
+            "the forked path must be planned, and only it"
+        );
+        assert_eq!(plan.obligations.len(), 1, "exactly one loser to preserve: {plan:?}");
     }
 
     #[test]
@@ -435,19 +589,11 @@ mod tests {
                 )
             })
             .expect("the carrier must durably preserve late B");
-        let Op::Put { path: conflict_path, version, .. } = conflict_op else {
+        let Op::Put { version, .. } = conflict_op else {
             unreachable!();
         };
         assert_eq!(*version, b_version.version_hash);
 
-        let job_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM materialization_jobs WHERE group_id = ?1 AND path = ?2",
-                rusqlite::params![GROUP, conflict_path.as_str()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(job_count, 1, "carrier and materialization job must commit together");
         assert_eq!(dag_store::group_heads(&conn, GROUP).unwrap(), vec![carrier.compute_hash()]);
         assert!(
             plan_retroactive_merge(&conn, GROUP).unwrap().expect_plan().direct_ops.is_empty(),
@@ -661,6 +807,236 @@ mod tests {
                      is oversized"
                 );
             }
+        }
+    }
+
+    /// Attribution benchmark for the 2026-09-02 30k device-A-fix acceptance
+    /// run (a real gpu-box `many_small_files` reproduction whose `a.log`
+    /// showed `repair_retroactive_conflict_copy_obligations`'s own
+    /// `write_immediate` transaction -- `replica_coordinator.rs:722`, wired
+    /// straight through to this module's `plan_retroactive_merge` --
+    /// escalating from 682ms to 57,263ms held across 13 samples over ~6
+    /// minutes, holding the process-wide writer gate for the whole span).
+    ///
+    /// Realistic shape: one device sequentially admits N single-file `Put`
+    /// changes, each to its OWN path, each chained onto the group's current
+    /// head (`dag_group_heads`) exactly like real local capture does -- a
+    /// linear chain of depth N with zero forks, the overwhelmingly common
+    /// case (an ordinary folder with no concurrent writer) and exactly the
+    /// shape the failing run hit. `pre_fix_walk_only` duplicates
+    /// `paths_that_can_have_concurrent_heads`'s walk from before the
+    /// group-scoped fork-existence fast path was added (2026-09-02) --
+    /// kept here ONLY to quantify the fix, never called from production
+    /// code.
+    mod scale_benchmark {
+        use super::*;
+        use std::time::Instant;
+
+        /// Pre-fix shape of `paths_that_can_have_concurrent_heads`: walks
+        /// every change reachable from `frontier` back to the retained
+        /// boundary, decoding each one, with no way to conclude "no fork
+        /// exists" short of walking the whole reachable set. See this
+        /// module's own current `paths_that_can_have_concurrent_heads` for
+        /// the fixed version (a group-scoped, indexed fork-existence check
+        /// short-circuits this walk entirely when the group's retained
+        /// history has never forked).
+        fn pre_fix_walk_only(
+            conn: &Connection,
+            frontier: &[ChangeHash],
+        ) -> Result<Vec<String>, SyncSqliteError> {
+            let mut touch_counts: std::collections::HashMap<String, u8> =
+                std::collections::HashMap::new();
+            let mut visited = HashSet::<[u8; 32]>::new();
+            let mut stack = frontier.to_vec();
+            while let Some(hash) = stack.pop() {
+                if !visited.insert(hash.0) {
+                    continue;
+                }
+                let Some(change) = read_change(conn, &hash)? else { continue };
+                let mut touched_by_this_change: HashSet<&str> = HashSet::new();
+                for op in &change.ops {
+                    match op {
+                        Op::Put { path, .. } | Op::Delete { path } => {
+                            touched_by_this_change.insert(path.as_str());
+                        }
+                        Op::Move { from, to, .. } => {
+                            touched_by_this_change.insert(from.as_str());
+                            touched_by_this_change.insert(to.as_str());
+                        }
+                    }
+                }
+                for path in touched_by_this_change.drain() {
+                    match touch_counts.get_mut(path) {
+                        Some(count) => *count = 2,
+                        None => {
+                            touch_counts.insert(path.to_string(), 1);
+                        }
+                    }
+                }
+                stack.extend(change.parents.iter().copied());
+            }
+            Ok(touch_counts
+                .into_iter()
+                .filter(|(_, count)| *count > 1)
+                .map(|(path, _)| path)
+                .collect())
+        }
+
+        /// Seeds a fork-free linear chain of `n` single-file local `Put`s
+        /// directly into `changes`/`change_parents`/`group_heads`, matching
+        /// `retained_history_integrity::append_change`'s own insert shape
+        /// exactly -- but skipping `dag_store::admit_change`'s validation
+        /// (causal-auth monotonicity, conflict-copy carrier checks,
+        /// execution-fence/projection-obligation bumps), which is
+        /// irrelevant to what this benchmark measures and dominates the
+        /// seed-phase cost for no benefit at N in the tens of thousands
+        /// (mirrors `dag_is_ancestor_scale_benchmark.rs`'s own
+        /// `seed_linear_chain` for exactly this reason). Each change is
+        /// still a genuine, validly-signed `Change` (`to_wire_bytes`
+        /// round-trips through `read_change`/`Change::from_wire_bytes`
+        /// exactly like production data), so `pre_fix_walk_only`'s decode
+        /// step exercises the real wire format, not a stub.
+        fn seed_fork_free_chain(conn: &Connection, n: u64) -> Vec<ChangeHash> {
+            let v = version(1);
+            dag_store::put_file_version(conn, GROUP, &v).unwrap();
+            let signing_key = key(7);
+
+            let insert_direct = |change: &Change| {
+                let hash = change.compute_hash();
+                conn.execute(
+                    "INSERT INTO changes \
+                     (change_hash, group_id, device_id, lamport, encoded, applied, \
+                      authenticated_header) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+                    rusqlite::params![
+                        &hash.0[..],
+                        change.group_id.as_str(),
+                        change.device_id.as_str(),
+                        change.lamport as i64,
+                        change.to_wire_bytes(),
+                        change.authenticated_header_encoding(),
+                    ],
+                )
+                .unwrap();
+                for parent in &change.parents {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO change_parents (child_hash, parent_hash) \
+                         VALUES (?1, ?2)",
+                        rusqlite::params![&hash.0[..], &parent.0[..]],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "DELETE FROM group_heads WHERE group_id = ?1 AND change_hash = ?2",
+                        rusqlite::params![change.group_id.as_str(), &parent.0[..]],
+                    )
+                    .unwrap();
+                }
+                conn.execute(
+                    "INSERT OR IGNORE INTO group_heads (group_id, change_hash) VALUES (?1, ?2)",
+                    rusqlite::params![change.group_id.as_str(), &hash.0[..]],
+                )
+                .unwrap();
+                hash
+            };
+
+            let root = put_change_at("f0000000.bin", Vec::new(), 0, "device-a", &v, &signing_key);
+            let mut tip = insert_direct(&root);
+            let mut tip_lamport = root.lamport;
+            for i in 1..n {
+                let change = put_change_at(
+                    &format!("f{i:07}.bin"),
+                    vec![tip],
+                    tip_lamport,
+                    "device-a",
+                    &v,
+                    &signing_key,
+                );
+                tip_lamport = change.lamport;
+                tip = insert_direct(&change);
+            }
+            vec![tip]
+        }
+
+        fn bench_one_scale(n: u64) {
+            let conn = setup();
+            let seed_started = Instant::now();
+            let frontier = seed_fork_free_chain(&conn, n);
+            let seed_elapsed = seed_started.elapsed();
+
+            let t = Instant::now();
+            let before = pre_fix_walk_only(&conn, &frontier).unwrap();
+            let before_elapsed = t.elapsed();
+            assert!(before.is_empty(), "sanity: a fork-free chain has no concurrent paths");
+
+            let t = Instant::now();
+            let after = paths_that_can_have_concurrent_heads(&conn, GROUP, &frontier).unwrap();
+            let after_elapsed = t.elapsed();
+            assert!(after.is_empty(), "sanity: a fork-free chain has no concurrent paths");
+
+            let t = Instant::now();
+            let plan = plan_retroactive_merge(&conn, GROUP).unwrap().expect_plan();
+            let plan_elapsed = t.elapsed();
+            assert!(plan.source_paths.is_empty(), "sanity: nothing to repair in a fork-free chain");
+
+            println!(
+                "n={n:>6}  seed={seed_elapsed:>10.2?}  BEFORE(walk-only)={before_elapsed:>10.2?}  \
+                 AFTER(fast-path)={after_elapsed:>10.2?}  \
+                 plan_retroactive_merge={plan_elapsed:>10.2?}"
+            );
+        }
+
+        /// Run with:
+        ///   cargo test -p yadorilink-sync-sqlite --lib \
+        ///     retroactive_conflict::tests::scale_benchmark:: \
+        ///     plan_retroactive_merge_latency_vs_chain_depth \
+        ///     -- --ignored --nocapture --test-threads=1
+        #[test]
+        #[ignore = "scale benchmark, not a correctness test -- see module doc comment"]
+        fn plan_retroactive_merge_latency_vs_chain_depth() {
+            for n in [1_000u64, 5_000, 15_000, 30_000] {
+                bench_one_scale(n);
+            }
+        }
+
+        /// Deterministic regression guard (not ignored -- runs in the
+        /// default suite). Both the pre-fix walk and the post-fix
+        /// group-scoped existence check are O(this group's retained
+        /// change count) -- the fix does not make this O(1), and does not
+        /// claim to (see this module's own scale_benchmark doc comment and
+        /// `plan_retroactive_merge_latency_vs_chain_depth`'s own measured
+        /// numbers: BEFORE/AFTER both grow roughly linearly with n, but
+        /// AFTER stays a consistent ~17-18x cheaper at every measured
+        /// scale -- 26.46ms->1.44ms at n=1,000 up to 815.24ms->49.00ms at
+        /// n=30,000 -- because it replaces N `Change::from_wire_bytes`
+        /// decodes with N indexed `change_parents` COUNTs). That constant-
+        /// factor win is what matters here: the real 30k run's own
+        /// pathology was many REPEATED per-call walks as the group's
+        /// history kept growing between polls (682ms -> 57,263ms across 13
+        /// samples), so a per-call constant-factor cut of this size cuts
+        /// the same cumulative cost by roughly the same factor. 200ms is a
+        /// huge margin below the pre-fix walk's own cost at n=20,000
+        /// (~550ms extrapolated) and a huge margin above the post-fix cost
+        /// (~33ms extrapolated), so this only fails if the expensive decode
+        /// path comes back for a fork-free chain.
+        #[test]
+        fn concurrent_heads_check_for_a_fork_free_chain_avoids_the_pre_fix_decode_cost() {
+            let conn = setup();
+            let n = 20_000u64;
+            let frontier = seed_fork_free_chain(&conn, n);
+
+            let t = Instant::now();
+            let paths = paths_that_can_have_concurrent_heads(&conn, GROUP, &frontier).unwrap();
+            let elapsed = t.elapsed();
+
+            assert!(paths.is_empty(), "sanity: a fork-free chain has no concurrent paths");
+            assert!(
+                elapsed.as_millis() < 200,
+                "paths_that_can_have_concurrent_heads against a {n}-deep FORK-FREE chain took \
+                 {elapsed:?} -- expected a low-double-digit-millisecond indexed existence check \
+                 at this depth, nowhere near the pre-fix decode-every-change walk's own cost. \
+                 See this module's own scale_benchmark doc comment for the 682ms->57,263ms \
+                 production escalation this guards against."
+            );
         }
     }
 }

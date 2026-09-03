@@ -231,8 +231,8 @@ use sha2::{Digest, Sha256};
 use yadorilink_local_storage::BlockStore;
 
 use yadorilink_local_storage::{
-    block_size_for, owner_exec_bit_from_metadata, StorageError, CDC_AVG_SIZE, CDC_MAX_SIZE,
-    CDC_MIN_SIZE, CDC_SIZE_THRESHOLD,
+    block_size_for, read_replicated_xattrs, unix_mode_from_metadata, StorageError, CDC_AVG_SIZE,
+    CDC_MAX_SIZE, CDC_MIN_SIZE, CDC_SIZE_THRESHOLD,
 };
 use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::file::{BlockInfo, RecordKind};
@@ -424,8 +424,18 @@ fn classify_symlink(
         size,
         mtime_unix_nanos,
         RecordKind::Symlink,
-        false,
+        // A symlink carries no permission bits of its own in this identity
+        // model -- matches `local_change.rs`'s `metadata_columns_for`'s own
+        // symlink branch (`None`, not a captured value), so the same
+        // symlink produces the same identity regardless of which capture
+        // path (this bulk scan vs. the ordinary watch-driven path) saw it
+        // first.
+        None,
         Some(target_bytes),
+        // Xattrs are not scanned for a symlink either, for the identical
+        // reason -- always empty, agreeing with `local_change.rs`'s own
+        // symlink branch.
+        Vec::new(),
     );
 
     Ok(SinglePassClassification { fingerprint, file_version })
@@ -457,7 +467,11 @@ fn classify_single_pass_handle(
     }
 
     let metadata = identity_handle.metadata()?;
-    let exec_bit = owner_exec_bit_from_metadata(&metadata);
+    let unix_mode = unix_mode_from_metadata(&metadata);
+    // Read from `identity_handle`, the same already-open handle `unix_mode`
+    // itself is derived from -- never a fresh path lookup, matching this
+    // function's own "same-handle guarantee" for everything else it reads.
+    let xattrs = read_replicated_xattrs(&identity_handle);
     let mtime_unix_nanos = metadata
         .modified()
         .ok()
@@ -497,8 +511,9 @@ fn classify_single_pass_handle(
         offset,
         mtime_unix_nanos,
         RecordKind::File,
-        exec_bit,
+        unix_mode,
         None,
+        xattrs,
     );
 
     Ok(SinglePassClassification { fingerprint, file_version })
@@ -624,7 +639,7 @@ mod tests {
         fs::write(&src_path, content).unwrap();
 
         // Same metadata source for both paths -- `classify_single_pass`
-        // derives `mtime_unix_nanos`/`exec_bit` from the file's real
+        // derives `mtime_unix_nanos`/`unix_mode` from the file's real
         // metadata, so this test must feed the existing, independent path
         // the same real values rather than placeholders, or a difference
         // there (not in the block/version-hash logic under test) would
@@ -636,7 +651,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as i64;
-        let real_exec_bit = owner_exec_bit_from_metadata(&real_metadata);
+        let real_unix_mode = unix_mode_from_metadata(&real_metadata);
 
         let store_a_dir = tempfile::tempdir().unwrap();
         let store_a = FsBlockStore::new(store_a_dir.path()).unwrap();
@@ -646,8 +661,9 @@ mod tests {
             content.len() as u64,
             real_mtime_unix_nanos,
             RecordKind::File,
-            real_exec_bit,
+            real_unix_mode,
             None,
+            Vec::new(),
         );
 
         let store_b_dir = tempfile::tempdir().unwrap();
@@ -911,8 +927,9 @@ mod tests {
             expected_target.len() as u64,
             expected_mtime,
             RecordKind::Symlink,
-            false,
+            None,
             Some(expected_target.clone()),
+            Vec::new(),
         );
 
         assert_eq!(classification.file_version.blocks, Vec::new());

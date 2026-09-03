@@ -186,8 +186,24 @@ pub fn verify_delete_target_within_canonical_root(
 /// purely local write with no wire-carried authored time). Shared by
 /// `write_placeholder` and `reconstruct_file` so every materialization write
 /// — sparse placeholder or real content alike — stamps the on-disk mtime the
-/// same way. Some filesystems/platforms don't support setting mtime this
-/// way; that is cosmetic, not a correctness issue, so failures are ignored.
+/// same way.
+///
+/// A `set_times` failure here (some filesystems/platforms don't support
+/// setting mtime at all, or only at coarser precision) is silently
+/// ignored, not propagated -- this is `mtime`'s retained-only treatment
+/// (see `SettlementEvidence::ExactObject`'s own doc comment for the full
+/// target-projection-contract model this and every other metadata field
+/// follows): `mtime_unix_nanos` stays authoritative in the LOGICAL
+/// version (`version_hash`) regardless of whether this stamp lands, and
+/// nothing downstream currently strict-verifies disk mtime against it,
+/// so a failed stamp never blocks completion. It is not, however,
+/// unimportant when it succeeds: `reconstruct_file`'s own doc comment
+/// below explains a real, separate mechanism (`local_change.rs`'s
+/// self-echo-suppression fast path) that this stamp landing correctly
+/// makes cheaper -- a failure just means that one fast path doesn't
+/// fire for this file, falling through to the slower but still-correct
+/// content-hash comparison a few steps further down the same function,
+/// not that anything becomes wrong.
 fn stamp_mtime(file: &fs::File, mtime_unix_nanos: i64) {
     if mtime_unix_nanos >= 0 {
         let mtime = std::time::SystemTime::UNIX_EPOCH
@@ -195,6 +211,62 @@ fn stamp_mtime(file: &fs::File, mtime_unix_nanos: i64) {
         let times = fs::FileTimes::new().set_modified(mtime);
         let _ = file.set_times(times);
     }
+}
+
+/// [`stamp_mtime`]'s path-based counterpart, for a caller (a metadata-
+/// only fast path that never opens its own fresh `File` handle the way
+/// `reconstruct_file`/`write_placeholder` do mid-write) that only has
+/// `path` to work with. Best-effort in exactly the same way: a
+/// `set_times` failure is silently ignored, never propagated -- see
+/// `stamp_mtime`'s own doc comment for the target-projection-contract
+/// reasoning (mtime is retained-only, not exact-required, on every
+/// target today). Only the leading `File::open` can fail here, and that
+/// failure IS propagated: a metadata-only fast path only ever calls this
+/// after already confirming the path exists, so an open failure at this
+/// point is a genuine anomaly, not an expected "this target can't do
+/// this" outcome.
+pub fn stamp_mtime_at_path(path: &Path, mtime_unix_nanos: i64) -> Result<(), StorageError> {
+    let file = fs::File::open(path)?;
+    stamp_mtime(&file, mtime_unix_nanos);
+    Ok(())
+}
+
+/// Whether `path`'s on-disk mtime already equals `desired_mtime_unix_
+/// nanos` -- a pure, read-only comparison with no side effects, the
+/// mtime counterpart of `unix_mode_already_matches_disk`/`xattrs_
+/// already_match_disk`. Exists so a caller that must bump a physical-
+/// mutation fence before its first real mutating syscall (never after)
+/// can decide whether attempting `stamp_mtime_at_path` would actually
+/// change anything, before committing to either it or a fence bump --
+/// this is purely a fence-bump-correctness concern, NOT a completion
+/// gate: mtime stays retained-only (see `SettlementEvidence::
+/// ExactObject`'s own doc comment), so this function's result never
+/// blocks `ExactObject` from being constructed, only decides whether the
+/// stamp attempt below it needs a preceding bump.
+///
+/// A negative `desired_mtime_unix_nanos` (the "no authoritative mtime to
+/// stamp" sentinel `stamp_mtime` itself also honors) trivially matches:
+/// there is nothing to compare against, the same "not applicable, so
+/// nothing to enforce" treatment `unix_mode_already_matches_disk` gives
+/// `unix_mode: None`. A pre-1970 on-disk mtime (which a non-negative
+/// desired value can never equal) is treated as a mismatch rather than
+/// an error -- letting the caller attempt (and, being best-effort,
+/// harmlessly fail or succeed at) a real stamp rather than surfacing a
+/// hard error for what is, at most, a stale/unusual timestamp already on
+/// disk.
+pub fn mtime_already_matches_disk(
+    path: &Path,
+    desired_mtime_unix_nanos: i64,
+) -> Result<bool, StorageError> {
+    if desired_mtime_unix_nanos < 0 {
+        return Ok(true);
+    }
+    let modified = fs::metadata(path)?.modified()?;
+    let actual_nanos = match modified.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as i64,
+        Err(_) => return Ok(false),
+    };
+    Ok(actual_nanos == desired_mtime_unix_nanos)
 }
 
 /// Reconstructs a file at `out_path` from `blocks`, reading each block's
@@ -221,15 +293,39 @@ pub fn reconstruct_file(
     blocks: &[BlockInfo],
     mtime_unix_nanos: i64,
 ) -> Result<(), StorageError> {
+    let tmp_path = reconstruct_file_to_temp(store, out_path, blocks, mtime_unix_nanos)?;
+    persist_reconstructed_file(&tmp_path, out_path)
+}
+
+/// The "assemble" half of [`reconstruct_file`]: reads `blocks` from `store`
+/// and writes them, concatenated, into a fresh, durably-fsynced temp file
+/// near `out_path` (same directory, so a later rename can be atomic on the
+/// same filesystem) -- WITHOUT touching `out_path` itself at all. Returns
+/// the temp file's path.
+///
+/// Split out (C4-6: receiver-side materialization batching) so a caller
+/// that needs to defer the final publish -- e.g. to batch several paths'
+/// SQLite commits together before any of them become visible on disk --
+/// can do the slow part (this function: network-fetch-bound block reads)
+/// without holding that path's lock, then take the lock only for the fast
+/// [`persist_reconstructed_file`] half. Callers with no such need should
+/// keep calling [`reconstruct_file`], which does both steps exactly as
+/// before -- this split changes no behavior for them.
+///
+/// On any failure (a block-store read error mid-loop, a short write), the
+/// temp file is removed so an interrupted assemble leaves the directory as
+/// it found it -- the caller never receives a `tmp_path` for a file that
+/// only partially exists.
+pub fn reconstruct_file_to_temp(
+    store: &dyn BlockContentStore,
+    out_path: &Path,
+    blocks: &[BlockInfo],
+    mtime_unix_nanos: i64,
+) -> Result<PathBuf, StorageError> {
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent)?;
     }
     let tmp_path = unique_tmp_path(out_path);
-    // Assemble into the temp file, then atomically rename it into place. Any
-    // failure along the way (a block-store read error mid-loop, a short write,
-    // a failed rename) must not leave the orphaned `.yadorilink-tmp.*` file
-    // behind. Remove it on every error path so an interrupted reconstruct
-    // leaves the directory as it found it.
     let assemble = || -> Result<(), StorageError> {
         let mut out = fs::File::create(&tmp_path)?;
         for block in blocks {
@@ -237,6 +333,14 @@ pub fn reconstruct_file(
             let data = store.get(&hash_hex)?;
             std::io::Write::write_all(&mut out, &data)?;
         }
+        // M6-2: receiver-side phase timing (see hydration.rs's own M6PHASE
+        // lines for the daemon-level points either side of this function).
+        // This function is shared with the version-restore materialization
+        // path, not only on-demand hydration -- a phase-log reader
+        // interested specifically in a bulk-transfer receiver run should
+        // anchor these against `T_recv_materialize_start`, which only the
+        // hydration path emits.
+        tracing::warn!("M6PHASE T_recv_write_done: final-file write complete (all blocks written to the temp file)");
         // Stamp the mtime before the final `sync_all`/rename below, so a
         // reader that observes the renamed-into-place file always also
         // observes its final mtime — no window where the file is visible
@@ -246,15 +350,42 @@ pub fn reconstruct_file(
         // durable across power loss. Persist the complete temp before the
         // rename can publish it under the user-visible path.
         out.sync_all()?;
+        tracing::warn!("M6PHASE T_recv_fsync_done: final-file fsync complete");
         Ok(())
         // `out` is dropped (closed) here, before the rename below.
     };
-    if let Err(e) = assemble().and_then(|()| {
-        rename_path(&tmp_path, out_path)?;
-        sync_parent_directory(out_path)?;
-        Ok(())
-    }) {
+    if let Err(e) = assemble() {
         let _ = remove_path(&tmp_path);
+        return Err(e);
+    }
+    Ok(tmp_path)
+}
+
+/// The "publish" half of [`reconstruct_file`]: atomically renames an
+/// already-assembled temp file (from [`reconstruct_file_to_temp`]) into
+/// place at `out_path`, then syncs the parent directory. Fast (one rename,
+/// one directory fsync) and does no network/block-store I/O -- the
+/// intended boundary for a caller that wants to hold a path's lock across
+/// only this short step, not the slower assemble step above.
+///
+/// On any failure, removes `tmp_path` so an interrupted publish leaves the
+/// directory as it found it. `tmp_path` must not be reused after this
+/// returns, whether it succeeds or fails.
+pub fn persist_reconstructed_file(tmp_path: &Path, out_path: &Path) -> Result<(), StorageError> {
+    let publish = || -> Result<(), StorageError> {
+        rename_path(tmp_path, out_path)?;
+        tracing::warn!("M6PHASE T_recv_rename_done: temp-file-to-final-path rename complete");
+        sync_parent_directory(out_path)?;
+        // On Unix this is a real parent-directory fsync (see `sync_parent_
+        // directory`'s own doc comment); on non-Unix it is a documented
+        // no-op, so this line still fires there but measures nothing real
+        // -- a phase-log reader on a non-Unix capture should read this
+        // span as "step skipped," not "step free."
+        tracing::warn!("M6PHASE T_recv_dir_fsync_done: parent-directory fsync complete (or skipped, non-Unix)");
+        Ok(())
+    };
+    if let Err(e) = publish() {
+        let _ = remove_path(tmp_path);
         return Err(e);
     }
     Ok(())
@@ -521,17 +652,163 @@ pub fn mint_windows_placeholder_generation() -> u64 {
     counter.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Sets/clears the owner-exec bit on an already-materialized file. A no-op
-/// on any non-Unix platform (Windows has no equivalent owner-exec
-/// permission bit, so this must be silent there, not an error).
+/// Whether [`apply_unix_mode`] would need to perform a real
+/// `set_permissions` syscall for `path` given the desired `unix_mode` -- a
+/// pure, read-only comparison against what disk currently holds, with no
+/// side effects. `true` means calling `apply_unix_mode` right now would be
+/// a genuine no-op; `false` means it would actually change something.
+/// Exists so a caller that must bump a physical-mutation fence before its
+/// first real mutating syscall (never after) can decide whether it needs
+/// to bump at all, before committing to either `apply_unix_mode` or a
+/// fence bump.
 #[cfg(unix)]
-pub fn apply_exec_bit(path: &Path, exec_bit: bool) -> Result<(), StorageError> {
+pub fn unix_mode_already_matches_disk(path: &Path, unix_mode: Option<u32>) -> Result<bool, StorageError> {
     use std::os::unix::fs::PermissionsExt;
-    const OWNER_EXEC: u32 = 0o100;
+    const PERMISSION_BITS: u32 = 0o777;
+    let Some(unix_mode) = unix_mode else {
+        return Ok(true);
+    };
+    let metadata = fs::metadata(path)?;
+    let mode = metadata.permissions().mode();
+    Ok((mode & PERMISSION_BITS) == (unix_mode & PERMISSION_BITS))
+}
+
+/// See the `#[cfg(unix)]` `unix_mode_already_matches_disk` above --
+/// `apply_unix_mode` is already a no-op off Unix, so it never needs a
+/// fence bump either.
+///
+/// Target projection contract (see `SettlementEvidence::ExactObject`'s
+/// own doc comment for the full model): `unix_mode` is retained-only on
+/// a non-Unix target, not exact-required. This function's own `Ok(true)`
+/// is that retained-only status expressed as "no mutation needed," which
+/// is also, deliberately, exactly what an exact-required field reports
+/// once it genuinely already matches -- a caller cannot tell "nothing to
+/// verify here" from "verified and it matches" from this return value
+/// alone, and does not need to: either way, this field never blocks
+/// `ExactObject` completion on this platform.
+#[cfg(not(unix))]
+pub fn unix_mode_already_matches_disk(_path: &Path, _unix_mode: Option<u32>) -> Result<bool, StorageError> {
+    Ok(true)
+}
+
+/// Whether [`apply_xattrs`] would need to perform any real
+/// `fsetxattr`/`fremovexattr` syscall for `path` given the desired
+/// `xattrs` -- the xattr counterpart of `unix_mode_already_matches_disk`,
+/// for the same reason. Reuses `chunker::read_replicated_xattrs`, the same
+/// read side `apply_xattrs` itself is the write-side counterpart to, so
+/// the two can never disagree about which names/values are "replicated"
+/// ones.
+#[cfg(target_os = "linux")]
+pub fn xattrs_already_match_disk(path: &Path, xattrs: &[(String, Vec<u8>)]) -> Result<bool, StorageError> {
+    let file = fs::File::open(path)?;
+    let mut current = crate::chunker::read_replicated_xattrs(&file);
+    let mut desired = xattrs.to_vec();
+    current.sort();
+    desired.sort();
+    Ok(current == desired)
+}
+
+/// See the `#[cfg(target_os = "linux")]` `xattrs_already_match_disk` above
+/// -- `apply_xattrs` is already a no-op off Linux, so it never needs a
+/// fence bump either.
+#[cfg(not(target_os = "linux"))]
+pub fn xattrs_already_match_disk(_path: &Path, _xattrs: &[(String, Vec<u8>)]) -> Result<bool, StorageError> {
+    Ok(true)
+}
+
+/// The `ExactObject` proof gate: whether `path`'s on-disk replicated
+/// extended attributes exactly equal `desired`, verified strictly. This
+/// is NOT `xattrs_already_match_disk` -- that function exists only to
+/// choose snapshot-vs-bump before any mutation and reuses
+/// `read_replicated_xattrs`'s best-effort reader, which silently folds a
+/// real enumeration/read failure into "no attributes" (fine for deciding
+/// whether a mutating syscall is needed, since falling through to
+/// actually attempt the syscalls is always safe). An `ExactObject`
+/// completion proof has no such fallback available: publishing it means
+/// claiming disk demonstrably holds this exact desired version, and
+/// `FileVersion`'s content-addressed identity bakes replicated xattr
+/// bytes directly into `version_hash` (see `FileVersion::compute_hash`)
+/// -- so a caller that cannot actually confirm the attributes match must
+/// never be allowed to read that failure as a match.
+///
+/// Returns `Ok(true)`/`Ok(false)` for a confirmed match/mismatch, and
+/// `Err` when this backend cannot even attempt the comparison -- a real
+/// I/O failure enumerating or reading an attribute (this Linux arm
+/// only; the non-Linux arm below has no replicated-xattr backend to
+/// fail reading from in the first place, and always settles as
+/// retained-only -- see its own doc comment). Every caller gating
+/// `SettlementEvidence::ExactObject` on this Linux arm's `Err` must
+/// treat it exactly like `Ok(false)`: leave the obligation outstanding
+/// for retry, never propagate it as a hard failure of the write itself
+/// (the content and any other metadata this call's caller already
+/// applied are still genuinely on disk).
+///
+/// `path` is opened with ordinary, symlink-following semantics -- correct
+/// (and required, to still catch a genuine stale attribute) for a
+/// `RecordKind::File` whose `desired` may legitimately be empty, but
+/// wrong for a symlink or directory path, which `FileMeta::xattrs`'s own
+/// doc says is never scanned at all (always an empty `desired`) and
+/// which may not even have a followable target (a dangling symlink is
+/// perfectly valid). Callers must only invoke this for `RecordKind::
+/// File`; skip it entirely for every other kind rather than passing an
+/// empty `desired` and relying on this function to no-op.
+#[cfg(target_os = "linux")]
+pub fn verify_replicated_xattrs_exact(path: &Path, desired: &[(String, Vec<u8>)]) -> Result<bool, StorageError> {
+    let file = fs::File::open(path)?;
+    let mut current = crate::chunker::read_replicated_xattrs_strict(&file)?;
+    let mut desired = desired.to_vec();
+    current.sort();
+    desired.sort();
+    Ok(current == desired)
+}
+
+/// Off Linux, replicated-xattr support does not exist at all (see
+/// `apply_xattrs`'s own non-Linux stub, which never writes anything).
+///
+/// Design decision (target projection contract, see `SettlementEvidence::
+/// ExactObject`'s own doc comment for the full model): a version's
+/// `xattrs` stay part of its authoritative logical identity
+/// (`VersionHash`) everywhere, but whether they are a REQUIRED-exact
+/// projection field or a RETAINED-only one (present in the logical
+/// version, but this target is never asked to physically reproduce it)
+/// is target-specific. On a backend with no replicated-xattr support at
+/// all, xattrs are always retained-only -- exactly the same "this
+/// target cannot represent it, so completion does not wait on it"
+/// treatment `unix_mode_already_matches_disk`'s own non-Unix arm already
+/// gives `unix_mode`. An earlier version of this function treated a
+/// nonempty desired set as permanently unrepresentable and refused to
+/// ever settle -- correct under the OLD "ExactObject means literal
+/// field-for-field equality" model, but wrong under this one: it left a
+/// path with any replicated attribute permanently un-completable on any
+/// non-Linux target, for a field this target was never expected to
+/// physically reproduce in the first place.
+#[cfg(not(target_os = "linux"))]
+pub fn verify_replicated_xattrs_exact(_path: &Path, _desired: &[(String, Vec<u8>)]) -> Result<bool, StorageError> {
+    Ok(true)
+}
+
+/// Sets the replicated permission bits (`REPLICATED_MODE_MASK`,
+/// owner/group/other read-write-execute) on an already-materialized file.
+/// `None` -- the authoring version carries no Unix permission info, i.e. it
+/// was authored on a platform with no Unix mode model -- is a deliberate
+/// no-op: this device does not fabricate a mode for a peer that never had
+/// one, it leaves whatever mode the write already produced (the process's
+/// own umask-derived default). Only the low 9 permission bits are ever
+/// touched; any higher bits (file type, setuid/setgid/sticky) already on
+/// disk are preserved untouched. A no-op on any non-Unix platform (Windows
+/// has no equivalent permission-bits model, so this must be silent there,
+/// not an error).
+#[cfg(unix)]
+pub fn apply_unix_mode(path: &Path, unix_mode: Option<u32>) -> Result<(), StorageError> {
+    use std::os::unix::fs::PermissionsExt;
+    const PERMISSION_BITS: u32 = 0o777;
+    let Some(unix_mode) = unix_mode else {
+        return Ok(());
+    };
     let metadata = fs::metadata(path)?;
     let mut perms = metadata.permissions();
     let mode = perms.mode();
-    let new_mode = if exec_bit { mode | OWNER_EXEC } else { mode & !OWNER_EXEC };
+    let new_mode = (mode & !PERMISSION_BITS) | (unix_mode & PERMISSION_BITS);
     if new_mode != mode {
         perms.set_mode(new_mode);
         fs::set_permissions(path, perms)?;
@@ -539,10 +816,96 @@ pub fn apply_exec_bit(path: &Path, exec_bit: bool) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// See the `#[cfg(unix)]` `apply_exec_bit` above — the no-op
+/// See the `#[cfg(unix)]` `apply_unix_mode` above — the no-op
 /// Windows/other-platform counterpart needed for cross-platform parity.
+/// `unix_mode` is retained-only, not exact-required, on a non-Unix
+/// target -- see `unix_mode_already_matches_disk`'s own non-Unix arm and
+/// `SettlementEvidence::ExactObject`'s doc comment for the full model.
 #[cfg(not(unix))]
-pub fn apply_exec_bit(_path: &Path, _exec_bit: bool) -> Result<(), StorageError> {
+pub fn apply_unix_mode(_path: &Path, _unix_mode: Option<u32>) -> Result<(), StorageError> {
+    Ok(())
+}
+
+/// Sets an already-materialized regular file's replicated extended
+/// attributes (Competitive Hardening C1.2a) to exactly `xattrs` — the
+/// write-side counterpart to `chunker::read_replicated_xattrs`. Scoped to
+/// the same `user.*` allow-list the read side captures under: only names
+/// in that namespace are ever set or removed here, so an attribute this
+/// device's capture path was never allowed to read is never touched by
+/// materialization either, mirroring `apply_unix_mode`'s "only the bits we
+/// replicate" discipline. An attribute already on disk under `user.*` but
+/// absent from `xattrs` is removed (a fresh temp-then-rename target
+/// normally carries none, but this keeps a re-materialized path from
+/// accumulating stale attributes from an earlier, different version at the
+/// same path). Best-effort: a failure to set or remove one attribute (e.g.
+/// a filesystem with no xattr support) is silently skipped, matching
+/// `read_replicated_xattrs`'s own "no attributes" fallback rather than
+/// failing the whole materialization over metadata that was never
+/// content-integrity-critical to begin with.
+#[cfg(target_os = "linux")]
+const LINUX_ALLOWED_XATTR_PREFIX: &str = "user.";
+
+/// Whether `name` is inside the one extended-attribute namespace this
+/// sync tool ever replicates on Linux -- the single predicate
+/// `apply_xattrs` uses on BOTH its set and remove sides, so the two can
+/// never disagree about which names are "replicated" ones. Factored out
+/// so it is directly unit-testable without needing a real filesystem or
+/// real syscalls at all (setting a genuinely privileged namespace like
+/// `trusted.*`/`security.*` to prove a filter caught it would require
+/// root in the first place, which would prove nothing about this
+/// specific code path).
+#[cfg(target_os = "linux")]
+fn is_replicated_xattr_name(name: &str) -> bool {
+    name.starts_with(LINUX_ALLOWED_XATTR_PREFIX)
+}
+
+#[cfg(target_os = "linux")]
+pub fn apply_xattrs(path: &Path, xattrs: &[(String, Vec<u8>)]) -> Result<(), StorageError> {
+    use std::os::unix::io::AsRawFd;
+
+    let file = fs::File::open(path)?;
+    let fd = file.as_raw_fd();
+
+    let existing = crate::chunker::list_xattr_names_for_apply(fd)
+        .into_iter()
+        .filter(|name| is_replicated_xattr_name(name));
+    for name in existing {
+        if !xattrs.iter().any(|(n, _)| n == &name) {
+            if let Ok(c_name) = std::ffi::CString::new(name) {
+                unsafe { libc::fremovexattr(fd, c_name.as_ptr()) };
+            }
+        }
+    }
+    // Defense in depth, independent of `FileMeta::decode`'s own
+    // allow-list rejection: this is the last point before a real
+    // `fsetxattr` syscall, so a non-allow-listed name must never reach
+    // it regardless of how it got here (a future caller that builds
+    // `xattrs` some other way, a decode check that regresses). Silently
+    // dropped, not an error -- exactly how every other best-effort
+    // outcome in this function is already handled.
+    for (name, value) in xattrs.iter().filter(|(name, _)| is_replicated_xattr_name(name)) {
+        if let Ok(c_name) = std::ffi::CString::new(name.as_str()) {
+            unsafe {
+                libc::fsetxattr(
+                    fd,
+                    c_name.as_ptr(),
+                    value.as_ptr() as *const libc::c_void,
+                    value.len(),
+                    0,
+                )
+            };
+        }
+    }
+    Ok(())
+}
+
+/// See the `#[cfg(target_os = "linux")]` `apply_xattrs` above — every other
+/// platform's read side (`read_replicated_xattrs`) never captures anything,
+/// so there is nothing this device would ever need to write back; kept as
+/// an explicit no-op for cross-platform parity rather than `#[cfg]`-hiding
+/// the call sites.
+#[cfg(not(target_os = "linux"))]
+pub fn apply_xattrs(_path: &Path, _xattrs: &[(String, Vec<u8>)]) -> Result<(), StorageError> {
     Ok(())
 }
 
@@ -642,6 +1005,36 @@ pub fn materialize_symlink_windows(out_path: &Path, target: &[u8]) -> Result<(),
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    /// C4-6: `reconstruct_file_to_temp` + `persist_reconstructed_file` must
+    /// together produce exactly what the composed `reconstruct_file` always
+    /// did -- and, critically, the temp-write half alone must never touch
+    /// `out_path` at all, since a caller batching several paths' SQLite
+    /// commits relies on being able to run this half for many paths without
+    /// any of them becoming visible until the (separate, later) publish
+    /// half runs.
+    #[test]
+    fn reconstruct_file_to_temp_then_persist_matches_reconstruct_file() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = crate::FsBlockStore::new(store_dir.path()).unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let src_path = src_dir.path().join("file.bin");
+        let content: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&src_path, &content).unwrap();
+        let blocks = crate::chunker::chunk_file(&store, &src_path).unwrap();
+
+        let out_path = src_dir.path().join("reconstructed.bin");
+        let tmp_path = reconstruct_file_to_temp(&store, &out_path, &blocks, -1).unwrap();
+
+        assert!(!out_path.exists(), "the temp-write half must not touch out_path at all");
+        assert!(tmp_path.exists());
+        assert_eq!(fs::read(&tmp_path).unwrap(), content);
+
+        persist_reconstructed_file(&tmp_path, &out_path).unwrap();
+
+        assert!(!tmp_path.exists(), "the temp path must be gone after a successful publish");
+        assert_eq!(fs::read(&out_path).unwrap(), content);
+    }
 
     /// A placeholder reports the file's correct size via `stat`
     /// without its content actually occupying disk space or being fetched.
@@ -802,12 +1195,38 @@ mod tests {
         assert_eq!(fs::read_link(&out_path).unwrap(), Path::new("new-target.txt"));
     }
 
-    /// Flipping the exec bit on and off actually changes the
-    /// owner-executable permission bit on disk, and is idempotent (calling
-    /// it again with the same value doesn't error or otherwise misbehave).
+    #[test]
+    fn stamp_mtime_at_path_actually_changes_disk_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, b"content").unwrap();
+        let desired = 1_700_000_123_456_789i64;
+
+        assert!(!mtime_already_matches_disk(&path, desired).unwrap());
+        stamp_mtime_at_path(&path, desired).unwrap();
+        assert!(mtime_already_matches_disk(&path, desired).unwrap());
+    }
+
+    /// A negative `desired_mtime_unix_nanos` (the "no authoritative
+    /// mtime to stamp" sentinel) is trivially satisfied regardless of
+    /// whatever the disk actually holds -- there is nothing to compare
+    /// against, mirroring `unix_mode_already_matches_disk`'s own
+    /// `unix_mode: None` treatment.
+    #[test]
+    fn mtime_already_matches_disk_is_trivially_true_for_a_negative_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, b"content").unwrap();
+        assert!(mtime_already_matches_disk(&path, -1).unwrap());
+    }
+
+    /// Changing the requested mode actually changes the on-disk permission
+    /// bits, and is idempotent (calling it again with the same value
+    /// doesn't error or otherwise misbehave). `None` is a deliberate no-op
+    /// — never fabricates a mode for a version that carries none.
     #[cfg(unix)]
     #[test]
-    fn apply_exec_bit_sets_and_clears_owner_exec_permission() {
+    fn apply_unix_mode_sets_and_clears_permission_bits() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -815,35 +1234,35 @@ mod tests {
         fs::write(&path, b"#!/bin/sh\necho hi\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
-        apply_exec_bit(&path, true).unwrap();
+        apply_unix_mode(&path, Some(0o744)).unwrap();
         let mode_after_set = fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode_after_set & 0o777, 0o744, "owner-exec bit must be set");
 
         // Idempotent: setting it again when already set is a harmless no-op.
-        apply_exec_bit(&path, true).unwrap();
+        apply_unix_mode(&path, Some(0o744)).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o744);
 
-        apply_exec_bit(&path, false).unwrap();
+        apply_unix_mode(&path, Some(0o644)).unwrap();
         let mode_after_clear = fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode_after_clear & 0o777, 0o644, "owner-exec bit must be cleared");
 
-        // Other permission bits (group/other read, in this case) are left
-        // alone — this only ever touches the owner-exec bit.
-        assert_eq!(mode_after_clear & 0o077, 0o044);
+        // `None` is a no-op — the mode from the last real apply survives.
+        apply_unix_mode(&path, None).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
     }
 
-    /// `apply_exec_bit` must never error on a plain file — this
+    /// `apply_unix_mode` must never error on a plain file — this
     /// runs unconditionally (not `#[cfg(unix)]`-gated) so the non-Unix
     /// no-op arm is at least compiled and exercised on every platform this
     /// crate builds for; on this dev machine it's the `#[cfg(unix)]`-arm's
     /// real permission-changing behavior above that's exercised.
     #[test]
-    fn apply_exec_bit_never_errors_on_a_plain_file() {
+    fn apply_unix_mode_never_errors_on_a_plain_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("plain.txt");
         fs::write(&path, b"hello").unwrap();
-        apply_exec_bit(&path, true).unwrap();
-        apply_exec_bit(&path, false).unwrap();
+        apply_unix_mode(&path, Some(0o755)).unwrap();
+        apply_unix_mode(&path, None).unwrap();
     }
 
     /// An independent review's finding: `create_dir_all(parent)` follows
@@ -888,4 +1307,147 @@ mod tests {
 
         assert!(sync_root.path().join("a").join("b").join("c").is_dir());
     }
+
+    /// `apply_xattrs` must both set every attribute in the supplied list
+    /// AND remove any `user.*` attribute already on disk that the list no
+    /// longer carries -- the same "set exactly what's replicated, nothing
+    /// left over from a prior version" contract `apply_unix_mode` gives
+    /// for permission bits.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_xattrs_sets_new_attributes_and_removes_stale_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        fs::write(&path, b"content").unwrap();
+
+        apply_xattrs(&path, &[("user.keep".to_string(), b"v1".to_vec())]).unwrap();
+        assert_eq!(
+            crate::read_replicated_xattrs(&fs::File::open(&path).unwrap()),
+            vec![("user.keep".to_string(), b"v1".to_vec())]
+        );
+
+        // A later version drops "user.keep" and adds "user.new" -- the
+        // stale attribute must not survive the second call.
+        apply_xattrs(&path, &[("user.new".to_string(), b"v2".to_vec())]).unwrap();
+        assert_eq!(
+            crate::read_replicated_xattrs(&fs::File::open(&path).unwrap()),
+            vec![("user.new".to_string(), b"v2".to_vec())]
+        );
+    }
+
+    /// An empty attribute list is a real, meaningful target state (this
+    /// version genuinely carries no extended attributes) -- confirms it
+    /// clears whatever was already on disk rather than being silently
+    /// treated as "nothing to do."
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_xattrs_with_an_empty_list_clears_existing_attributes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        fs::write(&path, b"content").unwrap();
+
+        apply_xattrs(&path, &[("user.gone".to_string(), b"v".to_vec())]).unwrap();
+        apply_xattrs(&path, &[]).unwrap();
+
+        assert_eq!(crate::read_replicated_xattrs(&fs::File::open(&path).unwrap()), Vec::new());
+    }
+
+    /// Regression for an independent review's finding: `apply_xattrs`'s
+    /// own removal side already restricted itself to `user.*`, but its
+    /// set side handed every incoming name straight to `fsetxattr`
+    /// unconditionally -- defense-in-depth for the same allow-list
+    /// `FileMeta::decode` now rejects a violation of at the wire-decode
+    /// boundary (a second, independent layer, in case some future caller
+    /// ever builds an `xattrs` list some other way). Confirmed genuinely
+    /// RED by temporarily hardcoding this to `true` for every name: it no
+    /// longer distinguished the allow-listed namespace from any other.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn is_replicated_xattr_name_only_accepts_the_user_namespace() {
+        assert!(is_replicated_xattr_name("user.foo"));
+        assert!(!is_replicated_xattr_name("security.selinux"));
+        assert!(!is_replicated_xattr_name("trusted.overlay"));
+        assert!(!is_replicated_xattr_name("system.posix_acl_access"));
+        assert!(!is_replicated_xattr_name("com.apple.quarantine"));
+    }
+
+    /// The `ExactObject` proof gate's positive case: an attribute set
+    /// genuinely applied end to end verifies as an exact match.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_replicated_xattrs_exact_confirms_a_genuine_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        fs::write(&path, b"content").unwrap();
+        let desired = vec![("user.a".to_string(), b"1".to_vec())];
+
+        apply_xattrs(&path, &desired).unwrap();
+
+        assert_eq!(verify_replicated_xattrs_exact(&path, &desired).unwrap(), true);
+    }
+
+    /// Regression for the exact gap an independent review caught: a
+    /// desired attribute that never actually landed on disk (standing in
+    /// for `apply_xattrs`'s own `fsetxattr` silently failing, which it
+    /// never surfaces as an `Err`) must never verify as an exact match.
+    /// Confirmed genuinely RED by temporarily hardcoding this function's
+    /// comparison to `true`: the mismatch below went undetected.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_replicated_xattrs_exact_detects_an_attribute_that_never_landed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        fs::write(&path, b"content").unwrap();
+        let desired = vec![("user.missing".to_string(), b"1".to_vec())];
+
+        // No `apply_xattrs` call at all -- disk carries none of what is
+        // desired, exactly what a silently-swallowed `fsetxattr` failure
+        // would also leave behind.
+
+        assert_eq!(verify_replicated_xattrs_exact(&path, &desired).unwrap(), false);
+    }
+
+    /// The mirror case: a stale attribute still on disk that the desired
+    /// version no longer carries (standing in for `apply_xattrs`'s
+    /// `fremovexattr` silently failing) must also never verify as exact.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_replicated_xattrs_exact_detects_a_stale_attribute_that_should_be_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        fs::write(&path, b"content").unwrap();
+
+        apply_xattrs(&path, &[("user.stale".to_string(), b"v".to_vec())]).unwrap();
+        // The version this file is meant to now exactly hold desires no
+        // attributes at all -- as if `apply_xattrs(&path, &[])`'s own
+        // `fremovexattr` call for "user.stale" had silently failed.
+
+        assert_eq!(verify_replicated_xattrs_exact(&path, &[]).unwrap(), false);
+    }
+
+    /// A same-name attribute whose VALUE differs must also fail exactness
+    /// -- name-only comparison would wrongly accept this.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_replicated_xattrs_exact_detects_a_value_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.bin");
+        fs::write(&path, b"content").unwrap();
+
+        apply_xattrs(&path, &[("user.a".to_string(), b"old".to_vec())]).unwrap();
+
+        assert_eq!(
+            verify_replicated_xattrs_exact(&path, &[("user.a".to_string(), b"new".to_vec())]).unwrap(),
+            false
+        );
+    }
+
+    // The non-Linux `verify_replicated_xattrs_exact` arm (always
+    // `Ok(true)`, unconditionally treating xattrs as retained-only on a
+    // backend with no replicated-xattr support -- see its own doc
+    // comment for the target-projection-contract reasoning) is `#[cfg(not(
+    // target_os = "linux"))]`, so it never compiles on the Linux machines
+    // this workspace is actually developed/tested on and has no dedicated
+    // test here; it is now a single unconditional return with no branch
+    // left to exercise.
 }

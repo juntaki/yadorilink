@@ -17,7 +17,6 @@ use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeCo
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_transport::DeviceKeyPair;
 
 const BURST_FILE_COUNT: usize = 300;
 
@@ -43,13 +42,10 @@ const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(180);
 async fn live_burst_of_many_small_files_converges_via_debounced_batching() {
     let coordination_addr = support::start_coordination_server().await;
     let account = support::register_and_login(&coordination_addr, "burst-test@example.com").await;
-
-    let keypair_a = Arc::new(DeviceKeyPair::generate());
     let device_a_id =
-        support::register_device(&account, "device-a", keypair_a.public_bytes()).await;
-    let keypair_b = Arc::new(DeviceKeyPair::generate());
+        support::register_device(&account, "device-a", [0u8; 32]).await;
     let device_b_id =
-        support::register_device(&account, "device-b", keypair_b.public_bytes()).await;
+        support::register_device(&account, "device-b", [0u8; 32]).await;
 
     let group_id = support::create_folder_group(&account, "burst-test-group").await;
     support::grant_access(&account, &group_id, &device_a_id).await;

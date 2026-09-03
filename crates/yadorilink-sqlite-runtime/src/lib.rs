@@ -24,6 +24,9 @@ mod error;
 mod pool;
 mod schema;
 
+// PERMANENT writer-gate observability -- see `database::c4_diag`'s own
+// header comment.
+pub use database::c4_diag;
 pub use database::SyncDatabase;
 pub use error::{DatabaseError, SqlOperationError};
 pub use pool::{ConnectionPool, BUSY_TIMEOUT};

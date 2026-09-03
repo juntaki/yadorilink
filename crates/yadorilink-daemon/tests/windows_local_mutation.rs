@@ -94,7 +94,7 @@ fn index_placeholder_row(
     content: &[u8],
     generation: u64,
     materialization_state: MaterializationState,
-    permit: &RootCommitPermit<'_>,
+    permit: &RootCommitPermit,
 ) {
     let hash = store.put(content).unwrap().into_bytes();
     state

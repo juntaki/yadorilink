@@ -5,7 +5,7 @@
 //!
 //! Real production code at every layer this exercises: real
 //! `DaemonState`, real `peer_orchestrator`-driven `PeerChannel`/
-//! WireGuard-shaped sessions over loopback UDP (same pattern as
+//! QUIC-shaped sessions over loopback UDP (same pattern as
 //! `relay_chaos.rs`), real DAG mutation propagation via the real
 //! filesystem watcher (`std::fs::write` on a linked local folder, not a
 //! raw DB upsert -- `monkey_chaos.rs`'s established convention), real

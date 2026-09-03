@@ -42,23 +42,35 @@ pub(crate) fn insert_orphan(
             next_seq,
         ],
     )?;
-    // Bound the buffer: keep the newest `ORPHAN_BOUND`, evict older ones. The
-    // `change_parents` edges recorded for an evicted orphan's declared
-    // parents must go with it -- left behind, a ghost edge under a hash no
-    // longer in `orphan_changes` (and never in `changes` either) would make
-    // `frontier_index::repair` think that parent still has a child and drop
-    // it out of `group_heads`. Deleted first, while the eviction set is
-    // still computable from the still-present `orphan_changes` rows.
-    conn.execute(
-        "DELETE FROM change_parents WHERE child_hash IN (\
-             SELECT change_hash FROM orphan_changes ORDER BY received_seq DESC LIMIT -1 OFFSET ?1)",
-        [ORPHAN_BOUND as i64],
-    )?;
-    conn.execute(
-        "DELETE FROM orphan_changes WHERE change_hash IN (\
-             SELECT change_hash FROM orphan_changes ORDER BY received_seq DESC LIMIT -1 OFFSET ?1)",
-        [ORPHAN_BOUND as i64],
-    )?;
+    // Bound the buffer: keep the newest `ORPHAN_BOUND`, evict older ones.
+    // Skipped entirely in the ordinary case (buffer well under the bound) --
+    // this function runs once per buffered change, potentially hundreds of
+    // times in one anti-entropy round (a cold catch-up beyond the wire
+    // batch cap buffers its whole response as orphans), and the eviction
+    // queries below have to walk past `ORPHAN_BOUND` rows every time they
+    // actually run; skipping that walk when it could not possibly find
+    // anything to evict turns what would otherwise be a full-buffer cost
+    // paid on every single insert into a cheap `COUNT(*)`.
+    let orphan_count: i64 = conn.query_row("SELECT COUNT(*) FROM orphan_changes", [], |r| r.get(0))?;
+    if orphan_count as usize > ORPHAN_BOUND {
+        // The `change_parents` edges recorded for an evicted orphan's
+        // declared parents must go with it -- left behind, a ghost edge
+        // under a hash no longer in `orphan_changes` (and never in
+        // `changes` either) would make `frontier_index::repair` think that
+        // parent still has a child and drop it out of `group_heads`.
+        // Deleted first, while the eviction set is still computable from
+        // the still-present `orphan_changes` rows.
+        conn.execute(
+            "DELETE FROM change_parents WHERE child_hash IN (\
+                 SELECT change_hash FROM orphan_changes ORDER BY received_seq DESC LIMIT -1 OFFSET ?1)",
+            [ORPHAN_BOUND as i64],
+        )?;
+        conn.execute(
+            "DELETE FROM orphan_changes WHERE change_hash IN (\
+                 SELECT change_hash FROM orphan_changes ORDER BY received_seq DESC LIMIT -1 OFFSET ?1)",
+            [ORPHAN_BOUND as i64],
+        )?;
+    }
     Ok(())
 }
 
@@ -110,12 +122,41 @@ pub fn promote_orphans(
                 Ok(c) => c,
                 Err(_) => {
                     // Corrupt buffered bytes: drop it rather than wedge the loop.
-                    drop_orphan_change(conn, &child_hash_blob)?;
+                    drop_orphan_subtree(conn, &child_hash_blob)?;
                     continue;
                 }
             };
             if !super::retained_history_integrity::has_all_parents(conn, &change)? {
                 continue;
+            }
+            // Re-verifies `4175e8cd`'s causal-auth-monotonicity invariant
+            // now that every parent is structurally present -- this orphan
+            // may have been buffered specifically because ITS parent
+            // wasn't yet readable at first contact (see `admit_change`'s
+            // own `CausalAuthCheck::Unresolvable`/`Hold`-no-longer-
+            // discards handling), so promotion is the first point this can
+            // actually be checked. `Violated` is permanent and provable:
+            // drop it, same treatment as an invalid parent-group/Lamport
+            // claim below. `Unresolvable` means a parent is structurally
+            // present via a prune with no retained checkpoint-boundary
+            // auth record -- fail closed, leave this orphan buffered for a
+            // later attempt rather than promoting on trust.
+            match super::retained_history_integrity::check_causal_auth_monotonicity_at_promotion(
+                conn, &change,
+            )? {
+                super::retained_history_integrity::CausalAuthCheck::Verified => {}
+                super::retained_history_integrity::CausalAuthCheck::Violated => {
+                    tracing::warn!(
+                        change_hash = %hex::encode(&child_hash_blob),
+                        "dropping a buffered orphan whose authorization coordinate is older than \
+                         its causal parent"
+                    );
+                    drop_orphan_subtree(conn, &child_hash_blob)?;
+                    continue;
+                }
+                super::retained_history_integrity::CausalAuthCheck::Unresolvable => {
+                    continue;
+                }
             }
             // NOT given the same drop-and-continue treatment as the checks
             // below, deliberately: `validate_referenced_versions`'s
@@ -152,7 +193,7 @@ pub fn promote_orphans(
                         reason,
                         "dropping a buffered orphan with an invalid parent-group or lamport claim"
                     );
-                    drop_orphan_change(conn, &child_hash_blob)?;
+                    drop_orphan_subtree(conn, &child_hash_blob)?;
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -186,7 +227,7 @@ pub fn promote_orphans(
                         reason,
                         "dropping a buffered orphan whose conflict-copy claims are invalid"
                     );
-                    drop_orphan_change(conn, &child_hash_blob)?;
+                    drop_orphan_subtree(conn, &child_hash_blob)?;
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -263,6 +304,49 @@ fn drop_orphan_change(conn: &Connection, change_hash: &[u8]) -> Result<(), SyncS
     conn.execute("DELETE FROM change_parents WHERE child_hash = ?1", [change_hash])?;
     conn.execute("DELETE FROM change_file_versions WHERE change_hash = ?1", [change_hash])?;
     conn.execute("DELETE FROM orphan_changes WHERE change_hash = ?1", [change_hash])?;
+    Ok(())
+}
+
+/// Like [`drop_orphan_change`], but also drops every OTHER still-buffered
+/// orphan that (transitively) names `change_hash` as a parent. `change_hash`
+/// itself need not be a buffered orphan -- `admit_change`'s own top-level
+/// causal-auth rejection (a change whose parent was already live, so it was
+/// never buffered at all) calls this too, purely to clean up any
+/// descendants that arrived and buffered before the rejection was
+/// discovered; `drop_orphan_change`'s own deletes are harmless no-ops for a
+/// hash that was never in `orphan_changes` to begin with.
+///
+/// Every permanent-drop case (corrupt bytes, an invalid parent-group/
+/// Lamport claim, invalid conflict-copy ops, or a causal-auth-monotonicity
+/// violation, in [`promote_orphans`] or in `admit_change`) means
+/// `change_hash` can never be promoted -- so any buffered orphan waiting on
+/// it as a parent can never be promoted either, no matter how many times
+/// its own bytes are re-delivered: it will keep re-evaluating cleanly on
+/// its OWN terms (referenced versions, its own parent shape, its own
+/// causal-auth coordinate) but `has_all_parents` will never see
+/// `change_hash` become present, because it never will. Left buffered,
+/// such a descendant would sit until `ORPHAN_BOUND` eviction happens to
+/// reach it -- possibly never, if newer orphans keep landing elsewhere in
+/// the buffer first -- all the while its own hash keeps showing up in
+/// `missing_ancestor_frontier` walks and getting re-requested every
+/// anti-entropy round for no reason that redelivery could ever fix.
+/// Dropping the whole dependent subtree now is what actually closes that
+/// loop.
+pub(crate) fn drop_orphan_subtree(conn: &Connection, change_hash: &[u8]) -> Result<(), SyncSqliteError> {
+    let mut queue: std::collections::VecDeque<Vec<u8>> = [change_hash.to_vec()].into();
+    while let Some(hash) = queue.pop_front() {
+        let children: Vec<Vec<u8>> = {
+            let mut stmt = conn.prepare(
+                "SELECT cp.child_hash FROM change_parents cp \
+                 JOIN orphan_changes o ON o.change_hash = cp.child_hash \
+                 WHERE cp.parent_hash = ?1",
+            )?;
+            let rows = stmt.query_map([&hash[..]], |r| r.get::<_, Vec<u8>>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        queue.extend(children);
+        drop_orphan_change(conn, &hash)?;
+    }
     Ok(())
 }
 

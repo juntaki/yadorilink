@@ -29,6 +29,24 @@ pub(crate) struct EvictOutcome {
     pub bytes_reclaimed: u64,
 }
 
+/// P0-B: `MaterializationService::status`'s own vocabulary, mirroring
+/// `yadorilink_replica_domain::session_state::MaterializationState` --
+/// decoupled per this module's own doc comment (never import that layer
+/// directly), same reasoning as `EvictOutcome` above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaterializationStateSummary {
+    Hydrated,
+    Placeholder,
+    Hydrating,
+    Evicting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MaterializationStatusSummary {
+    pub state: MaterializationStateSummary,
+    pub pinned: bool,
+}
+
 pub(crate) trait MaterializationPort: Send + Sync {
     fn hydrate<'a>(
         &'a self,
@@ -47,4 +65,13 @@ pub(crate) trait MaterializationPort: Send + Sync {
     /// Synchronous: eviction is a local index/block-store operation with no
     /// remote round trip, unlike `hydrate`/`pin`/`unpin`.
     fn evict(&self, group_id: &str, path: &str) -> Result<EvictOutcome, SyncError>;
+
+    /// Synchronous, same reasoning as `evict`: a plain local index read,
+    /// never a peer round trip. `None` means the daemon has no
+    /// materialization-state row for this path at all.
+    fn status(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<MaterializationStatusSummary>, SyncError>;
 }

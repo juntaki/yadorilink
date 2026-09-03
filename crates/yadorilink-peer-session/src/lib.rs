@@ -7,6 +7,9 @@
 
 pub mod adaptive_window;
 pub mod block_serve;
+pub mod c4_attr;
+pub mod c4_diag;
+pub mod c4_reconcile_timing;
 pub mod error;
 pub mod hazard;
 pub mod ports;

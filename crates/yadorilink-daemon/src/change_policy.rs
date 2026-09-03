@@ -37,12 +37,17 @@ pub struct PolicyRecord {
     pub record_hash: Vec<u8>,
     /// `auth_epoch` after this record applies.
     pub epoch: u64,
-    /// 0 Grant | 1 Revoke | 2 RotateAuthority.
+    /// 0 Grant | 1 Revoke | 2 RotateAuthority | 3 Grant-with-role. See
+    /// `ACTION_GRANT_WITH_ROLE`'s own doc comment for why this is a
+    /// DISTINCT action type from plain Grant, not a role field bolted onto
+    /// it.
     pub action_type: u32,
     /// Grant/Revoke.
     pub device_id: String,
     /// Grant only; 32 bytes (zero if the device has no signing key).
     pub signing_key_fingerprint: Vec<u8>,
+    /// Grant only; 0=Viewer, 1=Editor, 2=Owner. See [`WriterRole`].
+    pub role: u32,
     /// RotateAuthority only; 32 bytes.
     pub new_authority_key: Vec<u8>,
     /// 32-byte fingerprint of the signing authority key.
@@ -55,9 +60,69 @@ const POLICY_DOMAIN_TAG: &[u8; 8] = b"ylpolic1";
 const ACTION_GRANT: u32 = 0;
 const ACTION_REVOKE: u32 = 1;
 const ACTION_ROTATE_AUTHORITY: u32 = 2;
+/// A Grant record whose signing preimage includes an explicit role byte --
+/// distinct from `ACTION_GRANT`, never reused for it. This is a real
+/// cross-implementation contract with `coordination-worker/src/policy/
+/// service.ts::canonicalSigningBytes`: EVERY already-persisted, already-
+/// signed `ACTION_GRANT` record must keep verifying under its ORIGINAL
+/// preimage (no role byte) forever, so historical records never need
+/// re-signing (which would fork the chain at the same seq and trip the
+/// anti-rollback watermark). A role is therefore never encoded by appending
+/// a byte to `ACTION_GRANT`'s own preimage -- that would silently break
+/// every existing Grant's signature, exactly the incident this comment
+/// exists to prevent a repeat of. `parse_action`/`signing_bytes` dispatch
+/// the preimage SHAPE on this discriminant, not on whether a role happens
+/// to be present in the deserialized record.
+const ACTION_GRANT_WITH_ROLE: u32 = 3;
 const HASH_LEN: usize = 32;
 const SIGNATURE_LEN: usize = 64;
 const ZERO_HASH: [u8; HASH_LEN] = [0u8; HASH_LEN];
+
+/// A device's permission tier under one group's Grant. Read access (group
+/// membership, block-serving, sync eligibility) is unaffected by this value
+/// — that stays gated purely on group authorization, as it already was.
+/// This value ONLY narrows which authorized devices [`GroupPolicyState`]
+/// treats as WRITERS: `author_was_writer_at`/`current_writers`/`writers_at`
+/// admit `Editor`/`Owner` grants and exclude `Viewer` grants — a Viewer's
+/// signed change is rejected by every peer holding this policy chain, the
+/// same way an unauthorized device's change would be. `Owner` carries no
+/// extra cryptographic weight over `Editor` in THIS verifier today (nothing
+/// here yet distinguishes "may also manage grants" from "may write") — that
+/// distinction belongs to whichever service issues Grant/Revoke/
+/// RotateAuthority records (the coordination plane's policy service, the
+/// sole holder of a group's authority key), not to this read-only verifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WriterRole {
+    Viewer,
+    Editor,
+    Owner,
+}
+
+impl WriterRole {
+    /// Whether this role is treated as a writer by
+    /// [`GroupPolicyState::author_was_writer_at`] and the `current_writers`/
+    /// `writers_at` writer-set accessors.
+    fn is_writer(self) -> bool {
+        matches!(self, WriterRole::Editor | WriterRole::Owner)
+    }
+
+    pub fn to_wire(self) -> u32 {
+        match self {
+            WriterRole::Viewer => 0,
+            WriterRole::Editor => 1,
+            WriterRole::Owner => 2,
+        }
+    }
+
+    pub fn from_wire(value: u32) -> Result<Self, String> {
+        match value {
+            0 => Ok(WriterRole::Viewer),
+            1 => Ok(WriterRole::Editor),
+            2 => Ok(WriterRole::Owner),
+            other => Err(format!("policy record has invalid writer role {other}")),
+        }
+    }
+}
 
 /// Whether a Grant's bound signing-key fingerprint admits a change whose
 /// verifying key hashes to `presented_fingerprint`. A Grant records the
@@ -79,9 +144,26 @@ fn fingerprint_admits(bound: [u8; HASH_LEN], presented_fingerprint: [u8; HASH_LE
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PolicyAction {
-    Grant { device_id: String, signing_key_fingerprint: [u8; HASH_LEN] },
-    Revoke { device_id: String },
-    RotateAuthority { new_authority_key: [u8; HASH_LEN] },
+    Grant {
+        device_id: String,
+        signing_key_fingerprint: [u8; HASH_LEN],
+        role: WriterRole,
+        /// Whether `role` was itself part of the signed preimage
+        /// (`ACTION_GRANT_WITH_ROLE`) or is a synthesized default for a
+        /// legacy `ACTION_GRANT` record that has no role byte at all. Two
+        /// `Grant`s with the identical `role` value can still need
+        /// DIFFERENT preimage shapes -- `signing_bytes` reads this to
+        /// reproduce exactly what was signed, never inferring the shape
+        /// from the role value alone. See `ACTION_GRANT_WITH_ROLE`'s own
+        /// doc comment.
+        role_is_signed: bool,
+    },
+    Revoke {
+        device_id: String,
+    },
+    RotateAuthority {
+        new_authority_key: [u8; HASH_LEN],
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,11 +261,11 @@ impl GroupPolicyState {
             return false;
         }
 
-        let mut grants: HashMap<&str, [u8; HASH_LEN]> = HashMap::new();
+        let mut grants: HashMap<&str, ([u8; HASH_LEN], WriterRole)> = HashMap::new();
         for record in self.records.range(..=auth.auth_seq).map(|(_, record)| record) {
             match &record.action {
-                PolicyAction::Grant { device_id, signing_key_fingerprint } => {
-                    grants.insert(device_id.as_str(), *signing_key_fingerprint);
+                PolicyAction::Grant { device_id, signing_key_fingerprint, role, .. } => {
+                    grants.insert(device_id.as_str(), (*signing_key_fingerprint, *role));
                 }
                 PolicyAction::Revoke { device_id } => {
                     grants.remove(device_id.as_str());
@@ -193,8 +275,12 @@ impl GroupPolicyState {
         }
         grants
             .get(author)
-            .map(|bound_fingerprint| {
-                fingerprint_admits(*bound_fingerprint, signing_key_fingerprint)
+            .map(|(bound_fingerprint, role)| {
+                // A Viewer-role grant is never a writer: its change is
+                // rejected here exactly like an unauthorized device's would
+                // be, regardless of whether the fingerprint binding itself
+                // is otherwise valid. See `WriterRole`'s own doc comment.
+                role.is_writer() && fingerprint_admits(*bound_fingerprint, signing_key_fingerprint)
             })
             .unwrap_or(false)
     }
@@ -236,11 +322,11 @@ impl GroupPolicyState {
     }
 
     fn writers_up_to(&self, auth_seq: u64) -> Vec<AuthorizedWriter> {
-        let mut grants: BTreeMap<&str, [u8; HASH_LEN]> = BTreeMap::new();
+        let mut grants: BTreeMap<&str, ([u8; HASH_LEN], WriterRole)> = BTreeMap::new();
         for record in self.records.range(..=auth_seq).map(|(_, record)| record) {
             match &record.action {
-                PolicyAction::Grant { device_id, signing_key_fingerprint } => {
-                    grants.insert(device_id.as_str(), *signing_key_fingerprint);
+                PolicyAction::Grant { device_id, signing_key_fingerprint, role, .. } => {
+                    grants.insert(device_id.as_str(), (*signing_key_fingerprint, *role));
                 }
                 PolicyAction::Revoke { device_id } => {
                     grants.remove(device_id.as_str());
@@ -248,9 +334,14 @@ impl GroupPolicyState {
                 PolicyAction::RotateAuthority { .. } => {}
             }
         }
+        // Viewer-role grants are group members but not writers -- excluded
+        // here so this "writer set" accessor never hands a Viewer to
+        // callers (repair-election candidate ranking, etc.) that assume
+        // everything returned may legitimately author changes.
         grants
             .into_iter()
-            .map(|(device_id, signing_key_fingerprint)| AuthorizedWriter {
+            .filter(|(_, (_, role))| role.is_writer())
+            .map(|(device_id, (signing_key_fingerprint, _))| AuthorizedWriter {
                 device_id: device_id.to_string(),
                 signing_key_fingerprint,
             })
@@ -390,6 +481,35 @@ impl GroupPolicyState {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl GroupPolicyState {
+    /// The placeholder-authority state: an empty verified chain, matching
+    /// `author_was_writer_at`'s own `ChangeAuth::PLACEHOLDER` special case
+    /// (`records.is_empty() && current_seq == 0 && current_epoch == 0 &&
+    /// policy_head == ZERO_HASH`). For a test/benchmark that needs
+    /// `DaemonState::resolve_group_policy` to resolve to `Verified` (not
+    /// `Withhold`) for a group it never ran a real signed policy log
+    /// through -- without it, a real `DaemonState`'s one-shot, cached
+    /// retirement-session construction (`DaemonState::local_retirement_
+    /// session`) permanently revokes the group from every peer session the
+    /// first time it reaches this group, not on some ongoing basis; see
+    /// `DaemonState::install_test_group_policy_bootstrap`'s own doc comment
+    /// for the full mechanism. That method is what a caller outside this
+    /// module actually reaches this through (this struct's `records` field
+    /// is private to this module, so nothing else can construct a
+    /// `GroupPolicyState` literal at all).
+    pub fn placeholder_for_tests() -> Self {
+        Self {
+            current_seq: 0,
+            current_epoch: 0,
+            policy_head: ZERO_HASH,
+            final_authority_key: ZERO_HASH,
+            authority_generation: 0,
+            records: BTreeMap::new(),
+        }
+    }
+}
+
 pub fn verify_group_policy_log(
     service_public_key: &[u8],
     log: &GroupPolicyLog,
@@ -522,10 +642,38 @@ fn verify_record(
 
 fn parse_action(record: &PolicyRecord) -> Result<PolicyAction, String> {
     match record.action_type {
+        // Original, pre-role Grant shape -- preserved byte-for-byte forever
+        // (see `ACTION_GRANT_WITH_ROLE`'s own doc comment). No role byte
+        // exists in this shape's preimage at all; every such grant is
+        // implicitly Editor, exactly the "every authorized device is a
+        // full writer" behavior this whole mechanism had before roles
+        // existed. `record.role` is IGNORED here even if a deserializer
+        // populated it with some default -- this shape's cryptographic
+        // preimage never included it, so trusting it would be trusting an
+        // unsigned value.
         ACTION_GRANT => {
             let signing_key_fingerprint =
                 fixed::<HASH_LEN>(&record.signing_key_fingerprint, "signing_key_fingerprint")?;
-            Ok(PolicyAction::Grant { device_id: record.device_id.clone(), signing_key_fingerprint })
+            Ok(PolicyAction::Grant {
+                device_id: record.device_id.clone(),
+                signing_key_fingerprint,
+                role: WriterRole::Editor,
+                role_is_signed: false,
+            })
+        }
+        // New Grant shape: the preimage includes an explicit, signed role
+        // byte (see `signing_bytes`). Only ever used for grants minted
+        // after the coordination plane was updated to know about roles.
+        ACTION_GRANT_WITH_ROLE => {
+            let signing_key_fingerprint =
+                fixed::<HASH_LEN>(&record.signing_key_fingerprint, "signing_key_fingerprint")?;
+            let role = WriterRole::from_wire(record.role)?;
+            Ok(PolicyAction::Grant {
+                device_id: record.device_id.clone(),
+                signing_key_fingerprint,
+                role,
+                role_is_signed: true,
+            })
         }
         ACTION_REVOKE => Ok(PolicyAction::Revoke { device_id: record.device_id.clone() }),
         ACTION_ROTATE_AUTHORITY => {
@@ -546,10 +694,28 @@ fn signing_bytes(group_id: &str, record: &VerifiedPolicyRecord) -> Vec<u8> {
     put_u64(&mut buf, record.epoch);
     buf.extend_from_slice(&record.signer_key_id);
     match &record.action {
-        PolicyAction::Grant { device_id, signing_key_fingerprint } => {
-            buf.push(ACTION_GRANT as u8);
-            put_str(&mut buf, device_id);
-            buf.extend_from_slice(signing_key_fingerprint);
+        PolicyAction::Grant { device_id, signing_key_fingerprint, role, role_is_signed } => {
+            // Preimage SHAPE is driven by `role_is_signed`, not by `role`'s
+            // value -- an ACTION_GRANT (legacy, `role_is_signed = false`)
+            // record's preimage never had a role byte and must not gain
+            // one now, or every already-persisted, already-signed Grant
+            // record fails `verify_strict` (see `ACTION_GRANT_WITH_ROLE`'s
+            // own doc comment for the incident this guards against).
+            if *role_is_signed {
+                buf.push(ACTION_GRANT_WITH_ROLE as u8);
+                put_str(&mut buf, device_id);
+                buf.extend_from_slice(signing_key_fingerprint);
+                // Signed so a role can never be tampered with in transit or
+                // storage without invalidating the record's signature -- an
+                // in-transit downgrade (Owner->Viewer) or upgrade
+                // (Viewer->Editor) is exactly as detectable as tampering
+                // with the device_id or fingerprint would be.
+                buf.push(role.to_wire() as u8);
+            } else {
+                buf.push(ACTION_GRANT as u8);
+                put_str(&mut buf, device_id);
+                buf.extend_from_slice(signing_key_fingerprint);
+            }
         }
         PolicyAction::Revoke { device_id } => {
             buf.push(ACTION_REVOKE as u8);
@@ -580,17 +746,112 @@ fn fixed<const N: usize>(bytes: &[u8], field: &str) -> Result<[u8; N], String> {
     bytes.try_into().map_err(|_| format!("{field} is not {N} bytes"))
 }
 
-#[cfg(test)]
-mod tests {
+/// The *signing* half of the group policy log: turns a group's Grant/Revoke/
+/// RotateAuthority actions into the signed, hash-chained [`PolicyRecord`]s
+/// that [`verify_group_policy_log`] accepts.
+///
+/// In production this half lives in the coordination plane's policy service,
+/// which is the only holder of a group's authority private key; a daemon only
+/// ever verifies. It is compiled here for this module's own tests and for the
+/// deterministic simulator (`--cfg madsim`), and never in a production build.
+///
+/// The simulator needs it because it runs no coordination plane at all, yet a
+/// simulated daemon must still reach its verified policy the way a shipped one
+/// does -- through `verify_group_policy_log_with_base` and the rollback
+/// watermark. Handing the harness a way to *sign* a real log keeps every
+/// authorization check on the daemon side intact; the alternative (installing
+/// a `GroupPolicyState` into `DaemonState` directly) would simulate a daemon
+/// that no user ever runs.
+#[cfg(any(test, madsim))]
+pub mod policy_signing {
     use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha256};
 
-    use super::*;
+    use super::{
+        GroupPolicyLog, PolicyAction, PolicyRecord, VerifiedPolicyRecord, WriterRole, ACTION_GRANT,
+        ACTION_GRANT_WITH_ROLE, ACTION_REVOKE, ACTION_ROTATE_AUTHORITY, HASH_LEN, SIGNATURE_LEN,
+        ZERO_HASH,
+    };
 
-    fn service_key() -> SigningKey {
-        SigningKey::from_bytes(&[7u8; 32])
+    /// A group policy log whose chain is nothing but writer Grants, one per
+    /// entry of `writers` in the order given (so seq 1 grants `writers[0]`),
+    /// signed by `authority` and ready to be handed to the daemon exactly as a
+    /// netmap update's `group_policy_logs` entry would be. Every grant is
+    /// `WriterRole::Editor` -- callers that need a specific role (e.g. a
+    /// Viewer or Owner) should build records with [`grant_record`] directly.
+    ///
+    /// Each writer is named by its device id and its Ed25519 change-history
+    /// *public* key; the Grant binds the SHA-256 fingerprint of that key, which
+    /// is what admission later compares against the key that actually verified
+    /// an incoming change. Callers therefore cannot accidentally bind a
+    /// fingerprint that admits nothing.
+    pub fn signed_writer_grant_log(
+        authority: &SigningKey,
+        group_id: &str,
+        writers: &[(&str, [u8; 32])],
+    ) -> GroupPolicyLog {
+        let mut records: Vec<PolicyRecord> = Vec::with_capacity(writers.len());
+        let mut prev = ZERO_HASH;
+        for (index, (device_id, signing_public_key)) in writers.iter().enumerate() {
+            let fingerprint: [u8; HASH_LEN] = Sha256::digest(signing_public_key).into();
+            let record = grant_record(
+                authority,
+                group_id,
+                index as u64 + 1,
+                prev,
+                device_id,
+                fingerprint,
+                WriterRole::Editor,
+            );
+            prev = record.record_hash.as_slice().try_into().expect("record_hash is 32 bytes");
+            records.push(record);
+        }
+        GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: records.len() as u64,
+            // Grants alone never advance the authorization epoch; only a
+            // Revoke does, and this chain has none.
+            current_epoch: 0,
+            policy_head: prev.to_vec(),
+            records,
+        }
     }
 
-    fn grant_record(
+    /// Builds a NEW-format Grant (`ACTION_GRANT_WITH_ROLE`) -- the role is
+    /// part of the signed preimage. Use [`legacy_grant_record`] instead to
+    /// build a pre-role, `ACTION_GRANT`-shaped record (e.g. to test
+    /// backward compatibility with already-persisted historical data).
+    #[allow(clippy::too_many_arguments)]
+    pub fn grant_record(
+        key: &SigningKey,
+        group_id: &str,
+        seq: u64,
+        prev: [u8; HASH_LEN],
+        device_id: &str,
+        signing_key_fingerprint: [u8; HASH_LEN],
+        role: WriterRole,
+    ) -> PolicyRecord {
+        signed_record(
+            key,
+            group_id,
+            seq,
+            prev,
+            0,
+            PolicyAction::Grant {
+                device_id: device_id.to_string(),
+                signing_key_fingerprint,
+                role,
+                role_is_signed: true,
+            },
+        )
+    }
+
+    /// Builds a LEGACY-format Grant (`ACTION_GRANT`, the shape every
+    /// already-persisted historical record uses) -- no role byte in the
+    /// preimage at all, implicitly Editor. Exists specifically so tests can
+    /// prove the new code still verifies old-shaped records exactly as
+    /// before, without needing to re-derive the pre-role preimage by hand.
+    pub fn legacy_grant_record(
         key: &SigningKey,
         group_id: &str,
         seq: u64,
@@ -604,11 +865,16 @@ mod tests {
             seq,
             prev,
             0,
-            PolicyAction::Grant { device_id: device_id.to_string(), signing_key_fingerprint },
+            PolicyAction::Grant {
+                device_id: device_id.to_string(),
+                signing_key_fingerprint,
+                role: WriterRole::Editor,
+                role_is_signed: false,
+            },
         )
     }
 
-    fn revoke_record(
+    pub(super) fn revoke_record(
         key: &SigningKey,
         group_id: &str,
         seq: u64,
@@ -625,7 +891,7 @@ mod tests {
         )
     }
 
-    fn rotate_record(
+    pub(super) fn rotate_record(
         key: &SigningKey,
         group_id: &str,
         seq: u64,
@@ -642,7 +908,11 @@ mod tests {
         )
     }
 
-    fn signed_record(
+    /// Signs one record over exactly the bytes [`super::signing_bytes`]
+    /// produces -- the same function the verifier hashes -- so a record built
+    /// here and a record built by the coordination plane are byte-identical
+    /// for the same action.
+    pub(super) fn signed_record(
         key: &SigningKey,
         group_id: &str,
         seq: u64,
@@ -661,7 +931,7 @@ mod tests {
             action,
             signature: [0u8; SIGNATURE_LEN],
         };
-        let bytes = signing_bytes(group_id, &verified);
+        let bytes = super::signing_bytes(group_id, &verified);
         verified.signature = key.sign(&bytes).to_bytes();
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
@@ -677,15 +947,18 @@ mod tests {
             action_type: ACTION_GRANT,
             device_id: String::new(),
             signing_key_fingerprint: Vec::new(),
+            role: 0,
             new_authority_key: Vec::new(),
             signer_key_id: signer_key_id.to_vec(),
             signature: verified.signature.to_vec(),
         };
         match verified.action {
-            PolicyAction::Grant { device_id, signing_key_fingerprint } => {
-                record.action_type = ACTION_GRANT;
+            PolicyAction::Grant { device_id, signing_key_fingerprint, role, role_is_signed } => {
+                record.action_type =
+                    if role_is_signed { ACTION_GRANT_WITH_ROLE } else { ACTION_GRANT };
                 record.device_id = device_id;
                 record.signing_key_fingerprint = signing_key_fingerprint.to_vec();
+                record.role = role.to_wire();
             }
             PolicyAction::Revoke { device_id } => {
                 record.action_type = ACTION_REVOKE;
@@ -698,6 +971,18 @@ mod tests {
         }
         record
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use ed25519_dalek::SigningKey;
+
+    use super::policy_signing::{grant_record, legacy_grant_record, revoke_record, rotate_record};
+    use super::*;
+
+    fn service_key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
 
     #[test]
     fn admission_uses_policy_history_not_current_head() {
@@ -708,9 +993,9 @@ mod tests {
         // binding (the change's verifying key matches the granted one).
         let a_fp = [9u8; HASH_LEN];
         let b_fp = [7u8; HASH_LEN];
-        let a = grant_record(&key, group_id, 1, ZERO_HASH, "device-a", a_fp);
+        let a = grant_record(&key, group_id, 1, ZERO_HASH, "device-a", a_fp, WriterRole::Editor);
         let a_hash: [u8; HASH_LEN] = a.record_hash.as_slice().try_into().unwrap();
-        let b = grant_record(&key, group_id, 2, a_hash, "device-b", b_fp);
+        let b = grant_record(&key, group_id, 2, a_hash, "device-b", b_fp, WriterRole::Editor);
         let b_hash: [u8; HASH_LEN] = b.record_hash.as_slice().try_into().unwrap();
         let revoke_a = revoke_record(&key, group_id, 3, b_hash, "device-a");
         let revoke_hash: [u8; HASH_LEN] = revoke_a.record_hash.as_slice().try_into().unwrap();
@@ -761,7 +1046,8 @@ mod tests {
         // change signed by an arbitrary key ride the grant.
         let key = service_key();
         let group_id = "group";
-        let a = grant_record(&key, group_id, 1, ZERO_HASH, "device-a", ZERO_HASH);
+        let a =
+            grant_record(&key, group_id, 1, ZERO_HASH, "device-a", ZERO_HASH, WriterRole::Editor);
         let a_hash: [u8; HASH_LEN] = a.record_hash.as_slice().try_into().unwrap();
 
         let log = GroupPolicyLog {
@@ -824,9 +1110,25 @@ mod tests {
     fn revoke_chain() -> (SigningKey, [u8; HASH_LEN], [u8; HASH_LEN], GroupPolicyState) {
         let key = service_key();
         let group_id = "group";
-        let a = grant_record(&key, group_id, 1, ZERO_HASH, "device-a", [9u8; HASH_LEN]);
+        let a = grant_record(
+            &key,
+            group_id,
+            1,
+            ZERO_HASH,
+            "device-a",
+            [9u8; HASH_LEN],
+            WriterRole::Editor,
+        );
         let a_hash = hash_of(&a);
-        let b = grant_record(&key, group_id, 2, a_hash, "device-b", [7u8; HASH_LEN]);
+        let b = grant_record(
+            &key,
+            group_id,
+            2,
+            a_hash,
+            "device-b",
+            [7u8; HASH_LEN],
+            WriterRole::Editor,
+        );
         let b_hash = hash_of(&b);
         let revoke = revoke_record(&key, group_id, 3, b_hash, "device-a");
         let revoke_hash = hash_of(&revoke);
@@ -863,9 +1165,18 @@ mod tests {
         // After a restart the in-memory state is gone (base = None); a peer
         // replays the OLD chain up to seq 2 — signature-valid, but a rollback
         // that hides the seq-3 revoke of device-a.
-        let a = grant_record(&key, "group", 1, ZERO_HASH, "device-a", [9u8; HASH_LEN]);
+        let a = grant_record(
+            &key,
+            "group",
+            1,
+            ZERO_HASH,
+            "device-a",
+            [9u8; HASH_LEN],
+            WriterRole::Editor,
+        );
         assert_eq!(hash_of(&a), a_hash);
-        let b = grant_record(&key, "group", 2, a_hash, "device-b", [7u8; HASH_LEN]);
+        let b =
+            grant_record(&key, "group", 2, a_hash, "device-b", [7u8; HASH_LEN], WriterRole::Editor);
         let old_log = GroupPolicyLog {
             group_id: "group".to_string(),
             current_seq: 2,
@@ -886,9 +1197,25 @@ mod tests {
         let group_id = "group";
         // Two distinct seq-1 chains signed by the same authority: granting
         // different devices yields different record hashes (heads).
-        let x = grant_record(&key, group_id, 1, ZERO_HASH, "device-a", [9u8; HASH_LEN]);
+        let x = grant_record(
+            &key,
+            group_id,
+            1,
+            ZERO_HASH,
+            "device-a",
+            [9u8; HASH_LEN],
+            WriterRole::Editor,
+        );
         let x_hash = hash_of(&x);
-        let y = grant_record(&key, group_id, 1, ZERO_HASH, "device-b", [7u8; HASH_LEN]);
+        let y = grant_record(
+            &key,
+            group_id,
+            1,
+            ZERO_HASH,
+            "device-b",
+            [7u8; HASH_LEN],
+            WriterRole::Editor,
+        );
         let y_hash = hash_of(&y);
         assert_ne!(x_hash, y_hash);
 
@@ -919,9 +1246,25 @@ mod tests {
         let key = service_key();
         let group_id = "group";
         // Watermark at seq 2 (grant a, grant b).
-        let a = grant_record(&key, group_id, 1, ZERO_HASH, "device-a", [9u8; HASH_LEN]);
+        let a = grant_record(
+            &key,
+            group_id,
+            1,
+            ZERO_HASH,
+            "device-a",
+            [9u8; HASH_LEN],
+            WriterRole::Editor,
+        );
         let a_hash = hash_of(&a);
-        let b = grant_record(&key, group_id, 2, a_hash, "device-b", [7u8; HASH_LEN]);
+        let b = grant_record(
+            &key,
+            group_id,
+            2,
+            a_hash,
+            "device-b",
+            [7u8; HASH_LEN],
+            WriterRole::Editor,
+        );
         let b_hash = hash_of(&b);
         let base_log = GroupPolicyLog {
             group_id: group_id.to_string(),
@@ -991,7 +1334,15 @@ mod tests {
         let key1 = service_key();
         let group_id = "group";
         // Watermark at seq 1 under the original authority key (generation 0).
-        let a = grant_record(&key1, group_id, 1, ZERO_HASH, "device-a", [9u8; HASH_LEN]);
+        let a = grant_record(
+            &key1,
+            group_id,
+            1,
+            ZERO_HASH,
+            "device-a",
+            [9u8; HASH_LEN],
+            WriterRole::Editor,
+        );
         let a_hash = hash_of(&a);
         let base_log = GroupPolicyLog {
             group_id: group_id.to_string(),
@@ -1069,7 +1420,7 @@ mod tests {
         let key = service_key();
         let group_id = "group";
         let a_fp = [9u8; HASH_LEN];
-        let a = grant_record(&key, group_id, 1, ZERO_HASH, "device-a", a_fp);
+        let a = grant_record(&key, group_id, 1, ZERO_HASH, "device-a", a_fp, WriterRole::Editor);
         let a_hash: [u8; HASH_LEN] = a.record_hash.as_slice().try_into().unwrap();
 
         let log = GroupPolicyLog {
@@ -1144,9 +1495,25 @@ mod tests {
         // replay the same chain always compute byte-identical `Vec`s.
         let key = service_key();
         let group_id = "group";
-        let z = grant_record(&key, group_id, 1, ZERO_HASH, "device-z", [1u8; HASH_LEN]);
+        let z = grant_record(
+            &key,
+            group_id,
+            1,
+            ZERO_HASH,
+            "device-z",
+            [1u8; HASH_LEN],
+            WriterRole::Editor,
+        );
         let z_hash = hash_of(&z);
-        let a = grant_record(&key, group_id, 2, z_hash, "device-a", [2u8; HASH_LEN]);
+        let a = grant_record(
+            &key,
+            group_id,
+            2,
+            z_hash,
+            "device-a",
+            [2u8; HASH_LEN],
+            WriterRole::Editor,
+        );
         let a_hash = hash_of(&a);
         let log = GroupPolicyLog {
             group_id: group_id.to_string(),
@@ -1185,9 +1552,25 @@ mod tests {
         // writer set at seq 2".
         let key = service_key();
         let group_id = "group";
-        let a = grant_record(&key, group_id, 1, ZERO_HASH, "device-a", [9u8; HASH_LEN]);
+        let a = grant_record(
+            &key,
+            group_id,
+            1,
+            ZERO_HASH,
+            "device-a",
+            [9u8; HASH_LEN],
+            WriterRole::Editor,
+        );
         let a_hash = hash_of(&a);
-        let c = grant_record(&key, group_id, 3, a_hash, "device-c", [3u8; HASH_LEN]);
+        let c = grant_record(
+            &key,
+            group_id,
+            3,
+            a_hash,
+            "device-c",
+            [3u8; HASH_LEN],
+            WriterRole::Editor,
+        );
         let log = GroupPolicyLog {
             group_id: group_id.to_string(),
             current_seq: 1,
@@ -1273,8 +1656,15 @@ mod tests {
         let device_a_signing_key = SigningKey::from_bytes(&[42u8; 32]);
         let device_a_fingerprint: [u8; HASH_LEN] =
             Sha256::digest(device_a_signing_key.verifying_key().to_bytes()).into();
-        let grant =
-            grant_record(&authority, group_id, 1, ZERO_HASH, "device-a", device_a_fingerprint);
+        let grant = grant_record(
+            &authority,
+            group_id,
+            1,
+            ZERO_HASH,
+            "device-a",
+            device_a_fingerprint,
+            WriterRole::Editor,
+        );
         let head = hash_of(&grant);
         let log = GroupPolicyLog {
             group_id: group_id.to_string(),
@@ -1305,9 +1695,10 @@ mod tests {
             0,
             FileMeta {
                 mtime_unix_nanos: 0,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         );
         let record = FileRecord {
@@ -1336,6 +1727,7 @@ mod tests {
                     }],
                     versions: &[version],
                 },
+                None,
                 None,
                 crate::replica_coordinator::ReplicaChangeEmission {
                     emitter: &emitter,
@@ -1396,5 +1788,393 @@ mod tests {
             "a peer holding this group's real, verified policy must accept the locally-emitted \
              change's authorization stamp"
         );
+    }
+
+    // --- WriterRole regression tests -----------------------------------
+
+    /// The core security property this whole mechanism exists for: a
+    /// Viewer-role grant must never be treated as a writer by
+    /// `author_was_writer_at` -- the same predicate `NetmapChangeAuthenticator::
+    /// accepts_change_auth` calls for every peer's inbound admission. A
+    /// change signed by a Viewer-granted device must be rejected exactly
+    /// like an unauthorized device's change would be, not merely hidden by
+    /// a UI.
+    #[test]
+    fn a_viewer_role_grant_is_never_treated_as_a_writer() {
+        let key = service_key();
+        let group_id = "group";
+        let viewer_fp = [9u8; HASH_LEN];
+        let grant = grant_record(
+            &key,
+            group_id,
+            1,
+            ZERO_HASH,
+            "device-viewer",
+            viewer_fp,
+            WriterRole::Viewer,
+        );
+        let hash = hash_of(&grant);
+        let log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 1,
+            current_epoch: 0,
+            policy_head: hash.to_vec(),
+            records: vec![grant],
+        };
+        let policy = verify_group_policy_log(&key.verifying_key().to_bytes(), &log).unwrap();
+
+        assert!(
+            !policy.author_was_writer_at(
+                "device-viewer",
+                viewer_fp,
+                ChangeAuth { auth_seq: 1, auth_epoch: 0, policy_head_hash: hash }
+            ),
+            "a Viewer-role grant must never authorize a change, even with a correctly-bound \
+             fingerprint and a currently-valid ChangeAuth"
+        );
+        assert!(
+            policy.current_writers().is_empty(),
+            "a Viewer is a group member, not a writer -- current_writers() must exclude it"
+        );
+        assert_eq!(
+            policy.writers_at(1).unwrap(),
+            Vec::new(),
+            "writers_at() must exclude a Viewer-role grant at every historical sequence too"
+        );
+    }
+
+    /// Editor and Owner grants are both writers -- this verifier makes no
+    /// distinction between them (see `WriterRole`'s own doc comment for why
+    /// Owner's extra authority, if any, belongs to the signing service, not
+    /// here).
+    #[test]
+    fn editor_and_owner_role_grants_are_both_writers() {
+        let key = service_key();
+        let group_id = "group";
+        let editor_fp = [1u8; HASH_LEN];
+        let owner_fp = [2u8; HASH_LEN];
+        let editor = grant_record(
+            &key,
+            group_id,
+            1,
+            ZERO_HASH,
+            "device-editor",
+            editor_fp,
+            WriterRole::Editor,
+        );
+        let editor_hash = hash_of(&editor);
+        let owner = grant_record(
+            &key,
+            group_id,
+            2,
+            editor_hash,
+            "device-owner",
+            owner_fp,
+            WriterRole::Owner,
+        );
+        let owner_hash = hash_of(&owner);
+        let log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 2,
+            current_epoch: 0,
+            policy_head: owner_hash.to_vec(),
+            records: vec![editor, owner],
+        };
+        let policy = verify_group_policy_log(&key.verifying_key().to_bytes(), &log).unwrap();
+
+        assert!(policy.author_was_writer_at(
+            "device-editor",
+            editor_fp,
+            ChangeAuth { auth_seq: 2, auth_epoch: 0, policy_head_hash: owner_hash }
+        ));
+        assert!(policy.author_was_writer_at(
+            "device-owner",
+            owner_fp,
+            ChangeAuth { auth_seq: 2, auth_epoch: 0, policy_head_hash: owner_hash }
+        ));
+        let mut writers = policy.current_writers();
+        writers.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        assert_eq!(
+            writers.iter().map(|w| w.device_id.as_str()).collect::<Vec<_>>(),
+            vec!["device-editor", "device-owner"]
+        );
+    }
+
+    /// Revoke must remove a device from the writer set regardless of what
+    /// role its grant carried -- a Viewer revoke is a no-op on the writer
+    /// set (it was never in it), and an Editor/Owner revoke removes it same
+    /// as before roles existed.
+    #[test]
+    fn revoke_removes_a_grant_from_the_writer_set_regardless_of_its_role() {
+        let key = service_key();
+        let group_id = "group";
+        let editor_fp = [1u8; HASH_LEN];
+        let editor = grant_record(
+            &key,
+            group_id,
+            1,
+            ZERO_HASH,
+            "device-editor",
+            editor_fp,
+            WriterRole::Editor,
+        );
+        let editor_hash = hash_of(&editor);
+        let revoke = revoke_record(&key, group_id, 2, editor_hash, "device-editor");
+        let revoke_hash = hash_of(&revoke);
+        let log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 2,
+            current_epoch: 1,
+            policy_head: revoke_hash.to_vec(),
+            records: vec![editor, revoke],
+        };
+        let policy = verify_group_policy_log(&key.verifying_key().to_bytes(), &log).unwrap();
+
+        assert!(policy.current_writers().is_empty());
+        assert!(!policy.author_was_writer_at(
+            "device-editor",
+            editor_fp,
+            ChangeAuth { auth_seq: 2, auth_epoch: 1, policy_head_hash: revoke_hash }
+        ));
+    }
+
+    /// The role is part of what gets signed: a record with its `role` field
+    /// tampered after signing (Viewer -> Editor, a privilege escalation)
+    /// must fail signature verification, exactly like tampering with the
+    /// device_id or fingerprint would. This is the property that makes the
+    /// role a real security boundary rather than an unauthenticated hint --
+    /// without it, anything that can touch a `PolicyRecord` in transit or
+    /// storage (a compromised relay, a corrupted cache) could silently
+    /// upgrade a Viewer to a full writer.
+    #[test]
+    fn tampering_with_a_grants_role_after_signing_invalidates_the_signature() {
+        let key = service_key();
+        let group_id = "group";
+        let mut viewer_grant = grant_record(
+            &key,
+            group_id,
+            1,
+            ZERO_HASH,
+            "device-a",
+            [9u8; HASH_LEN],
+            WriterRole::Viewer,
+        );
+        // Escalate the wire record's role after signing, without
+        // re-signing -- simulates an in-transit/in-storage tamper attempt.
+        viewer_grant.role = WriterRole::Editor.to_wire();
+
+        let log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 1,
+            current_epoch: 0,
+            policy_head: viewer_grant.record_hash.clone(),
+            records: vec![viewer_grant],
+        };
+        let result = verify_group_policy_log(&key.verifying_key().to_bytes(), &log);
+        assert!(
+            result.is_err(),
+            "a record whose role was changed after signing must fail verification -- got {result:?}"
+        );
+    }
+
+    /// `parse_action` must fail closed on an out-of-range role value rather
+    /// than silently defaulting to some role -- a malformed or
+    /// forward-incompatible record must never be interpreted as granting
+    /// write access.
+    #[test]
+    fn an_out_of_range_role_value_is_rejected() {
+        assert!(WriterRole::from_wire(3).is_err());
+        assert!(WriterRole::from_wire(u32::MAX).is_err());
+        assert_eq!(WriterRole::from_wire(0), Ok(WriterRole::Viewer));
+        assert_eq!(WriterRole::from_wire(1), Ok(WriterRole::Editor));
+        assert_eq!(WriterRole::from_wire(2), Ok(WriterRole::Owner));
+    }
+
+    // --- Cross-implementation golden-vector tests -----------------------
+    //
+    // These pin the EXACT byte layout `coordination-worker/src/policy/
+    // service.ts::canonicalSigningBytes` must also produce -- see that
+    // file's own module doc comment and `coordination-worker/test/
+    // policy.test.ts`'s identical assertion. If either side's encoding
+    // drifts from the other, every Grant record either side signs fails
+    // `verify_strict` on the other -- the exact incident that motivated
+    // adding these tests. Update BOTH sides in lockstep, never just one.
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The pre-role preimage shape (`ACTION_GRANT`) is UNCHANGED by the
+    /// `WriterRole` work -- byte-for-byte identical to what
+    /// `coordination-worker`'s `canonicalSigningBytes` has always produced
+    /// and to what every already-persisted historical Grant record was
+    /// signed under. This is what makes the migration safe: no existing
+    /// record needs re-signing. Matches `policy.test.ts`'s "matches the
+    /// cross-implementation golden signing-bytes vector" test exactly
+    /// (group "g", device "d", all-zero prev/signer/fingerprint, epoch 0,
+    /// seq 1).
+    #[test]
+    fn legacy_grant_signing_bytes_match_the_cross_implementation_golden_vector() {
+        // Mirrors `policy.test.ts`'s own golden-vector test exactly: calls
+        // the signing-bytes builder directly with synthetic all-zero
+        // group/prev/signer inputs, NOT through a real signing key's
+        // actual derived signer_key_id -- both sides assert this same
+        // pure-function shape independent of any real key material.
+        let verified = VerifiedPolicyRecord {
+            seq: 1,
+            prev_record_hash: ZERO_HASH,
+            record_hash: ZERO_HASH,
+            epoch: 0,
+            signer_key_id: ZERO_HASH,
+            action: PolicyAction::Grant {
+                device_id: "d".to_string(),
+                signing_key_fingerprint: ZERO_HASH,
+                role: WriterRole::Editor,
+                role_is_signed: false,
+            },
+            signature: [0u8; SIGNATURE_LEN],
+        };
+        let bytes = signing_bytes("g", &verified);
+        let expected = concat!(
+            "796c706f6c696331",                                                 // "ylpolic1"
+            "0000000167",                                                       // len=1, "g"
+            "0000000000000001",                                                 // seq=1
+            "0000000000000000000000000000000000000000000000000000000000000000", // prev (32)
+            "0000000000000000",                                                 // epoch=0
+            "0000000000000000000000000000000000000000000000000000000000000000", // signer_key_id (32)
+            "00",         // action_type = ACTION_GRANT
+            "0000000164", // len=1, "d"
+            "0000000000000000000000000000000000000000000000000000000000000000", // fingerprint (32)
+        );
+        assert_eq!(
+            hex(&bytes),
+            expected,
+            "the legacy (role-less) Grant preimage must stay byte-identical to the \
+             cross-implementation golden vector in coordination-worker/test/policy.test.ts -- \
+             any difference means every already-persisted historical Grant record would fail \
+             signature verification"
+        );
+    }
+
+    /// The NEW preimage shape (`ACTION_GRANT_WITH_ROLE`) is a genuinely
+    /// different, longer byte sequence from the legacy shape above (same
+    /// prefix through the fingerprint, then a distinct action-type byte and
+    /// one extra trailing role byte) -- never confusable with it, and never
+    /// produced for a record whose signature was computed under the legacy
+    /// shape.
+    #[test]
+    fn role_carrying_grant_signing_bytes_differ_from_the_legacy_shape_by_action_type_and_trailing_role_byte(
+    ) {
+        // Same synthetic-input construction as the legacy golden-vector test
+        // above (group "g", device "d", all-zero prev/signer/fingerprint,
+        // epoch 0, seq 1, role=Editor) -- pinning the literal hex here too,
+        // for symmetry with that test and with `policy.test.ts`'s matching
+        // "a role-carrying grant produces a distinct, versioned
+        // signing-bytes shape" test. This exact hex was cross-checked three
+        // independent ways when this shape was first added: the Rust
+        // implementation, the TypeScript implementation under
+        // `@cloudflare/vitest-pool-workers`, and a from-scratch Python
+        // re-derivation of the documented byte layout -- all three agreed.
+        let with_role_verified = VerifiedPolicyRecord {
+            seq: 1,
+            prev_record_hash: ZERO_HASH,
+            record_hash: ZERO_HASH,
+            epoch: 0,
+            signer_key_id: ZERO_HASH,
+            action: PolicyAction::Grant {
+                device_id: "d".to_string(),
+                signing_key_fingerprint: ZERO_HASH,
+                role: WriterRole::Editor,
+                role_is_signed: true,
+            },
+            signature: [0u8; SIGNATURE_LEN],
+        };
+        let with_role_bytes = signing_bytes("g", &with_role_verified);
+        let with_role_expected = concat!(
+            "796c706f6c696331",                                                 // "ylpolic1"
+            "0000000167",                                                       // len=1, "g"
+            "0000000000000001",                                                 // seq=1
+            "0000000000000000000000000000000000000000000000000000000000000000", // prev (32)
+            "0000000000000000",                                                 // epoch=0
+            "0000000000000000000000000000000000000000000000000000000000000000", // signer_key_id (32)
+            "03",         // action_type = ACTION_GRANT_WITH_ROLE (NOT 0x00)
+            "0000000164", // len=1, "d"
+            "0000000000000000000000000000000000000000000000000000000000000000", // fingerprint (32)
+            "01",         // role = WriterRole::Editor
+        );
+        assert_eq!(
+            hex(&with_role_bytes),
+            with_role_expected,
+            "must equal policy.test.ts's matching golden vector byte-for-byte"
+        );
+
+        let legacy_verified = VerifiedPolicyRecord {
+            action: PolicyAction::Grant {
+                device_id: "d".to_string(),
+                signing_key_fingerprint: ZERO_HASH,
+                role: WriterRole::Editor,
+                role_is_signed: false,
+            },
+            ..with_role_verified
+        };
+        let legacy_bytes = signing_bytes("g", &legacy_verified);
+
+        assert_eq!(
+            with_role_bytes.len(),
+            legacy_bytes.len() + 1,
+            "the role-carrying shape must be exactly one byte longer (the trailing role byte)"
+        );
+        assert_ne!(
+            legacy_bytes,
+            with_role_bytes[..legacy_bytes.len()],
+            "the action-type byte must differ (ACTION_GRANT vs ACTION_GRANT_WITH_ROLE), so the \
+             two shapes are never byte-confusable even though this Editor grant's role value \
+             equals the legacy shape's implicit default"
+        );
+        assert_eq!(*with_role_bytes.last().unwrap(), WriterRole::Editor.to_wire() as u8);
+    }
+
+    /// The actual migration property: an already-persisted, legacy-shaped
+    /// record for a group that LATER receives new-shaped (role-carrying)
+    /// grants verifies exactly as it always did -- no re-signing, and the
+    /// mixed chain (old records + new records) is accepted as a whole.
+    #[test]
+    fn a_chain_mixing_legacy_and_role_carrying_grants_verifies() {
+        let key = service_key();
+        let group_id = "group";
+        let legacy = legacy_grant_record(&key, group_id, 1, ZERO_HASH, "device-a", [9u8; HASH_LEN]);
+        let legacy_hash = hash_of(&legacy);
+        let with_role = grant_record(
+            &key,
+            group_id,
+            2,
+            legacy_hash,
+            "device-b",
+            [7u8; HASH_LEN],
+            WriterRole::Viewer,
+        );
+        let with_role_hash = hash_of(&with_role);
+        let log = GroupPolicyLog {
+            group_id: group_id.to_string(),
+            current_seq: 2,
+            current_epoch: 0,
+            policy_head: with_role_hash.to_vec(),
+            records: vec![legacy, with_role],
+        };
+        let policy = verify_group_policy_log(&key.verifying_key().to_bytes(), &log)
+            .expect("a chain mixing legacy and role-carrying Grant records must verify as a whole");
+
+        // device-a's pre-existing legacy grant is still implicitly Editor.
+        assert!(policy.author_was_writer_at(
+            "device-a",
+            [9u8; HASH_LEN],
+            ChangeAuth { auth_seq: 2, auth_epoch: 0, policy_head_hash: with_role_hash }
+        ));
+        // device-b's new Viewer grant is correctly excluded from writers.
+        assert!(!policy.author_was_writer_at(
+            "device-b",
+            [7u8; HASH_LEN],
+            ChangeAuth { auth_seq: 2, auth_epoch: 0, policy_head_hash: with_role_hash }
+        ));
     }
 }

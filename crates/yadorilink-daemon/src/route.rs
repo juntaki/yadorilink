@@ -28,7 +28,7 @@
 //! this pass's new, separately-declared per-device role. Nothing in this
 //! module ever couples the two.
 
-/// A peer's own declared willingness to forward opaque WireGuard datagrams
+/// A peer's own declared willingness to forward opaque QUIC datagrams
 /// for OTHER peers in a shared group -- see this module's own doc comment
 /// for why this is never inferred from full-replica status. Sourced from
 /// the coordination-plane netmap (`WsNetmapPeer::relay_capable` in
@@ -82,9 +82,9 @@ impl RelayCapability {
 /// daemon's own relay-session bookkeeping instead, not from this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteKind {
-    /// A direct, authenticated WireGuard path to the peer.
+    /// A direct, authenticated QUIC path to the peer.
     Direct,
-    /// Connected by forwarding opaque WireGuard datagrams through another
+    /// Connected by forwarding opaque QUIC datagrams through another
     /// peer rather than a direct path.
     Relay,
 }

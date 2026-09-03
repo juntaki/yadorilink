@@ -370,7 +370,8 @@ fn import_create_op<S: DagImportSource>(
         .collect();
     let symlink_target =
         state.file_index_repository().get_symlink_target(group_id, &record.path)?;
-    let exec_bit = state.file_index_repository().get_exec_bit(group_id, &record.path)?;
+    let unix_mode = state.file_index_repository().get_unix_mode(group_id, &record.path)?;
+    let xattrs = state.file_index_repository().get_xattrs(group_id, &record.path)?;
     // The index is authoritative for the record type. In particular a
     // directory has neither blocks nor a symlink target, just like an empty
     // regular file, so inferring kind from `symlink_target` collapses it to a
@@ -381,9 +382,10 @@ fn import_create_op<S: DagImportSource>(
         .unwrap_or(RecordKind::File);
     let meta = FileMeta {
         mtime_unix_nanos: record.mtime_unix_nanos,
-        exec_bit,
+        unix_mode,
         symlink_target,
         record_kind,
+        xattrs,
     };
     let version = FileVersion::new(blocks, record.size, meta);
     let op = Op::Put {
@@ -541,9 +543,10 @@ mod tests {
             record.size,
             FileMeta {
                 mtime_unix_nanos: record.mtime_unix_nanos,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         )
         .version_hash;

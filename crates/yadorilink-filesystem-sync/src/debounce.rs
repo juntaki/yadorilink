@@ -37,8 +37,11 @@ pub const DEFAULT_QUIET_PERIOD: Duration = Duration::from_millis(300);
 /// A continuously-busy folder still flushes at least this often, so a
 /// long-running burst of activity doesn't delay every change indefinitely.
 pub const DEFAULT_MAX_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
-/// Distinct paths changing within one window above this count switches
-/// from per-path tracking to the full-rescan fallback.
+/// Distinct paths changing within one window at or above this count
+/// flushes the window early as its own bounded `Paths` batch (see
+/// `accumulate_event`) instead of growing it further — never a switch to
+/// the full-rescan fallback, which is reserved for genuine information
+/// loss (see `DebounceFlush::RescanRequired`'s own doc comment).
 pub const DEFAULT_BURST_THRESHOLD: usize = 500;
 /// Default capacity of the channel connecting the accumulator to its
 /// executor — small, since a flush is already a coalesced
@@ -83,10 +86,24 @@ pub enum DebounceFlush {
     /// concurrent edit's own (never debounce-delayed) file mtime,
     /// regardless of which genuinely happened first.
     Paths(Vec<(PathBuf, FsChangeKind, i64)>),
-    /// The number of distinct paths in this window exceeded
-    /// `burst_threshold`; per-path tracking was discarded —
-    /// the caller should run a full reconciliation scan instead.
-    BurstFallback,
+    /// Precise per-path tracking was genuinely lost for whatever changed
+    /// during this window — the caller should run a full reconciliation
+    /// scan instead. Reserved for the one case that actually loses
+    /// information: the watcher's own raw-event channel overflowed (see
+    /// `overflowed` in `run_debouncer`'s own doc comment), so some change
+    /// in this window is simply unknown to this accumulator. Crossing
+    /// `burst_threshold` distinct KNOWN paths is NOT this case — see
+    /// `Paths`'s own early-flush behavior above, which handles a large
+    /// but fully-known burst (e.g. a bulk rename/delete) as a sequence of
+    /// bounded `Paths` batches instead. Converting a large-but-known
+    /// burst into a full-tree rescan was a confirmed, measured bug: at
+    /// ~100k-file scale, a full disk-vs-index content rescan costs
+    /// roughly the ENTIRE tree's own content verification, not the size
+    /// of what actually changed — and `watcher.rs`'s own doc comment
+    /// already documents a full-rescan fallback like this one
+    /// deterministically stalling convergence when it re-derives/
+    /// re-versions files a concurrent peer write is racing.
+    RescanRequired,
 }
 
 /// Same shape as this crate's
@@ -108,9 +125,17 @@ enum State {
         window_started_at: Instant,
         last_event_at: Instant,
     },
-    /// Burst threshold was crossed; further events are observed (to know
-    /// when the burst subsides) but not tracked individually.
+    /// Precision was genuinely lost (watcher-channel overflow only — see
+    /// `RescanRequired`'s own doc comment; a large but fully-known burst no
+    /// longer reaches this state, see `accumulate_event`); further events
+    /// are observed (to know when the burst subsides) but not tracked
+    /// individually. `window_started_at` bounds this state's own worst-case
+    /// dwell time by `max_flush_interval`, the same defense-in-depth
+    /// `Accumulating` already has — a continuous trickle of further raw
+    /// events (each resetting `last_event_at`) must not indefinitely delay
+    /// the rescan this state exists to trigger.
     Bursting {
+        window_started_at: Instant,
         last_event_at: Instant,
     },
 }
@@ -245,7 +270,8 @@ pub async fn run_debouncer(
                 reason = "watcher_channel_overflow",
                 "filesystem watcher channel overflowed; falling back to full reconciliation"
             );
-            state = State::Bursting { last_event_at: Instant::now() };
+            let now = Instant::now();
+            state = State::Bursting { window_started_at: now, last_event_at: now };
         }
 
         let deadline = match &state {
@@ -254,7 +280,10 @@ pub async fn run_debouncer(
                 *last_event_at + config.quiet_period,
                 *window_started_at + config.max_flush_interval,
             )),
-            State::Bursting { last_event_at } => Some(*last_event_at + config.quiet_period),
+            State::Bursting { window_started_at, last_event_at } => Some(std::cmp::min(
+                *last_event_at + config.quiet_period,
+                *window_started_at + config.max_flush_interval,
+            )),
         };
 
         tokio::select! {
@@ -278,7 +307,7 @@ pub async fn run_debouncer(
                     flush_requests_open = false;
                     continue;
                 };
-                drain_ready_events(&mut events, &mut state, &config);
+                drain_ready_events(&mut events, &mut state, &config, &mut ready_queue);
                 let (next_state, found) = match state {
                     State::Accumulating { mut pending, window_started_at, last_event_at } => {
                         let found = match request.mode {
@@ -315,7 +344,7 @@ pub async fn run_debouncer(
                     flush_all_requests_open = false;
                     continue;
                 };
-                drain_ready_events(&mut events, &mut state, &config);
+                drain_ready_events(&mut events, &mut state, &config, &mut ready_queue);
                 let drained = match state {
                     State::Accumulating { pending, .. } => {
                         state = State::Idle;
@@ -331,7 +360,11 @@ pub async fn run_debouncer(
 
             maybe_event = events.recv() => {
                 let Some(event) = maybe_event else { break };
-                state = accumulate_event(state, event, &config);
+                let (next_state, flush) = accumulate_event(state, event, &config);
+                state = next_state;
+                if let Some(flush) = flush {
+                    push_ready(&mut ready_queue, flush);
+                }
             }
 
             _ = sleep_until_opt(deadline) => {
@@ -347,7 +380,7 @@ pub async fn run_debouncer(
                     State::Accumulating { pending, .. } => DebounceFlush::Paths(
                         pending.into_iter().map(|(path, (kind, at))| (path, kind, at)).collect(),
                     ),
-                    State::Bursting { .. } => DebounceFlush::BurstFallback,
+                    State::Bursting { .. } => DebounceFlush::RescanRequired,
                 };
                 push_ready(&mut ready_queue, flush);
                 state = State::Idle;
@@ -361,29 +394,56 @@ pub async fn run_debouncer(
 /// pre-reply drain in `drain_ready_events`, so a flush request can never
 /// answer from a state built by a *different* accumulation rule than the
 /// timer path uses.
-fn accumulate_event(state: State, event: FsChangeEvent, config: &DebounceConfig) -> State {
+///
+/// Returns the flush to push onto the ready queue when this event fills
+/// this window to `burst_threshold` — the caller is responsible for
+/// actually queuing it (`push_ready`), since only the caller knows
+/// whether it's mid-drain (`drain_ready_events`, which must not itself
+/// touch `ready_queue`) or on the main event-intake path.
+///
+/// `burst_threshold` distinct paths in one window flushes early as an
+/// ordinary bounded `Paths` batch rather than discarding per-path
+/// tracking — a confirmed, measured bug this replaces: converting a
+/// large but fully-known burst (e.g. a bulk rename/delete storm) into
+/// `RescanRequired` traded a bounded, known cost (this window's own
+/// path count) for an UNBOUNDED one (a full-tree disk-vs-index content
+/// verification, roughly the size of the entire synced folder regardless
+/// of how much of it actually changed) -- observed hanging a ~1k-file
+/// folder's own 900-op storm for the full length of a 900s test timeout
+/// with zero further progress. A sustained burst of N paths now costs
+/// `ceil(N / burst_threshold)` bounded batches instead.
+fn accumulate_event(
+    state: State,
+    event: FsChangeEvent,
+    config: &DebounceConfig,
+) -> (State, Option<DebounceFlush>) {
     let now = Instant::now();
     let observed_at = now_unix_nanos();
-    match state {
-        State::Idle => {
-            let mut pending = HashMap::new();
-            pending.insert(event.path, (event.kind, observed_at));
-            State::Accumulating { pending, window_started_at: now, last_event_at: now }
+    let (mut pending, window_started_at) = match state {
+        State::Idle => (HashMap::new(), now),
+        State::Accumulating { pending, window_started_at, .. } => (pending, window_started_at),
+        State::Bursting { window_started_at, .. } => {
+            return (State::Bursting { window_started_at, last_event_at: now }, None);
         }
-        State::Accumulating { mut pending, window_started_at, .. } => {
-            pending.insert(event.path, (event.kind, observed_at));
-            if pending.len() > config.burst_threshold {
-                tracing::warn!(
-                    reason = "burst_threshold_exceeded",
-                    burst_threshold = config.burst_threshold,
-                    "too many distinct paths changed in one debounce window; falling back to full reconciliation"
-                );
-                State::Bursting { last_event_at: now }
-            } else {
-                State::Accumulating { pending, window_started_at, last_event_at: now }
-            }
-        }
-        State::Bursting { .. } => State::Bursting { last_event_at: now },
+    };
+    pending.insert(event.path, (event.kind, observed_at));
+    // `>=`, not `>`, so a caller-configured `burst_threshold` of exactly 1
+    // (a real, publicly permitted `DebounceConfig` value) flushes on this
+    // very first event too, rather than only from the second one onward --
+    // checked uniformly here for a window of any prior size (including
+    // fresh-from-`Idle`), not only once already `Accumulating`.
+    if pending.len() >= config.burst_threshold {
+        tracing::warn!(
+            reason = "burst_threshold_reached",
+            burst_threshold = config.burst_threshold,
+            "debounce window reached its known-path threshold; flushing early as a batch"
+        );
+        let flush = DebounceFlush::Paths(
+            pending.into_iter().map(|(path, (kind, at))| (path, kind, at)).collect(),
+        );
+        (State::Idle, Some(flush))
+    } else {
+        (State::Accumulating { pending, window_started_at, last_event_at: now }, None)
     }
 }
 
@@ -429,29 +489,61 @@ fn drain_ready_events(
     events: &mut mpsc::Receiver<FsChangeEvent>,
     state: &mut State,
     config: &DebounceConfig,
+    ready_queue: &mut std::collections::VecDeque<DebounceFlush>,
 ) {
     while let Ok(event) = events.try_recv() {
         let current = std::mem::replace(state, State::Idle);
-        *state = accumulate_event(current, event, config);
+        let (next_state, flush) = accumulate_event(current, event, config);
+        *state = next_state;
+        // A burst-threshold early flush can complete mid-drain (see
+        // `accumulate_event`'s own doc comment) -- it must still reach the
+        // executor via the ordinary ready queue, never be silently dropped
+        // just because it happened while draining ahead of a flush request.
+        if let Some(flush) = flush {
+            push_ready(ready_queue, flush);
+        }
     }
 }
 
-/// Pushes a completed window onto the delivery queue, collapsing it into
-/// a single `BurstFallback` if the executor has fallen far enough behind
-/// that the queue would otherwise grow without bound — this is the same
-/// "too much changed to track precisely,
-/// reconcile from scratch instead" recovery as the burst-threshold and
-/// watcher-overflow triggers, applied to a third place bounded memory
-/// matters: the queue between this accumulator and its executor.
+/// Pushes a completed window onto the delivery queue, merging every
+/// currently-queued entry (plus this new one) into a single entry when the
+/// executor has fallen far enough behind that the queue would otherwise
+/// grow without bound — bounding queue DEPTH to 1 in that case, without
+/// discarding known paths the way collapsing to `RescanRequired` used to
+/// (a confirmed, measured bug — see `DebounceFlush::RescanRequired`'s own
+/// doc comment). Every queued `Paths` batch folds into one deduplicated
+/// map (a path touched by more than one queued batch keeps the latest
+/// batch's kind/timestamp, the same "last observation wins" rule
+/// `accumulate_event` already applies within a single window); only if a
+/// `RescanRequired` is already queued does the merge stay
+/// `RescanRequired` — that precision loss already happened and merging
+/// cannot recover it, but merging still bounds queue depth for it too.
 fn push_ready(queue: &mut std::collections::VecDeque<DebounceFlush>, flush: DebounceFlush) {
     if queue.len() >= DEFAULT_EXECUTOR_CHANNEL_CAPACITY {
         tracing::warn!(
             reason = "executor_backlog",
             queued = queue.len(),
-            "executor has fallen behind the accumulator; collapsing queued flushes into a full reconciliation"
+            "executor has fallen behind the accumulator; merging queued flushes to bound memory"
         );
-        queue.clear();
-        queue.push_back(DebounceFlush::BurstFallback);
+        let mut merged: HashMap<PathBuf, (FsChangeKind, i64)> = HashMap::new();
+        let mut rescan_required = false;
+        for queued in queue.drain(..).chain(std::iter::once(flush)) {
+            match queued {
+                DebounceFlush::Paths(paths) => {
+                    for (path, kind, at) in paths {
+                        merged.insert(path, (kind, at));
+                    }
+                }
+                DebounceFlush::RescanRequired => rescan_required = true,
+            }
+        }
+        if rescan_required {
+            queue.push_back(DebounceFlush::RescanRequired);
+        } else {
+            queue.push_back(DebounceFlush::Paths(
+                merged.into_iter().map(|(path, (kind, at))| (path, kind, at)).collect(),
+            ));
+        }
     } else {
         queue.push_back(flush);
     }
@@ -466,12 +558,41 @@ async fn send_front(
     queue: &std::collections::VecDeque<DebounceFlush>,
 ) -> Result<(), ()> {
     let front = queue.front().cloned().expect("caller guards on !queue.is_empty()");
-    flush_tx.send(front).await.map_err(|_| ())
+    // M6-2 phase-timing diagnostic (temporary): see chunker.rs's matching
+    // M6PHASE comment for why this exists.
+    tracing::warn!("M6PHASE T_debounce: debounce dispatch to the flush consumer");
+    let result = flush_tx.send(front).await.map_err(|_| ());
+    // Kept at `debug!` (downgraded 2026-09-01 from an investigation-era
+    // `warn!`, which fired on every dispatch -- too noisy for production
+    // `warn!` on an active sync). `capacity()` after a successful send
+    // reflects real occupancy regardless of this future's own
+    // cancel-safety (a cancelled/re-raced future never reaches this line
+    // at all).
+    if result.is_ok() {
+        tracing::debug!(
+            remaining_capacity = flush_tx.capacity(),
+            "C4_ATTR_DEBOUNCE dispatch completed"
+        );
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes every test that installs its own `tracing::subscriber::
+    /// set_default` -- `tracing`'s own global max-level cache is process-
+    /// wide, not thread-local, so two such tests genuinely running at the
+    /// same wall-clock time (`cargo test`'s default parallelism runs each
+    /// `#[test]` on its own OS thread) can race that shared cache and
+    /// cause a `tracing::warn!` call in one test's own debouncer task to be
+    /// silently filtered out for the whole run, not merely delayed --
+    /// confirmed empirically (isolated and `--test-threads=1` runs never
+    /// flake; concurrent runs did, consistently in the same test, even
+    /// after polling the log buffer for up to 5s found nothing). Every
+    /// other test in this module is unaffected and stays fully parallel.
+    static TRACING_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn no_overflow() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
@@ -507,7 +628,7 @@ mod tests {
             DebounceFlush::Paths(paths) => {
                 paths.into_iter().map(|(path, kind, _at)| (path, kind)).collect()
             }
-            DebounceFlush::BurstFallback => panic!("expected Paths, got BurstFallback"),
+            DebounceFlush::RescanRequired => panic!("expected Paths, got RescanRequired"),
         }
     }
 
@@ -607,7 +728,7 @@ mod tests {
                     "already-claimed path must not be flushed again: {paths:?}"
                 )
             }
-            Ok(Some(DebounceFlush::BurstFallback)) => panic!("unexpected burst fallback"),
+            Ok(Some(DebounceFlush::RescanRequired)) => panic!("unexpected burst fallback"),
             Ok(None) => panic!("accumulator task ended unexpectedly"),
             Err(_) => {} // no flush at all is also an acceptable outcome
         }
@@ -835,7 +956,7 @@ mod tests {
                     "already-drained paths must not be flushed again: {paths:?}"
                 )
             }
-            Ok(Some(DebounceFlush::BurstFallback)) => panic!("unexpected burst fallback"),
+            Ok(Some(DebounceFlush::RescanRequired)) => panic!("unexpected burst fallback"),
             Ok(None) => panic!("accumulator task ended unexpectedly"),
             Err(_) => {} // no flush at all is also an acceptable outcome
         }
@@ -1004,10 +1125,21 @@ mod tests {
         keep_sending.abort();
     }
 
-    /// Exceeding the burst threshold within one window switches to
-    /// `BurstFallback` instead of a `Paths` batch.
+    /// Exceeding the burst threshold within one window flushes early as a
+    /// sequence of bounded `Paths` batches — never `RescanRequired`, which
+    /// is reserved for genuine information loss (watcher overflow). A
+    /// confirmed, measured bug this replaces: converting a large but
+    /// fully-known burst into a full-rescan fallback traded a bounded cost
+    /// for an unbounded one and was observed stalling a real ~1k-file
+    /// rename/delete storm indefinitely.
     #[tokio::test]
-    async fn exceeding_burst_threshold_triggers_burst_fallback() {
+    async fn exceeding_burst_threshold_flushes_early_as_bounded_batches() {
+        // See `burst_threshold_of_one_flushes_on_the_first_event`'s own
+        // comment on why a test that emits the same `tracing::warn!`
+        // callsite the log-capturing tests below assert on must also be
+        // serialized against them, even without installing its own
+        // subscriber.
+        let _tracing_guard = TRACING_TEST_MUTEX.lock().await;
         let (events_tx, events_rx) = mpsc::channel(64);
         let (flush_tx, mut flush_rx) = mpsc::channel(16);
         tokio::spawn(run_debouncer(
@@ -1030,11 +1162,83 @@ mod tests {
                 .unwrap();
         }
 
-        let flush = tokio::time::timeout(Duration::from_secs(2), flush_rx.recv())
+        let mut seen: Vec<PathBuf> = Vec::new();
+        for _ in 0..2 {
+            let flush = tokio::time::timeout(Duration::from_secs(2), flush_rx.recv())
+                .await
+                .expect("timed out waiting for flush")
+                .unwrap();
+            let paths = match flush {
+                DebounceFlush::Paths(paths) => paths,
+                DebounceFlush::RescanRequired => {
+                    panic!("a known 10-path burst must never fall back to a full rescan")
+                }
+            };
+            assert_eq!(paths.len(), 5, "each early flush must be exactly one bounded batch");
+            seen.extend(paths.into_iter().map(|(path, _, _)| path));
+        }
+        seen.sort();
+        let expected: Vec<PathBuf> =
+            (0..10).map(|i| PathBuf::from(format!("file-{i}.txt"))).collect();
+        assert_eq!(seen, expected, "all 10 known paths must be delivered, none lost");
+    }
+
+    /// A `burst_threshold` of exactly 1 -- a real, publicly permitted
+    /// `DebounceConfig` value -- must flush on the very FIRST event of a
+    /// fresh window, not only from the second one onward. Codex review
+    /// finding on the early-flush fix above: the threshold check lived
+    /// only in the `Accumulating` arm, so a length-1 map built fresh from
+    /// `Idle` never got checked at all until a quiet period/max-flush-
+    /// interval elapsed.
+    #[tokio::test]
+    async fn burst_threshold_of_one_flushes_on_the_first_event() {
+        // Also serialized against the tracing-subscriber-installing tests
+        // below, even though this test never installs one itself: this
+        // test's own `accumulate_event` call emits the exact same
+        // `tracing::warn!("burst_threshold_reached", ...)` line those
+        // tests capture, and `tracing`'s per-callsite interest cache is
+        // rebuilt globally (not per-thread) whenever a subscriber is
+        // installed/dropped elsewhere in the process -- letting this run
+        // concurrently with one of those tests could race that rebuild
+        // and cause the OTHER test's own capture to silently miss the
+        // line, not just this one (confirmed empirically: `--test-
+        // threads=1` and fully-isolated single-test runs never flake).
+        let _tracing_guard = TRACING_TEST_MUTEX.lock().await;
+        let config = DebounceConfig {
+            quiet_period: Duration::from_secs(30),
+            max_flush_interval: Duration::from_secs(60),
+            burst_threshold: 1,
+        };
+        let (events_tx, events_rx) = mpsc::channel(16);
+        let (flush_tx, mut flush_rx) = mpsc::channel(16);
+        tokio::spawn(run_debouncer(
+            config,
+            events_rx,
+            flush_tx,
+            no_overflow(),
+            no_flush_requests(),
+            no_flush_all_requests(),
+        ));
+
+        events_tx
+            .send(FsChangeEvent { path: "a.txt".into(), kind: FsChangeKind::CreatedOrModified })
             .await
-            .expect("timed out waiting for flush")
             .unwrap();
-        assert_eq!(flush, DebounceFlush::BurstFallback);
+
+        // The quiet period/max_flush_interval are both far longer than
+        // this timeout -- only the threshold-of-1 early flush can produce
+        // a result this fast.
+        let flush = tokio::time::timeout(Duration::from_millis(500), flush_rx.recv())
+            .await
+            .expect(
+                "a burst_threshold of 1 must flush on the very first event, not wait for \
+                     the quiet period",
+            )
+            .unwrap();
+        assert_eq!(
+            expect_paths(flush),
+            vec![(PathBuf::from("a.txt"), FsChangeKind::CreatedOrModified)]
+        );
     }
 
     /// A quiet folder (`Idle` state, no timer armed) doesn't spuriously
@@ -1135,6 +1339,7 @@ mod tests {
     /// log output correctly.
     #[tokio::test]
     async fn burst_threshold_trigger_logs_a_distinguishable_reason() {
+        let _tracing_guard = TRACING_TEST_MUTEX.lock().await;
         let buf = SharedLogBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer({
@@ -1166,16 +1371,30 @@ mod tests {
         }
         let flush =
             tokio::time::timeout(Duration::from_secs(2), flush_rx.recv()).await.unwrap().unwrap();
-        assert_eq!(flush, DebounceFlush::BurstFallback);
-
         assert!(
-            buf.contains("burst_threshold_exceeded"),
+            matches!(flush, DebounceFlush::Paths(_)),
+            "a known burst must flush as bounded Paths batches, not fall back to a rescan"
+        );
+
+        // Polls rather than checking once immediately: under CPU contention
+        // (many tests running concurrently) the log write can lag behind
+        // this task observing the flush, even though the `tracing::warn!`
+        // call is causally before it -- same rationale, and same fix, as
+        // `executor_backlog_trigger_logs_a_distinguishable_reason_and_merges_
+        // the_queue`'s own identical polling loop below.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !buf.contains("burst_threshold_reached") && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            buf.contains("burst_threshold_reached"),
             "log did not mention the burst-threshold reason"
         );
     }
 
     #[tokio::test]
     async fn watcher_overflow_trigger_logs_a_distinguishable_reason() {
+        let _tracing_guard = TRACING_TEST_MUTEX.lock().await;
         let buf = SharedLogBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer({
@@ -1199,7 +1418,7 @@ mod tests {
 
         let flush =
             tokio::time::timeout(Duration::from_secs(2), flush_rx.recv()).await.unwrap().unwrap();
-        assert_eq!(flush, DebounceFlush::BurstFallback);
+        assert_eq!(flush, DebounceFlush::RescanRequired);
 
         assert!(
             buf.contains("watcher_channel_overflow"),
@@ -1207,13 +1426,17 @@ mod tests {
         );
     }
 
-    /// Once the delivery queue
-    /// reaches capacity (executor never drains), further completed
-    /// windows collapse into a single `BurstFallback` instead of growing
-    /// the queue without bound, and the collapse is logged with its own
-    /// distinguishable reason.
+    /// Once the delivery queue reaches capacity (executor never drains),
+    /// further completed windows merge into a single `Paths` entry instead
+    /// of growing the queue without bound -- bounding queue depth WITHOUT
+    /// discarding known paths (a confirmed, measured bug the merge
+    /// replaces: collapsing straight to `RescanRequired` here converted a
+    /// merely-slow executor into an unbounded full-tree rescan even though
+    /// every path that changed was already known). The merge is logged
+    /// with its own distinguishable reason.
     #[tokio::test]
-    async fn executor_backlog_trigger_logs_a_distinguishable_reason_and_collapses_the_queue() {
+    async fn executor_backlog_trigger_logs_a_distinguishable_reason_and_merges_the_queue() {
+        let _tracing_guard = TRACING_TEST_MUTEX.lock().await;
         let buf = SharedLogBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer({
@@ -1275,23 +1498,39 @@ mod tests {
             "log did not mention the executor-backlog reason"
         );
 
-        // Now drain: the queue was collapsed, so what's left is a small,
-        // bounded number of entries ending in a BurstFallback — not one
-        // entry per file.
-        let mut seen = 0;
-        let mut saw_fallback = false;
+        // Now drain: the queue was merged, so what's left is a small,
+        // bounded number of entries — not one per file — and every known
+        // path (this scenario never overflowed the watcher channel, only
+        // the delivery queue) must still be present, not discarded.
+        let mut seen_entries = 0;
+        let mut saw_rescan_required = false;
+        let mut seen_paths: Vec<PathBuf> = Vec::new();
         while let Ok(Some(flush)) =
             tokio::time::timeout(Duration::from_millis(500), flush_rx.recv()).await
         {
-            seen += 1;
-            if flush == DebounceFlush::BurstFallback {
-                saw_fallback = true;
+            seen_entries += 1;
+            match flush {
+                DebounceFlush::RescanRequired => saw_rescan_required = true,
+                DebounceFlush::Paths(paths) => {
+                    seen_paths.extend(paths.into_iter().map(|(path, _, _)| path));
+                }
             }
             assert!(
-                seen <= DEFAULT_EXECUTOR_CHANNEL_CAPACITY + 1,
-                "queue was not bounded/collapsed"
+                seen_entries <= DEFAULT_EXECUTOR_CHANNEL_CAPACITY + 1,
+                "queue was not bounded/merged"
             );
         }
-        assert!(saw_fallback, "expected the collapsed backlog to end in a BurstFallback");
+        assert!(
+            !saw_rescan_required,
+            "no watcher overflow occurred in this scenario -- every path was known, so the \
+             merge must never fall back to a full rescan"
+        );
+        seen_paths.sort();
+        seen_paths.dedup();
+        let mut expected: Vec<PathBuf> = (0..(DEFAULT_EXECUTOR_CHANNEL_CAPACITY + 4))
+            .map(|i| PathBuf::from(format!("file-{i}.txt")))
+            .collect();
+        expected.sort();
+        assert_eq!(seen_paths, expected, "merging a backed-up queue must lose no known path");
     }
 }

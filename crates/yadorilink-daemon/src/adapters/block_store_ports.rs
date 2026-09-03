@@ -34,7 +34,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use yadorilink_local_storage::{
-    BlockContentStore, BlockReclamationStore, BlockStore, ContentHash, GcReport, StorageError,
+    BlockContentStore, BlockReclamationStore, BlockStore, ContentHash, GcReport, LocallyHashedBlock,
+    StorageError,
 };
 
 /// Adapts an already-erased `Arc<dyn BlockStore + Send + Sync>` to
@@ -53,6 +54,14 @@ impl BlockStorePortsAdapter {
 impl BlockContentStore for BlockStorePortsAdapter {
     fn put(&self, data: &[u8]) -> Result<ContentHash, StorageError> {
         self.0.put(data)
+    }
+
+    fn put_prepared(&self, prepared: &LocallyHashedBlock) -> Result<(), StorageError> {
+        self.0.put_prepared(prepared)
+    }
+
+    fn put_prepared_batch(&self, prepared: &[LocallyHashedBlock]) -> Result<(), StorageError> {
+        self.0.put_prepared_batch(prepared)
     }
 
     fn get(&self, hash: &str) -> Result<Vec<u8>, StorageError> {

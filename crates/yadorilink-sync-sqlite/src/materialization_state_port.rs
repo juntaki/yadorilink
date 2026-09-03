@@ -150,7 +150,7 @@ pub trait MaterializationStatePort: Send + Sync {
         group_id: &str,
         path: &str,
         state: MaterializationState,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError>;
 
     /// Atomically changes a current file's materialization state only when
@@ -163,12 +163,12 @@ pub trait MaterializationStatePort: Send + Sync {
         path: &str,
         expected: MaterializationState,
         next: MaterializationState,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<bool, SyncSqliteError>;
 
     fn is_path_dirty(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError>;
 
-    fn get_exec_bit(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError>;
+    fn get_unix_mode(&self, group_id: &str, path: &str) -> Result<Option<u32>, SyncSqliteError>;
 
     /// Hydrated, unpinned, non-deleted files for `group_id`, ordered
     /// least-recently-accessed first -- the automatic eviction sweep's
@@ -207,7 +207,7 @@ pub trait MaterializationStatePort: Send + Sync {
         &self,
         group_id: &str,
         path: &str,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError>;
 
     /// Records the durable materialization-write-in-progress intent, which
@@ -219,7 +219,7 @@ pub trait MaterializationStatePort: Send + Sync {
         group_id: &str,
         path: &str,
         target_version_hash: &[u8],
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError>;
 
     /// Tombstones a path with "now" as the observed time -- the
@@ -230,7 +230,7 @@ pub trait MaterializationStatePort: Send + Sync {
         group_id: &str,
         path: &str,
         device_id: &str,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError>;
 
     /// Tombstones a path and appends the signed `Delete` change describing
@@ -248,8 +248,9 @@ pub trait MaterializationStatePort: Send + Sync {
         path: &str,
         device_id: &str,
         observed_at_unix_nanos: i64,
+        publish_absent_proof: bool,
         emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<ChangeHash, SyncSqliteError>;
 
     fn record_dirty_path(
@@ -258,7 +259,7 @@ pub trait MaterializationStatePort: Send + Sync {
         path: &str,
         change_kind: &str,
         observed_at_unix_nanos: i64,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError>;
 
     fn list_dirty_paths(
@@ -266,12 +267,12 @@ pub trait MaterializationStatePort: Send + Sync {
         group_id: &str,
     ) -> Result<Vec<yadorilink_replica_domain::session_state::DirtyPath>, SyncSqliteError>;
 
-    fn set_exec_bit(
+    fn set_unix_mode(
         &self,
         group_id: &str,
         path: &str,
-        exec_bit: bool,
-        permit: &RootCommitPermit<'_>,
+        unix_mode: Option<u32>,
+        permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError>;
 
     fn set_pinned(&self, group_id: &str, path: &str, pinned: bool) -> Result<(), SyncSqliteError>;
@@ -291,7 +292,7 @@ pub trait MaterializationStatePort: Send + Sync {
         &self,
         group_id: &str,
         record: &FileRecord,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError>;
 
     fn upsert_file_with_origin(
@@ -299,7 +300,7 @@ pub trait MaterializationStatePort: Send + Sync {
         group_id: &str,
         record: &FileRecord,
         origin_device_id: &str,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError>;
 
     /// Every retained version of `path` -- consulted while resolving which
@@ -358,7 +359,7 @@ pub trait MaterializationStatePort: Send + Sync {
         group_id: &'a str,
         path: &'a str,
         target_version_hash: &[u8],
-        permit: &'a RootCommitPermit<'a>,
+        permit: &'a RootCommitPermit,
     ) -> Result<Box<dyn OpenMaterializationIntent + Send + 'a>, SyncSqliteError>;
 
     /// Semantic-operation read replacing `evict_file`'s three unconditional

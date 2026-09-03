@@ -14,11 +14,6 @@ thiserror.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
-# Pinned exactly: the WireGuard engine seam depends on 0.7.1's public API
-# (rate_limiter::RateLimiter for MAC1 verification, Tunn decapsulate for
-# bounded per-peer initiation trials). Upstream master is a separate rebuild
-# and explicitly not for direct use, so this must not float.
-boringtun = { version = "=0.7.1", default-features = false }
 rand = "0.10.2"
 hex = "0.4"
 prost = "0.14.4"
@@ -30,6 +25,26 @@ ed25519-dalek = "3"
 # own, so it is madsim-safe and shared across real and simulated builds; the
 # prober loop and the socket it runs over stay ours.
 stun = { version = "0.17", default-features = false }
+
+# M6-2A: bulk data plane transport (`bulk_quic.rs`). `quinn` 0.11.11 is
+# already resolved in this workspace's Cargo.lock (pulled in transitively),
+# so this pins the exact version already present rather than letting a
+# range float independently. `rustls-ring` (not the default `platform-
+# verifier`/`rustls-aws-lc-rs`) keeps this on the same `ring` crypto
+# provider `rustls` 0.23.42 already resolves with elsewhere in this
+# workspace, and avoids pulling in `aws-lc-rs`'s C/cmake build requirement.
+# Available under simulation too, deliberately. `bulk_quic.rs` itself stays
+# excluded -- it drives raw UDP sockets below what madsim's tokio shim can
+# intercept -- but `quic_socket.rs` runs the SAME quinn stack over the
+# transport hub's own shimmed socket, so the simulator sees every datagram.
+# Keeping quinn out of madsim builds would force a simulation-only fake QUIC,
+# which is exactly what must not exist: a deterministic test that does not
+# exercise the real transport proves nothing about it.
+quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Certificate generation for TLS handshake tests. `ring` crypto backend,
+# matching the rest of this dependency set.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 [dev-dependencies]
 tempfile = "3"

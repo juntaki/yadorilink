@@ -17,10 +17,16 @@
 # deployment artifact.
 #
 # SIGNING: release builds must set YADORILINK_RELEASE_BUILD=1 and provide
-# YADORILINK_PKG_SIGN_IDENTITY (a Developer ID Installer identity). Set
+# YADORILINK_APP_SIGN_IDENTITY (a Developer ID Application identity, used to
+# codesign the yadorilink/yadorilink-daemon/yadorilink-status-app Mach-O
+# binaries directly -- the FinderSync host .app is signed separately by
+# xcodebuild's own automatic signing) and YADORILINK_PKG_SIGN_IDENTITY (a
+# Developer ID Installer identity, used to sign the assembled .pkg). Set
 # YADORILINK_NOTARY_PROFILE to an xcrun notarytool keychain profile to
-# notarize and staple the signed pkg. Local/interim unsigned builds are
-# still possible, but this script writes a SHA-256 sidecar next to the
+# notarize and staple the signed pkg -- notarization rejects a .pkg
+# containing any unsigned executable, so YADORILINK_APP_SIGN_IDENTITY is
+# not optional once notarization is in play. Local/interim unsigned builds
+# are still possible, but this script writes a SHA-256 sidecar next to the
 # unsigned artifact so the integrity gap is explicit and checkable.
 
 set -euo pipefail
@@ -32,6 +38,7 @@ XCODE_PROJ_DIR="$REPO_ROOT/shell-ext/macos/YadoriLinkFinderSync"
 STAGE_DIR="$SCRIPT_DIR/.stage"
 XCODE_BUILD_DIR="$SCRIPT_DIR/.xcode-build"
 OUT_DIR="$SCRIPT_DIR/dist"
+APP_SIGN_IDENTITY="${YADORILINK_APP_SIGN_IDENTITY:-}"
 PKG_SIGN_IDENTITY="${YADORILINK_PKG_SIGN_IDENTITY:-}"
 NOTARY_PROFILE="${YADORILINK_NOTARY_PROFILE:-}"
 RELEASE_BUILD="${YADORILINK_RELEASE_BUILD:-0}"
@@ -50,6 +57,11 @@ command -v cargo >/dev/null || { echo "cargo not found on PATH"; exit 1; }
 command -v xcodebuild >/dev/null || { echo "xcodebuild not found (install Xcode)"; exit 1; }
 command -v shasum >/dev/null || { echo "shasum not found on PATH"; exit 1; }
 
+if [ "$RELEASE_BUILD" = "1" ] && [ -z "$APP_SIGN_IDENTITY" ]; then
+    echo "YADORILINK_RELEASE_BUILD=1 requires YADORILINK_APP_SIGN_IDENTITY."
+    echo "Use a Developer ID Application identity to codesign the CLI/daemon binaries."
+    exit 1
+fi
 if [ "$RELEASE_BUILD" = "1" ] && [ -z "$PKG_SIGN_IDENTITY" ]; then
     echo "YADORILINK_RELEASE_BUILD=1 requires YADORILINK_PKG_SIGN_IDENTITY."
     echo "Use a Developer ID Installer identity, then optionally set YADORILINK_NOTARY_PROFILE."
@@ -82,11 +94,12 @@ if [ -z "$XCODEGEN_BIN" ]; then
     exit 1
 fi
 
-if ! security find-identity -v -p codesigning 2>/dev/null | grep -qE "Apple (Development|Distribution)"; then
-    echo "WARNING: no real 'Apple Development'/'Apple Distribution' signing identity found in the"
-    echo "login keychain. project.yml uses CODE_SIGN_STYLE Automatic + DEVELOPMENT_TEAM 594UQF7QX3;"
-    echo "an ad-hoc signature is known NOT to work for this extension (see this script's header"
-    echo "comment) so xcodebuild below will likely fail or produce a non-functional .app."
+if ! security find-identity -v -p codesigning 2>/dev/null | grep -qE "Apple (Development|Distribution)|Developer ID Application"; then
+    echo "WARNING: no real 'Apple Development'/'Apple Distribution'/'Developer ID Application'"
+    echo "signing identity found in the login keychain. project.yml uses CODE_SIGN_STYLE Automatic +"
+    echo "DEVELOPMENT_TEAM 594UQF7QX3; an ad-hoc signature is known NOT to work for this extension"
+    echo "(see this script's header comment) so xcodebuild below will likely fail or produce a"
+    echo "non-functional .app."
 fi
 
 log "Building for yadorilink $PKG_VERSION"
@@ -151,6 +164,23 @@ chmod 755 \
     "$STAGE_DIR/usr/local/bin/yadorilink" \
     "$STAGE_DIR/usr/local/bin/yadorilink-daemon" \
     "$STAGE_DIR/usr/local/bin/yadorilink-status-app"
+
+# Codesign the raw CLI/daemon Mach-O binaries directly -- xcodebuild only
+# signs the FinderSync host .app above; these three are staged via a plain
+# cp and, without this, would ship inside a "signed" .pkg while remaining
+# individually unsigned. --options runtime (hardened runtime) + --timestamp
+# (secure timestamp) are both required for notarization to accept them.
+if [ -n "$APP_SIGN_IDENTITY" ]; then
+    log "codesigning CLI/daemon binaries"
+    codesign --force --options runtime --timestamp \
+        --sign "$APP_SIGN_IDENTITY" \
+        "$STAGE_DIR/usr/local/bin/yadorilink" \
+        "$STAGE_DIR/usr/local/bin/yadorilink-daemon" \
+        "$STAGE_DIR/usr/local/bin/yadorilink-status-app"
+    codesign --verify --strict "$STAGE_DIR/usr/local/bin/yadorilink"
+    codesign --verify --strict "$STAGE_DIR/usr/local/bin/yadorilink-daemon"
+    codesign --verify --strict "$STAGE_DIR/usr/local/bin/yadorilink-status-app"
+fi
 
 # ditto (not cp -R) preserves the.app bundle's resource forks / extended
 # attributes / code signature exactly, which a plain recursive copy can

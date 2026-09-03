@@ -14,6 +14,13 @@ pub enum TransportError {
 
     #[error("no route to peer: {0}")]
     NoRoute(String),
+
+    /// A QUIC/TLS configuration could not be assembled from the pinned crypto
+    /// provider. Not reachable by anything a peer sends -- it means the
+    /// provider does not offer what TLS 1.3 over QUIC requires -- but it is an
+    /// error rather than a panic because it sits on the connection path.
+    #[error("quic configuration error: {0}")]
+    QuicConfig(String),
 }
 
 impl TransportError {
@@ -31,6 +38,7 @@ impl TransportError {
             TransportError::Io(_) => "io",
             TransportError::ChannelClosed => "channel_closed",
             TransportError::NoRoute(_) => "no_route",
+            TransportError::QuicConfig(_) => "quic_config",
         }
     }
 }

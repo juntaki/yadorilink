@@ -96,6 +96,13 @@ enum Command {
         #[command(subcommand)]
         action: TrashAction,
     },
+    /// List currently-live conflicted-copy files across every linked
+    /// folder -- the same files `status`'s per-link `conflict_count`
+    /// already tallies, shown here individually.
+    Conflicts {
+        #[command(subcommand)]
+        action: ConflictsAction,
+    },
     /// Force-hydrate a placeholder file and keep it hydrated (on-demand-sync).
     Pin { local_path: String },
     /// Allow a pinned file to become a placeholder again (on-demand-sync).
@@ -103,6 +110,9 @@ enum Command {
     /// Manually convert a hydrated file back into a placeholder to
     /// reclaim local disk space (on-demand-sync).
     Evict { local_path: String },
+    /// Show one file's current materialization state (hydrated/
+    /// placeholder/hydrating/evicting) and pin flag (on-demand-sync).
+    MaterializationStatus { local_path: String },
     /// Control the sync daemon.
     Daemon {
         #[command(subcommand)]
@@ -291,6 +301,25 @@ enum ReportAction {
         #[command(subcommand)]
         action: ReportConsentAction,
     },
+    /// Inspect and manage the local submit-retry queue (reports that
+    /// failed to submit and are waiting to be retried automatically).
+    /// Requires the daemon -- the queue is daemon-owned runtime state.
+    Queue {
+        #[command(subcommand)]
+        action: ReportQueueAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReportQueueAction {
+    /// List queued reports awaiting automatic retry.
+    List,
+    /// Print one queued report's full JSON envelope.
+    Show { report_id: String },
+    /// Remove one queued report without submitting it.
+    Delete { report_id: String },
+    /// Remove every queued report without submitting any of them.
+    Flush,
 }
 
 #[derive(Subcommand)]
@@ -402,7 +431,7 @@ enum DeviceAction {
     /// De-register a device, revoking its access to every folder group at
     /// once. Takes effect promptly, not just eventually: any
     /// currently-connected peer of this device is pushed an updated
-    /// netmap immediately and tears its WireGuard tunnel/sync session
+    /// netmap immediately and tears its QUIC connection/sync session
     /// down; a peer that's offline at removal time gets the
     /// already-updated (device-absent) netmap the next time it
     /// reconnects.
@@ -448,8 +477,8 @@ enum ShareAction {
     /// the `yadorilink share revoke <edge>` form. Takes effect promptly for a
     /// currently-connected peer (bounded, sub-second propagation target)
     /// rather than only on its next poll: if the two devices still share
-    /// another folder group, their WireGuard tunnel stays up and only this
-    /// group's sync activity stops; otherwise the tunnel is torn down
+    /// another folder group, their QUIC connection stays up and only this
+    /// group's sync activity stops; otherwise the connection is torn down
     /// entirely, same as `device remove`.
     Revoke {
         /// A folder-group name (when `device_id` is also given, the
@@ -549,6 +578,13 @@ enum TrashAction {
     Restore { local_path: String },
 }
 
+#[derive(Subcommand)]
+enum ConflictsAction {
+    /// List currently-live conflicted-copy files across every linked
+    /// folder.
+    List,
+}
+
 #[tokio::main]
 async fn main() {
     // Best-effort: installs a stderr subscriber so `tracing::warn!` audit
@@ -628,9 +664,15 @@ async fn run(command: Command) -> Result<(), CliError> {
                 commands::version_history::trash_restore(local_path).await
             }
         },
+        Command::Conflicts { action } => match action {
+            ConflictsAction::List => commands::version_history::conflicts_list().await,
+        },
         Command::Pin { local_path } => commands::materialization::pin(local_path).await,
         Command::Unpin { local_path } => commands::materialization::unpin(local_path).await,
         Command::Evict { local_path } => commands::materialization::evict(local_path).await,
+        Command::MaterializationStatus { local_path } => {
+            commands::materialization::status(local_path).await
+        }
         Command::Daemon { action } => match action {
             DaemonAction::Start => commands::daemon::start().await,
             DaemonAction::Stop => commands::daemon::stop().await,
@@ -666,6 +708,16 @@ async fn run(command: Command) -> Result<(), CliError> {
                 ReportConsentAction::Prompts { enabled } => {
                     commands::report::consent_prompts(enabled).await
                 }
+            },
+            ReportAction::Queue { action } => match action {
+                ReportQueueAction::List => commands::report::queue_list().await,
+                ReportQueueAction::Show { report_id } => {
+                    commands::report::queue_show(report_id).await
+                }
+                ReportQueueAction::Delete { report_id } => {
+                    commands::report::queue_delete(report_id).await
+                }
+                ReportQueueAction::Flush => commands::report::queue_flush().await,
             },
         },
         Command::Diagnose { action } => match action {

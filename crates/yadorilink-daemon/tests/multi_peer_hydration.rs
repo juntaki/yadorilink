@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use boringtun::x25519::{PublicKey, StaticSecret};
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::hydration;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
@@ -20,7 +19,7 @@ use yadorilink_local_storage::{BlockStore, FsBlockStore, DEFAULT_BLOCK_SIZE};
 use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_transport::{PeerChannel, TransportHub};
+use yadorilink_transport::{QuicPeerChannel, TransportHub};
 
 const GROUP: &str = "shared";
 const PATH: &str = "big.bin";
@@ -33,43 +32,31 @@ async fn bind_unused_addr() -> std::net::SocketAddr {
     listener.local_addr().unwrap()
 }
 
-fn gen_keypair() -> (StaticSecret, PublicKey) {
-    let mut bytes = [0u8; 32];
-    rand::fill(&mut bytes);
-    let secret = StaticSecret::from(bytes);
-    let public = PublicKey::from(&secret);
-    (secret, public)
-}
-
-async fn connect_pair(_addr: std::net::SocketAddr) -> (Arc<PeerChannel>, Arc<PeerChannel>) {
-    let (secret_a, public_a) = gen_keypair();
-    let (secret_b, public_b) = gen_keypair();
-    // Direct loopback: bind each side's UDP socket and hand the other its
-    // address as the sole direct candidate — the same wiring the daemon's
-    // peer orchestrator uses to pair two channels.
+async fn connect_pair(_addr: std::net::SocketAddr) -> (Arc<QuicPeerChannel>, Arc<QuicPeerChannel>) {
+    use yadorilink_transport::{ConnectRole, DeviceSigningKeyPair, QuicPeerEndpoint};
+    // Direct loopback: bind each side's UDP socket and dial the other's
+    // address -- the same wiring the daemon's peer orchestrator uses.
     let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr_a = socket_a.local_addr().unwrap();
     let addr_b = socket_b.local_addr().unwrap();
-    let a = PeerChannel::connect(
-        secret_a,
-        public_b,
-        0,
-        vec![addr_b],
-        TransportHub::from_socket(socket_a, None),
+    let key_a = DeviceSigningKeyPair::generate();
+    let key_b = DeviceSigningKeyPair::generate();
+    let public_a = key_a.public_bytes();
+    let public_b = key_b.public_bytes();
+    let endpoint_a = QuicPeerEndpoint::new(TransportHub::from_socket(socket_a), key_a).unwrap();
+    let endpoint_b = QuicPeerEndpoint::new(TransportHub::from_socket(socket_b), key_b).unwrap();
+    endpoint_a.authorize(public_b);
+    endpoint_b.authorize(public_a);
+    let accepting = {
+        let endpoint_b = endpoint_b.clone();
+        tokio::spawn(async move { endpoint_b.accept(public_a).await })
+    };
+    let dialed = endpoint_a.connect(addr_b, public_b).await.unwrap();
+    let accepted = accepting.await.unwrap().unwrap();
+    (
+        QuicPeerChannel::new(dialed, ConnectRole::Dial),
+        QuicPeerChannel::new(accepted, ConnectRole::Accept),
     )
-    .await
-    .unwrap();
-    let b = PeerChannel::connect(
-        secret_b,
-        public_a,
-        1,
-        vec![addr_a],
-        TransportHub::from_socket(socket_b, None),
-    )
-    .await
-    .unwrap();
-    (Arc::new(a), Arc::new(b))
 }
 
 struct TestDevice {
@@ -568,6 +555,72 @@ async fn hydration_deadline_bounds_an_unresponsive_peer() {
             .get_materialization_state(GROUP, PATH)
             .unwrap(),
         Some(MaterializationState::Placeholder)
+    );
+}
+
+/// R3e: the size-aware per-block deadline (`PeerSyncSession::fetch_
+/// response_timeout_for`, which replaced a single fixed 5s constant --
+/// see that function's own doc comment for the measurement behind the
+/// change) must still detect a genuinely silent peer -- connected, but
+/// its own session task never runs, so nothing ever answers -- within a
+/// bounded time close to what the formula computes for the requested
+/// block's declared size. Not near-instant (which would mean the
+/// deadline was somehow bypassed) and not unbounded (the property the
+/// old fixed constant existed to guarantee, and which this size-aware
+/// replacement must not lose).
+///
+/// Calls `fetch_block_sized` directly rather than going through
+/// `hydration::hydrate`, to isolate this one deadline from the file-level
+/// `HYDRATION_TIMEOUT`/dispatcher retry machinery entirely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn silent_peer_is_detected_within_the_sized_per_block_deadline() {
+    let addr = bind_unused_addr().await;
+    let device_d = new_device("device-d-silent-probe");
+    let device_b = new_device("device-b-silent-probe");
+
+    // Same fixture shape as `hydration_deadline_bounds_an_unresponsive_
+    // peer` above: B is reachable at the transport level but its own
+    // session task never runs, so it never answers anything.
+    let (channel_d, _channel_b_unused) = connect_pair(addr).await;
+    let session_d_to_b = PeerSyncSession::new(
+        channel_d,
+        device_d.device_id.clone(),
+        device_b.device_id.clone(),
+        device_d.state.replica_coordinator.clone(),
+        std::sync::Arc::new(
+            yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                device_d.state.block_store.clone(),
+            ),
+        ),
+        vec![GROUP.to_string()],
+        HashMap::from([(GROUP.to_string(), device_d.root.path().to_path_buf())]),
+    );
+    tokio::spawn(session_d_to_b.clone().run());
+
+    // A modest, arbitrary size (well below `DEFAULT_BLOCK_SIZE`) -- large
+    // enough that its top-up over the fixed baseline is meaningfully
+    // nonzero, small enough that this test stays fast.
+    const PROBE_BLOCK_SIZE: u64 = 16 * 1024;
+    let expected = PeerSyncSession::fetch_response_timeout_for(PROBE_BLOCK_SIZE);
+    let probe_hash = vec![0x11u8; 32];
+
+    let started = std::time::Instant::now();
+    let result = session_d_to_b
+        .fetch_block_sized(GROUP, "silent-probe.bin", &probe_hash, PROBE_BLOCK_SIZE)
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(result.is_none(), "a silent peer must resolve to no data, not an error or content");
+    assert!(
+        elapsed + Duration::from_millis(500) >= expected,
+        "resolved suspiciously fast ({elapsed:?}) for a {expected:?} sized deadline -- the \
+         size-aware deadline may have been bypassed"
+    );
+    assert!(
+        elapsed < expected + Duration::from_secs(5),
+        "took {elapsed:?}, well past the sized deadline of {expected:?} -- the deadline is not \
+         actually bounding this fetch"
     );
 }
 

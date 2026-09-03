@@ -30,7 +30,9 @@
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations;
+use yadorilink_filesystem_sync::materialization_repair::{
+    repair_interrupted_materializations, RepairMode,
+};
 use yadorilink_filesystem_sync::stale_temp_files::cleanup_stale_temp_files;
 use yadorilink_local_storage::{BlockStore, FsBlockStore};
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
@@ -113,7 +115,7 @@ fn run_scenario(seed: u64) -> Result<(), String> {
     // crash to recover, not a file the user deleted while the daemon was stopped
     // (which would carry no intent). Seed it here to model the real crash state.
     state
-        .materialization_job_repository()
+        .materialization_intent_repository()
         .begin_materialization_intent(GROUP_ID, PATH, &[0u8; 32], &RootCommitPermit::for_tests())
         .map_err(|e| e.to_string())?;
 
@@ -137,6 +139,7 @@ fn run_scenario(seed: u64) -> Result<(), String> {
         &store,
         &root,
         GROUP_ID,
+        RepairMode::Startup,
         &RootCommitPermit::for_tests(),
     )
     .map_err(|e| format!("seed {seed}: repair_interrupted_materializations failed: {e}"))?;

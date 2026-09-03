@@ -149,7 +149,6 @@ async fn scenario_body(seed: u64) -> Result<IndexSnapshot, String> {
         sync_db_path: config_dir.path().join("sync-state.sqlite3"),
         control_socket_path: config_dir.path().join("daemon.sock"),
         shell_ipc_socket_path: config_dir.path().join("shell.sock"),
-        keypair_path: config_dir.path().join("wg_key"),
         state_probe: Some(probe.clone()),
         // This smoke test drives a single daemon with no peers, so it never
         // supplies a static netmap (that is the two-device test's job).

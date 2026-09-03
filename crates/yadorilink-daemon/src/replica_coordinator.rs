@@ -105,9 +105,9 @@ pub(crate) type LocalChangeAuthProvider =
     dyn Fn(&str) -> Result<ChangeAuth, PolicyUnavailable> + Send + Sync + 'static;
 
 #[derive(Clone, Copy)]
-pub struct ReplicaChangeEmission<'a, 'permit> {
+pub struct ReplicaChangeEmission<'a> {
     pub emitter: &'a ChangeEmitter,
-    pub permit: &'a RootCommitPermit<'permit>,
+    pub permit: &'a RootCommitPermit<'a>,
 }
 /// Local copy of what was `yadorilink_sync_core::index::RepairElectionProvider`
 /// -- a plain type alias with no logic of its own (see that module's
@@ -134,7 +134,7 @@ pub struct ReplicaCoordinator {
     file_index_repository: yadorilink_sync_sqlite::file_index::FileIndexRepository,
     materialization_state_repository: yadorilink_sync_sqlite::MaterializationStateRepository,
     change_history_repository: yadorilink_sync_sqlite::ChangeHistoryRepository,
-    materialization_job_repository: yadorilink_sync_sqlite::MaterializationJobRepository,
+    materialization_intent_repository: yadorilink_sync_sqlite::MaterializationIntentRepository,
     policy_watermark_repository: yadorilink_sync_sqlite::PolicyWatermarkRepository,
     dirty_path_repository: yadorilink_sync_sqlite::DirtyPathRepository,
     restore_operation_repository: yadorilink_sync_sqlite::RestoreOperationRepository,
@@ -159,6 +159,16 @@ pub struct ReplicaCoordinator {
     root_adoption_lock: Mutex<()>,
     materialization_wake: MaterializationWake,
     retirement_wake: RetirementWake,
+    /// Same per-group dirty/generation shape as `retirement_wake` (a
+    /// separate `RetirementWake` instance, not shared -- `pending`/
+    /// `complete` are consumer-specific, so retirement's own loop
+    /// completing a generation must never clear the hazard-recheck loop's
+    /// independent one, and vice versa), driving `HazardHeld` liveness: a
+    /// held path has no re-arm event of its own when the sibling that
+    /// caused its hold changes, so this reuses the same "DAG frontier
+    /// advanced or a materialization job completed" wake points that
+    /// already fire `retirement_wake` to trigger a re-check sweep instead.
+    hazard_recheck_wake: RetirementWake,
 }
 
 /// Same schema-bootstrap sequencing as `yadorilink_sync_core::index`'s
@@ -221,8 +231,8 @@ impl ReplicaCoordinator {
             change_history_repository: yadorilink_sync_sqlite::ChangeHistoryRepository::new(
                 database.clone(),
             ),
-            materialization_job_repository:
-                yadorilink_sync_sqlite::MaterializationJobRepository::new(database.clone()),
+            materialization_intent_repository:
+                yadorilink_sync_sqlite::MaterializationIntentRepository::new(database.clone()),
             policy_watermark_repository: yadorilink_sync_sqlite::PolicyWatermarkRepository::new(
                 database.clone(),
             ),
@@ -251,6 +261,7 @@ impl ReplicaCoordinator {
             root_adoption_lock: Mutex::new(()),
             materialization_wake: MaterializationWake::new(),
             retirement_wake: RetirementWake::new(),
+            hazard_recheck_wake: RetirementWake::new(),
         }
     }
 
@@ -354,10 +365,10 @@ impl ReplicaCoordinator {
         &self.change_history_repository
     }
 
-    pub fn materialization_job_repository(
+    pub fn materialization_intent_repository(
         &self,
-    ) -> &yadorilink_sync_sqlite::MaterializationJobRepository {
-        &self.materialization_job_repository
+    ) -> &yadorilink_sync_sqlite::MaterializationIntentRepository {
+        &self.materialization_intent_repository
     }
 
     pub fn policy_watermark_repository(
@@ -468,6 +479,10 @@ impl ReplicaCoordinator {
         &self.retirement_wake
     }
 
+    pub fn hazard_recheck_wake(&self) -> &RetirementWake {
+        &self.hazard_recheck_wake
+    }
+
     // --- The 17 permanently-remaining `SyncState` production methods,
     // reproduced verbatim (per `phase7d9f-exit-report.md` §14.3's
     // authoritative list, re-verified fresh against `index.rs` for this
@@ -535,7 +550,8 @@ impl ReplicaCoordinator {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         meta: Option<&LocalFileMetaColumns>,
-        emission: ReplicaChangeEmission<'_, '_>,
+        filesystem_identity: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
+        emission: ReplicaChangeEmission<'_>,
     ) -> Result<ChangeHash, SyncError> {
         let auth = self.local_emission_auth(group_id)?;
         Ok(self.file_index_repository.upsert_file_emitting_change(
@@ -544,6 +560,7 @@ impl ReplicaCoordinator {
             origin_device_id,
             content,
             meta,
+            filesystem_identity,
             yadorilink_sync_sqlite::file_index::ChangeEmissionContext {
                 emitter: emission.emitter,
                 permit: emission.permit,
@@ -561,7 +578,7 @@ impl ReplicaCoordinator {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         metas: &[Option<LocalFileMetaColumns>],
-        emission: ReplicaChangeEmission<'_, '_>,
+        emission: ReplicaChangeEmission<'_>,
     ) -> Result<Option<ChangeHash>, SyncError> {
         let auth = self.local_emission_auth(group_id)?;
         Ok(self.file_index_repository.upsert_files_batch_emitting_change(
@@ -585,8 +602,9 @@ impl ReplicaCoordinator {
         path: &str,
         device_id: &str,
         observed_at_unix_nanos: i64,
+        publish_absent_proof: bool,
         emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<ChangeHash, SyncError> {
         let auth = self.local_emission_auth(group_id)?;
         Ok(self.file_index_repository.mark_deleted_emitting_change(
@@ -594,6 +612,7 @@ impl ReplicaCoordinator {
             path,
             device_id,
             observed_at_unix_nanos,
+            publish_absent_proof,
             yadorilink_sync_sqlite::file_index::ChangeEmissionContext { emitter, permit, auth },
         )?)
     }
@@ -1009,8 +1028,8 @@ impl CheckpointStore for ReplicaCoordinator {
 // because that crate cannot name `ReplicaCoordinator` (the reverse
 // dependency direction is forbidden by this whole initiative's boundary
 // rules -- see this module's own top doc comment). Only this one accessor is
-// exposed: `ReplicaCoordinator`'s own `MaterializationJobRepository`
-// instance (`materialization_job_repository`, added 7D-10.3), constructed
+// exposed: `ReplicaCoordinator`'s own `MaterializationIntentRepository`
+// instance (`materialization_intent_repository`, added 7D-10.3), constructed
 // against the SAME underlying `Arc<SyncDatabase>` a live `SyncState` in the
 // same process already opened (`from_database`'s own doc comment) -- so the
 // journal table this seam writes to is identical to `SyncState`'s, not a
@@ -1025,10 +1044,10 @@ impl CheckpointStore for ReplicaCoordinator {
 // finally unblocked by this impl but still its own scoped unit of work. See
 // `docs/design/phase7d10-exit-report.md`'s 7D-10.4 addendum.
 impl crate::materialization_intent::MaterializationIntentJournal for ReplicaCoordinator {
-    fn materialization_job_repository(
+    fn materialization_intent_repository(
         &self,
-    ) -> &yadorilink_sync_sqlite::MaterializationJobRepository {
-        &self.materialization_job_repository
+    ) -> &yadorilink_sync_sqlite::MaterializationIntentRepository {
+        &self.materialization_intent_repository
     }
 }
 
@@ -1149,7 +1168,7 @@ mod materialization_intent_journal_tests {
 
     /// End-to-end proof that the generalized guard opens and clears a real,
     /// durable intent against a `ReplicaCoordinator`-backed
-    /// `MaterializationJobRepository` -- not merely that the trait bound
+    /// `MaterializationIntentRepository` -- not merely that the trait bound
     /// type-checks. Previously built the coordinator against a live
     /// `SyncState`'s already-open `Arc<SyncDatabase>` to mirror production's
     /// then-transitional dual-wiring; `SyncState` was deleted in Phase
@@ -1161,7 +1180,7 @@ mod materialization_intent_journal_tests {
         let permit = RootCommitPermit::for_tests();
 
         assert!(!coordinator
-            .materialization_job_repository()
+            .materialization_intent_repository()
             .has_materialization_intent("group-1", "a.bin")
             .unwrap());
 
@@ -1174,13 +1193,13 @@ mod materialization_intent_journal_tests {
         )
         .unwrap();
         assert!(coordinator
-            .materialization_job_repository()
+            .materialization_intent_repository()
             .has_materialization_intent("group-1", "a.bin")
             .unwrap());
 
         guard.clear().unwrap();
         assert!(!coordinator
-            .materialization_job_repository()
+            .materialization_intent_repository()
             .has_materialization_intent("group-1", "a.bin")
             .unwrap());
     }

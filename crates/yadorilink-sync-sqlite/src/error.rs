@@ -33,6 +33,18 @@ pub enum SyncSqliteError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
+    /// `dag_store::admit_change` found a change whose pinned authorization
+    /// coordinate is older than one of its own causal parents' -- the
+    /// revoked-writer-replay attack `4175e8cd` closed. A distinct variant
+    /// (rather than folding into `InvalidInput`) so `ChangeHistoryRepository
+    /// ::dag_admit_change[_with_versions]` can recognize it specifically and
+    /// run a follow-up cleanup pass outside the now-rolled-back admission
+    /// transaction (see those methods' own doc comments) -- string-matching
+    /// `InvalidInput`'s message would work today but silently break the
+    /// moment that message's wording ever changed.
+    #[error("change pins an authorization coordinate older than its causal parent")]
+    CausalAuthViolation,
+
     /// An I/O failure surfaced while satisfying a
     /// [`yadorilink_root_authority::root_commit::RootCommitPermit::verify`]
     /// re-check inside a write transaction (see

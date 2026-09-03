@@ -34,7 +34,9 @@ use yadorilink_local_storage::{chunk_file, FsBlockStore};
 use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_replica_domain::file::FileRecord;
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_transport::{PeerChannel, TransportHub};
+use yadorilink_transport::{
+    ConnectRole, DeviceSigningKeyPair, QuicPeerChannel, QuicPeerEndpoint, TransportHub,
+};
 
 const GROUP: &str = "perf-group";
 
@@ -189,36 +191,30 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
     // hydration test's `install_test_root_commit_authority` call.
     dest_state.install_test_root_commit_authority(GROUP);
 
-    let secret_source = boringtun::x25519::StaticSecret::from([61u8; 32]);
-    let secret_dest = boringtun::x25519::StaticSecret::from([62u8; 32]);
-    let public_source = boringtun::x25519::PublicKey::from(&secret_source);
-    let public_dest = boringtun::x25519::PublicKey::from(&secret_dest);
-
-    // Direct loopback pairing: each side binds a UDP socket and dials the
-    // other's address as its sole direct candidate.
+    // Direct loopback pairing: each side binds a UDP socket and one dials
+    // the other's address.
     let socket_source = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let socket_dest = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr_source = socket_source.local_addr().unwrap();
     let addr_dest = socket_dest.local_addr().unwrap();
 
-    let channel_source = PeerChannel::connect(
-        secret_source,
-        public_dest,
-        0,
-        vec![addr_dest],
-        TransportHub::from_socket(socket_source, None),
-    )
-    .await
-    .unwrap();
-    let channel_dest = PeerChannel::connect(
-        secret_dest,
-        public_source,
-        1,
-        vec![addr_source],
-        TransportHub::from_socket(socket_dest, None),
-    )
-    .await
-    .unwrap();
+    let key_source = DeviceSigningKeyPair::generate();
+    let key_dest = DeviceSigningKeyPair::generate();
+    let public_source = key_source.public_bytes();
+    let public_dest = key_dest.public_bytes();
+    let endpoint_source =
+        QuicPeerEndpoint::new(TransportHub::from_socket(socket_source), key_source).unwrap();
+    let endpoint_dest =
+        QuicPeerEndpoint::new(TransportHub::from_socket(socket_dest), key_dest).unwrap();
+    endpoint_source.authorize(public_dest);
+    endpoint_dest.authorize(public_source);
+    let accepting = {
+        let endpoint_dest = endpoint_dest.clone();
+        tokio::spawn(async move { endpoint_dest.accept(public_source).await })
+    };
+    let dialed = endpoint_source.connect(addr_dest, public_dest).await.unwrap();
+    let accepted = accepting.await.unwrap().unwrap();
+    let channel_source = QuicPeerChannel::new(dialed, ConnectRole::Dial);
+    let channel_dest = QuicPeerChannel::new(accepted, ConnectRole::Accept);
 
     // The serving side needs its own link for the group, exactly as the
     // receiving side has: sync roots are derived from the link table in
@@ -257,7 +253,7 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
     let generation = source_sync_state.startup_readiness().begin_group_startup(GROUP);
     source_sync_state.startup_readiness().mark_group_ready(GROUP, generation);
     let session_source = PeerSyncSession::new(
-        Arc::new(channel_source),
+        channel_source,
         "device-source".into(),
         "device-dest".into(),
         source_sync_state,
@@ -280,7 +276,7 @@ async fn large_file_hydration_does_not_block_concurrent_async_work() {
     tokio::spawn(session_source.clone().run());
 
     let session_dest = PeerSyncSession::new(
-        Arc::new(channel_dest),
+        channel_dest,
         "device-dest".into(),
         "device-source".into(),
         dest_sync_state.clone(),

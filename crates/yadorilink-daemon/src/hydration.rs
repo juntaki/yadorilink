@@ -21,15 +21,16 @@ use sha2::{Digest, Sha256};
 use yadorilink_filesystem_sync::materialization_eviction::{
     evict_file, run_disk_pressure_eviction_sweep, MaterializationContext,
 };
-use yadorilink_local_storage::{apply_exec_bit, reconstruct_file};
+use yadorilink_local_storage::{apply_unix_mode, apply_xattrs, reconstruct_file};
 use yadorilink_local_storage::{disk_bytes_match_indexed_blocks, BlockStore, StorageError};
 use yadorilink_peer_session::peer_session::PeerSyncSession;
+use yadorilink_peer_session::ports::PeerReplicaStatePort;
 use yadorilink_replica_domain::file::BlockInfo;
 #[cfg(test)]
 use yadorilink_replica_domain::file::VersionBlock;
 use yadorilink_replica_domain::session_state::{MaterializationPolicy, MaterializationState};
 
-use crate::daemon_state::DaemonState;
+use crate::daemon_state::{run_blocking_sweep_offloaded, DaemonState};
 
 /// A single deadline for the *entire* multi-session dispatch —
 /// supersedes what used to be `PeerSyncSession::hydrate_file`'s per-session
@@ -65,13 +66,129 @@ const HYDRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// Deliberately much shorter than `HYDRATION_TIMEOUT`: the whole point is
 /// to free up a stuck worker to try the next candidate long before the
 /// file-level deadline would otherwise be spent waiting on it alone.
-const PER_BLOCK_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+///
+/// Sized per block, not a fixed constant: [`PeerSyncSession::fetch_
+/// response_timeout_for`]'s own doc comment has the measurement (8
+/// concurrent 128KiB fetches sharing one relay-forwarded session
+/// genuinely needed 13.3-14.3s each) behind why a single fixed deadline
+/// undercounts a block-fetch sharing a connection with several concurrent
+/// siblings. This wrap must stay strictly above that inner deadline with
+/// real margin (below, `PER_BLOCK_FETCH_TIMEOUT_MARGIN`) -- it exists
+/// specifically to catch `fetch_block_sized` itself hanging past its own
+/// internal bound (a bug, not the ordinary case), so setting it equal to
+/// the inner deadline would make this wrap preempt that deadline before
+/// it ever gets a chance to fire on its own.
+fn per_block_fetch_timeout(block_size: u64) -> std::time::Duration {
+    PeerSyncSession::fetch_response_timeout_for(block_size) + PER_BLOCK_FETCH_TIMEOUT_MARGIN
+}
+
+const PER_BLOCK_FETCH_TIMEOUT_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Small scheduling margin added atop `2 *` the largest still-missing
+/// block's own response deadline when deriving a stall budget (see
+/// `HydrationStallTracker`'s own doc comment). `2x`, not `1x`: at
+/// `AdaptiveWindow`'s floor of a single in-flight request, one genuine
+/// per-block timeout can consume nearly the whole per-block deadline by
+/// itself, so the stall budget must leave room for that AND one full
+/// follow-up attempt, not just one.
+const STALL_BUDGET_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Tracks durable block-fetch progress for one `hydrate`/`hydrate_with_
+/// timeout` call, so `run_with_stall_deadline` can fail on genuine
+/// inactivity -- no block has durably completed in a while -- instead of
+/// on a fixed wall-clock ceiling for the whole multi-block dispatch.
+///
+/// A fixed absolute deadline (this module's previous design: a single
+/// `tokio::time::timeout` around the whole `hydrate_inner` call) cannot
+/// tell "no reachable candidate can serve these blocks" apart from "a
+/// large file is transferring correctly, just slower than the deadline
+/// assumed" -- both look identical from outside: no result by the
+/// deadline. Once `PeerSyncSession::fetch_response_timeout_for` made the
+/// per-block deadline size- (and indirectly, contention-) aware, that gap
+/// became real: a genuinely-progressing relay-contended transfer could
+/// need several times `HYDRATION_TIMEOUT`'s old flat 30s to finish a
+/// multi-block file, and the flat deadline would abort it anyway, even
+/// though `fetch_blocks_from_sessions` was completing blocks the whole
+/// time (confirmed directly: a real relay-recovery run gained 39/48
+/// blocks, monotonically, across eight 30s-bounded attempts that each
+/// individually "failed").
+///
+/// `record_progress` is called by `fetch_blocks_from_sessions` every time
+/// a block durably completes (CAS write, then this group's provenance for
+/// it, both landed) -- exactly the signal that distinguishes stalled from
+/// slow. `raise_budget` is called once `resolve_blocks_local_first` knows
+/// the actual missing blocks' sizes, so the budget reflects THIS
+/// dispatch's own real worst-case per-block wait, not a guess made before
+/// any block was known.
+struct HydrationStallTracker {
+    last_progress: StdMutex<std::time::Instant>,
+    stall_budget: StdMutex<std::time::Duration>,
+}
+
+impl HydrationStallTracker {
+    fn new(initial_stall_budget: std::time::Duration) -> Self {
+        Self {
+            last_progress: StdMutex::new(std::time::Instant::now()),
+            stall_budget: StdMutex::new(initial_stall_budget),
+        }
+    }
+
+    fn record_progress(&self) {
+        *self.last_progress.lock().unwrap_or_else(|p| p.into_inner()) = std::time::Instant::now();
+    }
+
+    /// Raises the stall budget to `candidate` if it's larger than the
+    /// current one -- never lowers it. The caller-supplied base (this
+    /// call's own `timeout` argument, covering preflight/disk-check work
+    /// before any block size is known) and this dispatch's derived,
+    /// size-aware minimum both apply; the larger always wins.
+    fn raise_budget(&self, candidate: std::time::Duration) {
+        let mut budget = self.stall_budget.lock().unwrap_or_else(|p| p.into_inner());
+        if candidate > *budget {
+            *budget = candidate;
+        }
+    }
+
+    fn is_stalled(&self) -> bool {
+        let budget = *self.stall_budget.lock().unwrap_or_else(|p| p.into_inner());
+        self.last_progress.lock().unwrap_or_else(|p| p.into_inner()).elapsed() >= budget
+    }
+}
+
+/// How often `run_with_stall_deadline` re-checks `HydrationStallTracker::
+/// is_stalled` -- frequent enough that a genuine stall is caught promptly
+/// relative to any reasonable stall budget, cheap enough (one lock/compare,
+/// no I/O) that polling this often costs nothing meaningful.
+const STALL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Runs `future` to completion unless `stall` reports inactivity first, in
+/// which case this returns `HydrationFailed` for `path` without waiting
+/// for `future` any further. See `HydrationStallTracker`'s own doc comment
+/// for why this replaces a flat `tokio::time::timeout` around the whole
+/// multi-block dispatch.
+async fn run_with_stall_deadline<T>(
+    path: &str,
+    stall: &HydrationStallTracker,
+    future: impl std::future::Future<Output = Result<T, SyncError>>,
+) -> Result<T, SyncError> {
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            _ = tokio::time::sleep(STALL_CHECK_INTERVAL) => {
+                if stall.is_stalled() {
+                    return Err(SyncError::HydrationFailed(path.to_string()));
+                }
+            }
+        }
+    }
+}
 
 /// How long an idle worker (one whose last `pop_for` came back empty while
 /// `BlockWorkQueue::has_outstanding` was still true) sleeps before
 /// re-checking the queue — see `BlockWorkQueue::outstanding`'s doc comment
 /// for the worker-starvation race this polling avoids. Short relative to
-/// `PER_BLOCK_FETCH_TIMEOUT` so a block freed up by a timed-out peer is
+/// `per_block_fetch_timeout` so a block freed up by a timed-out peer is
 /// picked up by a waiting idle worker almost immediately, not after a
 /// meaningful further delay.
 const WORKER_IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
@@ -281,12 +398,12 @@ struct BlockWorkQueue {
     /// Count of blocks currently checked out by a worker (returned from
     /// `pop_for`, not yet resolved via `mark_not_found` or
     /// `resolve_fetched`) — a worker-starvation race found alongside
-    /// `PER_BLOCK_FETCH_TIMEOUT`: `fetch_blocks_from_sessions`'s workers
+    /// `per_block_fetch_timeout`: `fetch_blocks_from_sessions`'s workers
     /// used to exit for good the first time `pop_for` came back empty. With
     /// a fast-failing peer that's harmless (a `mark_not_found` reassignment
     /// arrives within milliseconds, long before the other workers could
     /// plausibly have drained the queue and exited already). But
-    /// `PER_BLOCK_FETCH_TIMEOUT` can leave a block checked out for several
+    /// `per_block_fetch_timeout` can leave a block checked out for several
     /// real seconds before a stuck request is finally treated as
     /// not-found and requeued — plenty of time for every *other* worker to
     /// finish its own share, see an empty queue, and exit permanently.
@@ -432,7 +549,7 @@ impl BlockWorkQueue {
     }
 
     /// Requeues `block` after `peer_id`'s request for it went
-    /// unanswered within `PER_BLOCK_FETCH_TIMEOUT` — deliberately
+    /// unanswered within `per_block_fetch_timeout` — deliberately
     /// **not** recorded in `tried_by`, unlike `mark_not_found`. A
     /// timeout is ambiguous (the peer might genuinely have the block and
     /// just answered slowly, or the response was lost in transit — real,
@@ -575,6 +692,14 @@ enum BlockDispatchFatal {
     /// The peer supplied valid bytes, but this device could not persist them.
     /// This is a local storage failure and must never count against the peer.
     Storage(yadorilink_local_storage::StorageError),
+    /// The block's bytes were durably persisted to the block store, but
+    /// recording this group's provenance for it failed. Also local
+    /// infrastructure, never a peer not-found signal — but fatal rather than
+    /// silently skipped: a block resolved without its provenance durable
+    /// would be indistinguishable from one that was never genuinely fetched
+    /// through this group on the very next hydration attempt (see
+    /// `resolve_blocks_local_first`'s `has_group_provenance` check).
+    Provenance(yadorilink_sync_sqlite::SyncSqliteError),
     /// A local blocking/worker task failed before it could report a storage
     /// result. Also local infrastructure, never a peer not-found signal.
     WorkerTask(String),
@@ -584,6 +709,7 @@ impl BlockDispatchFatal {
     fn into_sync_error(self) -> SyncError {
         match self {
             Self::Storage(error) => SyncError::from(error),
+            Self::Provenance(error) => SyncError::from(error),
             Self::WorkerTask(message) => SyncError::CorruptState(message),
         }
     }
@@ -603,14 +729,17 @@ fn dispatch_has_failed(slot: &Arc<StdMutex<Option<BlockDispatchFatal>>>) -> bool
     slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_blocks_from_sessions(
     group_id: &str,
     file_path: &str,
     missing: Vec<BlockInfo>,
     candidates: &[(String, Arc<PeerSyncSession>)],
     block_store: Arc<dyn BlockStore + Send + Sync>,
+    replica_coordinator: Arc<crate::replica_coordinator::ReplicaCoordinator>,
     progress: crate::transfer_progress::TransferProgressTracker,
     recent_errors: crate::recent_errors::RecentErrorLog,
+    stall: Option<Arc<HydrationStallTracker>>,
 ) -> Result<Vec<BlockInfo>, SyncError> {
     if missing.is_empty() || candidates.is_empty() {
         return Ok(missing);
@@ -646,6 +775,7 @@ async fn fetch_blocks_from_sessions(
         for _lane in 0..session.fetch_window() {
             let work = work.clone();
             let block_store = block_store.clone();
+            let replica_coordinator = replica_coordinator.clone();
             let peer_id = peer_id.clone();
             let session = session.clone();
             let candidate_ids = candidate_ids.clone();
@@ -654,6 +784,7 @@ async fn fetch_blocks_from_sessions(
             let progress = progress.clone();
             let recent_errors = recent_errors.clone();
             let fatal = fatal.clone();
+            let stall = stall.clone();
             workers.push(tokio::spawn(async move {
             loop {
                 if dispatch_has_failed(&fatal) {
@@ -695,8 +826,8 @@ async fn fetch_blocks_from_sessions(
                 // successful-outcome subset.
                 let fetch_started = std::time::Instant::now();
                 let outcome = tokio::time::timeout(
-                    PER_BLOCK_FETCH_TIMEOUT,
-                    session.fetch_block(&group_id, &file_path, &block.hash),
+                    per_block_fetch_timeout(block.size as u64),
+                    session.fetch_block_sized(&group_id, &file_path, &block.hash, block.size as u64),
                 )
                 .await;
                 progress.observe_block_fetch_seconds(fetch_started.elapsed().as_secs_f64());
@@ -714,6 +845,22 @@ async fn fetch_blocks_from_sessions(
                             continue;
                         }
                         let data_len = data.len() as u64;
+                        // M6-2: receiver-side phase timing -- this block's
+                        // content has now fully arrived over the wire and
+                        // passed hash/size verification, before it is
+                        // handed to local storage for the durable commit
+                        // below. Fires once per block (this loop's own
+                        // granularity), not once per run -- a phase-log
+                        // reader takes the EARLIEST occurrence in a pass as
+                        // "first block begins receiving" and the LATEST as
+                        // "last content byte received," the same "many
+                        // occurrences, pick the meaningful ones" reading
+                        // `phase_log.rs` already gives the source side's own
+                        // repeated `T_watch` lines.
+                        tracing::warn!(
+                            "M6PHASE T_recv_block_received: a block's content fully arrived over \
+                             the wire and passed verification"
+                        );
                         // `BlockStore::put` is synchronous
                         // `std::fs` I/O plus a full SHA-256 hash — move it
                         // off this tokio worker thread so a big/slow write
@@ -741,10 +888,127 @@ async fn fetch_blocks_from_sessions(
                         };
                         match put_result {
                             Ok(Ok(_)) => {
-                                // Counted as done only once the bytes are
-                                // actually persisted locally.
-                                progress.record_block_done(&group_id, &file_path, data_len, &peer_id);
-                                guard.resolve_fetched()
+                                // M6-2: receiver-side phase timing -- this
+                                // block is now durably committed to local
+                                // storage (`BlockStore::put` above is
+                                // synchronous, fsync included; see
+                                // `fs_backend.rs`'s own commit path -- there
+                                // is no background durability worker on
+                                // this side the way the source-side
+                                // chunker's producer/durability split has
+                                // one). Same "many occurrences per pass,
+                                // earliest is first-durable, latest is
+                                // last-durable" reading as `T_recv_block_
+                                // received` above.
+                                tracing::warn!(
+                                    "M6PHASE T_recv_block_durable: a block's durable local commit \
+                                     completed"
+                                );
+                                // Record this group's provenance for the block
+                                // IMMEDIATELY after its bytes are durably in
+                                // the block store, and before the work item is
+                                // resolved -- never batched until the whole
+                                // dispatch finishes. `hydrate`'s caller wraps
+                                // the entire multi-block fetch in one outer
+                                // `tokio::time::timeout`; a deadline there
+                                // drops this future mid-flight, and a
+                                // provenance write deferred to "after every
+                                // block succeeds" would never happen for
+                                // blocks that were genuinely, durably fetched
+                                // moments before the drop. The next hydration
+                                // attempt's `has_group_provenance` check
+                                // would then treat already-present, verified
+                                // bytes as still missing and re-fetch them
+                                // from scratch -- observed directly as a real
+                                // repro (`relay_failure_during_hydration`'s
+                                // recovery step re-transferring ~80% of a
+                                // payload on every retry, never converging).
+                                let provenance_result = {
+                                    let replica_coordinator = replica_coordinator.clone();
+                                    let group_id = group_id.clone();
+                                    let hash = block.hash.clone();
+                                    #[cfg(not(madsim))]
+                                    {
+                                        tokio::task::spawn_blocking(move || {
+                                            replica_coordinator
+                                                .change_history_repository()
+                                                .record_group_block_provenance(
+                                                    &group_id,
+                                                    std::slice::from_ref(&hash),
+                                                )
+                                        })
+                                        .await
+                                    }
+                                    #[cfg(madsim)]
+                                    {
+                                        Ok::<_, tokio::task::JoinError>(
+                                            replica_coordinator
+                                                .change_history_repository()
+                                                .record_group_block_provenance(
+                                                    &group_id,
+                                                    std::slice::from_ref(&hash),
+                                                ),
+                                        )
+                                    }
+                                };
+                                match provenance_result {
+                                    Ok(Ok(())) => {
+                                        // Counted as done only once the bytes
+                                        // are actually persisted locally AND
+                                        // this group's provenance for them is
+                                        // durable. Reported to the stall
+                                        // tracker at the same point -- this
+                                        // IS the durable-progress signal
+                                        // `HydrationStallTracker` exists to
+                                        // watch for.
+                                        if let Some(stall) = &stall {
+                                            stall.record_progress();
+                                        }
+                                        progress.record_block_done(
+                                            &group_id, &file_path, data_len, &peer_id,
+                                        );
+                                        guard.resolve_fetched()
+                                    }
+                                    Ok(Err(error)) => {
+                                        tracing::error!(
+                                            error = %error,
+                                            peer = %peer_id,
+                                            file_path = %file_path,
+                                            "block bytes persisted but recording this group's \
+                                             provenance for it failed"
+                                        );
+                                        recent_errors
+                                            .record("storage", "hydration_local_persist");
+                                        record_dispatch_fatal(
+                                            &fatal,
+                                            BlockDispatchFatal::Provenance(error),
+                                        );
+                                        // Dropping the guard neutrally requeues
+                                        // the block. It does NOT mark this
+                                        // peer as lacking it.
+                                        drop(guard);
+                                        break;
+                                    }
+                                    Err(join_error) => {
+                                        tracing::error!(
+                                            error = %join_error,
+                                            peer = %peer_id,
+                                            file_path = %file_path,
+                                            "local provenance-write task failed"
+                                        );
+                                        recent_errors
+                                            .record("corrupt_state", "hydration_local_persist");
+                                        record_dispatch_fatal(
+                                            &fatal,
+                                            BlockDispatchFatal::WorkerTask(format!(
+                                                "local provenance-write task failed while \
+                                                 hydrating {group_id}/{file_path}: {join_error}"
+                                            )),
+                                        );
+                                        drop(guard);
+                                        break;
+                                    }
+                                }
                             }
                             Ok(Err(error)) => {
                                 tracing::error!(
@@ -796,7 +1060,7 @@ async fn fetch_blocks_from_sessions(
                         guard.mark_timed_out(&peer_id);
                     }
                     Err(_elapsed) => {
-                        // See `PER_BLOCK_FETCH_TIMEOUT`'s doc comment: this
+                        // See `per_block_fetch_timeout`'s doc comment: this
                         // peer never answered at all (as distinct from
                         // `Ok(Ok(None))`, an explicit not-found reply). Uses
                         // `mark_timed_out`, not `mark_not_found` — see that
@@ -816,7 +1080,8 @@ async fn fetch_blocks_from_sessions(
                         // one place that can tell it.
                         tracing::warn!(
                             peer = %peer_id,
-                            timeout = ?PER_BLOCK_FETCH_TIMEOUT,
+                            size = block.size,
+                            timeout = ?per_block_fetch_timeout(block.size as u64),
                             "block fetch timed out waiting for this peer's response; reassigning"
                         );
                         session.record_fetch_timeout();
@@ -851,27 +1116,56 @@ async fn fetch_blocks_from_sessions(
 
 /// Hydrates `path` in `group_id` by partitioning its missing blocks across
 /// every currently-connected, authorized peer session and fetching
-/// concurrently, bounded by one file-level
-/// `HYDRATION_TIMEOUT`. Reverts to `Placeholder` and returns
-/// `HydrationFailed` if the deadline elapses or any block remains
-/// unavailable from every candidate.
+/// concurrently, bounded by a stall deadline (`HydrationStallTracker`) that
+/// starts at `HYDRATION_TIMEOUT` and grows to cover the largest missing
+/// block's own real response deadline. Reverts to `Placeholder` and
+/// returns `HydrationFailed` if no block durably completes for that whole
+/// stall budget, or if any block remains unavailable from every candidate.
 pub async fn hydrate(
     state: &Arc<DaemonState>,
     group_id: &str,
     path: &str,
 ) -> Result<(), SyncError> {
-    hydrate_with_timeout(state, group_id, path, HYDRATION_TIMEOUT).await
+    hydrate_impl(state, group_id, path, HydrationBound::Stall(HYDRATION_TIMEOUT)).await
 }
 
-/// Like `hydrate`, with an explicit deadline — production callers use the
-/// default (30s); tests use a much shorter one to verify the deadline
-/// bounds the *whole* multi-session dispatch without waiting out the real
-/// production budget.
+/// Like `hydrate`, but `timeout` is an absolute wall-clock ceiling on the
+/// whole dispatch, not a stall-tracker base -- this deliberately does NOT
+/// get `HydrationStallTracker`'s size-aware extension. A caller reaching
+/// for this function instead of `hydrate` is asking for a hard cap that
+/// holds regardless of how large the missing blocks turn out to be (e.g. a
+/// test proving the deadline mechanism actually bounds execution, or a
+/// call site that would rather fail fast than wait out a large transfer);
+/// `hydrate`'s own default path is what production code should use when it
+/// wants slow-but-genuinely-progressing transfers to keep going past
+/// `HYDRATION_TIMEOUT`.
 pub async fn hydrate_with_timeout(
     state: &Arc<DaemonState>,
     group_id: &str,
     path: &str,
     timeout: std::time::Duration,
+) -> Result<(), SyncError> {
+    hydrate_impl(state, group_id, path, HydrationBound::Flat(timeout)).await
+}
+
+/// How `hydrate_impl` bounds a dispatch -- see `hydrate` and
+/// `hydrate_with_timeout`'s own doc comments for when each applies.
+enum HydrationBound {
+    /// A stall-tracked budget seeded at `Duration` and grown to cover the
+    /// largest missing block's own real response deadline; only resets on
+    /// durable per-block progress, not on a fixed wall clock.
+    Stall(std::time::Duration),
+    /// A flat, absolute `tokio::time::timeout` -- exactly this module's
+    /// pre-stall-tracker behavior, preserved verbatim for callers that want
+    /// a genuine hard ceiling.
+    Flat(std::time::Duration),
+}
+
+async fn hydrate_impl(
+    state: &Arc<DaemonState>,
+    group_id: &str,
+    path: &str,
+    bound: HydrationBound,
 ) -> Result<(), SyncError> {
     // M2-5: single-flight coalescing -- a concurrent caller for the SAME
     // path (two apps opening the same file at once, or a retried
@@ -897,23 +1191,36 @@ pub async fn hydrate_with_timeout(
         crate::hydration_single_flight::Role::Leader(leader) => leader,
     };
 
-    // `tokio::time::timeout` dropping the `hydrate_inner` future on
-    // elapse runs that future's own local drop glue exactly like any
-    // other Rust value drop -- including `HydrationStateGuard`'s
-    // authoring-bound revert-on-drop, which by this point is the ONLY
-    // thing responsible for reverting a still-`Hydrating` row back to
-    // `Placeholder`. This used to ALSO blindly force `Placeholder` here,
-    // unconditionally, AFTER that drop already ran -- if `hydrate_inner`
-    // had raced past the guard's own `complete()` (a successful commit)
-    // just before the deadline fired, this blind write would silently
-    // downgrade a row this same attempt had just correctly finished
-    // hydrating. Letting the guard be the sole authority (bound to the
-    // authoring identity captured before marking `Hydrating`) means a
-    // completed commit, or a DIFFERENT concurrent attempt's own
-    // legitimate `Hydrating` row, is never touched here.
-    let result = tokio::time::timeout(timeout, hydrate_inner(state, group_id, path))
-        .await
-        .unwrap_or(Err(SyncError::HydrationFailed(path.to_string())));
+    // `run_with_stall_deadline` (and, for `Flat`, `tokio::time::timeout`)
+    // dropping the `hydrate_inner` future on deadline runs that future's
+    // own local drop glue exactly like any other Rust value drop --
+    // including `HydrationStateGuard`'s authoring-bound revert-on-drop,
+    // which by this point is the ONLY thing responsible for reverting a
+    // still-`Hydrating` row back to `Placeholder`. This used to ALSO
+    // blindly force `Placeholder` here, unconditionally, AFTER that drop
+    // already ran -- if `hydrate_inner` had raced past the guard's own
+    // `complete()` (a successful commit) just before the deadline fired,
+    // this blind write would silently downgrade a row this same attempt
+    // had just correctly finished hydrating. Letting the guard be the sole
+    // authority (bound to the authoring identity captured before marking
+    // `Hydrating`) means a completed commit, or a DIFFERENT concurrent
+    // attempt's own legitimate `Hydrating` row, is never touched here.
+    let result = match bound {
+        HydrationBound::Stall(base) => {
+            let stall = Arc::new(HydrationStallTracker::new(base));
+            run_with_stall_deadline(
+                path,
+                &stall,
+                hydrate_inner(state, group_id, path, Some(&stall)),
+            )
+            .await
+        }
+        HydrationBound::Flat(timeout) => {
+            tokio::time::timeout(timeout, hydrate_inner(state, group_id, path, None))
+                .await
+                .unwrap_or_else(|_| Err(SyncError::HydrationFailed(path.to_string())))
+        }
+    };
     // Every hydration failure (disk pressure, no reachable candidate,
     // timed-out/incomplete fetch, or anything else `hydrate_inner` can
     // return) lands in the recent-error ring buffer here, centrally —
@@ -932,6 +1239,7 @@ async fn hydrate_inner(
     state: &Arc<DaemonState>,
     group_id: &str,
     path: &str,
+    stall: Option<&Arc<HydrationStallTracker>>,
 ) -> Result<(), SyncError> {
     // Hydration is a materialization write (block-store reads plus a
     // `reconstruct_file` disk write) — held for this whole function's
@@ -1159,21 +1467,47 @@ async fn hydrate_inner(
     // never fetched, so a placeholder whose blocks are all present and intact
     // hydrates with no peer contacted at all — i.e. it succeeds offline. A
     // peer is required only for genuinely-missing (or locally-corrupt) blocks.
-    let still_missing = resolve_blocks_local_first(state, group_id, path, &record.blocks).await?;
+    // `stall`: this dispatch's own stall tracker when `hydrate_impl` chose
+    // `HydrationBound::Stall` -- `None` for `HydrationBound::Flat`, whose
+    // caller wants a hard wall-clock ceiling instead (see `HydrationBound`'s
+    // own doc comment). When present, its budget grows to cover the real
+    // missing-block sizes once they're known, and every durably-completed
+    // block resets it.
+    let still_missing =
+        resolve_blocks_local_first(state, group_id, path, &record.blocks, stall).await?;
 
     if !still_missing.is_empty() {
         return Err(SyncError::HydrationFailed(path.to_string()));
     }
+    // M6-2: receiver-side phase timing -- every block this file's record
+    // lists is now present (already-local or freshly fetched-and-committed)
+    // in this device's own block store. This is the file-level
+    // completeness check, distinct from `T_recv_block_durable` above: on
+    // this codebase's receiver path each block's own commit is already
+    // synchronous (no batching, no background durability worker -- see
+    // that tag's own comment), so this event and the LAST `T_recv_block_
+    // durable` of the same pass are expected to land very close together,
+    // not measure a genuinely separate "drain" phase the way the
+    // source-side producer/durability split does.
+    tracing::warn!("M6PHASE T_recv_all_blocks_available: every block this file needs is now local");
 
-    match hydration_commit_decision(
-        state,
-        group_id,
-        path,
-        &record,
-        &root,
-        &out_path,
-        initial_disk_identity,
-    )? {
+    // `hydration_commit_decision` is synchronous, and its `Hydrated` arm
+    // re-reads the whole file and re-hashes it against the indexed blocks
+    // (`disk_bytes_match_indexed_blocks`) -- a full sequential read plus a
+    // SHA-256 per block, unbounded in the file's size. Hand this worker's core
+    // off for it rather than holding the runtime for the duration; see
+    // `run_blocking_sweep_offloaded` for the guard's fallbacks.
+    match run_blocking_sweep_offloaded(|| {
+        hydration_commit_decision(
+            state,
+            group_id,
+            path,
+            &record,
+            &root,
+            &out_path,
+            initial_disk_identity,
+        )
+    })? {
         HydrationCommitDecision::Commit => {
             // `hydration_commit_decision` above re-reads the link table and
             // compares `local_root_for_group` against `expected_root`, but
@@ -1208,14 +1542,38 @@ async fn hydrate_inner(
             // -- the write-side twin of the tombstone escape this module's
             // `verify_delete_target` closes on the delete side.
             yadorilink_local_storage::verify_write_target_within_root(&out_path, &root)?;
-            reconstruct_file(
-                &crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                    state.block_store.clone(),
-                ),
-                &out_path,
-                &record.blocks,
-                record.mtime_unix_nanos,
-            )?;
+            // Synchronous, and proportional to the file: it reads every
+            // block out of the block store and writes the assembled bytes to
+            // disk. `hydrate` is called straight from async tasks, so hand
+            // the worker's core off for the write instead of holding the
+            // runtime for however long the file takes.
+            //
+            // M6-2: receiver-side phase timing -- about to begin
+            // reconstructing the real file from CAS blocks.
+            // `run_blocking_sweep_offloaded` below is `block_in_place` (or,
+            // outside a multi-thread runtime, a plain synchronous call), not
+            // a queued `spawn_blocking`, so there is no meaningful dispatch
+            // delay between this line and `reconstruct_file` actually
+            // starting.
+            tracing::warn!("M6PHASE T_recv_materialize_start: begins reconstructing the real file from CAS blocks");
+            // This on-demand hydration write has no DAG-frontier proof of
+            // its own to publish under -- it only ever bumps/invalidates
+            // the fence, inside `path_lock` (held for this whole
+            // function), before the real write below.
+            state
+                .replica_coordinator
+                .dag_bump_mutation_fence(group_id, path, "hydration_write")
+                .map_err(|e| SyncError::CorruptState(format!("{path}: mutation fence bump failed: {e}")))?;
+            run_blocking_sweep_offloaded(|| {
+                reconstruct_file(
+                    &crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                        state.block_store.clone(),
+                    ),
+                    &out_path,
+                    &record.blocks,
+                    record.mtime_unix_nanos,
+                )
+            })?;
             // M5-A review follow-up (blocker #56): captured immediately
             // after the write this device itself just performed --
             // exactly what the already-`Hydrated` fast path above needs
@@ -1238,9 +1596,13 @@ async fn hydrate_inner(
             // file's exec bit was silently lost on every daemon-side
             // on-demand hydration: the index kept the correct bit, but
             // disk never got it applied after `reconstruct_file`.
-            apply_exec_bit(
+            apply_unix_mode(
                 &out_path,
-                state.replica_coordinator.file_index_repository().get_exec_bit(group_id, path)?,
+                state.replica_coordinator.file_index_repository().get_unix_mode(group_id, path)?,
+            )?;
+            apply_xattrs(
+                &out_path,
+                &state.replica_coordinator.file_index_repository().get_xattrs(group_id, path)?,
             )?;
             // Author-bound, not a blind `set_materialization_state`, for
             // the identical reason `HydrationStateGuard`'s own
@@ -1266,6 +1628,12 @@ async fn hydrate_inner(
             {
                 return Err(SyncError::HydrationFailed(path.to_string()));
             }
+            // M6-2: receiver-side phase timing -- the state-machine commit
+            // that marks this file `Hydrated` (fully materialized) has now
+            // completed. The measured window this investigation cares about
+            // ends here; everything after this arm is bookkeeping
+            // (clearing a degraded-link flag, single-flight completion).
+            tracing::warn!("M6PHASE T_recv_hydrated_commit: Hydrated state-machine commit completed");
         }
         HydrationCommitDecision::AlreadyComplete => {}
         HydrationCommitDecision::Stale => {
@@ -1327,11 +1695,11 @@ fn preflight_disk_pressure(
         // condvar (`begin_reference_write`/`begin_physical_deletion`) and does
         // synchronous SQLite/block-store I/O. `preflight_disk_pressure` is
         // invoked directly from the async `hydrate` path, so run the sweep
-        // through `block_in_place` when a multi-thread worker is available —
-        // otherwise concurrent on-demand hydrations under disk pressure would
-        // park a tokio worker on the gate while a sibling hydration holds the
-        // gate mid-await, starving the pool. This mirrors the offload guard the
-        // GC sweep already uses; see `gc::run_sweep_with_grace_cutoff`.
+        // offloaded (see `daemon_state::run_blocking_sweep_offloaded`, below)
+        // when a multi-thread worker is available — otherwise concurrent
+        // on-demand hydrations under disk pressure would park a tokio worker
+        // on the gate while a sibling hydration holds the gate mid-await,
+        // starving the pool.
         let run_sweep = || {
             if !state.on_demand_pipeline_is_connected() {
                 tracing::warn!(
@@ -1383,28 +1751,12 @@ fn preflight_disk_pressure(
                 }
             }
         };
-        #[cfg(not(madsim))]
-        {
-            match tokio::runtime::Handle::try_current() {
-                Ok(handle)
-                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
-                {
-                    tokio::task::block_in_place(run_sweep);
-                }
-                // No multi-thread worker to offload onto (current-thread
-                // runtime, or called outside a runtime): the plain synchronous
-                // path is correct and cannot starve a worker pool.
-                _ => run_sweep(),
-            }
-        }
-        // The deterministic simulator runs a single-threaded runtime and its
-        // tokio shim exposes neither `runtime_flavor()` nor `block_in_place`,
-        // so always take the plain synchronous path there — identical result to
-        // the `_ =>` branch above.
-        #[cfg(madsim)]
-        {
-            run_sweep();
-        }
+        // Offloads onto a `block_in_place` worker when a multi-thread runtime
+        // is current, otherwise runs inline. Shared with every other call
+        // site in this crate that wraps a plain synchronous function this
+        // way -- see `daemon_state::run_blocking_sweep_offloaded`'s doc
+        // comment.
+        crate::daemon_state::run_blocking_sweep_offloaded(run_sweep);
     }
 
     let after_sweep =
@@ -1454,6 +1806,36 @@ pub async fn unpin(state: &DaemonState, group_id: &str, path: &str) -> Result<()
     let path_lock = state.replica_coordinator.path_lock_registry().path_lock(group_id, path);
     let _path_guard = path_lock.lock().await;
     Ok(state.replica_coordinator.file_index_repository().set_pinned(group_id, path, false)?)
+}
+
+/// One file's current materialization state and pin flag — a plain local
+/// index read, no peer or path lock needed (unlike `hydrate`/`pin`, this
+/// never changes anything). `None` means the daemon has no
+/// materialization-state row for `path` at all: never indexed, or not a
+/// path this group currently tracks. Callers (the control-socket IPC
+/// handler, `yadorilink status`-style tooling) must treat that as "not
+/// currently known," never as an implicit `Placeholder`/`Hydrated` guess.
+pub fn materialization_status(
+    state: &DaemonState,
+    group_id: &str,
+    path: &str,
+) -> Result<Option<MaterializationStatusInfo>, SyncError> {
+    let Some(materialization_state) =
+        state.replica_coordinator.materialization_state_repository().get_materialization_state(
+            group_id, path,
+        )?
+    else {
+        return Ok(None);
+    };
+    let pinned = state.replica_coordinator.file_index_repository().is_pinned(group_id, path)?;
+    Ok(Some(MaterializationStatusInfo { state: materialization_state, pinned }))
+}
+
+/// [`materialization_status`]'s return value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaterializationStatusInfo {
+    pub state: MaterializationState,
+    pub pinned: bool,
 }
 
 /// Manually evicts `path` back to a placeholder (spec "Manual Eviction").
@@ -1608,8 +1990,11 @@ async fn restore_to_version_inner(
     // same local-present-first path (`resolve_blocks_local_first`), so a
     // version whose blocks are all still cached locally restores with no peer
     // contacted, and only genuinely-missing (or locally-corrupt) blocks are
-    // fetched from a reachable peer.
-    let still_missing = resolve_blocks_local_first(state, group_id, path, &version.blocks).await?;
+    // fetched from a reachable peer. `None`: version restore keeps its own
+    // flat `restore_to_version_with_timeout` deadline, out of scope for
+    // the stall-based deadline `hydrate`/`hydrate_with_timeout` use.
+    let still_missing =
+        resolve_blocks_local_first(state, group_id, path, &version.blocks, None).await?;
     if !still_missing.is_empty() {
         let err = SyncError::VersionContentUnavailable(format!("{group_id}/{path}@{version_seq}"));
         state.telemetry.record_recent_error(err.category(), "restore_version");
@@ -1641,8 +2026,9 @@ async fn restore_to_version_inner(
         version.size,
         now_unix_nanos,
         version.record_kind,
-        version.exec_bit,
+        version.unix_mode,
         version.symlink_target.clone(),
+        version.xattrs.clone(),
     );
     let signing_key = state.device_signing_key().ok_or_else(|| {
         SyncError::CorruptState(format!(
@@ -1684,7 +2070,8 @@ async fn restore_to_version_inner(
                 record_kind: version.record_kind,
                 symlink_target: version.symlink_target.clone(),
                 symlink_out_of_root: false,
-                exec_bit: version.exec_bit,
+                unix_mode: version.unix_mode,
+                xattrs: version.xattrs.clone(),
             },
         },
         &restored_file_version,
@@ -1729,7 +2116,27 @@ async fn restore_to_version_inner(
         state.replica_coordinator.as_ref(),
     )?;
     yadorilink_local_storage::verify_write_target_within_root(&out_path, &root)?;
-    // A restored version carries its own `record_kind`/`exec_bit`/
+    // Phase E finding: every mutation below (reconstruct_file, apply_unix_
+    // mode/apply_xattrs, materialize_symlink, create_dir_all) used to run
+    // with NO mutation-fence bump at all, unlike every sibling physical
+    // mutator in this codebase (`hydrate_inner`'s equivalent write above,
+    // `materialization_repair.rs`'s reconstruct path). Same reasoning as
+    // `hydrate_inner`'s own bump: this restore write has no DAG-frontier
+    // proof of its own to publish under (the local emission above creates
+    // a fresh obligation for the ordinary scheduler to resolve later, but
+    // THIS function's own direct write is not that resolution) -- it only
+    // ever bumps/invalidates the fence, inside `path_lock` (held for this
+    // whole function), before the real write below. Without this, an
+    // existing `path_materialized_generations` proof for this path would
+    // survive this write untouched, so a concurrent, unrelated completion
+    // for the same path could read a proof as still "usable" (its
+    // `published_under_mutation_generation` unchanged) right up to the
+    // instant this restore silently changed the bytes it describes.
+    state
+        .replica_coordinator
+        .dag_bump_mutation_fence(group_id, path, "restore_write")
+        .map_err(|e| SyncError::CorruptState(format!("{path}: mutation fence bump failed: {e}")))?;
+    // A restored version carries its own `record_kind`/`unix_mode`/
     // `symlink_target` (captured per-row, not just for the `current` row
     // -- see `VersionRecord::record_kind`'s own doc comment), but this
     // used to always call `reconstruct_file` unconditionally regardless
@@ -1740,21 +2147,28 @@ async fn restore_to_version_inner(
     // `materialize_symlink_at`'s established per-kind materialization.
     match version.record_kind {
         yadorilink_replica_domain::file::RecordKind::File => {
-            reconstruct_file(
-                &crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                    state.block_store.clone(),
-                ),
-                &out_path,
-                &version.blocks,
-                // Not `version.mtime_unix_nanos` (that historical version's
-                // own original authored time) — a restore is authored by
-                // THIS device right now, same as `new_record.mtime_unix_
-                // nanos` above, which is what gets indexed for it. Stamping
-                // disk to match keeps the same on-disk/indexed-mtime
-                // invariant `reconstruct_file`'s own doc comment describes.
-                now_unix_nanos,
-            )?;
-            apply_exec_bit(&out_path, version.exec_bit)?;
+            // Same whole-file assemble-and-write as `hydrate_inner`'s own
+            // `reconstruct_file` above, reached from an async task the same
+            // way — offloaded identically.
+            run_blocking_sweep_offloaded(|| {
+                reconstruct_file(
+                    &crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                        state.block_store.clone(),
+                    ),
+                    &out_path,
+                    &version.blocks,
+                    // Not `version.mtime_unix_nanos` (that historical
+                    // version's own original authored time) — a restore is
+                    // authored by THIS device right now, same as
+                    // `new_record.mtime_unix_nanos` above, which is what gets
+                    // indexed for it. Stamping disk to match keeps the same
+                    // on-disk/indexed-mtime invariant `reconstruct_file`'s own
+                    // doc comment describes.
+                    now_unix_nanos,
+                )
+            })?;
+            apply_unix_mode(&out_path, version.unix_mode)?;
+            apply_xattrs(&out_path, &version.xattrs)?;
         }
         yadorilink_replica_domain::file::RecordKind::Symlink => match &version.symlink_target {
             Some(target) => {
@@ -1895,6 +2309,7 @@ async fn resolve_blocks_local_first(
     group_id: &str,
     path: &str,
     blocks: &[BlockInfo],
+    stall: Option<&Arc<HydrationStallTracker>>,
 ) -> Result<Vec<BlockInfo>, SyncError> {
     let hashes: Vec<String> = blocks.iter().map(|b| hex::encode(&b.hash)).collect();
     let present = state.block_store.present_blocks(&hashes)?;
@@ -1934,31 +2349,40 @@ async fn resolve_blocks_local_first(
     let blocks_total = missing.len() as u64;
     let _progress_guard = state.telemetry.begin_transfer(group_id, path, bytes_total, blocks_total);
 
+    // Now that the actual missing blocks (and their real sizes) are known,
+    // raise the stall budget to cover this dispatch's own worst case --
+    // see `HydrationStallTracker`'s own doc comment for why a caller-
+    // supplied flat deadline alone isn't enough once a single block's own
+    // response deadline can itself approach or exceed it.
+    if let Some(stall) = stall {
+        if let Some(&max_missing_size) = missing.iter().map(|b| b.size as u64).max().as_ref() {
+            stall.raise_budget(
+                PeerSyncSession::fetch_response_timeout_for(max_missing_size) * 2 + STALL_BUDGET_MARGIN,
+            );
+        }
+    }
+
+    // Provenance for each block is recorded inside `fetch_blocks_from_
+    // sessions` itself, immediately after that block's bytes are durably
+    // persisted -- not batched here after the whole dispatch returns. See
+    // that function's own doc comment on the success arm for why: this
+    // call is itself wrapped in an outer stall deadline (`hydrate_with_
+    // timeout`'s `run_with_stall_deadline`), and a stall firing mid-
+    // dispatch drops this future before any code here would run, silently
+    // losing provenance for blocks that were genuinely, durably fetched
+    // moments before.
     let unresolved = fetch_blocks_from_sessions(
         group_id,
         path,
-        missing.clone(),
+        missing,
         &candidates,
         state.block_store.clone(),
+        state.replica_coordinator.clone(),
         state.telemetry.transfer_progress_handle(),
         state.telemetry.recent_errors_handle(),
+        stall.cloned(),
     )
     .await?;
-
-    // Only successful fetches reach this point absent from `unresolved`:
-    // the dispatcher verifies hash+size and persists bytes before resolving
-    // work. Record provenance now, never when metadata is merely received.
-    let unresolved_hashes: HashSet<&[u8]> =
-        unresolved.iter().map(|block| block.hash.as_slice()).collect();
-    let fetched_hashes: Vec<Vec<u8>> = missing
-        .iter()
-        .filter(|block| !unresolved_hashes.contains(block.hash.as_slice()))
-        .map(|block| block.hash.clone())
-        .collect();
-    state
-        .replica_coordinator
-        .change_history_repository()
-        .record_group_block_provenance(group_id, &fetched_hashes)?;
     Ok(unresolved)
 }
 
@@ -1995,6 +2419,37 @@ mod tests {
     use crate::replica_coordinator::ReplicaCoordinator;
     use sha2::{Digest, Sha256};
     use yadorilink_local_storage::FsBlockStore;
+
+    /// A fresh stall tracker at the production default -- for tests that
+    /// call `hydrate_inner` directly and don't care about stall-deadline
+    /// behavior specifically.
+    fn test_stall() -> Arc<HydrationStallTracker> {
+        Arc::new(HydrationStallTracker::new(HYDRATION_TIMEOUT))
+    }
+
+    /// R3e: `per_block_fetch_timeout` (this module's own outer wrap around
+    /// `PeerSyncSession::fetch_block_sized`) must stay strictly above
+    /// `PeerSyncSession::fetch_response_timeout_for` (the inner deadline
+    /// that actually governs the fetch) with real margin, across a range
+    /// of block sizes -- not just the one size exercised by any single
+    /// integration test. If the outer wrap ever equalled or undercut the
+    /// inner one, it would preempt `fetch_block_sized` before its own
+    /// deadline could ever fire on its own, silently reintroducing the
+    /// exact "outer timeout masks the inner one" failure mode this pair of
+    /// constants exists to avoid (see `per_block_fetch_timeout`'s own doc
+    /// comment).
+    #[test]
+    fn outer_per_block_timeout_stays_above_the_inner_sized_deadline_with_margin() {
+        for size in [0u64, 1, 4096, 128 * 1024, 1024 * 1024, 16 * 1024 * 1024] {
+            let inner = PeerSyncSession::fetch_response_timeout_for(size);
+            let outer = per_block_fetch_timeout(size);
+            assert!(
+                outer >= inner + PER_BLOCK_FETCH_TIMEOUT_MARGIN,
+                "for size={size}: outer={outer:?} must be at least inner={inner:?} + \
+                 margin={PER_BLOCK_FETCH_TIMEOUT_MARGIN:?}"
+            );
+        }
+    }
 
     fn block(hash_byte: u8) -> BlockInfo {
         BlockInfo { hash: vec![hash_byte; 32], offset: 0, size: 100 }
@@ -2210,9 +2665,9 @@ mod tests {
         let state_a = state.clone();
         let state_b = state.clone();
         let task_a =
-            tokio::spawn(async move { hydrate_inner(&state_a, "group-1", "doc.txt").await });
+            tokio::spawn(async move { hydrate_inner(&state_a, "group-1", "doc.txt", Some(&test_stall())).await });
         let task_b =
-            tokio::spawn(async move { hydrate_inner(&state_b, "group-1", "doc.txt").await });
+            tokio::spawn(async move { hydrate_inner(&state_b, "group-1", "doc.txt", Some(&test_stall())).await });
 
         let (result_a, result_b) = tokio::join!(task_a, task_b);
 
@@ -2398,7 +2853,7 @@ mod tests {
         // and observe the still-registered leader before it completes.
         tokio::task::yield_now().await;
 
-        let leader_result = hydrate_inner(&state, "group-1", "doc.txt").await;
+        let leader_result = hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await;
         leader.complete(leader_result.as_ref().map(|_| ()).map_err(|_| ()));
 
         let follower_result = follower_task.await.unwrap();
@@ -2482,7 +2937,7 @@ mod tests {
 
         let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
         state.install_test_root_commit_authority("group-1");
-        hydrate_inner(&state, "group-1", "doc.txt").await.unwrap();
+        hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await.unwrap();
         assert_eq!(
             std::fs::read(root_dir.path().join("doc.txt")).unwrap(),
             indexed_content,
@@ -2503,7 +2958,7 @@ mod tests {
         let edited_content = b"an editor's unsaved-by-the-index-yet edit";
         std::fs::write(root_dir.path().join("doc.txt"), edited_content).unwrap();
 
-        hydrate_inner(&state, "group-1", "doc.txt").await.unwrap();
+        hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await.unwrap();
 
         assert_eq!(
             std::fs::read(root_dir.path().join("doc.txt")).unwrap(),
@@ -2540,7 +2995,7 @@ mod tests {
         // window before the local watcher/debounce pipeline has caught up.
         std::fs::write(root_dir.path().join("doc.txt"), b"").unwrap();
 
-        hydrate_inner(&state, "group-1", "doc.txt").await.unwrap();
+        hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await.unwrap();
 
         assert_eq!(
             std::fs::read(root_dir.path().join("doc.txt")).unwrap(),
@@ -2629,7 +3084,7 @@ mod tests {
 
         let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
         state.install_test_root_commit_authority("group-1");
-        hydrate_inner(&state, "group-1", "doc.txt").await.unwrap();
+        hydrate_inner(&state, "group-1", "doc.txt", Some(&test_stall())).await.unwrap();
 
         assert_eq!(
             std::fs::read(root_dir.path().join("doc.txt")).unwrap(),
@@ -2694,7 +3149,7 @@ mod tests {
         let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
         let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
         state.install_test_root_commit_authority("group-1");
-        hydrate_inner(&state, "group-1", "link.txt").await.unwrap();
+        hydrate_inner(&state, "group-1", "link.txt", Some(&test_stall())).await.unwrap();
 
         let out_path = root_dir.path().join("link.txt");
         assert!(
@@ -2767,7 +3222,7 @@ mod tests {
         .unwrap();
 
         let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
-        let result = hydrate_inner(&state, "group-1", "sub/nested/doc.txt").await;
+        let result = hydrate_inner(&state, "group-1", "sub/nested/doc.txt", Some(&test_stall())).await;
 
         assert!(
             result.is_err(),
@@ -2787,7 +3242,7 @@ mod tests {
     /// it applied after an on-demand hydration.
     #[cfg(unix)]
     #[tokio::test]
-    async fn hydrate_applies_the_recorded_exec_bit_after_reconstruct() {
+    async fn hydrate_applies_the_recorded_unix_mode_after_reconstruct() {
         use std::os::unix::fs::PermissionsExt;
 
         let store_dir = tempfile::tempdir().unwrap();
@@ -2829,7 +3284,7 @@ mod tests {
             .unwrap();
         sync_state
             .file_index_repository()
-            .set_exec_bit("group-1", "run.sh", true, &permit)
+            .set_unix_mode("group-1", "run.sh", Some(0o755), &permit)
             .unwrap();
         sync_state
             .materialization_state_repository()
@@ -2843,7 +3298,7 @@ mod tests {
 
         let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
         state.install_test_root_commit_authority("group-1");
-        hydrate_inner(&state, "group-1", "run.sh").await.unwrap();
+        hydrate_inner(&state, "group-1", "run.sh", Some(&test_stall())).await.unwrap();
 
         let mode = std::fs::metadata(root_dir.path().join("run.sh")).unwrap().permissions().mode();
         assert_ne!(
@@ -3013,11 +3468,11 @@ mod tests {
     /// whichever of `resolve_fetched`/`mark_not_found`/`mark_timed_out`
     /// it was heading toward. That block would vanish from every
     /// tracking set at once: not `queue`, not `exhausted`, `outstanding`
-    /// never decremented -- and `fetch_blocks_from_sessions`'s own caller
-    /// computes "successfully fetched" as `missing - remaining()`, so a
-    /// vanished block would be silently counted as fetched and have its
-    /// provenance recorded despite never being written to the block
-    /// store. `PoppedBlock::drop`, simulated directly here without
+    /// never decremented -- and `fetch_blocks_from_sessions` resolves a
+    /// block (and records this group's provenance for it) only via the
+    /// success arm that runs immediately after its bytes are durably
+    /// written, so a vanished block must never silently read back as
+    /// resolved. `PoppedBlock::drop`, simulated directly here without
     /// needing a real panic, must requeue instead.
     #[test]
     fn a_popped_block_dropped_without_being_resolved_is_requeued_not_lost() {
@@ -3055,8 +3510,10 @@ mod tests {
                 yadorilink_local_storage::FsBlockStore::new(tempfile::tempdir().unwrap().path())
                     .unwrap(),
             ),
+            Arc::new(crate::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap()),
             crate::transfer_progress::TransferProgressTracker::new(),
             crate::recent_errors::RecentErrorLog::new(),
+            None,
         )
         .await;
         assert!(result.unwrap().is_empty());
@@ -3075,8 +3532,10 @@ mod tests {
             missing.clone(),
             &[],
             store,
+            Arc::new(crate::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap()),
             crate::transfer_progress::TransferProgressTracker::new(),
             crate::recent_errors::RecentErrorLog::new(),
+            None,
         )
         .await;
         assert_eq!(result.unwrap(), missing, "with no candidate sessions, nothing can be fetched");
@@ -3669,8 +4128,71 @@ mod tests {
         assert_eq!(original_v1.size, 19);
     }
 
+    /// **Phase E finding**: `restore_to_version_inner`'s physical write
+    /// (`reconstruct_file`) used to run with no mutation-fence bump at all,
+    /// unlike every sibling physical mutator (`hydrate_inner`'s equivalent
+    /// write, `materialization_repair.rs`'s reconstruct path) -- an
+    /// existing `path_materialized_generations` proof for this path would
+    /// have survived the restore's write completely untouched, so a
+    /// concurrent, unrelated completion for the same path could have read
+    /// that proof as still "usable" right up to the instant the restore
+    /// silently changed the bytes it describes. This proves the fence is
+    /// now genuinely bumped by the restore write itself, not merely that
+    /// restore succeeds.
+    #[tokio::test]
+    async fn restore_to_version_bumps_the_mutation_fence_before_its_physical_write() {
+        let (state, _store_dir) = test_state();
+        state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]));
+        state.replica_coordinator.set_local_change_auth_provider(Arc::new(|_| {
+            Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER)
+        }));
+        let root = tempfile::tempdir().unwrap();
+        let local_path = root.path().to_string_lossy().to_string();
+        state.replica_coordinator.link_repository().add_link(&local_path, GROUP).unwrap();
+        #[cfg(windows)]
+        state
+            .replica_coordinator
+            .link_repository()
+            .set_windows_symlink_opt_in(&local_path, true)
+            .unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            root.path(),
+            GROUP,
+            state.replica_coordinator.as_ref(),
+        )
+        .unwrap();
+
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        let v1_block = put_block(&state, GROUP, b"version one content");
+        let v1 = record_with_blocks(PATH, vec![v1_block.clone()], 19);
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &v1, "device-a", &permit)
+            .unwrap();
+
+        let v2_block = put_block(&state, GROUP, b"version two content!!");
+        let v2 = record_with_blocks(PATH, vec![v2_block], 21);
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &v2, "device-a", &permit)
+            .unwrap();
+
+        let fence_before = state.replica_coordinator.dag_snapshot_mutation_fence(GROUP, PATH).unwrap();
+
+        restore_to_version(&state, GROUP, PATH, 1).await.unwrap();
+
+        let fence_after = state.replica_coordinator.dag_snapshot_mutation_fence(GROUP, PATH).unwrap();
+        assert!(
+            fence_after > fence_before,
+            "restore's physical write must bump the mutation fence like every other physical \
+             mutator (before: {fence_before}, after: {fence_after})"
+        );
+    }
+
     /// An independent review's finding: `VersionRecord` carries its own
-    /// per-row `record_kind`/`symlink_target`/`exec_bit` (captured at the
+    /// per-row `record_kind`/`symlink_target`/`unix_mode` (captured at the
     /// time that row was current, not just read live off the `current`
     /// row -- see `VersionRecord::record_kind`'s own doc comment), but
     /// restore used to ignore all three and unconditionally call
@@ -3891,7 +4413,7 @@ mod tests {
             .set_materialization_state(GROUP, PATH, MaterializationState::Placeholder, &permit)
             .unwrap();
 
-        hydrate_inner(&state, GROUP, PATH).await.unwrap();
+        hydrate_inner(&state, GROUP, PATH, Some(&test_stall())).await.unwrap();
 
         let out_path = root.path().join(PATH);
         assert!(

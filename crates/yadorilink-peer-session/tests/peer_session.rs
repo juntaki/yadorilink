@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use boringtun::x25519::{PublicKey, StaticSecret};
 use ed25519_dalek::SigningKey;
 use prost::Message as _;
 use sha2::{Digest, Sha256};
@@ -16,11 +15,18 @@ use yadorilink_peer_session::peer_session::{
     BlockWriteActivityProvider, ChangeAuthenticator, PeerSyncSession, PeerSyncSessionDeps,
     RootCommitAuthorityProvider,
 };
+use yadorilink_peer_session::ports::PeerReplicaStatePort;
 use yadorilink_peer_session::rate_limiter::RateLimiters;
 use yadorilink_replica_domain::session_state::{MaterializationPolicy, MaterializationState};
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
-use yadorilink_transport::PeerChannel;
+use yadorilink_transport::{QuicBlockStream, QuicPeerChannel, MAX_BLOCK_STREAM_HEADER_BYTES};
+
+// One block exchange is one bidirectional stream, so the response's outcome
+// oneof is the type these tests match on constantly. Aliased because the
+// generated path (`proto::block_response_header::Outcome`) is long enough to
+// push every assertion that names it onto its own line.
+use proto::block_response_header::Outcome as BlockOutcome;
 
 // Reusable non-madsim change-DAG test support (pinned-key authenticator +
 // signed-change producer). Only `pinned_authenticator` is used here; the
@@ -39,16 +45,32 @@ async fn bind_unused_addr() -> std::net::SocketAddr {
     listener.local_addr().unwrap()
 }
 
-fn gen_keypair() -> (StaticSecret, PublicKey) {
-    let mut bytes = [0u8; 32];
-    rand::fill(&mut bytes);
-    let secret = StaticSecret::from(bytes);
-    let public = PublicKey::from(&secret);
-    (secret, public)
-}
-
 fn sha256_bytes(data: &[u8]) -> Vec<u8> {
     Sha256::digest(data).to_vec()
+}
+
+/// `len` bytes that compression cannot shrink, derived deterministically
+/// from `seed`.
+///
+/// Chained SHA-256 output has no structure for zstd to exploit, so every
+/// compressed form of it is larger than the original -- which is what makes
+/// it the right content for any test whose subject is the size of a block
+/// *on the wire*. A responder always tries to compress, so a block of
+/// repeated bytes would cross the wire two orders of magnitude smaller than
+/// its stored size, and a test that reasoned about the stored size would be
+/// reasoning about a number that never appears anywhere.
+///
+/// Deterministic rather than random on purpose: a failing run has to be
+/// reproducible, which a real RNG would not make it.
+fn incompressible_bytes(seed: &str, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len + 32);
+    let mut block = sha256_bytes(seed.as_bytes());
+    while out.len() < len {
+        out.extend_from_slice(&block);
+        block = sha256_bytes(&block);
+    }
+    out.truncate(len);
+    out
 }
 
 struct Device {
@@ -189,81 +211,370 @@ fn link_with_completed_startup(state: &ReplicaCoordinator, local_path: &str) {
     state.startup_readiness().mark_group_ready(GROUP, generation);
 }
 
-async fn connect_pair(_addr: std::net::SocketAddr) -> (Arc<PeerChannel>, Arc<PeerChannel>) {
-    let (secret_a, public_a) = gen_keypair();
-    let (secret_b, public_b) = gen_keypair();
-    // Direct loopback: bind each side's UDP socket and hand the other its
-    // address as the sole direct candidate — the same wiring the daemon's
-    // peer orchestrator uses, minus the coordination-plane candidate
-    // discovery.
-    let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr_a = socket_a.local_addr().unwrap();
-    let addr_b = socket_b.local_addr().unwrap();
-    let a = PeerChannel::connect(
-        secret_a,
-        public_b,
-        0,
-        vec![addr_b],
-        yadorilink_transport::TransportHub::from_socket(socket_a, Some(public_a)),
-    )
-    .await
-    .unwrap();
-    let b = PeerChannel::connect(
-        secret_b,
-        public_a,
-        1,
-        vec![addr_a],
-        yadorilink_transport::TransportHub::from_socket(socket_b, Some(public_b)),
-    )
-    .await
-    .unwrap();
-    (Arc::new(a), Arc::new(b))
+/// A channel whose peer never answers: sends are accepted and go nowhere,
+/// and `recv` never resolves.
+///
+/// It models the silence, not the socket. Under QUIC a connection either
+/// completed a handshake or does not exist, so "a peer that never replies"
+/// cannot be built by dialing an address nobody is on -- that is simply a
+/// failed connect.
+struct SilentPeerChannel;
+
+#[async_trait::async_trait]
+impl yadorilink_peer_session::ports::PeerMessageChannel for SilentPeerChannel {
+    async fn send(&self, _payload: Vec<u8>) -> Result<(), yadorilink_transport::TransportError> {
+        Ok(())
+    }
+
+    fn try_send(&self, _payload: Vec<u8>) -> bool {
+        true
+    }
+
+    async fn recv(&self) -> Option<Vec<u8>> {
+        std::future::pending().await
+    }
+
+    /// No peer means no stream to open. Reported as a closed channel rather
+    /// than as a stream that silently never answers, because that is the
+    /// distinction the port itself draws: a transport that cannot carry
+    /// block content says so, and a requester treats it exactly like any
+    /// other failed fetch instead of waiting out a timeout for it.
+    async fn open_block_stream(
+        &self,
+    ) -> Result<
+        Box<dyn yadorilink_peer_session::ports::PeerBlockStream>,
+        yadorilink_transport::TransportError,
+    > {
+        Err(yadorilink_transport::TransportError::ChannelClosed)
+    }
+
+    /// Never resolves, for the same reason `recv` does not: this channel
+    /// models a peer that is there and says nothing, so its block-serving
+    /// loop waits forever rather than seeing an end-of-stream that would
+    /// shut the session down.
+    async fn accept_block_stream(
+        &self,
+    ) -> Option<Box<dyn yadorilink_peer_session::ports::PeerBlockStream>> {
+        std::future::pending().await
+    }
 }
 
-/// Completes the exact-generation `ClusterConfig` handshake that
-/// `PeerSyncSession::run()`'s `exact_generation_preflight` requires as the
-/// very first message exchange, from the perspective of a raw
-/// (not-`PeerSyncSession`-wrapped) test peer. Must be called on `channel`
-/// after the OTHER side has been `spawn_session()`-started and before
-/// `channel` sends (or, for a hand-written fake responder, before it starts
-/// waiting to receive) any application message (`BlockRequest`,
-/// `BlockReply`, etc.) — otherwise the peer's `run()` task's own
-/// `exact_generation_preflight` never sees a `ClusterConfig` come back, so
-/// it fails after its bounded retries and `run()` exits silently (the test
-/// harness discards the `JoinHandle`), and every subsequent
-/// `recv_matching_*`/`fetch_block`/`hydrate_file_with_timeout` call that
-/// depends on that peer's message-dispatch loop hangs or times out waiting
-/// for a reply that will never come.
+async fn connect_pair(_addr: std::net::SocketAddr) -> (Arc<QuicPeerChannel>, Arc<QuicPeerChannel>) {
+    use yadorilink_transport::{ConnectRole, DeviceSigningKeyPair, QuicPeerEndpoint, TransportHub};
+    // Direct loopback: bind each side's UDP socket and dial the other's
+    // address -- the same wiring the daemon's peer orchestrator uses, minus
+    // the coordination-plane candidate discovery.
+    let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = socket_b.local_addr().unwrap();
+    let key_a = DeviceSigningKeyPair::generate();
+    let key_b = DeviceSigningKeyPair::generate();
+    let public_a = key_a.public_bytes();
+    let public_b = key_b.public_bytes();
+    let endpoint_a = QuicPeerEndpoint::new(TransportHub::from_socket(socket_a), key_a).unwrap();
+    let endpoint_b = QuicPeerEndpoint::new(TransportHub::from_socket(socket_b), key_b).unwrap();
+    endpoint_a.authorize(public_b);
+    endpoint_b.authorize(public_a);
+    let accepting = {
+        let endpoint_b = endpoint_b.clone();
+        tokio::spawn(async move { endpoint_b.accept(public_a).await })
+    };
+    let dialed = endpoint_a.connect(addr_b, public_b).await.unwrap();
+    let accepted = accepting.await.unwrap().unwrap();
+    (
+        QuicPeerChannel::new(dialed, ConnectRole::Dial),
+        QuicPeerChannel::new(accepted, ConnectRole::Accept),
+    )
+}
+
+// ---------------------------------------------------------------------
+// Standing in for a peer on the block-transfer path.
+//
+// One block request is one bidirectional stream: the requester opens it,
+// writes a length-prefixed `BlockRequestHeader` and finishes its own
+// direction; the responder writes a length-prefixed `BlockResponseHeader`
+// and then exactly the number of raw body bytes that header declared,
+// followed by FIN. Nothing correlates a request to its answer except the
+// stream they share, and nothing is chunked.
+//
+// The helpers below are that exchange, from either side, so a test that
+// stands in for a peer says *what it wants to answer* rather than
+// re-deriving the framing. Everything that a real responder can say is
+// expressible through them; so is everything a hostile one can, which is
+// the point -- the tampering the security tests do must be visible as a
+// deliberate choice at the call site, not buried in hand-rolled framing
+// that could accidentally drift from the wire.
+// ---------------------------------------------------------------------
+
+/// One answer to one block request, in the shape a responder puts it on the
+/// wire.
+///
+/// [`BlockAnswer::Found`] builds a self-consistent header from the request
+/// it is answering: the declared `size` is the body's real length and the
+/// `hash` is the requested one, echoed back. [`BlockAnswer::FoundExactly`]
+/// leaves all four fields to the caller, for the tests whose whole subject
+/// is a responder whose header and body disagree -- with each other, with
+/// the request, or with any legal block size.
+#[derive(Clone, Debug)]
+enum BlockAnswer {
+    Found { body: Vec<u8>, compression: i32 },
+    FoundExactly { size: u64, hash: Vec<u8>, compression: i32, body: Vec<u8> },
+    DontHave,
+    Busy { retry_after_ms: u32, queue_depth: u32 },
+    Rejected { reason: String },
+}
+
+impl BlockAnswer {
+    /// The ordinary `Found`: these exact bytes, uncompressed. What a
+    /// responder that simply holds the block sends, and what all but a
+    /// handful of tests want.
+    fn found(body: impl Into<Vec<u8>>) -> Self {
+        BlockAnswer::Found { body: body.into(), compression: proto::Compression::None as i32 }
+    }
+
+    /// The response header and the body bytes that follow it. The body is
+    /// empty for every outcome but `Found`, which is what makes each of
+    /// them end the stream the same way.
+    fn into_wire(self, request: &proto::BlockRequestHeader) -> (proto::BlockResponseHeader, Vec<u8>) {
+        let outcome = match self {
+            BlockAnswer::Found { body, compression } => {
+                let found = proto::BlockFound {
+                    size: body.len() as u64,
+                    hash: request.block_hash.clone(),
+                    compression,
+                };
+                return (proto::BlockResponseHeader { outcome: Some(BlockOutcome::Found(found)) }, body);
+            }
+            BlockAnswer::FoundExactly { size, hash, compression, body } => {
+                let found = proto::BlockFound { size, hash, compression };
+                return (proto::BlockResponseHeader { outcome: Some(BlockOutcome::Found(found)) }, body);
+            }
+            BlockAnswer::DontHave => BlockOutcome::DontHave(true),
+            BlockAnswer::Busy { retry_after_ms, queue_depth } => {
+                BlockOutcome::Busy(proto::BlockBusy { retry_after_ms, queue_depth })
+            }
+            BlockAnswer::Rejected { reason } => {
+                BlockOutcome::Rejected(proto::BlockRejected { reason })
+            }
+        };
+        (proto::BlockResponseHeader { outcome: Some(outcome) }, Vec::new())
+    }
+}
+
+/// Accepts the next block stream the peer opened on `channel` and reads the
+/// request header off it, leaving the stream open for the answer.
+///
+/// Kept separate from [`answer_block_request`] so a test can do something
+/// in between -- time the gap, decide what to answer from what was asked,
+/// or hold the request in flight while it changes the responder's state.
+async fn accept_block_request(
+    channel: &QuicPeerChannel,
+) -> (QuicBlockStream, proto::BlockRequestHeader) {
+    let mut stream =
+        channel.accept_block_stream().await.expect("the channel closed before a block request");
+    let header = stream
+        .recv_message(MAX_BLOCK_STREAM_HEADER_BYTES)
+        .await
+        .expect("the block stream ended before its request header");
+    let request = proto::BlockRequestHeader::decode(header.as_slice())
+        .expect("a block request header must decode");
+    (stream, request)
+}
+
+/// Writes `answer` onto `stream`: the response header, then the body bytes
+/// it declared, then the FIN that ends this side of the exchange.
+async fn answer_block_request(
+    stream: &mut QuicBlockStream,
+    request: &proto::BlockRequestHeader,
+    answer: BlockAnswer,
+) {
+    let (header, body) = answer.into_wire(request);
+    stream.send_message(&header.encode_to_vec()).await.expect("the response header must go out");
+    stream.send_body(&body).await.expect("the response body must go out");
+}
+
+/// Acts as the responder for the next `count` block requests on `channel`,
+/// answering each with whatever `answer` returns for it, and hands back
+/// every request header it served in arrival order.
+///
+/// Serving them one after another is enough even for a test that has
+/// several requests in flight at once: each is its own stream, so a request
+/// waiting to be accepted is not blocking any other exchange the way a
+/// second message on a shared channel once could. A test that specifically
+/// needs two answers to overlap drives [`accept_block_request`]/
+/// [`answer_block_request`] itself instead.
+async fn serve_block_requests(
+    channel: &QuicPeerChannel,
+    count: usize,
+    mut answer: impl FnMut(usize, &proto::BlockRequestHeader) -> BlockAnswer,
+) -> Vec<proto::BlockRequestHeader> {
+    let mut served = Vec::with_capacity(count);
+    for index in 0..count {
+        let (mut stream, request) = accept_block_request(channel).await;
+        let reply = answer(index, &request);
+        answer_block_request(&mut stream, &request, reply).await;
+        served.push(request);
+    }
+    served
+}
+
+/// Opens a block stream to the session on the far end of `channel` and
+/// sends one request header on it, without waiting for the answer.
+///
+/// For a test that needs a request to be genuinely *in flight* while it
+/// does something else -- revoking the responder's authorization, holding
+/// its dispatch slot, or issuing a second concurrent request whose outcome
+/// depends on the first still being unfinished. Read the answer with
+/// [`read_block_response`] when the test is ready for it.
+async fn begin_block_request_in_group(
+    channel: &QuicPeerChannel,
+    group_id: &str,
+    file_path: &str,
+    hash: &[u8],
+) -> QuicBlockStream {
+    let mut stream = channel.open_block_stream().await.expect("a block stream must open");
+    let header = proto::BlockRequestHeader {
+        folder_group_id: group_id.to_string(),
+        file_path: file_path.to_string(),
+        block_hash: hash.to_vec(),
+    };
+    stream.send_message(&header.encode_to_vec()).await.expect("the request header must go out");
+    // Nothing else is ever sent on this direction; saying so is what lets
+    // the responder stop reading rather than infer it.
+    stream.finish_send();
+    stream
+}
+
+/// [`begin_block_request_in_group`] for the group these tests share.
+async fn begin_block_request(
+    channel: &QuicPeerChannel,
+    file_path: &str,
+    hash: &[u8],
+) -> QuicBlockStream {
+    begin_block_request_in_group(channel, GROUP, file_path, hash).await
+}
+
+/// Reads one whole block response off `stream`: its header, then exactly
+/// the body bytes that header declared.
+///
+/// The body comes back raw -- before any decompression -- because the tests
+/// that inspect a response's wire form need exactly that, and the ones that
+/// do not simply ignore it. A non-`Found` outcome has no body at all, which
+/// reads as an empty `Vec`.
+async fn read_block_response(stream: &mut QuicBlockStream) -> (proto::BlockResponseHeader, Vec<u8>) {
+    let header = stream
+        .recv_message(MAX_BLOCK_STREAM_HEADER_BYTES)
+        .await
+        .expect("the block stream ended before its response header");
+    let response = proto::BlockResponseHeader::decode(header.as_slice())
+        .expect("a block response header must decode");
+    let size = match &response.outcome {
+        Some(BlockOutcome::Found(found)) => found.size as usize,
+        _ => 0,
+    };
+    let body = stream.recv_body(size).await.expect("the block stream ended before its body");
+    (response, body)
+}
+
+/// One whole block request/response exchange against the session on the far
+/// end of `channel`: request out, answer and body back.
+async fn request_block_in_group(
+    channel: &QuicPeerChannel,
+    group_id: &str,
+    file_path: &str,
+    hash: &[u8],
+) -> (proto::BlockResponseHeader, Vec<u8>) {
+    let mut stream = begin_block_request_in_group(channel, group_id, file_path, hash).await;
+    read_block_response(&mut stream).await
+}
+
+/// [`request_block_in_group`] for the group these tests share.
+async fn request_block(
+    channel: &QuicPeerChannel,
+    file_path: &str,
+    hash: &[u8],
+) -> (proto::BlockResponseHeader, Vec<u8>) {
+    request_block_in_group(channel, GROUP, file_path, hash).await
+}
+
+/// The `Found` outcome of `response`, or a panic naming what arrived
+/// instead -- the assertion nearly every served-content test opens with.
+fn expect_found(response: &proto::BlockResponseHeader) -> &proto::BlockFound {
+    match &response.outcome {
+        Some(BlockOutcome::Found(found)) => found,
+        other => panic!("expected a Found block response, got {other:?}"),
+    }
+}
+
+/// Completes the `ClusterConfig` handshake that `PeerSyncSession::run()`
+/// requires as the very first message exchange, from the perspective of a
+/// raw (not-`PeerSyncSession`-wrapped) test peer. Must be called on
+/// `channel` after the OTHER side has been `spawn_session()`-started and
+/// before `channel` sends (or, for a hand-written fake responder, before it
+/// starts waiting to receive) anything else -- otherwise the peer's `run()`
+/// task's own `wait_for_and_process_peer_first_frame` never sees a
+/// `ClusterConfig` come back, so it fails after its bounded retries and
+/// `run()` exits silently (the test harness discards the `JoinHandle`), and
+/// every subsequent block request, `fetch_block` or
+/// `hydrate_file_with_timeout` call that depends on that peer's
+/// message-dispatch loop hangs or times out waiting for something that will
+/// never come.
 ///
 /// Returns any non-`ClusterConfig` messages received while draining for it,
 /// in receipt order, as raw encoded bytes. `PeerSyncSession::run()`'s own
-/// `exact_generation_preflight` send is NOT the only thing that can put a
-/// message on the wire before this function is called: a caller that spawns
-/// this raw-peer task and then immediately calls a session method that
-/// sends independent of `run()` (e.g. `fetch_block`/`hydrate_file_with_timeout`,
-/// which call `self.send` directly, not gated on the handshake) races that
-/// send against `run()`'s own preflight send on the SAME peer — either can
-/// reach this side first. A caller doing that must replay the returned
-/// messages into its own subsequent processing rather than assume the very
-/// first message it ever sees post-handshake is guaranteed fresh.
+/// first send is not the only thing that can put a message on the wire
+/// before this function is called: a caller that spawns this raw-peer task
+/// and then immediately calls a session method that sends independent of
+/// `run()` races that send against `run()`'s own first send on the SAME
+/// peer -- either can reach this side first. A caller doing that must
+/// replay the returned messages into its own subsequent processing rather
+/// than assume the very first message it ever sees post-handshake is
+/// guaranteed fresh.
 ///
 /// `session` must be the `PeerSyncSession` on the OTHER end of `channel`
 /// (the one started via `spawn_session`/`spawn_session_without_convergence_
-/// driver`) — its `change_dag_negotiated()` flag only flips true once that
-/// session's own recv loop has actually processed the second, inner-layer
-/// `ClusterConfig` this function sends, which is the direct causal signal
-/// that the handshake fully landed (not a fixed sleep guessing at it).
+/// driver`) -- its `peer_handshake_received()` flag only flips true once
+/// that session has actually processed the single `ClusterConfig` this
+/// function sends (handshake consolidation, 2026-09-02: there is exactly
+/// one owner of receiving and processing the peer's first frame now --
+/// `wait_for_and_process_peer_first_frame`, which feeds it directly into
+/// `handle_cluster_config` -- so a single frame is sufficient; a prior
+/// version of this helper sent two to work around an outer preflight layer
+/// that read and discarded the first one), which is the direct causal
+/// signal that the handshake fully landed (not a fixed sleep guessing at
+/// it).
 async fn complete_raw_peer_handshake(
-    channel: &PeerChannel,
+    channel: &QuicPeerChannel,
     session: &PeerSyncSession,
 ) -> Vec<Vec<u8>> {
-    // Receive the peer's own ClusterConfig (sent first by
-    // exact_generation_preflight) and reply with one that satisfies
-    // `PeerSyncSession::validate_exact_peer_config`'s "exact generation"
-    // check in full: protocol_version match, all 4 `supports_*` bools true,
-    // zstd present in `supported_compression`, and both inflight budgets
-    // greater than zero. Any other message received first is buffered and
+    /// One `ClusterConfig` satisfying the handshake's serve-budget check in
+    /// full -- which, now that the protocol generation is settled inside
+    /// the TLS handshake and no capabilities are negotiated on top of it,
+    /// is just the two in-flight budgets being greater than zero.
+    fn handshake_bytes() -> Vec<u8> {
+        proto::SyncMessage {
+            payload: Some(proto::sync_message::Payload::ClusterConfig(proto::ClusterConfig {
+                max_inflight_requests: 64,
+                max_inflight_bytes: 64 * 1024 * 1024,
+                ..Default::default()
+            })),
+        }
+        .encode_to_vec()
+    }
+
+    // Sent BEFORE anything is read, not in reply to the peer's own -- which
+    // is a real constraint, not a stylistic choice, whenever this raw peer
+    // happens to be the DIALLING side of the connection. A QUIC stream does
+    // not exist for the far side until bytes are written to it, and the
+    // accepting side's channel is waiting for exactly that: it accepts the
+    // dialler's control stream before it will write its own first frame,
+    // and before it will let a block stream be opened at all (see
+    // `QuicPeerChannel::open_block_stream`'s wait on the control stream
+    // being settled). A raw peer that waited to receive first would leave
+    // both sides waiting on each other with nothing on the wire.
+    channel.send(handshake_bytes()).await.unwrap();
+
+    // Now the peer's own. Any other message received first is buffered and
     // returned rather than asserted away -- see this function's own doc
     // comment for why that race is real.
     let mut buffered = Vec::new();
@@ -276,89 +587,346 @@ async fn complete_raw_peer_handshake(
         buffered.push(bytes);
     }
 
-    // `supported_compression` MUST include zstd here: `validate_exact_peer_
-    // config`'s "exact generation" check requires it unconditionally, so
-    // this outer reply cannot omit it without failing the preflight itself.
-    channel
-        .send(
-            proto::SyncMessage {
-                payload: Some(proto::sync_message::Payload::ClusterConfig(proto::ClusterConfig {
-                    protocol_version: PeerSyncSession::PROTOCOL_VERSION,
-                    supports_reliable_delivery: true,
-                    supports_change_dag: true,
-                    supports_version_present: true,
-                    supports_version_hash_exact: true,
-                    supported_compression: vec![proto::Compression::Zstd as i32],
-                    max_inflight_requests: 64,
-                    max_inflight_bytes: 64 * 1024 * 1024,
-                    ..Default::default()
-                })),
-            }
-            .encode_to_vec(),
-        )
-        .await
-        .unwrap();
-    channel.enable_reliable_delivery();
-
-    // The exact-generation exchange above is a separate, outer gate
-    // (`PeerSyncSession::run`'s own `exact_generation_preflight`) from the
-    // *inner* session's feature negotiation (compression, reliable
-    // delivery, version-present/hash-exact — `handle_message`'s
-    // `ClusterConfig` arm, driven off `self.inner.clone().run()`'s own
-    // `ClusterConfig` it sends once the preflight succeeds). The
-    // preflight's `channel.recv()` above already consumed this peer's only
-    // `ClusterConfig` on the wire, so the inner layer never saw it and
-    // every `record_peer_*_support` flag (e.g. `reliable_delivery_
-    // negotiated`) would otherwise stay false. Send a second one so the
-    // inner recv loop — now running — processes it too. Deliberately
-    // WITHOUT zstd here, unlike the outer reply above: `record_peer_
-    // compression_support` is sticky-true-only (never resets a peer back to
-    // "does not support compression" once set), and most tests using this
-    // helper assert on literal, uncompressed reply bytes -- a test that
-    // specifically wants compression negotiated (`compression_negotiated()`
-    // == true) must send its own additional zstd-advertising `ClusterConfig`
-    // after this call returns.
-    channel
-        .send(
-            proto::SyncMessage {
-                payload: Some(proto::sync_message::Payload::ClusterConfig(proto::ClusterConfig {
-                    protocol_version: PeerSyncSession::PROTOCOL_VERSION,
-                    supports_reliable_delivery: true,
-                    supports_change_dag: true,
-                    supports_version_present: true,
-                    supports_version_hash_exact: true,
-                    supported_compression: vec![],
-                    max_inflight_requests: 64,
-                    max_inflight_bytes: 64 * 1024 * 1024,
-                    ..Default::default()
-                })),
-            }
-            .encode_to_vec(),
-        )
-        .await
-        .unwrap();
-    // The inner recv loop processes this second ClusterConfig on a spawned
-    // `handle_message` task, asynchronously with respect to this function
-    // returning. A caller that immediately sends an application message
-    // right after this call needs that task to have actually landed first
-    // -- wait on the direct causal evidence that it has
-    // (`change_dag_negotiated()` only flips once `session` has processed
-    // this exact `ClusterConfig`) instead of a fixed sleep guessing at
-    // machine speed, which would just be a fresh instance of the same
-    // zero-margin-timeout class of flake this helper exists to avoid
-    // elsewhere.
+    // `wait_for_and_process_peer_first_frame` processes this ClusterConfig
+    // synchronously, inline in `run()`'s own task, before the concurrent
+    // recv loop's machinery ever starts -- so unlike a message dispatched
+    // through that loop, there is no separate spawned task to wait on
+    // landing. Still poll `peer_handshake_received()` rather than assume it
+    // is already true the instant `channel.send` above returns: this
+    // function's own send races the far side's task scheduling, not just
+    // its recv loop.
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !session.change_dag_negotiated() {
+        while !session.peer_handshake_received() {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("inner ClusterConfig was not processed by the peer session in time");
+    .expect("ClusterConfig was not processed by the peer session in time");
     buffered
 }
 
+/// M6-1B follow-up (independent-review finding, confirmed via a real
+/// `yadorilink-bench L1 --two-process --netem "loss ..."` repro under the
+/// pre-QUIC WireGuard-plus-ARQ transport, where the original trigger was
+/// its `PeerChannel` reconnecting after that transport's own
+/// reliable-delivery layer exhausted its retransmit budget): a peer whose
+/// own `PeerSyncSession` restarts -- today, the equivalent trigger is its
+/// underlying `QuicPeerChannel` ending (the QUIC connection closing, e.g.
+/// `yadorilink_transport::PEER_IDLE_TIMEOUT` firing) and a fresh
+/// `PeerSyncSession` replacing it -- sends a fresh `ClusterConfig` with
+/// `acked_peer_cluster_config: false` as the first message of its own
+/// `run()` (via its own `wait_for_and_process_peer_first_frame`), exactly
+/// like a brand-new peer would.
+///
+/// Before this fix, an ALREADY-negotiated session had no path left that
+/// would ever answer it: `spawn_cluster_config_retry`'s own bounded retry
+/// loop and the periodic full-index-resync re-offer are both permanently
+/// gated on `peer_acked_my_cluster_config` being false, and neither ever
+/// fires again once it flips true (a one-way, sticky fact about the past,
+/// correctly so for the ordinary case) -- nothing else in `handle_cluster_
+/// config` ever sent a reply. The peer's own fresh `run()`, whose own first
+/// `ClusterConfig` send happens exactly once (retries are
+/// `spawn_cluster_config_retry`'s job, not this send's), could then never
+/// succeed again for the rest of this session's lifetime, observed in the
+/// repro as a permanent "peer did not complete the handshake after bounded
+/// retries" cycle even though this side's own transport layer had already
+/// fully recovered and reconnected.
+///
+/// Tolerates this already-negotiated session's own ordinary periodic
+/// traffic (heads-announces, resync re-offers -- `TEST_RESYNC_INTERVAL` is
+/// deliberately fast, 200ms, so real interleaving is likely within this
+/// test's own bounded wait) by scanning every message that arrives within
+/// the window rather than asserting the reply is literally the next byte
+/// on the wire -- `reliable.rs`'s own module doc comment is explicit that
+/// this layer is "reliable, NOT in-order".
+#[tokio::test]
+async fn established_session_replies_to_a_fresh_unacked_cluster_config() {
+    fn cluster_config_bytes(acked_peer_cluster_config: bool) -> Vec<u8> {
+        proto::SyncMessage {
+            payload: Some(proto::sync_message::Payload::ClusterConfig(proto::ClusterConfig {
+                max_inflight_requests: 64,
+                max_inflight_bytes: 64 * 1024 * 1024,
+                acked_peer_cluster_config,
+                ..Default::default()
+            })),
+        }
+        .encode_to_vec()
+    }
+
+    /// Drains whatever this already-negotiated session sends on its own
+    /// (heads-announces, periodic resync re-offers -- `TEST_RESYNC_
+    /// INTERVAL` is a fast 200ms) for `window`, returning whether any
+    /// `ClusterConfig` was seen among it.
+    async fn drain_for(channel: &QuicPeerChannel, window: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + window;
+        let mut saw_cluster_config = false;
+        while let Ok(Some(bytes)) = tokio::time::timeout_at(deadline, channel.recv()).await {
+            if matches!(
+                proto::SyncMessage::decode(bytes.as_slice()).unwrap().payload,
+                Some(proto::sync_message::Payload::ClusterConfig(_))
+            ) {
+                saw_cluster_config = true;
+            }
+        }
+        saw_cluster_config
+    }
+
+    let addr = bind_unused_addr().await;
+    let device_a = Device::new("device-a");
+    let (channel_a, requester_channel) = connect_pair(addr).await;
+    let session_a = spawn_session_without_convergence_driver(channel_a, &device_a, "device-b");
+    complete_raw_peer_handshake(&requester_channel, &session_a).await;
+    assert!(
+        session_a.peer_handshake_received(),
+        "sanity: the handshake must have completed already"
+    );
+
+    // Settle `session_a`'s own `peer_acked_my_cluster_config` to true --
+    // `complete_raw_peer_handshake`'s own `ClusterConfig` never does
+    // (it defaults `acked_peer_cluster_config` to false), which would
+    // otherwise leave `session_a`'s OWN periodic resync re-offer (gated on
+    // this exact flag being false) firing forever regardless of this
+    // fix, making the test below unable to tell the two apart.
+    requester_channel.send(cluster_config_bytes(true)).await.unwrap();
+
+    // Best-effort settle window, deliberately NOT asserted on: `spawn_
+    // cluster_config_retry`'s own PRE-EXISTING bounded retry loop (started
+    // at `run`'s own very beginning, well before this test's "settle"
+    // message above) may still have one already-in-flight send racing the
+    // settle message's own `handshake_notify` wakeup -- a real, narrow,
+    // and entirely benign timing race in that loop's own logic, unrelated
+    // to this fix. Drained here (not asserted empty) purely so it can
+    // never be mistaken for the fix's own reply below.
+    drain_for(&requester_channel, TEST_RESYNC_INTERVAL * 3).await;
+
+    // Simulates the peer's own application-level session restarting: a
+    // fresh ClusterConfig claiming `acked_peer_cluster_config: false`,
+    // exactly what a freshly-reconnected peer's own `run()` sends as the
+    // very first message of its new session.
+    requester_channel.send(cluster_config_bytes(false)).await.unwrap();
+
+    // `session_a` must reply with its own `ClusterConfig` promptly --
+    // without the fix, `session_a`'s own `peer_acked_my_cluster_config`
+    // is now sticky-true (just settled above) and nothing left ever sends
+    // another one, so this window would end having seen only ordinary
+    // periodic traffic (if any) and never a `ClusterConfig`.
+    assert!(
+        drain_for(&requester_channel, Duration::from_secs(3)).await,
+        "an already-negotiated session must reply with its own ClusterConfig once it receives \
+         one from the peer claiming acked_peer_cluster_config: false again -- otherwise a peer \
+         that reconnects at the application layer can never complete its own handshake \
+         against this session ever again"
+    );
+}
+
+/// Handshake consolidation regression (2026-09-02), requirement 1: exactly
+/// one `ClusterConfig` exchange completes the handshake and transitions the
+/// session to usable/live state (requirement 6) -- there is no second,
+/// hidden inner-layer exchange left to satisfy. Before the fix, the
+/// facade's own now-removed `peer_handshake_preflight` read and discarded
+/// the peer's first `ClusterConfig` without ever feeding it to
+/// `handle_cluster_config`, so `peer_handshake_received()` -- and the
+/// heads-announce that `handle_cluster_config` sends as its own "session is
+/// now usable" publication -- could only ever be reached by a SECOND frame.
+#[tokio::test]
+async fn exactly_one_cluster_config_exchange_completes_the_handshake_and_makes_the_session_usable()
+{
+    let addr = bind_unused_addr().await;
+    let device_a = Device::new("device-a");
+    let (channel_a, requester_channel) = connect_pair(addr).await;
+    let session_a = spawn_session_without_convergence_driver(channel_a, &device_a, "device-b");
+
+    assert!(!session_a.peer_handshake_received(), "sanity: nothing sent yet");
+
+    let cluster_config = proto::SyncMessage {
+        payload: Some(proto::sync_message::Payload::ClusterConfig(proto::ClusterConfig {
+            max_inflight_requests: 64,
+            max_inflight_bytes: 64 * 1024 * 1024,
+            ..Default::default()
+        })),
+    }
+    .encode_to_vec();
+    requester_channel.send(cluster_config).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !session_a.peer_handshake_received() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a single ClusterConfig must be sufficient to complete the handshake");
+
+    // `handle_cluster_config`'s own "the session is now usable" publication
+    // is the heads-announce it sends for every shared group -- must appear
+    // off this one frame, with no second ClusterConfig ever sent.
+    let announced = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let bytes = requester_channel.recv().await.expect("channel closed");
+            let message = proto::SyncMessage::decode(bytes.as_slice()).unwrap();
+            match message.payload {
+                Some(proto::sync_message::Payload::HeadsAnnounce(announce))
+                    if announce.folder_group_id == GROUP =>
+                {
+                    return true;
+                }
+                // `run()`'s own outbound ClusterConfig (sent before it ever
+                // reads anything) and `spawn_cluster_config_retry`'s
+                // resends are expected, ordinary traffic here, not the
+                // signal this loop is looking for.
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        announced,
+        "a single ClusterConfig must transition the session to usable/live (a heads-announce \
+         for the shared group) without requiring a second exchange"
+    );
+}
+
+/// Handshake consolidation regression (2026-09-02), requirement 2: a first
+/// peer frame that is not `ClusterConfig` must fail the handshake closed --
+/// `run()` must return an error, and the session must never report the
+/// handshake as received.
+#[tokio::test]
+async fn a_non_cluster_config_first_frame_fails_the_handshake_closed() {
+    let addr = bind_unused_addr().await;
+    let device_a = Device::new("device-a");
+    let (channel_a, requester_channel) = connect_pair(addr).await;
+
+    let session_a = PeerSyncSession::new_with_dependencies(
+        channel_a,
+        device_a.device_id.clone(),
+        "device-b".to_string(),
+        device_a.state.clone(),
+        device_a.store.clone(),
+        vec![GROUP.to_string()],
+        device_a.sync_roots(),
+        None,
+        PeerSyncSessionDeps {
+            change_authenticator: Arc::new(DerivedKeyAuthenticator),
+            root_commit_authority_provider: AlwaysValidRootCommitAuthorityProvider::shared(),
+            maintenance_reconcile_interval: TEST_RESYNC_INTERVAL,
+            ..PeerSyncSessionDeps::standalone()
+        },
+    );
+    let run_handle = tokio::spawn(session_a.clone().run());
+
+    let stray = proto::SyncMessage {
+        payload: Some(proto::sync_message::Payload::HeadsAnnounce(proto::HeadsAnnounce {
+            folder_group_id: GROUP.to_string(),
+            heads: vec![],
+        })),
+    }
+    .encode_to_vec();
+    requester_channel.send(stray).await.unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(15), run_handle)
+        .await
+        .expect("run() must not hang forever on a non-ClusterConfig first frame")
+        .expect("run()'s own task must not panic");
+    assert!(
+        result.is_err(),
+        "a first frame that is not ClusterConfig must fail the handshake closed, not silently \
+         accept the peer as handshaken, got {result:?}"
+    );
+    assert!(
+        !session_a.peer_handshake_received(),
+        "the session must never report the handshake as received when it never got a \
+         ClusterConfig as the peer's first frame"
+    );
+}
+
+/// Handshake consolidation regression (2026-09-02), requirement 4: a
+/// reconnect gets a fresh handshake, not stale prior-connection state.
+/// Mirrors the daemon's own reconnect behavior (`peer_orchestrator.rs`'s
+/// `run_one_generation` always calls `PeerSyncSession::new_with_dependencies`
+/// again on reconnect, never reuses a session past its own connection) by
+/// constructing two entirely independent sessions for the SAME peer device
+/// id, the second only starting after the first has already completed its
+/// own handshake.
+#[tokio::test]
+async fn a_reconnected_session_gets_its_own_fresh_handshake() {
+    let addr = bind_unused_addr().await;
+    let device_a = Device::new("device-a");
+
+    let (channel_1, requester_channel_1) = connect_pair(addr).await;
+    let session_1 = spawn_session_without_convergence_driver(channel_1, &device_a, "device-b");
+    complete_raw_peer_handshake(&requester_channel_1, &session_1).await;
+    assert!(session_1.peer_handshake_received(), "sanity: the first session must have completed");
+
+    let (channel_2, requester_channel_2) = connect_pair(addr).await;
+    let session_2 = spawn_session_without_convergence_driver(channel_2, &device_a, "device-b");
+    assert!(
+        !session_2.peer_handshake_received(),
+        "a freshly constructed session for a reconnecting peer must start with no handshake \
+         state carried over from the prior connection's session"
+    );
+    complete_raw_peer_handshake(&requester_channel_2, &session_2).await;
+    assert!(
+        session_2.peer_handshake_received(),
+        "the new session must independently complete its own handshake"
+    );
+}
+
+/// Handshake consolidation regression (2026-09-02), requirement 5: no
+/// duplicate `ClusterConfig` remains unread for the session loop -- once
+/// `run()`'s own single, synchronous read of the peer's first frame
+/// returns, the very NEXT frame on the wire is the recv loop's own to
+/// dispatch, not a second handshake frame this side is still implicitly
+/// waiting to consume (the old bug's mirror image: the outer preflight
+/// consumed the peer's real first `ClusterConfig` and left the inner layer
+/// waiting for one an ordinary peer would never send again).
+#[tokio::test]
+async fn no_duplicate_cluster_config_is_left_unread_for_the_recv_loop() {
+    let addr = bind_unused_addr().await;
+    let device_a = Device::new("device-a");
+    let (channel_a, requester_channel) = connect_pair(addr).await;
+    let session_a = spawn_session_without_convergence_driver(channel_a, &device_a, "device-b");
+
+    // Exactly one ClusterConfig, then -- immediately, no pause and no
+    // second handshake frame -- an application-level HeadsAnnounce naming a
+    // head this session cannot already know about.
+    complete_raw_peer_handshake(&requester_channel, &session_a).await;
+    let unknown_head = vec![0x42u8; 32];
+    let announce = proto::SyncMessage {
+        payload: Some(proto::sync_message::Payload::HeadsAnnounce(proto::HeadsAnnounce {
+            folder_group_id: GROUP.to_string(),
+            heads: vec![unknown_head.clone()],
+        })),
+    }
+    .encode_to_vec();
+    requester_channel.send(announce).await.unwrap();
+
+    let saw_change_request = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let bytes = requester_channel.recv().await.expect("channel closed");
+            let message = proto::SyncMessage::decode(bytes.as_slice()).unwrap();
+            match message.payload {
+                Some(proto::sync_message::Payload::ChangeRequest(request))
+                    if request.want_heads.contains(&unknown_head) =>
+                {
+                    return true;
+                }
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(
+        saw_change_request,
+        "the HeadsAnnounce sent immediately after the single handshake ClusterConfig must \
+         reach the recv loop's ordinary dispatch and produce a ChangeRequest -- if a duplicate \
+         ClusterConfig were still expected/consumed here, this frame would be lost or delayed"
+    );
+}
+
 fn spawn_session(
-    channel: Arc<PeerChannel>,
+    channel: Arc<dyn yadorilink_peer_session::ports::PeerMessageChannel>,
     device: &Device,
     peer_device_id: &str,
 ) -> Arc<PeerSyncSession> {
@@ -372,7 +940,7 @@ fn spawn_session(
 /// multi-device stand-in, etc.) than the automatic per-device-id derivation
 /// `spawn_session` installs.
 fn spawn_session_with_authenticator(
-    channel: Arc<PeerChannel>,
+    channel: Arc<dyn yadorilink_peer_session::ports::PeerMessageChannel>,
     device: &Device,
     peer_device_id: &str,
     change_authenticator: Arc<dyn ChangeAuthenticator>,
@@ -390,7 +958,7 @@ fn spawn_session_with_authenticator(
 }
 
 fn spawn_session_with_authenticator_and_resync_interval(
-    channel: Arc<PeerChannel>,
+    channel: Arc<QuicPeerChannel>,
     device: &Device,
     peer_device_id: &str,
     change_authenticator: Arc<dyn ChangeAuthenticator>,
@@ -468,7 +1036,7 @@ impl RootCommitAuthorityProvider for AlwaysValidRootCommitAuthorityProvider {
 const TEST_RESYNC_INTERVAL: Duration = Duration::from_millis(200);
 
 fn spawn_session_with_groups(
-    channel: Arc<PeerChannel>,
+    channel: Arc<dyn yadorilink_peer_session::ports::PeerMessageChannel>,
     device: &Device,
     peer_device_id: &str,
     shared_group_ids: Vec<String>,
@@ -492,7 +1060,7 @@ fn spawn_session_with_groups(
 /// the frontier every 200ms and would let a completely dead startup announce
 /// pass.
 fn spawn_session_production_resync(
-    channel: Arc<PeerChannel>,
+    channel: Arc<QuicPeerChannel>,
     device: &Device,
     peer_device_id: &str,
 ) -> Arc<PeerSyncSession> {
@@ -518,9 +1086,19 @@ const TEST_CONVERGENCE_FALLBACK: Duration = Duration::from_millis(100);
 /// disk content (not just DAG admission) needs this driver running, or it will
 /// hang until its own timeout regardless of how correct the sync logic is.
 ///
-/// Deliberately polls `reconcile_local_materialization_audit` rather than
-/// re-deriving the engine's own job-scheduling logic — this harness only
-/// needs *some* driver of materialization, not a second implementation of it.
+/// Deliberately polls `reconcile_paths_directly` for whatever the DAG
+/// currently shows as admitted-but-unapplied, rather than re-deriving the
+/// engine's own claim/obligation logic — this harness only needs *some*
+/// driver of materialization, not a second implementation of the real
+/// scheduler. `reconcile_local_materialization_audit` alone is NOT enough
+/// for this: ordinary projection now runs exclusively through
+/// `projection_obligations` + the
+/// daemon's Convergence Engine, neither of which this session-only
+/// harness has, so the periodic audit's remaining responsibilities
+/// (conflict-copy retirement, repair candidates) alone would never
+/// materialize a fresh admission here. `dag_list_unapplied_changes`
+/// remains available for exactly this kind of diagnostic/test use even
+/// though nothing in production scheduling reads it anymore.
 fn spawn_test_convergence_driver(
     session: &Arc<PeerSyncSession>,
     state: Arc<ReplicaCoordinator>,
@@ -535,6 +1113,41 @@ fn spawn_test_convergence_driver(
             };
 
             for group_id in &group_ids {
+                if let Ok(unapplied) =
+                    state.change_history_repository().dag_list_unapplied_changes(group_id)
+                {
+                    let mut paths = std::collections::BTreeSet::new();
+                    for change in &unapplied {
+                        for op in &change.ops {
+                            yadorilink_replica_engine::change_ops::collect_op_paths(op, &mut paths);
+                        }
+                    }
+                    // Excludes any path a real, in-flight fetch is
+                    // currently hydrating: a handful of tests manually
+                    // orchestrate a precise race window against ONE
+                    // path's materialization state while a real
+                    // `hydrate_file` call is in progress (e.g.
+                    // `hydrate_file_detects_a_superseding_authoring_
+                    // change_mid_fetch`/`..._a_concurrent_disk_edit_mid_
+                    // fetch`), and this driver's own unconditional sweep
+                    // landing on the SAME path mid-fetch raced those
+                    // tests into real, reproducible failures -- this
+                    // driver has no business touching a path something
+                    // else is already actively fetching.
+                    paths.retain(|path| {
+                        !matches!(
+                            state
+                                .materialization_state_repository()
+                                .get_materialization_state(group_id, path),
+                            Ok(Some(
+                                yadorilink_replica_domain::session_state::MaterializationState::Hydrating
+                            ))
+                        )
+                    });
+                    if !paths.is_empty() {
+                        let _ = session.clone().reconcile_paths_directly(group_id, paths).await;
+                    }
+                }
                 if let Err(error) =
                     session.clone().reconcile_local_materialization_audit(group_id).await
                 {
@@ -558,10 +1171,65 @@ fn spawn_test_convergence_driver(
     });
 }
 
+/// One-shot sibling of [`spawn_test_convergence_driver`] for the many call
+/// sites in this file that drive materialization inline (no background
+/// loop) rather than via that spawned driver -- same reasoning, same fix:
+/// `reconcile_local_materialization_audit` alone no longer performs
+/// ordinary reprojection, so a caller expecting a fresh admission to
+/// materialize after ONE call must
+/// also drive `reconcile_paths_directly` for whatever the DAG shows as
+/// admitted-but-unapplied first. Propagates the audit call's own error
+/// (matching every existing call site's `.unwrap()`); the reconcile step
+/// is best-effort, exactly like `spawn_test_convergence_driver`'s.
+async fn drive_materialization_for_test(
+    session: &Arc<PeerSyncSession>,
+    state: &Arc<ReplicaCoordinator>,
+    group_id: &str,
+) -> Result<bool, yadorilink_peer_session::PeerSessionError> {
+    if let Ok(unapplied) = state.change_history_repository().dag_list_unapplied_changes(group_id) {
+        let mut paths = std::collections::BTreeSet::new();
+        for change in &unapplied {
+            for op in &change.ops {
+                yadorilink_replica_engine::change_ops::collect_op_paths(op, &mut paths);
+            }
+        }
+        if !paths.is_empty() {
+            let _ = session.clone().reconcile_paths_directly(group_id, paths).await;
+        }
+    }
+    session.clone().reconcile_local_materialization_audit(group_id).await
+}
+
+/// Sibling of [`drive_materialization_for_test`] for the handful of modules
+/// that construct their session via `peer_session_impl::PeerSyncSession`
+/// directly (bypassing the public facade re-export this file's top-level
+/// `use` brings in) rather than through one of this file's own
+/// `spawn_session*` helpers -- a genuinely different Rust type from the
+/// facade's `PeerSyncSession`, not just a differently-spelled import of the
+/// same one, so it needs its own overload.
+async fn drive_materialization_for_test_impl(
+    session: &Arc<yadorilink_peer_session::peer_session_impl::PeerSyncSession>,
+    state: &Arc<ReplicaCoordinator>,
+    group_id: &str,
+) -> Result<bool, yadorilink_peer_session::PeerSessionError> {
+    if let Ok(unapplied) = state.change_history_repository().dag_list_unapplied_changes(group_id) {
+        let mut paths = std::collections::BTreeSet::new();
+        for change in &unapplied {
+            for op in &change.ops {
+                yadorilink_replica_engine::change_ops::collect_op_paths(op, &mut paths);
+            }
+        }
+        if !paths.is_empty() {
+            let _ = session.clone().reconcile_paths_directly(group_id, paths).await;
+        }
+    }
+    session.clone().reconcile_local_materialization_audit(group_id).await
+}
+
 /// Shared spawn seam: `resync_interval` of `None` leaves the production default
 /// in place, `Some(i)` shortens the periodic frontier re-announce to `i`.
 fn spawn_session_configured(
-    channel: Arc<PeerChannel>,
+    channel: Arc<dyn yadorilink_peer_session::ports::PeerMessageChannel>,
     device: &Device,
     peer_device_id: &str,
     shared_group_ids: Vec<String>,
@@ -582,16 +1250,16 @@ fn spawn_session_configured(
 
 /// Like `spawn_session_configured`, but skips installing the test-only
 /// convergence driver: a hand-written fake responder in a test that answers
-/// exactly one `BlockRequest` (to model a specific corrupt/mismatched/bomb
-/// reply and assert on the resulting error) can otherwise have that single
-/// reply consumed by the driver's own legitimate background repair fetch for
-/// the same placeholder, racing the test's own explicit
+/// exactly one block request (to model a specific corrupt/mismatched/bomb
+/// answer and assert on the resulting error) can otherwise have that single
+/// answer consumed by the driver's own legitimate background repair fetch
+/// for the same placeholder, racing the test's own explicit
 /// `hydrate_file_with_timeout` call for it. Use this for any test whose
 /// subject is hydration's own request/response handling (timeout, corrupt or
-/// mismatched bytes, request-id correlation) rather than end-to-end disk
-/// convergence.
+/// mismatched bytes, a header bound to the wrong block) rather than
+/// end-to-end disk convergence.
 fn spawn_session_without_convergence_driver(
-    channel: Arc<PeerChannel>,
+    channel: Arc<QuicPeerChannel>,
     device: &Device,
     peer_device_id: &str,
 ) -> Arc<PeerSyncSession> {
@@ -611,10 +1279,10 @@ fn spawn_session_without_convergence_driver(
 /// `AlwaysValidRootCommitAuthorityProvider` instead of `PeerSyncSessionDeps::
 /// standalone()`'s deny-by-default one, so `hydrate_file_with_timeout` (and
 /// any other real mutation path) can actually attempt its fetch instead of
-/// failing closed before ever sending a `BlockRequest` -- for a test whose
+/// failing closed before ever sending a block request -- for a test whose
 /// fake responder depends on that request actually arriving.
 fn spawn_session_without_convergence_driver_with_root_authority(
-    channel: Arc<PeerChannel>,
+    channel: Arc<QuicPeerChannel>,
     device: &Device,
     peer_device_id: &str,
 ) -> Arc<PeerSyncSession> {
@@ -631,7 +1299,7 @@ fn spawn_session_without_convergence_driver_with_root_authority(
 }
 
 fn spawn_session_with_block_serve_engine(
-    channel: Arc<PeerChannel>,
+    channel: Arc<QuicPeerChannel>,
     device: &Device,
     peer_device_id: &str,
     block_serve_engine: Arc<yadorilink_peer_session::block_serve::BlockServeEngine>,
@@ -649,10 +1317,55 @@ fn spawn_session_with_block_serve_engine(
             change_authenticator: Arc::new(DerivedKeyAuthenticator),
             root_commit_authority_provider: AlwaysValidRootCommitAuthorityProvider::shared(),
             block_serve_engine,
-            full_index_resync_interval: TEST_RESYNC_INTERVAL,
+            maintenance_reconcile_interval: TEST_RESYNC_INTERVAL,
             ..PeerSyncSessionDeps::standalone()
         },
     );
+    spawn_test_convergence_driver(&session, device.state.clone(), vec![GROUP.to_owned()]);
+    tokio::spawn(session.clone().run());
+    session
+}
+
+/// Like [`spawn_session`], but with this session's [`RateLimiters`] wired
+/// at construction.
+///
+/// Wired at construction and not with `set_rate_limiters` afterwards,
+/// because `set_rate_limiters` is one of the dependency setters that
+/// `assert_not_started` guards: it panics with "PeerSyncSession
+/// dependencies are immutable after run() starts" the moment `run()` has
+/// begun. `spawn_session` spawns `run()` before it returns, so calling
+/// the setter on its result is a race against the scheduler that a busy
+/// machine loses -- observed, as exactly that panic. `PeerSyncSessionDeps`
+/// carries the field, so there is no reason to race it.
+fn spawn_session_with_rate_limiters(
+    channel: Arc<QuicPeerChannel>,
+    device: &Device,
+    peer_device_id: &str,
+    rate_limiters: Arc<RateLimiters>,
+) -> Arc<PeerSyncSession> {
+    let session = PeerSyncSession::new_with_dependencies(
+        channel,
+        device.device_id.clone(),
+        peer_device_id.to_owned(),
+        device.state.clone(),
+        device.store.clone(),
+        vec![GROUP.to_owned()],
+        device.sync_roots(),
+        None,
+        PeerSyncSessionDeps {
+            change_authenticator: Arc::new(DerivedKeyAuthenticator),
+            root_commit_authority_provider: AlwaysValidRootCommitAuthorityProvider::shared(),
+            rate_limiters,
+            maintenance_reconcile_interval: TEST_RESYNC_INTERVAL,
+            ..PeerSyncSessionDeps::standalone()
+        },
+    );
+    session.set_block_serve_engine(yadorilink_peer_session::block_serve::BlockServeEngine::new(
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+        1_000,
+    ));
     spawn_test_convergence_driver(&session, device.state.clone(), vec![GROUP.to_owned()]);
     tokio::spawn(session.clone().run());
     session
@@ -666,7 +1379,7 @@ fn spawn_session_with_block_serve_engine(
 /// `yadorilink_peer_session::peer_session_impl`).
 #[allow(clippy::too_many_arguments)]
 fn spawn_session_configured_ex(
-    channel: Arc<PeerChannel>,
+    channel: Arc<dyn yadorilink_peer_session::ports::PeerMessageChannel>,
     device: &Device,
     peer_device_id: &str,
     shared_group_ids: Vec<String>,
@@ -704,7 +1417,7 @@ fn spawn_session_configured_ex(
     // `PeerSyncSession::set_block_serve_engine`'s own doc comment), so this
     // harness's own sessions get one too rather than falling into
     // `handle_block_request`'s defensive "no engine installed" fail-closed
-    // path on any test that happens to exercise a `BlockRequest`. Generous,
+    // path on any test that happens to exercise a block request. Generous,
     // effectively unlimited budgets -- these tests aren't about credit
     // exhaustion unless they say so.
     session.set_block_serve_engine(yadorilink_peer_session::block_serve::BlockServeEngine::new(
@@ -714,7 +1427,7 @@ fn spawn_session_configured_ex(
         1_000,
     ));
     if let Some(interval) = resync_interval {
-        session.set_full_index_resync_interval(interval);
+        session.set_maintenance_reconcile_interval(interval);
     }
     if install_convergence_driver {
         spawn_test_convergence_driver(&session, convergence_state, convergence_groups);
@@ -730,13 +1443,35 @@ fn expect_file_changed(outcome: LocalChangeOutcome) -> yadorilink_replica_domain
     }
 }
 
-async fn wait_until<F: Fn() -> bool>(cond: F, timeout: Duration) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while !cond() {
-        if tokio::time::Instant::now() > deadline {
-            panic!("condition never became true within timeout");
+/// Polls `cond` until it holds, panicking with the *call site* and the
+/// budget once `timeout` elapses.
+///
+/// The location is the point. This helper is awaited from well over a
+/// hundred places in this file, and the old bare "condition never became
+/// true within timeout" panic named none of them -- a failing run gave a
+/// reader a test name and nothing else, so telling a genuine convergence
+/// regression apart from an unrelated wait in the same test meant
+/// re-deriving the call graph by hand every time. `#[track_caller]` on a
+/// plain function returning a future records the caller correctly;
+/// putting it on an `async fn` would record wherever the future happened
+/// to be polled instead.
+#[track_caller]
+fn wait_until<F: Fn() -> bool>(
+    cond: F,
+    timeout: Duration,
+) -> impl std::future::Future<Output = ()> {
+    let caller = std::panic::Location::caller();
+    async move {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if cond() {
+                return;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("condition never became true within {timeout:?}, awaited at {caller}");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -750,14 +1485,17 @@ fn dag_authenticator(devices: &[&Device]) -> Arc<dyn ChangeAuthenticator> {
     pinned_authenticator(&pairs)
 }
 
-/// Waits until both sessions have negotiated the change DAG over the handshake
-/// (both advertise support, so this is automatic once the run() loops connect).
-async fn wait_dag_negotiated(
+/// Waits until each session has seen the other's handshake -- the single
+/// "the peer is talking to us" signal, and the gate every announce path
+/// checks before it sends anything. Automatic once both `run()` loops
+/// connect; waiting on it is how a test knows the pair is ready to converge
+/// rather than guessing with a sleep.
+async fn wait_handshake_exchanged(
     a: &Arc<PeerSyncSession>,
     b: &Arc<PeerSyncSession>,
     timeout: Duration,
 ) {
-    wait_until(|| a.change_dag_negotiated() && b.change_dag_negotiated(), timeout).await;
+    wait_until(|| a.peer_handshake_received() && b.peer_handshake_received(), timeout).await;
 }
 
 /// Drives `announce_local_commit` (the idempotent HeadsAnnounce the daemon's
@@ -766,23 +1504,134 @@ async fn wait_dag_negotiated(
 /// loopback UDP would otherwise stall convergence until the slow periodic
 /// frontier audit; re-announcing is exactly that audit at a test cadence and
 /// never changes what the DAG decides.
-async fn announce_until<F: Fn() -> bool>(
-    session: &Arc<PeerSyncSession>,
-    group: &str,
+///
+/// Reports the awaiting call site on timeout for the same reason
+/// [`wait_until`] does -- see its doc comment.
+#[track_caller]
+fn announce_until<'a, F: Fn() -> bool + 'a>(
+    session: &'a Arc<PeerSyncSession>,
+    group: &'a str,
     cond: F,
     timeout: Duration,
-) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let _ = session.announce_local_commit(group).await;
-        for _ in 0..8 {
+) -> impl std::future::Future<Output = ()> + 'a {
+    let caller = std::panic::Location::caller();
+    async move {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let _ = session.announce_local_commit(group).await;
+            for _ in 0..8 {
+                if cond() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             if cond() {
                 return;
             }
+            if tokio::time::Instant::now() > deadline {
+                panic!("condition never became true within {timeout:?}, announced from {caller}");
+            }
+        }
+    }
+}
+
+/// How long a convergence wait tolerates *no* forward progress before it
+/// declares a stall.
+///
+/// Sized against the slowest per-item step this suite actually observes,
+/// not against a whole test's runtime. These tests are required to run
+/// with `TMPDIR` on real, non-tmpfs storage (tmpfs timestamp granularity
+/// is too coarse for the mtime-sensitive tests elsewhere in the
+/// workspace), so every file materialization pays real `fsync`s: three
+/// or four of them, for the block store's put, `reconstruct_file`'s own,
+/// and the parent directory. On a rotational disk shared with concurrent
+/// build and test I/O, one `fsync` measures 100-960ms (median ~450ms)
+/// against ~0.02ms on tmpfs -- four orders of magnitude, which no single
+/// flat deadline can span. The worst gap between two consecutive files
+/// landing, measured across a 150-file sync on such a disk, was ~5.6s.
+/// 30s is more than five times that, so a genuinely wedged convergence
+/// is still reported promptly while a merely slow disk never trips it.
+const NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// [`announce_while_progressing`] without the announcing, for a wait
+/// driven by a raw test peer rather than by a `PeerSyncSession`. Same
+/// reasoning, same failure report: see that function and
+/// [`NO_PROGRESS_TIMEOUT`].
+#[track_caller]
+fn wait_while_progressing<F: Fn() -> bool, P: Fn() -> usize>(
+    done: F,
+    progress: P,
+    stall_timeout: Duration,
+) -> impl std::future::Future<Output = ()> {
+    let caller = std::panic::Location::caller();
+    async move {
+        let mut best = progress();
+        let mut last_progress_at = tokio::time::Instant::now();
+        loop {
+            if done() {
+                return;
+            }
+            let now = progress();
+            if now > best {
+                best = now;
+                last_progress_at = tokio::time::Instant::now();
+            }
+            if last_progress_at.elapsed() > stall_timeout {
+                panic!(
+                    "stalled with no progress for {stall_timeout:?} (progress metric stuck at \
+                     {best}), awaited at {caller}"
+                );
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        if tokio::time::Instant::now() > deadline {
-            panic!("condition never became true within timeout");
+    }
+}
+
+/// Like [`announce_until`], but bounded by lack of forward progress
+/// instead of by total elapsed time, and reporting how far it got.
+///
+/// A flat deadline on a bulk convergence conflates two completely
+/// different failures: "convergence is wedged" and "this disk is slow".
+/// The first is a regression worth failing on; the second is a property
+/// of whatever storage `TMPDIR` points at, and those two differ by
+/// orders of magnitude (see [`NO_PROGRESS_TIMEOUT`]). Watching
+/// `progress` climb separates them: as long as items keep landing the
+/// wait keeps waiting, and the moment they stop it fails with the exact
+/// count it reached, which is the diagnostic a flat timeout never gave.
+#[track_caller]
+fn announce_while_progressing<'a, P: Fn() -> usize + 'a>(
+    session: &'a Arc<PeerSyncSession>,
+    group: &'a str,
+    progress: P,
+    target: usize,
+    stall_timeout: Duration,
+) -> impl std::future::Future<Output = ()> + 'a {
+    let caller = std::panic::Location::caller();
+    async move {
+        let mut best = progress();
+        let mut last_progress_at = tokio::time::Instant::now();
+        loop {
+            if best >= target {
+                return;
+            }
+            let _ = session.announce_local_commit(group).await;
+            for _ in 0..8 {
+                let now = progress();
+                if now > best {
+                    best = now;
+                    last_progress_at = tokio::time::Instant::now();
+                }
+                if best >= target {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if last_progress_at.elapsed() > stall_timeout {
+                panic!(
+                    "convergence stalled at {best}/{target} with no progress for \
+                     {stall_timeout:?}, announced from {caller}"
+                );
+            }
         }
     }
 }
@@ -811,13 +1660,13 @@ fn is_final_conflict_copy(name: &str) -> bool {
 /// This test therefore keeps the production resync default and never announces
 /// by hand. The 30s bound is deliberately well inside the 90s frontier audit,
 /// so nothing can rescue a broken startup push: if the announce at the end of
-/// config negotiation stops firing, this test fails and nothing else in this
-/// file does.
+/// the handshake stops firing, this test fails and nothing else in this file
+/// does.
 ///
 /// Do not "stabilize" this test by shortening the resync interval or adding a
 /// manual announce loop — either one silently deletes the only coverage of the
 /// startup push. If it proves flaky, fix the flake, not the assertion.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_heads_announce_alone_replicates_a_pre_existing_file() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -845,7 +1694,7 @@ async fn startup_heads_announce_alone_replicates_a_pre_existing_file() {
     // have let this assertion pass with the heads-announce completely dead — no
     // longer exists, so this test is load-bearing by construction rather than
     // by opting into a boundary switch.
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let replicated = device_b.root_path().join("pre-existing.bin");
     wait_until(|| replicated.exists(), Duration::from_secs(30)).await;
@@ -860,7 +1709,7 @@ async fn startup_heads_announce_alone_replicates_a_pre_existing_file() {
 /// sync-engine spec: "Initial sync reconciles existing files" — device A
 /// already has a file before B ever connects; B must end up with an
 /// identical copy after the session starts.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn initial_sync_replicates_existing_file_to_new_peer() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -884,7 +1733,7 @@ async fn initial_sync_replicates_existing_file_to_new_peer() {
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // device-a's pre-existing file is already in its DAG (process_event above);
     // the startup heads-announce carries it to device-b once negotiated.
@@ -1096,7 +1945,7 @@ async fn ondemand_peer_adoption_waits_for_block_deletion_gate_before_index_commi
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn same_version_resync_rehydrates_a_missing_eager_file() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -1134,7 +1983,7 @@ async fn same_version_resync_rehydrates_a_missing_eager_file() {
         auth.clone(),
         Duration::from_millis(100),
     );
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let replicated_path = device_b.root_path().join(file_name);
     announce_until(&session_a, GROUP, || replicated_path.exists(), Duration::from_secs(20)).await;
@@ -1151,10 +2000,27 @@ async fn same_version_resync_rehydrates_a_missing_eager_file() {
         )
         .unwrap();
 
+    // Drive the audit until the row reaches its terminal state, not until
+    // the bytes land. Rehydration writes the file first and commits the
+    // `Hydrating -> Hydrated` transition last: `reconstruct_file` (fsync,
+    // rename, parent-dir fsync), then the materialized-fingerprint write,
+    // then `apply_unix_mode`, and only then
+    // `transition_materialization_state_if_same_authoring`. Breaking out
+    // of this loop on the disk bytes and then asserting the state column
+    // was reading the two ends of that window in the wrong order, so the
+    // test failed with `Some(Hydrating)` whenever it happened to sample
+    // inside it -- which is most of the time once the fingerprint write
+    // is contended.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        session_b.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
-        if std::fs::read(&replicated_path).ok().as_deref() == Some(contents.as_slice()) {
+        drive_materialization_for_test(&session_b, &device_b.state, GROUP).await.unwrap();
+        if device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, file_name)
+            .unwrap()
+            == Some(MaterializationState::Hydrated)
+        {
             break;
         }
         assert!(tokio::time::Instant::now() < deadline, "repair audit never rehydrated the file");
@@ -1172,7 +2038,7 @@ async fn same_version_resync_rehydrates_a_missing_eager_file() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
     windows,
     ignore = "M2-3a: on Windows, real placeholder creation is deferred to \
@@ -1225,9 +2091,19 @@ async fn same_version_resync_does_not_hydrate_an_ondemand_placeholder() {
         auth.clone(),
         Duration::from_millis(100),
     );
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let replicated_path = device_b.root_path().join(file_name);
+    // Both halves, not just the state column. `materialize`'s on-demand
+    // branch writes `Placeholder` into the index BEFORE it calls
+    // `create_or_defer_placeholder`, and creating the placeholder is not
+    // cheap: `write_placeholder` fsyncs the sparse temp file, renames it
+    // into place and fsyncs the parent directory. The index column
+    // therefore reads `Placeholder` for as long as those three
+    // filesystem operations take, while the artifact this test then
+    // audits and inspects does not exist yet -- so gating on the column
+    // alone and following it with a fixed 100ms sleep was gating on
+    // nothing at all.
     announce_until(
         &session_a,
         GROUP,
@@ -1239,12 +2115,15 @@ async fn same_version_resync_does_not_hydrate_an_ondemand_placeholder() {
                 .ok()
                 .flatten()
                 == Some(MaterializationState::Placeholder)
+                && std::fs::metadata(&replicated_path)
+                    .map(|m| m.len() == contents.len() as u64)
+                    .unwrap_or(false)
         },
         Duration::from_secs(20),
     )
     .await;
 
-    session_b.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
+    drive_materialization_for_test(&session_b, &device_b.state, GROUP).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert_eq!(
@@ -1265,7 +2144,7 @@ async fn same_version_resync_does_not_hydrate_an_ondemand_placeholder() {
 /// with no directional gate that could reject it or record it as
 /// divergence. This is the baseline the removed send-only mode used to
 /// suppress; it must now always take effect.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bidirectional_link_applies_incoming_change() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -1292,7 +2171,7 @@ async fn bidirectional_link_applies_incoming_change() {
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     announce_until(
         &session_a,
@@ -1320,7 +2199,7 @@ async fn bidirectional_link_applies_incoming_change() {
 /// `paused` at all on the incoming-apply path (only the daemon's
 /// local→peer broadcast did). Pause suspends the link entirely; the file
 /// is simply not applied while paused.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paused_link_does_not_apply_an_incoming_change() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -1347,7 +2226,7 @@ async fn paused_link_does_not_apply_an_incoming_change() {
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // Announce device-a's change repeatedly; a paused link must drop every
     // HeadsAnnounce/ChangeBatch (handle_heads_announce and handle_change_batch
@@ -1376,7 +2255,7 @@ async fn paused_link_does_not_apply_an_incoming_change() {
 /// unwanted files: an incoming delete runs `remove_file` against a path resolved
 /// under the group's root, so a session still holding the detached folder as its
 /// root deletes the user's real files inside it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unlinked_folder_never_lets_a_peer_tombstone_delete_local_files() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -1406,7 +2285,7 @@ async fn unlinked_folder_never_lets_a_peer_tombstone_delete_local_files() {
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let landed = device_b.root_path().join("vacation.jpg");
     announce_until(&session_a, GROUP, || landed.exists(), Duration::from_secs(20)).await;
@@ -1485,7 +2364,7 @@ async fn session_construction_never_creates_a_missing_sync_root() {
 /// The write half of the same guarantee: after an unlink, a peer's *new* file
 /// must not appear inside the detached folder either. The link row is the only
 /// record that the folder is ours to write into, and it is gone.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unlinked_folder_does_not_apply_an_incoming_peer_change() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -1512,7 +2391,7 @@ async fn unlinked_folder_does_not_apply_an_incoming_peer_change() {
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     for _ in 0..5 {
         let _ = session_a.announce_local_commit(GROUP).await;
@@ -1534,7 +2413,7 @@ async fn unlinked_folder_does_not_apply_an_incoming_peer_change() {
 /// sync-engine spec: "Local file edit detected" + incremental propagation
 ///  — a change made *after* the initial sync must also reach
 /// the peer, sent as an index update rather than a full re-sync.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incremental_change_after_initial_sync_propagates() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -1542,13 +2421,13 @@ async fn incremental_change_after_initial_sync_propagates() {
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     // Pin each device's signing key on both sessions so B admits A's signed
-    // change, then wait for the automatic change-DAG negotiation.
+    // change, then wait for both handshakes to land.
     let auth = dag_authenticator(&[&device_a, &device_b]);
     let session_a =
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // A local edit on A: `process_event` emits a signed Create into the DAG.
     let file_path = device_a.root_path().join("notes.txt");
@@ -1575,7 +2454,7 @@ async fn incremental_change_after_initial_sync_propagates() {
 /// devices edit the same file before either has seen the other's change;
 /// version vectors must detect this as a true conflict (not a simple
 /// ordering), and both copies must survive on both devices.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_edit_produces_conflict_copy_on_both_sides() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -1647,7 +2526,7 @@ async fn concurrent_edit_produces_conflict_copy_on_both_sides() {
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // Both devices should end up with two files: the winning content at
     // "shared.txt" and a conflict-marked copy of the losing content. Both sides
@@ -1694,7 +2573,7 @@ async fn concurrent_edit_produces_conflict_copy_on_both_sides() {
 /// file for the tombstone (fix: `resolve_and_apply_conflict`
 /// skips creating a conflict copy for a tombstone loser entirely, since
 /// "conflict copy of a deletion" has no content to preserve).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_vs_edit_conflict_tombstone_as_loser_leaves_no_ghost_file() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -1777,6 +2656,7 @@ async fn delete_vs_edit_conflict_tombstone_as_loser_leaves_no_ghost_file() {
             "shared.txt",
             "device-b",
             1000,
+            false,
             &device_b.emitter(),
             &RootCommitPermit::for_tests(),
         )
@@ -1827,7 +2707,7 @@ async fn delete_vs_edit_conflict_tombstone_as_loser_leaves_no_ghost_file() {
 /// intersection from the coordination plane), even if a peer sends them —
 /// a peer naming an unrelated group_id in a message must not be able to
 /// read or write files outside what it's actually authorized to share.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unauthorized_group_id_in_incoming_message_is_ignored() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -1874,7 +2754,7 @@ async fn unauthorized_group_id_in_incoming_message_is_ignored() {
 /// instead of full content": adopting a file into an `OnDemand`-policy
 /// folder must index it and write a correctly-sized placeholder — without
 /// ever fetching its blocks from the peer.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
     windows,
     ignore = "M2-3a: on Windows, real placeholder creation is deferred to \
@@ -1961,7 +2841,7 @@ async fn ondemand_folder_adopts_placeholder_without_fetching_blocks() {
 /// blocks on demand and materialize its real content, transitioning to
 /// `Hydrated` — the on-access path, independent of ordinary index
 /// reconciliation.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
     windows,
     ignore = "M2-3a: on Windows, real placeholder creation is deferred to \
@@ -2037,6 +2917,68 @@ async fn hydrate_file_fetches_and_materializes_placeholder_content() {
     }
 }
 
+/// **Phase E finding**: `hydrate_file_with_timeout_locked`'s physical write
+/// (`reconstruct_file_off_runtime`, `apply_unix_mode`, `apply_xattrs`) used
+/// to run with no mutation-fence bump at all -- unlike every sibling
+/// physical mutator in this codebase (`materialize`'s own hydration/
+/// placeholder/content writes, the daemon's `hydration.rs::hydrate_inner`
+/// for its equivalent on-demand-hydration write). An existing
+/// `path_materialized_generations` proof for this path would have survived
+/// this write completely untouched (the fence never moving), so a
+/// concurrent, unrelated completion for the same path could have read that
+/// proof as still "usable" right up to the instant `hydrate_file` silently
+/// wrote real content over the placeholder. This proves the fence is now
+/// genuinely bumped by the hydration write itself, not merely that
+/// hydration succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydrate_file_bumps_the_mutation_fence_before_its_physical_write() {
+    let addr = bind_unused_addr().await;
+    let device_a = Device::new("device-a");
+    let device_b = Device::new("device-b");
+
+    let root_b = device_b.root_path().to_string_lossy().to_string();
+    link_with_completed_startup(&device_b.state, &root_b);
+    device_b
+        .state
+        .link_repository()
+        .set_materialization_policy(
+            &root_b,
+            yadorilink_replica_domain::session_state::MaterializationPolicy::OnDemand,
+        )
+        .unwrap();
+
+    let content = vec![0x77u8; 300_000];
+    let file_path = device_a.root_path().join("report.pdf");
+    std::fs::write(&file_path, &content).unwrap();
+    device_a
+        .processor()
+        .process_event(
+            GROUP,
+            &device_a.root_path(),
+            &FsChangeEvent { path: file_path, kind: FsChangeKind::CreatedOrModified },
+        )
+        .await
+        .unwrap();
+
+    let (channel_a, channel_b) = connect_pair(addr).await;
+    let _session_a = spawn_session(channel_a, &device_a, "device-b");
+    let session_b = spawn_session(channel_b, &device_b, "device-a");
+
+    let placeholder_path = device_b.root_path().join("report.pdf");
+    wait_until(|| placeholder_path.exists(), Duration::from_secs(10)).await;
+
+    let fence_before = device_b.state.dag_snapshot_mutation_fence(GROUP, "report.pdf").unwrap();
+
+    session_b.hydrate_file(GROUP, "report.pdf").await.unwrap();
+
+    let fence_after = device_b.state.dag_snapshot_mutation_fence(GROUP, "report.pdf").unwrap();
+    assert!(
+        fence_after > fence_before,
+        "hydrate_file's physical write must bump the mutation fence like every other physical \
+         mutator (before: {fence_before}, after: {fence_after})"
+    );
+}
+
 /// If a concurrent update supersedes a row's authoring identity WHILE
 /// `hydrate_file` is mid-fetch (a peer's own materialize landing a
 /// newer version for the same path), this attempt must not go on to
@@ -2046,7 +2988,7 @@ async fn hydrate_file_fetches_and_materializes_placeholder_content() {
 /// An independent Codex review's own counter-scenario to the rollback-
 /// only fix (`HydratingStateGuard`'s authoring-bound CAS alone does not
 /// protect the SUCCESSFUL commit path, only the failure-rollback path).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
     windows,
     ignore = "M2-3a: on Windows, real placeholder creation is deferred to \
@@ -2073,10 +3015,10 @@ async fn hydrate_file_detects_a_superseding_authoring_change_mid_fetch() {
         )
         .unwrap();
 
-    // A larger file (many blocks) so the real block-by-block fetch has
-    // enough wall-clock duration for the race below to land reliably,
-    // without relying on a fixed sleep -- the race is synchronized on a
-    // real state transition (`Hydrating`), not a timing guess.
+    // A larger file (many blocks) so the real block-by-block fetch is a
+    // genuine, multi-round-trip fetch rather than a single reply. Size
+    // alone is NOT what makes the mid-fetch window below wide enough --
+    // see the download limiter installed on `session_b`.
     let content = vec![0x77u8; 4_000_000];
     let file_path = device_a.root_path().join("bigfile.bin");
     std::fs::write(&file_path, &content).unwrap();
@@ -2092,7 +3034,32 @@ async fn hydrate_file_detects_a_superseding_authoring_change_mid_fetch() {
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let _session_a = spawn_session(channel_a, &device_a, "device-b");
-    let session_b = spawn_session(channel_b, &device_b, "device-a");
+    // The mid-fetch window this test needs has to be REAL, not hoped for.
+    // `Hydrating` is transient and is observed here by polling every
+    // 50ms, while 4 MB over loopback is ~31 blocks fetched
+    // `fetch_window`-at-a-time on a sub-millisecond link: on an unloaded
+    // machine the whole hydration can begin and end inside a single poll
+    // interval, so the wait below never sees `Hydrating` at all and the
+    // test fails with a timeout for being too FAST. That is the reported
+    // "passes at one commit, fails at another" behaviour -- it tracks how
+    // busy the machine is, not the code -- and no amount of extra file
+    // size fixes it, because a faster machine just fetches the extra
+    // blocks faster too.
+    //
+    // A download rate limit turns that into a bounded, known window using
+    // the product's own knob rather than a sleep. The bucket starts with
+    // one second's worth of tokens, so the first 1 MB is unthrottled and
+    // the remaining ~3 MB is paced at 1 MB/s: a floor of roughly three
+    // seconds on the fetch, two orders of magnitude above the 50ms poll
+    // and well inside `DEFAULT_HYDRATION_TIMEOUT` (30s). Nothing this
+    // test asserts changes; only the certainty that the interleaving
+    // below actually happens mid-fetch.
+    let session_b = spawn_session_with_rate_limiters(
+        channel_b,
+        &device_b,
+        "device-a",
+        Arc::new(RateLimiters::new(0, 1_000_000)),
+    );
 
     let placeholder_path = device_b.root_path().join("bigfile.bin");
     wait_until(|| placeholder_path.exists(), Duration::from_secs(10)).await;
@@ -2189,7 +3156,7 @@ async fn hydrate_file_detects_a_superseding_authoring_change_mid_fetch() {
 /// interleaving is forced the same way as the test above: a real,
 /// multi-block network fetch gives a real await window, synchronized on
 /// the row actually reaching `Hydrating` rather than a timing guess.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
     windows,
     ignore = "M2-3a: on Windows, real placeholder creation is deferred to \
@@ -2231,7 +3198,32 @@ async fn hydrate_file_detects_a_concurrent_disk_edit_mid_fetch() {
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let _session_a = spawn_session(channel_a, &device_a, "device-b");
-    let session_b = spawn_session(channel_b, &device_b, "device-a");
+    // The mid-fetch window this test needs has to be REAL, not hoped for.
+    // `Hydrating` is transient and is observed here by polling every
+    // 50ms, while 4 MB over loopback is ~31 blocks fetched
+    // `fetch_window`-at-a-time on a sub-millisecond link: on an unloaded
+    // machine the whole hydration can begin and end inside a single poll
+    // interval, so the wait below never sees `Hydrating` at all and the
+    // test fails with a timeout for being too FAST. That is the reported
+    // "passes at one commit, fails at another" behaviour -- it tracks how
+    // busy the machine is, not the code -- and no amount of extra file
+    // size fixes it, because a faster machine just fetches the extra
+    // blocks faster too.
+    //
+    // A download rate limit turns that into a bounded, known window using
+    // the product's own knob rather than a sleep. The bucket starts with
+    // one second's worth of tokens, so the first 1 MB is unthrottled and
+    // the remaining ~3 MB is paced at 1 MB/s: a floor of roughly three
+    // seconds on the fetch, two orders of magnitude above the 50ms poll
+    // and well inside `DEFAULT_HYDRATION_TIMEOUT` (30s). Nothing this
+    // test asserts changes; only the certainty that the interleaving
+    // below actually happens mid-fetch.
+    let session_b = spawn_session_with_rate_limiters(
+        channel_b,
+        &device_b,
+        "device-a",
+        Arc::new(RateLimiters::new(0, 1_000_000)),
+    );
 
     let placeholder_path = device_b.root_path().join("bigfile.bin");
     wait_until(|| placeholder_path.exists(), Duration::from_secs(10)).await;
@@ -2385,28 +3377,10 @@ async fn hydrate_file_without_any_connected_peer_fails_immediately() {
     // simulate "adopted as a placeholder, but the only peer that has it
     // is now disconnected" by constructing a session whose channel points
     // at a peer that immediately drops.
-    let (secret_b, public_b) = gen_keypair();
-    // A channel to a peer public key nobody is listening on: the daemon
-    // side of this pairing never responds to any BlockRequest. The direct
-    // candidate is a real port that was bound then dropped, so it stays
-    // unbound and nothing ever answers.
-    let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let ghost_addr = {
-        let throwaway = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        throwaway.local_addr().unwrap()
-    };
-    let (_ghost_secret, ghost_public) = gen_keypair();
-    let channel_b = std::sync::Arc::new(
-        PeerChannel::connect(
-            secret_b,
-            ghost_public,
-            0,
-            vec![ghost_addr],
-            yadorilink_transport::TransportHub::from_socket(socket_b, Some(public_b)),
-        )
-        .await
-        .unwrap(),
-    );
+    // A channel whose peer never answers: no block stream ever opens on it,
+    // which is what "the only peer that has it is gone" looks like from this
+    // side.
+    let channel_b = std::sync::Arc::new(SilentPeerChannel);
     let session_b = spawn_session(channel_b, &device_b, "device-a");
 
     device_b
@@ -2463,7 +3437,7 @@ async fn hydrate_file_without_any_connected_peer_fails_immediately() {
 /// to byte-identical content — eviction doesn't touch sync state (version,
 /// block list), so a second hydration from the same (or any other) peer
 /// reconstructs exactly the same bytes.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
     windows,
     ignore = "M2-3a: on Windows, real placeholder creation is deferred to \
@@ -2587,7 +3561,7 @@ async fn evict_then_rehydrate_round_trips_to_identical_content() {
 /// a file created on A appears as a placeholder on both B and C with no
 /// content transfer; hydrating on B fetches content only there, C stays a
 /// placeholder throughout.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
     windows,
     ignore = "M2-3a: on Windows, real placeholder creation is deferred to \
@@ -2715,7 +3689,7 @@ async fn three_devices_on_demand_hydration_is_per_device_not_group_wide() {
 /// caller indefinitely — exercised here with a short timeout to keep the
 /// test itself fast (production uses `DEFAULT_HYDRATION_TIMEOUT`, task ).
 /// Simulated with a real, connected channel whose peer side simply never
-/// runs (so a `BlockRequest` is sent but never answered) — a stalled peer
+/// runs (so a block request is sent but never answered) — a stalled peer
 /// is a more realistic "unreachable" case than a channel that fails to
 /// establish at all, and exercises the same timeout path either way.
 #[tokio::test]
@@ -2774,7 +3748,7 @@ async fn hydration_chaos_no_reachable_peer_times_out_cleanly() {
     // `channel_nobody` is kept alive (so the connection stays open — this
     // tests the *timeout* path, not a connection-closed error) but
     // intentionally never driven by a `.run` loop, so nothing ever
-    // reads the `BlockRequest` `hydrate_file_with_timeout` sends over
+    // accepts the block stream `hydrate_file_with_timeout` opens on
     // `channel_b`.
     let (_channel_nobody, channel_b) = connect_pair(addr).await;
     let session_b = spawn_session(channel_b, &device_b, "device-nobody");
@@ -2803,10 +3777,12 @@ async fn hydration_chaos_no_reachable_peer_times_out_cleanly() {
 }
 
 /// a peer response is not trusted just because it arrives on the
-/// encrypted channel. The bytes must match the requested block's hash and
-/// size before they are persisted or materialized.
+/// encrypted channel. The bytes must hash to the requested block before
+/// they are persisted or materialized -- a responder that answers the right
+/// question with the wrong content is answering it wrongly, and the stream
+/// having been the correct one proves nothing about what came back on it.
 #[tokio::test]
-async fn hydration_rejects_block_response_with_wrong_hash_or_size() {
+async fn hydration_rejects_block_bytes_that_do_not_hash_to_the_request() {
     let addr = bind_unused_addr().await;
     let device_b = Device::new("device-b");
     let root_b = device_b.root_path().to_string_lossy().to_string();
@@ -2856,52 +3832,34 @@ async fn hydration_rejects_block_response_with_wrong_hash_or_size() {
     let (responder_channel, channel_b) = connect_pair(addr).await;
     // Not `spawn_session`: see the identical note in
     // `hydration_rejects_a_decompression_bomb_block_response` -- this test's
-    // one hand-written fake responder answers exactly one `BlockRequest`,
+    // one hand-written fake responder answers exactly one block request,
     // which the test-only convergence driver's own concurrent repair fetch
     // for this same placeholder could otherwise race and consume.
     // `_with_root_authority`: `hydrate_file_with_timeout` below is a real
     // mutation path gated on a live root-commit authority --
     // `PeerSyncSessionDeps::standalone()`'s deny-by-default provider would
     // otherwise make it fail fast with `NotFound` before ever sending the
-    // `BlockRequest` this test's fake responder is waiting to answer.
+    // request this test's fake responder is waiting to answer.
     let session_b = spawn_session_without_convergence_driver_with_root_authority(
         channel_b, &device_b, "device-a",
     );
     let handshake_session_b = session_b.clone();
+    // The task gets its own handle to the channel; this test keeps the
+    // original alive until every assertion has run. Dropping the LAST
+    // `Arc<QuicPeerChannel>` closes the QUIC connection outright, and a
+    // responder that finished its side of a stream is not the same as a
+    // requester that has read it -- a connection closed the moment the last
+    // answer was written would reset a body still in flight and turn a
+    // deliberate answer into an indistinguishable transport failure.
+    let responder_channel_for_task = responder_channel.clone();
     let responder = tokio::spawn(async move {
-        let mut buffered: std::collections::VecDeque<Vec<u8>> =
-            complete_raw_peer_handshake(&responder_channel, &handshake_session_b).await.into();
-        loop {
-            let bytes = match buffered.pop_front() {
-                Some(bytes) => bytes,
-                None => responder_channel.recv().await.unwrap(),
-            };
-            let msg = proto::SyncMessage::decode(bytes.as_slice()).unwrap();
-            let Some(proto::sync_message::Payload::BlockRequest(req)) = msg.payload else {
-                continue;
-            };
-            responder_channel
-                .send(
-                    proto::SyncMessage {
-                        payload: Some(proto::sync_message::Payload::BlockReply(
-                            proto::BlockReply {
-                                block_hash: req.block_hash,
-                                outcome: Some(proto::block_reply::Outcome::Found(
-                                    proto::BlockReplyFound {
-                                        data: bad_data,
-                                        compression: proto::Compression::None as i32,
-                                    },
-                                )),
-                                request_id: req.request_id,
-                            },
-                        )),
-                    }
-                    .encode_to_vec(),
-                )
-                .await
-                .unwrap();
-            break;
-        }
+        complete_raw_peer_handshake(&responder_channel_for_task, &handshake_session_b).await;
+        // A well-formed `Found` in every respect except the one that
+        // matters: the header declares this body's real length and echoes
+        // the requested hash back, so nothing about the exchange itself
+        // looks wrong -- only the bytes are someone else's.
+        serve_block_requests(&responder_channel_for_task, 1, |_, _| BlockAnswer::found(bad_data.clone()))
+            .await;
     });
 
     let result =
@@ -2928,6 +3886,363 @@ async fn hydration_rejects_block_response_with_wrong_hash_or_size() {
     );
 }
 
+/// Sets `device` up the way a peer that has adopted a file but not its
+/// content is set up: an index row for `path` referencing one block whose
+/// hash is `content`'s, a `Placeholder` materialization state, and a
+/// placeholder on disk -- with nothing at all in the block store. A
+/// `hydrate_file_with_timeout` call against it turns into exactly one block
+/// request for the returned hash.
+///
+/// Factored out because the three "the responder answered, and the answer
+/// must not be believed" tests below need the identical fixture and differ
+/// only in what the responder says.
+fn seed_placeholder_awaiting_hydration(device: &Device, path: &str, content: &[u8]) -> Vec<u8> {
+    let hash = sha256_bytes(content);
+    device
+        .state
+        .file_index_repository()
+        .upsert_file(
+            GROUP,
+            &yadorilink_replica_domain::file::FileRecord {
+                path: path.into(),
+                size: content.len() as u64,
+                mtime_unix_nanos: 0,
+                blocks: vec![yadorilink_replica_domain::file::BlockInfo {
+                    hash: hash.clone(),
+                    offset: 0,
+                    size: content.len() as u32,
+                }],
+                deleted: false,
+            },
+            &RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    device
+        .state
+        .materialization_state_repository()
+        .set_materialization_state(
+            GROUP,
+            path,
+            MaterializationState::Placeholder,
+            &RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    yadorilink_local_storage::write_placeholder(
+        &device.root_path().join(path),
+        content.len() as u64,
+        0,
+    )
+    .unwrap();
+    hash
+}
+
+/// A `Found` header declaring more bytes than any legal block must be
+/// refused on the strength of the declaration alone, before a buffer that
+/// size is ever allocated for it.
+///
+/// This is what is left of the old oversized-`total_size` defence once
+/// chunking is gone. The shape of the attack is unchanged -- a peer turns a
+/// number it controls into an allocation this device makes -- but there is
+/// no reassembly buffer to size any more, only the single `recv_body` call
+/// that reads the body off the stream. The bound therefore has to be
+/// applied to the declared size before that call, which is exactly what
+/// this test pins: the responder declares 16 MiB + 1 and sends no body at
+/// all, and the request must still resolve promptly as unusable rather than
+/// waiting for bytes that were never coming.
+#[tokio::test]
+async fn hydration_rejects_a_found_header_declaring_more_than_the_maximum_block_size() {
+    let addr = bind_unused_addr().await;
+    let device_b = Device::new("device-b");
+    let root_b = device_b.root_path().to_string_lossy().to_string();
+    link_with_completed_startup(&device_b.state, &root_b);
+
+    let expected = vec![0x11u8; 4096];
+    let expected_hash = seed_placeholder_awaiting_hydration(&device_b, "oversized.bin", &expected);
+
+    let (responder_channel, channel_b) = connect_pair(addr).await;
+    // Not `spawn_session`: see the identical note in
+    // `hydration_rejects_a_decompression_bomb_block_response`.
+    let session_b = spawn_session_without_convergence_driver_with_root_authority(
+        channel_b, &device_b, "device-a",
+    );
+    let handshake_session_b = session_b.clone();
+    // The task gets its own handle to the channel; this test keeps the
+    // original alive until every assertion has run. Dropping the LAST
+    // `Arc<QuicPeerChannel>` closes the QUIC connection outright, and a
+    // responder that finished its side of a stream is not the same as a
+    // requester that has read it -- a connection closed the moment the last
+    // answer was written would reset a body still in flight and turn a
+    // deliberate answer into an indistinguishable transport failure.
+    let responder_channel_for_task = responder_channel.clone();
+    let responder = tokio::spawn(async move {
+        complete_raw_peer_handshake(&responder_channel_for_task, &handshake_session_b).await;
+        serve_block_requests(&responder_channel_for_task, 1, |_, request| BlockAnswer::FoundExactly {
+            // One byte past `MAX_BLOCK_SIZE` (16 MiB): large enough to be
+            // refused, and deliberately just barely so, since a bound that
+            // is off by one in the permissive direction is the only kind a
+            // round number would not catch.
+            size: 16 * 1024 * 1024 + 1,
+            hash: request.block_hash.clone(),
+            compression: proto::Compression::None as i32,
+            body: Vec::new(),
+        })
+        .await;
+    });
+
+    let started = Instant::now();
+    let result =
+        session_b.hydrate_file_with_timeout(GROUP, "oversized.bin", Duration::from_secs(3)).await;
+    let elapsed = started.elapsed();
+    await_responder(responder).await;
+
+    assert!(
+        matches!(result, Err(yadorilink_peer_session::PeerSessionError::HydrationFailed(_))),
+        "a Found header above the maximum block size must fail hydration, got {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the oversized declaration must be refused on sight, not waited out for a body that \
+         never arrives; took {elapsed:?}"
+    );
+    assert!(
+        !yadorilink_local_storage::BlockStore::exists(
+            device_b.store.as_ref(),
+            &hex::encode(&expected_hash)
+        )
+        .unwrap(),
+        "nothing may be persisted for a block whose declared size was refused"
+    );
+    assert_eq!(
+        device_b
+            .state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "oversized.bin")
+            .unwrap(),
+        Some(MaterializationState::Placeholder)
+    );
+}
+
+/// A `Found` header echoing a DIFFERENT hash than the request must be
+/// refused, however good its bytes are.
+///
+/// The requester already knows which hash it asked for, so the echoed one
+/// carries no information -- it is a cross-check, and this is what it
+/// catches: a responder answering a question that was not asked. It is the
+/// property the old `request_id` correlation defence used to provide from
+/// the other direction, and it survives the move to one stream per request
+/// because a stream proves only which exchange an answer belongs to, never
+/// which block it is an answer about.
+#[tokio::test]
+async fn hydration_rejects_a_found_header_bound_to_a_different_hash() {
+    let addr = bind_unused_addr().await;
+    let device_b = Device::new("device-b");
+    let root_b = device_b.root_path().to_string_lossy().to_string();
+    link_with_completed_startup(&device_b.state, &root_b);
+
+    let expected = vec![0x22u8; 4096];
+    let expected_hash = seed_placeholder_awaiting_hydration(&device_b, "mislabelled.bin", &expected);
+    let other_hash = sha256_bytes(b"some entirely different block");
+    assert_ne!(other_hash, expected_hash);
+
+    let (responder_channel, channel_b) = connect_pair(addr).await;
+    let session_b = spawn_session_without_convergence_driver_with_root_authority(
+        channel_b, &device_b, "device-a",
+    );
+    let handshake_session_b = session_b.clone();
+    // The task gets its own handle to the channel; this test keeps the
+    // original alive until every assertion has run. Dropping the LAST
+    // `Arc<QuicPeerChannel>` closes the QUIC connection outright, and a
+    // responder that finished its side of a stream is not the same as a
+    // requester that has read it -- a connection closed the moment the last
+    // answer was written would reset a body still in flight and turn a
+    // deliberate answer into an indistinguishable transport failure.
+    let responder_channel_for_task = responder_channel.clone();
+    let responder_expected = expected.clone();
+    let responder_other_hash = other_hash.clone();
+    let responder = tokio::spawn(async move {
+        complete_raw_peer_handshake(&responder_channel_for_task, &handshake_session_b).await;
+        // The bytes are the genuinely correct ones -- only the identity the
+        // header binds them to is wrong. Nothing but the echoed hash can
+        // distinguish this from a good answer, which is the whole point of
+        // checking it.
+        serve_block_requests(&responder_channel_for_task, 1, |_, _| BlockAnswer::FoundExactly {
+            size: responder_expected.len() as u64,
+            hash: responder_other_hash.clone(),
+            compression: proto::Compression::None as i32,
+            body: responder_expected.clone(),
+        })
+        .await;
+    });
+
+    let result = session_b
+        .hydrate_file_with_timeout(GROUP, "mislabelled.bin", Duration::from_secs(3))
+        .await;
+    await_responder(responder).await;
+
+    assert!(
+        matches!(result, Err(yadorilink_peer_session::PeerSessionError::HydrationFailed(_))),
+        "a Found header bound to a different hash must fail hydration, got {result:?}"
+    );
+    for hash in [&expected_hash, &other_hash] {
+        assert!(
+            !yadorilink_local_storage::BlockStore::exists(
+                device_b.store.as_ref(),
+                &hex::encode(hash)
+            )
+            .unwrap(),
+            "a response bound to the wrong hash must not be stored under either one"
+        );
+    }
+}
+
+/// Two concurrent requests for the identical block hash, in two different
+/// folder groups, must not be cross-wired: each gets its own peer's answer
+/// for its own group, even when those answers disagree.
+///
+/// Nothing correlates a request to its answer any more except the stream
+/// they share, so this is the property that replaces the old
+/// `request_id`-uniqueness defence -- and it is a stronger one, because two
+/// exchanges on two streams were never on the same channel to begin with,
+/// where two ids merely had to differ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_requests_for_one_hash_in_two_groups_are_not_cross_wired() {
+    const OTHER_GROUP: &str = "shared-documents";
+
+    let addr = bind_unused_addr().await;
+    let device_b = Device::new("device-b");
+    let data = b"one block, referenced from two different groups".to_vec();
+    let hash = sha256_bytes(&data);
+
+    let (responder_channel, channel_b) = connect_pair(addr).await;
+    let session_b = spawn_session_without_convergence_driver(channel_b, &device_b, "device-a");
+    let handshake_session_b = session_b.clone();
+    // The task gets its own handle to the channel; this test keeps the
+    // original alive until every assertion has run. Dropping the LAST
+    // `Arc<QuicPeerChannel>` closes the QUIC connection outright, and a
+    // responder that finished its side of a stream is not the same as a
+    // requester that has read it -- a connection closed the moment the last
+    // answer was written would reset a body still in flight and turn a
+    // deliberate answer into an indistinguishable transport failure.
+    let responder_channel_for_task = responder_channel.clone();
+    let responder_data = data.clone();
+    let responder = tokio::spawn(async move {
+        complete_raw_peer_handshake(&responder_channel_for_task, &handshake_session_b).await;
+        // Answers on the request's own group, never on arrival order: the
+        // two requests genuinely race, so a responder that assumed an order
+        // would be testing its own sequencing rather than the requester's
+        // ability to keep two answers apart.
+        serve_block_requests(&responder_channel_for_task, 2, |_, request| {
+            if request.folder_group_id == GROUP {
+                BlockAnswer::found(responder_data.clone())
+            } else {
+                BlockAnswer::DontHave
+            }
+        })
+        .await;
+    });
+
+    let (served, refused) = tokio::join!(
+        session_b.fetch_block(GROUP, "shared.bin", &hash),
+        session_b.fetch_block(OTHER_GROUP, "shared.bin", &hash),
+    );
+    await_responder(responder).await;
+
+    assert_eq!(
+        served.unwrap().map(|bytes| bytes.to_vec()),
+        Some(data),
+        "the group the peer served must receive the block"
+    );
+    assert!(
+        refused.unwrap().is_none(),
+        "the group the peer refused must receive nothing -- an identical hash in another group \
+         is a different question, and its answer must not be handed to this one"
+    );
+}
+
+/// `Rejected` is an answer about this peer, not about this moment: the
+/// requester must stop asking it. `dont_have` is not -- it is racy enough
+/// (the peer's own index may simply not have caught up yet) to be worth a
+/// bounded retry, which is the behavior `Rejected` must be visibly distinct
+/// from.
+///
+/// One test for both because the distinction, not either one alone, is the
+/// property: each is counted on the responder's side, where the number of
+/// requests that actually arrived is directly observable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejection_stops_the_requester_where_dont_have_does_not() {
+    let addr = bind_unused_addr().await;
+    let device_b = Device::new("device-b");
+    let root_b = device_b.root_path().to_string_lossy().to_string();
+    link_with_completed_startup(&device_b.state, &root_b);
+
+    seed_placeholder_awaiting_hydration(&device_b, "racy.bin", b"answered dont_have every time");
+    seed_placeholder_awaiting_hydration(&device_b, "denied.bin", b"answered with a rejection");
+
+    let (responder_channel, channel_b) = connect_pair(addr).await;
+    let session_b = spawn_session_without_convergence_driver_with_root_authority(
+        channel_b, &device_b, "device-a",
+    );
+    let handshake_session_b = session_b.clone();
+    // The task gets its own handle to the channel; this test keeps the
+    // original alive until every assertion has run. Dropping the LAST
+    // `Arc<QuicPeerChannel>` closes the QUIC connection outright, and a
+    // responder that finished its side of a stream is not the same as a
+    // requester that has read it -- a connection closed the moment the last
+    // answer was written would reset a body still in flight and turn a
+    // deliberate answer into an indistinguishable transport failure.
+    let responder_channel_for_task = responder_channel.clone();
+    // How many requests actually reached the responder, per path. Shared
+    // rather than returned, because the responder task is deliberately
+    // unbounded -- it cannot know in advance how many retries the requester
+    // will make, which is the very thing being measured.
+    let request_counts: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+    let responder_counts = request_counts.clone();
+    let responder = tokio::spawn(async move {
+        complete_raw_peer_handshake(&responder_channel_for_task, &handshake_session_b).await;
+        loop {
+            let (mut stream, request) = accept_block_request(&responder_channel_for_task).await;
+            *responder_counts
+                .lock()
+                .unwrap()
+                .entry(request.file_path.clone())
+                .or_insert(0) += 1;
+            let answer = match request.file_path.as_str() {
+                "denied.bin" => BlockAnswer::Rejected {
+                    reason: "requester is not authorized for this folder group".to_string(),
+                },
+                _ => BlockAnswer::DontHave,
+            };
+            answer_block_request(&mut stream, &request, answer).await;
+        }
+    });
+
+    for path in ["racy.bin", "denied.bin"] {
+        let result = session_b.hydrate_file_with_timeout(GROUP, path, Duration::from_secs(10)).await;
+        assert!(
+            matches!(result, Err(yadorilink_peer_session::PeerSessionError::HydrationFailed(_))),
+            "no answer here supplies content, so hydrating {path} must fail; got {result:?}"
+        );
+    }
+    responder.abort();
+
+    let counts = request_counts.lock().unwrap();
+    let dont_have = counts.get("racy.bin").copied().unwrap_or(0);
+    let rejected = counts.get("denied.bin").copied().unwrap_or(0);
+    assert!(
+        dont_have > 1,
+        "dont_have is the one answer worth re-asking about -- the peer's own index may simply \
+         be behind -- so it must have been retried, but only {dont_have} request(s) arrived"
+    );
+    assert!(
+        rejected < dont_have,
+        "a rejection is a hard denial that will be answered identically every time, so it must \
+         be retried strictly less than dont_have is ({rejected} vs {dont_have})"
+    );
+}
+
+/// A `Busy` answer is a "come back later, with a hint how much later", not
+/// a "no": the requester must retry the same peer and must wait out the
+/// hint before it does.
 #[tokio::test]
 async fn requester_honors_busy_retry_after_before_retrying_same_peer() {
     let addr = bind_unused_addr().await;
@@ -2938,71 +4253,31 @@ async fn requester_honors_busy_retry_after_before_retrying_same_peer() {
     let (responder_channel, channel_b) = connect_pair(addr).await;
     let session_b = spawn_session_without_convergence_driver(channel_b, &device_b, "device-a");
     let handshake_session_b = session_b.clone();
+    // The task gets its own handle to the channel; this test keeps the
+    // original alive until every assertion has run. Dropping the LAST
+    // `Arc<QuicPeerChannel>` closes the QUIC connection outright, and a
+    // responder that finished its side of a stream is not the same as a
+    // requester that has read it -- a connection closed the moment the last
+    // answer was written would reset a body still in flight and turn a
+    // deliberate answer into an indistinguishable transport failure.
+    let responder_channel_for_task = responder_channel.clone();
     let responder = tokio::spawn(async move {
-        let mut buffered: std::collections::VecDeque<Vec<u8>> =
-            complete_raw_peer_handshake(&responder_channel, &handshake_session_b).await.into();
+        complete_raw_peer_handshake(&responder_channel_for_task, &handshake_session_b).await;
+        // Timed from the responder's side rather than the requester's: what
+        // is being measured is the gap between the two requests actually
+        // arriving, which is the only thing the peer's `retry_after_ms`
+        // hint can influence.
         let mut first_request_at = None;
-        let mut first_request_id = None;
-        loop {
-            let bytes = match buffered.pop_front() {
-                Some(bytes) => bytes,
-                None => responder_channel.recv().await.unwrap(),
-            };
-            let msg = proto::SyncMessage::decode(bytes.as_slice()).unwrap();
-            let Some(proto::sync_message::Payload::BlockRequest(req)) = msg.payload else {
-                continue;
-            };
-
-            if first_request_at.is_none() {
+        serve_block_requests(&responder_channel_for_task, 2, |index, _| {
+            if index == 0 {
                 first_request_at = Some(tokio::time::Instant::now());
-                first_request_id = Some(req.request_id);
-                responder_channel
-                    .send(
-                        proto::SyncMessage {
-                            payload: Some(proto::sync_message::Payload::BlockReply(
-                                proto::BlockReply {
-                                    block_hash: req.block_hash,
-                                    outcome: Some(proto::block_reply::Outcome::Busy(
-                                        proto::BlockReplyBusy {
-                                            retry_after_ms: 80,
-                                            queue_depth: 1,
-                                        },
-                                    )),
-                                    request_id: req.request_id,
-                                },
-                            )),
-                        }
-                        .encode_to_vec(),
-                    )
-                    .await
-                    .unwrap();
-                continue;
+                BlockAnswer::Busy { retry_after_ms: 80, queue_depth: 1 }
+            } else {
+                BlockAnswer::found(data.clone())
             }
-
-            let retry_delay = first_request_at.unwrap().elapsed();
-            let second_request_id = req.request_id;
-            responder_channel
-                .send(
-                    proto::SyncMessage {
-                        payload: Some(proto::sync_message::Payload::BlockReply(
-                            proto::BlockReply {
-                                block_hash: req.block_hash,
-                                outcome: Some(proto::block_reply::Outcome::Found(
-                                    proto::BlockReplyFound {
-                                        data,
-                                        compression: proto::Compression::None as i32,
-                                    },
-                                )),
-                                request_id: req.request_id,
-                            },
-                        )),
-                    }
-                    .encode_to_vec(),
-                )
-                .await
-                .unwrap();
-            break (first_request_id.unwrap(), second_request_id, retry_delay);
-        }
+        })
+        .await;
+        first_request_at.expect("the first request must have been served").elapsed()
     });
 
     let received = session_b
@@ -3010,10 +4285,9 @@ async fn requester_honors_busy_retry_after_before_retrying_same_peer() {
         .await
         .unwrap()
         .expect("the retry must receive the block");
-    let (first_request_id, second_request_id, retry_delay) = responder.await.unwrap();
+    let retry_delay = responder.await.unwrap();
 
     assert_eq!(&received[..], b"available after one busy response");
-    assert_ne!(first_request_id, second_request_id, "a retry needs fresh correlation");
     assert!(
         retry_delay >= Duration::from_millis(70),
         "retry ignored the peer's 80ms backoff hint: {retry_delay:?}"
@@ -3058,46 +4332,26 @@ async fn block_request_for_unreferenced_hash_is_refused() {
     let (channel_a, requester_channel) = connect_pair(addr).await;
     let session_a = spawn_session(channel_a, &device_a, "device-b");
     complete_raw_peer_handshake(&requester_channel, &session_a).await;
-    requester_channel
-        .send(
-            proto::SyncMessage {
-                payload: Some(proto::sync_message::Payload::BlockRequest(proto::BlockRequest {
-                    folder_group_id: GROUP.to_string(),
-                    file_path: "public.bin".to_string(),
-                    block_hash: secret_hash.clone(),
-                    request_id: 0,
-                })),
-            }
-            .encode_to_vec(),
-        )
-        .await
-        .unwrap();
 
-    let reply = loop {
-        let bytes = requester_channel.recv().await.unwrap();
-        let msg = proto::SyncMessage::decode(bytes.as_slice()).unwrap();
-        if let Some(proto::sync_message::Payload::BlockReply(reply)) = msg.payload {
-            break reply;
-        }
-    };
+    let (response, body) = request_block(&requester_channel, "public.bin", &secret_hash).await;
 
-    assert_eq!(reply.block_hash, secret_hash);
     assert!(
-        matches!(reply.outcome, Some(proto::block_reply::Outcome::DontHave(true))),
+        matches!(response.outcome, Some(BlockOutcome::DontHave(true))),
         "unreferenced block hash must be refused, got {:?}",
-        reply.outcome
+        response.outcome
     );
+    assert!(body.is_empty(), "a refused request must carry no block bytes at all");
 }
 
 /// (security review): a hydration request's
-/// underlying `BlockRequest` goes through the exact same
+/// underlying block request goes through the exact same
 /// `handle_block_request` authorization check as any other block fetch —
 /// there is no separate, unchecked path for on-access hydration. Verified
 /// here by having the *responding* peer's session independently lack
 /// authorization for the group (simulating a coordination-plane ACL that
 /// doesn't actually cover this pairing), even though the requester
 /// believes it does — content must never be leaked either way.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hydration_block_request_is_refused_for_a_group_the_peer_does_not_authorize() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -3164,29 +4418,12 @@ async fn hydration_block_request_is_refused_for_a_group_the_peer_does_not_author
     );
 }
 
-/// Waits for and returns the next `BlockReply` matching `hash` on
-/// `channel`, ignoring any other message types (handshake `ClusterConfig`/
-/// etc.) that may arrive interleaved — same pattern
-/// `block_request_for_unreferenced_hash_is_refused` inlines, factored out
-/// here since the mid-session-revocation test below needs it twice.
-async fn recv_matching_block_reply(channel: &PeerChannel, hash: &[u8]) -> proto::BlockReply {
-    loop {
-        let bytes = channel.recv().await.unwrap();
-        let msg = proto::SyncMessage::decode(bytes.as_slice()).unwrap();
-        if let Some(proto::sync_message::Payload::BlockReply(reply)) = msg.payload {
-            if reply.block_hash == hash {
-                return reply;
-            }
-        }
-    }
-}
-
 /// "A mid-session revocation stops further block requests without
 /// waiting for teardown": a block request that was valid when the
 /// session started must be refused once a netmap update
 /// revokes that group edge mid-session — even though nothing here tears
-/// down the transport-level `PeerChannel`/tunnel (that reaction is a
-/// separate concern, deliberately exercised nowhere in this test).
+/// down the transport-level `QuicPeerChannel`/connection (that reaction is
+/// a separate concern, deliberately exercised nowhere in this test).
 /// `PeerSyncSession::revoke_group` is the hook a daemon-level netmap-diff
 /// reaction is expected to call; this test calls it directly to simulate
 /// that reaction landing mid-session, proving the sync-engine layer's own
@@ -3237,37 +4474,12 @@ async fn block_request_is_refused_after_mid_session_group_revocation() {
     assert!(session_a.shares_group(GROUP), "sanity: session starts out authorized for GROUP");
     complete_raw_peer_handshake(&requester_channel, &session_a).await;
 
-    let send_request = |channel: Arc<PeerChannel>, hash: Vec<u8>| async move {
-        channel
-            .send(
-                proto::SyncMessage {
-                    payload: Some(proto::sync_message::Payload::BlockRequest(
-                        proto::BlockRequest {
-                            folder_group_id: GROUP.to_string(),
-                            file_path: "public.bin".to_string(),
-                            block_hash: hash,
-                            request_id: 0,
-                        },
-                    )),
-                }
-                .encode_to_vec(),
-            )
-            .await
-            .unwrap();
-    };
-
     // Baseline: while still authorized, the request succeeds.
-    send_request(requester_channel.clone(), hash.clone()).await;
-    let first_reply = recv_matching_block_reply(&requester_channel, &hash).await;
-    assert!(
-        matches!(first_reply.outcome, Some(proto::block_reply::Outcome::Found(_))),
-        "block request must succeed while peer is authorized, got {:?}",
-        first_reply.outcome
-    );
-    let Some(proto::block_reply::Outcome::Found(found)) = first_reply.outcome else {
-        unreachable!()
-    };
-    assert_eq!(found.data, data);
+    let (first_response, first_body) =
+        request_block(&requester_channel, "public.bin", &hash).await;
+    let found = expect_found(&first_response);
+    assert_eq!(found.hash, hash, "a Found response must echo the hash it answers");
+    assert_eq!(first_body, data);
 
     // Simulate a netmap update revoking device-b's authorization for GROUP
     // as seen by device-a's session, mid-session — nothing here touches
@@ -3279,15 +4491,17 @@ async fn block_request_is_refused_after_mid_session_group_revocation() {
         "revoke_group must be reflected immediately, without waiting for anything else"
     );
 
-    // Same request, same still-open tunnel, now refused.
-    send_request(requester_channel.clone(), hash.clone()).await;
-    let second_reply = recv_matching_block_reply(&requester_channel, &hash).await;
+    // Same request, same still-open connection, now refused.
+    let (second_response, second_body) =
+        request_block(&requester_channel, "public.bin", &hash).await;
     assert!(
-        matches!(second_reply.outcome, Some(proto::block_reply::Outcome::Rejected(_))),
+        matches!(second_response.outcome, Some(BlockOutcome::Rejected(_))),
         "block request must be refused once a mid-session revocation is reflected in local \
-         netmap/ACL state, even though the transport tunnel hasn't been torn down -- got {:?}",
-        second_reply.outcome
+         netmap/ACL state, even though the transport connection hasn't been torn down -- got \
+         {:?}",
+        second_response.outcome
     );
+    assert!(second_body.is_empty(), "a refused request must carry no block bytes at all");
 }
 
 /// Regression for a confirmed disclosure window: `handle_block_request`
@@ -3300,7 +4514,7 @@ async fn block_request_is_refused_after_mid_session_group_revocation() {
 /// queued. Forces the exact race deterministically: this test itself
 /// holds `device-b`/`GROUP`'s one dispatch slot (via the same public
 /// `acquire_dispatch_turn` the real session calls), so the real
-/// `BlockRequest` sent below is GUARANTEED to be queued, not granted
+/// block request sent below is GUARANTEED to be queued, not granted
 /// immediately -- revocation happens while it waits, and only then does
 /// this test release the slot to let it proceed.
 #[tokio::test]
@@ -3353,22 +4567,12 @@ async fn block_request_is_rejected_if_authorization_is_revoked_while_waiting_for
     let holder_guard = engine.acquire_dispatch_turn("device-b", GROUP, 1).await.unwrap();
 
     complete_raw_peer_handshake(&requester_channel, &session_a).await;
-    requester_channel
-        .send(
-            proto::SyncMessage {
-                payload: Some(proto::sync_message::Payload::BlockRequest(proto::BlockRequest {
-                    folder_group_id: GROUP.to_string(),
-                    file_path: "dispatch-wait.bin".to_string(),
-                    block_hash: hash.clone(),
-                    request_id: 0,
-                })),
-            }
-            .encode_to_vec(),
-        )
-        .await
-        .unwrap();
-    // Give the recv loop a moment to spawn the handler and reach (and
-    // block on) `acquire_dispatch_turn`.
+    // Left in flight deliberately: the request's own stream stays open with
+    // nothing read off it yet, which is exactly the state the serving side
+    // is in while it waits for a dispatch turn.
+    let mut request = begin_block_request(&requester_channel, "dispatch-wait.bin", &hash).await;
+    // Give the serving side a moment to accept the stream, spawn its
+    // handler and reach (and block on) `acquire_dispatch_turn`.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     session_a.revoke_group(GROUP);
@@ -3378,17 +4582,15 @@ async fn block_request_is_rejected_if_authorization_is_revoked_while_waiting_for
     // AFTER the revocation above.
     drop(holder_guard);
 
-    let reply = tokio::time::timeout(
-        Duration::from_secs(3),
-        recv_matching_block_reply(&requester_channel, &hash),
-    )
-    .await
-    .expect("the request must resolve promptly once its dispatch turn is granted");
+    let (response, _body) =
+        tokio::time::timeout(Duration::from_secs(3), read_block_response(&mut request))
+            .await
+            .expect("the request must resolve promptly once its dispatch turn is granted");
     assert!(
-        matches!(reply.outcome, Some(proto::block_reply::Outcome::Rejected(_))),
+        matches!(response.outcome, Some(BlockOutcome::Rejected(_))),
         "a peer whose authorization was revoked WHILE its request merely waited for a dispatch \
          turn must be refused, not served -- got {:?}",
-        reply.outcome
+        response.outcome
     );
 }
 
@@ -3409,7 +4611,7 @@ async fn index_update_from_just_revoked_peer_is_rejected() {
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     assert!(session_b.shares_group(GROUP), "sanity: B starts out authorizing A for GROUP");
 
@@ -3440,7 +4642,7 @@ async fn index_update_from_just_revoked_peer_is_rejected() {
     );
 }
 
-/// An authorized peer is served the content it requests via `BlockRequest`:
+/// An authorized peer is served the content it requests:
 /// block reads are gated only on group authorization (`shares_group`), and
 /// every authorized device is a full bidirectional peer, so a peer sharing
 /// the group is served existing content normally. Mirrors
@@ -3489,40 +4691,21 @@ async fn block_requests_are_served_to_an_authorized_peer() {
     assert!(session_a.shares_group(GROUP), "sanity: the peer is authorized for the group");
     complete_raw_peer_handshake(&requester_channel, &session_a).await;
 
-    let send_request = |channel: Arc<PeerChannel>, hash: Vec<u8>| async move {
-        channel
-            .send(
-                proto::SyncMessage {
-                    payload: Some(proto::sync_message::Payload::BlockRequest(
-                        proto::BlockRequest {
-                            folder_group_id: GROUP.to_string(),
-                            file_path: "readable.bin".to_string(),
-                            block_hash: hash,
-                            request_id: 0,
-                        },
-                    )),
-                }
-                .encode_to_vec(),
-            )
-            .await
-            .unwrap();
-    };
-
-    send_request(requester_channel.clone(), hash.clone()).await;
-    let reply = recv_matching_block_reply(&requester_channel, &hash).await;
-    let Some(proto::block_reply::Outcome::Found(found)) = reply.outcome else {
+    let (response, body) = request_block(&requester_channel, "readable.bin", &hash).await;
+    let Some(BlockOutcome::Found(found)) = &response.outcome else {
         panic!(
             "an authorized peer must be served existing content: block requests are gated only \
              on group authorization (shares_group) -- got {:?}",
-            reply.outcome
+            response.outcome
         );
     };
-    assert_eq!(found.data, data);
+    assert_eq!(found.hash, hash, "a Found response must echo the hash it answers");
+    assert_eq!(body, data);
 }
 
 // --- Characterization tests for `docs/design/phase7-peer-handler-
 // inventory.md`'s "Deep dive: handle_block_request /
-// handle_block_request_with_credit / handle_block_reply invariant
+// handle_block_request_with_credit invariant
 // ordering" section. These pin the exact examination-permit-drop and
 // dispatch/credit-guard drop ORDERING that section's own line-level
 // reading of the source established, so a future mechanical
@@ -3612,31 +4795,13 @@ async fn await_responder(responder: tokio::task::JoinHandle<()>) {
     }
 }
 
-/// Sends a raw `BlockRequest` for `hash` at `file_path` over `channel`.
-async fn send_block_request(channel: &PeerChannel, file_path: &str, hash: Vec<u8>) {
-    channel
-        .send(
-            proto::SyncMessage {
-                payload: Some(proto::sync_message::Payload::BlockRequest(proto::BlockRequest {
-                    folder_group_id: GROUP.to_string(),
-                    file_path: file_path.to_string(),
-                    block_hash: hash,
-                    request_id: 0,
-                })),
-            }
-            .encode_to_vec(),
-        )
-        .await
-        .unwrap();
-}
-
 /// Builds a `BlockServeEngine` with generous dispatch/credit budgets (not
 /// what the tests using this helper exercise) but a device-wide
 /// examination-admission pool drained down to exactly one free slot --
 /// every other slot consumed directly via the engine's own public
 /// `try_begin_examination` and held in the returned `Vec` for the whole
 /// test. With one slot deliberately left free, a live session backed by
-/// this engine can push exactly one `BlockRequest` through examination at a
+/// this engine can push exactly one block request through examination at a
 /// time; a second request sent immediately afterward can only also get
 /// examined (rather than denied at the recv loop's own `try_begin_
 /// examination` gate -- a `Busy` reply with no handler ever spawned for it)
@@ -3686,28 +4851,26 @@ async fn examination_permit_is_released_before_reply_on_shares_group_rejection()
     complete_raw_peer_handshake(&requester_channel, &session_a).await;
 
     let hash_1 = sha256_bytes(b"first unauthorized request");
-    send_block_request(&requester_channel, "whatever-1.bin", hash_1.clone()).await;
-    let reply_1 = recv_matching_block_reply(&requester_channel, &hash_1).await;
+    let (response_1, _) = request_block(&requester_channel, "whatever-1.bin", &hash_1).await;
     assert!(
-        matches!(reply_1.outcome, Some(proto::block_reply::Outcome::Rejected(_))),
+        matches!(response_1.outcome, Some(BlockOutcome::Rejected(_))),
         "sanity: this path must be the shares_group rejection, got {:?}",
-        reply_1.outcome
+        response_1.outcome
     );
 
     let hash_2 = sha256_bytes(b"second unauthorized request, the probe");
-    send_block_request(&requester_channel, "whatever-2.bin", hash_2.clone()).await;
-    let reply_2 = recv_matching_block_reply(&requester_channel, &hash_2).await;
+    let (response_2, _) = request_block(&requester_channel, "whatever-2.bin", &hash_2).await;
     assert!(
-        !matches!(reply_2.outcome, Some(proto::block_reply::Outcome::Busy(_))),
-        "the probe request must not be denied examination admission by the recv loop's own \
+        !matches!(response_2.outcome, Some(BlockOutcome::Busy(_))),
+        "the probe request must not be denied examination admission by the accept loop's own \
          try_begin_examination gate -- the only spare examination slot this device had must \
          already have been returned by the first request's own reply time, got {:?}",
-        reply_2.outcome
+        response_2.outcome
     );
     assert!(
-        matches!(reply_2.outcome, Some(proto::block_reply::Outcome::Rejected(_))),
+        matches!(response_2.outcome, Some(BlockOutcome::Rejected(_))),
         "sanity: the probe must take the identical shares_group rejection path, got {:?}",
-        reply_2.outcome
+        response_2.outcome
     );
     drop(held_permits);
 }
@@ -3729,28 +4892,26 @@ async fn examination_permit_is_released_before_reply_when_block_is_not_reference
     // retained version -- `block_request_is_referenced` returns false for
     // both, with nothing seeded in device-a's state at all.
     let hash_1 = sha256_bytes(b"first unreferenced hash");
-    send_block_request(&requester_channel, "unreferenced-1.bin", hash_1.clone()).await;
-    let reply_1 = recv_matching_block_reply(&requester_channel, &hash_1).await;
+    let (response_1, _) = request_block(&requester_channel, "unreferenced-1.bin", &hash_1).await;
     assert!(
-        matches!(reply_1.outcome, Some(proto::block_reply::Outcome::DontHave(true))),
+        matches!(response_1.outcome, Some(BlockOutcome::DontHave(true))),
         "sanity: this path must be the not-referenced dont_have path, got {:?}",
-        reply_1.outcome
+        response_1.outcome
     );
 
     let hash_2 = sha256_bytes(b"second unreferenced hash, the probe");
-    send_block_request(&requester_channel, "unreferenced-2.bin", hash_2.clone()).await;
-    let reply_2 = recv_matching_block_reply(&requester_channel, &hash_2).await;
+    let (response_2, _) = request_block(&requester_channel, "unreferenced-2.bin", &hash_2).await;
     assert!(
-        !matches!(reply_2.outcome, Some(proto::block_reply::Outcome::Busy(_))),
+        !matches!(response_2.outcome, Some(BlockOutcome::Busy(_))),
         "the probe request must not be denied examination admission -- the only spare \
          examination slot must already have been returned by the first request's own reply \
          time, got {:?}",
-        reply_2.outcome
+        response_2.outcome
     );
     assert!(
-        matches!(reply_2.outcome, Some(proto::block_reply::Outcome::DontHave(true))),
+        matches!(response_2.outcome, Some(BlockOutcome::DontHave(true))),
         "sanity: the probe must take the identical not-referenced path, got {:?}",
-        reply_2.outcome
+        response_2.outcome
     );
     drop(held_permits);
 }
@@ -3778,27 +4939,25 @@ async fn examination_permit_is_released_before_reply_when_group_has_no_block_pro
     session_a.set_block_serve_engine(engine);
     complete_raw_peer_handshake(&requester_channel, &session_a).await;
 
-    send_block_request(&requester_channel, "no-provenance-1.bin", hash_1.clone()).await;
-    let reply_1 = recv_matching_block_reply(&requester_channel, &hash_1).await;
+    let (response_1, _) = request_block(&requester_channel, "no-provenance-1.bin", &hash_1).await;
     assert!(
-        matches!(reply_1.outcome, Some(proto::block_reply::Outcome::Rejected(_))),
+        matches!(response_1.outcome, Some(BlockOutcome::Rejected(_))),
         "sanity: this path must be the no-provenance rejection, got {:?}",
-        reply_1.outcome
+        response_1.outcome
     );
 
-    send_block_request(&requester_channel, "no-provenance-2.bin", hash_2.clone()).await;
-    let reply_2 = recv_matching_block_reply(&requester_channel, &hash_2).await;
+    let (response_2, _) = request_block(&requester_channel, "no-provenance-2.bin", &hash_2).await;
     assert!(
-        !matches!(reply_2.outcome, Some(proto::block_reply::Outcome::Busy(_))),
+        !matches!(response_2.outcome, Some(BlockOutcome::Busy(_))),
         "the probe request must not be denied examination admission -- the only spare \
          examination slot must already have been returned by the first request's own reply \
          time, got {:?}",
-        reply_2.outcome
+        response_2.outcome
     );
     assert!(
-        matches!(reply_2.outcome, Some(proto::block_reply::Outcome::Rejected(_))),
+        matches!(response_2.outcome, Some(BlockOutcome::Rejected(_))),
         "sanity: the probe must take the identical no-provenance rejection path, got {:?}",
-        reply_2.outcome
+        response_2.outcome
     );
     drop(held_permits);
 }
@@ -3822,31 +4981,32 @@ async fn examination_permit_is_released_before_reply_on_the_pass_through_serve_p
     session_a.set_block_serve_engine(engine);
     complete_raw_peer_handshake(&requester_channel, &session_a).await;
 
-    send_block_request(&requester_channel, "servable-1.bin", hash_1.clone()).await;
-    let reply_1 = recv_matching_block_reply(&requester_channel, &hash_1).await;
-    let Some(proto::block_reply::Outcome::Found(found_1)) = reply_1.outcome else {
-        panic!("sanity: this path must be the pass-through serve path, got {:?}", reply_1.outcome);
-    };
-    assert_eq!(found_1.data, data_1);
+    let (response_1, body_1) = request_block(&requester_channel, "servable-1.bin", &hash_1).await;
+    if !matches!(response_1.outcome, Some(BlockOutcome::Found(_))) {
+        panic!(
+            "sanity: this path must be the pass-through serve path, got {:?}",
+            response_1.outcome
+        );
+    }
+    assert_eq!(body_1, data_1);
 
-    send_block_request(&requester_channel, "servable-2.bin", hash_2.clone()).await;
-    let reply_2 = recv_matching_block_reply(&requester_channel, &hash_2).await;
+    let (response_2, body_2) = request_block(&requester_channel, "servable-2.bin", &hash_2).await;
     assert!(
-        !matches!(reply_2.outcome, Some(proto::block_reply::Outcome::Busy(_))),
+        !matches!(response_2.outcome, Some(BlockOutcome::Busy(_))),
         "the probe request must not be denied examination admission -- on this path \
          examination_permits is dropped unconditionally before dispatch even begins, so it \
          must already have been returned well before the first request's own reply, got {:?}",
-        reply_2.outcome
+        response_2.outcome
     );
-    let Some(proto::block_reply::Outcome::Found(found_2)) = reply_2.outcome else {
-        panic!("sanity: the probe must also be served, got an unexpected outcome");
-    };
-    assert_eq!(found_2.data, data_2);
+    if !matches!(response_2.outcome, Some(BlockOutcome::Found(_))) {
+        panic!("sanity: the probe must also be served, got {:?}", response_2.outcome);
+    }
+    assert_eq!(body_2, data_2);
     drop(held_permits);
 }
 
 /// Pins invariant 2 from the peer-handler inventory doc's deep dive: a
-/// `BlockRequest` that cannot get a fair dispatch turn within
+/// block request that cannot get a fair dispatch turn within
 /// `DISPATCH_WAIT_BUDGET` (~2s, `handle_block_request_with_credit`'s own
 /// constant) must give up and answer `Busy` rather than hang past that
 /// budget. A precise millisecond assertion would be fragile against
@@ -3887,21 +5047,21 @@ async fn dispatch_wait_budget_timeout_returns_busy_within_a_bounded_window() {
     complete_raw_peer_handshake(&requester_channel, &session_a).await;
 
     let started = Instant::now();
-    send_block_request(&requester_channel, "dispatch-timeout.bin", hash.clone()).await;
+    let mut request = begin_block_request(&requester_channel, "dispatch-timeout.bin", &hash).await;
 
-    let reply = tokio::time::timeout(
-        Duration::from_secs(6),
-        recv_matching_block_reply(&requester_channel, &hash),
-    )
-    .await
-    .expect("the request must resolve, not hang forever, once DISPATCH_WAIT_BUDGET elapses");
+    let (response, _body) =
+        tokio::time::timeout(Duration::from_secs(6), read_block_response(&mut request))
+            .await
+            .expect(
+                "the request must resolve, not hang forever, once DISPATCH_WAIT_BUDGET elapses",
+            );
     let elapsed = started.elapsed();
 
     assert!(
-        matches!(reply.outcome, Some(proto::block_reply::Outcome::Busy(_))),
+        matches!(response.outcome, Some(BlockOutcome::Busy(_))),
         "a request that can never get a dispatch turn must answer Busy once its wait budget \
          elapses, got {:?}",
-        reply.outcome
+        response.outcome
     );
     assert!(
         elapsed < Duration::from_secs(4),
@@ -3920,7 +5080,7 @@ async fn dispatch_wait_budget_timeout_returns_busy_within_a_bounded_window() {
 
 /// Pins invariant 3 from the peer-handler inventory doc's deep dive, the
 /// highest-value invariant in this family: `credit_guard` (`ServeCreditGuard`)
-/// must be dropped only AFTER the `BlockReply` send actually completes, not
+/// must be dropped only AFTER the block response send actually completes, not
 /// before -- see `handle_block_request_with_credit`'s own comment mirroring
 /// the "72 concurrent requests" incident this exact ordering exists to
 /// prevent a repeat of. A byte-budget window where credit looks free while
@@ -3946,10 +5106,18 @@ async fn credit_guard_is_released_only_after_the_reply_finishes_sending() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
 
+    // Incompressible on purpose. The whole mechanism this test relies on is
+    // the serving side's upload rate limiter turning one block into a
+    // multi-second send, and that limiter debits the bytes that actually go
+    // on the wire -- which, for a block the responder can compress, is a
+    // tiny fraction of `BLOCK_LEN` and no window at all.
     const BLOCK_LEN: usize = 6_000;
-    let block_a = seed_referenced_block(&device_a, "credit-a.bin", &vec![0xAAu8; BLOCK_LEN]);
-    let block_b = seed_referenced_block(&device_a, "credit-b.bin", &vec![0xBBu8; BLOCK_LEN]);
-    let block_c = seed_referenced_block(&device_a, "credit-c.bin", &vec![0xCCu8; BLOCK_LEN]);
+    let block_a =
+        seed_referenced_block(&device_a, "credit-a.bin", &incompressible_bytes("credit-a", BLOCK_LEN));
+    let block_b =
+        seed_referenced_block(&device_a, "credit-b.bin", &incompressible_bytes("credit-b", BLOCK_LEN));
+    let block_c =
+        seed_referenced_block(&device_a, "credit-c.bin", &incompressible_bytes("credit-c", BLOCK_LEN));
 
     let (channel_a, requester_channel) = connect_pair(addr).await;
     let session_a = spawn_session(channel_a, &device_a, "device-b");
@@ -3975,7 +5143,12 @@ async fn credit_guard_is_released_only_after_the_reply_finishes_sending() {
     complete_raw_peer_handshake(&requester_channel, &session_a).await;
 
     let started = Instant::now();
-    send_block_request(&requester_channel, "credit-a.bin", block_a.clone()).await;
+    // Both requests are left in flight on their own streams: A's answer is
+    // read only after B's, which is what makes the two genuinely overlap.
+    // On the old shared control stream this needed no such care because
+    // every reply landed in one inbound queue; here the overlap is the
+    // test's own responsibility.
+    let mut request_a = begin_block_request(&requester_channel, "credit-a.bin", &block_a).await;
 
     // Well inside the ~2s throttled window above, and well after
     // `try_admit` for request A has certainly already run (a synchronous,
@@ -3983,7 +5156,7 @@ async fn credit_guard_is_released_only_after_the_reply_finishes_sending() {
     // must fail here if A's guard is still held, which is exactly what
     // forces this race deterministically rather than probabilistically.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    send_block_request(&requester_channel, "credit-b.bin", block_b.clone()).await;
+    let mut request_b = begin_block_request(&requester_channel, "credit-b.bin", &block_b).await;
 
     // The actual oracle below is the SEQUENCE of outcomes (Busy, then
     // Found, then Found once credit is released), not wall-clock deadlines
@@ -3994,13 +5167,13 @@ async fn credit_guard_is_released_only_after_the_reply_finishes_sending() {
     // correctness check; it must stay generous relative to the ~2s
     // throttled-send window baked into the rate limiter above.
     tokio::time::timeout(Duration::from_secs(10), async {
-        let reply_b = recv_matching_block_reply(&requester_channel, &block_b).await;
+        let (response_b, _) = read_block_response(&mut request_b).await;
         assert!(
-            matches!(reply_b.outcome, Some(proto::block_reply::Outcome::Busy(_))),
+            matches!(response_b.outcome, Some(BlockOutcome::Busy(_))),
             "request B must be denied credit admission while request A's reply is still being \
              sent (within the throttled upload window) -- if this were Found instead, \
              credit_guard was released BEFORE the send it is supposed to guard, got {:?}",
-            reply_b.outcome
+            response_b.outcome
         );
         assert!(
             started.elapsed() < Duration::from_millis(1_800),
@@ -4009,22 +5182,21 @@ async fn credit_guard_is_released_only_after_the_reply_finishes_sending() {
              accidentally serialized"
         );
 
-        let reply_a = recv_matching_block_reply(&requester_channel, &block_a).await;
+        let (response_a, _) = read_block_response(&mut request_a).await;
         assert!(
-            matches!(reply_a.outcome, Some(proto::block_reply::Outcome::Found(_))),
+            matches!(response_a.outcome, Some(BlockOutcome::Found(_))),
             "request A itself must still succeed, got {:?}",
-            reply_a.outcome
+            response_a.outcome
         );
 
         // Now that A's reply has actually been observed, its credit must
         // already be released -- a fresh, same-sized request must succeed.
-        send_block_request(&requester_channel, "credit-c.bin", block_c.clone()).await;
-        let reply_c = recv_matching_block_reply(&requester_channel, &block_c).await;
+        let (response_c, _) = request_block(&requester_channel, "credit-c.bin", &block_c).await;
         assert!(
-            matches!(reply_c.outcome, Some(proto::block_reply::Outcome::Found(_))),
+            matches!(response_c.outcome, Some(BlockOutcome::Found(_))),
             "request C must succeed once request A's credit_guard has released its share \
              (observed via A's own reply having already arrived), got {:?}",
-            reply_c.outcome
+            response_c.outcome
         );
     })
     .await
@@ -4042,19 +5214,17 @@ async fn credit_guard_is_released_only_after_the_reply_finishes_sending() {
 /// here; this comment exists so the doc's four numbered invariants each
 /// have an explicit pointer to their covering test.
 ///
-/// Pins invariant 5: `handle_block_reply` -- the handler that runs on the
-/// REQUESTING side when its own outstanding `BlockRequest` is answered --
-/// acquires no examination, dispatch, or credit permit of any kind; it
-/// only correlates the reply against `pending_block_requests_by_id` and
-/// resolves the bytes. Demonstrated by fully saturating the REQUESTING
+/// Pins invariant 5: the REQUESTING side of a block exchange acquires no
+/// examination, dispatch, or credit permit of any kind. Those three budgets
+/// bound what this device agrees to *serve*; asking a peer for a block
+/// spends none of them, and a device whose serve engine is saturated must
+/// still be able to fetch. Demonstrated by fully saturating the requesting
 /// session's own `BlockServeEngine` (the one it would use only if IT were
-/// serving inbound requests from someone else) -- its examination-
+/// answering inbound requests from someone else) -- its examination-
 /// admission pool, its one dispatch slot, and its one byte of credit -- for
-/// the whole test, and confirming `fetch_block` still resolves promptly:
-/// if `handle_block_reply` touched any of that shared, per-device
-/// admission state, this fully starved engine would make it hang or fail.
+/// the whole test, and confirming `fetch_block` still resolves promptly.
 #[tokio::test]
-async fn handle_block_reply_acquires_no_examination_dispatch_or_credit_permit() {
+async fn fetching_a_block_acquires_no_examination_dispatch_or_credit_permit() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
     let device_b = Device::new("device-b");
@@ -4085,7 +5255,7 @@ async fn handle_block_reply_acquires_no_examination_dispatch_or_credit_permit() 
         "device-a",
         starved_engine.clone(),
     );
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
     let mut held_examination_permits = Vec::new();
     while let Ok(permit) = starved_engine.try_begin_examination() {
         held_examination_permits.push(permit);
@@ -4101,8 +5271,8 @@ async fn handle_block_reply_acquires_no_examination_dispatch_or_credit_permit() 
     )
     .await
     .expect(
-        "handle_block_reply must resolve promptly regardless of this session's own (unrelated) \
-         serve-side admission state",
+        "a fetch must resolve promptly regardless of this session's own (unrelated) serve-side \
+         admission state",
     )
     .unwrap();
 
@@ -4118,7 +5288,7 @@ async fn handle_block_reply_acquires_no_examination_dispatch_or_credit_permit() 
 /// committed edits reconciles every file in the frontier correctly, end to
 /// end (materializes each file with the right content on disk and in the
 /// index).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_reconciles_every_file_in_an_announced_frontier() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -4152,7 +5322,7 @@ async fn peer_reconciles_every_file_in_an_announced_frontier() {
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
     // The three edits are already committed to device-a's DAG by process_event
     // above; announcing the head carries the whole frontier to device-b at once.
     let _ = records;
@@ -4212,9 +5382,10 @@ async fn eager_materialize_leaves_placeholder_when_peer_cannot_supply_a_block() 
         content.len() as u64,
         yadorilink_replica_domain::file::FileMeta {
             mtime_unix_nanos: 0,
-            exec_bit: false,
+            unix_mode: None,
             symlink_target: None,
             record_kind: yadorilink_replica_domain::file::RecordKind::File,
+            xattrs: Vec::new(),
         },
     );
     let create_op = yadorilink_replica_domain::change::Op::Put {
@@ -4233,6 +5404,7 @@ async fn eager_materialize_leaves_placeholder_when_peer_cannot_supply_a_block() 
                 versions: std::slice::from_ref(&absent_version),
             },
             None,
+            None,
             yadorilink_daemon::replica_coordinator::ReplicaChangeEmission {
                 emitter: &device_a.emitter(),
                 permit: &RootCommitPermit::for_tests(),
@@ -4248,7 +5420,7 @@ async fn eager_materialize_leaves_placeholder_when_peer_cannot_supply_a_block() 
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // device-b eagerly materializes, cannot fetch the block, and (with the
     // fix) records a retriable placeholder instead of a Hydrated row.
@@ -4312,6 +5484,7 @@ async fn eager_materialize_leaves_placeholder_when_peer_cannot_supply_a_block() 
             device_b.store.as_ref(),
             &device_b.root_path(),
             GROUP,
+            yadorilink_filesystem_sync::materialization_repair::RepairMode::Startup,
             &RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -4360,7 +5533,7 @@ async fn eager_materialize_leaves_placeholder_when_peer_cannot_supply_a_block() 
 /// canonicalize-and-`starts_with` check is the defense-in-depth this test
 /// confirms actually closes the gap.
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn symlinked_intermediate_component_does_not_let_a_write_escape_the_sync_root() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -4396,7 +5569,7 @@ async fn symlinked_intermediate_component_does_not_let_a_write_escape_the_sync_r
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // Announce device-b's evil_link/pwned.txt commit and wait until device-a
     // has ADMITTED it into its index — the point at which it tries to
@@ -4463,7 +5636,7 @@ async fn symlinked_intermediate_component_does_not_let_a_write_escape_the_sync_r
 /// real peer connection — device B's already-synced copy must be
 /// completely unaffected: no tombstone ever reaches it, because the
 /// rescan never produced one to begin with.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn newly_ignored_file_drops_from_local_index_without_tombstoning_the_peers_copy() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -4487,7 +5660,7 @@ async fn newly_ignored_file_drops_from_local_index_without_tombstoning_the_peers
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let replicated_path = device_b.root_path().join("cache.tmp");
     announce_until(&session_a, GROUP, || replicated_path.exists(), Duration::from_secs(20)).await;
@@ -4540,16 +5713,16 @@ async fn newly_ignored_file_drops_from_local_index_without_tombstoning_the_peers
 /// itself — only device B does, via its own `.yadorilinkignore` (device-local,
 /// unsynced) — so this exercises the filter purely from the receiving side.
 ///
-/// Device B MUST get a change authenticator, and this test MUST assert the DAG
-/// is negotiated. Both are load-bearing, not ceremony: without an
+/// Device B MUST get a change authenticator, and this test MUST wait for the
+/// pair's handshakes. Both are load-bearing, not ceremony: without an
 /// authenticator `handle_change_batch` drops every incoming change unverified
 /// before it reaches the projection path, so the ignore assertions below would
 /// pass vacuously — every file would be dropped for the wrong reason. This test
 /// passed against a build that materialized `secret.log` on the change-DAG path
 /// with no ignore check whatsoever. Any future edit that drops the
-/// authenticator or stops the pair negotiating the DAG must fail
-/// `wait_dag_negotiated` loudly rather than go on claiming coverage it does not
-/// have.
+/// authenticator or stops the pair exchanging handshakes must fail
+/// `wait_handshake_exchanged` loudly rather than go on claiming coverage it
+/// does not have.
 ///
 /// On relaying — a deliberate, load-bearing inversion. This test used to also
 /// assert the ignored record was never *forwarded* onward, by draining a
@@ -4563,11 +5736,10 @@ async fn newly_ignored_file_drops_from_local_index_without_tombstoning_the_peers
 /// ignore the path must still be able to receive the change *through* this one
 /// (store-and-forward). A device that dropped an ignored path's change from its
 /// DAG would censor the mesh with its own local config and strand that third
-/// device; one that recorded the skip as a *failure* would hold the change at
-/// `applied = 0` forever and re-drive it every reprojection cycle. So the
-/// assertions below pin both halves: the bytes never land here, and the change
-/// still retires as applied so it relays onward.
-#[tokio::test]
+/// device. So the assertions below pin both halves: the bytes never land
+/// here, and the change is still admitted to this device's own DAG (its
+/// frontier still advances past it) so it relays onward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incoming_change_for_a_locally_ignored_path_is_not_projected_but_still_relayed() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -4620,7 +5792,7 @@ async fn incoming_change_for_a_locally_ignored_path_is_not_projected_but_still_r
 
     // Assert the pair really is on the change DAG, so this test cannot quietly
     // degrade into proving nothing again.
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // The ordinary (non-ignored) file replicating is the signal that device
     // A's announced frontier — one batch covering both changes — has already
@@ -4645,19 +5817,6 @@ async fn incoming_change_for_a_locally_ignored_path_is_not_projected_but_still_r
         device_b.state.change_history_repository().dag_has_change(&secret_change).unwrap(),
         "the ignored path's change must still be admitted to this device's DAG so it can \
          still relay onward to a device that does not ignore the path"
-    );
-    // ... and the skip must retire the change as applied, not park it as a
-    // retryable failure. Heads advancing past it is what tells the peer "we
-    // already hold this", so it is never re-sent.
-    assert!(
-        device_b
-            .state
-            .change_history_repository()
-            .dag_list_unapplied_changes(GROUP)
-            .unwrap()
-            .is_empty(),
-        "an ignored path's change must retire as applied — recording the skip as a failure \
-         would hold it unapplied forever and re-drive it every reprojection cycle"
     );
     assert_eq!(
         device_b.state.sqlite().dag_group_heads(GROUP).unwrap(),
@@ -4684,7 +5843,7 @@ async fn incoming_change_for_a_locally_ignored_path_is_not_projected_but_still_r
 /// then the user added it to B's `.yadorilinkignore`, and A goes on editing it.
 /// B's pre-existing change is already in the DAG, so B's head and A's head are
 /// genuinely concurrent and a conflict is resolved on both sides.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conflict_on_a_locally_ignored_path_materializes_no_conflict_copy() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -4760,7 +5919,7 @@ async fn conflict_on_a_locally_ignored_path_materializes_no_conflict_copy() {
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // Settle on two positive signals, never a sleep — an absence assertion is
     // only worth anything once the thing that would have caused the presence has
@@ -4791,22 +5950,6 @@ async fn conflict_on_a_locally_ignored_path_materializes_no_conflict_copy() {
     }
     assert!(a_has_copy(), "sanity check: the non-ignoring device must resolve the conflict");
     assert!(b_has_a_change(), "device B never received A's change; nothing was actually tested");
-
-    // The ignored path's change must still RETIRE. Skipping a projection is a
-    // decision, not a failure, so the change is marked applied and B's heads
-    // advance past it — that is what stops the peer re-announcing it forever and
-    // the reprojection backstop re-driving it every cycle. A change parked at
-    // `applied = 0` here would mean the fix traded a privacy defect for an
-    // endless churn loop.
-    assert!(
-        device_b
-            .state
-            .change_history_repository()
-            .dag_list_unapplied_changes(GROUP)
-            .unwrap()
-            .is_empty(),
-        "an ignored path's change must still be marked applied, or the DAG never settles"
-    );
 
     let names_b: Vec<String> = std::fs::read_dir(device_b.root_path())
         .unwrap()
@@ -4916,6 +6059,7 @@ async fn symlink_tombstone_removes_link_but_never_its_target() {
             "link.txt",
             "device-a",
             0,
+            false,
             &device_a.emitter(),
             &RootCommitPermit::for_tests(),
         )
@@ -4995,6 +6139,7 @@ async fn tombstone_must_not_delete_through_an_intermediate_directory_symlink() {
             "external/victim.txt",
             "device-a",
             0,
+            false,
             &device_a.emitter(),
             &RootCommitPermit::for_tests(),
         )
@@ -5074,6 +6219,7 @@ async fn held_file_tombstone_clears_held_state() {
             "A.txt",
             "device-a",
             0,
+            false,
             &device_a.emitter(),
             &RootCommitPermit::for_tests(),
         )
@@ -5145,7 +6291,7 @@ async fn case_fold_collision_holds_the_second_arriving_file_without_touching_the
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let first_replicated = device_b.root_path().join("Photo.jpg");
     announce_until(&session_a, GROUP, || first_replicated.exists(), Duration::from_secs(20)).await;
@@ -5259,7 +6405,7 @@ async fn combined_case_and_normalization_collision_holds_the_second_arriving_fil
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let first_replicated = device_b.root_path().join("Caf\u{e9}.txt");
     announce_until(&session_a, GROUP, || first_replicated.exists(), Duration::from_secs(20)).await;
@@ -5388,6 +6534,7 @@ async fn tombstone_of_a_case_fold_colliding_path_holds_rather_than_deletes_the_s
             "photo.jpg",
             "device-a",
             0,
+            false,
             &device_a.emitter(),
             &RootCommitPermit::for_tests(),
         )
@@ -5493,6 +6640,7 @@ async fn tombstone_of_the_live_file_itself_does_not_corrupt_its_own_index_row_wh
             "Photo.jpg",
             "device-a",
             0,
+            false,
             &device_a.emitter(),
             &RootCommitPermit::for_tests(),
         )
@@ -5601,7 +6749,7 @@ async fn held_files_blocks_are_still_served_to_a_requesting_peer() {
 /// genuine symlink on disk, `LocalChangeProcessor::process_event` (section
 /// 2's actual scan/watch classification — not a hand-built `FileRecord`)
 /// records it as `RecordKind::Symlink` with its target text, and only
-/// *then* do the two devices connect over an actual `PeerChannel`
+/// *then* do the two devices connect over an actual `QuicPeerChannel`
 /// and run real `PeerSyncSession`s. If `send_full_index`
 /// (`PeerSyncSession::file_info_for_record`) didn't populate the new wire
 /// fields, or `reconcile_one_file`/`apply_incoming_wire_metadata` didn't
@@ -5694,9 +6842,9 @@ async fn symlink_created_on_one_device_materializes_as_a_real_symlink_on_its_pee
 /// Closes the same wire gap as the symlink
 /// test above, for the other field the gap silently dropped in both
 /// directions — the owner-executable bit. Device A's index records a file
-/// as executable (`ReplicaCoordinator::set_exec_bit`, standing in for section 2/3's
+/// as executable (`ReplicaCoordinator::set_unix_mode`, standing in for section 2/3's
 /// still-separately-open local-capture wiring — see
-/// `yadorilink_local_storage::chunker::owner_exec_bit_from_metadata`'s doc
+/// `yadorilink_local_storage::chunker::unix_mode_from_metadata`'s doc
 /// comment for that distinct, still-undone gap; this test is scoped to
 /// whether an *already-recorded* bit
 /// crosses the wire and gets applied for real, not to how it got recorded
@@ -5704,8 +6852,8 @@ async fn symlink_created_on_one_device_materializes_as_a_real_symlink_on_its_pee
 /// **actual on-disk file** — not just its index row — with the owner-exec
 /// permission bit set.
 #[cfg(unix)]
-#[tokio::test]
-async fn exec_bit_set_on_one_device_is_applied_to_the_real_file_on_its_peer() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unix_mode_set_on_one_device_is_applied_to_the_real_file_on_its_peer() {
     use std::os::unix::fs::PermissionsExt;
 
     let addr = bind_unused_addr().await;
@@ -5715,7 +6863,7 @@ async fn exec_bit_set_on_one_device_is_applied_to_the_real_file_on_its_peer() {
     let file_path = device_a.root_path().join("run.sh");
     std::fs::write(&file_path, b"#!/bin/sh\necho hi\n").unwrap();
     // Make it executable on disk BEFORE capturing, so process_event records the
-    // exec bit into the emitted DAG change's FileVersion. The raw set_exec_bit
+    // exec bit into the emitted DAG change's FileVersion. The raw set_unix_mode
     // index setter does not emit a change, so the exec bit would never cross the
     // DAG wire — only the deleted legacy index wire carried an index column.
     let mut perms = std::fs::metadata(&file_path).unwrap().permissions();
@@ -5736,7 +6884,31 @@ async fn exec_bit_set_on_one_device_is_applied_to_the_real_file_on_its_peer() {
     let _session_b = spawn_session(channel_b, &device_b, "device-a");
 
     let replicated_path = device_b.root_path().join("run.sh");
-    announce_until(&session_a, GROUP, || replicated_path.exists(), Duration::from_secs(20)).await;
+    // Waiting on `exists()` here waits on the wrong edge. `materialize`
+    // publishes the reconstructed file by renaming it into place and only
+    // then chmods it: the eager branch runs `reconstruct_file` (fsync,
+    // rename, parent-dir fsync), then the materialized-fingerprint write,
+    // then `intent_guard.clear()`, and `apply_unix_mode` last. So the file
+    // is visible under its final name, with its final content, across a
+    // window that contains two more index writes before it ever carries
+    // the bit this test is about -- and `exists()` becoming true says
+    // nothing about that window having closed.
+    //
+    // The mode is the last thing that path applies, so it is the only
+    // sound edge to wait on here. That is exactly what the metadata-only
+    // sibling test above (`unix_mode_only_change_...`) already waits on;
+    // this one was left waiting on the earlier, unrelated edge.
+    announce_until(
+        &session_a,
+        GROUP,
+        || {
+            std::fs::metadata(&replicated_path)
+                .map(|m| m.permissions().mode() & 0o100 != 0)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(20),
+    )
+    .await;
 
     assert_eq!(std::fs::read(&replicated_path).unwrap(), b"#!/bin/sh\necho hi\n");
     let mode = std::fs::metadata(&replicated_path).unwrap().permissions().mode();
@@ -5762,8 +6934,8 @@ async fn exec_bit_set_on_one_device_is_applied_to_the_real_file_on_its_peer() {
 /// corrupted/truncated by a spurious rewrite) while the permission bit
 /// updates, which is the fast path's whole externally-observable contract.
 #[cfg(unix)]
-#[tokio::test]
-async fn exec_bit_only_change_propagates_over_the_wire_without_disturbing_content() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unix_mode_only_change_propagates_over_the_wire_without_disturbing_content() {
     use std::os::unix::fs::PermissionsExt;
 
     let addr = bind_unused_addr().await;
@@ -5789,7 +6961,7 @@ async fn exec_bit_only_change_propagates_over_the_wire_without_disturbing_conten
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let replicated_path = device_b.root_path().join("build.sh");
     announce_until(&session_a, GROUP, || replicated_path.exists(), Duration::from_secs(20)).await;
@@ -5840,19 +7012,27 @@ async fn exec_bit_only_change_propagates_over_the_wire_without_disturbing_conten
     );
 }
 
-// --- Rate-limiting integration tests ---
-
-/// The default (unlimited, `RateLimiters::unlimited`) session
-/// configuration imposes no measurable delay on a real block transfer —
-/// end-to-end confirmation alongside `rate_limiter::tests`'s unit-level one.
-#[tokio::test]
-async fn unlimited_rate_limiters_impose_no_measurable_delay_on_a_real_transfer() {
+/// Same wire gap as the two `unix_mode_*` tests above, for extended
+/// attributes (Competitive Hardening C1.2a): device A's file carries a
+/// `user.*` xattr *before* capture, so `process_event` records it into the
+/// emitted DAG change's `FileVersion` (mirroring the unix-mode test's own
+/// "set it on disk before capturing" precondition), and a real two-peer
+/// sync must leave device B's actual on-disk file -- not just its index
+/// row -- carrying the same attribute.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xattr_set_on_one_device_is_applied_to_the_real_file_on_its_peer() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
     let device_b = Device::new("device-b");
 
-    let file_path = device_a.root_path().join("unthrottled.bin");
-    std::fs::write(&file_path, vec![0x22u8; 50_000]).unwrap();
+    let file_path = device_a.root_path().join("tagged.txt");
+    std::fs::write(&file_path, b"hello").unwrap();
+    yadorilink_local_storage::apply_xattrs(
+        &file_path,
+        &[("user.yadorilink-test".to_string(), b"marker".to_vec())],
+    )
+    .unwrap();
     device_a
         .processor()
         .process_event(
@@ -5865,19 +7045,194 @@ async fn unlimited_rate_limiters_impose_no_measurable_delay_on_a_real_transfer()
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let session_a = spawn_session(channel_a, &device_a, "device-b");
-    let session_b = spawn_session(channel_b, &device_b, "device-a");
+    let _session_b = spawn_session(channel_b, &device_b, "device-a");
+
+    let replicated_path = device_b.root_path().join("tagged.txt");
+    announce_until(
+        &session_a,
+        GROUP,
+        || {
+            replicated_path.exists()
+                && std::fs::File::open(&replicated_path)
+                    .map(|f| !yadorilink_local_storage::read_replicated_xattrs(&f).is_empty())
+                    .unwrap_or(false)
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+
+    assert_eq!(std::fs::read(&replicated_path).unwrap(), b"hello");
+    let file = std::fs::File::open(&replicated_path).unwrap();
+    assert_eq!(
+        yadorilink_local_storage::read_replicated_xattrs(&file),
+        vec![("user.yadorilink-test".to_string(), b"marker".to_vec())],
+        "device B's real, on-disk file must carry the xattr device A advertised"
+    );
+}
+
+/// The exec-bit-only sibling test above (`unix_mode_only_change_...`)
+/// proved metadata-only changes reach `try_apply_metadata_only_update`'s
+/// fast path without disturbing content; this proves the same for an
+/// xattr-only change (size and mtime... no -- capture always stamps a new
+/// mtime, so this is a metadata-only *content-identical* change, the same
+/// shape the unix-mode sibling test exercises): content stays
+/// byte-identical while only the extended attribute changes.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xattr_only_change_propagates_over_the_wire_without_disturbing_content() {
+    let addr = bind_unused_addr().await;
+    let device_a = Device::new("device-a");
+    let device_b = Device::new("device-b");
+
+    let file_path = device_a.root_path().join("notes.txt");
+    let content = b"unchanged content";
+    std::fs::write(&file_path, content).unwrap();
+    device_a
+        .processor()
+        .process_event(
+            GROUP,
+            &device_a.root_path(),
+            &FsChangeEvent { path: file_path, kind: FsChangeKind::CreatedOrModified },
+        )
+        .await
+        .unwrap();
+
+    let (channel_a, channel_b) = connect_pair(addr).await;
+    let auth = dag_authenticator(&[&device_a, &device_b]);
+    let session_a =
+        spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
+    let session_b =
+        spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
+
+    let replicated_path = device_b.root_path().join("notes.txt");
+    announce_until(&session_a, GROUP, || replicated_path.exists(), Duration::from_secs(20)).await;
+    assert_eq!(std::fs::read(&replicated_path).unwrap(), content);
+
+    // Content is unchanged; only the xattr is added and re-captured.
+    let notes_txt = device_a.root_path().join("notes.txt");
+    yadorilink_local_storage::apply_xattrs(
+        &notes_txt,
+        &[("user.yadorilink-test".to_string(), b"added-later".to_vec())],
+    )
+    .unwrap();
+    let _ = expect_file_changed(
+        device_a
+            .processor()
+            .process_event(
+                GROUP,
+                &device_a.root_path(),
+                &FsChangeEvent { path: notes_txt, kind: FsChangeKind::CreatedOrModified },
+            )
+            .await
+            .unwrap(),
+    );
+
+    announce_until(
+        &session_a,
+        GROUP,
+        || {
+            std::fs::File::open(&replicated_path)
+                .map(|f| !yadorilink_local_storage::read_replicated_xattrs(&f).is_empty())
+                .unwrap_or(false)
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+
+    assert_eq!(
+        std::fs::read(&replicated_path).unwrap(),
+        content,
+        "the metadata-only fast path must never disturb already-correct file content"
+    );
+    let file = std::fs::File::open(&replicated_path).unwrap();
+    assert_eq!(
+        yadorilink_local_storage::read_replicated_xattrs(&file),
+        vec![("user.yadorilink-test".to_string(), b"added-later".to_vec())],
+    );
+}
+
+// --- Rate-limiting integration tests ---
+
+/// The default (unlimited, `RateLimiters::unlimited`) session
+/// configuration imposes no measurable delay on a real block transfer —
+/// end-to-end confirmation alongside `rate_limiter::tests`'s unit-level one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlimited_rate_limiters_impose_no_measurable_delay_on_a_real_transfer() {
+    let addr = bind_unused_addr().await;
+    let device_a = Device::new("device-a");
+    let device_b = Device::new("device-b");
+
+    let (channel_a, channel_b) = connect_pair(addr).await;
     // Explicit (matches the real, un-configured default), confirming the
-    // session-level plumbing itself adds no overhead either.
-    session_a.set_rate_limiters(Arc::new(RateLimiters::unlimited()));
-    session_b.set_rate_limiters(Arc::new(RateLimiters::unlimited()));
+    // session-level plumbing itself adds no overhead either. Wired at
+    // construction -- see `spawn_session_with_rate_limiters`.
+    let session_a = spawn_session_with_rate_limiters(
+        channel_a,
+        &device_a,
+        "device-b",
+        Arc::new(RateLimiters::unlimited()),
+    );
+    let session_b = spawn_session_with_rate_limiters(
+        channel_b,
+        &device_b,
+        "device-a",
+        Arc::new(RateLimiters::unlimited()),
+    );
+
+    // Session bring-up is deliberately outside the measured window, and
+    // this is the whole fix: `HANDSHAKE_RETRY_BASE_DELAY` is 2s, so a
+    // single `ClusterConfig` that is dropped or merely late puts a hard
+    // 2s step between `connect_pair` and the first byte of application
+    // traffic. The old form started its clock before the handshake and
+    // then asserted the total was under 2s -- the exact same 2s -- so
+    // the assertion was decided by handshake luck rather than by the
+    // rate limiter it names. Observed failures sat just past the
+    // boundary (2.51s, 2.66s), which is that constant plus a transfer,
+    // not a slow transfer.
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
+
+    // Commit the file only once the pair is negotiated, so the measured
+    // window is exactly announce -> ChangeBatch -> block fetch -> write
+    // for 50 KB over an established connection: the span a rate limiter
+    // is the only thing that could plausibly stretch.
+    let file_path = device_a.root_path().join("unthrottled.bin");
+    std::fs::write(&file_path, vec![0x22u8; 50_000]).unwrap();
+    device_a
+        .processor()
+        .process_event(
+            GROUP,
+            &device_a.root_path(),
+            &FsChangeEvent { path: file_path, kind: FsChangeKind::CreatedOrModified },
+        )
+        .await
+        .unwrap();
 
     let replicated_path = device_b.root_path().join("unthrottled.bin");
     let start = std::time::Instant::now();
-    wait_until(|| replicated_path.exists(), Duration::from_secs(5)).await;
+    announce_until(&session_a, GROUP, || replicated_path.exists(), Duration::from_secs(60)).await;
+    let elapsed = start.elapsed();
+    // 10s, and the number is chosen against two floors rather than picked
+    // for roundness.
+    //
+    // Below: landing one file costs three or four `fsync`s (the block
+    // store's put, `reconstruct_file`'s own, and the parent directory's),
+    // and with `TMPDIR` on a rotational disk (see `NO_PROGRESS_TIMEOUT`)
+    // one `fsync` measures 100-960ms. So the
+    // storage-bound floor for this transfer is seconds, not
+    // milliseconds, and the old 2s bound sat underneath its own floor:
+    // it was measuring the disk, and reported 2.51s / 2.66s / 2.82s
+    // doing it.
+    //
+    // Above: the bound still has to fail if a limiter is engaged.
+    // `configured_download_rate_caps_real_block_transfer_throughput`
+    // below treats 4 KB/s as a meaningful configured rate; at that rate
+    // this same 50 KB file takes ~11.5s. 10s therefore still separates
+    // "no throttling" from the smallest throttle this file's sibling
+    // test considers worth asserting on.
     assert!(
-        start.elapsed() < Duration::from_secs(2),
-        "an unlimited-rate transfer should complete quickly, took {:?}",
-        start.elapsed()
+        elapsed < Duration::from_secs(10),
+        "an unlimited-rate transfer should complete quickly, took {elapsed:?}"
     );
 }
 
@@ -5885,7 +7240,7 @@ async fn unlimited_rate_limiters_impose_no_measurable_delay_on_a_real_transfer()
 /// block-transfer throughput — the file is small enough to be a single
 /// `DEFAULT_BLOCK_SIZE` block, so the configured rate directly bounds the
 /// one `fetch_block` call's `acquire` wait.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn configured_download_rate_caps_real_block_transfer_throughput() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -5906,10 +7261,16 @@ async fn configured_download_rate_caps_real_block_transfer_throughput() {
 
     let (channel_a, channel_b) = connect_pair(addr).await;
     let _session_a = spawn_session(channel_a, &device_a, "device-b");
-    let session_b = spawn_session(channel_b, &device_b, "device-a");
-
     let rate_bytes_per_sec = 4_000u64;
-    session_b.set_rate_limiters(Arc::new(RateLimiters::new(0, rate_bytes_per_sec)));
+    // Wired at construction, not set afterwards -- see
+    // `spawn_session_with_rate_limiters` for why the setter cannot be
+    // used on an already-spawned session.
+    let _session_b = spawn_session_with_rate_limiters(
+        channel_b,
+        &device_b,
+        "device-a",
+        Arc::new(RateLimiters::new(0, rate_bytes_per_sec)),
+    );
 
     let replicated_path = device_b.root_path().join("throttled.bin");
     let start = std::time::Instant::now();
@@ -5931,26 +7292,29 @@ async fn configured_download_rate_caps_real_block_transfer_throughput() {
 
 // ---------------------------------------------------------------------
 // Transfer compression: real, wire-driven proof that compression is
-// actually negotiated and used end-to-end — not just that
-// `compress_block`/`decompress_block` work in isolation
-// (`peer_session::compression_codec_tests` already covers that). These
-// tests either drive a real two-`PeerSyncSession` pair (proving
-// negotiation + content correctness through the real send/receive path)
-// or pair one real session with a raw, manually-driven `PeerChannel`
-// acting as the peer (the same pattern `block_request_for_unreferenced_
-// hash_is_refused`/`hydration_rejects_block_response_with_wrong_hash_or_
-// size` already use above), so the exact bytes a real session puts on the
+// actually used end-to-end — not just that `compress_block`/
+// `decompress_block` work in isolation (`peer_session::
+// compression_codec_tests` already covers that). These tests either drive
+// a real two-`PeerSyncSession` pair (proving content correctness through
+// the real send/receive path) or pair one real session with a raw,
+// manually-driven `QuicPeerChannel` acting as the peer (the same pattern
+// `block_request_for_unreferenced_hash_is_refused` and the hydration
+// tests already use above), so the exact bytes a real session puts on the
 // wire can be inspected directly.
+//
+// Compression is not negotiated any more: both ends of a connection are
+// the same protocol generation and understand every `Compression` value,
+// so a responder simply picks per payload — zstd when it helps, raw when
+// compressing would inflate. What remains to prove is that the choice is
+// made on the real merits of the bytes, and that either choice round-trips.
 // ---------------------------------------------------------------------
 
-/// Two real sessions, both advertising compression support (this
-/// build always does — ), must negotiate it and still deliver
-/// byte-for-byte correct content through the real compress-on-send /
-/// decompress-on-receive path — not merely "sync still works," but sync
-/// still works *with compression actually engaged*, verified via the
-/// public `compression_negotiated` getter.
-#[tokio::test]
-async fn compression_is_negotiated_between_two_real_sessions_and_content_round_trips() {
+/// Two real sessions must deliver byte-for-byte correct content through
+/// the real compress-on-send / decompress-on-receive path — not merely
+/// "sync still works," but sync still works with compression actually
+/// engaged on content that compresses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compressible_content_round_trips_between_two_real_sessions() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
     let device_b = Device::new("device-b");
@@ -5975,14 +7339,10 @@ async fn compression_is_negotiated_between_two_real_sessions_and_content_round_t
     let session_a = spawn_session(channel_a, &device_a, "device-b");
     let session_b = spawn_session(channel_b, &device_b, "device-a");
 
-    // Negotiation happens from the handshake `ClusterConfig` each side
-    // Sends first in `run` — both sessions should observe
-    // the other as compression-capable shortly after connecting.
-    wait_until(
-        || session_a.compression_negotiated() && session_b.compression_negotiated(),
-        Duration::from_secs(5),
-    )
-    .await;
+    // Both sessions have to be talking to each other before device-b can
+    // learn there is anything to fetch; the block traffic that follows
+    // runs on its own streams either way.
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let replicated_path = device_b.root_path().join("app.log");
     wait_until(|| replicated_path.exists(), Duration::from_secs(10)).await;
@@ -5994,13 +7354,12 @@ async fn compression_is_negotiated_between_two_real_sessions_and_content_round_t
     );
 }
 
-/// A raw, manually-driven peer that advertises compression
-/// support must actually receive a `Compression::Zstd`-tagged, genuinely
-/// smaller `BlockResponse` for compressible content — inspecting the real
-/// wire bytes a live `PeerSyncSession::handle_block_request` produces,
-/// not just asserting the codec functions work standalone.
-#[tokio::test]
-async fn block_response_is_actually_compressed_on_the_wire_when_negotiated() {
+/// A raw, manually-driven peer must actually receive a
+/// `Compression::Zstd`-tagged, genuinely smaller body for compressible
+/// content — inspecting the real wire bytes a live `handle_block_request`
+/// produces, not just asserting the codec functions work standalone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_block_response_is_actually_compressed_on_the_wire_for_compressible_content() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
 
@@ -6026,98 +7385,63 @@ async fn block_response_is_actually_compressed_on_the_wire_when_negotiated() {
     let (channel_a, requester_channel) = connect_pair(addr).await;
     let session_a = spawn_session(channel_a, &device_a, "device-b");
 
-    // Complete the exact-generation handshake as a raw peer (not a full
-    // `PeerSyncSession`) so this test can inspect exactly what
-    // `handle_block_request` puts on the wire in response.
-    // `complete_raw_peer_handshake`'s own inner-layer ClusterConfig
-    // deliberately omits zstd (most callers want literal, uncompressed
-    // reply bytes) -- this test is the one that specifically wants
-    // compression negotiated, so it sends its own additional
-    // zstd-advertising ClusterConfig, which the inner recv loop's
-    // `record_peer_compression_support` picks up (sticky-true-only, so this
-    // only ever turns compression ON, never off).
+    // Complete the handshake as a raw peer (not a full `PeerSyncSession`)
+    // so this test can inspect exactly what the serving side puts on the
+    // wire in response.
     complete_raw_peer_handshake(&requester_channel, &session_a).await;
-    requester_channel
-        .send(
-            proto::SyncMessage {
-                payload: Some(proto::sync_message::Payload::ClusterConfig(proto::ClusterConfig {
-                    protocol_version: PeerSyncSession::PROTOCOL_VERSION,
-                    supports_reliable_delivery: true,
-                    supports_change_dag: true,
-                    supports_version_present: true,
-                    supports_version_hash_exact: true,
-                    supported_compression: vec![proto::Compression::Zstd as i32],
-                    max_inflight_requests: 64,
-                    max_inflight_bytes: 64 * 1024 * 1024,
-                    ..Default::default()
-                })),
-            }
-            .encode_to_vec(),
-        )
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    requester_channel
-        .send(
-            proto::SyncMessage {
-                payload: Some(proto::sync_message::Payload::BlockRequest(proto::BlockRequest {
-                    folder_group_id: GROUP.to_string(),
-                    file_path: "big.txt".to_string(),
-                    block_hash: block.hash.clone(),
-                    request_id: 0,
-                })),
-            }
-            .encode_to_vec(),
-        )
-        .await
-        .unwrap();
-
-    let reply = recv_matching_block_reply(&requester_channel, &block.hash).await;
-    let Some(proto::block_reply::Outcome::Found(found)) = reply.outcome else {
-        panic!("expected a Found reply, got {:?}", reply.outcome);
-    };
+    let (response, body) = request_block(&requester_channel, "big.txt", &block.hash).await;
+    let found = expect_found(&response);
 
     assert_eq!(
         found.compression,
         proto::Compression::Zstd as i32,
-        "a negotiated-compression peer must receive a Zstd-tagged reply for compressible content"
+        "highly compressible content must be sent compressed"
+    );
+    assert_eq!(
+        found.size as usize,
+        body.len(),
+        "the declared size is what is actually on the wire, post-compression"
     );
     assert!(
-        found.data.len() < (block.size as usize) / 2,
+        body.len() < (block.size as usize) / 2,
         "compressed payload ({} bytes) should be well under half the raw block size ({} bytes) \
          for highly repetitive text",
-        found.data.len(),
+        body.len(),
         block.size
     );
-    let decompressed = zstd::stream::decode_all(found.data.as_slice()).unwrap();
+    let decompressed = zstd::stream::decode_all(body.as_slice()).unwrap();
     assert_eq!(decompressed.len(), block.size as usize);
     assert_eq!(
         sha256_bytes(&decompressed),
         block.hash,
-        "decompressed wire bytes must match the block's content hash (D4)"
+        "decompressed wire bytes must match the block's content hash"
     );
 }
 
-/// A peer whose `ClusterConfig` does not advertise `zstd` support (an old,
-/// pre-this-change peer) must never receive a `Compression::Zstd`-tagged
-/// response — block fetch behaves identically to pre-change behavior,
-/// byte-for-byte. Note this peer still completes the mandatory
-/// exact-generation handshake (`complete_raw_peer_handshake`) -- a peer
-/// that skips the handshake entirely is no longer a reachable state at
-/// all now that `PeerSyncSession::run()`'s preflight requires it
-/// unconditionally; what this test actually characterizes is compression
-/// specifically staying unnegotiated, not the handshake itself being
-/// absent. `complete_raw_peer_handshake`'s own inner-layer `ClusterConfig`
-/// already omits zstd by default (see its doc comment), so no extra setup
-/// is needed here beyond calling it.
-#[tokio::test]
-async fn block_reply_is_uncompressed_without_inner_compression_negotiation() {
+/// The other half of the same decision: content that compression would
+/// make *larger* is sent raw, tagged `Compression::None`.
+///
+/// This is what is left of the old "an unnegotiated peer never receives a
+/// compressed block" test. Compression is no longer negotiated at all --
+/// every peer that reaches a session understands both encodings — so
+/// "the peer did not ask for it" is no longer a reason a responder can
+/// have for choosing raw. The only reason left is the real one:
+/// `compress_block` returns the original bytes with `COMPRESSION_NONE`
+/// whenever compressing them would inflate them, which is exactly what
+/// already-incompressible content does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_block_response_is_sent_raw_when_compressing_it_would_inflate_it() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
 
-    let content = "the quick brown fox jumps over the lazy dog\n".repeat(2_000).into_bytes();
-    let file_path = device_a.root_path().join("big.txt");
+    let content = incompressible_bytes("a block compression cannot shrink", 64 * 1024);
+    assert!(
+        zstd::stream::encode_all(content.as_slice(), 3).unwrap().len() >= content.len(),
+        "sanity: this content must genuinely be one that compression cannot shrink"
+    );
+
+    let file_path = device_a.root_path().join("random.bin");
     std::fs::write(&file_path, &content).unwrap();
     let record = expect_file_changed(
         device_a
@@ -6135,50 +7459,30 @@ async fn block_reply_is_uncompressed_without_inner_compression_negotiation() {
     let (channel_a, requester_channel) = connect_pair(addr).await;
     let session_a = spawn_session(channel_a, &device_a, "device-b");
     complete_raw_peer_handshake(&requester_channel, &session_a).await;
-    assert!(
-        !session_a.compression_negotiated(),
-        "sanity: complete_raw_peer_handshake's inner ClusterConfig must not advertise zstd"
-    );
 
-    requester_channel
-        .send(
-            proto::SyncMessage {
-                payload: Some(proto::sync_message::Payload::BlockRequest(proto::BlockRequest {
-                    folder_group_id: GROUP.to_string(),
-                    file_path: "big.txt".to_string(),
-                    block_hash: block.hash.clone(),
-                    request_id: 0,
-                })),
-            }
-            .encode_to_vec(),
-        )
-        .await
-        .unwrap();
-
-    let reply = recv_matching_block_reply(&requester_channel, &block.hash).await;
-    let Some(proto::block_reply::Outcome::Found(found)) = reply.outcome else {
-        panic!("expected a Found reply, got {:?}", reply.outcome);
-    };
+    let (response, body) = request_block(&requester_channel, "random.bin", &block.hash).await;
+    let found = expect_found(&response);
 
     assert_eq!(
         found.compression,
         proto::Compression::None as i32,
-        "a peer that never advertised compression support must never receive a compressed block"
+        "a block compression would only make bigger must be sent raw"
     );
     assert_eq!(
-        found.data, content,
-        "an unnegotiated block reply must carry the exact raw bytes, unchanged"
+        body,
+        content[..block.size as usize].to_vec(),
+        "a raw block response must carry the exact block bytes, unchanged"
     );
 }
 
-/// A decompression-bomb bound: a `BlockReply` declaring
+/// A decompression-bomb bound: a block response declaring
 /// `Compression::Zstd` whose true decompressed size vastly exceeds the
 /// sync engine's `MAX_BLOCK_SIZE` (16 MiB) must be rejected without ever
 /// materializing that size in memory, hydration must fail cleanly (not
 /// hang or crash), and nothing must be persisted to the block store —
-/// mirroring `hydration_rejects_block_response_with_wrong_hash_or_size`'s
-/// structure exactly, since both are the same reject-and-reassign path
-/// (see `PeerSyncSession::handle_block_response`'s doc comment).
+/// mirroring `hydration_rejects_block_bytes_that_do_not_hash_to_the_
+/// request`'s structure exactly, since both are the same
+/// reject-and-reassign path.
 #[tokio::test]
 async fn hydration_rejects_a_decompression_bomb_block_response() {
     let addr = bind_unused_addr().await;
@@ -6238,54 +7542,40 @@ async fn hydration_rejects_a_decompression_bomb_block_response() {
     let (responder_channel, channel_b) = connect_pair(addr).await;
     // Not `spawn_session`: this test's subject is hydration's own bounded
     // decompression, driven by one hand-written fake responder answering
-    // exactly one `BlockRequest`. The test-only convergence driver would
+    // exactly one block request. The test-only convergence driver would
     // independently discover "bomb.bin" as a materialization repair
-    // candidate and issue its own concurrent `BlockRequest` for the same
-    // hash, racing this test's explicit `hydrate_file_with_timeout` call for
-    // the single canned reply below.
+    // candidate and issue its own concurrent request for the same hash,
+    // racing this test's explicit `hydrate_file_with_timeout` call for the
+    // single canned answer below.
     // `_with_root_authority`: see the identical note in
-    // `hydration_rejects_block_response_with_wrong_hash_or_size` --
+    // `hydration_rejects_block_bytes_that_do_not_hash_to_the_request` --
     // `hydrate_file_with_timeout` below needs a live root-commit authority
-    // to actually send the `BlockRequest` this fake responder is waiting
-    // to answer.
+    // to actually send the request this fake responder is waiting to
+    // answer.
     let session_b = spawn_session_without_convergence_driver_with_root_authority(
         channel_b, &device_b, "device-a",
     );
     let handshake_session_b = session_b.clone();
+    // The task gets its own handle to the channel; this test keeps the
+    // original alive until every assertion has run. Dropping the LAST
+    // `Arc<QuicPeerChannel>` closes the QUIC connection outright, and a
+    // responder that finished its side of a stream is not the same as a
+    // requester that has read it -- a connection closed the moment the last
+    // answer was written would reset a body still in flight and turn a
+    // deliberate answer into an indistinguishable transport failure.
+    let responder_channel_for_task = responder_channel.clone();
     let responder = tokio::spawn(async move {
-        let mut buffered: std::collections::VecDeque<Vec<u8>> =
-            complete_raw_peer_handshake(&responder_channel, &handshake_session_b).await.into();
-        loop {
-            let bytes = match buffered.pop_front() {
-                Some(bytes) => bytes,
-                None => responder_channel.recv().await.unwrap(),
-            };
-            let msg = proto::SyncMessage::decode(bytes.as_slice()).unwrap();
-            let Some(proto::sync_message::Payload::BlockRequest(req)) = msg.payload else {
-                continue;
-            };
-            responder_channel
-                .send(
-                    proto::SyncMessage {
-                        payload: Some(proto::sync_message::Payload::BlockReply(
-                            proto::BlockReply {
-                                block_hash: req.block_hash,
-                                outcome: Some(proto::block_reply::Outcome::Found(
-                                    proto::BlockReplyFound {
-                                        data: bomb,
-                                        compression: proto::Compression::Zstd as i32,
-                                    },
-                                )),
-                                request_id: req.request_id,
-                            },
-                        )),
-                    }
-                    .encode_to_vec(),
-                )
-                .await
-                .unwrap();
-            break;
-        }
+        complete_raw_peer_handshake(&responder_channel_for_task, &handshake_session_b).await;
+        // The header declares only the compressed length -- which is tiny,
+        // and well inside every bound the requester checks before reading.
+        // The bomb is entirely in what those bytes expand to, which is what
+        // makes the decompression bound (rather than the size bound) the
+        // thing under test here.
+        serve_block_requests(&responder_channel_for_task, 1, |_, _| BlockAnswer::Found {
+            body: bomb.clone(),
+            compression: proto::Compression::Zstd as i32,
+        })
+        .await;
     });
 
     let start = std::time::Instant::now();
@@ -6319,10 +7609,10 @@ async fn hydration_rejects_a_decompression_bomb_block_response() {
     );
 }
 
-/// (second half): a `BlockResponse` declaring `Compression::Zstd`
-/// whose bytes aren't a valid zstd stream at all (corrupted or tampered in
-/// transit) must be rejected the same way — cleanly, no panic, no
-/// persisted block, hydration reported as failed.
+/// The other half of the same bound: a block response declaring
+/// `Compression::Zstd` whose bytes aren't a valid zstd stream at all
+/// (corrupted or tampered in transit) must be rejected the same way —
+/// cleanly, no panic, no persisted block, hydration reported as failed.
 #[tokio::test]
 async fn hydration_rejects_a_corrupt_compressed_block_response() {
     let addr = bind_unused_addr().await;
@@ -6372,52 +7662,33 @@ async fn hydration_rejects_a_corrupt_compressed_block_response() {
     let (responder_channel, channel_b) = connect_pair(addr).await;
     // Not `spawn_session`: see the identical note in
     // `hydration_rejects_a_decompression_bomb_block_response` -- this test's
-    // one hand-written fake responder answers exactly one `BlockRequest`,
+    // one hand-written fake responder answers exactly one block request,
     // which the test-only convergence driver's own concurrent repair fetch
     // for this same placeholder could otherwise race and consume.
     // `_with_root_authority`: see the identical note in
-    // `hydration_rejects_block_response_with_wrong_hash_or_size` --
+    // `hydration_rejects_block_bytes_that_do_not_hash_to_the_request` --
     // `hydrate_file_with_timeout` below needs a live root-commit authority
-    // to actually send the `BlockRequest` this fake responder is waiting
-    // to answer.
+    // to actually send the request this fake responder is waiting to
+    // answer.
     let session_b = spawn_session_without_convergence_driver_with_root_authority(
         channel_b, &device_b, "device-a",
     );
     let handshake_session_b = session_b.clone();
+    // The task gets its own handle to the channel; this test keeps the
+    // original alive until every assertion has run. Dropping the LAST
+    // `Arc<QuicPeerChannel>` closes the QUIC connection outright, and a
+    // responder that finished its side of a stream is not the same as a
+    // requester that has read it -- a connection closed the moment the last
+    // answer was written would reset a body still in flight and turn a
+    // deliberate answer into an indistinguishable transport failure.
+    let responder_channel_for_task = responder_channel.clone();
     let responder = tokio::spawn(async move {
-        let mut buffered: std::collections::VecDeque<Vec<u8>> =
-            complete_raw_peer_handshake(&responder_channel, &handshake_session_b).await.into();
-        loop {
-            let bytes = match buffered.pop_front() {
-                Some(bytes) => bytes,
-                None => responder_channel.recv().await.unwrap(),
-            };
-            let msg = proto::SyncMessage::decode(bytes.as_slice()).unwrap();
-            let Some(proto::sync_message::Payload::BlockRequest(req)) = msg.payload else {
-                continue;
-            };
-            responder_channel
-                .send(
-                    proto::SyncMessage {
-                        payload: Some(proto::sync_message::Payload::BlockReply(
-                            proto::BlockReply {
-                                block_hash: req.block_hash,
-                                outcome: Some(proto::block_reply::Outcome::Found(
-                                    proto::BlockReplyFound {
-                                        data: vec![0xFFu8; 256], // not a valid zstd frame
-                                        compression: proto::Compression::Zstd as i32,
-                                    },
-                                )),
-                                request_id: req.request_id,
-                            },
-                        )),
-                    }
-                    .encode_to_vec(),
-                )
-                .await
-                .unwrap();
-            break;
-        }
+        complete_raw_peer_handshake(&responder_channel_for_task, &handshake_session_b).await;
+        serve_block_requests(&responder_channel_for_task, 1, |_, _| BlockAnswer::Found {
+            body: vec![0xFFu8; 256], // not a valid zstd frame
+            compression: proto::Compression::Zstd as i32,
+        })
+        .await;
     });
 
     let result =
@@ -6426,7 +7697,7 @@ async fn hydration_rejects_a_corrupt_compressed_block_response() {
 
     assert!(
         matches!(result, Err(yadorilink_peer_session::PeerSessionError::HydrationFailed(_))),
-        "an undecompressable block reply must fail hydration, got {result:?}"
+        "an undecompressable block response must fail hydration, got {result:?}"
     );
     let expected_hash_hex = hex::encode(&expected_hash);
     assert!(
@@ -6445,7 +7716,41 @@ async fn hydration_rejects_a_corrupt_compressed_block_response() {
 /// successful round trips, then shrinks once timeouts are reported the
 /// way a real caller-imposed bound would report them, then grows back
 /// once good conditions resume.
-#[tokio::test]
+///
+/// # Formerly failing: `AdaptiveWindow` was reading pipeline queueing as
+/// # RTT inflation
+///
+/// `ensure_blocks_present` pipelines block fetches at a FIXED
+/// `DEFAULT_BLOCK_FETCH_CONCURRENCY` (32) that has nothing to do with
+/// `fetch_window`, and once more than one request to a peer is in
+/// flight, that peer's OWN reply order need not match send order at
+/// all -- confirmed directly, a real 8-request burst answered in
+/// positions `8,6,1,7,4,5,2,3` relative to send order. A queued reply's
+/// own elapsed time is therefore not attributable to any fixed share of
+/// "this request's real round trip"; it is contaminated by however much
+/// of its siblings' own service time happened to land ahead of it, in an
+/// order not recoverable after the fact. `AdaptiveWindow::on_success`
+/// read that contaminated latency as RTT inflation and applied a
+/// multiplicative decrease on nearly every sample after the second, so
+/// the window decayed to `ADAPTIVE_WINDOW_MIN` on the very first real
+/// multi-block transfer and stayed there -- the exact inverse of what
+/// the controller was introduced for (see `adaptive_window`'s own module
+/// header: "Fast, low-RTT links never got to pipeline past that fixed
+/// count").
+///
+/// Fixed at the source: `fetch_block_raw` now passes `on_success` the
+/// number of requests to this peer that were outstanding when THIS one
+/// was sent (`register_block_fetch_waiter`'s returned queue position). A
+/// reply with a live sibling at send time can no longer trigger the
+/// RTT-inflation back-off or perturb the smoothed baseline at all -- it
+/// still grows the window (a successful reply under real concurrent load
+/// IS positive evidence that concurrency is sustainable), but only a
+/// truly isolated reply (no sibling in flight when it was sent) is
+/// trusted to say anything about the link's actual RTT. See
+/// `on_success`'s own doc comment for the full reasoning, and
+/// `adaptive_window`'s `pipelined_replies_out_of_send_order_never_read_
+/// as_inflation` unit test, which replays this exact captured burst.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
     windows,
     ignore = "M2-3a: on Windows, real placeholder creation is deferred to \
@@ -6499,7 +7804,7 @@ async fn fetch_window_grows_under_real_traffic_and_shrinks_after_timeouts_then_r
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     let placeholder_path = device_b.root_path().join("big-archive.tar");
     announce_until(&session_a, GROUP, || placeholder_path.exists(), Duration::from_secs(20)).await;
@@ -6575,7 +7880,7 @@ async fn fetch_window_grows_under_real_traffic_and_shrinks_after_timeouts_then_r
 /// reconnect looks like) mixed with a handful of records that genuinely
 /// changed. The fast-path skip must never swallow a real change, and every
 /// unchanged record must still converge correctly.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn large_mostly_unchanged_index_resync_still_correctly_reconciles_the_few_real_changes() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -6602,7 +7907,7 @@ async fn large_mostly_unchanged_index_resync_still_correctly_reconciles_the_few_
         spawn_session_with_authenticator(channel_a, &device_a, "device-b", auth.clone());
     let session_b =
         spawn_session_with_authenticator(channel_b, &device_b, "device-a", auth.clone());
-    wait_dag_negotiated(&session_a, &session_b, Duration::from_secs(10)).await;
+    wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
 
     // Initial full sync over the DAG — every file materializes on device_b.
     // 150 sequential local commits form a 150-deep linear chain; this relies
@@ -6613,11 +7918,27 @@ async fn large_mostly_unchanged_index_resync_still_correctly_reconciles_the_few_
     // promotion (see its doc comment) — without both, this used to take
     // well over a minute and get slower, not faster, as more headroom was
     // given it.
-    announce_until(
+    // Bounded by lack of progress, not by total elapsed time -- see
+    // `announce_while_progressing`. A flat budget cannot be right for this
+    // wait on both a tmpfs and a spinning disk at once: 150 files land
+    // here one at a time, each paying `reconstruct_file`'s fsync, the
+    // parent-directory fsync and the block store's own, so the total is
+    // set by the storage underneath and varies by two orders of
+    // magnitude. Measured with `TMPDIR` on a rotational disk shared with
+    // concurrent build and test I/O: one file every ~2.5s, so the 30s
+    // flat budget this used to carry covered the first twelve files and
+    // nothing else. It was not detecting a stall; it was detecting the
+    // disk.
+    announce_while_progressing(
         &session_a,
         GROUP,
-        || (0..FILE_COUNT).all(|i| device_b.root_path().join(format!("file_{i:04}.txt")).exists()),
-        Duration::from_secs(30),
+        || {
+            (0..FILE_COUNT)
+                .filter(|i| device_b.root_path().join(format!("file_{i:04}.txt")).exists())
+                .count()
+        },
+        FILE_COUNT,
+        NO_PROGRESS_TIMEOUT,
     )
     .await;
     for i in 0..FILE_COUNT {
@@ -6714,7 +8035,7 @@ async fn large_mostly_unchanged_index_resync_still_correctly_reconciles_the_few_
 /// adopts it outright via `reconcile_one_file`'s `ChangeOrdering::Before`
 /// branch — exercising `materialize`'s tombstone-apply path over the real
 /// wire, not a direct `ReplicaCoordinator` call.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tombstone_adopted_from_a_peer_enters_recoverable_trash() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -6759,6 +8080,7 @@ async fn tombstone_adopted_from_a_peer_enters_recoverable_trash() {
             "shared.txt",
             "device-b",
             2000,
+            false,
             &device_b.emitter(),
             &RootCommitPermit::for_tests(),
         )
@@ -6806,10 +8128,10 @@ async fn tombstone_adopted_from_a_peer_enters_recoverable_trash() {
 /// task/permit rather than sharing one permit across a single batched
 /// message — see `DagProducer::last_commit_as_wire_batch`), followed by an
 /// interleaved control message — a trailing `ChangeBatch` for a zero-block
-/// file, which needs no `BlockRequest` of its own — all *before* answering a
-/// single `BlockRequest` for the `N` real files: reproducing exactly the
+/// file, which needs no block request of its own — all *before* answering a
+/// single block request for the `N` real files: reproducing exactly the
 /// ordering that used to deadlock: every permit held by a task stuck awaiting
-/// a `BlockResponse` this test hasn't sent yet, with other messages (including
+/// a block response this test hasn't sent yet, with other messages (including
 /// the trailing control update) queued behind them.
 ///
 /// Each change is authored by its own producer device, so the `N` changes are
@@ -6817,7 +8139,7 @@ async fn tombstone_adopted_from_a_peer_enters_recoverable_trash() {
 /// the stimulus to mean what it says: the recv loop hands each message to its
 /// own task and those tasks run concurrently, so a chain would let a child be
 /// dequeued before its parent was admitted, get held as an orphan, and return
-/// its permit immediately instead of blocking on a `BlockResponse` — quietly
+/// its permit immediately instead of blocking on a block response — quietly
 /// dismantling the very permit exhaustion this test exists to create. It also
 /// mirrors what a real catch-up carries: one peer relaying many devices'
 /// independent edits (store-and-forward).
@@ -6825,14 +8147,30 @@ async fn tombstone_adopted_from_a_peer_enters_recoverable_trash() {
 /// Before this change's fix, the recv loop would block on
 /// `acquire_owned` trying to admit the 65th message and never call
 /// `self.channel.recv` again — so it could never even read, let alone
-/// process, the incoming `BlockResponse`s this test's responder task
-/// sends once it observes the resulting `BlockRequest`s, nor the
+/// process, the block responses this test's responder task sends once it
+/// observes the resulting block requests, nor the
 /// trailing control update. Forward progress would then depend entirely
 /// on each stuck fetch's own `DEFAULT_HYDRATION_TIMEOUT` (30s, times
 /// `RECONCILE_RETRY_ATTEMPTS`) elapsing — far outside this test's
 /// generous-but-bounded timeouts, so the old structure fails this test
 /// with a timeout rather than a clean assertion failure.
-#[tokio::test]
+/// Runs multi-threaded on purpose, unlike most of the lighter
+/// `#[tokio::test]` cases in this file. The stimulus is 80 concurrently
+/// running `handle_message` tasks, a responder task and the channel actor,
+/// all making real SQLite writes against one `ReplicaCoordinator`; on the
+/// default current-thread runtime that is 80 tasks time-slicing a single
+/// thread, and any writer-gate contention retry inside one of them --
+/// which retries in `std::thread::sleep` -- stalls the responder and the
+/// channel actor along with it. That starvation is not what this test is
+/// about, and it is not what production does either: every real session
+/// runs on the daemon's multi-threaded runtime, where
+/// `record_materialized_fingerprint_off_runtime`'s `block_in_place`
+/// hand-off (a no-op on a current-thread runtime, by design) keeps
+/// exactly that gate off the worker driving the channel. Four workers,
+/// not two: the permit-exhaustion stimulus wants the 80 admitted tasks to
+/// genuinely overlap, while the recv loop and the responder still get
+/// scheduled promptly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recv_loop_survives_a_catchup_batch_larger_than_the_permit_budget() {
     let addr = bind_unused_addr().await;
     let device_a = Device::new("device-a");
@@ -6841,10 +8179,6 @@ async fn recv_loop_survives_a_catchup_batch_larger_than_the_permit_budget() {
     // semaphore is genuinely, fully exhausted by real concurrently-running
     // tasks, not just close to it.
     const N: usize = 80;
-
-    let (channel_a, channel_b) = connect_pair(addr).await;
-    let session_a = spawn_session(channel_a, &device_a, "device-b");
-    complete_raw_peer_handshake(&channel_b, &session_a).await;
 
     struct StressFile {
         path: String,
@@ -6869,6 +8203,36 @@ async fn recv_loop_survives_a_catchup_batch_larger_than_the_permit_budget() {
         })
         .collect();
 
+    // The interleaved control message, built here with the rest of the
+    // stimulus rather than mid-stream: see the connection comment below
+    // for why nothing expensive may happen once the channel is open.
+    // A zero-block file needs no block request of its own, so — once
+    // dequeued — it's handled and indexed immediately rather than joining
+    // the same stuck-awaiting-a-block-response state as the `N` real files.
+    let control_device = Device::new("stress-control");
+    let control_producer = control_device.producer();
+    let (_control_record, control_version) =
+        control_producer.commit_create_empty(GROUP, "stress-control-signal", 0);
+    let control_batch = control_producer.last_commit_as_wire_batch(GROUP, &control_version);
+
+    // The connection is opened only now, with the whole stimulus already
+    // in hand. Building it is not cheap: `N` devices, each with its own
+    // store and its own real commit, is minutes of blocking disk work,
+    // and it used to run with this channel already live and completely
+    // idle. A QUIC connection left that idle is declared gone after
+    // `yadorilink_transport::PEER_IDLE_TIMEOUT` (30s) with nothing on the
+    // wire, and the only thing refreshing it here is QUIC's own ~10s
+    // keepalive -- sent by quinn's internal connection driver, which
+    // still has to be scheduled to run, on a runtime whose workers this
+    // setup is holding in synchronous `fsync`s. Miss that for long enough
+    // and the connection's own idle timeout fires, and every later `send`
+    // on this channel returns `ChannelClosed`, which is exactly how this
+    // test failed once its own timeouts stopped hiding it. Nothing
+    // between this line and the last `send` below blocks.
+    let (channel_a, channel_b) = connect_pair(addr).await;
+    let session_a = spawn_session(channel_a, &device_a, "device-b");
+    complete_raw_peer_handshake(&channel_b, &session_a).await;
+
     // One `ChangeBatch` per change, not one batched message covering all of
     // them — batching would process every change sequentially inside a
     // single `handle_message` call (one permit total), which could never
@@ -6885,17 +8249,9 @@ async fn recv_loop_survives_a_catchup_batch_larger_than_the_permit_budget() {
             .unwrap();
     }
 
-    // The interleaved control message: sent after every eager-fetch
-    // trigger and before any `BlockResponse` -- the exact ordering that
-    // used to wedge the recv loop behind its own exhausted permit pool.
-    // A zero-block file needs no `BlockRequest` of its own, so — once
-    // dequeued — it's handled and indexed immediately rather than joining
-    // the same stuck-awaiting-`BlockResponse` state as the `N` real files.
-    let control_device = Device::new("stress-control");
-    let control_producer = control_device.producer();
-    let (_control_record, control_version) =
-        control_producer.commit_create_empty(GROUP, "stress-control-signal", 0);
-    let control_batch = control_producer.last_commit_as_wire_batch(GROUP, &control_version);
+    // Sent after every eager-fetch trigger and before any block response
+    // -- the exact ordering that used to wedge the recv loop behind its
+    // own exhausted permit pool.
     channel_b
         .send(
             proto::SyncMessage {
@@ -6906,54 +8262,69 @@ async fn recv_loop_survives_a_catchup_batch_larger_than_the_permit_budget() {
         .await
         .unwrap();
 
-    // Answers every `BlockRequest` as it's observed, concurrently with
-    // the assertions below -- this is what proves permits actually
-    // *recover* (not just that one lucky message got through): the full
-    // batch, not merely the first 64, must eventually converge.
+    // Answers every block request as it's observed, concurrently with the
+    // assertions below -- this is what proves permits actually *recover*
+    // (not just that one lucky message got through): the full batch, not
+    // merely the first 64, must eventually converge.
     let responder_files: Vec<(Vec<u8>, Vec<u8>)> =
         files.iter().map(|f| (f.hash.clone(), f.content.clone())).collect();
     let channel_b_responder = channel_b.clone();
+    // Published so the waits below have a progress signal that starts
+    // moving immediately, rather than only once the first file has
+    // finished materializing.
+    let answered_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let responder_answered_count = answered_count.clone();
     let responder = tokio::spawn(async move {
+        // Each request arrives on its own stream, so they are served one
+        // after another here rather than demultiplexed out of a shared
+        // inbound queue. A hash this responder does not recognize is
+        // answered `dont_have` rather than ignored: leaving a stream
+        // unanswered would strand the requester on it, where the old
+        // shared-channel loop could simply skip a message.
         let mut answered = std::collections::HashSet::new();
         while answered.len() < N {
-            let Some(bytes) = channel_b_responder.recv().await else { break };
-            let Ok(msg) = proto::SyncMessage::decode(bytes.as_slice()) else { continue };
-            let Some(proto::sync_message::Payload::BlockRequest(req)) = msg.payload else {
-                continue;
-            };
-            let Some((hash, content)) =
-                responder_files.iter().find(|(hash, _)| *hash == req.block_hash)
-            else {
-                continue;
-            };
-            answered.insert(hash.clone());
-            let _ = channel_b_responder
-                .send(
-                    proto::SyncMessage {
-                        payload: Some(proto::sync_message::Payload::BlockReply(
-                            proto::BlockReply {
-                                block_hash: hash.clone(),
-                                outcome: Some(proto::block_reply::Outcome::Found(
-                                    proto::BlockReplyFound {
-                                        data: content.clone(),
-                                        compression: proto::Compression::None as i32,
-                                    },
-                                )),
-                                request_id: req.request_id,
-                            },
-                        )),
+            let (mut stream, request) = accept_block_request(&channel_b_responder).await;
+            let answer = match responder_files.iter().find(|(hash, _)| *hash == request.block_hash)
+            {
+                Some((hash, content)) => {
+                    if answered.insert(hash.clone()) {
+                        responder_answered_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    .encode_to_vec(),
-                )
-                .await;
+                    BlockAnswer::found(content.clone())
+                }
+                None => BlockAnswer::DontHave,
+            };
+            answer_block_request(&mut stream, &request, answer).await;
         }
     });
 
     // The actual deadlock-vs-not assertion: the recv loop must still
     // deliver this control message even though, at the moment it was
     // sent, every one of `MAX_IN_FLIGHT_MESSAGES_PER_PEER` permits was
-    // held by a task awaiting a `BlockReply` nobody had sent yet.
-    wait_until(
+    // held by a task awaiting a block response nobody had sent yet.
+    // Every wait below is bounded by absence of progress rather than by a
+    // flat deadline, for the reason `NO_PROGRESS_TIMEOUT` sets out: each
+    // of the `N` permit-holding tasks completes by materializing a real
+    // file, so the whole batch drains at the speed of whatever storage
+    // `TMPDIR` names -- ~2.5s per file on a rotational disk against
+    // milliseconds on tmpfs, and no one number is right for both. The
+    // flat 15s these carried covered six of the eighty; raising it to
+    // 120s still was not enough under load, which is the point: the
+    // quantity worth asserting is that the batch keeps draining, not that
+    // it drains inside some particular number of seconds.
+    //
+    // The progress metric is replies sent plus files landed. Replies
+    // start flowing as soon as the first tasks are admitted, so the
+    // metric moves from the very beginning instead of sitting at zero
+    // until the first materialization completes.
+    let landed = || {
+        files.iter().filter(|f| device_a.root_path().join(&f.path).exists()).count()
+    };
+    let progress =
+        || answered_count.load(std::sync::atomic::Ordering::Relaxed) + landed();
+
+    wait_while_progressing(
         || {
             device_a
                 .state
@@ -6962,18 +8333,24 @@ async fn recv_loop_survives_a_catchup_batch_larger_than_the_permit_budget() {
                 .unwrap()
                 .is_some()
         },
-        Duration::from_secs(15),
+        progress,
+        NO_PROGRESS_TIMEOUT,
     )
     .await;
 
-    tokio::time::timeout(Duration::from_secs(15), responder)
-        .await
-        .expect("expected every BlockRequest to be observed and answered promptly")
-        .unwrap();
+    // The responder only sees a block request once its task has been
+    // admitted, so observing all `N` of them takes the full batch drain.
+    wait_while_progressing(
+        || answered_count.load(std::sync::atomic::Ordering::Relaxed) >= N,
+        progress,
+        NO_PROGRESS_TIMEOUT,
+    )
+    .await;
+    responder.await.expect("the responder task must not panic");
 
+    wait_while_progressing(|| landed() == N, progress, NO_PROGRESS_TIMEOUT).await;
     for f in &files {
         let replicated_path = device_a.root_path().join(&f.path);
-        wait_until(|| replicated_path.exists(), Duration::from_secs(15)).await;
         assert_eq!(&std::fs::read(&replicated_path).unwrap(), &f.content);
     }
 }
@@ -7022,9 +8399,10 @@ mod promoted_orphan_projection_tests {
             0,
             FileMeta {
                 mtime_unix_nanos: 0,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         )
     }
@@ -7069,25 +8447,8 @@ mod promoted_orphan_projection_tests {
     /// batch` may enqueue an outbound change-request for a still-missing
     /// parent; sending on this channel simply queues the datagram (the send
     /// half stays open), so the call under test completes without a peer.
-    async fn unreachable_channel() -> Arc<yadorilink_transport::PeerChannel> {
-        use boringtun::x25519::{PublicKey, StaticSecret};
-        let mut secret_bytes = [0u8; 32];
-        rand::fill(&mut secret_bytes);
-        let local_secret = StaticSecret::from(secret_bytes);
-        let local_public = PublicKey::from(&local_secret);
-        let peer_public = PublicKey::from(&StaticSecret::from([9u8; 32]));
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let hub = yadorilink_transport::TransportHub::from_socket(socket, Some(local_public));
-        let channel = yadorilink_transport::PeerChannel::connect(
-            local_secret,
-            peer_public,
-            0,
-            Vec::new(),
-            hub,
-        )
-        .await
-        .unwrap();
-        Arc::new(channel)
+    async fn unreachable_channel() -> Arc<super::SilentPeerChannel> {
+        Arc::new(super::SilentPeerChannel)
     }
 
     /// The regression this targets: two changes touching DIFFERENT paths,
@@ -7132,8 +8493,8 @@ mod promoted_orphan_projection_tests {
             .handle_change_batch(yadorilink_sync_wire::ChangeBatchFrame {
                 folder_group_id: GROUP.to_string(),
                 changes: vec![],
-                compressed_changes: vec![],
                 file_versions: vec![version.canonical_encoding()],
+                more: false,
             })
             .await
             .unwrap();
@@ -7154,9 +8515,10 @@ mod promoted_orphan_projection_tests {
             7,
             FileMeta {
                 mtime_unix_nanos: 0,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         );
         // `parent.lamport` is the only valid predecessor maximum. Supplying a
@@ -7207,11 +8569,11 @@ mod promoted_orphan_projection_tests {
             .handle_change_batch(yadorilink_sync_wire::ChangeBatchFrame {
                 folder_group_id: GROUP.to_string(),
                 changes: vec![parent.to_wire_bytes(), rejected.to_wire_bytes()],
-                compressed_changes: Vec::new(),
                 file_versions: vec![
                     parent_version.canonical_encoding(),
                     poisoned_version.canonical_encoding(),
                 ],
+                more: false,
             })
             .await
             .unwrap();
@@ -7231,8 +8593,19 @@ mod promoted_orphan_projection_tests {
             .unwrap());
     }
 
+    /// Reverse order: the child (b.txt) precedes its parent (a.txt) in one
+    /// wire batch, so `handle_change_batch` orphans the child first, then
+    /// admits the parent and promotes it — all within one call, durably.
+    /// Materialization itself is no longer something this crate-level test
+    /// can drive or observe: ordinary projection now runs exclusively
+    /// through `projection_obligations` and the daemon's Convergence
+    /// Engine, which this bare `PeerSyncSession` test has no obligation
+    /// engine to exercise. This
+    /// test's own scope is therefore admission ordering/promotion only —
+    /// the reverse-order materialization outcome is covered at the daemon
+    /// layer instead.
     #[tokio::test]
-    async fn reverse_ordered_batch_projects_both_paths_immediately() {
+    async fn reverse_ordered_batch_admits_and_promotes_both_changes_durably() {
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
         let author_verifying_key = signing_key.verifying_key().to_bytes();
         let (parent, child, version) = build_parent_then_child(&signing_key);
@@ -7282,37 +8655,128 @@ mod promoted_orphan_projection_tests {
         let batch = yadorilink_sync_wire::ChangeBatchFrame {
             folder_group_id: GROUP.to_string(),
             changes: vec![child.to_wire_bytes(), parent.to_wire_bytes()],
-            compressed_changes: Vec::new(),
             file_versions: vec![version.canonical_encoding()],
+            more: false,
         };
         session.handle_change_batch(batch).await.unwrap();
 
-        // Both changes are durable immediately (DAG admission is still
-        // synchronous within `handle_change_batch` — only materialization is
-        // now deferred)...
+        // Both changes are durable immediately: DAG admission (including
+        // orphan promotion) is synchronous within `handle_change_batch`,
+        // regardless of when/whether materialization ever runs.
         assert!(state.change_history_repository().dag_has_change(&parent.compute_hash()).unwrap());
         assert!(state.change_history_repository().dag_has_change(&child.compute_hash()).unwrap());
+    }
 
-        // ...`handle_change_batch` itself only admits the DAG changes and
-        // enqueues materialization jobs now (CONV-1); drive the same
-        // projection step the Convergence Engine would, exactly as it would
-        // call it, in one pass covering both the parent's path and the
-        // promoted orphan's path together.
-        session.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
+    /// C4 writer-gate convoy fix (2026-09-01), end-to-end through the real
+    /// wire path: a single inbound `ChangeBatchFrame` with more than
+    /// `REMOTE_ADMISSION_BATCH_SIZE` (8) independent Changes must still
+    /// admit every one of them, AND the underlying storage-layer fast-path
+    /// call site (`ChangeHistoryRepository::admit_one_bounded_chunk`'s own
+    /// `write_immediate`, `change_history.rs:557`) must be invoked
+    /// approximately `ceil(N / 8)` times, not once per Change -- proving
+    /// `handle_change_batch`'s Stage 1/Stage 2 restructuring actually
+    /// reaches the bounded batch API in production, not just in the
+    /// storage-layer's own unit tests. Filters `call_site_stats()` to this
+    /// one specific internal call site (rather than a global reset) so
+    /// this assertion is robust to unrelated writer-gate traffic from any
+    /// other test running concurrently in this same binary.
+    #[tokio::test]
+    async fn a_wire_batch_larger_than_the_admission_chunk_size_is_admitted_in_bounded_db_groups() {
+        let signing_key = SigningKey::from_bytes(&[19u8; 32]);
+        let author_verifying_key = signing_key.verifying_key().to_bytes();
 
+        const N: usize = 20;
+        let sender = rusqlite::Connection::open_in_memory().unwrap();
+        dag_store::init_dag_schema(&sender).unwrap();
+        let version = empty_version();
+        dag_store::put_file_version(&sender, GROUP, &version).unwrap();
+        let emitter = ChangeEmitter::new("device-a", signing_key.clone());
+        let changes: Vec<Change> = (0..N)
+            .map(|i| {
+                dag_store::emit_local_change(
+                    &sender,
+                    GROUP,
+                    vec![create_op(&format!("bulk-{i:03}.txt"), &version)],
+                    ChangeAuth::PLACEHOLDER,
+                    &emitter,
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let sync_root = root_dir.path().canonicalize().unwrap();
+        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
+        let generation = state.startup_readiness().begin_group_startup(GROUP);
+        state.startup_readiness().mark_group_ready(GROUP, generation);
+        let session = PeerSyncSession::new_with_forwarding(
+            unreachable_channel().await,
+            "device-b".to_string(),
+            "device-a".to_string(),
+            state.clone(),
+            store,
+            vec![GROUP.to_string()],
+            HashMap::from([(GROUP.to_string(), sync_root)]),
+            None,
+            PeerSyncSessionOneTimeDeps {
+                change_authenticator: Arc::new(TestAuthenticator {
+                    author_device_id: "device-a".to_string(),
+                    author_verifying_key,
+                }),
+                ..PeerSyncSessionOneTimeDeps::test_permissive()
+            },
+        );
+
+        let before: u64 = yadorilink_sqlite_runtime::c4_diag::call_site_stats()
+            .into_iter()
+            .filter(|(site, _)| site.contains("change_history.rs:557"))
+            .map(|(_, count)| count)
+            .sum();
+
+        session
+            .handle_change_batch(yadorilink_sync_wire::ChangeBatchFrame {
+                folder_group_id: GROUP.to_string(),
+                changes: changes.iter().map(|c| c.to_wire_bytes()).collect(),
+                file_versions: vec![version.canonical_encoding()],
+                more: false,
+            })
+            .await
+            .unwrap();
+
+        for change in &changes {
+            assert!(
+                state.change_history_repository().dag_has_change(&change.compute_hash()).unwrap(),
+                "every one of the {N} independent Changes in the wire batch must be durably \
+                 admitted"
+            );
+        }
+
+        let after: u64 = yadorilink_sqlite_runtime::c4_diag::call_site_stats()
+            .into_iter()
+            .filter(|(site, _)| site.contains("change_history.rs:557"))
+            .map(|(_, count)| count)
+            .sum();
+        let delta = after - before;
         assert!(
-            state.file_index_repository().get_file(GROUP, "a.txt").unwrap().is_some(),
-            "the parent's path must be materialized"
+            delta >= 1 && delta <= N as u64,
+            "sanity: at least one fast-path call must have run and at most {N} (one per Change, \
+             the pre-batching shape), got {delta}"
         );
         assert!(
-            state.file_index_repository().get_file(GROUP, "b.txt").unwrap().is_some(),
-            "the promoted orphan's path must be materialized in the same audit pass"
-        );
-        // ...and both changes are marked applied, so the backstop has nothing
-        // left to re-drive.
-        assert!(
-            state.change_history_repository().dag_list_unapplied_changes(GROUP).unwrap().is_empty(),
-            "both the parent and the promoted orphan must be marked applied after one audit pass"
+            delta <= 5,
+            "{N} Changes chunked at REMOTE_ADMISSION_BATCH_SIZE=8 must take roughly \
+             ceil({N} / 8) = 3 fast-path calls, not one per Change -- got {delta} (a generous \
+             upper bound of 5 tolerates a small number of exceptional-fallback replays without \
+             this assertion becoming exactly ceil(N/8) fragile)"
         );
     }
 
@@ -7358,8 +8822,8 @@ mod promoted_orphan_projection_tests {
         let empty_batch = || yadorilink_sync_wire::ChangeBatchFrame {
             folder_group_id: GROUP.to_string(),
             changes: vec![],
-            compressed_changes: Vec::new(),
             file_versions: vec![],
+            more: false,
         };
 
         // Closed: the admission call must not complete.
@@ -7417,9 +8881,10 @@ mod promoted_orphan_projection_tests {
             4096,
             FileMeta {
                 mtime_unix_nanos: 0,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         );
         let sender = rusqlite::Connection::open_in_memory().unwrap();
@@ -7469,8 +8934,8 @@ mod promoted_orphan_projection_tests {
         let batch = yadorilink_sync_wire::ChangeBatchFrame {
             folder_group_id: GROUP.to_string(),
             changes: vec![change.to_wire_bytes()],
-            compressed_changes: Vec::new(),
             file_versions: vec![version.canonical_encoding()],
+            more: false,
         };
 
         let started = std::time::Instant::now();
@@ -7573,8 +9038,8 @@ mod promoted_orphan_projection_tests {
             .handle_change_batch(yadorilink_sync_wire::ChangeBatchFrame {
                 folder_group_id: GROUP.to_string(),
                 changes: vec![child.to_wire_bytes()],
-                compressed_changes: Vec::new(),
                 file_versions: vec![version.canonical_encoding()],
+                more: false,
             })
             .await
             .unwrap();
@@ -7604,8 +9069,8 @@ mod promoted_orphan_projection_tests {
             .handle_change_batch(yadorilink_sync_wire::ChangeBatchFrame {
                 folder_group_id: GROUP.to_string(),
                 changes: vec![parent.to_wire_bytes()],
-                compressed_changes: Vec::new(),
                 file_versions: vec![version.canonical_encoding()],
+                more: false,
             })
             .await
             .unwrap();
@@ -7619,17 +9084,18 @@ mod promoted_orphan_projection_tests {
 
     /// Pins invariant 3: sending the identical `ChangeBatch` twice must not
     /// duplicate the observable effects of admission -- neither a second,
-    /// competing DAG head nor a re-armed/duplicated materialization job.
+    /// competing DAG head nor a re-armed/duplicated projection obligation.
     /// `dag_store::append_is_idempotent_under_duplicate_delivery` already
     /// proves DAG-level idempotency (`changes`/`group_heads` row counts) for
     /// `dag_store::append_change` directly; this instead exercises the real
     /// `handle_change_batch` entry point end to end and additionally pins
-    /// the materialization-job side, whose own idempotency rule
-    /// (`materialization_jobs::enqueue_pending`'s doc comment: "same
-    /// version, non-terminal: ... must not be reset") is a separate
-    /// mechanism from DAG admission's own.
+    /// the projection-obligation side (Phase D: the obligation-driven
+    /// scheduler's own live claim source, replacing this test's original
+    /// `materialization_jobs`-based assertion, retired once
+    /// `handle_change_batch` stopped separately enqueuing into that table --
+    /// see `admit_prepared_emission`/`dag_store::admit_change`'s own bump).
     #[tokio::test]
-    async fn duplicate_change_batch_does_not_duplicate_the_dag_head_or_the_materialization_job() {
+    async fn duplicate_change_batch_does_not_duplicate_the_dag_head_or_the_projection_obligation() {
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
         let author_verifying_key = signing_key.verifying_key().to_bytes();
         let (parent, _child, version) = build_parent_then_child(&signing_key);
@@ -7667,42 +9133,229 @@ mod promoted_orphan_projection_tests {
         let batch = || yadorilink_sync_wire::ChangeBatchFrame {
             folder_group_id: GROUP.to_string(),
             changes: vec![parent.to_wire_bytes()],
-            compressed_changes: Vec::new(),
             file_versions: vec![version.canonical_encoding()],
+            more: false,
         };
 
         session.handle_change_batch(batch()).await.unwrap();
         assert!(state.change_history_repository().dag_has_change(&parent.compute_hash()).unwrap());
         let heads_after_first = state.sqlite().dag_group_heads(GROUP).unwrap();
-        let job_after_first = state
-            .materialization_job_repository()
-            .materialization_get_job(GROUP, "a.txt")
+        let obligation_after_first = state
+            .sqlite()
+            .dag_lookup_projection_obligation(GROUP, "a.txt")
             .unwrap()
-            .expect("a materialization job must be enqueued after the first admission");
+            .expect("a projection obligation must exist after the first admission");
 
         // A little real elapsed time so that, if the second delivery DID
-        // touch the job row (re-arming it), `updated_at`/`last_progress_at`
-        // would visibly differ -- making this a genuine idempotency check,
-        // not one that only passes because both calls happened to land in
-        // the same clock tick.
+        // touch the obligation row (re-arming it), `updated_at` would
+        // visibly differ -- making this a genuine idempotency check, not
+        // one that only passes because both calls happened to land in the
+        // same clock tick.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Resend the identical batch.
         session.handle_change_batch(batch()).await.unwrap();
         let heads_after_second = state.sqlite().dag_group_heads(GROUP).unwrap();
-        let job_after_second = state
-            .materialization_job_repository()
-            .materialization_get_job(GROUP, "a.txt")
+        let obligation_after_second = state
+            .sqlite()
+            .dag_lookup_projection_obligation(GROUP, "a.txt")
             .unwrap()
-            .expect("the job row must still exist after a duplicate delivery");
+            .expect("the obligation must still exist after a duplicate delivery");
 
         assert_eq!(
             heads_after_first, heads_after_second,
             "a duplicate change must not create a second, competing DAG head"
         );
         assert_eq!(
-            job_after_first, job_after_second,
-            "a duplicate change must not re-arm or otherwise mutate the materialization job row"
+            obligation_after_first, obligation_after_second,
+            "a duplicate change must not re-arm or otherwise mutate the projection obligation"
+        );
+    }
+
+    /// Phase D's headline regression: `admitted -> admitted` must be a
+    /// zero-projection-event no-op, not merely "idempotent
+    /// after one extra delivery" -- replaying the SAME already-admitted
+    /// batch 1000 times must never accumulate any observable side effect,
+    /// at any point along the way, not just at the end. Checked directly
+    /// via full-row equality (not just presence) on every one of the two
+    /// durable records a real admission touches: the `projection_
+    /// obligations` row (would-be re-arm target) and the
+    /// `path_materialized_generations` row (would-be stale-proof target,
+    /// which stays absent here since nothing in this unit-style harness
+    /// ever materializes -- proving it's never spuriously created either).
+    /// DAG heads are checked too, at the end, as the coarsest possible
+    /// "nothing else moved" signal. Does not rely on code inspection of
+    /// the `dag_has_change -> continue` branch alone.
+    #[tokio::test]
+    async fn duplicate_admitted_change_has_zero_projection_side_effects() {
+        let signing_key = SigningKey::from_bytes(&[13u8; 32]);
+        let author_verifying_key = signing_key.verifying_key().to_bytes();
+        let (parent, _child, version) = build_parent_then_child(&signing_key);
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let sync_root = root_dir.path().canonicalize().unwrap();
+        let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
+        let generation = state.startup_readiness().begin_group_startup(GROUP);
+        state.startup_readiness().mark_group_ready(GROUP, generation);
+        let session = PeerSyncSession::new_with_forwarding(
+            unreachable_channel().await,
+            "device-b".to_string(),
+            "device-a".to_string(),
+            state.clone(),
+            Arc::new(FsBlockStore::new(store_dir.path()).unwrap()),
+            vec![GROUP.to_string()],
+            HashMap::from([(GROUP.to_string(), sync_root)]),
+            None,
+            PeerSyncSessionOneTimeDeps {
+                change_authenticator: Arc::new(TestAuthenticator {
+                    author_device_id: "device-a".to_string(),
+                    author_verifying_key,
+                }),
+                ..PeerSyncSessionOneTimeDeps::test_permissive()
+            },
+        );
+        let batch = || yadorilink_sync_wire::ChangeBatchFrame {
+            folder_group_id: GROUP.to_string(),
+            changes: vec![parent.to_wire_bytes()],
+            file_versions: vec![version.canonical_encoding()],
+            more: false,
+        };
+
+        session.handle_change_batch(batch()).await.unwrap();
+        let heads_after_admission = state.sqlite().dag_group_heads(GROUP).unwrap();
+        let obligation_after_admission = state
+            .sqlite()
+            .dag_lookup_projection_obligation(GROUP, "a.txt")
+            .unwrap()
+            .expect("a projection obligation must exist after the real admission");
+        let materialized_generation_after_admission =
+            state.sqlite().dag_lookup_materialized_generation(GROUP, "a.txt").unwrap();
+        assert!(
+            materialized_generation_after_admission.is_none(),
+            "sanity: nothing in this unit-style harness ever actually materializes anything"
+        );
+
+        const REPLAY_COUNT: usize = 1000;
+        for i in 0..REPLAY_COUNT {
+            session.handle_change_batch(batch()).await.unwrap();
+            let obligation_now = state
+                .sqlite()
+                .dag_lookup_projection_obligation(GROUP, "a.txt")
+                .unwrap()
+                .expect("the obligation must still exist after a duplicate delivery");
+            assert_eq!(
+                obligation_now, obligation_after_admission,
+                "replay {i}/{REPLAY_COUNT}: a duplicate delivery must never re-arm or otherwise \
+                 mutate the projection obligation, at any point during repeated replay"
+            );
+            assert!(
+                state.sqlite().dag_lookup_materialized_generation(GROUP, "a.txt").unwrap().is_none(),
+                "replay {i}/{REPLAY_COUNT}: a duplicate delivery must never spuriously create a \
+                 materialized-generation record"
+            );
+        }
+
+        assert_eq!(
+            state.sqlite().dag_group_heads(GROUP).unwrap(),
+            heads_after_admission,
+            "1000 duplicate deliveries must never create a second, competing DAG head"
+        );
+    }
+
+    /// PROJ-4, at the full `handle_change_batch` integration level (the
+    /// pre-existing unit test `bumping_one_path_never_touches_an_
+    /// unrelated_path` only proved this at the raw-SQL `bump_projection_
+    /// obligations_for_touched_paths` level): admitting a change
+    /// that touches "b.txt" must not perturb "a.txt"'s already-settled
+    /// obligation at all -- not its generation, not its `updated_at`, not
+    /// its existence. Real ammunition for this matters post Phase D: with
+    /// `redelivered_known` gone, admission-time invalidation is the ONLY
+    /// mechanism left that could possibly over-invalidate an unrelated path
+    /// if it were ever accidentally broadened.
+    #[tokio::test]
+    async fn unrelated_path_admission_does_not_invalidate_this_path() {
+        let signing_key = SigningKey::from_bytes(&[11u8; 32]);
+        let author_verifying_key = signing_key.verifying_key().to_bytes();
+        let (parent, child, version) = build_parent_then_child(&signing_key);
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let sync_root = root_dir.path().canonicalize().unwrap();
+        let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
+        let generation = state.startup_readiness().begin_group_startup(GROUP);
+        state.startup_readiness().mark_group_ready(GROUP, generation);
+        let session = PeerSyncSession::new_with_forwarding(
+            unreachable_channel().await,
+            "device-b".to_string(),
+            "device-a".to_string(),
+            state.clone(),
+            Arc::new(FsBlockStore::new(store_dir.path()).unwrap()),
+            vec![GROUP.to_string()],
+            HashMap::from([(GROUP.to_string(), sync_root)]),
+            None,
+            PeerSyncSessionOneTimeDeps {
+                change_authenticator: Arc::new(TestAuthenticator {
+                    author_device_id: "device-a".to_string(),
+                    author_verifying_key,
+                }),
+                ..PeerSyncSessionOneTimeDeps::test_permissive()
+            },
+        );
+
+        session
+            .handle_change_batch(yadorilink_sync_wire::ChangeBatchFrame {
+                folder_group_id: GROUP.to_string(),
+                changes: vec![parent.to_wire_bytes()],
+                file_versions: vec![version.canonical_encoding()],
+                more: false,
+            })
+            .await
+            .unwrap();
+        let obligation_before = state
+            .sqlite()
+            .dag_lookup_projection_obligation(GROUP, "a.txt")
+            .unwrap()
+            .expect("a.txt must have an obligation after its own admission");
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        session
+            .handle_change_batch(yadorilink_sync_wire::ChangeBatchFrame {
+                folder_group_id: GROUP.to_string(),
+                changes: vec![child.to_wire_bytes()],
+                file_versions: vec![version.canonical_encoding()],
+                more: false,
+            })
+            .await
+            .unwrap();
+        assert!(
+            state.change_history_repository().dag_has_change(&child.compute_hash()).unwrap(),
+            "sanity: the unrelated, b.txt-touching change must have actually landed"
+        );
+        let obligation_after = state
+            .sqlite()
+            .dag_lookup_projection_obligation(GROUP, "a.txt")
+            .unwrap()
+            .expect("a.txt's obligation must still exist");
+
+        assert_eq!(
+            obligation_before, obligation_after,
+            "an admission touching only b.txt must not perturb a.txt's obligation at all"
         );
     }
 
@@ -7759,8 +9412,8 @@ mod promoted_orphan_projection_tests {
             .handle_change_batch(yadorilink_sync_wire::ChangeBatchFrame {
                 folder_group_id: GROUP.to_string(),
                 changes: vec![change.to_wire_bytes()],
-                compressed_changes: Vec::new(),
                 file_versions: vec![version.canonical_encoding()],
+                more: false,
             })
             .await
             .unwrap();
@@ -7836,8 +9489,8 @@ mod promoted_orphan_projection_tests {
             .handle_change_batch(yadorilink_sync_wire::ChangeBatchFrame {
                 folder_group_id: GROUP.to_string(),
                 changes: vec![forged.to_wire_bytes()],
-                compressed_changes: Vec::new(),
                 file_versions: vec![version.canonical_encoding()],
+                more: false,
             })
             .await
             .unwrap();
@@ -7856,8 +9509,8 @@ mod promoted_orphan_projection_tests {
             .handle_change_batch(yadorilink_sync_wire::ChangeBatchFrame {
                 folder_group_id: GROUP.to_string(),
                 changes: vec![honest_parent.to_wire_bytes()],
-                compressed_changes: Vec::new(),
                 file_versions: vec![honest_version.canonical_encoding()],
+                more: false,
             })
             .await
             .unwrap();
@@ -7870,144 +9523,11 @@ mod promoted_orphan_projection_tests {
         );
     }
 
-    /// Pins invariant 7: `dag_mark_applied` is only ever called from
-    /// `reproject_unapplied_changes`, and only for a change whose
-    /// projection this audit attempt actually proved successful
-    /// (`change_projection_succeeded`) -- never unconditionally just
-    /// because an audit ran. `reverse_ordered_batch_projects_both_paths_
-    /// immediately` above proves the SUCCESS half (an audit that can
-    /// complete DOES mark applied); this proves the complementary FAILURE
-    /// half, reusing `handle_change_batch_never_blocks_on_an_unfetchable_
-    /// block`'s own unfetchable-block construction (a projection
-    /// precondition -- the block's content -- that can never be satisfied
-    /// over this test's unreachable channel) to show that running the
-    /// audit explicitly does NOT mark the change applied when its
-    /// projection still cannot succeed. Together these two tests pin
-    /// invariant 6 as well: an admitted-but-unprojectable change is neither
-    /// lost nor falsely marked done, so it stays exactly the kind of
-    /// "admitted but unapplied" state `reproject_unapplied_changes` is
-    /// built to keep retrying.
-    #[tokio::test]
-    async fn reproject_unapplied_changes_does_not_mark_applied_when_projection_still_fails() {
-        use yadorilink_replica_domain::file::VersionBlock;
-        use yadorilink_replica_domain::ids::BlockHash;
-
-        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
-        let author_verifying_key = signing_key.verifying_key().to_bytes();
-
-        let version = FileVersion::new(
-            vec![VersionBlock { hash: BlockHash(vec![0xCD; 32]), size: 4096 }],
-            4096,
-            FileMeta {
-                mtime_unix_nanos: 0,
-                exec_bit: false,
-                symlink_target: None,
-                record_kind: RecordKind::File,
-            },
-        );
-        let sender = rusqlite::Connection::open_in_memory().unwrap();
-        dag_store::init_dag_schema(&sender).unwrap();
-        dag_store::put_file_version(&sender, GROUP, &version).unwrap();
-        let emitter = ChangeEmitter::new("device-a", signing_key.clone());
-        let change = dag_store::emit_local_change(
-            &sender,
-            GROUP,
-            vec![create_op("still-unfetchable.bin", &version)],
-            ChangeAuth::PLACEHOLDER,
-            &emitter,
-        )
-        .unwrap();
-
-        let root_dir = tempfile::tempdir().unwrap();
-        let store_dir = tempfile::tempdir().unwrap();
-        let sync_root = root_dir.path().canonicalize().unwrap();
-        let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-        state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
-        // Force `Eager` materialization: an `OnDemand` group would
-        // materialize a correctly-sized placeholder without ever needing
-        // the block's actual bytes, which would make this change project
-        // successfully regardless of block availability -- defeating the
-        // whole point of this test, which needs projection to genuinely be
-        // unable to complete.
-        state
-            .link_repository()
-            .set_materialization_policy(
-                &sync_root.to_string_lossy(),
-                yadorilink_replica_domain::session_state::MaterializationPolicy::Eager,
-            )
-            .unwrap();
-        yadorilink_root_authority::root_identity::VerifiedRoot::open(
-            &sync_root,
-            GROUP,
-            state.as_ref(),
-        )
-        .unwrap();
-        let generation = state.startup_readiness().begin_group_startup(GROUP);
-        state.startup_readiness().mark_group_ready(GROUP, generation);
-        let session = PeerSyncSession::new_with_forwarding(
-            unreachable_channel().await,
-            "device-b".to_string(),
-            "device-a".to_string(),
-            state.clone(),
-            Arc::new(FsBlockStore::new(store_dir.path()).unwrap()),
-            vec![GROUP.to_string()],
-            HashMap::from([(GROUP.to_string(), sync_root)]),
-            None,
-            PeerSyncSessionOneTimeDeps {
-                change_authenticator: Arc::new(TestAuthenticator {
-                    author_device_id: "device-a".to_string(),
-                    author_verifying_key,
-                }),
-                ..PeerSyncSessionOneTimeDeps::test_permissive()
-            },
-        );
-
-        session
-            .handle_change_batch(yadorilink_sync_wire::ChangeBatchFrame {
-                folder_group_id: GROUP.to_string(),
-                changes: vec![change.to_wire_bytes()],
-                compressed_changes: Vec::new(),
-                file_versions: vec![version.canonical_encoding()],
-            })
-            .await
-            .unwrap();
-        assert!(state.change_history_repository().dag_has_change(&change.compute_hash()).unwrap());
-        assert!(!state
-            .change_history_repository()
-            .dag_list_unapplied_changes(GROUP)
-            .unwrap()
-            .is_empty());
-
-        // Explicitly drive the same re-projection audit
-        // `reconcile_local_materialization_audit` calls internally. The
-        // block is still unfetchable (no reachable peer, same as above), so
-        // projection still cannot succeed.
-        session.reproject_unapplied_changes(GROUP, 1).await.unwrap();
-
-        // The index record and a `Pending` materialization job exist (the
-        // eager-fetch attempt was armed) but the block was never actually
-        // obtained -- the file stays a `Placeholder`, never `Hydrated`.
-        assert_eq!(
-            state
-                .materialization_state_repository()
-                .get_materialization_state(GROUP, "still-unfetchable.bin")
-                .unwrap(),
-            Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder),
-            "the file must still be a placeholder, not hydrated -- content was never obtained"
-        );
-        let still_unapplied =
-            state.change_history_repository().dag_list_unapplied_changes(GROUP).unwrap();
-        assert!(
-            still_unapplied.iter().any(|c| c.compute_hash() == change.compute_hash()),
-            "a change whose projection still cannot succeed must remain unapplied after an audit \
-             attempt -- dag_mark_applied must only be called once projection actually succeeds, \
-             not just because an audit ran"
-        );
-    }
 }
 
 #[cfg(test)]
 mod reconcile_group_paths_flush_tests {
+    use crate::drive_materialization_for_test_impl;
     use ed25519_dalek::SigningKey;
     use std::collections::{BTreeSet, HashMap};
     use std::future::Future;
@@ -8063,35 +9583,18 @@ mod reconcile_group_paths_flush_tests {
             0,
             FileMeta {
                 mtime_unix_nanos: 0,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         )
     }
 
     /// A live channel with no reachable peer: `handle_change_batch` may enqueue
     /// an outbound change-request for a missing parent; the send simply queues.
-    async fn unreachable_channel() -> Arc<yadorilink_transport::PeerChannel> {
-        use boringtun::x25519::{PublicKey, StaticSecret};
-        let mut secret_bytes = [0u8; 32];
-        rand::fill(&mut secret_bytes);
-        let local_secret = StaticSecret::from(secret_bytes);
-        let local_public = PublicKey::from(&local_secret);
-        let peer_public = PublicKey::from(&StaticSecret::from([9u8; 32]));
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let hub = yadorilink_transport::TransportHub::from_socket(socket, Some(local_public));
-        Arc::new(
-            yadorilink_transport::PeerChannel::connect(
-                local_secret,
-                peer_public,
-                0,
-                Vec::new(),
-                hub,
-            )
-            .await
-            .unwrap(),
-        )
+    async fn unreachable_channel() -> Arc<super::SilentPeerChannel> {
+        Arc::new(super::SilentPeerChannel)
     }
 
     fn batch_of(
@@ -8101,8 +9604,8 @@ mod reconcile_group_paths_flush_tests {
         yadorilink_sync_wire::ChangeBatchFrame {
             folder_group_id: GROUP.to_string(),
             changes: changes.iter().map(|c| c.to_wire_bytes()).collect(),
-            compressed_changes: Vec::new(),
             file_versions: versions.iter().map(|v| v.canonical_encoding()).collect(),
+            more: false,
         }
     }
 
@@ -8336,7 +9839,7 @@ mod reconcile_group_paths_flush_tests {
     /// Scenario (a): a genuinely concurrent local edit to P is captured by the
     /// admission-loop flush (P is the incoming change's own path) and preserved
     /// as a conflict copy rather than silently overwritten.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_edit_via_change_batch_preserves_local_edit_as_conflict_copy() {
         let h = setup().await;
         let version = empty_version();
@@ -8351,7 +9854,7 @@ mod reconcile_group_paths_flush_tests {
         // `handle_change_batch` now only admits the change and enqueues a
         // materialization job (CONV-1); drive the same projection step the
         // Convergence Engine would.
-        h.session.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
+        drive_materialization_for_test_impl(&h.session, &h.state, GROUP).await.unwrap();
         assert!(h.sync_root.join(P).exists(), "baseline P must materialize");
 
         let flush = h.flush.clone();
@@ -8364,7 +9867,7 @@ mod reconcile_group_paths_flush_tests {
         // admission loop flushes P first, turning the pending edit into a
         // genuinely concurrent change.
         h.session.handle_change_batch(batch_of(&[r], &[&version])).await.unwrap();
-        h.session.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
+        drive_materialization_for_test_impl(&h.session, &h.state, GROUP).await.unwrap();
 
         let copies = conflict_copy_files(&h.sync_root);
         assert_eq!(copies.len(), 1, "exactly one conflict copy expected; found {copies:?}");
@@ -8389,12 +9892,12 @@ mod reconcile_group_paths_flush_tests {
         let (c0, r) = (&chain[0], &chain[1]);
 
         h.session.handle_change_batch(batch_of(&[c0], &[&version])).await.unwrap();
-        h.session.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
+        drive_materialization_for_test_impl(&h.session, &h.state, GROUP).await.unwrap();
         // Local edit on disk, but no flush handle wired: nothing dispatches it.
         std::fs::write(h.sync_root.join(P), LOCAL_EDIT).unwrap();
 
         h.session.handle_change_batch(batch_of(&[r], &[&version])).await.unwrap();
-        h.session.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
+        drive_materialization_for_test_impl(&h.session, &h.state, GROUP).await.unwrap();
 
         assert!(
             conflict_copy_files(&h.sync_root).is_empty(),
@@ -8413,7 +9916,7 @@ mod reconcile_group_paths_flush_tests {
     /// (tombstone) resolution in `reconcile_group_paths` captures P's pending
     /// edit before the delete. Without that fix this test fails: P is deleted
     /// and the reconcile-site flush is never asked for P.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn promoted_orphan_tombstone_flushes_pending_local_edit_before_delete() {
         let h = setup().await;
         let version = empty_version();
@@ -8426,7 +9929,7 @@ mod reconcile_group_paths_flush_tests {
 
         // Baseline: adopt C0 so P is live on disk and in the index.
         h.session.handle_change_batch(batch_of(&[c0], &[&version])).await.unwrap();
-        h.session.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
+        drive_materialization_for_test_impl(&h.session, &h.state, GROUP).await.unwrap();
         assert!(h.sync_root.join(P).exists(), "baseline P must materialize");
 
         let flush = h.flush.clone();
@@ -8451,7 +9954,7 @@ mod reconcile_group_paths_flush_tests {
         // pass rather than inline here) is the sole line of defense for P's
         // pending edit.
         h.session.handle_change_batch(batch_of(&[par], &[&version])).await.unwrap();
-        h.session.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
+        drive_materialization_for_test_impl(&h.session, &h.state, GROUP).await.unwrap();
 
         let calls = flush.take_calls();
         assert!(
@@ -8486,12 +9989,12 @@ mod reconcile_group_paths_flush_tests {
         let (c0, par, o) = (&chain[0], &chain[1], &chain[2]);
 
         h.session.handle_change_batch(batch_of(&[c0], &[&version])).await.unwrap();
-        h.session.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
+        drive_materialization_for_test_impl(&h.session, &h.state, GROUP).await.unwrap();
         h.session.handle_change_batch(batch_of(&[o], &[])).await.unwrap();
         // Local edit on disk, but no flush handle wired.
         std::fs::write(h.sync_root.join(P), LOCAL_EDIT).unwrap();
         h.session.handle_change_batch(batch_of(&[par], &[&version])).await.unwrap();
-        h.session.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
+        drive_materialization_for_test_impl(&h.session, &h.state, GROUP).await.unwrap();
 
         // No flush => the tombstone wins and P is deleted from the index.
         let rec = h.state.file_index_repository().get_file(GROUP, P).unwrap().unwrap();
@@ -8688,10 +10191,15 @@ mod reconcile_group_paths_flush_tests {
     }
 }
 
+/// The responder side of the exact-version-hash check, plus the local-path
+/// guards that share its fixture shape. Named for a capability bit that no
+/// longer exists: the check itself was never optional, and with the
+/// negotiation gone it is simply what every responder does.
 #[cfg(test)]
-mod version_hash_exact_capability_tests {
+mod exact_version_hash_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Duration;
     use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
     use yadorilink_ipc_proto::sync as proto;
     use yadorilink_local_storage::FsBlockStore;
@@ -8706,25 +10214,8 @@ mod version_hash_exact_capability_tests {
     /// A live channel to nowhere, sufficient to construct a `PeerSyncSession`
     /// for a purely local, no-network test — mirrors `promoted_orphan_
     /// projection_tests::unreachable_channel`.
-    async fn unreachable_channel() -> Arc<yadorilink_transport::PeerChannel> {
-        use boringtun::x25519::{PublicKey, StaticSecret};
-        let mut secret_bytes = [0u8; 32];
-        rand::fill(&mut secret_bytes);
-        let local_secret = StaticSecret::from(secret_bytes);
-        let local_public = PublicKey::from(&local_secret);
-        let peer_public = PublicKey::from(&StaticSecret::from([9u8; 32]));
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let hub = yadorilink_transport::TransportHub::from_socket(socket, Some(local_public));
-        let channel = yadorilink_transport::PeerChannel::connect(
-            local_secret,
-            peer_public,
-            0,
-            Vec::new(),
-            hub,
-        )
-        .await
-        .unwrap();
-        Arc::new(channel)
+    async fn unreachable_channel() -> Arc<super::SilentPeerChannel> {
+        Arc::new(super::SilentPeerChannel)
     }
 
     /// Claims a sync root for the group, as linking the folder does. Tests that
@@ -8782,66 +10273,8 @@ mod version_hash_exact_capability_tests {
         );
     }
 
-    /// A freshly constructed session — never having run a `ClusterConfig`
-    /// handshake at all, the same starting state as a session that DID run
-    /// one against a peer predating this field (which always leaves it
-    /// `false`) — must report the capability as not negotiated. Recording an
-    /// advertisement of `true` then flips it, mirroring `record_peer_
-    /// version_present_support`'s pattern this field's negotiation copies.
-    #[tokio::test]
-    async fn defaults_unsupported_and_flips_once_advertised() {
-        let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-        let store: Arc<dyn yadorilink_local_storage::BlockContentStore> =
-            Arc::new(FsBlockStore::new(tempfile::tempdir().unwrap().path()).unwrap());
-        let session = new_session(state, store).await;
-
-        assert!(
-            !session.version_hash_exact_negotiated(),
-            "a session that never completed the handshake must default to unsupported, exactly \
-             like a peer that predates the field"
-        );
-
-        session.record_peer_version_hash_exact_support(true);
-        assert!(
-            session.version_hash_exact_negotiated(),
-            "recording a peer's advertised support must flip the negotiated flag"
-        );
-
-        // A `false` advertisement (or none at all) must never clear an
-        // already-recorded `true` — the field only ever latches on, exactly
-        // like every other one-shot capability flag in this file.
-        session.record_peer_version_hash_exact_support(false);
-        assert!(
-            session.version_hash_exact_negotiated(),
-            "a later false/absent advertisement must not un-negotiate an already-confirmed \
-             capability"
-        );
-    }
-
-    /// This build's own outgoing handshake always advertises the capability
-    /// — it always enforces the exact-hash check on the answering side, so
-    /// advertising anything else would be a lie a peer could rely on.
-    #[tokio::test]
-    async fn this_build_always_advertises_the_capability() {
-        let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-        let store: Arc<dyn yadorilink_local_storage::BlockContentStore> =
-            Arc::new(FsBlockStore::new(tempfile::tempdir().unwrap().path()).unwrap());
-        let session = new_session(state, store).await;
-
-        let frame = session.cluster_config_message();
-        let yadorilink_sync_wire::OutboundFrame::ClusterConfig(config) = frame else {
-            panic!("cluster_config_message must produce a ClusterConfig frame");
-        };
-        assert!(
-            config.supports_version_hash_exact,
-            "this build's responder always enforces the exact-version-hash check, so it must \
-             always advertise that capability"
-        );
-    }
-
-    /// Regression lock on `holds_version_durably`'s pre-existing behavior:
-    /// this capability-bit follow-up changes nothing about how the
-    /// RESPONDER itself verifies a query. A retained version whose block
+    /// Regression lock on `holds_version_durably`'s behavior: a retained
+    /// version whose block
     /// list happens to coincide with the query's (here, because only the
     /// mtime differs) must still be rejected when the queried `version_hash`
     /// does not equal that retained version's actual identity; the exact
@@ -9078,7 +10511,7 @@ mod version_hash_exact_capability_tests {
         assert!(!out_path.exists(), "no file was written before the simulated crash");
         assert!(
             state
-                .materialization_job_repository()
+                .materialization_intent_repository()
                 .has_materialization_intent(GROUP, "doc.txt")
                 .unwrap(),
             "the LIVE materialize path must journal a durable intent before committing the \
@@ -9093,6 +10526,7 @@ mod version_hash_exact_capability_tests {
             store.as_ref(),
             &sync_root,
             GROUP,
+            yadorilink_filesystem_sync::materialization_repair::RepairMode::Startup,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -9118,6 +10552,210 @@ mod version_hash_exact_capability_tests {
                 .unwrap()
                 .is_some_and(|r| !r.deleted),
             "the index row must remain a live (not-deleted) record — no tombstone"
+        );
+    }
+
+    /// M6-1A regression, still pending until now: `materialize`'s bulk
+    /// incoming-content path (the branch this module's own crash-recovery
+    /// test above also drives) wraps `ensure_blocks_present` with `BULK_
+    /// FETCH_RESPONSE_TIMEOUT`/`BULK_MATERIALIZE_TIMEOUT`, not the old
+    /// `FETCH_RESPONSE_TIMEOUT` (5s) -- see those constants' own doc
+    /// comments for the M6-1 finding this fixed: under the pre-QUIC
+    /// WireGuard-plus-ARQ transport, `FETCH_RESPONSE_TIMEOUT` was 5-13x
+    /// SHORTER than that transport's own real worst-case single-frame
+    /// recovery window, so this application layer routinely gave up on a
+    /// fetch the transport layer was still actively, successfully
+    /// retrying. The same class of problem exists under QUIC too --
+    /// `BULK_FETCH_RESPONSE_TIMEOUT` is now derived from
+    /// `yadorilink_transport::PEER_IDLE_TIMEOUT` (30s) instead, the real
+    /// worst case for "the peer stopped answering and nobody has noticed
+    /// yet" under the current transport -- so this fix and its test stay
+    /// warranted regardless of which transport originally motivated it.
+    /// This drives a REAL two-socket peer connection (not
+    /// `unreachable_channel`, unlike every other test in this module) with
+    /// a hand-scripted responder that deliberately delays its block
+    /// response past the OLD 5s ceiling but well inside the NEW bulk
+    /// one, and asserts two things the fix's own value is entirely about:
+    /// (1) the fetch still succeeds -- the old 5s timeout would have
+    /// reported `TimedOut` here and left a placeholder -- and (2) the
+    /// responder saw exactly ONE block request for this hash, never a
+    /// second one: `ensure_blocks_present`'s retry loop does not treat
+    /// `FetchOutcome::TimedOut` as retriable (see its own doc comment on
+    /// that arm), so a request that eventually succeeds within the bulk
+    /// budget must never have been retried in the first place -- a
+    /// regression that reintroduced the old short timeout would fail
+    /// assertion (1); a regression that made this layer retry on ordinary
+    /// slowness would fail assertion (2).
+    #[tokio::test]
+    async fn bulk_materialize_survives_a_reply_delay_past_the_old_fetch_timeout() {
+        use prost::Message as _;
+
+        // Comfortably past `FETCH_RESPONSE_TIMEOUT` (5s, the OLD ceiling
+        // this fix replaced for this exact path) and comfortably under
+        // `yadorilink_transport::PEER_IDLE_TIMEOUT` (30s) plus
+        // `BULK_FETCH_RESPONSE_TIMEOUT`'s own +10s margin on top of that
+        // (40s total, `BULK_FETCH_RESPONSE_TIMEOUT`'s actual value) --
+        // this value only needs to cross the OLD ceiling, not approach the
+        // new one, to prove the fix; picked well clear of both bounds so
+        // the assertion is unambiguous either way.
+        const REPLY_DELAY: Duration = Duration::from_secs(8);
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn yadorilink_local_storage::BlockContentStore> =
+            Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let root_dir = tempfile::tempdir().unwrap();
+        let sync_root = root_dir.path().canonicalize().unwrap();
+        state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
+        adopt_root(&state, GROUP, &sync_root);
+        let generation = state.startup_readiness().begin_group_startup(GROUP);
+        state.startup_readiness().mark_group_ready(GROUP, generation);
+        let sync_roots = HashMap::from([(GROUP.to_string(), sync_root.clone())]);
+
+        // Deliberately NOT stored/provenance-recorded locally: this block
+        // must actually cross the (slow) wire, exercising the real
+        // `fetch_block_raw` timeout this test is about -- the crash-
+        // recovery test above documents the opposite (already-present)
+        // case's own reason for avoiding a live peer.
+        let content = b"bulk-path content delayed past the old 5s ceiling".to_vec();
+        let hash = super::sha256_bytes(&content);
+        let record = FileRecord {
+            path: "slow-arrival.bin".to_string(),
+            size: content.len() as u64,
+            mtime_unix_nanos: 1,
+            blocks: vec![BlockInfo { hash: hash.clone(), offset: 0, size: content.len() as u32 }],
+            deleted: false,
+        };
+
+        let addr = super::bind_unused_addr().await;
+        let (fetcher_channel, responder_channel) = super::connect_pair(addr).await;
+        let session = PeerSyncSession::new(
+            fetcher_channel,
+            "device-b".to_string(),
+            "device-a".to_string(),
+            state.clone(),
+            store.clone(),
+            vec![GROUP.to_string()],
+            sync_roots,
+        );
+        // Handshake consolidation (2026-09-02) moved the sole "wait for
+        // and process the peer's first frame" owner onto this
+        // crate-internal `peer_session_impl` type's own `run()` -- the
+        // rest of this test's session's own recv loop (needed for
+        // `fetch_block_raw`'s reply to ever be dispatched, hence the
+        // spawn below) will not start until that first exchange lands, so
+        // pre-seed the far end with exactly the one `ClusterConfig` `run()`
+        // needs before spawning it. The responder side otherwise never
+        // touches this control channel (only `accept_block_stream`), so
+        // this session's own outbound `ClusterConfig` (`run()`'s first
+        // send) is simply left unread, same as any other raw-peer test
+        // helper here that does not care about the reverse direction.
+        let handshake_from_responder = proto::SyncMessage {
+            payload: Some(proto::sync_message::Payload::ClusterConfig(proto::ClusterConfig {
+                max_inflight_requests: 64,
+                max_inflight_bytes: 64 * 1024 * 1024,
+                ..Default::default()
+            })),
+        }
+        .encode_to_vec();
+        responder_channel.send(handshake_from_responder).await.unwrap();
+        let _run_handle = tokio::spawn(session.clone().run());
+
+        // The scripted responder: waits for exactly one block request for
+        // this hash, sleeps `REPLY_DELAY`, then answers `Found` -- and
+        // keeps accepting afterward so an unwanted SECOND request (proof
+        // of an unwanted retry) would also be captured, not silently
+        // missed by the test ending too early. The bounded wait for a
+        // further stream is what ends the loop: no more requests arriving
+        // is the outcome this test wants, so it must be observable as the
+        // task finishing rather than as a hang.
+        let responder_content = content.clone();
+        // The task gets its own handle; this test keeps the original alive
+        // until its assertions have run, for the reason the raw-responder
+        // tests above spell out: dropping the last `Arc<QuicPeerChannel>`
+        // closes the connection, which would reset a body still in flight.
+        let responder_channel_for_task = responder_channel.clone();
+        let responder = tokio::spawn(async move {
+            let content = responder_content;
+            let mut requests_for_this_hash: u32 = 0;
+            loop {
+                let Ok(Some(mut stream)) = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    responder_channel_for_task.accept_block_stream(),
+                )
+                .await
+                else {
+                    break; // no further traffic -- done observing
+                };
+                let Ok(header) = stream
+                    .recv_message(yadorilink_transport::MAX_BLOCK_STREAM_HEADER_BYTES)
+                    .await
+                else {
+                    break;
+                };
+                let request = proto::BlockRequestHeader::decode(header.as_slice()).unwrap();
+                if request.block_hash != hash {
+                    continue;
+                }
+                requests_for_this_hash += 1;
+                if requests_for_this_hash == 1 {
+                    tokio::time::sleep(REPLY_DELAY).await;
+                    super::answer_block_request(
+                        &mut stream,
+                        &request,
+                        super::BlockAnswer::found(content.clone()),
+                    )
+                    .await;
+                }
+            }
+            requests_for_this_hash
+        });
+
+        let out_path = sync_root.join("slow-arrival.bin");
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            session.materialize(GROUP, &record, MaterializationPolicy::Eager, "device-a", None),
+        )
+        .await
+        .expect(
+            "materialize must resolve within the bulk budget, not hang -- REPLY_DELAY (8s) is \
+             far short of BULK_MATERIALIZE_TIMEOUT",
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                result,
+                yadorilink_peer_session::peer_session_impl::MaterializeResult::Settled(_)
+            ),
+            "expected a successful (Settled) materialize despite the delayed reply, got \
+             {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(&out_path).unwrap(),
+            content,
+            "the real content must have materialized once the delayed reply arrived"
+        );
+        assert_eq!(
+            state.materialization_state_repository().get_materialization_state(
+                GROUP,
+                "slow-arrival.bin"
+            ).unwrap(),
+            Some(MaterializationState::Hydrated),
+            "a reply that arrives within the bulk budget must produce a normal Hydrated row, \
+             not a placeholder -- the old 5s FETCH_RESPONSE_TIMEOUT would have timed out first \
+             and left exactly a placeholder here instead"
+        );
+
+        let requests_seen = responder.await.unwrap();
+        assert_eq!(
+            requests_seen,
+            1,
+            "exactly one block request must have been sent for this hash -- a response that \
+             arrives within BULK_FETCH_RESPONSE_TIMEOUT must never trigger a duplicate fetch \
+             (FetchOutcome::TimedOut, the only outcome that could have raced a slow-but-\
+             eventually-successful reply, is deliberately not retried inside \
+             ensure_blocks_present -- see that match arm's own doc comment)"
         );
     }
 
@@ -9663,10 +11301,11 @@ mod version_hash_exact_capability_tests {
             GROUP,
             &tombstone,
             &yadorilink_peer_session::peer_session_impl::IncomingWireMeta {
+                xattrs: Vec::new(),
                 record_kind: yadorilink_replica_domain::file::RecordKind::File,
                 symlink_target: None,
                 symlink_out_of_root: false,
-                exec_bit: false,
+                unix_mode: None,
                 authoring_change_hash: None,
                 origin_device_id: None,
             },
@@ -9714,11 +11353,10 @@ mod version_hash_exact_capability_tests {
     /// onto the still-live row -- it records neither the pending
     /// tombstone's authoring identity nor that a deletion is pending at
     /// all -- so nothing downstream can tell "durably resolved" from "live
-    /// file that happens to carry a hold reason". `Settled` here used to
-    /// feed straight into `reproject_unapplied_changes` marking this
-    /// tombstone's own DAG change permanently `applied`, which stops this
-    /// crate's only periodic convergence sweep from ever re-examining it
-    /// again even though nothing was deleted.
+    /// file that happens to carry a hold reason". `Settled` here would let
+    /// this path's projection obligation close as though the deletion had
+    /// actually happened, so nothing would ever re-examine it again even
+    /// though nothing was deleted.
     #[tokio::test]
     async fn hazardous_tombstone_of_a_genuine_live_row_reports_retry_required() {
         let store_dir = tempfile::tempdir().unwrap();
@@ -9950,7 +11588,7 @@ mod version_hash_exact_capability_tests {
         assert!(
             matches!(
                 result,
-                yadorilink_peer_session::peer_session_impl::MaterializeResult::Settled
+                yadorilink_peer_session::peer_session_impl::MaterializeResult::Settled(_)
             ),
             "this deletion already converged (the row is already a genuine tombstone, not a \
              scaffold) -- reporting RetryRequired here would churn forever on a redundant resend"
@@ -10073,7 +11711,7 @@ mod version_hash_exact_capability_tests {
 
         assert!(matches!(
             result,
-            yadorilink_peer_session::peer_session_impl::MaterializeResult::Settled
+            yadorilink_peer_session::peer_session_impl::MaterializeResult::Settled(_)
         ));
         assert_eq!(
             state.file_index_repository().get_authoring_change_hash(GROUP, "photo.jpg").unwrap(),
@@ -10669,7 +12307,7 @@ mod version_hash_exact_capability_tests {
         // The crux: the success path cleared the intent after the durable rename.
         assert!(
             !state
-                .materialization_job_repository()
+                .materialization_intent_repository()
                 .has_materialization_intent(GROUP, "doc.txt")
                 .unwrap(),
             "a completed materialize must leave NO materialization intent"
@@ -10684,6 +12322,7 @@ mod version_hash_exact_capability_tests {
             store.as_ref(),
             &sync_root,
             GROUP,
+            yadorilink_filesystem_sync::materialization_repair::RepairMode::Startup,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -10702,7 +12341,8 @@ mod version_hash_exact_capability_tests {
 }
 
 #[cfg(test)]
-mod dag_negotiated_restart_regression_tests {
+mod handshaken_peer_restart_regression_tests {
+    use crate::drive_materialization_for_test_impl;
     use ed25519_dalek::SigningKey;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -10718,7 +12358,7 @@ mod dag_negotiated_restart_regression_tests {
     use yadorilink_replica_domain::change::Op;
     use yadorilink_root_authority::ignore_patterns::EffectiveIgnoreSet;
 
-    const GROUP: &str = "restart-dag-negotiated-group";
+    const GROUP: &str = "restart-handshaken-peer-group";
 
     /// Pins one author's verifying key and treats it as a writer — the same
     /// shape `promoted_orphan_projection_tests`' `TestAuthenticator` uses.
@@ -10741,29 +12381,12 @@ mod dag_negotiated_restart_regression_tests {
     /// sending on it simply queues a datagram nobody reads (the send half
     /// stays open), which is all `handle_heads_announce` needs to run its
     /// real request-computation logic without a live two-sided connection.
-    async fn unreachable_channel() -> Arc<yadorilink_transport::PeerChannel> {
-        use boringtun::x25519::{PublicKey, StaticSecret};
-        let mut secret_bytes = [0u8; 32];
-        rand::fill(&mut secret_bytes);
-        let local_secret = StaticSecret::from(secret_bytes);
-        let local_public = PublicKey::from(&local_secret);
-        let peer_public = PublicKey::from(&StaticSecret::from([9u8; 32]));
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let hub = yadorilink_transport::TransportHub::from_socket(socket, Some(local_public));
-        let channel = yadorilink_transport::PeerChannel::connect(
-            local_secret,
-            peer_public,
-            0,
-            Vec::new(),
-            hub,
-        )
-        .await
-        .unwrap();
-        Arc::new(channel)
+    async fn unreachable_channel() -> Arc<super::SilentPeerChannel> {
+        Arc::new(super::SilentPeerChannel)
     }
 
-    #[tokio::test]
-    async fn startup_scan_change_must_reach_dag_negotiated_peer() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_scan_change_must_reach_an_already_handshaken_peer() {
         let signing_key = SigningKey::from_bytes(&[11u8; 32]);
         let author_verifying_key = signing_key.verifying_key().to_bytes();
 
@@ -10829,7 +12452,7 @@ mod dag_negotiated_restart_regression_tests {
             Arc::new(FsBlockStore::new(store_dir_b.path()).unwrap());
         // Retain a handle to the peer's block store so the test can supply the
         // block content the peer would fetch over a live channel — the
-        // `unreachable_channel` delivers no `BlockResponse`, so without this the
+        // `unreachable_channel` delivers no block content, so without this the
         // peer's records stay content-less bootstrap scaffolds that never
         // materialize either version's bytes.
         let store_b_seed = store_b.clone();
@@ -10871,7 +12494,7 @@ mod dag_negotiated_restart_regression_tests {
         );
 
         // The peer fetches v1's block content as part of pulling the
-        // pre-restart head (a live channel carries it in a `BlockResponse`).
+        // pre-restart head (a live channel carries it on a block stream).
         // Seeding the bytes straight into the peer's own CAS store models
         // that fetch's *end state*, but skips the provenance record the real
         // fetch path (`ensure_blocks_present`) always writes alongside it --
@@ -10890,14 +12513,14 @@ mod dag_negotiated_restart_regression_tests {
         let batch = yadorilink_sync_wire::ChangeBatchFrame {
             folder_group_id: GROUP.to_string(),
             changes: vec![change_v1.to_wire_bytes()],
-            compressed_changes: Vec::new(),
             file_versions: vec![version_v1.canonical_encoding()],
+            more: false,
         };
         session_b.handle_change_batch(batch).await.unwrap();
         // `handle_change_batch` only admits the change and enqueues a
         // materialization job now (CONV-1); drive the same projection step
         // the Convergence Engine would.
-        session_b.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
+        drive_materialization_for_test_impl(&session_b, &state_b, GROUP).await.unwrap();
         assert!(
             state_b.change_history_repository().dag_has_change(&heads_v1[0]).unwrap(),
             "sanity: the peer admitted the pre-restart change the normal way"
@@ -10917,7 +12540,7 @@ mod dag_negotiated_restart_regression_tests {
         let heads_after_restart = state_a.sqlite().dag_group_heads(GROUP).unwrap();
 
         // ---- The local device announces its (possibly stale) heads to the
-        // ---- DAG-negotiated peer, exactly as `announce_local_commit`/the
+        // ---- already-handshaken peer, exactly as `announce_local_commit`/the
         // ---- daemon's post-restart announce would.
         let announce = yadorilink_sync_wire::HeadsAnnounceFrame {
             folder_group_id: GROUP.to_string(),
@@ -10969,11 +12592,11 @@ mod dag_negotiated_restart_regression_tests {
         let batch_v2 = yadorilink_sync_wire::ChangeBatchFrame {
             folder_group_id: GROUP.to_string(),
             changes: vec![change_v2.to_wire_bytes()],
-            compressed_changes: Vec::new(),
             file_versions: vec![version_v2.canonical_encoding()],
+            more: false,
         };
         session_b.handle_change_batch(batch_v2).await.unwrap();
-        session_b.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
+        drive_materialization_for_test_impl(&session_b, &state_b, GROUP).await.unwrap();
 
         // ---- The peer must have learned about the offline edit. It must
         // ---- not still be sitting on the pre-restart (V1) content.
@@ -10981,7 +12604,7 @@ mod dag_negotiated_restart_regression_tests {
             state_b.file_index_repository().get_file(GROUP, "notes.txt").unwrap().unwrap();
         assert_ne!(
             peer_record_after.blocks, peer_record_v1.blocks,
-            "a DAG-heads-negotiated peer must receive the offline edit the restart scan \
+            "an already-handshaken peer must receive the offline edit the restart scan \
              reconciled locally, not remain stuck on the pre-restart content because the \
              announced heads never advanced past what the peer already has"
         );
@@ -10990,6 +12613,7 @@ mod dag_negotiated_restart_regression_tests {
 
 #[cfg(test)]
 mod dag_convergence_authority_tests {
+    use crate::drive_materialization_for_test_impl;
     use yadorilink_peer_session::peer_session_impl::{
         ChangeAuthenticator, PeerSyncSession, PeerSyncSessionOneTimeDeps,
     };
@@ -11020,32 +12644,15 @@ mod dag_convergence_authority_tests {
     /// A live channel with no reachable peer: sends just queue on the open send
     /// half, so a call under test never blocks on a peer. (Same shape as the
     /// promoted-orphan projection tests.)
-    async fn unreachable_channel() -> Arc<yadorilink_transport::PeerChannel> {
-        use boringtun::x25519::{PublicKey, StaticSecret};
-        let mut secret_bytes = [0u8; 32];
-        rand::fill(&mut secret_bytes);
-        let local_secret = StaticSecret::from(secret_bytes);
-        let local_public = PublicKey::from(&local_secret);
-        let peer_public = PublicKey::from(&StaticSecret::from([9u8; 32]));
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let hub = yadorilink_transport::TransportHub::from_socket(socket, Some(local_public));
-        let channel = yadorilink_transport::PeerChannel::connect(
-            local_secret,
-            peer_public,
-            0,
-            Vec::new(),
-            hub,
-        )
-        .await
-        .unwrap();
-        Arc::new(channel)
+    async fn unreachable_channel() -> Arc<super::SilentPeerChannel> {
+        Arc::new(super::SilentPeerChannel)
     }
 
-    async fn harness(local: &str, peer: &str, dag_negotiated: bool) -> Harness {
+    async fn harness(local: &str, peer: &str, peer_handshake_received: bool) -> Harness {
         harness_with_deps(
             local,
             peer,
-            dag_negotiated,
+            peer_handshake_received,
             PeerSyncSessionOneTimeDeps::test_permissive(),
         )
         .await
@@ -11056,7 +12663,7 @@ mod dag_convergence_authority_tests {
     async fn harness_with_deps(
         local: &str,
         peer: &str,
-        dag_negotiated: bool,
+        peer_handshake_received: bool,
         one_time_deps: PeerSyncSessionOneTimeDeps,
     ) -> Harness {
         let root_dir = tempfile::tempdir().unwrap();
@@ -11086,9 +12693,13 @@ mod dag_convergence_authority_tests {
             None,
             one_time_deps,
         );
-        if dag_negotiated {
-            session.record_peer_change_dag_support(true);
-            assert!(session.change_dag_negotiated());
+        if peer_handshake_received {
+            // Nothing is on the far end of this channel to send a real
+            // `ClusterConfig`, so the flag every announce path gates on is
+            // set directly. It is the whole of "the peer is talking to us"
+            // now that no capability bits are negotiated on top of it.
+            session.mark_peer_handshake_received_for_tests();
+            assert!(session.peer_handshake_received());
         }
         Harness { session, state, _root: root_dir, _store_dir: store_dir, root }
     }
@@ -11107,7 +12718,7 @@ mod dag_convergence_authority_tests {
     /// rejected instead of falling back to an empty version vector.
     #[tokio::test]
     async fn projected_rows_without_authoring_identity_are_rejected() {
-        let h = harness("device-local", "device-p", /*dag*/ true).await;
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
         let local = empty_record("split.txt", OLD_MTIME);
         h.state
             .file_index_repository()
@@ -11117,21 +12728,13 @@ mod dag_convergence_authority_tests {
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
-        assert!(
-            h.state
-                .materialization_job_repository()
-                .materialization_get_job(GROUP, "split.txt")
-                .unwrap()
-                .is_none(),
-            "precondition: no job enqueued yet"
-        );
-
         let incoming = empty_record("split.txt", NEW_MTIME);
         let meta = yadorilink_peer_session::peer_session_impl::IncomingWireMeta {
+            xattrs: Vec::new(),
             record_kind: RecordKind::File,
             symlink_target: None,
             symlink_out_of_root: false,
-            exec_bit: false,
+            unix_mode: None,
             origin_device_id: None,
             authoring_change_hash: None,
         };
@@ -11155,20 +12758,14 @@ mod dag_convergence_authority_tests {
             record.mtime_unix_nanos, OLD_MTIME,
             "neither side may be adopted by the legacy exchange -- the DAG decides"
         );
-        assert!(h
-            .state
-            .materialization_job_repository()
-            .materialization_get_job(GROUP, "split.txt")
-            .unwrap()
-            .is_none());
     }
 
     /// An independent review's finding: `apply_locked_record`'s own
     /// `Equal`-authoring branch (and `authoring_proves_redundant`'s own
     /// batched fast path, `rematerialize_local_records`'s only skip
     /// mechanism) used to trust `same_record_content` alone -- content
-    /// equality never proved `record_kind`/`symlink_target`/`exec_bit`
-    /// hadn't independently diverged (an interrupted `apply_exec_bit`, or
+    /// equality never proved `record_kind`/`symlink_target`/`unix_mode`
+    /// hadn't independently diverged (an interrupted `apply_unix_mode`, or
     /// any other way the index/disk end up out of step with the identical,
     /// already-admitted DAG version's own metadata). Reached the materia-
     /// lization-audit way (`reconcile_local_materialization_audit` ->
@@ -11177,8 +12774,8 @@ mod dag_convergence_authority_tests {
     /// exactly this class of drift, and it must not just detect it and
     /// fall through as if fully settled.
     #[tokio::test]
-    async fn equal_authoring_repairs_a_diverged_exec_bit() {
-        let h = harness("device-local", "device-p", /*dag*/ true).await;
+    async fn equal_authoring_repairs_a_diverged_unix_mode() {
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
         let out_path = h.root.join("run.sh");
         std::fs::write(&out_path, b"").unwrap();
 
@@ -11188,8 +12785,9 @@ mod dag_convergence_authority_tests {
             0,
             OLD_MTIME,
             RecordKind::File,
-            true, // the DAG version itself says executable
+            Some(0o755), // the DAG version itself says executable
             None,
+            Vec::new(),
         );
         let change = Change::create_signed(
             vec![],
@@ -11212,7 +12810,7 @@ mod dag_convergence_authority_tests {
 
         // This device already applied this exact version's content, but
         // its own exec bit (index AND disk) has drifted to non-executable
-        // -- simulating an interrupted `apply_exec_bit`, with nothing
+        // -- simulating an interrupted `apply_unix_mode`, with nothing
         // else about the record having changed.
         h.state
             .file_index_repository()
@@ -11232,10 +12830,10 @@ mod dag_convergence_authority_tests {
             .unwrap();
         h.state
             .file_index_repository()
-            .set_exec_bit(
+            .set_unix_mode(
                 GROUP,
                 "run.sh",
-                false,
+                Some(0o644),
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
@@ -11248,10 +12846,11 @@ mod dag_convergence_authority_tests {
             deleted: false,
         };
         let meta = yadorilink_peer_session::peer_session_impl::IncomingWireMeta {
+            xattrs: Vec::new(),
             record_kind: RecordKind::File,
             symlink_target: None,
             symlink_out_of_root: false,
-            exec_bit: true,
+            unix_mode: Some(0o755),
             origin_device_id: None,
             authoring_change_hash: Some(author),
         };
@@ -11269,8 +12868,9 @@ mod dag_convergence_authority_tests {
             ),
             "an equal-authoring repair must settle, not error or defer: {outcome:?}"
         );
-        assert!(
-            h.state.file_index_repository().get_exec_bit(GROUP, "run.sh").unwrap(),
+        assert_eq!(
+            h.state.file_index_repository().get_unix_mode(GROUP, "run.sh").unwrap(),
+            Some(0o755),
             "the index's own exec bit must be repaired to match the authoring change's version"
         );
         #[cfg(unix)]
@@ -11289,7 +12889,7 @@ mod dag_convergence_authority_tests {
     /// concurrent edit.
     #[tokio::test]
     async fn materialization_audit_runs_on_dag_session() {
-        let h = harness("device-d", "device-p", /*dag*/ true).await;
+        let h = harness("device-d", "device-p", /*peer handshake received*/ true).await;
         // An indexed (empty-content) record whose on-disk file is missing — the
         // shape the audit exists to repair.
         let rec = empty_record("audit.txt", OLD_MTIME);
@@ -11332,7 +12932,7 @@ mod dag_convergence_authority_tests {
     /// that produces these races.
     #[tokio::test]
     async fn a_stale_content_materialize_upgrades_to_the_newer_winner_in_place() {
-        let h = harness("device-local", "device-p", /*dag*/ true).await;
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
         let key_a = SigningKey::from_bytes(&[1u8; 32]);
         let version_old = empty_version(OLD_MTIME);
         let change_old = Change::create_signed(
@@ -11395,7 +12995,7 @@ mod dag_convergence_authority_tests {
         assert!(
             matches!(
                 result,
-                yadorilink_peer_session::peer_session_impl::MaterializeResult::Settled
+                yadorilink_peer_session::peer_session_impl::MaterializeResult::Settled(_)
             ),
             "the upgraded materialize must settle, not defer to a retry"
         );
@@ -11427,7 +13027,7 @@ mod dag_convergence_authority_tests {
     /// no longer the current winner.
     #[tokio::test]
     async fn a_stale_content_materialize_must_not_resurrect_a_newer_local_tombstone() {
-        let h = harness("device-local", "device-p", /*dag*/ true).await;
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
         let key_a = SigningKey::from_bytes(&[1u8; 32]);
         let version_w = empty_version(OLD_MTIME);
         let change_w = Change::create_signed(
@@ -11540,7 +13140,7 @@ mod dag_convergence_authority_tests {
     /// `apply_incoming_wire_metadata` unconditionally before `materialize`,
     /// which bootstraps a `version_seq = 0` scaffold row and stamps it with
     /// the incoming meta; `upsert_file_in_tx`'s scaffold-promotion path
-    /// then carries that stamped `record_kind`/`symlink_target`/`exec_bit`
+    /// then carries that stamped `record_kind`/`symlink_target`/`unix_mode`
     /// forward onto the real, landed tombstone row -- meaningless metadata
     /// (a delete has no kind) baked permanently into a deleted record. A
     /// tombstone with no genuine local history reaching a hazard hold and
@@ -11550,7 +13150,7 @@ mod dag_convergence_authority_tests {
     /// needs no filesystem probe to reproduce.
     #[tokio::test]
     async fn a_never_seen_tombstone_does_not_leak_wire_metadata_onto_its_landed_row() {
-        let h = harness("device-local", "device-p", /*dag*/ true).await;
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
         let key_a = SigningKey::from_bytes(&[3u8; 32]);
         let change_t = Change::create_signed(
             vec![],
@@ -11578,10 +13178,11 @@ mod dag_convergence_authority_tests {
             deleted: true,
         };
         let meta = yadorilink_peer_session::peer_session_impl::IncomingWireMeta {
+            xattrs: Vec::new(),
             record_kind: RecordKind::Symlink,
             symlink_target: Some(b"/somewhere-meaningless".to_vec()),
             symlink_out_of_root: true,
-            exec_bit: true,
+            unix_mode: Some(0o755),
             origin_device_id: None,
             authoring_change_hash: Some(yadorilink_replica_domain::ids::ChangeHash(
                 change_t.compute_hash().0,
@@ -11611,9 +13212,10 @@ mod dag_convergence_authority_tests {
             None,
             "nor the incoming wire meta's symlink_target"
         );
-        assert!(
-            !h.state.file_index_repository().get_exec_bit(GROUP, "gone.txt").unwrap(),
-            "nor the incoming wire meta's exec_bit"
+        assert_eq!(
+            h.state.file_index_repository().get_unix_mode(GROUP, "gone.txt").unwrap(),
+            None,
+            "nor the incoming wire meta's unix_mode"
         );
     }
 
@@ -11634,7 +13236,7 @@ mod dag_convergence_authority_tests {
     /// landed_row` for the filesystem-independent half of this same fix.
     #[tokio::test]
     async fn a_hazard_declined_tombstone_reaching_dag_projection_is_not_marked_settled() {
-        let h = harness("device-local", "device-p", /*dag*/ true).await;
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
         if !yadorilink_peer_session::hazard::is_case_insensitive_filesystem(&h.root) {
             eprintln!("skipping: {} is case-sensitive here", h.root.display());
             return;
@@ -11676,10 +13278,11 @@ mod dag_convergence_authority_tests {
                 deleted: false,
             },
             &yadorilink_peer_session::peer_session_impl::IncomingWireMeta {
+                xattrs: Vec::new(),
                 record_kind: RecordKind::File,
                 symlink_target: None,
                 symlink_out_of_root: false,
-                exec_bit: false,
+                unix_mode: None,
                 authoring_change_hash: None,
                 origin_device_id: None,
             },
@@ -11746,7 +13349,7 @@ mod dag_convergence_authority_tests {
     /// easiest case to construct directly.
     #[tokio::test]
     async fn apply_locked_record_propagates_retry_required_from_a_dropped_hazard_tombstone() {
-        let h = harness("device-local", "device-p", /*dag*/ true).await;
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
         if !yadorilink_peer_session::hazard::is_case_insensitive_filesystem(&h.root) {
             eprintln!("skipping: {} is case-sensitive here", h.root.display());
             return;
@@ -11794,10 +13397,11 @@ mod dag_convergence_authority_tests {
             deleted: true,
         };
         let meta = yadorilink_peer_session::peer_session_impl::IncomingWireMeta {
+            xattrs: Vec::new(),
             record_kind: RecordKind::File,
             symlink_target: None,
             symlink_out_of_root: false,
-            exec_bit: false,
+            unix_mode: None,
             origin_device_id: None,
             authoring_change_hash: Some(yadorilink_replica_domain::ids::ChangeHash(
                 change_t.compute_hash().0,
@@ -11840,7 +13444,7 @@ mod dag_convergence_authority_tests {
     #[tokio::test]
     async fn redelivery_of_a_real_dag_descendant_tombstone_advances_authoring_identity_through_the_ordering_gate(
     ) {
-        let h = harness("device-local", "device-p", /*dag*/ true).await;
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
         if !yadorilink_peer_session::hazard::is_case_insensitive_filesystem(&h.root) {
             eprintln!("skipping: {} is case-sensitive here", h.root.display());
             return;
@@ -11927,10 +13531,11 @@ mod dag_convergence_authority_tests {
             deleted: true,
         };
         let meta = yadorilink_peer_session::peer_session_impl::IncomingWireMeta {
+            xattrs: Vec::new(),
             record_kind: RecordKind::File,
             symlink_target: None,
             symlink_out_of_root: false,
-            exec_bit: false,
+            unix_mode: None,
             origin_device_id: None,
             authoring_change_hash: Some(descendant_hash),
         };
@@ -11981,7 +13586,7 @@ mod dag_convergence_authority_tests {
     /// forever under byte-identical DAGs.
     #[tokio::test]
     async fn audit_retires_an_ephemeral_conflict_copy_once_its_loser_window_closes() {
-        let h = harness("device-local", "device-p", /*dag*/ true).await;
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
         let key_a = SigningKey::from_bytes(&[1u8; 32]);
         let key_b = SigningKey::from_bytes(&[2u8; 32]);
         let version_w = empty_version(OLD_MTIME);
@@ -12067,7 +13672,7 @@ mod dag_convergence_authority_tests {
         assert!(h.root.join(&copy_path).exists(), "precondition: the copy is on disk");
 
         // While the loser is still live, the audit must NOT retire it.
-        h.session.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
+        drive_materialization_for_test_impl(&h.session, &h.state, GROUP).await.unwrap();
         assert!(
             h.state
                 .file_index_repository()
@@ -12099,7 +13704,7 @@ mod dag_convergence_authority_tests {
             .unwrap();
         let _ = winner_head; // winner stays live; only the loser was superseded
 
-        h.session.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
+        drive_materialization_for_test_impl(&h.session, &h.state, GROUP).await.unwrap();
         assert!(
             !h.root.join(&copy_path).exists(),
             "the no-longer-justified, never-carried copy must be retired from disk"
@@ -12114,6 +13719,178 @@ mod dag_convergence_authority_tests {
         );
     }
 
+    /// Once a conflict-copy path's actual-generation record already
+    /// asserts an exact object (as the publication boundary would have
+    /// written for it, simulated here directly since this file's harness
+    /// never drives `process_group` itself), retiring that copy must
+    /// invalidate the record -- `retire_conflict_copies_only`'s own
+    /// publication must overwrite it with an `Absent` record under the
+    /// frontier it verified. Confirmed genuinely RED against a version of
+    /// this fix with that publish loop removed: that version
+    /// left the stale `RegularFile` record in place after retirement,
+    /// failing this test's final assertion.
+    #[tokio::test]
+    async fn retired_conflict_copy_invalidates_its_actual_generation_record() {
+        use yadorilink_peer_session::ports::PeerReplicaStatePort;
+
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
+        let key_a = SigningKey::from_bytes(&[31u8; 32]);
+        let key_b = SigningKey::from_bytes(&[32u8; 32]);
+        let version_w = empty_version(OLD_MTIME);
+        let version_l = empty_version(NEW_MTIME);
+
+        // Two concurrent roots on "shared.bin": winner W (device-a) and
+        // loser L (device-b), genuinely different contents -- identical
+        // setup to `audit_retires_an_ephemeral_conflict_copy_once_its_
+        // loser_window_closes` above.
+        let change_w = Change::create_signed(
+            vec![],
+            0,
+            ChangeAuth::PLACEHOLDER,
+            yadorilink_replica_domain::ids::DeviceId("device-a".into()),
+            yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+            vec![Op::Put {
+                path: SyncPath("shared.bin".into()),
+                version: version_w.version_hash,
+                origin: PutOrigin::Direct,
+            }],
+            &key_a,
+        );
+        let change_l = Change::create_signed(
+            vec![],
+            0,
+            ChangeAuth::PLACEHOLDER,
+            yadorilink_replica_domain::ids::DeviceId("device-b".into()),
+            yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+            vec![Op::Put {
+                path: SyncPath("shared.bin".into()),
+                version: version_l.version_hash,
+                origin: PutOrigin::Direct,
+            }],
+            &key_b,
+        );
+        h.state
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change_w, std::slice::from_ref(&version_w), true)
+            .unwrap();
+        h.state
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change_l, std::slice::from_ref(&version_l), true)
+            .unwrap();
+
+        let (loser_head, loser_version) = {
+            let heads = h.state.sqlite().dag_group_heads(GROUP).unwrap();
+            assert_eq!(heads.len(), 2, "sanity: W and L are concurrent heads");
+            if yadorilink_replica_engine::conflict::dag_conflict_loser_is_a(
+                change_w.lamport,
+                &change_w.compute_hash().0,
+                change_l.lamport,
+                &change_l.compute_hash().0,
+            ) {
+                (&change_w, &version_w)
+            } else {
+                (&change_l, &version_l)
+            }
+        };
+        let copy_path = yadorilink_replica_engine::conflict::conflict_copy_path_for_losing_change(
+            "shared.bin",
+            loser_head.device_id.0.as_str(),
+            loser_version.meta.mtime_unix_nanos,
+            &loser_version.version_hash.0,
+        );
+        h.session
+            .reconcile_paths_directly(
+                GROUP,
+                std::collections::BTreeSet::from(["shared.bin".into()]),
+            )
+            .await
+            .unwrap()
+            .expect("audit guard must be free");
+        assert!(
+            h.state.file_index_repository().get_file(GROUP, &copy_path).unwrap().is_some_and(|r| !r.deleted),
+            "precondition: the transient-frontier reconcile derived and indexed the loser's copy"
+        );
+
+        // Simulate what `process_group`'s own publication boundary would
+        // have written for this copy once materialized -- this file's
+        // harness never drives `process_group` itself, so the initial
+        // exact-object publish is injected directly via the same port
+        // method `process_group` calls.
+        let frontier_before_retirement = h.state.sqlite().dag_group_heads(GROUP).unwrap();
+        let fence_before_retirement =
+            h.state.dag_snapshot_mutation_fence(GROUP, &copy_path).unwrap();
+        let published = h
+            .state
+            .dag_publish_materialized_generation_if_fence_current(
+                GROUP,
+                &copy_path,
+                &frontier_before_retirement,
+                yadorilink_peer_session::ports::ExactActualState::Object {
+                    kind: RecordKind::File,
+                    version: loser_version.version_hash,
+                    identity: None,
+                },
+                fence_before_retirement,
+            )
+            .unwrap();
+        assert!(published, "sanity: the simulated initial publish must succeed");
+        assert!(
+            matches!(
+                h.state.sqlite().dag_lookup_materialized_generation(GROUP, &copy_path).unwrap(),
+                Some(basis) if basis.object_kind
+                    == yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::RegularFile
+            ),
+            "sanity: the copy's actual-generation record now asserts an exact object"
+        );
+
+        // The loser's own author supersedes it: the conflict window closes
+        // with no cross-branch merge, so no change ever carries the copy,
+        // and the audit must retire it.
+        let version_l2 = empty_version(NEW_MTIME + 1);
+        let loser_child = Change::create_signed(
+            vec![loser_head.compute_hash()],
+            loser_head.lamport,
+            ChangeAuth::PLACEHOLDER,
+            loser_head.device_id.clone(),
+            yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+            vec![Op::Put {
+                path: SyncPath("shared.bin".into()),
+                version: version_l2.version_hash,
+                origin: PutOrigin::Direct,
+            }],
+            if loser_head.device_id.0 == "device-a" { &key_a } else { &key_b },
+        );
+        h.state
+            .change_history_repository()
+            .dag_admit_change_with_versions(&loser_child, std::slice::from_ref(&version_l2), true)
+            .unwrap();
+
+        let outcome = h.session.clone().retire_conflict_copies_only(GROUP).await.unwrap();
+        assert!(
+            matches!(
+                outcome,
+                yadorilink_peer_session::peer_session_impl::RetirementAttempt::Settled { .. }
+            ),
+            "a stable-frontier retirement pass must settle, got {outcome:?}"
+        );
+        assert!(
+            !h.root.join(&copy_path).exists(),
+            "sanity: the no-longer-justified copy must be physically retired"
+        );
+
+        let after_retirement =
+            h.state.sqlite().dag_lookup_materialized_generation(GROUP, &copy_path).unwrap();
+        assert!(
+            matches!(
+                &after_retirement,
+                Some(basis) if basis.object_kind
+                    == yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::Absent
+            ),
+            "retirement must invalidate the stale exact-object record and publish Absent under \
+             the frontier it verified, got {after_retirement:?}"
+        );
+    }
+
     /// Commit 5's own regression: a DAG admission landing WHILE a
     /// retirement pass is mid-flight must not let that pass's outcome be
     /// treated as `Settled` for the frontier generation it targeted, even
@@ -12125,7 +13902,7 @@ mod dag_convergence_authority_tests {
     /// admission lands, so there is no race to get unlucky on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn frontier_change_mid_pass_defers_completion_and_a_follow_up_settles_the_new_frontier() {
-        let h = harness("device-local", "device-p", /*dag*/ true).await;
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
         let key_a = SigningKey::from_bytes(&[21u8; 32]);
         let key_b = SigningKey::from_bytes(&[22u8; 32]);
         let version_w = empty_version(OLD_MTIME);
@@ -12174,6 +13951,33 @@ mod dag_convergence_authority_tests {
             )
             .unwrap();
         std::fs::write(h.root.join(&copy_path), b"").unwrap();
+
+        // Simulate the `Present(version=W)` publish the publication
+        // boundary would have written for this copy once materialized --
+        // same simulation `retired_conflict_copy_
+        // invalidates_its_actual_generation_record` uses, since this
+        // file's harness never drives `process_group` itself.
+        {
+            use yadorilink_peer_session::ports::PeerReplicaStatePort;
+            let frontier_now = h.state.sqlite().dag_group_heads(GROUP).unwrap();
+            let fence_now = h.state.dag_snapshot_mutation_fence(GROUP, &copy_path).unwrap();
+            assert!(
+                h.state
+                    .dag_publish_materialized_generation_if_fence_current(
+                        GROUP,
+                        &copy_path,
+                        &frontier_now,
+                        yadorilink_peer_session::ports::ExactActualState::Object {
+                            kind: RecordKind::File,
+                            version: version_w.version_hash,
+                            identity: None,
+                        },
+                        fence_now,
+                    )
+                    .unwrap(),
+                "sanity: the simulated initial publish must succeed"
+            );
+        }
 
         // Hold the exact path_lock retirement's own materialize call for
         // `copy_path` will block on -- see `retire_unjustified_ephemeral_
@@ -12236,6 +14040,20 @@ mod dag_convergence_authority_tests {
             "the copy was genuinely unjustified under the frontier the pass evaluated it \
              against; FrontierChanged must not roll this back"
         );
+        // The deletion is real and stays real (asserted above), but a
+        // `FrontierChanged` pass must publish no fresh `Absent` for it --
+        // `frontier_before` is no longer provably this group's causal
+        // basis. The path's actual-generation record must be left
+        // non-usable: not the stale `Present(version=W)` this test
+        // published above (its own pre-delete bump already invalidated
+        // it), and not a fresh `Absent` either.
+        assert_eq!(
+            h.state.sqlite().dag_lookup_materialized_generation(GROUP, &copy_path).unwrap(),
+            None,
+            "a FrontierChanged retirement pass must leave the retired path's record non-usable \
+             -- neither the stale Present it started with nor a fresh Absent it has no \
+             frontier proof to publish"
+        );
 
         // A follow-up pass against the now-stable frontier must settle
         // cleanly -- this is the "always converge against the CURRENT
@@ -12250,32 +14068,624 @@ mod dag_convergence_authority_tests {
         );
     }
 
-    /// Confirmed regression, NOT yet fixed: `changes_for_request`'s ancestor
-    /// closure is gathered oldest-first (`collect_ancestor_closure`) and then
-    /// `ordered.truncate(max_changes_per_batch)` keeps only the FIRST
-    /// `max_changes_per_batch` entries -- so once a requested head's own
-    /// ancestor closure exceeds the batch cap (1000, `MAX_CHANGES_PER_BATCH`),
-    /// the requested head itself (necessarily the newest entry in an
-    /// oldest-first ordering) is silently dropped from every response,
-    /// forever, no matter how many times it is re-requested: the same
-    /// oldest-N-entries prefix is deterministic given an unchanged store, so
-    /// two identical requests produce byte-identical unprogressing batches.
-    /// There is no cursor/have-frontier in the wire protocol for a caller to
-    /// ask for "the NEXT 1000 after what you already sent me", so nothing
-    /// downstream (`missing_ancestor_frontier`, the periodic frontier
-    /// re-announce) can ever complete this catch-up either -- seeing the
-    /// same unknown head re-announced every second just re-triggers the
-    /// identical stuck request.
+    /// The desired-side hash builder (`desired_resolved_path_state_hash`)
+    /// and the real actual-side publication path (`process_group`'s own
+    /// boundary, simulated here via the identical port call -- this
+    /// file's harness never drives `process_group` itself) must agree
+    /// end to end on `resolved_path_state_hash` for the same resolved
+    /// content -- not merely individually correct in isolation. The real
+    /// risk this guards: `desired_state.rs`'s own `map_record_kind` and
+    /// the real `ReplicaCoordinator`'s `RecordKind -> MaterializedObjectKind`
+    /// mapping (`yadorilink-daemon/src/replica_coordinator/peer_replica_
+    /// state.rs`) are two independently-written mappings that currently
+    /// agree but share no code -- nothing enforces they stay in sync.
+    /// Confirmed genuinely RED by temporarily mismatching the daemon-side
+    /// mapping (`RecordKind::File -> MaterializedObjectKind::Directory`).
+    #[tokio::test]
+    async fn ordinary_materialization_publishes_a_hash_that_matches_stage1s_desired_side_builder() {
+        use yadorilink_peer_session::ports::PeerReplicaStatePort;
+
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
+        let key = SigningKey::from_bytes(&[41u8; 32]);
+        let version = empty_version(OLD_MTIME);
+        let change = Change::create_signed(
+            vec![],
+            0,
+            ChangeAuth::PLACEHOLDER,
+            yadorilink_replica_domain::ids::DeviceId("device-a".into()),
+            yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+            vec![Op::Put {
+                path: SyncPath("plain.txt".into()),
+                version: version.version_hash,
+                origin: PutOrigin::Direct,
+            }],
+            &key,
+        );
+        h.state
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change, std::slice::from_ref(&version), true)
+            .unwrap();
+
+        let heads_before = h.state.sqlite().dag_group_heads(GROUP).unwrap();
+
+        // The "legacy/ordinary path" materialization -- no worker involved.
+        let attempt = h
+            .session
+            .reconcile_paths_directly(GROUP, std::collections::BTreeSet::from(["plain.txt".into()]))
+            .await
+            .unwrap()
+            .expect("audit guard must be free");
+
+        let (kind, version_hash, identity, mutation_generation) = match attempt.evidence_for("plain.txt")
+        {
+            Some(yadorilink_peer_session::peer_session_impl::SettlementEvidence::ExactObject {
+                kind,
+                version,
+                identity,
+                mutation_generation,
+            }) => (*kind, *version, *identity, *mutation_generation),
+            other => panic!("expected plain.txt to settle as ExactObject, got {other:?}"),
+        };
+
+        // Simulate process_group's own publication boundary (this harness
+        // never drives process_group itself -- same pattern as 3.11/3.15).
+        let published = h
+            .state
+            .dag_publish_materialized_generation_if_fence_current(
+                GROUP,
+                "plain.txt",
+                &heads_before,
+                yadorilink_peer_session::ports::ExactActualState::Object {
+                    kind,
+                    version: version_hash,
+                    identity,
+                },
+                mutation_generation,
+            )
+            .unwrap();
+        assert!(published, "sanity: the simulated publish must land");
+
+        let actual = h
+            .state
+            .sqlite()
+            .dag_lookup_materialized_generation(GROUP, "plain.txt")
+            .unwrap()
+            .expect("row must be published");
+
+        let desired_hash = h
+            .state
+            .sqlite()
+            .dag_desired_resolved_path_state_hash(
+                GROUP,
+                "plain.txt",
+                &yadorilink_replica_engine::conflict::PathResolution::Present {
+                    winner: 0,
+                    conflict_copies: vec![],
+                },
+                Some(&version_hash),
+            )
+            .unwrap();
+
+        assert_eq!(
+            actual.resolved_path_state_hash, desired_hash,
+            "Stage 1's desired-side hash builder and Stage 3's real actual-side publication path \
+             (the real ReplicaCoordinator's RecordKind->MaterializedObjectKind mapping) must \
+             produce byte-identical resolved_path_state_hash for the same resolved content"
+        );
+        assert_eq!(
+            actual.object_kind,
+            yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::RegularFile
+        );
+        assert_eq!(actual.version, Some(version_hash));
+    }
+
+    /// A crash simulated between physical success and the publication --
+    /// literally, just never calling `dag_publish_
+    /// materialized_generation_if_fence_current` after a real write --
+    /// must leave the DAG-side `projection_obligations` row untouched
+    /// (nothing about materialize() ever consults or mutates it directly;
+    /// only the DAG-admission seams do) and must leave no usable stale
+    /// proof behind, because the pre-mutation fence bump already
+    /// invalidated any PRIOR proof this path may have carried,
+    /// independently of whether a fresh one is ever published. The
+    /// deeper claim (a future worker not wrongly treating this as a
+    /// satisfied obligation and skipping real work) is Stage 4's own
+    /// subject and not testable yet -- see `retired_conflict_copy_
+    /// invalidates_its_actual_generation_record`'s identical caveat.
+    /// Confirmed genuinely RED by swapping the real write's pre-mutation
+    /// `dag_bump_mutation_fence` call for a `dag_snapshot_mutation_fence`
+    /// (a read-only no-op), reproducing exactly the bug PROJ-7 exists to
+    /// prevent: a real mutation whose fence never advanced.
+    #[tokio::test]
+    async fn a_materialize_that_never_reaches_publication_leaves_the_projection_obligation_untouched_and_its_stale_proof_unusable(
+    ) {
+        use yadorilink_peer_session::ports::PeerReplicaStatePort;
+
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
+        let key_a = SigningKey::from_bytes(&[42u8; 32]);
+        let version = empty_version(OLD_MTIME);
+        let change = Change::create_signed(
+            vec![],
+            0,
+            ChangeAuth::PLACEHOLDER,
+            yadorilink_replica_domain::ids::DeviceId("device-a".into()),
+            yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+            vec![Op::Put {
+                path: SyncPath("crash-path.bin".into()),
+                version: version.version_hash,
+                origin: PutOrigin::Direct,
+            }],
+            &key_a,
+        );
+        h.state
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change, std::slice::from_ref(&version), true)
+            .unwrap();
+
+        // The real DAG admission seam already bumped projection_obligations
+        // for this path to generation 1.
+        let obligation_before = h
+            .state
+            .sqlite()
+            .dag_lookup_projection_obligation(GROUP, "crash-path.bin")
+            .unwrap()
+            .expect("admission must have created an obligation");
+        assert_eq!(obligation_before.invalidation_generation, 1);
+
+        // Simulate a PRIOR successful publish for this path (what
+        // process_group's own boundary would have written on an earlier
+        // tick) -- makes the "no usable stale proof" assertion below
+        // non-trivial: there IS something to invalidate.
+        let fence0 = h.state.dag_snapshot_mutation_fence(GROUP, "crash-path.bin").unwrap();
+        assert_eq!(fence0, 0);
+        assert!(h
+            .state
+            .dag_publish_materialized_generation_if_fence_current(
+                GROUP,
+                "crash-path.bin",
+                &h.state.sqlite().dag_group_heads(GROUP).unwrap(),
+                yadorilink_peer_session::ports::ExactActualState::Absent,
+                fence0,
+            )
+            .unwrap());
+        assert!(
+            matches!(
+                h.state.sqlite().dag_lookup_materialized_generation(GROUP, "crash-path.bin").unwrap(),
+                Some(basis) if basis.object_kind
+                    == yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::Absent
+            ),
+            "sanity: the simulated prior publish is usable before the crash-inducing mutation"
+        );
+
+        // The real write -- and THE CRASH: deliberately never call
+        // dag_publish_materialized_generation_if_fence_current afterward.
+        // That omission alone IS "a crash simulated between physical
+        // success and the publication."
+        let head = yadorilink_replica_engine::conflict::PathHead {
+            change_hash: change.compute_hash().0,
+            lamport: change.lamport,
+            device_id: "device-a".into(),
+            content: Some(yadorilink_replica_engine::conflict::PathHeadContent {
+                version_hash: version.version_hash.0,
+                mtime_unix_nanos: version.meta.mtime_unix_nanos,
+            }),
+        };
+        let result = h
+            .session
+            .materialize_dag_content_head(
+                GROUP,
+                "crash-path.bin",
+                &head,
+                yadorilink_replica_domain::session_state::MaterializationPolicy::Eager,
+                None,
+            )
+            .await
+            .unwrap();
+        let mutation_generation = match result {
+            yadorilink_peer_session::peer_session_impl::MaterializeResult::Settled(
+                yadorilink_peer_session::peer_session_impl::SettlementEvidence::ExactObject {
+                    mutation_generation,
+                    ..
+                },
+            ) => mutation_generation,
+            other => panic!("expected a real write to settle as ExactObject, got {other:?}"),
+        };
+        assert_eq!(
+            mutation_generation, 1,
+            "the real write must have bumped the fence past the prior publish's generation 0"
+        );
+        assert!(h.root.join("crash-path.bin").exists(), "sanity: the physical write really happened");
+
+        let obligation_after = h
+            .state
+            .sqlite()
+            .dag_lookup_projection_obligation(GROUP, "crash-path.bin")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            obligation_after.invalidation_generation, obligation_before.invalidation_generation,
+            "a materialize() that never reaches publication must not touch the DAG-side \
+             obligation at all"
+        );
+        assert_eq!(
+            h.state.sqlite().dag_lookup_materialized_generation(GROUP, "crash-path.bin").unwrap(),
+            None,
+            "no publication landed for the new mutation_generation -- the prior Absent publish \
+             must read back as non-usable, not as a stale-but-plausible proof"
+        );
+    }
+
+    /// Replays the exact race with the DAG frontier held constant
+    /// throughout. A materialization attempt (M) computes its evidence
+    /// for a conflict-copy path (fence bumped, NOT yet published); before
+    /// M's publication runs, an independent retirement pass judges the
+    /// same copy unjustified, bumps its fence again, and physically
+    /// deletes it -- publishing its own `Absent` under a fresh epoch.
+    /// M's late publication must then be rejected by the
+    /// mutation-generation CAS, and the path's actual-side state must
+    /// still reflect retirement's outcome, not M's stale `Present(L)`.
+    /// `outcome == Settled` here is this layer's proxy for "the frontier
+    /// guard is observed to pass" (matching `retire_conflict_copies_
+    /// only`'s own whole-pass frontier check) -- the literal
+    /// `process_group` comparison lives in `yadorilink-daemon` and is out
+    /// of scope for this harness, same limitation the sibling tests
+    /// above already record. Closing the obligation itself is also out
+    /// of scope here and not testable yet. Confirmed genuinely RED by
+    /// removing the fence-equality check from `publish_materialized_
+    /// generation_if_fence_current`.
+    #[tokio::test]
+    async fn old_attempt_cannot_republish_after_later_mutation_under_same_dag_frontier() {
+        use yadorilink_peer_session::ports::PeerReplicaStatePort;
+
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
+        let key_a = SigningKey::from_bytes(&[51u8; 32]);
+        let key_b = SigningKey::from_bytes(&[52u8; 32]);
+        let version_w = empty_version(OLD_MTIME);
+        let version_l = empty_version(NEW_MTIME);
+
+        let change_w = Change::create_signed(
+            vec![],
+            0,
+            ChangeAuth::PLACEHOLDER,
+            yadorilink_replica_domain::ids::DeviceId("device-a".into()),
+            yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+            vec![Op::Put {
+                path: SyncPath("shared.bin".into()),
+                version: version_w.version_hash,
+                origin: PutOrigin::Direct,
+            }],
+            &key_a,
+        );
+        let change_l = Change::create_signed(
+            vec![],
+            0,
+            ChangeAuth::PLACEHOLDER,
+            yadorilink_replica_domain::ids::DeviceId("device-b".into()),
+            yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+            vec![Op::Put {
+                path: SyncPath("shared.bin".into()),
+                version: version_l.version_hash,
+                origin: PutOrigin::Direct,
+            }],
+            &key_b,
+        );
+        h.state
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change_w, std::slice::from_ref(&version_w), true)
+            .unwrap();
+        h.state
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change_l, std::slice::from_ref(&version_l), true)
+            .unwrap();
+
+        let (loser_head, loser_version) = {
+            let heads = h.state.sqlite().dag_group_heads(GROUP).unwrap();
+            assert_eq!(heads.len(), 2, "sanity: W and L are concurrent heads");
+            if yadorilink_replica_engine::conflict::dag_conflict_loser_is_a(
+                change_w.lamport,
+                &change_w.compute_hash().0,
+                change_l.lamport,
+                &change_l.compute_hash().0,
+            ) {
+                (&change_w, &version_w)
+            } else {
+                (&change_l, &version_l)
+            }
+        };
+        let copy_path = yadorilink_replica_engine::conflict::conflict_copy_path_for_losing_change(
+            "shared.bin",
+            loser_head.device_id.0.as_str(),
+            loser_version.meta.mtime_unix_nanos,
+            &loser_version.version_hash.0,
+        );
+        h.session
+            .reconcile_paths_directly(GROUP, std::collections::BTreeSet::from(["shared.bin".into()]))
+            .await
+            .unwrap()
+            .expect("audit guard must be free");
+        assert!(
+            h.state.file_index_repository().get_file(GROUP, &copy_path).unwrap().is_some_and(|r| !r.deleted),
+            "precondition: the transient-frontier reconcile derived and indexed the loser's copy"
+        );
+
+        // M's real fence commitment for "writing copy_path to Present(L)" --
+        // evidence computed, epoch captured, deliberately NOT yet published.
+        let stale_epoch = h.state.dag_bump_mutation_fence(GROUP, &copy_path, "materialize").unwrap();
+
+        // The loser's own author supersedes it: the conflict window closes,
+        // so the copy becomes unjustified.
+        let version_l2 = empty_version(NEW_MTIME + 1);
+        let loser_child = Change::create_signed(
+            vec![loser_head.compute_hash()],
+            loser_head.lamport,
+            ChangeAuth::PLACEHOLDER,
+            loser_head.device_id.clone(),
+            yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+            vec![Op::Put {
+                path: SyncPath("shared.bin".into()),
+                version: version_l2.version_hash,
+                origin: PutOrigin::Direct,
+            }],
+            if loser_head.device_id.0 == "device-a" { &key_a } else { &key_b },
+        );
+        h.state
+            .change_history_repository()
+            .dag_admit_change_with_versions(&loser_child, std::slice::from_ref(&version_l2), true)
+            .unwrap();
+
+        // The independent mutator: a real retirement pass. Internally this
+        // bumps copy_path's fence again (past stale_epoch), physically
+        // deletes it, and -- since nothing else touches the frontier during
+        // the pass -- publishes Absent under its own fresh epoch.
+        let outcome = h.session.clone().retire_conflict_copies_only(GROUP).await.unwrap();
+        assert_eq!(
+            outcome,
+            yadorilink_peer_session::peer_session_impl::RetirementAttempt::Settled { retired: 1 },
+            "this is this layer's proxy for \"the frontier guard is observed to pass\" -- the \
+             test proves nothing if the frontier moved during the pass"
+        );
+        assert!(
+            matches!(
+                h.state.sqlite().dag_lookup_materialized_generation(GROUP, &copy_path).unwrap(),
+                Some(basis) if basis.object_kind
+                    == yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::Absent
+            ),
+            "sanity: retirement's own publish must have succeeded before M's late publish runs"
+        );
+
+        // M's late publication, using its now-stale epoch.
+        let frontier_before = h.state.sqlite().dag_group_heads(GROUP).unwrap();
+        let late_published = h
+            .state
+            .dag_publish_materialized_generation_if_fence_current(
+                GROUP,
+                &copy_path,
+                &frontier_before,
+                yadorilink_peer_session::ports::ExactActualState::Object {
+                    kind: RecordKind::File,
+                    version: version_l.version_hash,
+                    identity: None,
+                },
+                stale_epoch,
+            )
+            .unwrap();
+
+        assert!(!late_published, "a stale publication must be rejected by the mutation-generation CAS");
+        assert!(
+            matches!(
+                h.state.sqlite().dag_lookup_materialized_generation(GROUP, &copy_path).unwrap(),
+                Some(basis) if basis.object_kind
+                    == yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::Absent
+            ),
+            "C's actual-side state must still reflect retirement's outcome, not the stale \
+             Present(L)"
+        );
+    }
+
+    /// Symmetric companion to the test above: a late retirement `Absent`
+    /// publication must not overwrite a materialization that
+    /// legitimately recreated the path afterwards. Pure fence/CAS-ordering
+    /// property -- no DAG admissions needed. Confirmed genuinely RED by
+    /// the same fault as the primary test above.
+    #[tokio::test]
+    async fn late_retirement_absent_publication_cannot_overwrite_a_path_materialization_recreated() {
+        use yadorilink_peer_session::ports::PeerReplicaStatePort;
+
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
+        let path = "recreated.bin";
+
+        // Retirement's pre-delete bump -- evidence: Absent, not published yet.
+        let retire_epoch = h.state.dag_bump_mutation_fence(GROUP, path, "retire").unwrap();
+
+        // An independent, later materialization legitimately recreates the
+        // path.
+        let mat_epoch = h.state.dag_bump_mutation_fence(GROUP, path, "materialize").unwrap();
+        let frontier = h.state.sqlite().dag_group_heads(GROUP).unwrap();
+        let recreated_version = empty_version(NEW_MTIME).version_hash;
+        assert!(h
+            .state
+            .dag_publish_materialized_generation_if_fence_current(
+                GROUP,
+                path,
+                &frontier,
+                yadorilink_peer_session::ports::ExactActualState::Object {
+                    kind: RecordKind::File,
+                    version: recreated_version,
+                    identity: None,
+                },
+                mat_epoch,
+            )
+            .unwrap());
+
+        // Retirement's own late publish, using its now-stale epoch.
+        let late_absent = h
+            .state
+            .dag_publish_materialized_generation_if_fence_current(
+                GROUP,
+                path,
+                &frontier,
+                yadorilink_peer_session::ports::ExactActualState::Absent,
+                retire_epoch,
+            )
+            .unwrap();
+
+        assert!(
+            !late_absent,
+            "a late retirement Absent publish must not overwrite a legitimate later recreation"
+        );
+        assert!(matches!(
+            h.state.sqlite().dag_lookup_materialized_generation(GROUP, path).unwrap(),
+            Some(basis) if basis.object_kind
+                == yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::RegularFile
+                && basis.version == Some(recreated_version)
+        ));
+    }
+
+    /// A retirement pass with two copy-shaped candidates deletes copy A
+    /// cleanly and fails on copy B (a real `Err`, not a hazard -- see
+    /// below), so the pass returns `RetryRequired`. A's actual-side
+    /// record must still be corrected (`Present(L)` -> `Absent`); B's
+    /// record must be untouched; the pass must not complete its
+    /// retirement generation (`RetirementAttempt::RetryRequired`, which
+    /// `yadorilink-daemon`'s `engine_wrapper::settles_generation` already
+    /// keys generation-completion on -- asserting the variant here closes
+    /// this sub-claim by composition, no daemon-layer wiring needed).
+    ///
+    /// B's failure mechanism: a real filename hazard cannot be produced
+    /// in this harness (`hazard_reason_for` is hardcoded to
+    /// `NamePolicy::Posix` on this platform, where `invalid_name_reason`
+    /// is always `None`, and the case-fold/normalization hazards are
+    /// gated on live filesystem probes that read false on this project's
+    /// actual Linux/ext4 test environment) -- confirmed by reading
+    /// `hazard.rs` directly. Instead, B's on-disk entry is a DIRECTORY
+    /// while its index row says `deleted: false`; `materialize`'s
+    /// tombstone branch's `std::fs::remove_file` on a directory returns
+    /// `Err(IsADirectory)` (never `NotFound`), deterministically and
+    /// platform/privilege-independently, propagating as a genuine `Err`
+    /// from `materialize()` -- this is the task's own explicitly-allowed
+    /// alternative ("injected `MaterializeResult::RetryRequired` or
+    /// `Err`"). Confirmed genuinely RED by temporarily gating the publish
+    /// loop in `retire_conflict_copies_only` on
+    /// `matches!(outcome, RetirementAttempt::Settled { .. })`
+    /// (reproducing a status-keyed implementation).
+    #[tokio::test]
+    async fn partially_successful_retirement_pass_still_corrects_the_copies_it_deleted() {
+        use yadorilink_peer_session::ports::PeerReplicaStatePort;
+
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
+        let key_a = SigningKey::from_bytes(&[61u8; 32]);
+        let version_w = empty_version(OLD_MTIME);
+        let change_w = Change::create_signed(
+            vec![],
+            0,
+            ChangeAuth::PLACEHOLDER,
+            yadorilink_replica_domain::ids::DeviceId("device-a".into()),
+            yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+            vec![Op::Put {
+                path: SyncPath("shared.bin".into()),
+                version: version_w.version_hash,
+                origin: PutOrigin::Direct,
+            }],
+            &key_a,
+        );
+        h.state
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change_w, std::slice::from_ref(&version_w), true)
+            .unwrap();
+
+        let copy_path_a = yadorilink_replica_engine::conflict::conflict_copy_path_for_losing_change(
+            "shared.bin",
+            "device-l1",
+            NEW_MTIME,
+            &[9u8; 32],
+        );
+        let copy_path_b = yadorilink_replica_engine::conflict::conflict_copy_path_for_losing_change(
+            "shared.bin",
+            "device-l2",
+            NEW_MTIME,
+            &[10u8; 32],
+        );
+
+        for p in [&copy_path_a, &copy_path_b] {
+            h.state
+                .file_index_repository()
+                .upsert_file_with_origin_and_author(
+                    GROUP,
+                    &FileRecord { path: p.clone(), size: 0, mtime_unix_nanos: 0, blocks: vec![], deleted: false },
+                    "device-local",
+                    &change_w.compute_hash(),
+                    &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+                )
+                .unwrap();
+        }
+        std::fs::write(h.root.join(&copy_path_a), b"").unwrap();
+        std::fs::create_dir(h.root.join(&copy_path_b)).unwrap();
+
+        // Simulate process_group's own prior publish for A only (task
+        // 3.11's pattern), so the test can observe Present(L) -> Absent
+        // for A specifically.
+        let frontier0 = h.state.dag_group_heads(GROUP).unwrap();
+        let fence_a0 = h.state.dag_snapshot_mutation_fence(GROUP, &copy_path_a).unwrap();
+        assert!(h
+            .state
+            .dag_publish_materialized_generation_if_fence_current(
+                GROUP,
+                &copy_path_a,
+                &frontier0,
+                yadorilink_peer_session::ports::ExactActualState::Object {
+                    kind: RecordKind::File,
+                    version: version_w.version_hash,
+                    identity: None,
+                },
+                fence_a0,
+            )
+            .unwrap());
+        // B gets NO pre-existing publish -- must stay None throughout.
+        assert_eq!(h.state.sqlite().dag_lookup_materialized_generation(GROUP, &copy_path_b).unwrap(), None);
+
+        let outcome = h.session.clone().retire_conflict_copies_only(GROUP).await.unwrap();
+        assert_eq!(
+            outcome,
+            yadorilink_peer_session::peer_session_impl::RetirementAttempt::RetryRequired,
+            "B's Err must make the whole pass RetryRequired, not Settled -- this IS \"does not \
+             complete its retirement generation\" (engine_wrapper::settles_generation is keyed \
+             on this variant alone)"
+        );
+
+        // A really was deleted, both on disk and in the index.
+        assert!(!h.root.join(&copy_path_a).exists());
+        assert!(h.state.file_index_repository().get_file(GROUP, &copy_path_a).unwrap().is_none_or(|r| r.deleted));
+
+        // A's actual-generation record was corrected: Present(L) -> Absent.
+        assert!(matches!(
+            h.state.sqlite().dag_lookup_materialized_generation(GROUP, &copy_path_a).unwrap(),
+            Some(basis) if basis.object_kind
+                == yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::Absent
+        ));
+
+        // B is untouched: still a live directory, still a live index row,
+        // still no published record at all.
+        assert!(h.root.join(&copy_path_b).is_dir());
+        assert!(h.state.file_index_repository().get_file(GROUP, &copy_path_b).unwrap().is_some_and(|r| !r.deleted));
+        assert_eq!(h.state.sqlite().dag_lookup_materialized_generation(GROUP, &copy_path_b).unwrap(), None);
+    }
+
+    /// A requested head whose own ancestor closure exceeds the batch cap
+    /// (1000, `MAX_CHANGES_PER_BATCH`) must still arrive -- delivered across
+    /// bounded, oldest-first pages from one `changes_for_request` call,
+    /// rather than being silently dropped by a single-page truncation. The
+    /// head is always the newest entry in the closure's oldest-first
+    /// ordering, so it always lands in the final page, whose `more` is
+    /// `false`.
     ///
     /// This test is deliberately independent of row14_strict_acceptance's
-    /// own scale (tens of changes, well under 1000) -- it exists to nail
-    /// down a distinct, confirmed-by-reading-the-code defect, not to explain
-    /// row14's own stall. Do not fold a fix for this into the same commit as
-    /// a row14 fix; verify each independently.
+    /// own scale (tens of changes, well under 1000) -- it exercises a
+    /// distinct, larger-than-cap scenario against the real SQLite-backed
+    /// history, not row14's own stall.
     #[tokio::test]
-    async fn changes_for_request_never_delivers_a_head_whose_ancestor_closure_exceeds_the_batch_cap(
+    async fn changes_for_request_delivers_the_full_delta_across_bounded_pages_including_the_requested_head(
     ) {
-        let h = harness("device-local", "device-p", /*dag*/ true).await;
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
         let key_a = SigningKey::from_bytes(&[30u8; 32]);
 
         // A linear chain of 1002 changes on "chain.bin", each one's own
@@ -12311,44 +14721,47 @@ mod dag_convergence_authority_tests {
         }
         let latest_hash = latest_hash.unwrap();
 
-        let (batch_1, _versions_1) = h
+        let pages = h
             .session
             .replica_engine
             .changes_for_request(
                 &yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
                 std::slice::from_ref(&latest_hash),
+                &[],
                 1000,
             )
             .unwrap();
-        assert_eq!(batch_1.len(), 1000, "the batch cap must still be honored");
+        assert_eq!(pages.len(), 2, "1002 changes at cap 1000 must split into exactly two pages");
+        assert_eq!(pages[0].changes.len(), 1000);
+        assert_eq!(pages[1].changes.len(), 2);
+        assert!(pages[0].more, "the first page must signal more pages follow");
+        assert!(!pages[1].more, "the last page must signal no further pages");
 
         let latest_encoded =
             h.state.sqlite().dag_get_change(&latest_hash).unwrap().unwrap().to_wire_bytes();
         assert!(
-            !batch_1.contains(&latest_encoded),
-            "CONFIRMED BUG: the oldest-first truncation drops the actually-requested head from \
-             its own response"
+            pages[1].changes.contains(&latest_encoded),
+            "the requested head must arrive, in the final page"
         );
 
-        // Re-requesting the SAME head against an unchanged store must, per
-        // the current implementation, reproduce the identical batch --
-        // proving this is a permanent stall, not merely a slow multi-round
-        // catch-up: nothing in the request/response shape lets a second
-        // identical request make different progress than the first.
-        let (batch_2, _versions_2) = h
+        // Re-requesting the SAME head against an unchanged store, with the
+        // receiver's `have_heads` still empty, reproduces identical pages --
+        // expected here, since nothing changed on either side, and no longer
+        // evidence of a stall: a real receiver advances `have_heads` after
+        // applying each page, which is exactly what makes progress happen
+        // (see the have_heads-aware selector tests in
+        // `yadorilink-replica-engine`).
+        let pages_again = h
             .session
             .replica_engine
             .changes_for_request(
                 &yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
                 std::slice::from_ref(&latest_hash),
+                &[],
                 1000,
             )
             .unwrap();
-        assert_eq!(
-            batch_1, batch_2,
-            "CONFIRMED BUG: an identical re-request of the same never-delivered head returns the \
-             identical stuck batch -- no progress across repeated requests"
-        );
+        assert_eq!(pages, pages_again, "an unchanged store and unchanged have_heads must recompute the identical delta");
     }
 
     // ---- CORE: DAG-decided winner is order-independent and the gate keeps the
@@ -12372,9 +14785,10 @@ mod dag_convergence_authority_tests {
             0,
             FileMeta {
                 mtime_unix_nanos: mtime,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         )
     }
@@ -12450,8 +14864,8 @@ mod dag_convergence_authority_tests {
         yadorilink_sync_wire::ChangeBatchFrame {
             folder_group_id: GROUP.to_string(),
             changes: changes.into_iter().map(|c| c.to_wire_bytes()).collect(),
-            compressed_changes: Vec::new(),
             file_versions: versions.into_iter().map(|v| v.canonical_encoding()).collect(),
+            more: false,
         }
     }
 
@@ -12460,7 +14874,7 @@ mod dag_convergence_authority_tests {
         let h = harness_with_deps(
             "device-d",
             "device-p",
-            /*dag*/ true,
+            /*peer handshake received*/ true,
             PeerSyncSessionOneTimeDeps {
                 change_authenticator: Arc::new(MultiAuthenticator {
                     keys: HashMap::from([
@@ -12491,7 +14905,7 @@ mod dag_convergence_authority_tests {
         // `handle_change_batch` only admits the DAG change and enqueues a
         // materialization job now (CONV-1); drive the same projection step
         // the Convergence Engine would, exactly as it would call it.
-        h.session.clone().reconcile_local_materialization_audit(GROUP).await.unwrap();
+        drive_materialization_for_test_impl(&h.session, &h.state, GROUP).await.unwrap();
 
         h.state
             .file_index_repository()
@@ -12516,6 +14930,7 @@ mod dag_convergence_authority_tests {
 
 #[cfg(test)]
 mod authorization_monotonicity_tests {
+    use crate::drive_materialization_for_test_impl;
     use ed25519_dalek::SigningKey;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -12559,9 +14974,10 @@ mod authorization_monotonicity_tests {
             0,
             FileMeta {
                 mtime_unix_nanos: 0,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         )
     }
@@ -12617,25 +15033,8 @@ mod authorization_monotonicity_tests {
         (parent, child, version)
     }
 
-    async fn unreachable_channel() -> Arc<yadorilink_transport::PeerChannel> {
-        use boringtun::x25519::{PublicKey, StaticSecret};
-        let mut secret_bytes = [0u8; 32];
-        rand::fill(&mut secret_bytes);
-        let local_secret = StaticSecret::from(secret_bytes);
-        let local_public = PublicKey::from(&local_secret);
-        let peer_public = PublicKey::from(&StaticSecret::from([9u8; 32]));
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let hub = yadorilink_transport::TransportHub::from_socket(socket, Some(local_public));
-        let channel = yadorilink_transport::PeerChannel::connect(
-            local_secret,
-            peer_public,
-            0,
-            Vec::new(),
-            hub,
-        )
-        .await
-        .unwrap();
-        Arc::new(channel)
+    async fn unreachable_channel() -> Arc<super::SilentPeerChannel> {
+        Arc::new(super::SilentPeerChannel)
     }
 
     /// Feeds `changes` (in the given order) as one batch to a fresh receiver
@@ -12683,8 +15082,8 @@ mod authorization_monotonicity_tests {
         let batch = yadorilink_sync_wire::ChangeBatchFrame {
             folder_group_id: GROUP.to_string(),
             changes: changes.iter().map(|c| c.to_wire_bytes()).collect(),
-            compressed_changes: Vec::new(),
             file_versions: vec![version.canonical_encoding()],
+            more: false,
         };
         session.handle_change_batch(batch).await.unwrap();
         // `handle_change_batch` only admits the DAG changes and enqueues
@@ -12692,7 +15091,7 @@ mod authorization_monotonicity_tests {
         // the Convergence Engine would, so every caller of this helper still
         // sees the same synchronously-observable materialized state it did
         // before that change.
-        session.reconcile_local_materialization_audit(GROUP).await.unwrap();
+        drive_materialization_for_test_impl(&session, &state, GROUP).await.unwrap();
         (state, root_dir, store_dir)
     }
 
@@ -12801,5 +15200,263 @@ mod authorization_monotonicity_tests {
             state.file_index_repository().get_file(GROUP, "b.txt").unwrap().is_some(),
             "the forward change's path materializes"
         );
+    }
+}
+
+/// C4-9 follow-up: the `changes_for_request` DAG-paging fix (`yadorilink-
+/// replica-engine::engine`) was validated against `ChangeAuth::PLACEHOLDER`
+/// changes, which `check_causal_auth_monotonicity` exempts outright and which
+/// therefore go straight to DAG-level admission (buffered as a real orphan on
+/// a missing parent, promotable the instant that parent lands). Real,
+/// non-PLACEHOLDER-stamped changes take a different path entirely: a change
+/// whose parent's authorization pin isn't yet readable is `Hold`-ed in
+/// `handle_change_batch` (`peer_session.rs`) and `continue`d past --
+/// dropped, never buffered anywhere (see `4175e8cd`'s "a missing or
+/// unreadable parent fails closed" design, which never reaches DAG-level
+/// admission at all for this case). So the very next change in the same
+/// batch, whose own parent is the one that was just Held-and-dropped,
+/// reports THAT parent as its own missing ancestor (not the true, deeper
+/// missing root) -- `missing_ancestor_frontier` can only walk through what
+/// was actually durably admitted or orphan-buffered, and a Held change is
+/// neither. This module tests whether that gap turns a real-auth cold
+/// catch-up beyond the wire batch cap into a many-round "staircase" (or
+/// worse) instead of the same bounded convergence the PLACEHOLDER case
+/// already proves.
+mod real_auth_dag_paging_tests {
+    use super::*;
+    use yadorilink_peer_session::ports::PeerReplicaStatePort;
+    use yadorilink_replica_domain::change::{Change, ChangeAuth, Op};
+    use yadorilink_replica_domain::file::{FileMeta, FileVersion, RecordKind};
+    use yadorilink_replica_domain::ids::SyncPath;
+    use yadorilink_sync_sqlite::dag_store::{self, ChangeEmitter};
+
+    /// A non-PLACEHOLDER pin, distinct from `authorization_monotonicity_
+    /// tests::real_auth` (separate module, can't share it) but built the
+    /// same way. Every change in a chain built with this uses the SAME
+    /// (seq, epoch) -- the ordinary "long uninterrupted local edit history
+    /// under one still-valid grant" scenario, not a revocation attack.
+    fn real_auth(seq: u64, epoch: u64) -> ChangeAuth {
+        ChangeAuth { auth_seq: seq, auth_epoch: epoch, policy_head_hash: [seq as u8 ^ 0x5A; 32] }
+    }
+
+    fn empty_version() -> FileVersion {
+        FileVersion::new(
+            vec![],
+            0,
+            FileMeta {
+                mtime_unix_nanos: 0,
+                unix_mode: None,
+                symlink_target: None,
+                record_kind: RecordKind::File,
+                xattrs: Vec::new(),
+            },
+        )
+    }
+
+    /// Builds `count` real-auth-stamped tombstone changes chained parent ->
+    /// child (via a throwaway sender DB, exactly like `authorization_
+    /// monotonicity_tests::build_chain` but extended past 2 items), then
+    /// admits every one of them directly into `device`'s own
+    /// `ReplicaCoordinator` in order (bypassing the wire-receive causal-auth
+    /// check entirely, exactly as if `device` had authored and locally
+    /// committed each one itself -- the SAME shorthand `ordinary_batch_
+    /// tests::Harness::admit_delete` uses in the `yadorilink-peer-session`
+    /// unit tests, just against the real store instead of a fake).
+    fn seed_real_auth_chain(device: &Device, count: usize) -> Vec<Change> {
+        let sender = rusqlite::Connection::open_in_memory().unwrap();
+        dag_store::init_dag_schema(&sender).unwrap();
+        let version = empty_version();
+        dag_store::put_file_version(&sender, GROUP, &version).unwrap();
+        let emitter = ChangeEmitter::new(device.device_id.clone(), device.signing_key.clone());
+        let auth = real_auth(10, 2);
+        let mut changes = Vec::with_capacity(count);
+        for i in 0..count {
+            let change = dag_store::emit_local_change(
+                &sender,
+                GROUP,
+                vec![Op::Delete { path: SyncPath(format!("path-{i:05}")) }],
+                auth,
+                &emitter,
+            )
+            .unwrap();
+            device.state.dag_admit_change_with_versions(&change, &[], false).unwrap();
+            changes.push(change);
+        }
+        changes
+    }
+
+    /// The RED case this module exists to catch: an empty receiver, behind a
+    /// real-auth-stamped chain one change longer than the wire batch cap
+    /// (1000), must actually reach the tip and every one of its ancestors
+    /// within a generous but bounded window -- not merely make asymptotic
+    /// progress that a short test timeout can't distinguish from a genuine
+    /// stall.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn empty_receiver_reaches_a_real_auth_tip_beyond_the_batch_cap() {
+        let addr = bind_unused_addr().await;
+        let device_a = Device::new("device-a");
+        let device_b = Device::new("device-b");
+
+        // One more than `peer_session.rs`'s private `MAX_CHANGES_PER_BATCH`
+        // (1000) -- not importable from this integration-test binary, so
+        // pinned here by value; C4-9's own unit tests pin the same value the
+        // same way.
+        let chain = seed_real_auth_chain(&device_a, 1001);
+        let tip = chain.last().unwrap().compute_hash();
+
+        let (channel_a, channel_b) = connect_pair(addr).await;
+        let auth = dag_authenticator(&[&device_a, &device_b]);
+        // No convergence driver: this module tests DAG-level admission and
+        // anti-entropy termination only (`dag_has_change`), never disk
+        // materialization -- `spawn_session_with_authenticator`'s driver
+        // would otherwise run `reconcile_local_materialization_audit` in a
+        // tight background loop for the whole test, competing for the same
+        // writer_gate `handle_change_batch`'s own admission/orphan-
+        // buffering needs and starving it for no reason this test cares
+        // about.
+        let session_a = spawn_session_configured_ex(
+            channel_a,
+            &device_a,
+            "device-b",
+            vec![GROUP.to_string()],
+            None,
+            false,
+            auth.clone(),
+            Some(AlwaysValidRootCommitAuthorityProvider::shared()),
+        );
+        let session_b = spawn_session_configured_ex(
+            channel_b,
+            &device_b,
+            "device-a",
+            vec![GROUP.to_string()],
+            None,
+            false,
+            auth,
+            Some(AlwaysValidRootCommitAuthorityProvider::shared()),
+        );
+        wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
+
+        // 180s: measured convergence at this chain length is ~125s with
+        // both fixes in place (the `changes_for_request` selector, and
+        // `insert_orphan`'s O(n) per-insert eviction-eligibility check --
+        // see that function's own doc comment). This test asserts
+        // termination, not throughput, so the budget stays generous.
+        announce_until(
+            &session_a,
+            GROUP,
+            || device_b.state.dag_has_change(&tip).unwrap_or(false),
+            Duration::from_secs(180),
+        )
+        .await;
+
+        for change in &chain {
+            assert!(
+                device_b.state.dag_has_change(&change.compute_hash()).unwrap(),
+                "ancestor missing even though the tip arrived: {:?}",
+                change.compute_hash()
+            );
+        }
+    }
+
+    /// Distinguishes "healthy chunked catch-up" (O(chain_len / cap) rounds)
+    /// from a genuine one-hop-per-round staircase (O(chain_len) rounds).
+    /// Measures wall-clock and `c4_diag` writer_gate stats separately for
+    /// the (expensive, sequential-SQL) seeding phase and the actual wire
+    /// catch-up phase, so a slow seed can never be mistaken for a slow
+    /// catch-up.
+    ///
+    /// `#[ignore]`d: at 5x the batch cap this hits a SEPARATE, already-known
+    /// scaling gap in `PeerReplicaEngine::changes_for_request` -- it walks
+    /// the FULL ancestor closure of every requested hash before selecting
+    /// from it, so a request against a long retained history does DAG reads
+    /// proportional to that history's total depth, not to the batch cap.
+    /// At 5000 real-auth changes, combined with `announce_until`'s ~400ms
+    /// re-announce cadence re-triggering that full-closure walk repeatedly,
+    /// this does not converge within a 900s budget (seed alone is ~450s).
+    /// The (cap+1)-length test above -- which exercises the SAME causal-
+    /// auth-buffering fix this module is actually about -- converges in
+    /// ~125s and is not ignored. Fixing the closure-walk itself (a bounded
+    /// reverse traversal instead of a full walk-then-truncate) is
+    /// deliberately out of scope here; do not attempt to close this by
+    /// tuning batching/selection further without that structural fix.
+    #[ignore = "known changes_for_request closure-walk scaling gap, separate from this module's \
+                own causal-auth fix -- see this fn's own doc comment"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn empty_receiver_reaches_a_real_auth_tip_five_times_beyond_the_batch_cap() {
+        const CHAIN_LEN: usize = 5000;
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let addr = bind_unused_addr().await;
+        let device_a = Device::new("device-a");
+        let device_b = Device::new("device-b");
+
+        let seed_started = std::time::Instant::now();
+        let chain = seed_real_auth_chain(&device_a, CHAIN_LEN);
+        let tip = chain.last().unwrap().compute_hash();
+        tracing::warn!(
+            chain_len = CHAIN_LEN,
+            seed_elapsed_ms = seed_started.elapsed().as_millis() as u64,
+            "C4_DIAG: real-auth chain seeded into device_a's own ReplicaCoordinator"
+        );
+
+        let (channel_a, channel_b) = connect_pair(addr).await;
+        let auth = dag_authenticator(&[&device_a, &device_b]);
+        // See the sibling (cap+1) test's own comment: no convergence
+        // driver here either, for the same reason.
+        let session_a = spawn_session_configured_ex(
+            channel_a,
+            &device_a,
+            "device-b",
+            vec![GROUP.to_string()],
+            None,
+            false,
+            auth.clone(),
+            Some(AlwaysValidRootCommitAuthorityProvider::shared()),
+        );
+        let session_b = spawn_session_configured_ex(
+            channel_b,
+            &device_b,
+            "device-a",
+            vec![GROUP.to_string()],
+            None,
+            false,
+            auth,
+            Some(AlwaysValidRootCommitAuthorityProvider::shared()),
+        );
+        wait_handshake_exchanged(&session_a, &session_b, Duration::from_secs(10)).await;
+
+        yadorilink_sqlite_runtime::c4_diag::reset();
+        let wire_started = std::time::Instant::now();
+        announce_until(
+            &session_a,
+            GROUP,
+            || device_b.state.dag_has_change(&tip).unwrap_or(false),
+            Duration::from_secs(900),
+        )
+        .await;
+        let (gate_acquisitions, gate_wait) = yadorilink_sqlite_runtime::c4_diag::stats();
+        let call_sites = yadorilink_sqlite_runtime::c4_diag::call_site_stats();
+        let top_call_sites: String = call_sites
+            .iter()
+            .take(10)
+            .map(|(loc, n)| format!("{n}x {loc}"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        tracing::warn!(
+            chain_len = CHAIN_LEN,
+            wire_elapsed_ms = wire_started.elapsed().as_millis() as u64,
+            gate_acquisitions,
+            gate_wait_ms = gate_wait.as_millis() as u64,
+            top_call_sites,
+            "C4_DIAG: real-auth wire catch-up summary"
+        );
+
+        for change in &chain {
+            assert!(
+                device_b.state.dag_has_change(&change.compute_hash()).unwrap(),
+                "ancestor missing even though the tip arrived: {:?}",
+                change.compute_hash()
+            );
+        }
     }
 }

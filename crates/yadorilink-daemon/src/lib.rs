@@ -4,6 +4,7 @@
 pub mod adapters;
 pub mod app;
 pub mod application;
+pub mod c4_diag;
 pub mod change_auth;
 pub mod change_policy;
 pub mod commit_orchestration;
@@ -48,6 +49,15 @@ pub mod recovery_diagnosis;
 pub mod recovery_evidence;
 pub mod recovery_snapshot;
 pub mod relay_carrier;
+// The relay forwarder binds a real, dedicated UDP socket per relay session
+// and connects it to the destination address -- none of which the
+// deterministic simulator models -- so the whole module is production-only,
+// matching `nat_traversal`/`resource_lock` above. `relay_session_handler`
+// only exists to bridge `DaemonState` into this module (grant admission plus
+// dispatch into the forwarder), so it is production-only for the same
+// reason; `peer_orchestrator` substitutes an always-deny relay handler under
+// the simulator instead.
+#[cfg(not(madsim))]
 pub mod relay_forwarder;
 // Rust 1.97's doc_lazy_continuation lint treats explanatory paragraphs after
 // numbered security-review lists as malformed list continuations. These two
@@ -57,6 +67,10 @@ pub mod relay_forwarder;
 pub mod relay_grant;
 #[allow(clippy::doc_lazy_continuation)]
 pub mod relay_session;
+// Bridges `DaemonState` into `relay_forwarder` (grant admission plus
+// dispatch into the forwarding actor) -- see `relay_forwarder`'s own gating
+// comment above for why neither exists under the deterministic simulator.
+#[cfg(not(madsim))]
 pub mod relay_session_handler;
 /// `ReplicaCoordinator` (Phase 7D-10.2) -- see that module's own doc
 /// comment for what it is and why it is additive alongside `SyncState`,

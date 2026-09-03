@@ -2,9 +2,10 @@
 //! lifecycles (`app::run(DaemonConfig)`) inside one `madsim` simulation
 //! node, pairs them over a static-netmap discovery seam (no coordination
 //! server, no relay), links the same group folder on both, writes a file on
-//! daemon A, and asserts daemon B materializes it -- an end-to-end proof
+//! daemon A and asserts daemon B materializes it, then writes a file on
+//! daemon B and asserts daemon A materializes that -- an end-to-end proof
 //! that two in-sim daemons can discover each other and converge on a file's
-//! content under the seeded, simulated scheduler.
+//! content, in both directions, under the seeded, simulated scheduler.
 //!
 //! This builds on `dst_daemon_smoke.rs` (which proves a *single* daemon
 //! boots and indexes in-sim). The one thing the real daemon cannot do
@@ -26,6 +27,10 @@
 //! `#[cfg(madsim)]`-gated, production unchanged):
 //!   - Peer discovery: the static-netmap seam above, in place of the
 //!     `tonic`/WebSocket coordination netmap stream.
+//!   - Group policy: the harness signs the group's authorized-writer policy
+//!     log with an authority key it owns, in place of the coordination
+//!     plane's policy service, and each daemon verifies it through the
+//!     production `record_group_policy_states` path -- see `scenario_body`.
 //!   - Control socket + shell-IPC (`UnixListener`): not started under
 //!     `--cfg madsim` (see `app.rs`); each daemon is driven through
 //!     `DaemonState`/`shutdown_tx` via the `state_probe` seam.
@@ -48,7 +53,6 @@ use yadorilink_filesystem_sync::debounce::DebounceConfig;
 use yadorilink_filesystem_sync::watcher::{
     FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
 };
-use yadorilink_transport::DeviceKeyPair;
 
 const GROUP_ID: &str = "dst-daemon-two-device-group";
 
@@ -107,7 +111,6 @@ async fn boot_daemon(
         sync_db_path: config_dir.path().join("sync-state.sqlite3"),
         control_socket_path: config_dir.path().join("daemon.sock"),
         shell_ipc_socket_path: config_dir.path().join("shell.sock"),
-        keypair_path: config_dir.path().join("wg_key"),
         state_probe: Some(probe.clone()),
         sim_discovery: Some(sim_discovery),
         // This test uses the real, un-decorated block store (no fault injection).
@@ -162,12 +165,42 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
 
     // Two device keypairs; each daemon's static netmap lists the *other's*
     // public key.
-    let keypair_a = DeviceKeyPair::generate();
-    let keypair_b = DeviceKeyPair::generate();
-    let public_a = keypair_a.public;
-    let public_b = keypair_b.public;
-    let keypair_a = Arc::new(keypair_a);
-    let keypair_b = Arc::new(keypair_b);
+    // Fixed rather than random: a simulated run has to be reproducible from
+    // its seed alone, and these keys only need to be distinct and stable.
+    let signing_a = ed25519_dalek::SigningKey::from_bytes(&[0xA1; 32]);
+    let signing_b = ed25519_dalek::SigningKey::from_bytes(&[0xB2; 32]);
+    let signing_public_a = signing_a.verifying_key().to_bytes();
+    let signing_public_b = signing_b.verifying_key().to_bytes();
+
+    // Stand in for the coordination plane's policy service. In production a
+    // group's authorized-writer set is not something a daemon decides: the
+    // plane signs a hash-chained policy log with the group's authority key and
+    // ships it alongside the netmap, and the daemon verifies it before it will
+    // treat the group as anything but fail-closed. Nothing in the simulation
+    // provides that, so the harness owns the authority private key and signs a
+    // genuine log here; both daemons then verify it through the production
+    // path (`peer_orchestrator::record_group_policy_states`), pin the
+    // authority key, and record the anti-rollback watermark exactly as they
+    // would against a real coordination plane.
+    //
+    // Without it the group is *introduced* on both devices (each is linked
+    // locally and names the other as a writer) but has no verified policy
+    // state, which `DaemonState::resolve_group_policy` answers -- correctly --
+    // with `Withhold`: "this group's real policy has not been resolved yet
+    // this run". Every session then has the group revoked out from under it
+    // and drops the peer's heads announcements, so the two devices pair up and
+    // never converge.
+    //
+    // Fixed key bytes, like the device signing keys above: a simulated run has
+    // to be reproducible from its seed alone.
+    let policy_authority = ed25519_dalek::SigningKey::from_bytes(&[0xC3; 32]);
+    let group_policy_log =
+        yadorilink_daemon::change_policy::policy_signing::signed_writer_grant_log(
+            &policy_authority,
+            GROUP_ID,
+            &[("device-a", signing_public_a), ("device-b", signing_public_b)],
+        );
+    let policy_service_public_key = policy_authority.verifying_key().to_bytes();
 
     // Pre-bind one direct UDP socket per daemon on the simulation node's
     // loopback; each daemon dials the other's address as its direct
@@ -183,26 +216,30 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
     let addr_b = socket_b.local_addr().map_err(|e| format!("addr_b: {e}"))?;
 
     let sim_a = SimDiscovery {
-        keypair: keypair_a,
+        signing_key: signing_a.clone(),
         local_device_id: "device-a".to_string(),
         peers: vec![SimPeer {
             device_id: "device-b".to_string(),
-            public_key: public_b,
+            signing_public_key: signing_public_b,
             shared_group_ids: vec![GROUP_ID.to_string()],
-            local_socket: socket_a,
             peer_candidates: vec![addr_b],
         }],
+        policy_service_public_key,
+        group_policy_logs: vec![group_policy_log.clone()],
+        local_socket: socket_a,
     };
     let sim_b = SimDiscovery {
-        keypair: keypair_b,
+        signing_key: signing_b.clone(),
         local_device_id: "device-b".to_string(),
         peers: vec![SimPeer {
             device_id: "device-a".to_string(),
-            public_key: public_a,
+            signing_public_key: signing_public_a,
             shared_group_ids: vec![GROUP_ID.to_string()],
-            local_socket: socket_b,
             peer_candidates: vec![addr_a],
         }],
+        policy_service_public_key,
+        group_policy_logs: vec![group_policy_log.clone()],
+        local_socket: socket_b,
     };
 
     // Boot both real daemon lifecycles as in-sim tasks. Each links the
@@ -266,6 +303,48 @@ async fn scenario_body(seed: u64) -> Result<(), String> {
         return Err(format!("content diverged on B: got {} bytes", got.len()));
     }
 
+    // Now the reverse direction on the same live sessions: B writes, A
+    // materializes. This is not a mirror-image duplicate of the assertion
+    // above -- the two directions exercise different halves of the
+    // authorization wiring. A->B proves B admits a change authored by A
+    // against A's Grant in the verified policy; B->A proves the same for A
+    // admitting B's, which depends on B's own Grant and B's pinned signing
+    // key. A policy log that named only the first writer, or a device whose
+    // own emission side never resolved the group, would still pass the
+    // one-directional assertion above.
+    let reverse_content = b"and back from daemon B, over the same paired session";
+    let reverse_on_b = daemon_b.root.join("reply.txt");
+    std::fs::write(&reverse_on_b, reverse_content).map_err(|e| format!("write file on B: {e}"))?;
+    stamp_deterministic_mtime(&reverse_on_b, mtime_nanos)?;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    daemon_b
+        .events_tx
+        .send(FsChangeEvent { path: reverse_on_b.clone(), kind: FsChangeKind::CreatedOrModified })
+        .await
+        .map_err(|_| "watcher event channel closed early on B".to_string())?;
+
+    let reverse_on_a = daemon_a.root.join("reply.txt");
+    wait_for(
+        || {
+            reverse_on_a.exists()
+                && std::fs::read(&reverse_on_a).map(|c| c == reverse_content).unwrap_or(false)
+        },
+        DebounceConfig::default().max_flush_interval + Duration::from_secs(60),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "daemon A never materialized the file synced from B (exists={}, sessions_a={:?})",
+            reverse_on_a.exists(),
+            daemon_a.state.peers.all_sessions().into_iter().map(|(id, _)| id).collect::<Vec<_>>()
+        )
+    })?;
+
+    let got_reverse = std::fs::read(&reverse_on_a).map_err(|e| format!("read file on A: {e}"))?;
+    if got_reverse != reverse_content {
+        return Err(format!("content diverged on A: got {} bytes", got_reverse.len()));
+    }
+
     // Graceful shutdown of both daemons through the same watch channel the
     // control socket's `Shutdown` request uses.
     daemon_a.state.shutdown_tx.send(true).map_err(|e| format!("shutdown A: {e}"))?;
@@ -323,7 +402,8 @@ fn run_scenario(seed: u64) -> Result<(), String> {
 }
 
 /// Two in-sim daemons discover each other via the static-netmap seam and
-/// converge on a file written on A appearing, byte-identical, on B.
+/// converge in both directions: a file written on A appears byte-identical
+/// on B, and a file then written on B appears byte-identical on A.
 #[test]
 fn two_daemons_discover_and_sync_a_file_in_sim() {
     let seed: u64 = std::env::var("DST_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(1);

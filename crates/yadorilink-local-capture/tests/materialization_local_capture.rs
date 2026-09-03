@@ -39,7 +39,7 @@
 //!
 //! The three tiny private helpers this test used
 //! (`materialization.rs::tests::{adopt_root, crashed_executable,
-//! disk_exec_bit}`) are not `pub`, so they are reproduced here directly
+//! disk_unix_mode}`) are not `pub`, so they are reproduced here directly
 //! rather than widened — each is a few lines with no logic of its own
 //! worth sharing.
 
@@ -48,7 +48,9 @@
 use std::sync::Arc;
 
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
-use yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations;
+use yadorilink_filesystem_sync::materialization_repair::{
+    repair_interrupted_materializations, RepairMode,
+};
 use yadorilink_local_storage::{BlockStore, FsBlockStore};
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 use yadorilink_root_authority::root_commit::{RootCommitPermit, RootLease};
@@ -89,15 +91,15 @@ fn crashed_executable(
         .unwrap();
     state
         .file_index_repository()
-        .set_exec_bit("group-1", path, true, &RootCommitPermit::for_tests())
+        .set_unix_mode("group-1", path, Some(0o755), &RootCommitPermit::for_tests())
         .unwrap();
     state
-        .materialization_job_repository()
+        .materialization_intent_repository()
         .begin_materialization_intent("group-1", path, &[0u8; 32], &RootCommitPermit::for_tests())
         .unwrap();
 }
 
-fn disk_exec_bit(path: &std::path::Path) -> bool {
+fn disk_unix_mode(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).unwrap().permissions().mode() & 0o100 != 0
 }
@@ -105,7 +107,7 @@ fn disk_exec_bit(path: &std::path::Path) -> bool {
 /// End-to-end over the seam that decides how bad a dropped exec bit is: a
 /// repair followed by the startup scan the daemon runs next.
 ///
-/// `reconstruct_file_journaled`'s own `apply_exec_bit` call (right after the
+/// `reconstruct_file_journaled`'s own `apply_unix_mode` call (right after the
 /// reconstruct) already reapplies the index's recorded exec bit to the
 /// repaired file, so by the time the scan runs, disk and index already agree
 /// — the scan mints nothing to report either way, and this test asserts that
@@ -116,7 +118,7 @@ fn disk_exec_bit(path: &std::path::Path) -> bool {
 /// reaches the same "nothing changed" verdict once exec bit already agrees,
 /// so this is not itself part of what the assertions below check.
 #[test]
-fn repair_leaves_disk_exec_bit_agreeing_with_the_index_across_a_scan() {
+fn repair_leaves_disk_unix_mode_agreeing_with_the_index_across_a_scan() {
     let block_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(block_dir.path()).unwrap());
     let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
@@ -129,6 +131,7 @@ fn repair_leaves_disk_exec_bit_agreeing_with_the_index_across_a_scan() {
         store.as_ref(),
         root.path(),
         "group-1",
+        RepairMode::Startup,
         &RootCommitPermit::for_tests(),
     )
     .unwrap();
@@ -148,12 +151,13 @@ fn repair_leaves_disk_exec_bit_agreeing_with_the_index_across_a_scan() {
         "the scan suppresses the repaired file as a self-echo, so it can neither propagate \
          a dropped exec bit nor repair one: {minted:?}"
     );
-    assert!(
-        state.file_index_repository().get_exec_bit("group-1", "tool.sh").unwrap(),
-        "the index keeps exec_bit=true across the scan"
+    assert_eq!(
+        state.file_index_repository().get_unix_mode("group-1", "tool.sh").unwrap(),
+        Some(0o755),
+        "the index keeps unix_mode=Some(0o755) across the scan"
     );
     assert!(
-        disk_exec_bit(&root.path().join("tool.sh")),
+        disk_unix_mode(&root.path().join("tool.sh")),
         "so the disk must already agree with it -- no later pass reconciles the two"
     );
 }

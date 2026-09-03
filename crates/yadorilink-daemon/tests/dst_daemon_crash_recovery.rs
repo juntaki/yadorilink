@@ -143,7 +143,6 @@ async fn boot_daemon(
         sync_db_path: sync_db_path.to_path_buf(),
         control_socket_path: config_dir.join("daemon.sock"),
         shell_ipc_socket_path: config_dir.join("shell.sock"),
-        keypair_path: config_dir.join("wg_key"),
         state_probe: Some(probe.clone()),
         sim_discovery: None,
         // This test uses the real, un-decorated block store (no fault injection).

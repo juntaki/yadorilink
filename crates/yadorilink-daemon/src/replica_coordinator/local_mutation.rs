@@ -60,7 +60,7 @@ use yadorilink_local_capture::ports::{LocalChangeEmission, LocalMutationStore};
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::session_state::{
-    ChangeContent, DirtyPath, LocalFileMetaColumns, MaterializationState,
+    ChangeContent, DirtyPath, LocalFileMetaColumns, MaterializationState, PreparedLocalMutation,
 };
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
@@ -75,6 +75,14 @@ impl LocalMutationStore for ReplicaCoordinator {
 
     fn get_file(&self, group_id: &str, path: &str) -> Result<Option<FileRecord>, SyncSqliteError> {
         self.file_index_repository().get_file(group_id, path)
+    }
+
+    fn get_authoring_change_hash(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<ChangeHash>, SyncSqliteError> {
+        self.file_index_repository().get_authoring_change_hash(group_id, path)
     }
 
     fn list_materialization_states(
@@ -144,24 +152,19 @@ impl LocalMutationStore for ReplicaCoordinator {
         group_id: &str,
         path: &str,
     ) -> Result<bool, SyncSqliteError> {
-        self.materialization_job_repository().has_materialization_intent(group_id, path)
+        self.materialization_intent_repository().has_materialization_intent(group_id, path)
     }
 
-    fn has_pending_materialization_job(
+    fn has_unsettled_projection_obligation(
         &self,
         group_id: &str,
         path: &str,
     ) -> Result<bool, SyncSqliteError> {
-        Ok(self
-            .materialization_job_repository()
-            .materialization_get_job(group_id, path)?
-            .is_some_and(|job| {
-                !matches!(
-                    job.state,
-                    yadorilink_sync_sqlite::MaterializationJobState::Completed
-                        | yadorilink_sync_sqlite::MaterializationJobState::Superseded
-                )
-            }))
+        // While a projection obligation exists for this path, an absent
+        // local file must not yet be interpreted as an offline user
+        // deletion -- any row at all (pending or the parked
+        // `ignore_blocked`) means the path is still being placed locally.
+        Ok(self.sqlite().dag_lookup_projection_obligation(group_id, path)?.is_some())
     }
 
     fn get_record_kind(
@@ -208,8 +211,16 @@ impl LocalMutationStore for ReplicaCoordinator {
         self.file_index_repository().set_symlink_out_of_root(group_id, path, out_of_root)
     }
 
-    fn get_exec_bit(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError> {
-        self.file_index_repository().get_exec_bit(group_id, path)
+    fn get_unix_mode(&self, group_id: &str, path: &str) -> Result<Option<u32>, SyncSqliteError> {
+        self.file_index_repository().get_unix_mode(group_id, path)
+    }
+
+    fn get_xattrs(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, SyncSqliteError> {
+        self.file_index_repository().get_xattrs(group_id, path)
     }
 
     fn record_materialized_fingerprint(
@@ -229,14 +240,24 @@ impl LocalMutationStore for ReplicaCoordinator {
         )
     }
 
-    fn set_exec_bit(
+    fn set_unix_mode(
         &self,
         group_id: &str,
         path: &str,
-        exec_bit: bool,
+        unix_mode: Option<u32>,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.file_index_repository().set_exec_bit(group_id, path, exec_bit, permit)
+        self.file_index_repository().set_unix_mode(group_id, path, unix_mode, permit)
+    }
+
+    fn set_xattrs(
+        &self,
+        group_id: &str,
+        path: &str,
+        xattrs: &[(String, Vec<u8>)],
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), SyncSqliteError> {
+        self.file_index_repository().set_xattrs(group_id, path, xattrs, permit)
     }
 
     fn dag_group_heads(&self, group_id: &str) -> Result<Vec<ChangeHash>, SyncSqliteError> {
@@ -250,7 +271,8 @@ impl LocalMutationStore for ReplicaCoordinator {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         meta: Option<&LocalFileMetaColumns>,
-        emission: LocalChangeEmission<'_, '_>,
+        filesystem_identity: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
+        emission: LocalChangeEmission<'_>,
     ) -> Result<ChangeHash, SyncSqliteError> {
         let auth = self.local_emission_auth(group_id).map_err(SyncSqliteError::from)?;
         self.file_index_repository().upsert_file_emitting_change(
@@ -259,6 +281,29 @@ impl LocalMutationStore for ReplicaCoordinator {
             origin_device_id,
             content,
             meta,
+            filesystem_identity,
+            yadorilink_sync_sqlite::file_index::ChangeEmissionContext {
+                emitter: emission.emitter,
+                permit: emission.permit,
+                auth,
+            },
+        )
+    }
+
+    fn commit_local_mutations_batch(
+        &self,
+        group_id: &str,
+        mutations: &[PreparedLocalMutation],
+        evidence: &[Option<yadorilink_sync_sqlite::file_index::LocalCaptureActualStateEvidence>],
+        origin_device_id: &str,
+        emission: LocalChangeEmission<'_>,
+    ) -> Result<Vec<ChangeHash>, SyncSqliteError> {
+        let auth = self.local_emission_auth(group_id).map_err(SyncSqliteError::from)?;
+        self.file_index_repository().commit_local_mutations_batch(
+            group_id,
+            mutations,
+            evidence,
+            origin_device_id,
             yadorilink_sync_sqlite::file_index::ChangeEmissionContext {
                 emitter: emission.emitter,
                 permit: emission.permit,
@@ -299,7 +344,7 @@ impl LocalMutationStore for ReplicaCoordinator {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         metas: &[Option<LocalFileMetaColumns>],
-        emission: LocalChangeEmission<'_, '_>,
+        emission: LocalChangeEmission<'_>,
     ) -> Result<Option<ChangeHash>, SyncSqliteError> {
         let auth = self.local_emission_auth(group_id).map_err(SyncSqliteError::from)?;
         self.file_index_repository().upsert_files_batch_emitting_change(
@@ -339,6 +384,7 @@ impl LocalMutationStore for ReplicaCoordinator {
         path: &str,
         device_id: &str,
         observed_at_unix_nanos: i64,
+        publish_absent_proof: bool,
         emitter: &ChangeEmitter,
         permit: &RootCommitPermit<'_>,
     ) -> Result<ChangeHash, SyncSqliteError> {
@@ -348,6 +394,7 @@ impl LocalMutationStore for ReplicaCoordinator {
             path,
             device_id,
             observed_at_unix_nanos,
+            publish_absent_proof,
             yadorilink_sync_sqlite::file_index::ChangeEmissionContext { emitter, permit, auth },
         )
     }
@@ -386,6 +433,15 @@ impl LocalMutationStore for ReplicaCoordinator {
         )
     }
 
+    fn record_dirty_paths_batch(
+        &self,
+        group_id: &str,
+        entries: &[(String, String, i64)],
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), SyncSqliteError> {
+        self.dirty_path_repository().record_dirty_paths_batch(group_id, entries, permit)
+    }
+
     fn mark_dirty_path_attempt(
         &self,
         group_id: &str,
@@ -403,6 +459,15 @@ impl LocalMutationStore for ReplicaCoordinator {
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
         self.dirty_path_repository().clear_dirty_path(group_id, path, permit)
+    }
+
+    fn clear_dirty_paths_conditional_batch(
+        &self,
+        group_id: &str,
+        entries: &[(String, i64)],
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), SyncSqliteError> {
+        self.dirty_path_repository().clear_dirty_paths_conditional_batch(group_id, entries, permit)
     }
 
     fn list_dirty_paths(&self, group_id: &str) -> Result<Vec<DirtyPath>, SyncSqliteError> {

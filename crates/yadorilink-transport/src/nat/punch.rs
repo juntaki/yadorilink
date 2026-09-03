@@ -4,15 +4,18 @@
 //! the same instant, so each NAT's outbound mapping is open when the other's
 //! probes arrive.
 //!
-//! There is no separate punch protocol on the wire. The "probe" is the
-//! transport's ordinary WireGuard handshake initiation — feeding a peer's
-//! candidate into the connection's candidate race (the same entry point LAN
-//! discovery uses) makes the transport send a handshake at it, and the
-//! existing rule that only authenticated traffic confirms a path applies
-//! unchanged. This module owns two concerns and nothing else: the *timing* of
-//! a synchronized burst, and the *bounds* that stop a peer being probed
+//! There is no separate punch protocol on the wire. A "probe" is whatever
+//! the transport already sends at a candidate to try to reach it, and the
+//! rule that only authenticated traffic confirms a path applies unchanged.
+//! This module owns two concerns and nothing else: the *timing* of a
+//! synchronized burst, and the *bounds* that stop a peer being probed
 //! forever. Symmetric NAT on both sides is out of scope: it is classified,
 //! the peer is marked unreachable, and store-and-forward carries propagation.
+//!
+//! The injection point a burst drives is a [`PunchTarget`], which the
+//! connectivity layer supplies. There is no production implementor while the
+//! candidate layer is being rebuilt on the QUIC transport; the timing and
+//! bounds below are unchanged and are what that work attaches to.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -70,7 +73,7 @@ struct PeerPunchState {
 /// Per-peer punch bounds and backoff. Pure decision logic (no I/O, no
 /// clock of its own — the caller passes `now`), so it is fully testable and
 /// behaves identically under simulation. `K` is the peer identity, typically
-/// a WireGuard public key.
+/// the peer's device public key.
 pub struct PunchLimiter<K: Eq + Hash> {
     config: PunchConfig,
     peers: HashMap<K, PeerPunchState>,
@@ -115,10 +118,8 @@ impl<K: Eq + Hash> PunchLimiter<K> {
     }
 }
 
-/// A connection into which punch probes are injected. The production
-/// implementation forwards each candidate to the peer's channel candidate
-/// race (`PeerChannel::add_direct_candidate`), which makes the transport send
-/// a WireGuard handshake at it.
+/// A connection into which punch probes are injected: one call per candidate
+/// address, and what "probe" means is the implementor's to decide.
 pub trait PunchTarget: Send + Sync {
     fn probe<'a>(
         &'a self,

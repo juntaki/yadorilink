@@ -16,9 +16,10 @@ mod unix_socket_tests {
     use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
     use yadorilink_ipc_proto::daemonctl::{
         DaemonControlRequest, DaemonControlResponse, EvictRequest, HydrateRequest, LinkRequest,
-        ListLinksRequest, ListTrashRequest, ListVersionsRequest, PauseRequest,
-        PendingEnrollmentKind, PinRequest, RestoreTrashRequest, RestoreVersionRequest,
-        ResumeRequest, StatusRequest, UnlinkRequest, UnpinRequest,
+        ListConflictsRequest, ListLinksRequest, ListTrashRequest, ListVersionsRequest,
+        MaterializationState, MaterializationStatusRequest, PauseRequest, PendingEnrollmentKind,
+        PinRequest, RestoreTrashRequest, RestoreVersionRequest, ResumeRequest, StatusRequest,
+        UnlinkRequest, UnpinRequest,
     };
     use yadorilink_ipc_proto::framing::{read_message, write_message};
     use yadorilink_local_storage::FsBlockStore;
@@ -516,6 +517,170 @@ mod unix_socket_tests {
         assert_eq!(status.links[0].conflict_count, 0);
     }
 
+    /// `yadorilink conflicts list` -- a live file whose path already
+    /// carries the "(conflicted copy" marker `conflict_count` above counts
+    /// by is individually listed, tagged with its link's `local_path`; a
+    /// plain (non-conflicted) file in the same group is not.
+    #[tokio::test]
+    async fn list_conflicts_returns_conflicted_copy_files_tagged_by_link() {
+        use yadorilink_replica_domain::file::FileRecord;
+
+        let (socket_path, dir, state) = start_daemon_with_state().await;
+        let folder = dir.path().join("shared");
+        std::fs::create_dir_all(&folder).unwrap();
+        let local_path = folder.to_string_lossy().to_string();
+        send(
+            &socket_path,
+            ReqPayload::Link(LinkRequest {
+                local_path: local_path.clone(),
+                group_id: "group-conflicts".into(),
+                on_demand: false,
+                max_local_size_bytes: None,
+                acknowledge_risks: true,
+                pending_enrollment_operation_id: String::new(),
+                pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
+                pending_enrollment_device_id: String::new(),
+            }),
+        )
+        .await;
+
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file(
+                "group-conflicts",
+                &FileRecord {
+                    path: "photo.jpg".into(),
+                    size: 5,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![],
+                    deleted: false,
+                },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file(
+                "group-conflicts",
+                &FileRecord {
+                    path: "photo (conflicted copy, 2026-01-01-000000, device-b).jpg".into(),
+                    size: 7,
+                    mtime_unix_nanos: 42,
+                    blocks: vec![],
+                    deleted: false,
+                },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+
+        let resp = send(&socket_path, ReqPayload::ListConflicts(ListConflictsRequest {})).await;
+        let Some(RespPayload::ListConflicts(list)) = resp.payload else {
+            panic!("wrong response variant: {resp:?}")
+        };
+        assert_eq!(list.files.len(), 1);
+        assert_eq!(list.files[0].local_path, local_path);
+        assert_eq!(list.files[0].path, "photo (conflicted copy, 2026-01-01-000000, device-b).jpg");
+        assert_eq!(list.files[0].size, 7);
+        assert_eq!(list.files[0].mtime_unix_nanos, 42);
+    }
+
+    /// A conflict-copy file routinely gets deleted by the retirement sweep
+    /// (`retire_unjustified_ephemeral_conflict_copies`) once it's no longer
+    /// justified -- this is the ordinary case, not an edge case. Once
+    /// deleted, it must disappear from BOTH `ListConflicts` and `status`'s
+    /// per-link `conflict_count`, and the two must keep agreeing with each
+    /// other throughout: both read the same underlying
+    /// `list_live_conflict_copies` query, so there is no way for one to
+    /// filter tombstones and the other not to.
+    #[tokio::test]
+    async fn a_deleted_conflict_copy_disappears_from_both_list_conflicts_and_conflict_count() {
+        use yadorilink_replica_domain::file::FileRecord;
+
+        let (socket_path, dir, state) = start_daemon_with_state().await;
+        let folder = dir.path().join("shared");
+        std::fs::create_dir_all(&folder).unwrap();
+        let local_path = folder.to_string_lossy().to_string();
+        send(
+            &socket_path,
+            ReqPayload::Link(LinkRequest {
+                local_path: local_path.clone(),
+                group_id: "group-retired-conflict".into(),
+                on_demand: false,
+                max_local_size_bytes: None,
+                acknowledge_risks: true,
+                pending_enrollment_operation_id: String::new(),
+                pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
+                pending_enrollment_device_id: String::new(),
+            }),
+        )
+        .await;
+
+        let conflict_path = "note (conflicted copy, 2026-01-01-000000, device-b).txt";
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file(
+                "group-retired-conflict",
+                &FileRecord {
+                    path: conflict_path.into(),
+                    size: 4,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![],
+                    deleted: false,
+                },
+                &permit,
+            )
+            .unwrap();
+
+        // Still live: both surfaces agree it exists.
+        let resp = send(&socket_path, ReqPayload::ListConflicts(ListConflictsRequest {})).await;
+        let Some(RespPayload::ListConflicts(list)) = resp.payload else {
+            panic!("wrong response variant: {resp:?}")
+        };
+        assert_eq!(list.files.len(), 1);
+        let resp = send(&socket_path, ReqPayload::Status(StatusRequest {})).await;
+        let Some(RespPayload::Status(status)) = resp.payload else {
+            panic!("wrong response variant")
+        };
+        assert_eq!(status.links[0].conflict_count, 1);
+
+        // The retirement sweep deletes it, same as it would once no unresolved
+        // divergence justifies keeping the copy around.
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file(
+                "group-retired-conflict",
+                &FileRecord {
+                    path: conflict_path.into(),
+                    size: 4,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![],
+                    deleted: true,
+                },
+                &permit,
+            )
+            .unwrap();
+
+        // Deleted: both surfaces agree it's gone -- neither still counts it.
+        let resp = send(&socket_path, ReqPayload::ListConflicts(ListConflictsRequest {})).await;
+        let Some(RespPayload::ListConflicts(list)) = resp.payload else {
+            panic!("wrong response variant: {resp:?}")
+        };
+        assert_eq!(list.files.len(), 0, "a deleted conflict copy must not be listed");
+        let resp = send(&socket_path, ReqPayload::Status(StatusRequest {})).await;
+        let Some(RespPayload::Status(status)) = resp.payload else {
+            panic!("wrong response variant")
+        };
+        assert_eq!(
+            status.links[0].conflict_count, 0,
+            "a deleted conflict copy must not be counted"
+        );
+    }
+
     /// A held file (a cross-platform name hazard, held rather than
     /// materialized or auto-renamed) is surfaced over the control socket
     /// with its count, path, reason, and hold timestamp, sourced from
@@ -982,6 +1147,116 @@ mod unix_socket_tests {
         let metadata = std::fs::metadata(folder.join("report.pdf")).unwrap();
         assert_eq!(metadata.len(), 1000);
         assert_ne!(std::fs::read(folder.join("report.pdf")).unwrap(), content);
+    }
+
+    /// P0-B: a path the daemon has never indexed reports `known: false`
+    /// over the control socket, never a guessed default state.
+    #[tokio::test]
+    async fn materialization_status_via_control_socket_reports_unknown_for_an_unindexed_path() {
+        let (socket_path, dir) = start_daemon().await;
+        let folder = dir.path().join("shared");
+        std::fs::create_dir_all(&folder).unwrap();
+        send(
+            &socket_path,
+            ReqPayload::Link(LinkRequest {
+                local_path: folder.to_string_lossy().to_string(),
+                group_id: "group-status-1".into(),
+                on_demand: false,
+                max_local_size_bytes: None,
+                acknowledge_risks: true,
+                pending_enrollment_operation_id: String::new(),
+                pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
+                pending_enrollment_device_id: String::new(),
+            }),
+        )
+        .await;
+
+        let resp = send(
+            &socket_path,
+            ReqPayload::MaterializationStatus(MaterializationStatusRequest {
+                absolute_path: folder.join("never-seen.bin").to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        match resp.payload {
+            Some(RespPayload::MaterializationStatus(status)) => {
+                assert!(!status.known);
+            }
+            other => panic!("expected a MaterializationStatus response, got {other:?}"),
+        }
+    }
+
+    /// P0-B: an indexed file's real materialization state and pin flag
+    /// round-trip through the control socket exactly, end to end.
+    #[tokio::test]
+    async fn materialization_status_via_control_socket_reports_the_real_state_and_pin_flag() {
+        let (socket_path, dir, state) = start_daemon_with_state().await;
+        let folder = dir.path().join("shared");
+        std::fs::create_dir_all(&folder).unwrap();
+        let local_path = folder.to_string_lossy().to_string();
+        send(
+            &socket_path,
+            ReqPayload::Link(LinkRequest {
+                local_path: local_path.clone(),
+                group_id: "group-status-2".into(),
+                on_demand: false,
+                max_local_size_bytes: None,
+                acknowledge_risks: true,
+                pending_enrollment_operation_id: String::new(),
+                pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
+                pending_enrollment_device_id: String::new(),
+            }),
+        )
+        .await;
+        LinkRuntimeController::new(state.clone()).stop(&local_path).await;
+
+        std::fs::write(folder.join("report.pdf"), vec![7u8; 10]).unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file(
+                "group-status-2",
+                &yadorilink_replica_domain::file::FileRecord {
+                    path: "report.pdf".into(),
+                    size: 10,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![],
+                    deleted: false,
+                },
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        state
+            .replica_coordinator
+            .materialization_state_repository()
+            .set_materialization_state(
+                "group-status-2",
+                "report.pdf",
+                yadorilink_replica_domain::session_state::MaterializationState::Hydrated,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .set_pinned("group-status-2", "report.pdf", true)
+            .unwrap();
+
+        let resp = send(
+            &socket_path,
+            ReqPayload::MaterializationStatus(MaterializationStatusRequest {
+                absolute_path: folder.join("report.pdf").to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+        match resp.payload {
+            Some(RespPayload::MaterializationStatus(status)) => {
+                assert!(status.known);
+                assert_eq!(status.state(), MaterializationState::Hydrated);
+                assert!(status.pinned);
+            }
+            other => panic!("expected a MaterializationStatus response, got {other:?}"),
+        }
     }
 
     /// hydrate/pin with no peer connected must

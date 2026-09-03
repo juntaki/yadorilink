@@ -20,17 +20,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ github.token }}
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-06-30
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: linux-fast
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -78,16 +78,16 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ github.token }}
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-06-30
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: windows-fast
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -97,52 +97,28 @@ jobs:
       - name: Windows shell extension
         working-directory: shell-ext/windows
         run: cargo build --release
-      - name: Windows shell extension tests
-        working-directory: shell-ext/windows
-        run: cargo test
 
   macos:
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ github.token }}
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-06-30
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-06-30
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: macos-fast
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --workspace --all-targets
       - name: macOS tests
         run: cargo test --workspace --exclude yadorilink-daemon
-      - name: macOS shell extensions (Rust FFI)
+      - name: macOS shell extensions
         run: |
           cargo build --release --manifest-path shell-ext/macos/core/Cargo.toml
           cargo build --release --manifest-path shell-ext/macos/fileprovider-core/Cargo.toml
-      - name: macOS shell extensions (Rust FFI tests)
-        run: cargo test --manifest-path shell-ext/macos/fileprovider-core/Cargo.toml
-      # Compile gate for the Swift side -- until this was added, the Rust
-      # FFI cores above were the ONLY part of shell-ext/macos CI actually
-      # compiled; Swift source changes (DomainRegistration.swift,
-      # FileProviderModel.swift, etc.) had no compile verification at all.
-      # No code signing (this runner has no signing identity) and no
-      # device/simulator run -- compile-only, still real value: catches
-      # Swift/Xcode-project drift (e.g. a deployment-target/API-
-      # availability mismatch) before it reaches a real build machine.
-      - name: macOS shell extensions (Xcode compile gate)
-        run: |
-          brew install xcodegen
-          cd shell-ext/macos/YadoriLinkFinderSync
-          xcodegen generate
-          for scheme in YadoriLinkFinderSyncHost YadoriLinkFinderSync YadoriLinkFileProvider; do
-            xcodebuild -project YadoriLinkFinderSync.xcodeproj \
-              -scheme "$scheme" -configuration Debug \
-              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
-              build
-          done

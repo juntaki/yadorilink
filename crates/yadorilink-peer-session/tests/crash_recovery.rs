@@ -48,13 +48,12 @@
 
 use std::sync::Arc;
 
-use boringtun::x25519::{PublicKey, StaticSecret};
 use ed25519_dalek::SigningKey;
 use tokio::net::TcpListener;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::FsBlockStore;
 use yadorilink_peer_session::peer_session::{PeerSyncSession, PeerSyncSessionDeps};
-use yadorilink_transport::PeerChannel;
+use yadorilink_transport::QuicPeerChannel;
 
 mod dag_wire_support;
 use dag_wire_support::{pinned_authenticator, DagProducer};
@@ -68,14 +67,6 @@ const GROUP: &str = "shared-photos";
 async fn bind_unused_addr() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     listener.local_addr().unwrap()
-}
-
-fn gen_keypair() -> (StaticSecret, PublicKey) {
-    let mut bytes = [0u8; 32];
-    rand::fill(&mut bytes);
-    let secret = StaticSecret::from(bytes);
-    let public = PublicKey::from(&secret);
-    (secret, public)
 }
 
 /// A persistent device identity: state and block store survive across a
@@ -119,7 +110,7 @@ impl Device {
             store: Arc::new(FsBlockStore::new(store_dir.path()).unwrap()),
             state,
             signing_key: SigningKey::from_bytes(&[device_id.as_bytes()[device_id.len() - 1]; 32]),
-            // Without this, every BlockRequest this device receives is
+            // Without this, every block request this device receives is
             // answered Rejected("source has no serving engine installed")
             // -- there is no more legacy direct-serve fallback for a
             // session with no engine set. A generous, effectively
@@ -139,40 +130,38 @@ impl Device {
     }
 }
 
-async fn connect_pair(_addr: std::net::SocketAddr) -> (Arc<PeerChannel>, Arc<PeerChannel>) {
-    let (secret_a, public_a) = gen_keypair();
-    let (secret_b, public_b) = gen_keypair();
-    // Direct loopback: bind each side's UDP socket and hand the other its
-    // address as the sole direct candidate — the same wiring the daemon's
-    // peer orchestrator uses, minus the coordination-plane candidate
-    // discovery.
+async fn connect_pair(_addr: std::net::SocketAddr) -> (Arc<QuicPeerChannel>, Arc<QuicPeerChannel>) {
+    use yadorilink_transport::{
+        ConnectRole, DeviceSigningKeyPair, QuicPeerEndpoint, TransportHub,
+    };
+    // Direct loopback: bind each side's UDP socket and dial the other's
+    // address -- the same wiring the daemon's peer orchestrator uses, minus
+    // the coordination-plane candidate discovery.
     let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr_a = socket_a.local_addr().unwrap();
     let addr_b = socket_b.local_addr().unwrap();
-    let a = PeerChannel::connect(
-        secret_a,
-        public_b,
-        0,
-        vec![addr_b],
-        yadorilink_transport::TransportHub::from_socket(socket_a, Some(public_a)),
+    let key_a = DeviceSigningKeyPair::generate();
+    let key_b = DeviceSigningKeyPair::generate();
+    let public_a = key_a.public_bytes();
+    let public_b = key_b.public_bytes();
+    let endpoint_a = QuicPeerEndpoint::new(TransportHub::from_socket(socket_a), key_a).unwrap();
+    let endpoint_b = QuicPeerEndpoint::new(TransportHub::from_socket(socket_b), key_b).unwrap();
+    endpoint_a.authorize(public_b);
+    endpoint_b.authorize(public_a);
+    let accepting = {
+        let endpoint_b = endpoint_b.clone();
+        tokio::spawn(async move { endpoint_b.accept(public_a).await })
+    };
+    let dialed = endpoint_a.connect(addr_b, public_b).await.unwrap();
+    let accepted = accepting.await.unwrap().unwrap();
+    (
+        QuicPeerChannel::new(dialed, ConnectRole::Dial),
+        QuicPeerChannel::new(accepted, ConnectRole::Accept),
     )
-    .await
-    .unwrap();
-    let b = PeerChannel::connect(
-        secret_b,
-        public_a,
-        1,
-        vec![addr_a],
-        yadorilink_transport::TransportHub::from_socket(socket_b, Some(public_b)),
-    )
-    .await
-    .unwrap();
-    (Arc::new(a), Arc::new(b))
 }
 
 fn spawn_session(
-    channel: Arc<PeerChannel>,
+    channel: Arc<QuicPeerChannel>,
     device: &Device,
     peer_device_id: &str,
 ) -> (Arc<PeerSyncSession>, tokio::task::JoinHandle<()>) {
@@ -194,7 +183,7 @@ fn spawn_session(
         },
     );
     session.set_block_serve_engine(device.block_serve_engine.clone());
-    session.set_full_index_resync_interval(std::time::Duration::from_millis(200));
+    session.set_maintenance_reconcile_interval(std::time::Duration::from_millis(200));
     let handle = tokio::spawn({
         let session = session.clone();
         async move {
@@ -291,7 +280,7 @@ async fn local_change_committed_before_a_crash_is_reoffered_and_admitted_on_reco
     let (session_b2, _handle_b2) = spawn_session(chan_b2, &device_b, "device-a");
 
     wait_until(
-        || session_a2.change_dag_negotiated() && session_b2.change_dag_negotiated(),
+        || session_a2.peer_handshake_received() && session_b2.peer_handshake_received(),
         std::time::Duration::from_secs(20),
     )
     .await;

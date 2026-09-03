@@ -30,9 +30,10 @@ fn test_version() -> FileVersion {
         0,
         FileMeta {
             mtime_unix_nanos: 0,
-            exec_bit: false,
+            unix_mode: None,
             symlink_target: None,
             record_kind: RecordKind::File,
+            xattrs: Vec::new(),
         },
     )
 }

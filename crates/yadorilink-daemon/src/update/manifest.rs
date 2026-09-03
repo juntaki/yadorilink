@@ -517,6 +517,20 @@ pub(crate) mod test_support {
                 .encode(signature.to_bytes()),
         }
     }
+
+    /// Turns `test_trusted_keys()`'s `(String, [u8; 32])` pairs into real
+    /// `TrustedKey`s a verifier can use. `TrustedKey.public_key_hex` is
+    /// `&'static str`; leaking the hex string is fine for a
+    /// `#[cfg(test)]`-only helper that runs a bounded number of times per
+    /// test binary.
+    pub fn trusted_keys_hex(keys: &[(String, [u8; 32])]) -> Vec<TrustedKey> {
+        keys.iter()
+            .map(|(id, pk)| TrustedKey {
+                key_id: Box::leak(id.clone().into_boxed_str()),
+                public_key_hex: Box::leak(hex::encode(pk).into_boxed_str()),
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -560,19 +574,6 @@ mod tests {
             install_source: "standalone".into(),
             rollout_bucket: 0,
         }
-    }
-
-    fn trusted_keys_hex(keys: &[(String, [u8; 32])]) -> Vec<TrustedKey> {
-        // `TrustedKey.public_key_hex` is `&'static str`; leak the hex
-        // string for the lifetime of the test process, which is fine for
-        // a `#[cfg(test)]`-only helper that runs a bounded number of
-        // times per test binary.
-        keys.iter()
-            .map(|(id, pk)| TrustedKey {
-                key_id: Box::leak(id.clone().into_boxed_str()),
-                public_key_hex: Box::leak(hex::encode(pk).into_boxed_str()),
-            })
-            .collect()
     }
 
     /// A validly-signed manifest with a newer, fully-rolled-out entry is

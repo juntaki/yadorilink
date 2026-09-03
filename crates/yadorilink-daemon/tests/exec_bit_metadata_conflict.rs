@@ -9,18 +9,18 @@
 //! convention of self-contained daemon integration test binaries.
 //!
 //! **Load-bearing context this file's assertions were written against**
-//! (see `yadorilink-sync-core::types::owner_exec_bit_from_metadata`'s doc
-//! comment, and `chunker::apply_exec_bit`/`peer_session`'s
+//! (see `yadorilink-sync-core::types::unix_mode_from_metadata`'s doc
+//! comment, and `chunker::apply_unix_mode`/`peer_session`'s
 //! `try_apply_metadata_only_update`/`apply_incoming_wire_metadata`):
-//! `owner_exec_bit_from_metadata` — the capture-side primitive that reads a
+//! `unix_mode_from_metadata` — the capture-side primitive that reads a
 //! locally-observed file's real owner-exec bit off its `std::fs::Metadata`
 //! — is now wired into `LocalChangeProcessor`'s record-building path: the
 //! size+mtime fast path compares the on-disk owner-exec bit against the
 //! indexed one and advances the file's version when they differ, so a real
 //! `chmod` on a synced file is captured, broadcast, and reconciled like any
-//! other change. The wire schema (`proto::FileInfo::exec_bit`) and the
-//! materialization-side apply (`apply_exec_bit`, `SyncState::get_exec_bit`/
-//! `set_exec_bit`) exist and are exercised end to end. The scenarios below
+//! other change. The wire schema (`proto::FileInfo::unix_mode`) and the
+//! materialization-side apply (`apply_unix_mode`, `SyncState::get_unix_mode`/
+//! `set_unix_mode`) exist and are exercised end to end. The scenarios below
 //! assert against that wired behavior: a brand-new executable file
 //! propagates its exec bit to peers (scenario 4); an exec-bit-only chmod
 //! advances the version, so toggling it while a peer concurrently edits
@@ -51,7 +51,7 @@ use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeCo
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::FsBlockStore;
 use yadorilink_replica_domain::ids::ChangeHash;
-use yadorilink_transport::{DeviceKeyPair, PeerChannel};
+use yadorilink_transport::QuicPeerChannel;
 
 /// This device's own indexed owner-exec bit for `path`, read directly from
 /// its file index (not inferred from on-disk permissions, which a test may
@@ -60,15 +60,17 @@ use yadorilink_transport::{DeviceKeyPair, PeerChannel};
 /// DAG-backed state actually holds, independent of what the test wrote to
 /// disk moments earlier.
 #[cfg(unix)]
-fn indexed_exec_bit(device: &TestDevice, group_id: &str, path: &str) -> bool {
+fn indexed_unix_mode(device: &TestDevice, group_id: &str, path: &str) -> bool {
+    const OWNER_EXEC: u32 = 0o100;
     device
         .state
         .replica_coordinator
         .file_index_repository()
-        .get_exec_bit(group_id, path)
+        .get_unix_mode(group_id, path)
         .unwrap_or_else(|error| {
             panic!("{}: failed to read indexed exec bit for {path}: {error}", device.device_id)
         })
+        .is_some_and(|mode| mode & OWNER_EXEC != 0)
 }
 
 struct TestDevice {
@@ -84,8 +86,7 @@ struct TestDevice {
 }
 
 async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
-    let keypair = Arc::new(DeviceKeyPair::generate());
-    let device_id = support::register_device(account, name, keypair.public_bytes()).await;
+    let device_id = support::register_device(account, name, [0u8; 32]).await;
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
@@ -141,9 +142,9 @@ async fn two_synced_devices(test_name: &str) -> (TestDevice, TestDevice, String)
 }
 
 /// Like [`two_synced_devices`], but also returns the two devices' underlying
-/// `PeerChannel`s so a caller can later `revoke()` both to genuinely and
+/// channels so a caller can later drop both to genuinely and
 /// cleanly sever the pairing -- used by
-/// `shared_history_exec_bit_only_divergence_converges_after_reconnect` to
+/// `shared_history_unix_mode_only_divergence_converges_after_reconnect` to
 /// construct a real disconnect/reconnect sequence on a file both devices
 /// already share history on, rather than the create/create shape
 /// [`two_unconnected_devices`] uses. See
@@ -152,7 +153,7 @@ async fn two_synced_devices(test_name: &str) -> (TestDevice, TestDevice, String)
 /// primitive here.
 async fn two_synced_devices_with_channels(
     test_name: &str,
-) -> (TestDevice, TestDevice, String, [Arc<PeerChannel>; 2]) {
+) -> (TestDevice, TestDevice, String, [Arc<QuicPeerChannel>; 2]) {
     let coordination_addr = support::start_coordination_server().await;
     let account =
         support::register_and_login(&coordination_addr, &format!("{test_name}@example.com")).await;
@@ -183,7 +184,7 @@ async fn two_synced_devices_with_channels(
 /// [`two_synced_devices`], but deliberately does NOT pair them yet — the
 /// caller connects them explicitly (via `support::connect_two_daemons`)
 /// once it is ready to. See
-/// `concurrent_exec_bit_true_vs_false_no_content_change`'s doc comment for
+/// `concurrent_unix_mode_true_vs_false_no_content_change`'s doc comment for
 /// why this matters: two devices that are already connected while each
 /// makes an independent local write race the wire, and — confirmed,
 /// reproduced, 5/5 runs — that race in this environment resolves in favor
@@ -254,8 +255,8 @@ fn snapshot(root: &std::path::Path) -> HashMap<String, String> {
 }
 
 /// Reads back the real owner-exec bit a materialized file carries on
-/// disk — the same bit `chunker::apply_exec_bit` sets/clears and
-/// `types::owner_exec_bit_from_metadata` would (if wired) capture.
+/// disk — the same bit `chunker::apply_unix_mode` sets/clears and
+/// `types::unix_mode_from_metadata` would (if wired) capture.
 /// Unix-only: intentionally not given a non-unix stub, since every call
 /// site is itself behind a `#[cfg(unix)]` block.
 #[cfg(unix)]
@@ -273,7 +274,7 @@ fn is_conflict_copy(name: &str) -> bool {
 }
 
 /// Like [`snapshot`], but pairs each entry's content with its owner-exec
-/// bit — used by `concurrent_exec_bit_true_vs_false_no_content_change`,
+/// bit — used by `concurrent_unix_mode_true_vs_false_no_content_change`,
 /// where equality must mean "both devices agree on every entry's bytes AND
 /// exec bit," not merely on bytes.
 #[cfg(unix)]
@@ -307,11 +308,11 @@ fn exec_snapshot(root: &std::path::Path) -> HashMap<String, (String, bool)> {
 /// materialize the same winning version — a divergence there would be a
 /// real candidate bug this assertion is positioned to catch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_exec_bit_toggle_true_vs_content_edit() {
+async fn concurrent_unix_mode_toggle_true_vs_content_edit() {
     #[cfg(not(unix))]
     {
         eprintln!(
-            "skipping concurrent_exec_bit_toggle_true_vs_content_edit: requires a POSIX owner-exec bit"
+            "skipping concurrent_unix_mode_toggle_true_vs_content_edit: requires a POSIX owner-exec bit"
         );
         return;
     }
@@ -454,11 +455,11 @@ async fn concurrent_exec_bit_toggle_true_vs_content_edit() {
 /// "converges to something": an unnoticed permission divergence between
 /// devices is the real regression this test exists to catch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_exec_bit_true_vs_false_no_content_change() {
+async fn concurrent_unix_mode_true_vs_false_no_content_change() {
     #[cfg(not(unix))]
     {
         eprintln!(
-            "skipping concurrent_exec_bit_true_vs_false_no_content_change: requires a POSIX owner-exec bit"
+            "skipping concurrent_unix_mode_true_vs_false_no_content_change: requires a POSIX owner-exec bit"
         );
         return;
     }
@@ -509,17 +510,17 @@ async fn concurrent_exec_bit_true_vs_false_no_content_change() {
         // Prove the actual claim this scenario's name makes -- not just that
         // *some* independent change was captured on each side, but that each
         // device's own file index genuinely holds the opposite exec-bit value
-        // this test wrote. Read from the file index (`get_exec_bit`), not
+        // this test wrote. Read from the file index (`get_unix_mode`), not
         // disk permissions: disk permissions only prove the test wrote them a
         // moment ago, not that local capture actually observed and recorded
         // them into the DAG-backed index that conflict resolution will read.
         assert!(
-            indexed_exec_bit(&device_a, &group_id, "shared.txt"),
+            indexed_unix_mode(&device_a, &group_id, "shared.txt"),
             "device-a's own file index must show shared.txt as executable before the two \
              devices ever connect -- otherwise this isn't a genuine pre-connect exec-bit divergence"
         );
         assert!(
-            !indexed_exec_bit(&device_b, &group_id, "shared.txt"),
+            !indexed_unix_mode(&device_b, &group_id, "shared.txt"),
             "device-b's own file index must show shared.txt as non-executable before the two \
              devices ever connect -- otherwise this isn't a genuine pre-connect exec-bit divergence"
         );
@@ -591,17 +592,17 @@ async fn concurrent_exec_bit_true_vs_false_no_content_change() {
         // The specific claim this scenario exists to catch: neither side's
         // exec-bit value was lost or silently collapsed to a shared wrong
         // value. `snapshot_a == snapshot_b` above already proves agreement,
-        // but agreement alone would also hold if a bug (e.g. `apply_exec_bit`
+        // but agreement alone would also hold if a bug (e.g. `apply_unix_mode`
         // always clearing the bit) collapsed BOTH devices to the same wrong
         // value -- that is exactly the failure mode a code reviewer reported
         // is reachable without this multiset check. Assert the winner and
         // conflict-copy TOGETHER carry exactly one `true` and one `false`,
         // proving both original values genuinely survived resolution rather
         // than one being lost.
-        let mut exec_bits: Vec<bool> = snapshot_a.values().map(|(_content, exec)| *exec).collect();
-        exec_bits.sort();
+        let mut unix_modes: Vec<bool> = snapshot_a.values().map(|(_content, exec)| *exec).collect();
+        unix_modes.sort();
         assert_eq!(
-            exec_bits,
+            unix_modes,
             vec![false, true],
             "the winner (shared.txt) and its conflict copy must together carry exactly one \
              true and one false exec bit -- neither original value may be lost or collapsed \
@@ -687,7 +688,7 @@ async fn metadata_only_touch_race_with_real_content_edit() {
 /// receive it with the SAME owner-exec bit set, not just the same
 /// content.
 ///
-/// Per this file's header, `owner_exec_bit_from_metadata` is now wired into
+/// Per this file's header, `unix_mode_from_metadata` is now wired into
 /// `local_change.rs`'s record-building path, so device A's brand-new
 /// executable file is captured with its owner-exec bit set and device B
 /// should receive an executable copy, not just the same content. This
@@ -696,11 +697,11 @@ async fn metadata_only_touch_race_with_real_content_edit() {
 /// propagation works at all, so a failure here is a real regression, not a
 /// flaky or ambiguous test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn exec_bit_set_on_brand_new_file_propagates_to_peer() {
+async fn unix_mode_set_on_brand_new_file_propagates_to_peer() {
     #[cfg(not(unix))]
     {
         eprintln!(
-            "skipping exec_bit_set_on_brand_new_file_propagates_to_peer: requires a POSIX owner-exec bit"
+            "skipping unix_mode_set_on_brand_new_file_propagates_to_peer: requires a POSIX owner-exec bit"
         );
         return;
     }
@@ -718,7 +719,7 @@ async fn exec_bit_set_on_brand_new_file_propagates_to_peer() {
         // Waits for content AND the exec bit together, not just content:
         // materialization writes content via reconstruct_file's atomic
         // rename and then applies the exec bit as a separate, subsequent
-        // apply_exec_bit call (see peer_session.rs) -- not one atomic step.
+        // apply_unix_mode call (see peer_session.rs) -- not one atomic step.
         // Polling for content alone would observe that always-present (if
         // usually sub-millisecond) window between the two and could assert
         // on the exec bit before it's actually applied, especially under
@@ -761,14 +762,14 @@ async fn exec_bit_set_on_brand_new_file_propagates_to_peer() {
 /// 1. Device A creates `shared.txt` (non-executable); device B receives it
 ///    over the wire -- a real, shared common-ancestor DAG version on both
 ///    devices, confirmed via [`dag_heads`] agreement before diverging.
-/// 2. The pairing is genuinely severed (`PeerChannel::revoke()`, via
+/// 2. The pairing is genuinely severed (dropping both channels, via
 ///    [`two_synced_devices_with_channels`] -- see its doc comment for why
 ///    not `JoinHandle::abort()`), so what follows cannot race delivery.
 /// 3. Device A makes one real chmod (false -> true): one recorded DAG
 ///    version past the common ancestor.
 /// 4. Device B makes two real, independently recorded chmods (false ->
 ///    true -> false): a genuine two-hop parallel branch past the SAME
-///    common ancestor, confirmed via `indexed_exec_bit`/[`dag_heads`]
+///    common ancestor, confirmed via `indexed_unix_mode`/[`dag_heads`]
 ///    advancing between each step, not merely written to disk and assumed
 ///    captured.
 /// 5. The two devices reconnect and must converge. Empirically confirmed
@@ -786,11 +787,11 @@ async fn exec_bit_set_on_brand_new_file_propagates_to_peer() {
 ///    check alone, which a bug that collapses every materialized exec bit
 ///    to the same wrong value would still satisfy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shared_history_exec_bit_only_divergence_converges_after_reconnect() {
+async fn shared_history_unix_mode_only_divergence_converges_after_reconnect() {
     #[cfg(not(unix))]
     {
         eprintln!(
-            "skipping shared_history_exec_bit_only_divergence_converges_after_reconnect: \
+            "skipping shared_history_unix_mode_only_divergence_converges_after_reconnect: \
              requires a POSIX owner-exec bit"
         );
         return;
@@ -830,11 +831,11 @@ async fn shared_history_exec_bit_only_divergence_converges_after_reconnect() {
         )
         .await;
         assert!(
-            !indexed_exec_bit(&device_a, &group_id, "shared.txt"),
+            !indexed_unix_mode(&device_a, &group_id, "shared.txt"),
             "device-a's own common-ancestor version must start non-executable"
         );
         assert!(
-            !indexed_exec_bit(&device_b, &group_id, "shared.txt"),
+            !indexed_unix_mode(&device_b, &group_id, "shared.txt"),
             "device-b's own common-ancestor version must start non-executable"
         );
 
@@ -848,20 +849,21 @@ async fn shared_history_exec_bit_only_divergence_converges_after_reconnect() {
 
         // Step 2: genuinely sever the pairing before either device's
         // divergent edit, so the branches below are provably concurrent
-        // rather than racing live wire delivery.
+        // rather than racing live wire delivery. Closing the connection is
+        // what does it: each side's session sees its `recv` end and exits.
         for channel in &channels {
-            channel.revoke();
+            channel.close_revoked();
         }
         wait_until_with_context(
-            || channels.iter().all(|channel| channel.is_revoked()),
+            || channels.iter().all(|channel| !channel.is_open()),
             Duration::from_secs(10),
-            || "peer channels never reported revoked".to_string(),
+            || "peer connections never closed".to_string(),
         )
         .await;
-        // `revoke()` only flags the channel and wakes the actor loop; give
-        // the actor a moment to actually exit and unregister so no
-        // in-flight packet from the moment of revocation is still being
-        // processed when the divergent edits below start.
+        // A closed connection still has to be observed by each session's own
+        // receive loop; give them a moment to exit so no in-flight message
+        // from the moment of the close is still being processed when the
+        // divergent edits below start.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Step 3: device-a makes one real chmod (false -> true).
@@ -873,7 +875,7 @@ async fn shared_history_exec_bit_only_divergence_converges_after_reconnect() {
         )
         .await;
         assert!(
-            indexed_exec_bit(&device_a, &group_id, "shared.txt"),
+            indexed_unix_mode(&device_a, &group_id, "shared.txt"),
             "device-a's own file index must show shared.txt as executable after its chmod"
         );
         let heads_a_after = dag_heads(&device_a, &group_id);
@@ -892,7 +894,7 @@ async fn shared_history_exec_bit_only_divergence_converges_after_reconnect() {
         )
         .await;
         assert!(
-            indexed_exec_bit(&device_b, &group_id, "shared.txt"),
+            indexed_unix_mode(&device_b, &group_id, "shared.txt"),
             "device-b's own file index must show shared.txt as executable after its first chmod"
         );
         let heads_b_after_first = dag_heads(&device_b, &group_id);
@@ -908,7 +910,7 @@ async fn shared_history_exec_bit_only_divergence_converges_after_reconnect() {
         )
         .await;
         assert!(
-            !indexed_exec_bit(&device_b, &group_id, "shared.txt"),
+            !indexed_unix_mode(&device_b, &group_id, "shared.txt"),
             "device-b's own file index must show shared.txt as non-executable after its second chmod"
         );
         let heads_b_after = dag_heads(&device_b, &group_id);
@@ -987,10 +989,10 @@ async fn shared_history_exec_bit_only_divergence_converges_after_reconnect() {
         // a single shared (possibly wrong) value. A bug that silently
         // forces every materialized exec bit to `false` would leave this
         // multiset `[false, false]`, not `[false, true]`.
-        let mut exec_bits: Vec<bool> = snapshot_a.values().map(|(_content, exec)| *exec).collect();
-        exec_bits.sort();
+        let mut unix_modes: Vec<bool> = snapshot_a.values().map(|(_content, exec)| *exec).collect();
+        unix_modes.sort();
         assert_eq!(
-            exec_bits,
+            unix_modes,
             vec![false, true],
             "the winner (shared.txt) and its conflict copy must together carry exactly one \
              true (device-a's one-hop branch) and one false (device-b's two-hop branch) exec \

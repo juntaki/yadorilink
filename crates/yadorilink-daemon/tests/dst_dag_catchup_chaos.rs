@@ -133,7 +133,7 @@
 //! and this scenario deliberately asserts the end-to-end outcome rather than
 //! either one specifically: the transport's own retransmission of an announce
 //! sent while partitioned, and the session's periodic frontier audit, which
-//! re-sends an idempotent `HeadsAnnounce` every `full_index_resync_interval`.
+//! re-sends an idempotent `HeadsAnnounce` every `maintenance_reconcile_interval`.
 //! Measured, not assumed: pushing the periodic interval out past the end of the
 //! run still converges (the transport alone suffices at this scenario's
 //! timings), while removing the explicit `announce_local_commit` *and* the
@@ -152,16 +152,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use boringtun::x25519::{PublicKey, StaticSecret};
 use dst_support::clock::HarnessClock;
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
 use yadorilink_local_capture::{LocalChangeOutcome, LocalChangeProcessor};
 use yadorilink_local_storage::FsBlockStore;
 use yadorilink_peer_session::peer_session::PeerSyncSession;
-use yadorilink_transport::PeerChannel;
 
 const GROUP_ID: &str = "dst-dag-catchup-group";
 const CANARY_PATH: &str = "startup-canary.bin";
@@ -196,9 +192,9 @@ struct Device {
     /// set-once: `connect`'s reconnect supervisor replaces this every time
     /// a natural session end (not a test-driven partition) triggers a
     /// fresh generation, mirroring `peer_orchestrator::spawn_peer_session`'s
-    /// production reconnect contract now that a `PeerChannel` actor can end
-    /// cleanly on its own (ARQ exhaustion tearing a genuinely-partitioned
-    /// channel down) rather than only via an explicit revoke.
+    /// production reconnect contract now that a `QuicPeerChannel` can end
+    /// cleanly on its own (the QUIC connection idling out against a
+    /// genuinely-partitioned peer) rather than only via an explicit revoke.
     session: StdMutex<Option<Arc<PeerSyncSession>>>,
 }
 
@@ -224,18 +220,6 @@ fn setup_device(
         processor,
         session: StdMutex::new(None),
     })
-}
-
-fn gen_keypair(rng: &mut StdRng) -> (StaticSecret, PublicKey) {
-    // `From<[u8; 32]>` rather than `StaticSecret::random_from_rng`: the latter
-    // no longer type-checks under `--cfg madsim` after the rand 0.10 bump
-    // (boringtun 0.7's x25519-dalek bounds rand_core 0.6 there). Equally
-    // deterministic per seed, and consumes the same 32 rng bytes.
-    let mut bytes = [0u8; 32];
-    rng.fill(&mut bytes);
-    let secret = StaticSecret::from(bytes);
-    let public = PublicKey::from(&secret);
-    (secret, public)
 }
 
 /// Writes `content` to `path` on `device`, indexes it, and announces the
@@ -310,7 +294,6 @@ fn snapshot(root: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
 /// generation, rather than firing-and-forgetting them (the previous,
 /// single-generation-only shape).
 async fn connect_once(
-    rng: &mut StdRng,
     laptop: &Arc<Device>,
     store_l: Arc<FsBlockStore>,
     always_on: &Arc<Device>,
@@ -319,35 +302,11 @@ async fn connect_once(
     tokio::task::JoinHandle<Result<(), yadorilink_peer_session::PeerSessionError>>,
     tokio::task::JoinHandle<Result<(), yadorilink_peer_session::PeerSessionError>>,
 ) {
-    let (secret_l, public_l) = gen_keypair(rng);
-    let (secret_a, public_a) = gen_keypair(rng);
-    let socket_l = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr_l = socket_l.local_addr().unwrap();
-    let addr_a = socket_a.local_addr().unwrap();
-
-    let channel_l = Arc::new(
-        PeerChannel::connect(
-            secret_l,
-            public_a,
-            0,
-            vec![addr_a],
-            yadorilink_transport::TransportHub::from_socket(socket_l, Some(public_l)),
-        )
-        .await
-        .unwrap(),
-    );
-    let channel_a = Arc::new(
-        PeerChannel::connect(
-            secret_a,
-            public_l,
-            1,
-            vec![addr_l],
-            yadorilink_transport::TransportHub::from_socket(socket_a, Some(public_a)),
-        )
-        .await
-        .unwrap(),
-    );
+    let (channel_l, channel_a) = quic_channel_pair(
+        tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+    )
+    .await;
 
     // Pin both devices' verifying keys -- computed ahead of session
     // construction since `ChangeAuthenticator` is now a construction-only
@@ -405,6 +364,44 @@ async fn connect_once(
     (tokio::spawn(session_l.run()), tokio::spawn(session_a.run()))
 }
 
+/// One authenticated QUIC connection between two loopback endpoints, as a
+/// channel on each side -- the real transport, so a simulated run exercises
+/// what ships rather than a substitute for it. Mirrors
+/// `dst_three_device_mesh_chaos.rs`'s identical helper: a fresh signing
+/// keypair per call is correct here too, since the pre-QUIC code this
+/// replaced (`gen_keypair`) also generated a fresh transport keypair for
+/// every reconnect generation rather than reusing one across the scenario.
+async fn quic_channel_pair(
+    socket_l: tokio::net::UdpSocket,
+    socket_a: tokio::net::UdpSocket,
+) -> (
+    Arc<yadorilink_transport::QuicPeerChannel>,
+    Arc<yadorilink_transport::QuicPeerChannel>,
+) {
+    use yadorilink_transport::{
+        ConnectRole, DeviceSigningKeyPair, QuicPeerChannel, QuicPeerEndpoint, TransportHub,
+    };
+    let addr_a = socket_a.local_addr().unwrap();
+    let key_l = DeviceSigningKeyPair::generate();
+    let key_a = DeviceSigningKeyPair::generate();
+    let public_l = key_l.public_bytes();
+    let public_a = key_a.public_bytes();
+    let endpoint_l = QuicPeerEndpoint::new(TransportHub::from_socket(socket_l), key_l).unwrap();
+    let endpoint_a = QuicPeerEndpoint::new(TransportHub::from_socket(socket_a), key_a).unwrap();
+    endpoint_l.authorize(public_a);
+    endpoint_a.authorize(public_l);
+    let accepting = {
+        let endpoint_a = endpoint_a.clone();
+        tokio::spawn(async move { endpoint_a.accept(public_l).await })
+    };
+    let dialed = endpoint_l.connect(addr_a, public_a).await.unwrap();
+    let accepted = accepting.await.unwrap().unwrap();
+    (
+        QuicPeerChannel::new(dialed, ConnectRole::Dial),
+        QuicPeerChannel::new(accepted, ConnectRole::Accept),
+    )
+}
+
 /// Exponential backoff between reconnect attempts -- matches
 /// `peer_orchestrator::spawn_peer_session`'s own production schedule
 /// (`supervise::BackoffConfig::RECONNECT`: 1s doubling, capped at 45s)
@@ -425,38 +422,26 @@ const RECONNECT_BACKOFF: yadorilink_daemon::supervise::BackoffConfig =
 /// `PeerSyncSession::run` handles and starts a fresh generation (new
 /// sockets, new `PeerChannel`s, new sessions, swapped into
 /// `Device::session`) whenever either ends on its own. Before this existed,
-/// a natural session end (e.g. `yadorilink-transport`'s ARQ layer tearing a
-/// channel down after exhausting retransmits against a genuinely
-/// partitioned peer) permanently silenced that side of the pair for the
-/// rest of the scenario -- indistinguishable, from this harness's point of
+/// a natural session end (e.g. the QUIC connection idling out against a
+/// genuinely partitioned peer) permanently silenced that side of the pair
+/// for the rest of the scenario -- indistinguishable, from this harness's point of
 /// view, from the test's own intentional `set_partitioned` packet-loss
 /// gate, except that a real partition heals (packet loss returns to 0) while
 /// a torn-down-and-never-reconnected channel does not. This mirrors
 /// `peer_orchestrator::spawn_peer_session`'s production reconnect contract
 /// (see that function's own doc comment for the identical reasoning).
 async fn connect(
-    rng: &mut StdRng,
     laptop: &Arc<Device>,
     store_l: Arc<FsBlockStore>,
     always_on: &Arc<Device>,
     store_a: Arc<FsBlockStore>,
 ) {
     let (mut h_l, mut h_a) =
-        connect_once(rng, laptop, store_l.clone(), always_on, store_a.clone()).await;
-
-    // A fresh, independently-seeded RNG for the background supervisor's own
-    // reconnect key generation -- derived from the caller's rng (so the
-    // whole scenario stays deterministic per its own base seed) rather than
-    // trying to move the caller's `&mut StdRng` across the 'static task
-    // boundary.
-    let mut seed_bytes = [0u8; 8];
-    rng.fill(&mut seed_bytes);
-    let reconnect_seed = u64::from_le_bytes(seed_bytes);
+        connect_once(laptop, store_l.clone(), always_on, store_a.clone()).await;
 
     let laptop = laptop.clone();
     let always_on = always_on.clone();
     tokio::spawn(async move {
-        let mut rng = StdRng::seed_from_u64(reconnect_seed);
         let mut attempt: u32 = 0;
         let mut generation_started = tokio::time::Instant::now();
         loop {
@@ -486,7 +471,7 @@ async fn connect(
             }
             tokio::time::sleep(RECONNECT_BACKOFF.next(attempt)).await;
             let (new_h_l, new_h_a) =
-                connect_once(&mut rng, &laptop, store_l.clone(), &always_on, store_a.clone()).await;
+                connect_once(&laptop, store_l.clone(), &always_on, store_a.clone()).await;
             h_l = new_h_l;
             h_a = new_h_a;
             attempt = attempt.saturating_add(1);
@@ -500,7 +485,6 @@ fn content_for(seed: u64, cycle: usize, seq: usize, tag: &str) -> Vec<u8> {
 }
 
 async fn run_scenario(seed: u64) -> Result<(), String> {
-    let mut rng = StdRng::seed_from_u64(seed);
     let clock = HarnessClock::from_seed(seed);
     clock.install_as_session_clock();
 
@@ -521,7 +505,7 @@ async fn run_scenario(seed: u64) -> Result<(), String> {
     let laptop = setup_device("device-laptop", root_l.clone(), state_l, store_l.clone());
     let always_on = setup_device("device-always-on", root_a.clone(), state_a, store_a.clone());
     set_partitioned(false);
-    connect(&mut rng, &laptop, store_l, &always_on, store_a).await;
+    connect(&laptop, store_l, &always_on, store_a).await;
 
     // Startup gate: prove the session is actually up (handshake + a first
     // heads-announce round trip) before the cycles begin. Not part of what this

@@ -10,8 +10,8 @@
 //! future caller that DOES accidentally exercise this channel (e.g. calls
 //! `.run()` on a local-only session) fails safe (hangs/no-ops) instead of
 //! panicking the whole daemon.
-use std::net::SocketAddr;
 
+use yadorilink_peer_session::ports::PeerBlockStream;
 use yadorilink_transport::TransportError;
 
 pub(crate) struct LoopbackPeerMessageChannel;
@@ -30,7 +30,20 @@ impl yadorilink_peer_session::ports::PeerMessageChannel for LoopbackPeerMessageC
         std::future::pending().await
     }
 
-    fn enable_reliable_delivery(&self) {}
+    /// There is no peer, so there is no stream to open. Reported as a
+    /// closed channel rather than as a pending future: unlike `recv`, whose
+    /// caller is a loop that should simply never see anything, a fetch has
+    /// a caller waiting on an answer, and "this session cannot fetch"
+    /// is one -- the same answer it would get from a connection that had
+    /// gone away.
+    async fn open_block_stream(&self) -> Result<Box<dyn PeerBlockStream>, TransportError> {
+        Err(TransportError::ChannelClosed)
+    }
 
-    async fn replace_coordination_candidates(&self, _candidates: Vec<SocketAddr>) {}
+    /// Never resolves, for the same reason `recv` does not: a local-only
+    /// session serves nothing, and a serving loop parked here is a serving
+    /// loop that does nothing rather than one that spins.
+    async fn accept_block_stream(&self) -> Option<Box<dyn PeerBlockStream>> {
+        std::future::pending().await
+    }
 }

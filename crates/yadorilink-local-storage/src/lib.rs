@@ -6,6 +6,7 @@ pub mod disk_verification;
 mod error;
 pub mod free_space;
 mod fs_backend;
+pub mod io_diag;
 /// Shared link preflight model (folder existence/empty-state/free-space/
 /// ignored-summary/risky-location checks) used by both `yadorilink-cli`'s
 /// client-side dry-run/confirmation gate and `yadorilink-daemon`'s
@@ -22,13 +23,15 @@ pub mod materialize_write;
 mod traits;
 
 pub use chunker::{
-    block_size_for, chunk_file, chunk_file_content_defined, owner_exec_bit_from_metadata,
-    CDC_AVG_SIZE, CDC_MAX_SIZE, CDC_MIN_SIZE, CDC_SIZE_THRESHOLD, DEFAULT_BLOCK_SIZE,
+    block_size_for, chunk_file, chunk_file_content_defined,
+    chunk_file_content_defined_with_callback, chunk_file_fixed_with_callback,
+    read_replicated_xattrs, unix_mode_from_metadata, CDC_AVG_SIZE, CDC_MAX_SIZE, CDC_MIN_SIZE,
+    CDC_SIZE_THRESHOLD, DEFAULT_BLOCK_SIZE,
 };
 pub use content_ports::{BlockContentStore, BlockReclamationStore};
 pub use disk_verification::{
     check_disk_headroom, disk_bytes_match_indexed_blocks, disk_content_comparison,
-    intent_target_hash, DiskContentComparison,
+    intent_target_hash, intent_target_hash_for_bytes, DiskContentComparison,
 };
 pub use error::StorageError;
 pub use free_space::{FreeSpaceState, VolumeFreeSpace};
@@ -38,10 +41,13 @@ pub use materialize_write::materialize_symlink;
 #[cfg(windows)]
 pub use materialize_write::materialize_symlink_windows;
 pub use materialize_write::{
-    apply_exec_bit, create_or_defer_placeholder, mint_windows_placeholder_generation,
-    reconstruct_file, verify_delete_target_within_canonical_root, verify_delete_target_within_root,
-    verify_write_target_within_canonical_root, verify_write_target_within_root, write_placeholder,
+    apply_unix_mode, apply_xattrs, create_or_defer_placeholder,
+    mint_windows_placeholder_generation, mtime_already_matches_disk, persist_reconstructed_file,
+    reconstruct_file, reconstruct_file_to_temp, stamp_mtime_at_path, unix_mode_already_matches_disk,
+    verify_delete_target_within_canonical_root, verify_delete_target_within_root,
+    verify_replicated_xattrs_exact, verify_write_target_within_canonical_root,
+    verify_write_target_within_root, write_placeholder, xattrs_already_match_disk,
     PlaceholderDiskIdentity, PlaceholderIdentityToRecord, INTERNAL_INODE_PROVIDER_KIND,
     WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
 };
-pub use traits::{BlockStore, ContentHash, GcReport, StorageUsage};
+pub use traits::{BlockStore, ContentHash, GcReport, LocallyHashedBlock, StorageUsage};
