@@ -75,6 +75,11 @@ test -f "$CORE_LIB" || { echo "missing $CORE_LIB"; exit 1; }
 # dependency tree changes.
 echo "-- discovering native-static-libs for the final swiftc link step --"
 NATIVE_LIBS="$(cd "$CORE_DIR" && cargo rustc --release --target "$RUST_TARGET" --crate-type staticlib -- --print native-static-libs 2>&1 | grep 'native-static-libs:' | sed -E 's/.*native-static-libs: *//')"
+# Strip any ANSI color codes cargo glued onto this line (CARGO_TERM_COLOR=
+# always, or a CI runner not detecting a non-tty stderr) -- otherwise a
+# trailing escape sequence right after the last flag defeats the `-lm`
+# filter below, since it's neither a space nor end-of-string anymore.
+NATIVE_LIBS="$(printf '%s' "$NATIVE_LIBS" | sed -E $'s/\x1b\\[[0-9;]*[a-zA-Z]//g')"
 # Drop `-lm`: recent macOS SDKs ship no standalone libm (its symbols moved
 # into libSystem, which is always linked), so passing it explicitly fails
 # with "ld: library 'm' not found" even though nothing is actually missing.
