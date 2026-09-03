@@ -193,7 +193,7 @@ madsim = "0.2"
 [dev-dependencies]
 # The runbook freshness lint (`tests/dst_runbook_freshness_lint.rs`) parses
 # `.cargo/config.toml`'s cargo aliases as TOML.
-toml = "0.9"
+toml = "1.1"
 # This crate's own `tests/*.rs` integration binaries link against
 # `yadorilink-daemon` as an ordinary external library, so `#[cfg(test)]` is
 # never active for it there -- `DaemonState::install_test_root_commit_authority`/
