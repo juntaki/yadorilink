@@ -1,5 +1,6 @@
-//! Storage-at-rest for a device's 32-byte private key secrets (the WireGuard
-//! X25519 static secret and the Ed25519 change-signing seed).
+//! Storage-at-rest for a device's 32-byte private key secret: the Ed25519
+//! seed that is this device's whole identity, signing its change history and
+//! authenticating its transport.
 //!
 //! Two layers are used, in defense-in-depth order:
 //!

@@ -23,15 +23,17 @@ use std::sync::Arc;
 use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_replica_domain::session_state::{ChangeContent, DirtyPath, LocalFileMetaColumns};
+use yadorilink_replica_domain::session_state::{
+    ChangeContent, DirtyPath, LocalFileMetaColumns, PreparedLocalMutation,
+};
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 use yadorilink_sync_sqlite::SyncSqliteError;
 
 #[derive(Clone, Copy)]
-pub struct LocalChangeEmission<'a, 'permit> {
+pub struct LocalChangeEmission<'a> {
     pub emitter: &'a ChangeEmitter,
-    pub permit: &'a RootCommitPermit<'permit>,
+    pub permit: &'a RootCommitPermit<'a>,
 }
 
 /// Capability surface `LocalChangeProcessor` needs to turn a detected local
@@ -46,6 +48,22 @@ pub trait LocalMutationStore: Send + Sync {
     /// The current row for `path`, read before deciding whether a detected
     /// filesystem event actually represents new content.
     fn get_file(&self, group_id: &str, path: &str) -> Result<Option<FileRecord>, SyncSqliteError>;
+
+    /// The current row's authoring identity: which `Change` last authored
+    /// it, if any. A precise "has anything committed a new version of this
+    /// row since I last looked" signal — every commit (this device's own or
+    /// a peer's) stamps a fresh, distinct hash, even when the new version's
+    /// `FileRecord` fields (size/mtime/blocks) happen to coincide with the
+    /// old one (a metadata-only change, or content that happens to hash the
+    /// same). Used by batched-commit revalidation
+    /// (`flush_pending_batch`) alongside [`Self::get_file`] rather than
+    /// instead of it, since a `FileRecord` comparison alone cannot catch
+    /// this case.
+    fn get_authoring_change_hash(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<ChangeHash>, SyncSqliteError>;
 
     /// Bulk materialization-state lookup for a whole group — used by
     /// `scan_existing_files` so deciding whether an on-disk entry is a
@@ -67,21 +85,22 @@ pub trait LocalMutationStore: Send + Sync {
         path: &str,
     ) -> Result<bool, SyncSqliteError>;
 
-    /// Whether `(group_id, path)` has a non-terminal (not `Completed`/
-    /// `Superseded`) row in the materialization job queue -- distinct from
-    /// `has_materialization_intent` above, which only covers the narrower
-    /// window a `MaterializationIntentGuard` protects (a `materialize()`
-    /// call already in flight). A path can have a durably-committed,
-    /// non-deleted index row with a QUEUED job that has not yet reached
-    /// `materialize()` at all (e.g. still `Pending`/`Backoff` after a
-    /// transient dispatch failure) -- no intent has ever been opened for
-    /// it, but it is just as much "we know about this file and are still
-    /// placing it locally" as an in-flight intent is. An M5-A finding: the
-    /// startup reconciliation scan's own `has_materialization_intent` check
-    /// alone is not enough to protect this state; a newly-arrived DAG
-    /// record whose materialization job is still queued when a restart's
-    /// scan runs was silently tombstoned before this check existed.
-    fn has_pending_materialization_job(
+    /// Whether `(group_id, path)` still has an unsettled `projection_
+    /// obligations` row -- distinct from `has_materialization_intent`
+    /// above, which only covers the narrower window a
+    /// `MaterializationIntentGuard` protects (a `materialize()` call
+    /// already in flight). A path can have a durably-committed, non-deleted
+    /// index row with an obligation that has not yet settled at all -- no
+    /// intent has ever been opened for it, but it is just as much "we know
+    /// about this file and are still placing it locally" as an in-flight
+    /// intent is. An M5-A finding: the startup reconciliation scan's own
+    /// `has_materialization_intent` check alone is not enough to protect
+    /// this state; a newly-arrived DAG record whose obligation is still
+    /// unsettled when a restart's scan runs was silently tombstoned before
+    /// this check existed. While an obligation exists for a path, an
+    /// absent local file must not yet be interpreted as an offline user
+    /// deletion.
+    fn has_unsettled_projection_obligation(
         &self,
         group_id: &str,
         path: &str,
@@ -166,7 +185,16 @@ pub trait LocalMutationStore: Send + Sync {
         out_of_root: bool,
     ) -> Result<(), SyncSqliteError>;
 
-    fn get_exec_bit(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError>;
+    fn get_unix_mode(&self, group_id: &str, path: &str) -> Result<Option<u32>, SyncSqliteError>;
+
+    /// See [`yadorilink_replica_domain::file::FileMeta::xattrs`]'s own doc
+    /// comment -- the currently-indexed replicated extended attributes for
+    /// `(group_id, path)`, empty for any row with none recorded.
+    fn get_xattrs(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, SyncSqliteError>;
 
     /// M5-A review follow-up (blocker #56, second round): records the disk
     /// identity of the exact bytes a locally-authored commit just verified
@@ -192,11 +220,21 @@ pub trait LocalMutationStore: Send + Sync {
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError>;
 
-    fn set_exec_bit(
+    fn set_unix_mode(
         &self,
         group_id: &str,
         path: &str,
-        exec_bit: bool,
+        unix_mode: Option<u32>,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), SyncSqliteError>;
+
+    /// See [`get_xattrs`](Self::get_xattrs)'s own doc comment -- sets
+    /// `(group_id, path)`'s replicated extended attributes.
+    fn set_xattrs(
+        &self,
+        group_id: &str,
+        path: &str,
+        xattrs: &[(String, Vec<u8>)],
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError>;
 
@@ -207,6 +245,19 @@ pub trait LocalMutationStore: Send + Sync {
     /// Commits a local create/update and appends the signed DAG change
     /// describing it, in one transaction — the primary write for a captured
     /// local edit.
+    ///
+    /// `filesystem_identity`: `Some` only when the caller has a strong
+    /// `FileIdentity` freshly observed from the real path, immediately
+    /// before this call, with disk fingerprint/index state/authoring
+    /// identity all independently reconfirmed unchanged since the content
+    /// was read — see `yadorilink_sync_sqlite::file_index::
+    /// FileIndexRepository::upsert_file_emitting_change`'s own doc comment
+    /// for the full precondition list and what passing `Some` here
+    /// actually commits (an exact actual-state proof, in the SAME
+    /// transaction, so the Convergence Engine's zero-work pre-check can
+    /// recognize this device's own locally-authored content as already
+    /// correct). `None` is always correct/safe — it simply forgoes that
+    /// optimization for this call.
     fn upsert_file_emitting_change(
         &self,
         group_id: &str,
@@ -214,8 +265,30 @@ pub trait LocalMutationStore: Send + Sync {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         meta: Option<&LocalFileMetaColumns>,
-        emission: LocalChangeEmission<'_, '_>,
+        filesystem_identity: Option<&yadorilink_root_authority::fs_identity::FileIdentity>,
+        emission: LocalChangeEmission<'_>,
     ) -> Result<ChangeHash, SyncSqliteError>;
+
+    /// Commits a bounded batch of already-prepared, already-revalidated
+    /// local mutations in one transaction — the batched counterpart to
+    /// [`Self::upsert_file_emitting_change`]/[`Self::mark_deleted_emitting_change`].
+    /// See `yadorilink_sync_sqlite::file_index::FileIndexRepository::
+    /// commit_local_mutations_batch`'s own doc for the correctness
+    /// preconditions the caller must have already established (disk/index
+    /// revalidation, path locks held for the whole call) before reaching
+    /// this method — this trait cannot enforce either. `evidence`, when
+    /// non-empty, must be aligned 1:1 with `mutations` — see that same
+    /// method's own doc comment and
+    /// `yadorilink_sync_sqlite::file_index::LocalCaptureActualStateEvidence`'s
+    /// doc comment.
+    fn commit_local_mutations_batch(
+        &self,
+        group_id: &str,
+        mutations: &[PreparedLocalMutation],
+        evidence: &[Option<yadorilink_sync_sqlite::file_index::LocalCaptureActualStateEvidence>],
+        origin_device_id: &str,
+        emission: LocalChangeEmission<'_>,
+    ) -> Result<Vec<ChangeHash>, SyncSqliteError>;
 
     /// Plain (non-emitting) upsert, used for local writes that do not need
     /// their own DAG change (e.g. metadata-only reconciliation writes local
@@ -247,7 +320,7 @@ pub trait LocalMutationStore: Send + Sync {
         origin_device_id: &str,
         content: ChangeContent<'_>,
         metas: &[Option<LocalFileMetaColumns>],
-        emission: LocalChangeEmission<'_, '_>,
+        emission: LocalChangeEmission<'_>,
     ) -> Result<Option<ChangeHash>, SyncSqliteError>;
 
     /// Tombstones a path with "now" as the observed time — the plain local
@@ -266,12 +339,19 @@ pub trait LocalMutationStore: Send + Sync {
     /// which stamps the debounce accumulator's own observed time rather
     /// than "now at dispatch time" (see `mark_deleted_at`'s doc comment for
     /// why that distinction matters for conflict ordering).
+    ///
+    /// `publish_absent_proof`: `true` only when the caller has revalidated
+    /// the path as still absent immediately before this call — commits an
+    /// exact `Absent` actual-state proof in the SAME transaction, same
+    /// reasoning as `upsert_file_emitting_change`'s `filesystem_identity`
+    /// parameter. `false` is always correct/safe.
     fn mark_deleted_emitting_change(
         &self,
         group_id: &str,
         path: &str,
         device_id: &str,
         observed_at_unix_nanos: i64,
+        publish_absent_proof: bool,
         emitter: &ChangeEmitter,
         permit: &RootCommitPermit<'_>,
     ) -> Result<ChangeHash, SyncSqliteError>;
@@ -303,6 +383,18 @@ pub trait LocalMutationStore: Send + Sync {
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError>;
 
+    /// Journals every `(path, change_kind, observed_at_unix_nanos)` in
+    /// `entries` in one durable transaction, before any of their
+    /// block-store/index work runs -- the batched form of
+    /// [`Self::record_dirty_path`], letting a whole debounce-flush batch
+    /// share one commit instead of paying one per path.
+    fn record_dirty_paths_batch(
+        &self,
+        group_id: &str,
+        entries: &[(String, String, i64)],
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), SyncSqliteError>;
+
     /// Records that a processing attempt for `path` failed, leaving the
     /// dirty row in place for retry.
     fn mark_dirty_path_attempt(
@@ -319,6 +411,19 @@ pub trait LocalMutationStore: Send + Sync {
         &self,
         group_id: &str,
         path: &str,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), SyncSqliteError>;
+
+    /// Clears every `(path, observed_at_unix_nanos)` in `entries` from the
+    /// dirty journal in one durable transaction, but only the exact
+    /// observation each entry names -- the batched, conditional form of
+    /// [`Self::clear_dirty_path`]. See the concrete `DirtyPathRepository`
+    /// method of the same name for why the condition matters: it must never
+    /// erase a newer, not-yet-processed event for the same path.
+    fn clear_dirty_paths_conditional_batch(
+        &self,
+        group_id: &str,
+        entries: &[(String, i64)],
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError>;
 

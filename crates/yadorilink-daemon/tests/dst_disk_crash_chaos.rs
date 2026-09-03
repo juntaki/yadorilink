@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use boringtun::x25519::{PublicKey, StaticSecret};
 use dst_support::case_ir::{ContentTable, DiskFault};
 use dst_support::oracle::GlobalOracle;
 use ed25519_dalek::SigningKey;
@@ -20,7 +19,9 @@ use sha2::{Digest, Sha256};
 use yadorilink_daemon::dag_import;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_filesystem_sync::debounce::{self, DebounceConfig, FlushPathRequest};
-use yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations;
+use yadorilink_filesystem_sync::materialization_repair::{
+    repair_interrupted_materializations, RepairMode,
+};
 use yadorilink_filesystem_sync::stale_temp_files::cleanup_stale_temp_files;
 use yadorilink_filesystem_sync::watcher::{
     FolderWatchSource, FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
@@ -36,7 +37,6 @@ use yadorilink_peer_session::peer_session::{
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
-use yadorilink_transport::PeerChannel;
 
 const GROUP_ID: &str = "dst-disk-crash-group";
 const DEFAULT_VARIATIONS: u64 = 20;
@@ -448,22 +448,6 @@ fn setup_device(
     device
 }
 
-fn gen_keypair(rng: &mut StdRng) -> (StaticSecret, PublicKey) {
-    // Prereq: derive the boringtun secret
-    // from 32 seed-driven bytes rather than `StaticSecret::random_from_rng`,
-    // which no longer type-checks under `--cfg madsim` after the committed rand
-    // 0.10 bump (boringtun 0.7's x25519-dalek 2.0.1 bounds rand_core 0.6 on
-    // `random_from_rng`). `From<[u8; 32]>` needs no rng trait and is equally
-    // deterministic per seed; test-only. `fill` consumes exactly 32 rng bytes
-    // like the old `random_from_rng`'s internal `fill_bytes`, so the per-seed
-    // workload stream is undisturbed (only the ephemeral key value is derived).
-    let mut bytes = [0u8; 32];
-    rng.fill(&mut bytes);
-    let secret = StaticSecret::from(bytes);
-    let public = PublicKey::from(&secret);
-    (secret, public)
-}
-
 async fn connect_sessions(
     rng: &mut StdRng,
     device_a: &Arc<ChaosDevice>,
@@ -471,34 +455,9 @@ async fn connect_sessions(
     device_b: &Arc<ChaosDevice>,
     store_b: Arc<dyn BlockStore + Send + Sync>,
 ) {
-    let (secret_a, public_a) = gen_keypair(rng);
-    let (secret_b, public_b) = gen_keypair(rng);
     let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr_a = socket_a.local_addr().unwrap();
-    let addr_b = socket_b.local_addr().unwrap();
-    let channel_a = Arc::new(
-        PeerChannel::connect(
-            secret_a,
-            public_b,
-            0,
-            vec![addr_b],
-            yadorilink_transport::TransportHub::from_socket(socket_a, Some(public_a)),
-        )
-        .await
-        .unwrap(),
-    );
-    let channel_b = Arc::new(
-        PeerChannel::connect(
-            secret_b,
-            public_a,
-            1,
-            vec![addr_a],
-            yadorilink_transport::TransportHub::from_socket(socket_b, Some(public_b)),
-        )
-        .await
-        .unwrap(),
-    );
+    let (channel_a, channel_b) = quic_channel_pair(socket_a, socket_b).await;
 
     // Both sessions must pin both authors' keys before `run()` handshakes, or
     // received changes are dropped unverified -- moved ahead of session
@@ -679,6 +638,7 @@ fn restart_recovery(
         store.as_ref(),
         root,
         GROUP_ID,
+        RepairMode::Startup,
         &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
     )
     .map_err(|e| e.to_string())?;
@@ -993,4 +953,38 @@ fn disk_fault_crash_restart_chaos_scenario() {
         skipped_time_limit < variations,
         "every seed hit the madsim time limit -- nothing was actually exercised"
     );
+}
+
+/// One authenticated QUIC connection between two loopback endpoints, as a
+/// channel on each side. The real transport, so a simulated run exercises
+/// what ships rather than a substitute for it.
+async fn quic_channel_pair(
+    socket_a: tokio::net::UdpSocket,
+    socket_b: tokio::net::UdpSocket,
+) -> (
+    std::sync::Arc<yadorilink_transport::QuicPeerChannel>,
+    std::sync::Arc<yadorilink_transport::QuicPeerChannel>,
+) {
+    use yadorilink_transport::{
+        ConnectRole, DeviceSigningKeyPair, QuicPeerChannel, QuicPeerEndpoint, TransportHub,
+    };
+    let addr_b = socket_b.local_addr().unwrap();
+    let key_a = DeviceSigningKeyPair::generate();
+    let key_b = DeviceSigningKeyPair::generate();
+    let public_a = key_a.public_bytes();
+    let public_b = key_b.public_bytes();
+    let endpoint_a = QuicPeerEndpoint::new(TransportHub::from_socket(socket_a), key_a).unwrap();
+    let endpoint_b = QuicPeerEndpoint::new(TransportHub::from_socket(socket_b), key_b).unwrap();
+    endpoint_a.authorize(public_b);
+    endpoint_b.authorize(public_a);
+    let accepting = {
+        let endpoint_b = endpoint_b.clone();
+        tokio::spawn(async move { endpoint_b.accept(public_a).await })
+    };
+    let dialed = endpoint_a.connect(addr_b, public_b).await.unwrap();
+    let accepted = accepting.await.unwrap().unwrap();
+    (
+        QuicPeerChannel::new(dialed, ConnectRole::Dial),
+        QuicPeerChannel::new(accepted, ConnectRole::Accept),
+    )
 }

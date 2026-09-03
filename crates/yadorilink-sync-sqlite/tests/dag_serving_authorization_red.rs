@@ -32,9 +32,10 @@ fn schema_init_repairs_or_refuses_extra_change_file_version_authorization() {
         3,
         FileMeta {
             mtime_unix_nanos: 0,
-            exec_bit: false,
+            unix_mode: None,
             symlink_target: None,
             record_kind: RecordKind::File,
+            xattrs: Vec::new(),
         },
     );
     put_file_version(&conn, "g", &version).unwrap();

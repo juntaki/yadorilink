@@ -50,7 +50,6 @@ use yadorilink_filesystem_sync::watcher::{
     FsChangeEvent, FsChangeKind, SimulatedFolderWatchSource,
 };
 use yadorilink_local_storage::{BlockStore, FsBlockStore};
-use yadorilink_transport::DeviceKeyPair;
 
 // --------------------------------------------------------------------------
 // Crate-root support the reused `dst_support` modules resolve via `super`.
@@ -229,7 +228,6 @@ async fn boot_daemon(
         sync_db_path: config_dir.path().join("sync-state.sqlite3"),
         control_socket_path: config_dir.path().join("daemon.sock"),
         shell_ipc_socket_path: config_dir.path().join("shell.sock"),
-        keypair_path: config_dir.path().join("wg_key"),
         state_probe: Some(probe.clone()),
         sim_discovery: Some(sim_discovery),
         block_store_override: Some(faulting),
@@ -669,13 +667,12 @@ async fn scenario_body(seed: u64) -> Result<Vec<Violation>, String> {
     let shared_config_dir =
         tempfile::tempdir().map_err(|e| format!("shared config tempdir: {e}"))?;
     std::env::set_var("YADORILINK_CONFIG_DIR", shared_config_dir.path());
-
-    let keypair_a = DeviceKeyPair::generate();
-    let keypair_b = DeviceKeyPair::generate();
-    let public_a = keypair_a.public;
-    let public_b = keypair_b.public;
-    let keypair_a = Arc::new(keypair_a);
-    let keypair_b = Arc::new(keypair_b);
+    // Fixed rather than random: a simulated run has to be reproducible from
+    // its seed alone, and these keys only need to be distinct and stable.
+    let signing_a = ed25519_dalek::SigningKey::from_bytes(&[0xA1; 32]);
+    let signing_b = ed25519_dalek::SigningKey::from_bytes(&[0xB2; 32]);
+    let signing_public_a = signing_a.verifying_key().to_bytes();
+    let signing_public_b = signing_b.verifying_key().to_bytes();
 
     let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
@@ -687,26 +684,26 @@ async fn scenario_body(seed: u64) -> Result<Vec<Violation>, String> {
     let addr_b = socket_b.local_addr().map_err(|e| format!("addr_b: {e}"))?;
 
     let sim_a = SimDiscovery {
-        keypair: keypair_a,
+        signing_key: signing_a.clone(),
         local_device_id: "device-a".to_string(),
         peers: vec![SimPeer {
             device_id: "device-b".to_string(),
-            public_key: public_b,
+            signing_public_key: signing_public_b,
             shared_group_ids: vec![GROUP_ID.to_string()],
-            local_socket: socket_a,
             peer_candidates: vec![addr_b],
         }],
+        local_socket: socket_a,
     };
     let sim_b = SimDiscovery {
-        keypair: keypair_b,
+        signing_key: signing_b.clone(),
         local_device_id: "device-b".to_string(),
         peers: vec![SimPeer {
             device_id: "device-a".to_string(),
-            public_key: public_a,
+            signing_public_key: signing_public_a,
             shared_group_ids: vec![GROUP_ID.to_string()],
-            local_socket: socket_b,
             peer_candidates: vec![addr_a],
         }],
+        local_socket: socket_b,
     };
 
     let plan_a = fault_plan_for(seed, 0);

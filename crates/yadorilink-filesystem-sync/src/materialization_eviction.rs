@@ -340,6 +340,11 @@ pub fn evict_file(
                     "{path} changed before placeholder commit"
                 )));
             }
+            // This is the mutator's own physical write (hydrated content
+            // -> placeholder) -- bump before it, inside `path_lock` (held
+            // by `_path_guard` for this whole function). No frontier proof
+            // to publish under here, so this only ever invalidates.
+            state.dag_bump_mutation_fence(group_id, path, "eviction_to_placeholder")?;
             evict_to_placeholder(
                 state,
                 group_id,

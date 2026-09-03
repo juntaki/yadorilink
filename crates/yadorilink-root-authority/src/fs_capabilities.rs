@@ -1143,7 +1143,22 @@ const GRANULARITY_SAMPLE_COUNT: usize = 32;
 /// either way, so it is treated the same as a proven-coarse result rather
 /// than left as an unresolved case that might later be read as `Fine` by
 /// accident — the unsafe direction to get wrong here is assuming `Fine`.
+///
+/// Count of real invocations of this function (not the cached wrapper's
+/// hits), process-wide -- cheap enough (one relaxed atomic increment) to
+/// leave on unconditionally rather than gating it behind `cfg(test)`, and
+/// exposed for tests via [`probe_birth_time_granularity_call_count_for_test`]
+/// so a regression can prove an actual call chain (not just the pure
+/// caching decision) triggers at most one real probe per volume.
+static PROBE_BIRTH_TIME_GRANULARITY_CALLS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn probe_birth_time_granularity_call_count_for_test() -> u64 {
+    PROBE_BIRTH_TIME_GRANULARITY_CALLS.load(Ordering::SeqCst)
+}
+
 pub fn probe_birth_time_granularity(dir: &Path) -> TimestampGranularity {
+    PROBE_BIRTH_TIME_GRANULARITY_CALLS.fetch_add(1, Ordering::Relaxed);
     let mut created = Vec::with_capacity(GRANULARITY_SAMPLE_COUNT);
     let mut timestamps = Vec::with_capacity(GRANULARITY_SAMPLE_COUNT);
     for i in 0..GRANULARITY_SAMPLE_COUNT {
@@ -1172,6 +1187,60 @@ pub fn probe_birth_time_granularity(dir: &Path) -> TimestampGranularity {
         return TimestampGranularity::Coarse;
     }
     TimestampGranularity::Fine
+}
+
+/// Process-wide cache for [`probe_birth_time_granularity`]'s result, keyed
+/// by [`VolumeIdentity`] rather than path for the same reason
+/// [`CapabilityCacheKey`] already is: a path is not a stable proxy for a
+/// filesystem (a removable drive can be reformatted at the same mountpoint;
+/// a network/container mount can be replaced entirely), so a path-keyed
+/// cache could silently keep serving a stale volume's granularity after a
+/// remount. A real probe performs genuine physical work -- creating,
+/// stat'ing and unlinking `GRANULARITY_SAMPLE_COUNT` artefacts -- so callers
+/// on a hot path must not pay it on every call. `verify_still_owns`
+/// (`sync_root_lock.rs`) is called from [`crate::root_commit::RootLease::
+/// begin_operation`], which fires on essentially every local capture,
+/// materialize, and hydration operation; before this cache existed it
+/// re-probed uncached on every single one, confirmed by a C4 live-burst
+/// attribution pass (2026-09-01) as a real, measurable per-operation tax:
+/// ~4,600 uncached probe cycles (~96 syscalls each, all inside the sync
+/// root the filesystem watcher is itself watching) in a single 120s, 2,000-
+/// file live-burst run. Falls back to an uncached probe (never a stale
+/// answer) if the volume identity itself cannot even be observed.
+static BIRTH_TIME_GRANULARITY_CACHE: std::sync::OnceLock<Mutex<HashMap<VolumeIdentity, TimestampGranularity>>> =
+    std::sync::OnceLock::new();
+
+/// Cached wrapper for [`probe_birth_time_granularity`]. Prefer this over the
+/// raw probe for any caller invoked more than once per process lifetime for
+/// the same root (which is every caller outside this module's own tests).
+pub fn cached_probe_birth_time_granularity(dir: &Path) -> TimestampGranularity {
+    let Ok(volume_identity) = observe_volume_identity(dir) else {
+        return probe_birth_time_granularity(dir);
+    };
+    cached_granularity_for_volume(volume_identity, || probe_birth_time_granularity(dir))
+}
+
+/// The pure caching decision [`cached_probe_birth_time_granularity`]
+/// delegates to, factored out so a test can exercise "same volume identity
+/// reuses the cached probe; a different one re-probes" directly with
+/// synthetic identities, without needing to actually remount a real volume.
+///
+/// Holds the lock across `probe` itself (matching `yadorilink-daemon`'s
+/// `peer_replica_state.rs::cached_granularity_for_volume`, the precedent
+/// this mirrors) rather than releasing it for the probe and re-locking to
+/// record the result: the latter shape is single-flight only after the
+/// first successful probe, not on it -- N concurrent first callers for the
+/// same volume would all miss the cache and all pay the full uncached probe
+/// cost, a thundering herd of exactly the syscall storm this cache exists
+/// to remove. `RootLease::begin_operation` is reachable concurrently from
+/// many in-flight operations, so the first-probe race is not theoretical.
+fn cached_granularity_for_volume(
+    volume_identity: VolumeIdentity,
+    probe: impl FnOnce() -> TimestampGranularity,
+) -> TimestampGranularity {
+    let cache = BIRTH_TIME_GRANULARITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard.entry(volume_identity).or_insert_with(probe)
 }
 
 /// The outcome of [`rename_no_replace`].
@@ -2144,6 +2213,57 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let granularity = probe_birth_time_granularity(dir.path());
         assert!(matches!(granularity, TimestampGranularity::Fine | TimestampGranularity::Coarse));
+    }
+
+    /// C4 live-burst attribution fix (2026-09-01): `verify_still_owns`
+    /// (`sync_root_lock.rs`) is reached from `RootLease::begin_operation`,
+    /// which fires on essentially every local capture, materialize, and
+    /// hydration operation -- an uncached probe there re-pays real file-
+    /// create/stat/unlink I/O on every single call. Uses two distinct
+    /// synthetic `VolumeIdentity` values rather than an actual remount
+    /// (impractical in a unit test) to prove the caching decision itself,
+    /// mirroring `yadorilink-daemon`'s own `peer_replica_state.rs`
+    /// precedent for the same value. Confirmed genuinely RED by temporarily
+    /// keying the cache on a constant instead of the given identity: the
+    /// second, different-identity call then wrongly reused the first
+    /// identity's cached value instead of re-probing.
+    #[test]
+    fn granularity_cache_reprobes_on_a_different_volume_identity_but_not_the_same_one() {
+        let volume_a = VolumeIdentity::Unix { device_id: 0xC4C4 };
+        let volume_b = VolumeIdentity::Unix { device_id: 0xD4D4 };
+
+        let probes_for_a = AtomicU64::new(0);
+        let first = cached_granularity_for_volume(volume_a, || {
+            probes_for_a.fetch_add(1, Ordering::SeqCst);
+            TimestampGranularity::Fine
+        });
+        let second = cached_granularity_for_volume(volume_a, || {
+            probes_for_a.fetch_add(1, Ordering::SeqCst);
+            TimestampGranularity::Coarse
+        });
+        assert_eq!(first, TimestampGranularity::Fine);
+        assert_eq!(
+            second,
+            TimestampGranularity::Fine,
+            "the same volume identity must reuse the cached probe"
+        );
+        assert_eq!(
+            probes_for_a.load(Ordering::SeqCst),
+            1,
+            "must probe only once for the same identity"
+        );
+
+        let probes_for_b = AtomicU64::new(0);
+        let third = cached_granularity_for_volume(volume_b, || {
+            probes_for_b.fetch_add(1, Ordering::SeqCst);
+            TimestampGranularity::Coarse
+        });
+        assert_eq!(
+            third,
+            TimestampGranularity::Coarse,
+            "a different volume identity must be probed fresh, never inherit another volume's \
+             cached answer -- exactly the case of a remount at the same path"
+        );
     }
 
     #[test]

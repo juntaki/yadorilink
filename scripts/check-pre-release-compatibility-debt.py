@@ -30,6 +30,37 @@ RESOLVED, and worth reading before touching the schema gate below.
     an inexact version check, or a real migration path -- the row-level
     checks stop being redundant and must come back. That is what the entry
     below is watching for.
+
+RESOLVED, and worth reading before touching the peer_session_public.rs gate
+below.
+    `peer_session_public.rs` used to carry its own exact-generation preflight:
+    a `PROTOCOL_VERSION` constant plus five capability bits, checked against
+    the peer's first `ClusterConfig` frame after the QUIC/TLS handshake
+    completed. `09477fcf` ("session: fetch and serve blocks on their own
+    streams, and stop negotiating") deleted all of it -- the constant, the
+    capability fields on the outbound frame, and `validate_exact_peer_config`
+    itself (renamed to `validate_peer_handshake`, which now only checks the
+    two serve-budget bounds, not a generation).
+
+    It is not a regression. `yadorilink-transport/src/quic_identity.rs`'s
+    `YADORILINK_P2P_ALPN` (`b"yadorilink-p2p/5"`) is set as the sole ALPN
+    protocol on both the client and server QUIC/TLS configs, so a peer
+    advertising a different generation's ALPN string is refused during the
+    TLS handshake itself -- strictly before any application frame, including
+    the old post-handshake `ClusterConfig` check, could ever exist. That is
+    an earlier and equally exact rejection point, not a looser one; the
+    generation number lives in the ALPN string, not a separate field, so
+    there is nothing left for an app-level equality check to add.
+    `quic_peer_identity.rs::a_peer_of_another_generation_is_refused` is a
+    dedicated test for exactly this: it constructs a peer whose ALPN differs
+    by one byte from `YADORILINK_P2P_ALPN` and asserts the handshake is
+    refused.
+
+    So the property is still enforced, by a different (and now watched)
+    mechanism. If ALPN is ever no longer generation-specific, or a peer of
+    another generation could otherwise reach a running session, the
+    app-level check stops being redundant and must come back. That is what
+    the entry below is watching for.
 """
 
 from __future__ import annotations
@@ -82,18 +113,15 @@ REQUIRED = {
     "crates/yadorilink-peer-session/src/peer_session_public.rs": (
         "pub struct PeerSyncSessionDeps",
         "pub fn new_with_dependencies",
-        # Not a pinned literal: an earlier attempt hard-coded this generation
-        # number as its own wrapper-only constant (`= 3`) and had to be
-        # reverted (`fix: keep exact handshake generation consistent with
-        # session wire`) because a wrapper-only generation is
-        # self-contradictory -- the inner session re-announces its own
-        # `ClusterConfig` after this preflight. The property that matters is
-        # that the public wrapper never diverges from the inner
-        # implementation's own generation constant.
-        "pub const PROTOCOL_VERSION: u32 = InnerPeerSyncSession::PROTOCOL_VERSION;",
-        "exact_generation_preflight",
         "dependencies are immutable after run() starts",
-        "config.protocol_version == Self::PROTOCOL_VERSION",
+    ),
+    # The exact-generation preflight that `peer_session_public.rs` used to
+    # perform after the handshake now happens *during* it -- see the
+    # `RESOLVED` note above. This is what actually delivers the property
+    # today; watch it, not a post-handshake application check.
+    "crates/yadorilink-transport/src/quic_identity.rs": (
+        'pub const YADORILINK_P2P_ALPN: &[u8] = b"yadorilink-p2p/5";',
+        "crypto.alpn_protocols = vec![YADORILINK_P2P_ALPN.to_vec()];",
     ),
     "crates/yadorilink-replica-domain/src/file.rs": (
         # `CurrentFileRecord` was renamed to `FileRecord` once the legacy

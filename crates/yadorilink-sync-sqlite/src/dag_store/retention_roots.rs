@@ -336,9 +336,10 @@ mod tests {
         let blocks = vec![VersionBlock { hash: BlockHash(vec![byte; 32]), size: 4 }];
         let meta = FileMeta {
             mtime_unix_nanos: 1,
-            exec_bit: false,
+            unix_mode: None,
             symlink_target: None,
             record_kind: RecordKind::File,
+            xattrs: Vec::new(),
         };
         FileVersion::new(blocks, 4, meta)
     }

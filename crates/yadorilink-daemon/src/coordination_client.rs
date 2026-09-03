@@ -103,8 +103,8 @@ pub use imp::{
     cancel_join_classified, commit_handoff_role_loss, compensate_handoff_role_loss,
     find_handoff_lease, prepare_create, prepare_join, query_enrollment_operation,
     query_membership_operation, query_membership_operation_categorized, query_role_loss_operation,
-    release_handoff_lease, report_endpoint, request_handoff_lease, resolve_edge, send_rendezvous,
-    set_storage_mode, upload_signing_key,
+    release_handoff_lease, report_endpoint, request_handoff_lease, request_relay_grant,
+    resolve_edge, send_rendezvous, set_storage_mode, upload_signing_key,
 };
 
 /// Why a remote-evidence lookup could not be answered -- see
@@ -306,6 +306,8 @@ pub struct RoleLossOperationRecord {
 mod imp {
     use base64::Engine;
     use serde::{Deserialize, Serialize};
+
+    use crate::relay_grant::RelayGrant;
 
     use super::{
         categorize_error_status, categorize_transport_error, evidence_http_client, ActivateOutcome,
@@ -710,12 +712,22 @@ mod imp {
         access_token: &str,
         device_id: String,
         candidates: &[EndpointCandidate],
+        // P0-A: this device's own declared relay-capability, reported on
+        // this SAME path (the daemon already sends one report
+        // unconditionally at startup and again on every candidate change --
+        // see nat_traversal.rs's `report_candidates_on_change` -- so this
+        // rides an existing schedule rather than needing a dedicated
+        // capability endpoint). See coordination-worker's `NetmapPeer.
+        // relayCapable` for the other end of this value's journey.
+        relay_capable: bool,
     ) {
         #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
         struct Body {
             candidates: Vec<WireCandidate>,
+            relay_capable: bool,
         }
-        let body = Body { candidates: wire_candidates(candidates) };
+        let body = Body { candidates: wire_candidates(candidates), relay_capable };
         post_no_content(
             format!("{addr}/devices/{device_id}/endpoint"),
             access_token,
@@ -839,6 +851,103 @@ mod imp {
             }
             Err(e) => {
                 tracing::debug!(error = %e, "handoff lease request failed");
+                None
+            }
+        }
+    }
+
+    /// M3 Pass 6 / P0-A: requests a signed [`crate::relay_grant::RelayGrant`]
+    /// authorizing `relay_device_id` to forward opaque QUIC datagrams
+    /// between this device (`source_device_id`) and `destination_device_id`,
+    /// all three members of `group_id`
+    /// (`POST /shares/groups/:groupId/relay/grant`). `source_device_id` is
+    /// this device's own id -- the Bearer token authenticates only the
+    /// account, never a specific device, so the coordination plane cannot
+    /// derive it and it must be sent explicitly (verified server-side
+    /// against the account's own device ownership; see the Worker's
+    /// `issueRelayGrant` doc comment).
+    ///
+    /// Reconstructs the full [`RelayGrant`] from what the CALLER already
+    /// knows (`group_id`/`source_device_id`/`relay_device_id`/
+    /// `destination_device_id`, exactly what was just requested) plus what
+    /// the plane decided (`grant_id`/`version`/validity window/
+    /// `max_session_bytes`/signature) -- the response never re-states the
+    /// four ids, so there is nothing for a caller to reconcile against a
+    /// possibly-differing echo.
+    ///
+    /// `None` on any failure (unreachable plane, rejected request --
+    /// unauthorized, not a member, relay not capable -- or an unparseable
+    /// response), matching every other best-effort call in this module and
+    /// [`crate::relay_carrier::RelayGrantSource`]'s own documented "no new
+    /// connectivity authority" contract: a missing grant here is
+    /// indistinguishable from any other reason a relay candidate didn't
+    /// pan out, and [`crate::relay_carrier::open_relay_path`] simply tries
+    /// the next one.
+    pub async fn request_relay_grant(
+        addr: &str,
+        access_token: &str,
+        group_id: &str,
+        source_device_id: &str,
+        relay_device_id: &str,
+        destination_device_id: &str,
+    ) -> Option<RelayGrant> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body<'a> {
+            source_device_id: &'a str,
+            relay_device_id: &'a str,
+            destination_device_id: &'a str,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Resp {
+            grant_id: String,
+            version: u32,
+            not_before_unix: i64,
+            expires_at_unix: i64,
+            max_session_bytes: Option<u64>,
+            signature_base64: String,
+        }
+        let url = format!("{addr}/shares/groups/{group_id}/relay/grant");
+        let body = Body { source_device_id, relay_device_id, destination_device_id };
+        let result =
+            reqwest::Client::new().post(&url).bearer_auth(access_token).json(&body).send().await;
+        match result {
+            Ok(resp) if resp.status().is_success() => match resp.json::<Resp>().await {
+                Ok(r) => {
+                    let signature = match base64::engine::general_purpose::STANDARD
+                        .decode(&r.signature_base64)
+                    {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "relay grant request: unparseable signature");
+                            return None;
+                        }
+                    };
+                    Some(RelayGrant {
+                        version: r.version,
+                        grant_id: r.grant_id,
+                        group_id: group_id.to_string(),
+                        source_device_id: source_device_id.to_string(),
+                        relay_device_id: relay_device_id.to_string(),
+                        destination_device_id: destination_device_id.to_string(),
+                        not_before_unix: r.not_before_unix,
+                        expires_at_unix: r.expires_at_unix,
+                        max_session_bytes: r.max_session_bytes,
+                        signature,
+                    })
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "relay grant request: unparseable response");
+                    None
+                }
+            },
+            Ok(resp) => {
+                tracing::debug!(status = %resp.status(), "relay grant request rejected");
+                None
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "relay grant request failed");
                 None
             }
         }

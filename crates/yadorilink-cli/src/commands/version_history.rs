@@ -8,8 +8,8 @@
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
 use yadorilink_ipc_proto::daemonctl::{
-    FileVersionInfo, ListTrashRequest, ListVersionsRequest, RestoreTrashRequest,
-    RestoreVersionRequest, TrashedFileInfo,
+    ConflictedFileInfo, FileVersionInfo, ListConflictsRequest, ListTrashRequest,
+    ListVersionsRequest, RestoreTrashRequest, RestoreVersionRequest, TrashedFileInfo,
 };
 
 use crate::control_client;
@@ -48,12 +48,15 @@ pub async fn versions(local_path: String) -> Result<(), CliError> {
 
 fn version_line(v: &FileVersionInfo) -> String {
     format!(
-        "v{}  {}  size={}  origin={}  state={}",
+        "v{}  {}  size={}  origin={}  state={}  mode={}",
         v.version_seq,
         v.mtime_unix_nanos,
         v.size,
         if v.origin_device_id.is_empty() { "unknown" } else { &v.origin_device_id },
         v.state,
+        // `-` for "no Unix permission info" (e.g. authored on Windows) --
+        // never fabricated as a fake octal value.
+        v.unix_mode.map(|mode| format!("{mode:#o}")).unwrap_or_else(|| "-".to_string()),
     )
 }
 
@@ -111,6 +114,28 @@ fn trashed_file_line(f: &TrashedFileInfo) -> String {
     )
 }
 
+/// `yadorilink conflicts list` — every currently-live conflicted-copy
+/// file across every linked folder (the same files `yadorilink status`'s
+/// per-link `conflict_count` already tallies, listed here individually).
+pub async fn conflicts_list() -> Result<(), CliError> {
+    let resp = control_client::send(ReqPayload::ListConflicts(ListConflictsRequest {})).await?;
+    let Some(RespPayload::ListConflicts(list)) = resp.payload else {
+        return Err(CliError::Other("unexpected daemon response".into()));
+    };
+    if list.files.is_empty() {
+        println!("No conflicted files.");
+        return Ok(());
+    }
+    for file in &list.files {
+        println!("{}", conflicted_file_line(file));
+    }
+    Ok(())
+}
+
+fn conflicted_file_line(f: &ConflictedFileInfo) -> String {
+    format!("{}/{}  size={}  mtime={}", f.local_path, f.path, f.size, f.mtime_unix_nanos)
+}
+
 /// `yadorilink trash restore <path>` — recovers a deleted file's
 /// last version before deletion as a new current version; the file becomes
 /// live again.
@@ -136,8 +161,12 @@ mod tests {
             mtime_unix_nanos: 12345,
             state: "superseded".into(),
             origin_device_id: "device-a".into(),
+            unix_mode: Some(0o755),
         };
-        assert_eq!(version_line(&v), "v3  12345  size=42  origin=device-a  state=superseded");
+        assert_eq!(
+            version_line(&v),
+            "v3  12345  size=42  origin=device-a  state=superseded  mode=0o755"
+        );
     }
 
     /// An unknown origin (empty string, see `FileVersionInfo.origin_device_id`'s
@@ -151,8 +180,24 @@ mod tests {
             mtime_unix_nanos: 0,
             state: "current".into(),
             origin_device_id: String::new(),
+            unix_mode: Some(0o644),
         };
         assert!(version_line(&v).contains("origin=unknown"));
+    }
+
+    /// No Unix permission info (a version authored on Windows) renders as
+    /// `-`, never a fabricated octal value.
+    #[test]
+    fn version_line_renders_absent_unix_mode() {
+        let v = FileVersionInfo {
+            version_seq: 1,
+            size: 0,
+            mtime_unix_nanos: 0,
+            state: "current".into(),
+            origin_device_id: "device-a".into(),
+            unix_mode: None,
+        };
+        assert!(version_line(&v).contains("mode=-"));
     }
 
     #[test]
@@ -168,6 +213,21 @@ mod tests {
         assert_eq!(
             trashed_file_line(&f),
             "/tmp/photos/vacation.jpg  deleted_at=999  last_known_size=1000  origin=device-b"
+        );
+    }
+
+    #[test]
+    fn conflicted_file_line_renders_every_field() {
+        let f = ConflictedFileInfo {
+            local_path: "/tmp/photos".into(),
+            path: "vacation (conflicted copy, 2026-01-01-000000, device-b).jpg".into(),
+            size: 1234,
+            mtime_unix_nanos: 5678,
+        };
+        assert_eq!(
+            conflicted_file_line(&f),
+            "/tmp/photos/vacation (conflicted copy, 2026-01-01-000000, device-b).jpg  size=1234  \
+             mtime=5678"
         );
     }
 }

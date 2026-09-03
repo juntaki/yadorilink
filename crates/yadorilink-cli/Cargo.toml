@@ -54,11 +54,6 @@ base64 = { version = "0.22" }
 # which mishandled IPv6 literal addresses (`http://[::1]:8787`) in an
 # earlier version of this file. Same crate `oauth2`/`google_login.rs` use.
 url = { version = "2" }
-# Operation ids for `share.rs`'s crash-safe create/join enrollment: a random
-# per-attempt operation id, the idempotency key for the coordination plane's
-# prepare/activate/cancel routes and the compensation trail. Same version pin
-# as `yadorilink-daemon`'s existing `uuid` dependency.
-uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 # Test-only: integration tests seed a `ReplicaCoordinator` fixture directly

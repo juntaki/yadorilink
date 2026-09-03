@@ -51,7 +51,6 @@ const CONVERGENCE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_transport::DeviceKeyPair;
 
 // `TestDevice`/`setup_device`/`start_syncing`/`n_synced_devices` are
 // intentionally duplicated from `taguchi_collision_matrix.rs` (and
@@ -71,8 +70,7 @@ struct TestDevice {
 }
 
 async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
-    let keypair = Arc::new(DeviceKeyPair::generate());
-    let device_id = support::register_device(account, name, keypair.public_bytes()).await;
+    let device_id = support::register_device(account, name, [0u8; 32]).await;
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();

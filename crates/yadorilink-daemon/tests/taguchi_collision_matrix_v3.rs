@@ -71,7 +71,6 @@ use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeCo
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_orchestrator;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_transport::DeviceKeyPair;
 
 struct TestDevice {
     device_id: String,
@@ -88,7 +87,6 @@ struct TestDevice {
 fn spawn_orchestrator(
     coordination_addr: String,
     device_id: String,
-    keypair: Arc<DeviceKeyPair>,
     state: Arc<DaemonState>,
 ) {
     let config = peer_orchestrator::OrchestratorConfig {
@@ -97,7 +95,7 @@ fn spawn_orchestrator(
         device_id,
     };
     tokio::spawn(async move {
-        let _ = peer_orchestrator::run(config, keypair, state).await;
+        let _ = peer_orchestrator::run(config, state).await;
     });
 }
 
@@ -109,7 +107,6 @@ fn spawn_orchestrator(
 /// orchestrator against the fake. The fake pushes a fresh netmap on
 /// registration, so co-group devices discover and connect to this one.
 async fn setup_device(fake: &FakeCoordination, device_id: &str, groups: &[&str]) -> TestDevice {
-    let keypair = Arc::new(DeviceKeyPair::generate());
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
@@ -117,7 +114,7 @@ async fn setup_device(fake: &FakeCoordination, device_id: &str, groups: &[&str])
     let state = DaemonState::new(device_id.to_string(), sync_state, store);
     let root = tempfile::tempdir().unwrap();
 
-    register_with_fake(fake, &state, device_id, keypair.public_bytes(), groups).await;
+    register_with_fake(fake, &state, device_id, groups).await;
 
     let local_path = root.path().to_string_lossy().to_string();
     for group_id in groups {
@@ -127,7 +124,7 @@ async fn setup_device(fake: &FakeCoordination, device_id: &str, groups: &[&str])
             .unwrap();
     }
 
-    spawn_orchestrator(fake.addr(), device_id.to_string(), keypair, state.clone());
+    spawn_orchestrator(fake.addr(), device_id.to_string(), state.clone());
 
     TestDevice {
         device_id: device_id.to_string(),
@@ -152,7 +149,7 @@ async fn wait_for_mesh(devices: &[&TestDevice]) {
                     d.state
                         .peers
                         .session(&o.device_id)
-                        .is_some_and(|session| session.change_dag_negotiated())
+                        .is_some_and(|session| session.peer_handshake_received())
                 })
             })
         },

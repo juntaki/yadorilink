@@ -21,6 +21,7 @@ pub mod captured_authoring;
 pub mod change_history;
 pub mod commit_window;
 pub mod dag_store;
+pub mod desired_state;
 pub mod dirty_path;
 pub mod early_physical_recovery;
 pub mod enrollment;
@@ -31,13 +32,13 @@ pub mod filesystem_transaction;
 mod frontier;
 pub mod handoff_lease;
 pub mod link;
-mod materialization_job_repository;
-mod materialization_jobs;
+mod materialization_intent_repository;
 mod materialization_state;
 pub mod materialization_state_port;
 pub mod materialized_generation;
 pub mod membership_operation;
 pub mod policy_watermark;
+pub mod projection_obligations;
 pub mod rebootstrap_store;
 mod replica_history;
 pub mod resolution_planning;
@@ -48,12 +49,12 @@ pub mod role_loss_operation;
 mod store;
 mod types;
 
-pub use change_history::ChangeHistoryRepository;
+pub use change_history::{ChangeHistoryRepository, PendingAdmission, REMOTE_ADMISSION_BATCH_SIZE};
 pub use dirty_path::DirtyPathRepository;
 pub use enrollment::EnrollmentRepository;
 pub use error::SyncSqliteError;
 pub use handoff_lease::HandoffLeaseRepository;
-pub use materialization_job_repository::MaterializationJobRepository;
+pub use materialization_intent_repository::MaterializationIntentRepository;
 pub use materialization_state::{
     ContentHash, MaterializationCounts, MaterializationStateRepository, MaterializedFingerprint,
     RecordedPlaceholderGeneration,
@@ -87,10 +88,5 @@ pub(crate) fn read_inventory_operation_id(
         _ => Ok(None),
     }
 }
-pub use materialization_jobs::{
-    claim_runnable_jobs, enqueue_pending, get_job, init_materialization_jobs_schema,
-    list_unfinished_jobs, mark_backoff, mark_superseded_if_version_matches, recover_after_restart,
-    reschedule_after_skip, transition, MaterializationJob, MaterializationJobState,
-};
 pub use store::SqliteSyncStore;
 pub use types::{CurrentVersionSnapshot, RetainedVersion, RetainedVersionState};

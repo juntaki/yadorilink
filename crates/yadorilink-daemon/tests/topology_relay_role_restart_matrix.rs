@@ -30,8 +30,8 @@
 //! `DaemonState::relay_forwarder`'s session/byte-forwarded counters as
 //! stronger evidence, but that forwarder measures a DIFFERENT mechanism
 //! (the `RelayCarrier`/handoff-lease-style relay `relay_session_e2e.rs`/
-//! `relay_chaos.rs` exercise), not ordinary `PeerChannel::connect_with_
-//! relay` WireGuard-tunnel-via-relay sync traffic -- confirmed by that
+//! `relay_chaos.rs` exercise), not ordinary relay-routed QUIC
+//! peer-session sync traffic -- confirmed by that
 //! attempt hanging waiting for forwarder activity that never came.
 //!
 //! In this canonical topology N is the sole relay-capable, full-replica
@@ -54,7 +54,8 @@ use std::time::Duration;
 
 use support::fake_coordination::FakeCoordination;
 use support::topology::{
-    fully_connected, restart_node, spawn_orchestrator, stand_up_canonical_topology, TopologyNode,
+    fully_connected, restart_node, spawn_orchestrator, stand_up_relay_forced_topology,
+    wire_relay_grant_source_with_ttl, TopologyNode,
 };
 use support::{register_with_fake, wait_until_with_context};
 use yadorilink_daemon::daemon_state::DaemonState;
@@ -62,35 +63,12 @@ use yadorilink_daemon::peer_registry::PeerReachability;
 use yadorilink_daemon::route::RouteKind;
 use yadorilink_peer_session::peer_session::PeerSyncSession;
 
-struct FakeGrantSource {
-    fake: FakeCoordination,
-    source_device_id: String,
-}
-
-impl yadorilink_daemon::relay_carrier::RelayGrantSource for FakeGrantSource {
-    fn request_relay_grant<'a>(
-        &'a self,
-        destination_device_id: &'a str,
-        _relay_device_id: &'a str,
-        _group_id: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Option<yadorilink_daemon::relay_grant::RelayGrant>>
-                + Send
-                + 'a,
-        >,
-    > {
-        let grant = self.fake.issue_relay_grant(&self.source_device_id, destination_device_id, 60);
-        Box::pin(async move { grant })
-    }
-}
-
-fn wire_relay_grant_source(fake: &FakeCoordination, state: &Arc<DaemonState>, device_id: &str) {
-    state.set_relay_grant_source(Arc::new(FakeGrantSource {
-        fake: fake.clone(),
-        source_device_id: device_id.to_string(),
-    }));
-}
+/// This file's three restart-during-relay scenarios are individually
+/// heavy (see `SERIALIZE_HEAVY_TESTS`'s own doc comment below) and their
+/// combined runtime, including the restart-and-reopen cycle, can approach
+/// `wire_relay_grant_source`'s 60s default TTL -- same rationale the R3
+/// relay-recovery tests settled on for their own grant TTL.
+const GRANT_TTL_SECONDS: i64 = 900;
 
 fn route_debug(state: &Arc<DaemonState>, peer_device_id: &str) -> &'static str {
     state.peers.reachability(peer_device_id).map(|r| r.route_str()).unwrap_or("no-session")
@@ -152,36 +130,30 @@ fn restore_n_canonical_role(fake: &FakeCoordination, n: &TopologyNode, group_id:
     fake.set_relay_capable(&n.device_id, true);
 }
 
-/// Common setup for all three scenarios: canonical topology, W's direct
-/// path forced broken so W's traffic (in either direction) must transit
-/// relay through N.
+/// Common setup for all three scenarios: the relay-forced topology
+/// (`stand_up_relay_forced_topology`), where M<->W are permanently
+/// mutually invisible via a peer-view override set BEFORE either
+/// orchestrator spawns, so W's traffic (in either direction, to/from M)
+/// must transit relay through N.
+///
+/// This used to stand up the canonical topology and then break W's
+/// globally-advertised endpoint via `fake.update_endpoint` -- but that
+/// only stops a NEW connection attempt from using W's old address; it has
+/// no effect on a connection N or M already established to W before the
+/// break, which simply keeps working (no live-connection teardown), so
+/// the wait below could observe W still Direct-routed indefinitely. The
+/// relay-forced topology's peer-view override applies before any
+/// connection to W exists at all, so there is no live connection to fail
+/// to tear down.
 async fn stand_up_with_w_relayed(
     group_id: &str,
 ) -> (TopologyNode, TopologyNode, TopologyNode, support::topology::TopologyHandles, FakeCoordination)
 {
     support::ensure_isolated_config_dir();
     let fake = FakeCoordination::start().await;
-    fake.enable_signed_policy();
-
-    let (n, m, w, handles) = stand_up_canonical_topology(&fake, group_id).await;
-    wire_relay_grant_source(&fake, &m.state, &m.device_id);
-    wire_relay_grant_source(&fake, &w.state, &w.device_id);
-
-    fake.update_endpoint(&w.device_id, "127.0.0.1:1".to_string());
-    wait_until_with_context(
-        || routed_via_relay(&m.state, &w.device_id) || routed_via_relay(&n.state, &w.device_id),
-        Duration::from_secs(90),
-        || {
-            format!(
-                "W's direct failure never produced a relay-routed session anywhere: \
-                 m->w route={:?} n->w route={:?}",
-                route_debug(&m.state, &w.device_id),
-                route_debug(&n.state, &w.device_id),
-            )
-        },
-    )
-    .await;
-
+    let (n, m, w, handles) = stand_up_relay_forced_topology(&fake, group_id).await;
+    wire_relay_grant_source_with_ttl(&fake, &m.state, &m.device_id, GRANT_TTL_SECONDS);
+    wire_relay_grant_source_with_ttl(&fake, &w.state, &w.device_id, GRANT_TTL_SECONDS);
     (n, m, w, handles, fake)
 }
 
@@ -198,6 +170,66 @@ async fn stand_up_with_w_relayed(
 /// that doesn't depend on the host machine's load.
 static SERIALIZE_HEAVY_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Waits for M<->W's relay-carried session to genuinely re-form after the
+/// relay ANCHOR (N) itself restarts -- specifically for
+/// `relay_anchor_restart_mid_session`, which is the one scenario in this
+/// file where N, not M or W, is the node that goes away and comes back.
+///
+/// `support::topology::wait_for_new_stable_relay_generation` (R3's own
+/// generation-aware oracle for the analogous ambiguity) doesn't fit here:
+/// it requires the relay anchor's own `RelayForwarder` session id to
+/// change too, but that id is a per-process counter that restarts from
+/// the same value on every fresh `DaemonState` -- confirmed empirically,
+/// `relay_session_id=Some(1)` both immediately before AND long after N's
+/// restart, even once M's and W's own session identities had genuinely
+/// changed. It works for R3's own scenario because the anchor there never
+/// restarts (only the pairing under it churns), so its counter really
+/// does advance. Comparing it across a full anchor-process restart can
+/// never detect a new generation, so this checks the two signals that
+/// still reliably distinguish "brand new relay path" from "stale route
+/// still reporting Connected" here instead: fresh `PeerSyncSession`
+/// identity on BOTH M's and W's own ends versus `before`, held stable for
+/// a short window, plus the production `routed_via_relay` status on both
+/// sides.
+async fn wait_for_new_relay_session_after_anchor_restart(
+    m: &TopologyNode,
+    w: &TopologyNode,
+    m_session_with_w_before: &Arc<PeerSyncSession>,
+    w_session_with_m_before: &Arc<PeerSyncSession>,
+    timeout: Duration,
+) {
+    const STABILITY_WINDOW: Duration = Duration::from_secs(2);
+    const POLL_INTERVAL: Duration = Duration::from_millis(200);
+    let deadline = std::time::Instant::now() + timeout;
+    let mut stable_since: Option<std::time::Instant> = None;
+    loop {
+        let m_session = m.state.peers.session(&w.device_id);
+        let w_session = w.state.peers.session(&m.device_id);
+        let fresh = m_session.as_ref().is_some_and(|s| !Arc::ptr_eq(s, m_session_with_w_before))
+            && w_session.as_ref().is_some_and(|s| !Arc::ptr_eq(s, w_session_with_m_before));
+        let relayed = routed_via_relay(&m.state, &w.device_id) && routed_via_relay(&w.state, &m.device_id);
+        let now = std::time::Instant::now();
+        if fresh && relayed {
+            let since = *stable_since.get_or_insert(now);
+            if now.duration_since(since) >= STABILITY_WINDOW {
+                return;
+            }
+        } else {
+            stable_since = None;
+        }
+        if now >= deadline {
+            panic!(
+                "m<->w never reached a new, stable relay session within {timeout:?} after n's \
+                 restart: fresh_session_identities={fresh} both_routed_via_relay={relayed} \
+                 m->w route={:?} w->m route={:?}",
+                route_debug(&m.state, &w.device_id),
+                route_debug(&w.state, &m.device_id),
+            );
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_anchor_restart_mid_session() {
     let _serialize = SERIALIZE_HEAVY_TESTS.lock().await;
@@ -209,6 +241,10 @@ async fn relay_anchor_restart_mid_session() {
         n.state.peers.session(&m.device_id).expect("N must have a session with M before restart");
     let n_session_with_w_before: Arc<PeerSyncSession> =
         n.state.peers.session(&w.device_id).expect("N must have a session with W before restart");
+    let m_session_with_w_before: Arc<PeerSyncSession> =
+        m.state.peers.session(&w.device_id).expect("M must have a session with W before restart");
+    let w_session_with_m_before: Arc<PeerSyncSession> =
+        w.state.peers.session(&m.device_id).expect("W must have a session with M before restart");
 
     // W (the only relay-forced node) authors a payload large enough that
     // the relay forwarding it through N takes measurable time -- giving
@@ -218,10 +254,10 @@ async fn relay_anchor_restart_mid_session() {
     // route itself (not `RelayForwarder`'s session/byte counters, which
     // measure the SEPARATE `RelayCarrier`/handoff-lease-style relay
     // mechanism `relay_session_e2e.rs`/`relay_chaos.rs` exercise, not
-    // ordinary `PeerChannel::connect_with_relay` WireGuard-tunnel-via-
-    // relay sync traffic -- confirmed by this test's own earlier version
-    // hanging on that assumption) is confirmed still Relay-routed right
-    // before the restart, matching the same production status signal
+    // ordinary relay-routed QUIC peer-session sync traffic -- confirmed
+    // by this test's own earlier version hanging on that assumption) is
+    // confirmed still Relay-routed right before the restart, matching
+    // the same production status signal
     // used throughout this session's other relay tests.
     let payload = lcg_payload(6 * 1024 * 1024, 0xA1B2_C3D4_E5F6_0718);
     std::fs::write(w.root.path().join("relayed-by-w.bin"), &payload).unwrap();
@@ -238,7 +274,7 @@ async fn relay_anchor_restart_mid_session() {
     // plausibly still in flight over the just-confirmed relay route.
     handles.take_and_shutdown(&n.device_id).await;
     let n = restart_node(n).await;
-    register_with_fake(&fake, &n.state, &n.device_id, n.keypair.public_bytes(), &[group_id]).await;
+    register_with_fake(&fake, &n.state, &n.device_id, &[group_id]).await;
     restore_n_canonical_role(&fake, &n, group_id);
     let n_runtime = spawn_orchestrator(fake.addr(), &n);
     handles.insert(n.device_id.clone(), n_runtime);
@@ -262,6 +298,39 @@ async fn relay_anchor_restart_mid_session() {
         || fully_connected(&n.state, &m.device_id) && fully_connected(&n.state, &w.device_id),
         Duration::from_secs(90),
         || "N's fresh post-restart sessions with M and W never completed negotiation".to_string(),
+    )
+    .await;
+    // Connectivity to N alone is not evidence M<->W's own relay-carried
+    // path has re-formed -- DAG metadata gossips through N regardless,
+    // but the actual block fetch below needs a live relay session. A
+    // bare `routed_via_relay` poll isn't enough either: it can observe
+    // M's OLD relay-carried session still reporting `Connected(Relay)`
+    // right after the old N process is gone (M's own liveness detection
+    // hasn't caught up yet), which is exactly what made the previous
+    // version of this wait pass while the immediately-following
+    // `hydrate_with_retries` still failed with "no reachable peer holds
+    // all required blocks". `support::topology::wait_for_new_stable_
+    // relay_generation` (R3's own generation-aware oracle for this class
+    // of stale-route ambiguity) doesn't fit THIS scenario specifically:
+    // it also requires the relay anchor's own `RelayForwarder` session id
+    // to change, but N's session-id counter resets on every fresh process
+    // (confirmed empirically: `relay_session_id=Some(1)` both before AND
+    // after N's restart, even though M's and W's own session identities
+    // genuinely did change) -- so a comparison against it can never
+    // detect a new generation when N ITSELF is what restarted, only when
+    // the anchor stays up and the pairing under it churns (R3's own
+    // scenario). `wait_for_new_relay_session_after_anchor_restart` checks
+    // the two signals that DO reliably distinguish "brand new relay path"
+    // from "stale route still reporting Connected" here: fresh
+    // `PeerSyncSession` identity on BOTH M's and W's own ends, held
+    // stable for a short window, plus the production `routed_via_relay`
+    // status on both sides.
+    wait_for_new_relay_session_after_anchor_restart(
+        &m,
+        &w,
+        &m_session_with_w_before,
+        &w_session_with_m_before,
+        Duration::from_secs(90),
     )
     .await;
 
@@ -354,13 +423,13 @@ async fn requester_restart_mid_relay_session() {
 
     handles.take_and_shutdown(&w.device_id).await;
     w = restart_node(w).await;
-    // W's direct endpoint is still the forced-broken one from before
-    // restart; re-force it broken again after re-registration (the fix
-    // `topology_restart_while_relayed.rs` established: re-registering
-    // silently restores W's own freshly-bound real endpoint otherwise).
-    register_with_fake(&fake, &w.state, &w.device_id, w.keypair.public_bytes(), &[group_id]).await;
-    fake.update_endpoint(&w.device_id, "127.0.0.1:1".to_string());
-    wire_relay_grant_source(&fake, &w.state, &w.device_id);
+    // The relay-forced topology's M<->W peer-view block survives
+    // `register_with_fake` re-registering W's fresh endpoint (see
+    // `FakeCoordination::set_peer_view_endpoints`'s own doc comment), so
+    // unlike the old endpoint-break technique this needs no manual
+    // re-block here.
+    register_with_fake(&fake, &w.state, &w.device_id, &[group_id]).await;
+    wire_relay_grant_source_with_ttl(&fake, &w.state, &w.device_id, GRANT_TTL_SECONDS);
     let w_runtime = spawn_orchestrator(fake.addr(), &w);
     handles.insert(w.device_id.clone(), w_runtime);
 
@@ -449,9 +518,9 @@ async fn requester_restart_mid_relay_session() {
 // 2. The startup reconciliation scan (`local_change.rs`) only checked
 //    `has_materialization_intent` before tombstoning a locally-missing
 //    path -- but a path can have a durably-committed, non-deleted index
-//    row whose materialization JOB is still queued (`Pending`/`Backoff`),
-//    with no intent ever opened for it yet. Fixed by also checking
-//    `has_pending_materialization_job`.
+//    row whose projection obligation is still unsettled, with no intent
+//    ever opened for it yet. Fixed by also checking
+//    `has_unsettled_projection_obligation`.
 // 3. The actual proximate cause of most of the residual: `get_file`/
 //    `list_files` cannot distinguish a real content-bearing row from
 //    `apply_incoming_wire_metadata`'s own `version_seq == 0` bootstrap
@@ -517,9 +586,11 @@ async fn destination_restart_mid_relay_session() {
 
     handles.take_and_shutdown(&w.device_id).await;
     w = restart_node(w).await;
-    register_with_fake(&fake, &w.state, &w.device_id, w.keypair.public_bytes(), &[group_id]).await;
-    fake.update_endpoint(&w.device_id, "127.0.0.1:1".to_string());
-    wire_relay_grant_source(&fake, &w.state, &w.device_id);
+    // The relay-forced topology's M<->W peer-view block survives
+    // `register_with_fake` re-registering W's fresh endpoint, so unlike
+    // the old endpoint-break technique this needs no manual re-block.
+    register_with_fake(&fake, &w.state, &w.device_id, &[group_id]).await;
+    wire_relay_grant_source_with_ttl(&fake, &w.state, &w.device_id, GRANT_TTL_SECONDS);
     let w_runtime = spawn_orchestrator(fake.addr(), &w);
     handles.insert(w.device_id.clone(), w_runtime);
 

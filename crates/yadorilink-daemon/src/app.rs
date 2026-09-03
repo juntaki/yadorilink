@@ -34,7 +34,6 @@ use yadorilink_local_storage::FsBlockStore;
 use crate::replica_coordinator::ReplicaCoordinator;
 #[cfg(madsim)]
 use yadorilink_local_storage::BlockStore;
-use yadorilink_transport::DeviceKeyPair;
 
 use crate::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use crate::daemon_state::DaemonState;
@@ -155,7 +154,6 @@ pub struct DaemonConfig {
     pub control_socket_path: PathBuf,
     #[cfg(unix)]
     pub shell_ipc_socket_path: PathBuf,
-    pub keypair_path: PathBuf,
     /// (simulator only) When `Some`, [`run`] publishes the `DaemonState` it
     /// builds into this slot so an in-sim smoke test can drive it. Always
     /// `None`/absent in production ([`DaemonConfig::from_env`] never sets it).
@@ -204,10 +202,6 @@ impl DaemonConfig {
         let shell_ipc_socket_path = std::env::var("YADORILINK_SHELL_IPC_SOCKET")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| dir.join("shell.sock"));
-        let keypair_path = std::env::var("YADORILINK_WG_KEY")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| dir.join("wg_key"));
-
         Self {
             config_dir: dir,
             block_store_root,
@@ -216,7 +210,6 @@ impl DaemonConfig {
             control_socket_path,
             #[cfg(unix)]
             shell_ipc_socket_path,
-            keypair_path,
             // The real binary is never driven by an in-sim probe.
             #[cfg(madsim)]
             state_probe: None,
@@ -254,6 +247,20 @@ fn enforce_trust_root_gate_at_startup() -> anyhow::Result<()> {
 pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     #[cfg(feature = "enforce-release-trust-root")]
     enforce_trust_root_gate_at_startup()?;
+
+    // `YADORILINK_DIAGNOSTIC_IO_COUNTERS=1` arms `yadorilink_local_storage
+    // ::io_diag`'s process-global durability/pipeline counters for this
+    // process's whole lifetime -- unset (every production process) leaves
+    // them off, at the cost of one relaxed atomic load per instrumented
+    // site (see io_diag's own module doc). Read once here, same shape as
+    // `fs_backend::fsync_diagnostically_disabled`'s `OnceLock`, rather than
+    // scattering the env lookup: this is the one place able to arm it
+    // before any block-store I/O happens. The recorded totals are dumped
+    // in `graceful_shutdown`, the one path every shutdown route funnels
+    // through.
+    if std::env::var("YADORILINK_DIAGNOSTIC_IO_COUNTERS").as_deref() == Ok("1") {
+        yadorilink_local_storage::io_diag::set_enabled(true);
+    }
 
     let dir = config.config_dir;
     std::fs::create_dir_all(&dir)?;
@@ -319,25 +326,30 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
 
     let block_store_root = config.block_store_root;
     let sync_db_path = config.sync_db_path;
-    let keypair_path = config.keypair_path;
 
     // Registration makes both private keys immutable identity state. Validate
     // them together before acquiring data-resource locks, opening the block
-    // store/SQLite, running migrations, or repairing linked files. Keep these
-    // exact loaded values for later wiring so no second read can observe a
+    // store/SQLite, running migrations, or repairing linked files. Keep this
+    // exact loaded value for later wiring so no second read can observe a
     // different file after persistent startup work has begun. Not cfg-gated:
     // `load_existing` is plain synchronous file I/O with no tokio/madsim
-    // dependency, and the coordination-plane connect branch below needs the
-    // transport keypair (to seed the shared hub's static public key) under
-    // the simulator too, not just in production.
+    // dependency.
+    //
+    // One key, not two. It signs this device's change history and it
+    // authenticates its transport, and a registered device that cannot load
+    // it must fail rather than mint a replacement -- see `KeyLoadError`.
     let registered_identity = if device_config.is_some() {
-        Some((
-            Arc::new(DeviceKeyPair::load_existing(&keypair_path)?),
-            yadorilink_transport::DeviceSigningKeyPair::load_existing(dir.join("signing_key"))?,
-        ))
+        Some(yadorilink_transport::DeviceSigningKeyPair::load_existing(dir.join("signing_key"))?)
     } else {
         None
     };
+    // Under the simulator the harness installs this device's key itself
+    // (`peer_orchestrator::run_sim`), so the load above is purely the
+    // validation that a registered device HAS one -- which still has to
+    // happen, and still has to happen here, before any persistent startup
+    // work begins.
+    #[cfg(madsim)]
+    let _ = &registered_identity;
 
     // Additive to the config-dir lock above: take exclusive OS locks on the
     // block-store root and the sync-state database *before* opening either
@@ -489,6 +501,23 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // crate also goes through).
     state.enable_disk_headroom_enforcement();
 
+    // `set_local_relay_capable` had no production entry point at all before
+    // this -- every existing call site was a test's own direct call on a
+    // `DaemonState` it built itself. This is this device's LOCAL half of
+    // "may I relay for others" (`route.rs`'s own doc comment: `Durability
+    // != Connectivity`, a device a user already trusts -- a home NAS, an
+    // always-on desktop -- can opt into this independently of full-replica
+    // status); the coordination plane's own netmap is the other half, and
+    // grants nothing on its own without this device also consenting
+    // locally. Env-var-gated rather than a config-file field for now,
+    // matching this function's own existing `YADORILINK_*` operator knobs
+    // (`YADORILINK_BLOCK_STORE`, `YADORILINK_DAEMON_METRICS_ADDR`, ...);
+    // promoting it to a real CLI/config surface is separate follow-up work,
+    // not something this one-line activation needs to wait for.
+    if std::env::var("YADORILINK_RELAY_CAPABLE").as_deref() == Ok("1") {
+        state.set_local_relay_capable(true);
+    }
+
     // Wire the generation-stamped peer custody confirmer. Physical cache
     // reclamation remains disabled until the responder can persist a custody
     // lease as a GC root; the real daemon keeps the exact-version protocol
@@ -501,7 +530,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
     // has no identity to attribute changes to), and not under the simulator,
     // whose in-process daemons drive emission through their own seams.
     #[cfg(not(madsim))]
-    if let Some((_, signing)) = registered_identity.as_ref() {
+    if let Some(signing) = registered_identity.as_ref() {
         state.set_device_signing_key(signing.signing.clone());
     }
 
@@ -675,15 +704,6 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
 
     match (device_config, token_store::load_access_token()) {
         (Some(cfg), Some(access_token)) => {
-            // A persisted registration pins this device's public transport key
-            // at the coordination plane. Missing key material is therefore a
-            // fatal identity-loss error, never an invitation to mint a new key
-            // peers do not recognize.
-            let keypair = registered_identity
-                .as_ref()
-                .expect("registered device keys were validated before persistent startup")
-                .0
-                .clone();
             tracing::info!(device_id = %cfg.device_id, "connecting to coordination plane");
 
             // Best-effort, production-only coordination-plane wiring, spawned
@@ -697,15 +717,6 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             //  - NAT-traversal candidate gathering (STUN + router port
             //    mapping) that keeps the coordination plane's view of this
             //    device's direct-connection candidates current.
-            // Seed the device static public key before any transport-using
-            // task binds the shared hub, so the hub's MAC1 initiation gate is
-            // keyed on this device from the first bind.
-            state.set_device_static_public(keypair.public_bytes());
-            // M3 Pass 2: closes the O(N^2) handshake-fan-in cost measured
-            // by `handshake_fan_in.rs` -- see `DaemonState::
-            // set_device_static_secret`'s own doc comment.
-            state.set_device_static_secret(keypair.secret.clone());
-
             #[cfg(not(madsim))]
             {
                 let addr = cfg.coordination_addr.clone();
@@ -722,7 +733,24 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
                 // `DaemonState::coordination_client_config`'s doc comment.
                 state.set_coordination_client_config(addr.clone(), token.clone());
 
-                if let Some((_, signing)) = registered_identity.as_ref() {
+                // P0-A: the production RelayGrantSource -- see that
+                // struct's own doc comment. Installed unconditionally,
+                // exactly like every other coordination-plane-backed
+                // capability wired in this same block: whether a grant is
+                // ever actually usable still depends entirely on this
+                // device's own relay_candidates() finding a live,
+                // relay-capable, directly-reachable peer to ask (see
+                // relay_carrier.rs::open_relay_path), same as before this
+                // existed.
+                state.set_relay_grant_source(std::sync::Arc::new(
+                    crate::relay_carrier::ProductionRelayGrantSource::new(
+                        addr.clone(),
+                        token.clone(),
+                        device_id.clone(),
+                    ),
+                ));
+
+                if let Some(signing) = registered_identity.as_ref() {
                     let addr = addr.clone();
                     let token = token.clone();
                     let device_id = device_id.clone();
@@ -780,7 +808,7 @@ pub async fn run(config: DaemonConfig) -> anyhow::Result<()> {
             let state = state.clone();
             state.set_task_alive(TASK_PEER_ORCHESTRATOR, true);
             essential.spawn(async move {
-                if let Err(e) = peer_orchestrator::run(orchestrator_config, keypair, state.clone()).await
+                if let Err(e) = peer_orchestrator::run(orchestrator_config, state.clone()).await
                 {
                     tracing::error!(error = %e, task = TASK_PEER_ORCHESTRATOR, "essential task failed");
                 } else {
@@ -1011,6 +1039,24 @@ async fn graceful_shutdown(
         let _ = std::fs::remove_file(path);
     }
 
+    // Dump `io_diag`'s counters, if `YADORILINK_DIAGNOSTIC_IO_COUNTERS=1`
+    // armed them at startup — `snapshot()` itself is just relaxed loads
+    // regardless, so this is unconditionally cheap to call and skip when
+    // nothing was ever recorded (every `calls == 0`).
+    if yadorilink_local_storage::io_diag::enabled() {
+        for op in yadorilink_local_storage::io_diag::snapshot() {
+            if op.calls > 0 {
+                tracing::info!(
+                    op = op.name,
+                    calls = op.calls,
+                    nanos = op.nanos,
+                    bytes = op.bytes,
+                    "io_diag counter at shutdown"
+                );
+            }
+        }
+    }
+
     // Finally, stop the essential tasks themselves (control socket,
     // shell IPC, peer orchestrator) — aborts whichever of them are still
     // running and awaits their abort, so this doesn't return until
@@ -1161,12 +1207,11 @@ mod startup_config_validation_tests {
     /// startup stopped before the sweep-and-repair pass rather than merely
     /// returning the right error at the end of it.
     async fn start_daemon_with_device_json(device_json: &str) -> StartupAttempt {
-        start_daemon_with_device_json_and_keys(device_json, false, false).await
+        start_daemon_with_device_json_and_keys(device_json, false).await
     }
 
     async fn start_daemon_with_device_json_and_keys(
         device_json: &str,
-        create_transport_key: bool,
         create_signing_key: bool,
     ) -> StartupAttempt {
         let _env_guard = CONFIG_ENV_MUTEX.lock().await;
@@ -1183,9 +1228,6 @@ mod startup_config_validation_tests {
         std::env::set_var("YADORILINK_SYNC_DB", &sync_db_path);
 
         std::fs::write(config_dir.path().join("device.json"), device_json).unwrap();
-        if create_transport_key {
-            DeviceKeyPair::generate_and_persist(config_dir.path().join("wg_key")).unwrap();
-        }
         if create_signing_key {
             yadorilink_transport::DeviceSigningKeyPair::generate_and_persist(
                 config_dir.path().join("signing_key"),
@@ -1215,23 +1257,23 @@ mod startup_config_validation_tests {
         )
     }
 
+    /// A registered device's key is validated before anything on disk is
+    /// touched. A device has one key now, and it is not optional: without it
+    /// this device can neither sign a change nor authenticate a connection,
+    /// so startup must abort rather than proceed as a device that appears to
+    /// work locally and is rejected by every peer.
     #[tokio::test]
-    async fn registered_keys_are_both_validated_before_persistent_startup() {
-        for (transport, signing, missing_name) in
-            [(false, true, "transport"), (true, false, "signing")]
-        {
-            let attempt =
-                start_daemon_with_device_json_and_keys(&current_device_json(), transport, signing)
-                    .await;
-            assert!(
-                !attempt.sync_db_path.exists(),
-                "missing {missing_name} key must abort before SQLite creation"
-            );
-            assert!(
-                attempt.stale_temp_file.exists(),
-                "missing {missing_name} key must abort before startup repair"
-            );
-        }
+    async fn a_registered_devices_key_is_validated_before_persistent_startup() {
+        let attempt =
+            start_daemon_with_device_json_and_keys(&current_device_json(), false).await;
+        assert!(
+            !attempt.sync_db_path.exists(),
+            "a missing device key must abort before SQLite creation"
+        );
+        assert!(
+            attempt.stale_temp_file.exists(),
+            "a missing device key must abort before startup repair"
+        );
     }
 
     /// A `device.json` from a newer build must abort startup before anything

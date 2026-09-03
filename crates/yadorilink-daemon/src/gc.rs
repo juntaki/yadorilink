@@ -114,24 +114,16 @@ async fn run_sweep_with_grace_cutoff(
     dry_run: bool,
     grace_cutoff: SystemTime,
 ) -> Result<GcReport, GcTriggerError> {
-    #[cfg(not(madsim))]
-    {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| run_sweep_sync(&state, dry_run, grace_cutoff))
-            }
-            _ => run_sweep_sync(&state, dry_run, grace_cutoff),
-        }
-    }
-    // The deterministic simulator runs a single-threaded runtime, so there
-    // is never a multi-thread worker to offload the blocking sweep onto —
-    // and its tokio shim exposes neither `runtime_flavor()` nor
-    // `block_in_place`. Always take the plain synchronous path there; the
-    // result is identical to the `_ =>` branch above.
-    #[cfg(madsim)]
-    {
+    // Offloads onto a `block_in_place` worker when a multi-thread runtime is
+    // current, otherwise runs inline (never a multi-thread worker to offload
+    // onto: a current-thread runtime, called outside a runtime, or the
+    // deterministic simulator, whose tokio shim exposes neither
+    // `runtime_flavor()` nor `block_in_place`). Shared with every other
+    // call site in this crate that wraps a plain synchronous function this
+    // way -- see `daemon_state::run_blocking_sweep_offloaded`'s doc comment.
+    crate::daemon_state::run_blocking_sweep_offloaded(|| {
         run_sweep_sync(&state, dry_run, grace_cutoff)
-    }
+    })
 }
 
 fn run_sweep_sync(

@@ -110,7 +110,7 @@ async fn unobtainable_content_converges_to_at_risk_not_stuck_protecting() {
     // X: the sole author of unique content, about to leave.
     let x = new_node("durability-x-author");
     link_on_demand(&x, &group_id);
-    register_with_fake(&fake, &x.state, &x.device_id, x.keypair.public_bytes(), &[&group_id]).await;
+    register_with_fake(&fake, &x.state, &x.device_id, &[&group_id]).await;
     let x_runtime = spawn_orchestrator(fake.addr(), &x);
     handles.insert(x.device_id.clone(), x_runtime);
 

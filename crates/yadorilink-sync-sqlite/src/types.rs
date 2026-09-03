@@ -40,7 +40,8 @@ pub struct RetainedVersion {
     pub origin_device_id: Option<String>,
     pub record_kind: RecordKind,
     pub symlink_target: Option<Vec<u8>>,
-    pub exec_bit: bool,
+    pub unix_mode: Option<u32>,
+    pub xattrs: Vec<(String, Vec<u8>)>,
 }
 
 /// The `state = 'current'` row of a file, read as one atomic statement --
@@ -54,7 +55,8 @@ pub struct CurrentVersionSnapshot {
     pub deleted: bool,
     pub record_kind: RecordKind,
     pub symlink_target: Option<Vec<u8>>,
-    pub exec_bit: bool,
+    pub unix_mode: Option<u32>,
+    pub xattrs: Vec<(String, Vec<u8>)>,
 }
 
 /// Field-for-field rename -- this crate already did every parse/derivation
@@ -78,7 +80,8 @@ impl From<CurrentVersionSnapshot>
             deleted: snapshot.deleted,
             record_kind: snapshot.record_kind,
             symlink_target: snapshot.symlink_target,
-            exec_bit: snapshot.exec_bit,
+            unix_mode: snapshot.unix_mode,
+            xattrs: snapshot.xattrs,
         }
     }
 }
@@ -97,8 +100,9 @@ impl From<RetainedVersion> for yadorilink_replica_domain::session_state::Version
             version.size,
             version.mtime_unix_nanos,
             version.record_kind,
-            version.exec_bit,
+            version.unix_mode,
             version.symlink_target.clone(),
+            version.xattrs.clone(),
         )
         .version_hash;
         Self {
@@ -116,7 +120,8 @@ impl From<RetainedVersion> for yadorilink_replica_domain::session_state::Version
             origin_device_id: version.origin_device_id,
             record_kind: version.record_kind,
             symlink_target: version.symlink_target,
-            exec_bit: version.exec_bit,
+            unix_mode: version.unix_mode,
+            xattrs: version.xattrs,
             version_hash,
         }
     }

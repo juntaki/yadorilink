@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::change::Op;
-use crate::file::{BlockInfo, FileVersion, RecordKind, VersionBlock};
+use crate::file::{BlockInfo, FileRecord, FileVersion, RecordKind, VersionBlock};
 use crate::ids::{ChangeHash, VersionHash};
 
 fn unknown_persisted_enum(kind: &str, value: &str) -> ! {
@@ -133,7 +133,8 @@ pub struct VersionRecord {
     pub origin_device_id: Option<String>,
     pub record_kind: RecordKind,
     pub symlink_target: Option<Vec<u8>>,
-    pub exec_bit: bool,
+    pub unix_mode: Option<u32>,
+    pub xattrs: Vec<(String, Vec<u8>)>,
     pub version_hash: VersionHash,
 }
 
@@ -157,7 +158,8 @@ pub struct CurrentVersionRecord {
     pub deleted: bool,
     pub record_kind: RecordKind,
     pub symlink_target: Option<Vec<u8>>,
-    pub exec_bit: bool,
+    pub unix_mode: Option<u32>,
+    pub xattrs: Vec<(String, Vec<u8>)>,
 }
 
 impl CurrentVersionRecord {
@@ -171,8 +173,9 @@ impl CurrentVersionRecord {
             self.size,
             self.mtime_unix_nanos,
             self.record_kind,
-            self.exec_bit,
+            self.unix_mode,
             self.symlink_target.clone(),
+            self.xattrs.clone(),
         )
     }
 }
@@ -241,10 +244,45 @@ pub struct ChangeContent<'a> {
     pub versions: &'a [FileVersion],
 }
 
+/// One path's fully-prepared local mutation for a bounded batched commit
+/// (`commit_local_mutations_batch`) — content already read, chunked, and
+/// hashed; the `FileRecord`/`Op`/`FileVersion`/metadata it will become
+/// already decided; not yet written anywhere. Deliberately minimal: no
+/// lock, no disk fingerprint, no staleness bookkeeping — those require a
+/// filesystem/tokio dependency this crate does not have, so
+/// `yadorilink-local-capture` (which prepares these and knows the caller's
+/// per-path lock) owns that half, revalidating a mutation is still current
+/// before including it in a batch. Each variant still becomes its own
+/// signed DAG `Change` when committed — a batch of N of these must never
+/// collapse into one multi-op `Change` (that changes causal/apply
+/// granularity for what were N independent local edits).
+#[derive(Debug)]
+pub enum PreparedLocalMutation {
+    Upsert {
+        record: FileRecord,
+        op: Op,
+        version: FileVersion,
+        meta: Option<LocalFileMetaColumns>,
+    },
+    Delete {
+        record: FileRecord,
+        op: Op,
+    },
+}
+
+impl PreparedLocalMutation {
+    pub fn record(&self) -> &FileRecord {
+        match self {
+            PreparedLocalMutation::Upsert { record, .. } => record,
+            PreparedLocalMutation::Delete { record, .. } => record,
+        }
+    }
+}
+
 /// The local-only per-file metadata columns a local content emission writes
 /// alongside its `FileRecord`. Folded into the emitting transaction (rather
 /// than applied as separate post-commit `set_record_kind`/`set_symlink_*`/
-/// `set_exec_bit` updates) so the materialized index row can never lag the
+/// `set_unix_mode` updates) so the materialized index row can never lag the
 /// `FileVersion` the emitted change carries across a crash between the
 /// commit and the setters. The kind/target/exec-bit values mirror exactly
 /// the [`crate::file::FileMeta`] the emitted `FileVersion` carries;
@@ -255,7 +293,10 @@ pub struct LocalFileMetaColumns {
     pub record_kind: RecordKind,
     pub symlink_target: Option<Vec<u8>>,
     pub symlink_out_of_root: bool,
-    pub exec_bit: bool,
+    pub unix_mode: Option<u32>,
+    /// See `FileMeta::xattrs`'s own doc comment -- already sorted by
+    /// name and filtered to the capture-side allow-list by the caller.
+    pub xattrs: Vec<(String, Vec<u8>)>,
 }
 
 /// One user-recoverable durability root — one retained version at `path`
@@ -322,6 +363,18 @@ pub struct TrashedFile {
     /// When the deletion itself (the tombstone's own `current` row) was
     /// recorded.
     pub deleted_at_unix_nanos: i64,
+}
+
+/// One currently-live conflicted-copy file, as returned by
+/// `SyncState::list_live_conflict_copies` — the single source of truth
+/// both `FileHistoryQueryService::list_conflicts` and
+/// `LinkStatusReadPort::list_links`'s `conflict_count` read from, so the
+/// two can never disagree about which paths count.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConflictCopyFile {
+    pub path: String,
+    pub size: u64,
+    pub mtime_unix_nanos: i64,
 }
 
 /// One journaled local edit awaiting durable processing into the index +

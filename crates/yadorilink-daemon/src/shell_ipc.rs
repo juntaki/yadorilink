@@ -451,7 +451,7 @@ mod local_write_tests {
     /// why the request itself carries no content) results in exactly one
     /// DAG change and one indexed row, through the SAME admission path a
     /// filesystem watcher's own event takes.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_write_request_for_a_new_file_admits_exactly_one_dag_change() {
         let state = test_state();
         let root = tempfile::tempdir().unwrap();
@@ -494,7 +494,7 @@ mod local_write_tests {
     /// notification) must not mint a second DAG change -- `process_event`'s
     /// own self-echo/no-op suppression, exercised here through the new
     /// signal source.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn duplicate_local_write_request_for_unchanged_content_does_not_duplicate_the_change() {
         let state = test_state();
         let root = tempfile::tempdir().unwrap();
@@ -534,7 +534,7 @@ mod local_write_tests {
 
     /// A `deleteItem` notification for an existing file tombstones it
     /// through the same admission path.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_write_request_for_a_delete_tombstones_the_file() {
         let state = test_state();
         let root = tempfile::tempdir().unwrap();

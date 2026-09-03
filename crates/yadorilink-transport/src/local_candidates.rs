@@ -26,7 +26,7 @@ use crate::nat::{Candidate, CandidateClass};
 pub const LOCAL_CANDIDATE_PRIORITY: i32 = 100;
 
 /// Returns this host's non-loopback, non-link-local interface addresses (both
-/// IPv4 and global IPv6), each paired with `port` (the local WireGuard-facing
+/// IPv4 and global IPv6), each paired with `port` (the local mesh-facing
 /// UDP port), suitable for reporting as endpoint candidates.
 pub fn local_candidate_addresses(port: u16) -> Vec<std::net::SocketAddr> {
     let Ok(interfaces) = if_addrs::get_if_addrs() else {

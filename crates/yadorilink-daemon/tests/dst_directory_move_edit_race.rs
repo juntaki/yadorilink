@@ -82,7 +82,6 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use boringtun::x25519::{PublicKey, StaticSecret};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
@@ -96,7 +95,6 @@ use yadorilink_peer_session::peer_session::{
     PeerSyncSession, PendingLocalChangeFlush, PendingLocalFlushOutcome,
 };
 use yadorilink_replica_domain::file::FileRecord;
-use yadorilink_transport::PeerChannel;
 
 const GROUP_ID: &str = "dst-dirmove-group";
 const DIR1: &str = "dir1";
@@ -108,7 +106,7 @@ const SETTLE: Duration = Duration::from_millis(500);
 
 /// Prefix marking an error as "the direct-path handshake / baseline
 /// exchange never established in time under simulated time" -- a known
-/// `madsim`-timing flake (both peers' WireGuard retries landing in
+/// `madsim`-timing flake (both peers' QUIC handshake retries landing in
 /// lockstep), not a failure of the behavior under test. Callers treat it
 /// as a skip. Same convention the sibling reconcile-race scenario uses.
 const BASELINE_TIMEOUT_MARKER: &str = "BASELINE_TIMEOUT: ";
@@ -288,14 +286,6 @@ async fn poll_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
     }
 }
 
-fn gen_keypair(rng: &mut StdRng) -> (StaticSecret, PublicKey) {
-    let mut bytes = [0u8; 32];
-    rng.fill(&mut bytes);
-    let secret = StaticSecret::from(bytes);
-    let public = PublicKey::from(&secret);
-    (secret, public)
-}
-
 async fn connect_sessions(
     rng: &mut StdRng,
     state_a: Arc<ReplicaCoordinator>,
@@ -306,35 +296,10 @@ async fn connect_sessions(
     root_b: PathBuf,
     pending_local_change_flush_a: Arc<dyn PendingLocalChangeFlush>,
 ) -> (Arc<PeerSyncSession>, Arc<PeerSyncSession>) {
-    let (secret_a, public_a) = gen_keypair(rng);
-    let (secret_b, public_b) = gen_keypair(rng);
     let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr_a = socket_a.local_addr().unwrap();
-    let addr_b = socket_b.local_addr().unwrap();
 
-    let channel_a = Arc::new(
-        PeerChannel::connect(
-            secret_a,
-            public_b,
-            0,
-            vec![addr_b],
-            yadorilink_transport::TransportHub::from_socket(socket_a, Some(public_a)),
-        )
-        .await
-        .unwrap(),
-    );
-    let channel_b = Arc::new(
-        PeerChannel::connect(
-            secret_b,
-            public_a,
-            1,
-            vec![addr_a],
-            yadorilink_transport::TransportHub::from_socket(socket_b, Some(public_b)),
-        )
-        .await
-        .unwrap(),
-    );
+    let (channel_a, channel_b) = quic_channel_pair(socket_a, socket_b).await;
 
     // Pin both devices' verifying keys on both sessions so each admits the
     // other's signed changes. Deliberately NOT `wire_dag_session`: that also
@@ -762,4 +727,38 @@ fn run_ordering_sweep(ordering: Ordering) {
 fn directory_move_vs_concurrent_child_edit_no_silent_loss() {
     run_ordering_sweep(Ordering::CbBeforeDirDispatch);
     run_ordering_sweep(Ordering::DirTombstoneBeforeCb);
+}
+
+/// One authenticated QUIC connection between two loopback endpoints, as a
+/// channel on each side. The real transport, so a simulated run exercises
+/// what ships rather than a substitute for it.
+async fn quic_channel_pair(
+    socket_a: tokio::net::UdpSocket,
+    socket_b: tokio::net::UdpSocket,
+) -> (
+    std::sync::Arc<yadorilink_transport::QuicPeerChannel>,
+    std::sync::Arc<yadorilink_transport::QuicPeerChannel>,
+) {
+    use yadorilink_transport::{
+        ConnectRole, DeviceSigningKeyPair, QuicPeerChannel, QuicPeerEndpoint, TransportHub,
+    };
+    let addr_b = socket_b.local_addr().unwrap();
+    let key_a = DeviceSigningKeyPair::generate();
+    let key_b = DeviceSigningKeyPair::generate();
+    let public_a = key_a.public_bytes();
+    let public_b = key_b.public_bytes();
+    let endpoint_a = QuicPeerEndpoint::new(TransportHub::from_socket(socket_a), key_a).unwrap();
+    let endpoint_b = QuicPeerEndpoint::new(TransportHub::from_socket(socket_b), key_b).unwrap();
+    endpoint_a.authorize(public_b);
+    endpoint_b.authorize(public_a);
+    let accepting = {
+        let endpoint_b = endpoint_b.clone();
+        tokio::spawn(async move { endpoint_b.accept(public_a).await })
+    };
+    let dialed = endpoint_a.connect(addr_b, public_b).await.unwrap();
+    let accepted = accepting.await.unwrap().unwrap();
+    (
+        QuicPeerChannel::new(dialed, ConnectRole::Dial),
+        QuicPeerChannel::new(accepted, ConnectRole::Accept),
+    )
 }

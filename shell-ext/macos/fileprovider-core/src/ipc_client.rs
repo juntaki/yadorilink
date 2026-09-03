@@ -277,6 +277,65 @@ mod tests {
         let result = respond_with(Some(wrong)).await;
         assert_eq!(result, None);
     }
+
+    async fn respond_to_hydrate(response: Option<ShellIpcMessage>) -> Result<(), String> {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            let _ = read_message::<ShellIpcMessage>(&mut server).await;
+            if let Some(response) = response {
+                let _ = write_message(&mut server, &response).await;
+            }
+        });
+        let result = hydrate_over(&mut client, "/a").await;
+        server_task.await.unwrap();
+        result
+    }
+
+    fn hydrate_response(ok: bool, error: &str) -> ShellIpcMessage {
+        ShellIpcMessage {
+            payload: Some(Payload::HydrateResponse(yadorilink_ipc_proto::shellipc::HydrateResponse {
+                ok,
+                error: error.to_string(),
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_ok_response_is_ok() {
+        assert_eq!(respond_to_hydrate(Some(hydrate_response(true, ""))).await, Ok(()));
+    }
+
+    /// The exact gap this whole change closes: a daemon-reported failure
+    /// detail (e.g. "no peer currently holds this content") must survive
+    /// all the way to `hydrate_over`'s own return value, not collapse
+    /// into a generic bool the way `HydrateResponse.error` used to be
+    /// discarded before this change.
+    #[tokio::test]
+    async fn hydrate_failure_response_preserves_the_daemons_own_error_detail() {
+        let result =
+            respond_to_hydrate(Some(hydrate_response(false, "no peer currently holds this content")))
+                .await;
+        assert_eq!(result, Err("no peer currently holds this content".to_string()));
+    }
+
+    #[tokio::test]
+    async fn hydrate_failure_response_with_no_detail_still_reports_an_error() {
+        let result = respond_to_hydrate(Some(hydrate_response(false, ""))).await;
+        assert_eq!(result, Err("the daemon reported a hydration failure".to_string()));
+    }
+
+    #[tokio::test]
+    async fn hydrate_connection_closed_without_a_response_is_an_error() {
+        let result = respond_to_hydrate(None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn hydrate_wrong_payload_type_is_an_error() {
+        let wrong = response(vec![], true);
+        let result = respond_to_hydrate(Some(wrong)).await;
+        assert!(result.is_err());
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -405,29 +464,77 @@ fn sync_state_str(s: SyncState) -> &'static str {
     }
 }
 
+thread_local! {
+    /// The specific reason the most recent `hydrate` call on THIS thread
+    /// returned `false`, if any -- distinct from `hydrate`'s own bare
+    /// `bool` return, which the P0-B investigation found collapses
+    /// "daemon unreachable," "timed out," "write failed," and a
+    /// daemon-reported failure (`HydrateResponse.error`, e.g. "no peer
+    /// currently holds this content") into one indistinguishable signal
+    /// before it ever reaches the OS callback. `fetchContents`'s
+    /// completion handler can report a more specific `NSFileProviderError`
+    /// using this, once the Swift side is wired to ask for it (see
+    /// `lib.rs::yadorilink_fp_last_hydrate_error`'s own doc comment for
+    /// why that wiring is deliberately not done as part of this change).
+    /// Thread-local, not global, since `runtime()` runs every call on its
+    /// own single background thread -- matches this crate's own
+    /// `OverrideForTest`-style reasoning elsewhere in this codebase for
+    /// why per-call state should never leak across unrelated calls.
+    static LAST_HYDRATE_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The detail `LAST_HYDRATE_ERROR` recorded for the most recent `hydrate`
+/// call, if it failed. See that thread-local's own doc comment.
+pub fn last_hydrate_error() -> Option<String> {
+    LAST_HYDRATE_ERROR.with(|cell| cell.borrow().clone())
+}
+
 /// Requests hydration of `path` (backs `fetchContents(for:version:
 /// request:completionHandler:)`). Bounded to `HYDRATION_TIMEOUT`;
 /// returns `false` on timeout, an unreachable daemon, or a
 /// `HydrateResponse{ok: false,..}` — the caller is expected to complete
 /// the OS callback with a clear I/O error in that case, never hang.
+/// `last_hydrate_error()` carries WHY, for a caller that wants more than
+/// the bare bool.
 pub fn hydrate(path: &str) -> bool {
-    runtime().block_on(async {
-        tokio::time::timeout(HYDRATION_TIMEOUT, hydrate_inner(path)).await.unwrap_or(false)
-    })
+    let result = runtime().block_on(async {
+        match tokio::time::timeout(HYDRATION_TIMEOUT, hydrate_inner(path)).await {
+            Ok(result) => result,
+            Err(_) => Err("timed out waiting for the daemon".to_string()),
+        }
+    });
+    let ok = result.is_ok();
+    LAST_HYDRATE_ERROR.with(|cell| *cell.borrow_mut() = result.err());
+    ok
 }
 
-async fn hydrate_inner(path: &str) -> bool {
-    let Ok(mut stream) = connect().await else { return false };
+async fn hydrate_inner(path: &str) -> Result<(), String> {
+    let mut stream =
+        connect().await.map_err(|e| format!("could not reach the daemon: {e}"))?;
+    hydrate_over(&mut stream, path).await
+}
+
+async fn hydrate_over<S>(stream: &mut S, path: &str) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let msg = ShellIpcMessage {
         payload: Some(Payload::HydrateRequest(HydrateRequest { path: path.to_string() })),
     };
-    if write_message(&mut stream, &msg).await.is_err() {
-        return false;
+    write_message(stream, &msg).await.map_err(|e| format!("could not reach the daemon: {e}"))?;
+    match read_message::<ShellIpcMessage>(stream).await {
+        Ok(Some(ShellIpcMessage { payload: Some(Payload::HydrateResponse(r)) })) => {
+            if r.ok {
+                Ok(())
+            } else if r.error.is_empty() {
+                Err("the daemon reported a hydration failure".to_string())
+            } else {
+                Err(r.error)
+            }
+        }
+        Ok(_) => Err("the daemon's response was not a hydrate response".to_string()),
+        Err(e) => Err(format!("could not reach the daemon: {e}")),
     }
-    matches!(
-        read_message::<ShellIpcMessage>(&mut stream).await,
-        Ok(Some(ShellIpcMessage { payload: Some(Payload::HydrateResponse(r)) })) if r.ok
-    )
 }
 
 /// Which File Provider callback produced this notification --

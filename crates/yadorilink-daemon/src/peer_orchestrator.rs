@@ -37,13 +37,14 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
 use yadorilink_peer_session::peer_session::{PeerSyncSession, PeerSyncSessionDeps};
 use yadorilink_transport::{
-    diff_netmap, public_key_from_bytes, run_burst, CandidateClass, DeviceKeyPair, NatClass,
-    NetmapDiff, NetmapSnapshot, PeerChannel, PunchConfig, PunchDecision, PunchLimiter, PunchTarget,
+    classify_endpoint, connect_role, diff_netmap, start_local_discovery, CandidateClass,
+    ConnectRole, DeviceSigningKeyPair, NatClass, NetmapDiff, NetmapSnapshot, PunchConfig,
+    PunchDecision, PunchLimiter, QuicPeerChannel, QuicPeerEndpoint,
 };
 
 use crate::connection_trace::{AddressClass, AttemptOutcome, CandidateSource};
@@ -52,6 +53,7 @@ use crate::daemon_state::DaemonState;
 use crate::device_config;
 use crate::error::DaemonError;
 use crate::peer_registry::{PeerReachability, UnreachableCategory};
+use crate::route::RouteKind;
 use crate::supervise::BackoffConfig;
 
 pub struct OrchestratorConfig {
@@ -85,19 +87,23 @@ struct NetmapDiffState {
     /// restore authorization or full-replica metadata that a newer snapshot
     /// already revoked.
     last_snapshot_generation: Arc<StdMutex<Option<u64>>>,
-    /// device_id -> its live `PeerChannel`, so a whole-device revocation
-    /// can call [`PeerChannel::revoke`] on the right one. Populated by
-    /// `spawn_peer_session` once `PeerChannel::connect` succeeds (mirrors
-    /// `DaemonState::sessions`' own insert-on-connect,
-    /// removed-on-session-end lifecycle).
-    channels: Arc<StdMutex<HashMap<String, Arc<PeerChannel>>>>,
-    /// M5-A review follow-up (blocker #55): device_id -> the highest
-    /// `session_index`-derived generation that has ever successfully
-    /// published into `channels` for that peer -- see
-    /// `insert_channel_revoking_superseded`'s own doc comment for why an
-    /// out-of-order (older) generation publishing SECOND must be
-    /// rejected outright, not merely revoked after the fact.
-    channel_generations: Arc<StdMutex<HashMap<String, u32>>>,
+    /// This device's one QUIC endpoint, built on first use.
+    ///
+    /// One per device, not one per peer: a `quinn::Endpoint` is the
+    /// demultiplexer that owns a UDP binding, and this device has exactly
+    /// one binding -- the transport hub's, shared with STUN and the relay
+    /// envelope, because a STUN-reflexive or port-mapped candidate is only
+    /// meaningful when it names the exact socket data flows on. Peers are
+    /// separated inside the endpoint by QUIC connection id.
+    ///
+    /// It lives here rather than in `run`'s locals because two very
+    /// different call sites need the same one: the netmap update loop,
+    /// which is the only thing that knows which peers are authorized, and
+    /// every peer supervisor, which is the only thing that dials. Built
+    /// lazily because it needs the shared socket, whose bind is fallible
+    /// and asynchronous, and a bind failure must be a retryable per-attempt
+    /// outcome rather than something that kills the coordination loop.
+    quic_endpoint: Arc<tokio::sync::OnceCell<Arc<QuicPeerEndpoint>>>,
     /// device_id -> the `JoinHandle` for its `spawn_peer_session` task, so
     /// a whole-device revocation can abort the in-flight
     /// `PeerSyncSession::run` (and whatever it's mid-request on)
@@ -140,175 +146,219 @@ struct NetmapDiffState {
     /// happens entirely in `spawn_peer_session`'s loop, outside the scope
     /// that touches this semaphore -- and released once that attempt
     /// resolves one way or the other (session established, or the attempt
-    /// failed); see `wait_for_first_handshake_resolution`.
+    /// failed).
+    ///
+    /// The permit covers one peer's whole attempt, which since candidate
+    /// racing means one peer's whole *race* -- see
+    /// `RECONNECT_HANDSHAKE_CONCURRENCY` for what that multiplies out to in
+    /// handshakes, and for the measurement that says the product is fine.
     reconnect_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Bumped once per applied netmap snapshot, so a live peer session can
+    /// be told that what this device knows about how to reach its peer has
+    /// changed.
+    ///
+    /// A live session needs nothing from an ordinary push -- it is already
+    /// connected, and refreshed candidates describe how to *reach* a peer.
+    /// It does need to know when the address it is connected on has stopped
+    /// being advertised, because that is the coordination plane saying the
+    /// path it is using is no longer one the peer expects to be reached at.
+    /// A counter rather than a notification, so a supervisor that was busy
+    /// when a push landed still sees it rather than missing the wakeup.
+    netmap_epoch: Arc<tokio::sync::watch::Sender<u64>>,
+    /// device_id -> (candidate address, last-announced-at) learned from
+    /// unauthenticated local network discovery
+    /// (`yadorilink_transport::start_local_discovery`), kept separate from
+    /// `desired_peers`'s own coordination/rendezvous-sourced candidates
+    /// rather than folded in, so `run_one_peer_session_attempt` can record
+    /// which source an attempt actually drew from.
+    ///
+    /// LAN discovery only ever surfaces a public key already present in
+    /// `DaemonState`'s pinned peer set (see `local_discovery`'s own module
+    /// doc comment), so an entry here can only ever name a device this
+    /// daemon already trusts -- it adds an address to dial, never a peer to
+    /// trust. The QUIC handshake still authenticates every candidate
+    /// against that same pinned key regardless of which map it came from.
+    ///
+    /// The timestamp is load-bearing, not informational: an unauthenticated
+    /// LAN attacker who has merely observed a real peer's public key
+    /// (broadcast in cleartext, by design -- see `local_discovery`'s own
+    /// module doc comment) can forge announcements carrying it, since the
+    /// broadcast layer itself does not authenticate. Without TTL-based
+    /// expiry a first-come cap would let such an attacker permanently
+    /// occupy every slot for a peer (denying real LAN discovery for the
+    /// rest of the process's life) and would never let a legitimate peer's
+    /// changed address (DHCP renewal, network switch, restart) replace a
+    /// stale one. `handle_lan_announcement` prunes expired entries and, if
+    /// still full, evicts the least-recently-seen one to make room --
+    /// bounding how long any one entry (forged or real) can occupy a slot
+    /// without being re-announced. This is a bound, not a full defense:
+    /// nothing here rate-limits a determined attacker who keeps
+    /// re-announcing faster than the TTL (the transport layer's own
+    /// per-source-IP rate limit, `local_discovery::MAX_ANNOUNCEMENTS_
+    /// PER_SOURCE_WINDOW`, is the only mitigation for that, and it is
+    /// deliberately coarse). The trust boundary this cache feeds is
+    /// unaffected either way: whatever address ends up here is still just
+    /// a dial target, never authorization, so the worst a successful
+    /// poisoning achieves is denying a LAN-discovery *convenience* for the
+    /// process lifetime, not a security bypass.
+    lan_discovered: Arc<StdMutex<HashMap<String, Vec<(SocketAddr, Instant)>>>>,
 }
 
-/// M3 Pass 3: global cap on concurrent in-flight handshake attempts (see
-/// `NetmapDiffState::reconnect_semaphore`). Matches `HANDSHAKE_WORKER_COUNT`
-/// (`yadorilink_transport::transport_hub`) deliberately -- there is no
-/// benefit to more handshake attempts racing at once than there are
-/// crypto workers on the receiving side to actually identify and dispatch
-/// their initiations.
+/// How many peers this device may be mid-connection-attempt with at once
+/// (see `NetmapDiffState::reconnect_semaphore`).
+///
+/// It counts *peers*, not handshakes, and the difference is worth stating
+/// because it did not used to exist. An attempt is now a candidate race, and
+/// a race opens one handshake per candidate -- so this admits up to
+/// `RECONNECT_HANDSHAKE_CONCURRENCY * MAX_RACED_CANDIDATES` outgoing
+/// handshakes, thirty-two rather than four. The name predates that and the
+/// old comment described a per-handshake worker pool in a transport that no
+/// longer exists.
+///
+/// Thirty-two is measured rather than assumed to be acceptable:
+/// `candidate_race_fan_in.rs` drives sixteen concurrent races of eight
+/// candidates each -- a hundred and twenty-eight concurrent handshakes, four
+/// times this ceiling -- and they complete in about 1.8s for roughly 8 MiB
+/// of resident memory. The cost that matters is per in-flight handshake and
+/// it is small; what this bound is really for is stopping every peer from
+/// re-attempting at once after an event that drops many sessions together (a
+/// network flap, a Wi-Fi roam, waking from sleep), which is a scheduling
+/// concern rather than a memory one.
 const RECONNECT_HANDSHAKE_CONCURRENCY: usize = 4;
-
-/// M3 Pass 3 (independent-review finding M2): caps how long a single
-/// attempt may hold a `reconnect_semaphore` permit before it's released
-/// regardless of whether the candidate race has actually resolved.
-/// `PeerChannel`'s own candidate race can run for its full
-/// `CANDIDATE_RACE_TIMEOUT` (20s, `yadorilink_transport::peer_channel`)
-/// before giving up on a silent peer -- without this cap, a device with
-/// many simultaneously-unreachable peers (a real outage, not a handful of
-/// slow ones) would only be able to attempt `RECONNECT_HANDSHAKE_CONCURRENCY`
-/// of them every ~20s, adding minutes of pure queuing latency for peers
-/// that would connect instantly once the network actually returns -- a
-/// regression this pass would otherwise introduce, not fix. Deliberately
-/// well below the full race timeout: the permit's job is only to bound how
-/// many candidate races run AT ONCE, not to track a specific attempt all
-/// the way to resolution -- the actor keeps racing candidates on its own
-/// after the permit is released early, this just stops it from also
-/// occupying a global concurrency slot while doing so.
-const RECONNECT_PERMIT_MAX_HOLD: Duration = Duration::from_secs(3);
 
 /// One peer's current connect parameters, re-read by
 /// `spawn_peer_session`'s reconnect loop at the start of every attempt —
 /// see `NetmapDiffState::desired_peers`'s own doc comment.
 #[derive(Clone)]
 struct PeerConnectSpec {
-    peer_public: boringtun::x25519::PublicKey,
     candidates: Vec<SocketAddr>,
     effective_group_ids: Vec<String>,
 }
 
 impl NetmapDiffState {
-    /// M3 Pass 3: removes `device_id`'s entry from `channels` only if it is
-    /// STILL `expected` (`Arc::ptr_eq`), mirroring `PeerRegistry::
-    /// remove_if_current`'s own identity guard exactly, for the identical
-    /// reason. Without this, `run_one_peer_session_attempt`'s natural-
-    /// session-end cleanup did a KEY-ONLY `remove` -- if a second
-    /// supervisor task for the SAME peer briefly coexists with this one
-    /// (e.g. `teardown_peer`'s `handle.abort()` on the OLD supervisor
-    /// hasn't actually taken effect yet -- `abort()` only cancels at the
-    /// next `.await` point, not synchronously -- when a NEW supervisor for
-    /// the same, re-authorized peer is already spawned and has ALREADY
-    /// connected and inserted its own fresh channel under the same key),
-    /// the OLD supervisor's cleanup could match the NEW supervisor's fresh
-    /// entry by key and revoke it -- killing a session that had just
-    /// started. Returns whether the removal actually happened (the caller
-    /// only calls `revoke()` in that case).
-    fn remove_channel_if_current(&self, device_id: &str, expected: &Arc<PeerChannel>) -> bool {
-        let mut channels = self.channels.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let matches = channels.get(device_id).is_some_and(|current| Arc::ptr_eq(current, expected));
-        if matches {
-            channels.remove(device_id);
-        }
-        matches
-    }
-
-    /// Registers `channel` as `device_id`'s current channel, revoking
-    /// whatever this replaces (M5-A soak-closure finding).
-    /// `channels.insert` alone silently discards any previous entry --
-    /// and per `PeerChannel::revoke`'s own doc comment, dropping every
-    /// `Arc` clone of a channel is NOT enough to stop its actor: an
-    /// un-revoked replaced channel stays permanently registered in the
-    /// transport hub's demux, still answering every future handshake
-    /// initiation for this peer under its own stale session index, with
-    /// no `Arc` left anywhere to ever revoke it again. This is the exact
-    /// zombie-channel class `remove_channel_if_current`'s own doc
-    /// comment already names above -- reachable in production the same
-    /// way that ABA race is: two supervisor generations for one peer
-    /// briefly coexisting (a new one connecting while the old one's
-    /// `teardown_peer` abort or natural session end hasn't been cleaned
-    /// up yet), confirmed live via the soak lane's rapid repeated-
-    /// restart chaos leaving a peer's session permanently stuck, unable
-    /// to ever re-handshake.
-    ///
-    /// M5-A review follow-up (blocker #55): `generation` is
-    /// `spawn_peer_session`'s own `session_index`-derived per-attempt
-    /// counter (monotonically increasing DAEMON-WIDE, not per-peer, but
-    /// still a valid real-time ordering signal for any one peer's own
-    /// sequence of attempts). Returns `false` -- doing nothing at all,
-    /// no insert, no revoke -- if a generation `>=` this one has already
-    /// published for `device_id`, closing the ABA window an earlier
-    /// version of this fix left open: two overlapping supervisor
-    /// generations for the same peer, where the OLDER one's publish
-    /// lands SECOND in real time (a plausible ordering under real
-    /// restart/reconnect chaos, not just a theoretical race) used to let
-    /// the stale generation win outright, revoking the genuinely live,
-    /// newer channel. `DaemonState::set_direct_channel`'s own mirror
-    /// independently applies the SAME `generation` guard against its own
-    /// `direct_channel_generations` map -- deliberately not made to
-    /// depend on this method's own accept/reject outcome, since the two
-    /// maps are updated by two separate lock acquisitions at the call
-    /// site and an even-newer generation could win the primary map's
-    /// race in the gap between them; each map converging independently
-    /// on the highest generation it has ever seen is what makes the
-    /// final state consistent regardless of call order.
-    fn insert_channel_revoking_superseded(
-        &self,
-        device_id: String,
-        channel: Arc<PeerChannel>,
-        generation: u32,
-    ) -> bool {
-        let mut generations =
-            self.channel_generations.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if generations.get(&device_id).is_some_and(|&recorded| recorded >= generation) {
-            return false;
-        }
-        generations.insert(device_id.clone(), generation);
-        let superseded = self
-            .channels
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(device_id, channel.clone());
-        if let Some(superseded) = superseded {
-            if !Arc::ptr_eq(&superseded, &channel) {
-                superseded.revoke();
-            }
-        }
-        true
-    }
-
     fn new() -> Self {
         Self {
             previous: Arc::new(StdMutex::new(HashMap::new())),
             last_snapshot_generation: Arc::new(StdMutex::new(None)),
-            channels: Arc::new(StdMutex::new(HashMap::new())),
-            channel_generations: Arc::new(StdMutex::new(HashMap::new())),
+            quic_endpoint: Arc::new(tokio::sync::OnceCell::new()),
             session_tasks: Arc::new(StdMutex::new(HashMap::new())),
             punch_limiter: Arc::new(StdMutex::new(PunchLimiter::new(PunchConfig::default()))),
             desired_peers: Arc::new(StdMutex::new(HashMap::new())),
             reconnect_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 RECONNECT_HANDSHAKE_CONCURRENCY,
             )),
+            netmap_epoch: Arc::new(tokio::sync::watch::channel(0).0),
+            lan_discovered: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 }
 
-/// Forwards each punch-burst probe into a peer channel's candidate race,
-/// which makes the transport send a WireGuard handshake at the address — the
-/// handshake itself is the probe, so no separate probe protocol is needed.
-struct ChannelPunchTarget {
-    channel: Arc<PeerChannel>,
-}
+/// How many LAN-discovered addresses this device will keep for one peer.
+/// Matches `MAX_PEER_CANDIDATES`'s reasoning: bounded so a noisy/misbehaving
+/// broadcaster cannot make one peer's candidate set grow without bound (on
+/// top of `local_discovery`'s own per-source rate limiting).
+const MAX_LAN_DISCOVERED_CANDIDATES: usize = 4;
 
-impl PunchTarget for ChannelPunchTarget {
-    fn probe<'a>(
-        &'a self,
-        candidate: SocketAddr,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move {
-            self.channel.add_direct_candidate(candidate).await;
+/// How long a LAN-learned candidate stays usable without being
+/// re-announced -- see `NetmapDiffState::lan_discovered`'s own doc comment
+/// for why this bound exists. Generous relative to
+/// `local_discovery`'s own 30s announce interval (ordinary jitter or a
+/// missed announcement or two must not evict a still-live peer), but short
+/// enough that a changed address or a stale/forged entry does not survive
+/// indefinitely.
+const LAN_DISCOVERED_CANDIDATE_TTL: Duration = Duration::from_secs(180);
+
+/// The LAN-discovered candidates for `peer_device_id` that are still within
+/// `LAN_DISCOVERED_CANDIDATE_TTL` of `now`, from an already-locked
+/// `lan_discovered` map. A pure, independently-testable read-time
+/// complement to `handle_lan_announcement`'s own write-time TTL pruning --
+/// see `NetmapDiffState::lan_discovered`'s own doc comment for why BOTH
+/// sides need the TTL applied, not just the write side.
+fn ttl_filtered_lan_candidates(
+    lan_discovered: &HashMap<String, Vec<(SocketAddr, Instant)>>,
+    peer_device_id: &str,
+    now: Instant,
+) -> Vec<SocketAddr> {
+    lan_discovered
+        .get(peer_device_id)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|(_, seen_at)| now.duration_since(*seen_at) <= LAN_DISCOVERED_CANDIDATE_TTL)
+                .map(|(addr, _seen_at)| *addr)
+                .collect()
         })
-    }
+        .unwrap_or_default()
 }
 
-/// Reacts to inbound rendezvous signals: for each, run a synchronized probe
-/// burst that feeds the peer's offered candidates into its existing channel,
-/// so both sides open their NAT mappings at roughly the same moment. A signal
-/// for a peer with no live channel yet is dropped — the next netmap push
-/// spawns that peer's session and our own rendezvous initiation re-opens the
-/// exchange.
+/// Folds one LAN discovery announcement into `diff_state.lan_discovered`.
+/// Resolves the announcement's public key back to a device id via
+/// `DaemonState`'s own pinned peer set -- an announcement naming a key this
+/// device does not already have pinned (an unauthorized device, or a
+/// stale/spoofed key) resolves to `None` and is dropped here, same as
+/// `handle_incoming_rendezvous` drops a rendezvous signal for a peer with
+/// no connect spec yet.
+///
+/// TTL-pruned and least-recently-seen-evicted on every call, not just
+/// appended -- see `NetmapDiffState::lan_discovered`'s own doc comment for
+/// why an unbounded first-come cap is unsafe here.
+fn handle_lan_announcement(
+    announcement: yadorilink_transport::PeerAnnouncement,
+    state: &Arc<DaemonState>,
+    diff_state: &NetmapDiffState,
+) {
+    let Some(device_id) = state.device_id_for_signing_key(&announcement.public_key) else {
+        tracing::debug!("LAN discovery announcement from an unpinned key; ignoring");
+        return;
+    };
+    // Only worth keeping if this device actually wants to reach that peer --
+    // mirrors `handle_incoming_rendezvous`'s identical "no connect spec yet"
+    // drop.
+    if !diff_state.desired_peers.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&device_id)
+    {
+        return;
+    }
+    let now = Instant::now();
+    let mut lan_discovered =
+        diff_state.lan_discovered.lock().unwrap_or_else(|p| p.into_inner());
+    let entry = lan_discovered.entry(device_id).or_default();
+    entry.retain(|(_, seen_at)| now.duration_since(*seen_at) <= LAN_DISCOVERED_CANDIDATE_TTL);
+
+    if let Some(existing) = entry.iter_mut().find(|(addr, _)| *addr == announcement.addr) {
+        existing.1 = now;
+        return;
+    }
+    if entry.len() >= MAX_LAN_DISCOVERED_CANDIDATES {
+        // Full even after pruning expired entries -- evict the
+        // least-recently-seen one to make room for this one, rather than
+        // refusing it outright. Bounds how long any single entry (forged
+        // or real) can occupy a slot without being the most recently
+        // re-announced; see this function's own doc comment.
+        if let Some((oldest_index, _)) =
+            entry.iter().enumerate().min_by_key(|(_, (_, seen_at))| *seen_at)
+        {
+            entry.remove(oldest_index);
+        }
+    }
+    entry.push((announcement.addr, now));
+}
+
+/// Reacts to inbound rendezvous signals by folding the candidates the peer
+/// offered into the connect parameters its supervisor re-reads at the start
+/// of every attempt, so the next attempt tries an address this device may
+/// never have been told about by the coordination plane.
+///
+/// It deliberately does not fire a synchronized probe burst back at those
+/// addresses. Under QUIC a probe is a dial, and a dial is not a free packet:
+/// which side of a pair dials is fixed by device-id ordering precisely so
+/// that a pair ends up with one connection rather than two, and firing dials
+/// outside that rule would produce connections no session ever claims. Making
+/// simultaneous-open work under QUIC belongs with the candidate-racing work
+/// as a whole, not here.
+///
+/// A signal naming a peer this device has no connect spec for is dropped --
+/// there is nothing yet to attach the candidates to, and the next netmap
+/// push creates that spec along with the peer's supervisor.
 fn handle_incoming_rendezvous(
     signals: Vec<(String, Vec<SocketAddr>)>,
     state: &Arc<DaemonState>,
@@ -318,25 +368,40 @@ fn handle_incoming_rendezvous(
         if candidates.is_empty() {
             continue;
         }
-        let channel = diff_state
-            .channels
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&from_device_id)
-            .cloned();
-        let Some(channel) = channel else {
-            tracing::debug!(peer = %from_device_id, "rendezvous signal for a peer with no active channel yet; ignoring");
+        let mut desired =
+            diff_state.desired_peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(spec) = desired.get_mut(&from_device_id) else {
+            tracing::debug!(
+                peer = %from_device_id,
+                "rendezvous signal for a peer this device has no connect spec for; ignoring"
+            );
             continue;
         };
+        // Appended, not replaced: the coordination plane's own endpoints for
+        // this peer are still valid, and a rendezvous offer is additional
+        // information about the same peer rather than a correction to it.
+        // Capped so a peer that signals repeatedly cannot grow one entry
+        // without bound.
+        for candidate in candidates {
+            if spec.candidates.len() >= MAX_PEER_CANDIDATES {
+                break;
+            }
+            if !spec.candidates.contains(&candidate) {
+                spec.candidates.push(candidate);
+            }
+        }
+        drop(desired);
         // Record that a punch was attempted so classification can reach
         // `UdpBlocked` if no attempt ever confirms a direct path.
         state.nat_observations.record_punch_attempt(false);
-        tokio::spawn(async move {
-            let target = ChannelPunchTarget { channel };
-            run_burst(&target, &candidates, &PunchConfig::default()).await;
-        });
     }
 }
+
+/// How many addresses this device will keep for one peer. Matches the cap
+/// the transport applied to its own candidate set, so a rendezvous flood
+/// cannot make any one peer's connect spec grow without bound, and a dial
+/// sweep stays bounded in time.
+const MAX_PEER_CANDIDATES: usize = 8;
 
 /// Offers this device's current server-reflexive candidates to a wanted but
 /// unconnected peer via the coordination plane, so both sides can begin
@@ -595,6 +660,114 @@ fn policy_service_key_pin_decision(
     }
 }
 
+/// The UDP port this device's own LAN-discovery announcer/listener binds
+/// and broadcasts to. Fixed rather than configurable: discovery only works
+/// at all if every device on the LAN agrees on where to listen, same as
+/// mDNS's own fixed port.
+///
+/// Deliberately NOT Syncthing's own registered local-discovery port
+/// (21027): a host running both would otherwise fail this bind outright
+/// (no `SO_REUSEADDR`/`SO_REUSEPORT` -- two unrelated protocols sharing a
+/// socket would each misinterpret the other's packets, so allowing the
+/// bind to "succeed" that way would be worse than failing it) with only a
+/// `tracing::warn!` to show for it.
+///
+/// Also deliberately BELOW Linux's default ephemeral port range
+/// (`/proc/sys/net/ipv4/ip_local_port_range`, typically 32768-60999): a
+/// value inside that range risks a silent, nondeterministic bind failure
+/// if any OTHER socket on the host -- including this same daemon's own
+/// QUIC endpoint, which grabs an OS-assigned ephemeral port immediately
+/// before this code runs -- happens to claim it first. Unlike the
+/// Syncthing collision above, that failure mode is invisible and
+/// unrepeatable (same one-shot `tracing::warn!`, no retry), which is worse
+/// than a deterministic conflict. Picked with no known conflicting
+/// well-known/registered use as of this writing.
+const LAN_DISCOVERY_BROADCAST_PORT: u16 = 31027;
+
+/// Starts this device's LAN discovery announcer/listener and the task that
+/// folds its announcements into `diff_state.lan_discovered`, if this
+/// device's own signing key and QUIC endpoint are both available. Returns
+/// the discovery socket's own bound address on success -- otherwise unused
+/// in production, but it gives a test a real address to send a raw
+/// announcement packet to, so this exact function (not a substitute) can
+/// be exercised end to end. `broadcast_port` is a parameter rather than
+/// reading the module constant directly for the same reason: production
+/// always passes `LAN_DISCOVERY_BROADCAST_PORT`, a test can pass `0` for
+/// an OS-assigned ephemeral port and avoid colliding with any other test
+/// or process using the real one.
+///
+/// The authorization check passed to `start_local_discovery` is LIVE --
+/// `DaemonState::device_id_for_signing_key` reads `peer_netmap_metadata`
+/// fresh on every announcement, never a set snapshotted here -- so this is
+/// safe to call before the netmap loop has ever run (the netmap is the
+/// ONLY writer of that metadata; a snapshot taken here at startup would be
+/// permanently empty, silently discarding every announcement forever, not
+/// just until the first netmap push -- this is the exact bug an earlier
+/// version of this function had, and
+/// `lan_discovery_started_before_any_peer_is_pinned_still_authorizes_one_
+/// pinned_later` below exists specifically to catch a regression back to
+/// it). Discovery starts working the moment any peer key is later pinned,
+/// and correctly stops accepting a peer's announcements the moment it's
+/// revoked, with nothing here needing to notice either transition.
+async fn start_lan_discovery(
+    state: &Arc<DaemonState>,
+    diff_state: &NetmapDiffState,
+    broadcast_port: u16,
+) -> Option<SocketAddr> {
+    // Eagerly built (rather than left to its usual on-first-attempt lazy
+    // init) so this device's real listening port is known before LAN
+    // discovery starts announcing one -- discovery would otherwise have
+    // nothing meaningful to broadcast until some peer's first connection
+    // attempt happened to trigger the bind. A bind failure here is not
+    // fatal to the whole daemon: it is exactly the same fallible path
+    // `run_one_peer_session_attempt` already tolerates per-attempt, just
+    // surfaced slightly earlier, so LAN discovery is simply skipped for
+    // this run rather than the netmap loop below being blocked on it.
+    let endpoint = match ensure_quic_endpoint(state, diff_state).await {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to build this device's QUIC endpoint early for local discovery; will \
+                 retry lazily on the first peer connection attempt, without LAN discovery for \
+                 this run"
+            );
+            return None;
+        }
+    };
+    let (Some(signing), Ok(local_addr)) = (state.device_signing_key(), endpoint.local_addr())
+    else {
+        return None;
+    };
+    let my_public_key = signing.verifying_key().to_bytes();
+    let my_port = local_addr.port();
+    let authorization_state = state.clone();
+    let is_authorized =
+        move |key: &[u8; 32]| authorization_state.device_id_for_signing_key(key).is_some();
+    match start_local_discovery(my_public_key, my_port, broadcast_port, is_authorized).await {
+        Ok((bound_addr, mut announcements)) => {
+            let state = state.clone();
+            let diff_state = diff_state.clone();
+            tokio::spawn(async move {
+                while let Some(announcement) = announcements.recv().await {
+                    handle_lan_announcement(announcement, &state, &diff_state);
+                }
+            });
+            Some(bound_addr)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                port = broadcast_port,
+                "failed to start local network discovery (possibly a port conflict with \
+                 another process bound to it); peers on this LAN will only be reachable via \
+                 coordination-plane/rendezvous candidates"
+            );
+            None
+        }
+    }
+}
+
 /// Establishes this device's coordination-netmap subscription and, as
 /// peers appear on it, their `PeerChannel`/`PeerSyncSession`s — and keeps
 /// doing so for as long as the daemon runs.
@@ -612,7 +785,6 @@ fn policy_service_key_pin_decision(
 /// no detached child task left behind to leak.
 pub async fn run(
     config: OrchestratorConfig,
-    keypair: Arc<DeviceKeyPair>,
     state: Arc<DaemonState>,
 ) -> Result<(), DaemonError> {
     let session_index = Arc::new(AtomicU32::new(0));
@@ -621,29 +793,11 @@ pub async fn run(
     // comment.
     let diff_state = NetmapDiffState::new();
 
-    // M3 Pass 2: closes the O(N^2) handshake-fan-in cost measured by
-    // `handshake_fan_in.rs` (see `DaemonState::set_device_static_secret`'s
-    // own doc comment) — belongs HERE, not left to each caller to remember
-    // externally (as `app.rs` previously did alone): any caller of `run`
-    // that skipped this, including every full-stack integration test that
-    // drives `run` directly rather than the production binary's own
-    // startup path, silently fell back to O(N^2) broadcast identification
-    // with no compile-time or runtime signal that the real fix wasn't
-    // active. Idempotent (`OnceLock`-backed) — a redundant call from
-    // `app.rs` alongside this one is a harmless no-op.
-    //
-    // The public key is set alongside it for the identical reason
-    // (independent-review finding L1): `run_sim` and `app.rs` both set
-    // BOTH keys together; `run` previously set only the secret, so a
-    // caller relying on `run` alone would get the O(1) identification path
-    // wired up but no MAC1 initiation gate on the hub (the gate keys off
-    // `device_static_public`, not the secret).
-    state.set_device_static_public(keypair.public_bytes());
-    state.set_device_static_secret(keypair.secret.clone());
+    let _ = start_lan_discovery(&state, &diff_state, LAN_DISCOVERY_BROADCAST_PORT).await;
 
     let mut attempt: u32 = 0;
     loop {
-        match run_netmap_attempt(&config, &keypair, &state, &session_index, &diff_state).await {
+        match run_netmap_attempt(&config, &state, &session_index, &diff_state).await {
             Ok(()) => {
                 tracing::warn!(attempt, "coordination netmap stream ended; reconnecting");
                 // A clean stream end still means the coordination-plane
@@ -819,6 +973,14 @@ mod ws_netmap {
         action_type: u32,
         device_id: String,
         signing_key_fingerprint_base64: String,
+        /// Grant only. `#[serde(default)]` so a coordination plane that has
+        /// not yet been updated to emit roles (every existing deployment,
+        /// today) omits the field entirely rather than failing to parse --
+        /// `None` is mapped to `WriterRole::Editor` below, preserving
+        /// today's actual behavior (every grant is a full writer) until the
+        /// coordination plane starts minting Viewer/Owner grants for real.
+        #[serde(default)]
+        role: Option<u32>,
         new_authority_key_base64: String,
         signer_key_id_base64: String,
         signature_base64: String,
@@ -828,13 +990,15 @@ mod ws_netmap {
     #[serde(rename_all = "camelCase")]
     struct WsNetmapPeer {
         device_id: String,
-        wireguard_public_key_base64: String,
-        /// Ed25519 signing key used to authenticate this peer's change
-        /// history, distributed alongside the WireGuard key. Optional:
-        /// devices registered before signing keys existed have none, and
-        /// the field may be absent on an older coordination plane, so its
-        /// absence is normal and simply means change-history signing is not
-        /// yet available with this peer.
+        /// The peer's Ed25519 device key: the one public key a device has,
+        /// authenticating both its change history and its transport.
+        ///
+        /// Modelled as `Option` because the coordination plane's schema
+        /// still permits it to be absent, not because absence is
+        /// acceptable -- a peer without one can never authenticate, so the
+        /// admission path rejects it and tears down anything it had. The
+        /// field name is the coordination plane's; the column it comes
+        /// from still carries the retired transport key's name there.
         #[serde(default)]
         signing_public_key_base64: Option<String>,
         endpoints: Vec<WsEndpoint>,
@@ -846,7 +1010,7 @@ mod ws_netmap {
         #[serde(default)]
         full_replica_group_ids: Vec<String>,
         /// M3 Pass 4: this peer's own declared willingness to relay opaque
-        /// WireGuard datagrams for other peers sharing a group with it --
+        /// QUIC datagrams for other peers sharing a group with it --
         /// see `crate::route::RelayCapability`'s own doc comment. Absent on
         /// an older coordination plane, or a peer that has never opted in,
         /// reads as `false` -- the fail-safe default, matching
@@ -931,7 +1095,6 @@ mod ws_netmap {
 
     pub(super) async fn run_netmap_attempt(
         config: &OrchestratorConfig,
-        keypair: &Arc<DeviceKeyPair>,
         state: &Arc<DaemonState>,
         session_index: &Arc<AtomicU32>,
         diff_state: &NetmapDiffState,
@@ -964,7 +1127,6 @@ mod ws_netmap {
             Some(true),
         );
 
-        let mut peer_key_pins = load_peer_key_pins()?;
         let mut signing_key_pins = load_signing_key_pins()?;
         let mut service_key_pins = load_service_key_pins()?;
 
@@ -1002,6 +1164,12 @@ mod ws_netmap {
                     &record.signing_key_fingerprint_base64,
                     "signingKeyFingerprintBase64",
                 )?,
+                // See `WsPolicyRecord::role`'s own doc comment: an absent
+                // role (today, always) defaults to Editor, matching current
+                // behavior exactly.
+                role: record
+                    .role
+                    .unwrap_or_else(|| crate::change_policy::WriterRole::Editor.to_wire()),
                 new_authority_key: decode_policy_b64(
                     &record.new_authority_key_base64,
                     "newAuthorityKeyBase64",
@@ -1167,7 +1335,7 @@ mod ws_netmap {
 
             // M5-A Pass 5 (restart-convergence), round 2: peer processing is
             // genuinely two-phase now. Phase 1 (admission) below runs EVERY
-            // peer's existing WireGuard-key and signing-key pin checks --
+            // peer's existing Ed25519 signing-key pin check --
             // exactly as before, teardown-and-skip on any failure -- but
             // does not publish anything into `peer_netmap_metadata` or run
             // any authorization validation yet. Only once every peer in
@@ -1197,8 +1365,7 @@ mod ws_netmap {
             // set, removes that window entirely.
             struct AdmittedPeer {
                 device_id: String,
-                signing_key: Option<[u8; 32]>,
-                peer_public: boringtun::x25519::PublicKey,
+                signing_key: [u8; 32],
                 candidate_endpoints: Vec<WsEndpoint>,
                 authorized_groups: HashSet<String>,
                 full_replica_groups: HashSet<String>,
@@ -1206,56 +1373,29 @@ mod ws_netmap {
             }
             let mut admitted: Vec<AdmittedPeer> = Vec::new();
             for peer in update.peers {
-                let Ok(public_key_bytes) = base64::engine::general_purpose::STANDARD
-                    .decode(&peer.wireguard_public_key_base64)
+                // The Ed25519 device key is mandatory, and its absence is
+                // not a lesser form of presence. It is what authenticates
+                // this device's connection to the peer in both directions,
+                // so a netmap entry without one does not describe a peer
+                // that can do less -- it describes a peer that can never
+                // connect at all. Admitting it would mean carrying an entry
+                // that every connect attempt has to reject again, and the
+                // only shape of peer it could ever match is one this
+                // generation of the protocol does not have.
+                let Some(signing_key) =
+                    decode_peer_signing_key(peer.signing_public_key_base64.as_deref())
                 else {
-                    tracing::warn!(device_id = %peer.device_id, "netmap peer has an invalid base64 public key; revoking any existing session");
+                    tracing::warn!(
+                        device_id = %peer.device_id,
+                        "netmap peer has no usable Ed25519 device key; revoking any existing session"
+                    );
                     teardown_peer(state, diff_state, &peer.device_id);
                     continue;
                 };
-                match verify_or_pin_peer_key(&mut peer_key_pins, &peer.device_id, &public_key_bytes)
-                {
-                    PeerKeyDecision::AlreadyPinned => {}
-                    PeerKeyDecision::NewlyPinned => save_peer_key_pins(&peer_key_pins)?,
-                    PeerKeyDecision::Mismatch => {
-                        tracing::error!(
-                            device_id = %peer.device_id,
-                            "netmap peer WireGuard key changed from pinned value; revoking any existing session"
-                        );
-                        teardown_peer(state, diff_state, &peer.device_id);
-                        continue;
-                    }
-                }
-                let signing_key_bytes = match peer.signing_public_key_base64.as_deref() {
-                    None | Some("") => None,
-                    Some(encoded) => {
-                        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded)
-                        else {
-                            tracing::warn!(device_id = %peer.device_id, "netmap peer has an invalid signing key; revoking any existing session");
-                            teardown_peer(state, diff_state, &peer.device_id);
-                            continue;
-                        };
-                        if bytes.len() != 32 {
-                            tracing::warn!(device_id = %peer.device_id, "netmap peer signing key is not 32 bytes; revoking any existing session");
-                            teardown_peer(state, diff_state, &peer.device_id);
-                            continue;
-                        }
-                        Some(bytes)
-                    }
-                };
-                if pin_peer_signing_key(
-                    &mut signing_key_pins,
-                    &peer.device_id,
-                    signing_key_bytes.clone(),
-                )? {
+                if pin_peer_signing_key(&mut signing_key_pins, &peer.device_id, &signing_key)? {
                     teardown_peer(state, diff_state, &peer.device_id);
                     continue;
                 }
-                let Ok(peer_public) = public_key_from_bytes(&public_key_bytes) else {
-                    tracing::warn!(device_id = %peer.device_id, "netmap peer has an invalid public key; revoking any existing session");
-                    teardown_peer(state, diff_state, &peer.device_id);
-                    continue;
-                };
                 let authorized_groups: HashSet<String> =
                     peer.shared_group_ids.iter().cloned().collect();
                 let full_replica_groups: HashSet<String> =
@@ -1267,10 +1407,7 @@ mod ws_netmap {
                 }
                 admitted.push(AdmittedPeer {
                     device_id: peer.device_id,
-                    signing_key: signing_key_bytes
-                        .as_deref()
-                        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()),
-                    peer_public,
+                    signing_key,
                     candidate_endpoints: peer.endpoints,
                     authorized_groups,
                     full_replica_groups,
@@ -1279,24 +1416,47 @@ mod ws_netmap {
             }
 
             // Phase 2: every peer admitted this pass has already passed its
-            // WireGuard-key and signing-key pin checks, so it is now safe
-            // to settle ALL of their CURRENT signing-key state (present or
-            // absent) before validating ANY of their shared groups -- no
-            // admitted peer's retained-history check can ever race an
-            // admitted peer's own not-yet-settled key, and no rejected
-            // peer's key is ever published at all. Settling `None` too
-            // (not just seeding `Some`) matters: a peer that stopped
-            // advertising a signing key this pass must have any STALE
-            // previously-recorded key removed here, before an earlier-
-            // processed peer's group validation could otherwise still
-            // validate against that stale key and cache a wrong `true` for
-            // the shared group (a Codex review finding on an earlier
-            // version of this fix, which only handled `Some`).
+            // Ed25519 signing-key pin check, so it is now safe to
+            // settle ALL of their keys before validating ANY of their shared
+            // groups -- no admitted peer's retained-history check can ever
+            // race an admitted peer's own not-yet-settled key, and no
+            // rejected peer's key is ever published at all.
+            //
+            // There is no "settle an absence" case to handle any more: a
+            // peer with no usable device key never reaches this list, and a
+            // peer that stops advertising one is torn down in phase 1, which
+            // clears its metadata outright.
             for peer in &admitted {
-                match peer.signing_key {
-                    Some(key) => state.record_peer_signing_key(&peer.device_id, key),
-                    None => state.forget_peer_signing_key(&peer.device_id),
+                state.record_peer_signing_key(&peer.device_id, peer.signing_key);
+            }
+
+            // The set of Ed25519 keys this device will accept a QUIC
+            // connection from is exactly the set of admitted peers this
+            // netmap names, replaced wholesale on every push. Wholesale
+            // rather than incrementally because that is the shape the
+            // authority actually speaks in: a netmap is a complete statement
+            // of who is authorized, and reconciling it by additions alone
+            // would leave a removed device authorized until something else
+            // happened to notice.
+            //
+            // This is the QUIC counterpart of the netmap gate the transport
+            // it replaces applied at channel registration, and it is the
+            // enforcement point for revocation: a key that leaves this set
+            // is refused at its next handshake, with no CA, CRL or OCSP
+            // involved. `apply_netmap_diff` above has already torn down the
+            // live connections of devices this push removed.
+            //
+            // A failure to build the endpoint is not fatal to this pass: the
+            // per-peer supervisors below retry it themselves, and until one
+            // succeeds there is no endpoint for anyone to connect to anyway.
+            match ensure_quic_endpoint(state, diff_state).await {
+                Ok(endpoint) => {
+                    endpoint.replace_authorized(admitted.iter().map(|peer| peer.signing_key))
                 }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not apply this netmap's peer authorization to the QUIC endpoint yet"
+                ),
             }
 
             for peer in admitted {
@@ -1308,7 +1468,7 @@ mod ws_netmap {
                 let effective_authorized_groups = apply_authoritative_peer_metadata(
                     state,
                     &peer.device_id,
-                    peer.signing_key,
+                    Some(peer.signing_key),
                     &peer.authorized_groups,
                     &peer.full_replica_groups,
                     peer.relay_capable,
@@ -1329,56 +1489,21 @@ mod ws_netmap {
                     .insert(
                         peer.device_id.clone(),
                         PeerConnectSpec {
-                            peer_public: peer.peer_public,
                             candidates: candidates.clone(),
                             effective_group_ids: effective_group_ids.clone(),
                         },
                     );
-                if let Some(session) = state.peers.session(&peer.device_id) {
-                    // M3 Pass 3 (independent-review finding M1):
-                    // `replace_coordination_candidates` (`yadorilink_
-                    // transport::peer_channel`) feeds into the actor's own
-                    // candidate-update handler, which resets an
-                    // `Unreachable` channel straight back into `Connecting`,
-                    // bypassing that peer's own backoff entirely -- and this
-                    // whole `for peer in
-                    // update.peers` loop fans out to EVERY live session from
-                    // a single netmap push. Without a permit here, one
-                    // coordination-plane update after a network flap would
-                    // kick every currently-unreachable peer into a
-                    // simultaneous candidate race at once, reproducing the
-                    // exact thundering herd `reconnect_semaphore` exists to
-                    // bound, just through this code path instead of
-                    // `run_one_peer_session_attempt`'s. If the channel was
-                    // already `Connected` (the common case -- most netmap
-                    // pushes don't follow an outage), the wait below returns
-                    // immediately and this permit is held only briefly.
-                    let permit = diff_state
-                        .reconnect_semaphore
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .expect("reconnect semaphore is never closed");
-                    session.replace_coordination_candidates(candidates).await;
-                    let channel = diff_state
-                        .channels
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .get(&peer.device_id)
-                        .cloned();
-                    match channel {
-                        Some(channel) => {
-                            tokio::spawn(async move {
-                                let _ = tokio::time::timeout(
-                                    RECONNECT_PERMIT_MAX_HOLD,
-                                    wait_for_first_handshake_resolution(&channel),
-                                )
-                                .await;
-                                drop(permit);
-                            });
-                        }
-                        None => drop(permit),
-                    }
+                // A live session needs nothing from this push beyond the
+                // `desired_peers` upsert just above. Refreshed candidates
+                // describe how to *reach* this peer, and this device is
+                // already connected to it; the supervisor re-reads them at
+                // the start of its next attempt if this connection ends.
+                // The transport this replaces had to be told mid-session,
+                // because its candidate race ran inside the live channel --
+                // which is also why a single netmap push after a network
+                // flap could kick every unreachable peer into a
+                // simultaneous re-race. There is no such fan-out here.
+                if state.peers.session(&peer.device_id).is_some() {
                     continue;
                 }
                 // A supervisor for this device may already be running --
@@ -1404,7 +1529,6 @@ mod ws_netmap {
                 let device_id = peer.device_id.clone();
                 let handle = spawn_peer_session(
                     state.clone(),
-                    keypair.clone(),
                     config.device_id.clone(),
                     device_id.clone(),
                     diff_state.clone(),
@@ -1416,6 +1540,13 @@ mod ws_netmap {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .insert(device_id, handle);
             }
+
+            // Every peer in this snapshot has had its connect spec upserted
+            // by now, so a supervisor woken here reads the whole update
+            // rather than half of it. A live session uses this to notice
+            // that the address it is connected on has stopped being
+            // advertised -- see `NetmapDiffState::netmap_epoch`.
+            diff_state.netmap_epoch.send_modify(|epoch| *epoch = epoch.wrapping_add(1));
         }
         // The server closed the stream without an error — still worth
         // retrying rather than treating as permanent.
@@ -1447,13 +1578,8 @@ fn verify_or_pin_peer_key(
     }
 }
 
-fn load_peer_key_pins() -> Result<HashMap<String, String>, DaemonError> {
-    load_key_pins(peer_key_pins_path())
-}
-
-/// The Ed25519 change-history signing keys, pinned exactly like the
-/// WireGuard keys above (same file lifecycle, same refuse-on-change rule),
-/// but in their own file so the two key spaces never collide.
+/// This device's record of every peer's Ed25519 device key, pinned on first
+/// sight and refused on change.
 fn load_signing_key_pins() -> Result<HashMap<String, String>, DaemonError> {
     load_key_pins(signing_key_pins_path())
 }
@@ -1470,21 +1596,29 @@ fn load_key_pins(path: PathBuf) -> Result<HashMap<String, String>, DaemonError> 
     }
 }
 
-/// Pins `device_id`'s Ed25519 signing key the same way `verify_or_pin_peer_key`
-/// pins its WireGuard key, returning `true` when the key changed from a
-/// previously-pinned value so the caller refuses the peer. `signing_key`
-/// is `None` when the netmap carried none for this peer — nothing to pin or
-/// check, so the peer is accepted (change-history signing is simply
-/// unavailable with it, per this change's migration story).
+/// Decodes a netmap peer's Ed25519 device key, or `None` if it carried
+/// nothing usable.
+///
+/// Absent, empty, not base64, or not 32 bytes are one outcome, not four:
+/// this key is what authenticates the peer's transport, so anything that is
+/// not a key is a netmap entry describing a peer that cannot connect. The
+/// caller rejects the peer and tears down anything it already had.
+fn decode_peer_signing_key(encoded: Option<&str>) -> Option<[u8; 32]> {
+    use base64::Engine;
+    let encoded = encoded.filter(|value| !value.is_empty())?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    <[u8; 32]>::try_from(bytes.as_slice()).ok()
+}
+
+/// Pins `device_id`'s Ed25519 device key via `verify_or_pin_peer_key`,
+/// returning `true` when the key changed from a previously-pinned value so
+/// the caller refuses the peer.
 fn pin_peer_signing_key(
     pins: &mut HashMap<String, String>,
     device_id: &str,
-    signing_key: Option<Vec<u8>>,
+    signing_key: &[u8; 32],
 ) -> Result<bool, DaemonError> {
-    let Some(signing_key) = signing_key else {
-        return Ok(false);
-    };
-    match verify_or_pin_peer_key(pins, device_id, &signing_key) {
+    match verify_or_pin_peer_key(pins, device_id, signing_key) {
         PeerKeyDecision::AlreadyPinned => Ok(false),
         PeerKeyDecision::NewlyPinned => {
             save_signing_key_pins(pins)?;
@@ -1493,7 +1627,7 @@ fn pin_peer_signing_key(
         PeerKeyDecision::Mismatch => {
             tracing::error!(
                 device_id = %device_id,
-                "netmap peer signing key changed from pinned value; refusing connection"
+                "netmap peer device key changed from pinned value; refusing connection"
             );
             Ok(true)
         }
@@ -1516,10 +1650,6 @@ fn pin_peer_signing_key(
 /// hand. `rename` on both Unix and Windows replaces `path` atomically as
 /// a single filesystem operation — a concurrent reader either sees the
 /// old complete file or the new complete file, never a mix of both.
-fn save_peer_key_pins(pins: &HashMap<String, String>) -> Result<(), DaemonError> {
-    save_key_pins(peer_key_pins_path(), pins)
-}
-
 fn save_signing_key_pins(pins: &HashMap<String, String>) -> Result<(), DaemonError> {
     save_key_pins(signing_key_pins_path(), pins)
 }
@@ -1563,10 +1693,6 @@ fn save_key_pins(path: PathBuf, pins: &HashMap<String, String>) -> Result<(), Da
     }
     std::fs::rename(&tmp_path, &path)?;
     Ok(())
-}
-
-fn peer_key_pins_path() -> PathBuf {
-    device_config::config_dir().join("peer_keys.json")
 }
 
 fn signing_key_pins_path() -> PathBuf {
@@ -1697,10 +1823,10 @@ fn apply_netmap_diff(diff: &NetmapDiff, state: &Arc<DaemonState>, diff_state: &N
     }
 }
 
-/// tears `device_id` down entirely — revokes its `PeerChannel`
-/// (see `PeerChannel::revoke`'s doc comment: this is what actually stops
-/// the WireGuard tunnel/actor and refuses any further handshake attempt
-/// from this key), aborts its `PeerSyncSession` task (so any
+/// tears `device_id` down entirely — revokes its QUIC connection
+/// (see `QuicPeerEndpoint::revoke_peer`'s doc comment: this is what
+/// actually withdraws the key and refuses any further handshake attempt
+/// from it), aborts its `PeerSyncSession` task (so any
 /// in-flight request it's awaiting on is cancelled immediately rather
 /// than left to notice its channel died), and removes it from
 /// `DaemonState`.
@@ -1715,19 +1841,36 @@ fn apply_netmap_diff(diff: &NetmapDiff, state: &Arc<DaemonState>, diff_state: &N
 /// channel and exits on its own (`end_session` would have run anyway at
 /// that point, just later).
 fn teardown_peer(state: &Arc<DaemonState>, diff_state: &NetmapDiffState, device_id: &str) {
-    if let Some(channel) = diff_state
-        .channels
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(device_id)
-    {
-        channel.revoke();
+    // Revocation is administrative exclusion, and raw public keys have no
+    // CA, CRL or OCSP to express it. It is therefore two distinct actions,
+    // and BOTH are required: withdrawing the key stops the peer's next
+    // handshake but says nothing to the connection it already has, while
+    // closing that connection alone would just prompt it to reconnect.
+    //
+    // The order is load-bearing. Withdraw first, then close: closing first
+    // would leave a window in which the peer, seeing its connection drop,
+    // reconnects and is accepted -- exactly the state this is preventing.
+    //
+    // The key is read before `clear_peer_netmap_metadata` below, which is
+    // where it is stored.
+    if let Some(endpoint) = diff_state.quic_endpoint.get() {
+        if let Some(peer_public_key) = state.peer_signing_key(device_id) {
+            // Stage one: no future handshake from this key is accepted, and
+            // any connection from it that arrived but was never claimed by a
+            // session is discarded.
+            endpoint.revoke_peer(&peer_public_key);
+        }
     }
-    // M3 Pass 5: mirrors the removal above onto `DaemonState` -- see
-    // `DaemonState::set_direct_channel`'s own doc comment. Unconditional,
-    // same reasoning as the `diff_state.channels` removal right above:
-    // full revocation always clears whatever is currently registered.
+    // Stage two: end the connection this device is already running a session
+    // on. Taken out of the route registry first so nothing else can pick it
+    // up between the two, and closed explicitly rather than left to the last
+    // `Arc` being dropped -- which `Arc` that is depends on task scheduling,
+    // and revocation must not.
+    let live_channel = state.direct_channel(device_id);
     state.remove_direct_channel(device_id);
+    if let Some(channel) = live_channel {
+        channel.close_revoked();
+    }
     // Must happen before aborting the supervisor task below: once removed,
     // even an in-flight reconnect attempt that started just before the
     // abort lands finds no spec at its next check and stops trying, rather
@@ -1735,6 +1878,15 @@ fn teardown_peer(state: &Arc<DaemonState>, diff_state: &NetmapDiffState, device_
     // before the abort is actually observed.
     diff_state
         .desired_peers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(device_id);
+    // Same reasoning as `desired_peers` above: a revoked peer's LAN-learned
+    // addresses must not survive to be offered as candidates on some later
+    // re-admission under stale assumptions, and there is no other prune
+    // point for this map otherwise.
+    diff_state
+        .lan_discovered
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(device_id);
@@ -1780,10 +1932,11 @@ fn prune_finished_session_tasks(diff_state: &NetmapDiffState) {
 /// Persistent per-peer supervisor: connects, runs the session to
 /// completion, then reconnects with backoff -- forever, until this exact
 /// task's `JoinHandle` (held in `diff_state.session_tasks`) is aborted by
-/// `teardown_peer`. A `PeerChannel`'s actor can end cleanly as part of its
-/// own normal operation now (e.g. `yadorilink-transport`'s ARQ layer tears
-/// a channel down after exhausting retransmits on a genuinely lost peer,
-/// rather than continuing with a permanently-poisoned ack window) -- before
+/// `teardown_peer`. A `QuicPeerChannel`'s `recv` can end cleanly as part of
+/// its own normal operation now (e.g. the QUIC connection idling out
+/// (`yadorilink_transport::quic_peer_endpoint::PEER_IDLE_TIMEOUT`) against
+/// a genuinely lost peer, rather than continuing to hold a connection
+/// quinn itself has already given up on) -- before
 /// this loop existed, that clean end was indistinguishable from
 /// `teardown_peer`'s own bookkeeping cleanup to this function's caller, so
 /// nothing ever reconnected: the peer stayed silently absent until some
@@ -1796,7 +1949,6 @@ fn prune_finished_session_tasks(diff_state: &NetmapDiffState) {
 /// footgun first).
 fn spawn_peer_session(
     state: Arc<DaemonState>,
-    keypair: Arc<DeviceKeyPair>,
     local_device_id: String,
     peer_device_id: String,
     diff_state: NetmapDiffState,
@@ -1809,11 +1961,11 @@ fn spawn_peer_session(
             let this_generation = session_index.fetch_add(1, Ordering::Relaxed);
             run_one_peer_session_attempt(
                 &state,
-                &keypair,
                 &local_device_id,
                 &peer_device_id,
                 &diff_state,
                 this_generation,
+                &session_index,
             )
             .await;
             // A generation that stayed up for a while was a genuine
@@ -1845,26 +1997,253 @@ fn spawn_peer_session(
     })
 }
 
-/// M3 Pass 3: waits for `channel`'s reachability to leave its initial
-/// `Connecting` state for the first time -- either the first `Connected` or
-/// the first `Unreachable` -- so `NetmapDiffState::reconnect_semaphore`'s
-/// permit can be released as soon as the actual handshake attempt it guards
-/// has resolved, without waiting on the channel's own subsequent, unrelated
-/// internal retry churn. Returns immediately if the channel is already past
-/// `Connecting` (e.g. it started `Unreachable { NoCandidates }`), or if the
-/// channel is revoked/dropped mid-wait (the `watch::Sender` side closing) --
-/// either way, there's nothing further for the permit to guard.
-async fn wait_for_first_handshake_resolution(channel: &PeerChannel) {
-    let mut rx = channel.reachability_watch();
-    loop {
-        let current = *rx.borrow();
-        if !matches!(current, yadorilink_transport::PeerReachability::Connecting { .. }) {
-            return;
+/// This device's one QUIC endpoint, built on first use and shared by every
+/// peer supervisor and by the netmap loop that authorizes peers on it.
+///
+/// Fallible and retried rather than fatal: it needs the shared UDP socket,
+/// whose bind can fail transiently, and it needs this device's Ed25519
+/// signing key, which a device that is not yet fully registered does not
+/// have. Both are conditions a later attempt can find resolved.
+async fn ensure_quic_endpoint(
+    state: &Arc<DaemonState>,
+    diff_state: &NetmapDiffState,
+) -> Result<Arc<QuicPeerEndpoint>, DaemonError> {
+    diff_state
+        .quic_endpoint
+        .get_or_try_init(|| async {
+            // All peer connections share this device's one long-lived UDP
+            // socket, so the NAT candidates it advertises describe the exact
+            // binding data flows on.
+            let hub = state.ensure_shared_socket().await?;
+            let signing = state.device_signing_key().ok_or_else(|| {
+                DaemonError::Config(
+                    "this device has no Ed25519 signing key, so it cannot authenticate a peer \
+                     connection"
+                        .to_string(),
+                )
+            })?;
+            // The same key that signs this device's change history also
+            // authenticates its transport. That reuse is deliberate: it is
+            // the only signature-capable key a device already holds and
+            // already distributes to peers through the netmap, and TLS 1.3
+            // domain-separates its own signatures by construction, so a
+            // transcript signature can never be replayed as authorship.
+            let device = DeviceSigningKeyPair {
+                verifying: signing.verifying_key(),
+                signing,
+            };
+            // Starts authorizing nobody. The netmap loop opens it to exactly
+            // the peers the current netmap names; until then there is no
+            // device this daemon should accept a connection from.
+            Ok(QuicPeerEndpoint::new(hub, device)?)
+        })
+        .await
+        .cloned()
+}
+
+/// Opens this attempt's one connection to `peer_device_id`, or reports why
+/// it could not.
+///
+/// Which side dials is decided by device-id ordering rather than by racing.
+/// Both devices know the other's key and address, so both *could* dial, and
+/// if both do the result is two connections where the protocol wants one --
+/// each side's session on a different connection, neither seeing the
+/// other's messages. QUIC has no simultaneous-open resolution to fall back
+/// on: unlike TCP, two dials are simply two connections. Lexicographic order
+/// on the device id settles it with no negotiation round trip that could
+/// itself race.
+///
+/// The dialing side races the peer's known addresses and takes the first
+/// that answers -- see [`QuicPeerEndpoint::connect_racing`] for why it must
+/// race rather than walk the list, and what it costs not to.
+async fn connect_to_peer(
+    endpoint: &Arc<QuicPeerEndpoint>,
+    role: ConnectRole,
+    peer_device_id: &str,
+    peer_public_key: [u8; 32],
+    candidates: &[SocketAddr],
+) -> Result<(Arc<QuicPeerChannel>, Option<SocketAddr>), UnreachableCategory> {
+    match role {
+        ConnectRole::Dial => {
+            if candidates.is_empty() {
+                return Err(UnreachableCategory::NoCandidates);
+            }
+            // The dials and this device's own inbox are watched together,
+            // not one after the other.
+            //
+            // A peer that cannot be reached at any address it advertises
+            // takes the dialling role toward its relay-capable peers (see
+            // `connect_to_relay_anchor`), and the connection it makes that
+            // way lands in this endpoint's inbox with nobody reading it:
+            // this side is the designated dialler, so it never calls
+            // `accept` in its own right. Looking only after the dials have
+            // all failed makes that fallback cost a full race first -- and
+            // the race's worst case is long enough that the supervisor's own
+            // budget can end the attempt before the inbox is ever consulted,
+            // which makes the fallback unreachable rather than slow.
+            //
+            // Biased toward the inbound, and that is a decision rather than
+            // a default: a connection in the inbox has already been
+            // *selected* by the peer, which is a commitment this device's
+            // own in-flight dial has not yet made. Preferring the committed
+            // one is what keeps the two ends on the same connection.
+            let inbound = endpoint.accept(peer_public_key);
+            tokio::pin!(inbound);
+            let raced = {
+                let racing = endpoint.connect_racing(candidates, peer_public_key);
+                tokio::pin!(racing);
+                tokio::select! {
+                    biased;
+                    claimed = &mut inbound => {
+                        return match claimed {
+                            Some(connection) => {
+                                tracing::info!(
+                                    peer = %peer_device_id,
+                                    "the peer dialled this device while it was dialling the peer"
+                                );
+                                // Accepted, not dialled: which side opened
+                                // the connection decides which side opens
+                                // the control stream, and getting that
+                                // backwards leaves both ends waiting for
+                                // the other.
+                                Ok((QuicPeerChannel::new(connection, ConnectRole::Accept), None))
+                            }
+                            None => Err(UnreachableCategory::NoResponse),
+                        };
+                    }
+                    raced = &mut racing => raced,
+                }
+            };
+
+            match raced {
+                Ok((connection, candidate)) => {
+                    Ok((QuicPeerChannel::new(connection, role), Some(candidate)))
+                }
+                // The category, never the raw error text: a
+                // connection-attempt diagnostic must not carry a peer's
+                // address into a log line.
+                Err(error) => {
+                    tracing::warn!(
+                        peer = %peer_device_id,
+                        candidate_count = candidates.len(),
+                        failure = error.category(),
+                        "no candidate accepted a QUIC connection"
+                    );
+                    // One last look at the inbox before giving up, for a
+                    // connection that arrived while the last dial was still
+                    // timing out. Short, because it is a check rather than a
+                    // wait: waiting longer here would delay the relay
+                    // fallback that comes after this for every genuinely
+                    // unreachable peer.
+                    match tokio::time::timeout(QUEUED_INBOUND_GRACE, &mut inbound).await {
+                        Ok(Some(connection)) => {
+                            tracing::info!(
+                                peer = %peer_device_id,
+                                "no advertised address answered, but the peer had dialled this \
+                                 device"
+                            );
+                            Ok((QuicPeerChannel::new(connection, ConnectRole::Accept), None))
+                        }
+                        _ => Err(UnreachableCategory::NoResponse),
+                    }
+                }
+            }
         }
-        if rx.changed().await.is_err() {
-            return;
-        }
+        // The accepting side has nothing to retry: it waits for the dialer,
+        // whose own supervisor applies the backoff. `None` means this
+        // device's endpoint is gone, which only happens at shutdown.
+        ConnectRole::Accept => match endpoint.accept(peer_public_key).await {
+            Some(connection) => Ok((QuicPeerChannel::new(connection, role), None)),
+            None => {
+                tracing::debug!(
+                    peer = %peer_device_id,
+                    "device QUIC endpoint closed while waiting for this peer to dial"
+                );
+                Err(UnreachableCategory::NoResponse)
+            }
+        },
     }
+}
+
+/// A live connection to a peer, together with what kind of path it is on
+/// and -- when that path is a relay -- the relay session carrying it.
+///
+/// The route is derived from the connection's own remote address rather
+/// than from how the connection came to exist. That matters on the
+/// accepting side, which does not open the relay session and would
+/// otherwise have no way to tell a relayed peer from a direct one: below
+/// the hub, quinn cannot tell the difference either, so the distinction has
+/// to be drawn from the synthetic address the hub minted.
+struct Established {
+    channel: Arc<QuicPeerChannel>,
+    route: RouteKind,
+    /// `Some` only on the side that *opened* the relay session. The
+    /// destination side of a relay path holds nothing: it never asked for
+    /// the session and has nothing to close.
+    relay: Option<crate::relay_carrier::OpenedRelayPath>,
+    /// The candidate this device dialed, when it dialed one. Used only for
+    /// the connection-class diagnostic; a relayed or accepted connection has
+    /// no dialed candidate to report.
+    dialed_candidate: Option<SocketAddr>,
+}
+
+impl Established {
+    fn from_connection(
+        channel: Arc<QuicPeerChannel>,
+        dialed_candidate: Option<SocketAddr>,
+        relay: Option<crate::relay_carrier::OpenedRelayPath>,
+    ) -> Self {
+        // Relay-carried traffic must never promote a peer to a confirmed
+        // *direct* route: the relay layer decides whether it may forward by
+        // asking exactly that question, so a relayed path answering "direct"
+        // is what would let one relay chain through another.
+        let route = if yadorilink_transport::is_synthetic_relay_addr(channel.remote_address()) {
+            RouteKind::Relay
+        } else {
+            RouteKind::Direct
+        };
+        Self { channel, route, relay, dialed_candidate }
+    }
+}
+
+/// How long a dial attempted *while an existing generation is still
+/// carrying traffic* may take before it is abandoned.
+///
+/// Much shorter than [`CONNECT_ATTEMPT_TIMEOUT`], and deliberately so: that
+/// one bounds a device with no connection at all, where waiting is the only
+/// option. This one bounds a speculative probe for a better path, where the
+/// current path is still working and a slow probe costs nothing but delay in
+/// noticing it failed.
+const PATH_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often a relay-carried generation re-checks whether a direct path has
+/// become available again.
+///
+/// A relay hop costs a peer's bandwidth and one of its bounded session
+/// slots, so a device on one should not sit there once it could reach the
+/// peer itself. A netmap push naming new candidates triggers this check
+/// immediately; the interval is the backstop for a direct path that becomes
+/// reachable again without the coordination plane saying anything -- a NAT
+/// mapping reopening, a link coming back.
+const RELAY_DIRECT_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How often a relay-carried generation checks that the relay session under
+/// it still exists. Short, because the whole point is to notice before the
+/// QUIC idle timeout would.
+const RELAY_SESSION_LIVENESS_INTERVAL: Duration = Duration::from_millis(500);
+
+/// What ended one generation of a peer connection.
+enum GenerationOutcome {
+    /// The session returned on its own -- the connection closed, the peer
+    /// went away, or it errored.
+    Ended,
+    /// A better path was established and this generation is superseded by
+    /// it. The caller closes this one and continues on the replacement.
+    Replaced(Established),
+    /// The relay session carrying this generation is gone (its grant
+    /// expired, the relay closed it, or the relay itself disconnected), so
+    /// the path underneath the connection no longer exists.
+    RelayLost,
 }
 
 /// One connect-then-run cycle of [`spawn_peer_session`]'s reconnect loop.
@@ -1874,13 +2253,23 @@ async fn wait_for_first_handshake_resolution(channel: &PeerChannel) {
 /// authorized-groups, not a stale snapshot from whenever this device's
 /// session for that peer first started (see `PeerConnectSpec`'s own doc
 /// comment).
+///
+/// One *attempt* can span several *generations*. Moving between a direct
+/// path and a relayed one is not a migration -- quinn exposes no way to
+/// change a peer's remote address, and reaching into its path state would be
+/// the wrong lever even if it did. It is a generation replacement: a new
+/// authenticated connection is established first, published as the next
+/// generation, and only then is the superseded one closed. That is the same
+/// machinery a reconnect already uses, so there is nothing new to invent
+/// and, crucially, no window in which this device has no working path to the
+/// peer at all.
 async fn run_one_peer_session_attempt(
     state: &Arc<DaemonState>,
-    keypair: &Arc<DeviceKeyPair>,
     local_device_id: &str,
     peer_device_id: &str,
     diff_state: &NetmapDiffState,
     session_index: u32,
+    generations: &Arc<AtomicU32>,
 ) {
     let attempt_started = tokio::time::Instant::now();
     let Some(spec) = diff_state
@@ -1905,35 +2294,70 @@ async fn run_one_peer_session_attempt(
 
     mark_connecting(state, peer_device_id);
 
-    // All peer channels share this device's one long-lived UDP socket, so
-    // the NAT candidates it advertises describe the exact binding data
-    // flows on. A bind failure here means no direct transport at all —
-    // report the peer unreachable rather than dropping it silently.
-    let shared = match state.ensure_shared_socket().await {
-        Ok(shared) => shared,
+    // Fresh-read like `desired_peers` above (see `NetmapDiffState::
+    // lan_discovered`'s own doc comment) and merged into a LOCAL candidate
+    // list for just this attempt -- never written back into `spec`/
+    // `desired_peers` itself, so the two sources stay distinguishable for
+    // the trace below rather than becoming one undifferentiated list.
+    // Capped at the same total `MAX_PEER_CANDIDATES` the coordination/
+    // rendezvous-sourced list already respects.
+    //
+    // The TTL is re-applied HERE, not just on the write path
+    // (`handle_lan_announcement`'s own prune-on-insert) -- a peer that was
+    // announced once and then never again (attacker gone quiet, or a real
+    // peer that left the network) must not keep handing out that address
+    // forever just because nothing has come along since to trigger a
+    // write-side prune. Read-time filtering is what actually makes the
+    // TTL bound true for every caller, not just the next writer.
+    let lan_candidates: Vec<SocketAddr> = ttl_filtered_lan_candidates(
+        &diff_state.lan_discovered.lock().unwrap_or_else(|p| p.into_inner()),
+        peer_device_id,
+        Instant::now(),
+    );
+    let mut attempt_candidates = spec.candidates.clone();
+    for candidate in &lan_candidates {
+        if attempt_candidates.len() >= MAX_PEER_CANDIDATES {
+            break;
+        }
+        if !attempt_candidates.contains(candidate) {
+            attempt_candidates.push(*candidate);
+        }
+    }
+
+    // The peer's Ed25519 device key is what a QUIC handshake with it
+    // authenticates against, in both directions: this device pins it as the
+    // one key allowed to answer a dial, and refuses an inbound connection
+    // presenting anything else. A peer the netmap carries no signing key for
+    // therefore cannot be connected to at all -- there is nothing to verify
+    // against, and connecting anyway would be an unauthenticated session
+    // carrying plaintext file content.
+    let Some(peer_public_key) = state.peer_signing_key(peer_device_id) else {
+        tracing::warn!(
+            peer = %peer_device_id,
+            "netmap peer has no signing key to authenticate a connection against"
+        );
+        report_unreachable(state, peer_device_id, UnreachableCategory::HandshakeRefused);
+        return;
+    };
+
+    let endpoint = match ensure_quic_endpoint(state, diff_state).await {
+        Ok(endpoint) => endpoint,
         Err(e) => {
-            tracing::warn!(peer = %peer_device_id, generation = session_index, error = %e, "failed to bind the shared transport socket");
-            set_reachability(
-                state,
-                peer_device_id,
-                PeerReachability::Unreachable(UnreachableCategory::NoResponse),
-            );
+            tracing::warn!(peer = %peer_device_id, generation = session_index, error = %e, "failed to build this device's QUIC endpoint");
+            report_unreachable(state, peer_device_id, UnreachableCategory::NoResponse);
             return;
         }
     };
 
-    // An empty candidate set is not an error — the channel is created
-    // and immediately reports `Unreachable { NoCandidates }`, which
-    // `poll_reachability` surfaces. A `connect` error here is therefore
-    // a genuine construction failure, reported as unreachable rather than
-    // dropping the peer silently.
-    let candidate_count = spec.candidates.len();
-    // M3 Pass 3: `ReconnectCoordinator` -- acquired here, immediately
-    // before the actual handshake attempt (this supervisor's own backoff
-    // sleep already happened, entirely in `spawn_peer_session`'s loop,
-    // before this function was even called), never during it. Dropped via
-    // an early `return` on a `connect` failure (nothing to wait on), or
-    // explicitly once `wait_for_first_handshake_resolution` resolves below.
+    let role = connect_role(local_device_id, peer_device_id);
+    let candidate_count = attempt_candidates.len();
+    // Acquired immediately before the actual connection attempt -- this
+    // supervisor's own backoff sleep already happened, entirely in
+    // `spawn_peer_session`'s loop -- and released as soon as the attempt
+    // resolves. It bounds how many peers this device may be mid-handshake
+    // with at once, so an event that drops many sessions together (a network
+    // flap, a Wi-Fi roam, this process waking from sleep) does not make every
+    // affected supervisor handshake simultaneously.
     let reconnect_permit = diff_state
         .reconnect_semaphore
         .clone()
@@ -1941,264 +2365,699 @@ async fn run_one_peer_session_attempt(
         .await
         .expect("reconnect semaphore is never closed");
     let connect_started = tokio::time::Instant::now();
-    // M3 Pass 6: `state.clone()` as the `RelayCarrier` -- `DaemonState`
-    // implements it (`relay_carrier.rs`), so a peer this direct race
-    // loses (or a relay path that's already in use) can fall back to
-    // relay sending. See that trait's own doc comment for why this is
-    // still deny-by-default everywhere else (test call sites, the madsim
-    // sibling below): only production wiring opts in.
-    let connect_result = PeerChannel::connect_with_relay(
-        keypair.secret.clone(),
-        spec.peer_public,
-        session_index,
-        spec.candidates,
-        shared,
-        state.clone() as Arc<dyn yadorilink_transport::RelayCarrier>,
+    let connect_result = tokio::time::timeout(
+        CONNECT_ATTEMPT_TIMEOUT,
+        connect_to_peer(&endpoint, role, peer_device_id, peer_public_key, &attempt_candidates),
     )
     .await;
+    drop(reconnect_permit);
+    // Attributable only in the success case: the winning candidate is known
+    // precisely (`dialed_candidate`), so this fires exactly when a LAN-
+    // discovered address is what actually got connected on -- not merely
+    // "was offered this attempt". A failed attempt does not get a
+    // LocalDiscovery trace entry: with several sources merged into one
+    // candidate list, a failure is not attributable to any one source
+    // (the same reasoning `record_reachability_transition`'s existing
+    // `DirectPath` entry already follows -- it records the CONFIRMED path,
+    // not every source that contributed a candidate).
+    if let Ok(Ok((_, Some(dialed)))) = &connect_result {
+        if lan_candidates.contains(dialed) {
+            state.telemetry.record_connection_attempt(
+                peer_device_id.to_string(),
+                CandidateSource::LocalDiscovery,
+                // Derived from the actual winning address, not hardcoded --
+                // a LAN-discovered candidate is USUALLY on-LAN by
+                // construction (that's what the broadcast/mDNS scope means),
+                // but a spoofed or misconfigured announcement could carry an
+                // off-LAN address, and hardcoding here would mis-record
+                // exactly that case in telemetry.
+                candidate_class_to_address(classify_endpoint(*dialed)),
+                AttemptOutcome::Connected,
+                connect_started.elapsed().as_millis() as u64,
+                "",
+                true,
+                Some(true),
+            );
+        }
+    }
     tracing::debug!(
         peer = %peer_device_id,
         generation = session_index,
         candidate_count,
-        connect_ok = connect_result.is_ok(),
+        connect_ok = matches!(connect_result, Ok(Ok(_))),
         connect_elapsed_ms = connect_started.elapsed().as_millis(),
         desired_spec_wait_ms = attempt_started.elapsed().as_millis(),
-        "peer channel connect attempt finished"
+        "peer connection attempt finished"
     );
 
-    let channel = match connect_result {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            tracing::warn!(peer = %peer_device_id, error = %e, "failed to establish peer channel");
-            state.telemetry.record_connection_attempt(
-                peer_device_id.to_string(),
-                CandidateSource::DirectPath,
-                AddressClass::Unknown,
-                AttemptOutcome::Failed,
-                0,
-                UnreachableCategory::NoResponse.as_str(),
-                false,
-                None,
+    let direct = match connect_result {
+        Ok(Ok((channel, dialed_candidate))) => Ok((channel, dialed_candidate)),
+        Ok(Err(category)) => Err(category),
+        Err(_elapsed) => {
+            tracing::warn!(
+                peer = %peer_device_id,
+                generation = session_index,
+                "peer connection attempt timed out"
             );
-            // The status entry stays so `yadorilink status` shows
-            // "cannot connect"; this supervisor's own reconnect loop
-            // re-attempts after backoff (this peer is not in
-            // `state.peers.sessions`, so it is not suppressed as connected).
-            set_reachability(
-                state,
-                peer_device_id,
-                PeerReachability::Unreachable(UnreachableCategory::NoResponse),
-            );
-            return;
+            Err(UnreachableCategory::NoResponse)
         }
     };
 
-    // M3 Pass 3 (independent-review finding H1): re-check the peer is
-    // still desired right before registering the channel -- `teardown_peer`
-    // removes `desired_peers` BEFORE calling `handle.abort()` on this
-    // supervisor, specifically so an in-flight attempt can notice and stop
-    // cleanly (see `teardown_peer`'s own comment). But `abort()` only takes
-    // effect at this task's NEXT `.await` point, and `PeerChannel::connect`
-    // above already completed -- there is no `.await` between here and the
-    // channel-registration code below for the abort to land on. Without
-    // this second check (the first is the `desired_peers` lookup at this
-    // function's own top, BEFORE `connect`), a `teardown_peer` that raced
-    // in during `connect`'s own await would go completely unnoticed: this
-    // attempt would insert a live channel and register a session, then get
-    // aborted before ever reaching this function's own natural-end cleanup
-    // below -- leaving a permanently unrevoked zombie channel with no
-    // supervisor left alive to clean it up.
+    let mut established = match direct {
+        Ok((channel, dialed_candidate)) => {
+            Established::from_connection(channel, dialed_candidate, None)
+        }
+        // No direct path. A relay is worth trying, but only on the dialing
+        // side: opening one is an act of dialing, and which side dials is
+        // fixed by device-id ordering precisely so a pair ends up with one
+        // connection rather than two. The accepting side simply keeps
+        // waiting -- if the peer needs a relay to reach this device, it is
+        // the peer that opens it.
+        Err(category) => {
+            match connect_via_relay(state, &endpoint, peer_device_id, peer_public_key, role).await {
+                Some(established) => established,
+                None => {
+                    match connect_to_relay_anchor(
+                        state,
+                        &endpoint,
+                        &spec,
+                        peer_device_id,
+                        peer_public_key,
+                        role,
+                    )
+                    .await
+                    {
+                        Some(established) => established,
+                        None => {
+                            report_unreachable(state, peer_device_id, category);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    // Re-check the peer is still desired before registering anything.
+    // `teardown_peer` removes `desired_peers` BEFORE calling `handle.abort()`
+    // on this supervisor, specifically so an in-flight attempt can notice and
+    // stop cleanly -- but `abort()` only takes effect at this task's NEXT
+    // `.await` point, and there is none between here and the registration
+    // below for it to land on. Without this second check a teardown that
+    // raced the connection would go unnoticed: this attempt would register a
+    // live channel and a session, then be aborted before reaching its own
+    // cleanup, leaving a connection to a revoked device with no supervisor
+    // left alive to end it.
     if !diff_state
         .desired_peers
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .contains_key(peer_device_id)
     {
-        channel.revoke();
+        // Closed rather than dropped, and its relay session -- if it had
+        // one -- torn down with it, so the peer learns immediately and the
+        // relaying device gets its slot back rather than waiting out an
+        // idle timeout.
+        discard_generation(state, peer_device_id, established);
         return;
     }
 
-    // M3 Pass 3: release the permit once the actor resolves its FIRST
-    // candidate race one way or the other (`Connected` or `Unreachable`) --
-    // the actual handshake attempt this permit exists to bound. Done from a
-    // detached task, not inline here, so this global concurrency bound
-    // never delays this attempt's own registration/session-start below (an
-    // inline `.await` here would serialize channel registration and
-    // `PeerSyncSession` creation behind full handshake resolution, changing
-    // this function's own externally-observed timing contract for no
-    // reason -- the permit only needs to track candidate-race concurrency,
-    // it has no business gating anything else). The actor's own internal
-    // retry loop may keep flapping between `Connecting`/`Unreachable`
-    // indefinitely after the first resolution, on its own per-peer backoff;
-    // that ongoing churn is what the existing backoff+jitter already
-    // governs, not this global bound.
-    let channel_for_permit = channel.clone();
-    tokio::spawn(async move {
-        // `RECONNECT_PERMIT_MAX_HOLD` bounds this wait -- see its own doc
-        // comment for why: the permit's job is bounding concurrent races,
-        // not tracking one attempt to full resolution.
-        let _ = tokio::time::timeout(
-            RECONNECT_PERMIT_MAX_HOLD,
-            wait_for_first_handshake_resolution(&channel_for_permit),
+    let mut generation = session_index;
+    loop {
+        let outcome = run_one_generation(
+            state,
+            local_device_id,
+            peer_device_id,
+            diff_state,
+            &endpoint,
+            &spec,
+            peer_public_key,
+            role,
+            &established,
+            generation,
         )
         .await;
-        drop(reconnect_permit);
-    });
 
-    // registered so a later netmap-diff teardown
-    // (`teardown_peer`) can find and `revoke` this exact channel —
-    // dropping every `Arc<PeerChannel>` clone this task will go on to
-    // hand out (below, and via `PeerSyncSession`) is not by itself
-    // enough to stop the actor (see `PeerChannel::revoke`'s doc
-    // comment), so `teardown_peer` needs a live reference, not just
-    // to out-live every other clone.
-    //
-    // M5-A soak-closure finding: see `insert_channel_revoking_
-    // superseded`'s own doc comment for why a plain `insert` here is
-    // unsafe -- confirmed live via the soak lane's rapid repeated-
-    // restart chaos leaving a peer's session permanently stuck.
-    diff_state.insert_channel_revoking_superseded(
-        peer_device_id.to_string(),
-        channel.clone(),
-        session_index,
+        match outcome {
+            GenerationOutcome::Replaced(replacement) => {
+                tracing::info!(
+                    peer = %peer_device_id,
+                    generation,
+                    from = established.route.as_str(),
+                    to = replacement.route.as_str(),
+                    "replacing a peer connection with one on a better path"
+                );
+                // The replacement is already authenticated and published
+                // before this closes anything, so the superseded connection
+                // is torn down against a working path rather than a hoped-for
+                // one -- and its relay session, if it had one, stops
+                // occupying a slot on the relaying device immediately rather
+                // than waiting out an idle timeout there.
+                discard_generation(state, peer_device_id, established);
+                established = replacement;
+                generation = generations.fetch_add(1, Ordering::Relaxed);
+            }
+            GenerationOutcome::RelayLost => {
+                tracing::info!(
+                    peer = %peer_device_id,
+                    generation,
+                    "the relay session carrying this connection is gone; reconnecting"
+                );
+                discard_generation(state, peer_device_id, established);
+                return;
+            }
+            GenerationOutcome::Ended => {
+                discard_generation(state, peer_device_id, established);
+                return;
+            }
+        }
+    }
+}
+
+/// Runs one generation's `PeerSyncSession` to completion, watching for a
+/// better path underneath it.
+#[allow(clippy::too_many_arguments)]
+async fn run_one_generation(
+    state: &Arc<DaemonState>,
+    local_device_id: &str,
+    peer_device_id: &str,
+    diff_state: &NetmapDiffState,
+    endpoint: &Arc<QuicPeerEndpoint>,
+    spec: &PeerConnectSpec,
+    peer_public_key: [u8; 32],
+    role: ConnectRole,
+    established: &Established,
+    generation: u32,
+) -> GenerationOutcome {
+    // A QUIC connection either exists or it does not, so there is no
+    // candidate race left to reflect and no reachability watch to poll:
+    // reaching this point IS the confirmed path, because the only way to
+    // reach it is through a mutually authenticated handshake. Whether that
+    // path is direct or relayed is the connection's remote address, read
+    // once when the generation was established.
+    let reachability = PeerReachability::Connected(established.route);
+    set_reachability(state, peer_device_id, reachability);
+    record_reachability_transition(
+        state,
+        peer_device_id,
+        reachability,
+        established.dialed_candidate.map(|addr| candidate_class_to_address(classify_endpoint(addr))),
     );
-    // M3 Pass 5: mirrors the insert above onto `DaemonState` -- see
-    // `DaemonState::set_direct_channel`'s own doc comment. Independently
-    // generation-guarded (blocker #55), not gated on the primary
-    // insert's own accept/reject result -- see that method's doc comment
-    // for why.
-    state.set_direct_channel(peer_device_id.to_string(), channel.clone(), session_index);
 
-    // Reflect the channel's live reachability into status: it starts
-    // `Connecting` while candidates race, becomes `Connected` once a
-    // direct path is confirmed, or `Unreachable` if the race is lost.
-    tokio::spawn(poll_reachability(state.clone(), peer_device_id.to_string(), channel.clone()));
+    // Registered so the relay layer can find this device's own direct route
+    // to a peer -- both to address a forwarding socket and to refuse to
+    // chain a relay through a route that is not itself direct. A relayed
+    // connection is deliberately NOT registered: it is not a direct route,
+    // and recording it as one is exactly how a relay would come to chain
+    // through another relay.
+    if established.route == RouteKind::Direct {
+        state.set_direct_channel(
+            peer_device_id.to_string(),
+            established.channel.clone(),
+            generation,
+        );
+    }
 
     let sync_roots = sync_roots_for_groups(state, &spec.effective_group_ids);
     let dependencies = peer_sync_session_deps(state);
-    let channel_for_cleanup = channel.clone();
     let session = PeerSyncSession::new_with_dependencies(
-        channel,
+        established.channel.clone(),
         local_device_id.to_string(),
         peer_device_id.to_string(),
         state.replica_coordinator.clone(),
         Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
             state.block_store.clone(),
         )),
-        spec.effective_group_ids,
+        spec.effective_group_ids.clone(),
         sync_roots,
         Some(state.forward_tx.clone()),
         dependencies,
     );
     state.peers.register_session(peer_device_id.to_string(), session.clone());
 
-    if let Err(e) = session.clone().run().await {
-        tracing::warn!(peer = %peer_device_id, generation = session_index, error = %e, "peer sync session ended with an error");
-    }
+    let outcome = {
+        let running = session.clone().run();
+        tokio::pin!(running);
+        tokio::select! {
+            result = &mut running => {
+                if let Err(e) = result {
+                    tracing::warn!(peer = %peer_device_id, generation, error = %e, "peer sync session ended with an error");
+                }
+                GenerationOutcome::Ended
+            }
+            replacement = await_better_path(
+                state,
+                endpoint,
+                diff_state,
+                peer_device_id,
+                peer_public_key,
+                role,
+                established,
+            ) => GenerationOutcome::Replaced(replacement),
+            replacement = await_inbound_replacement(endpoint, peer_public_key, role) =>
+                GenerationOutcome::Replaced(replacement),
+            () = await_relay_session_loss(state, established) => GenerationOutcome::RelayLost,
+        }
+    };
+
     end_session_if_current(state, peer_device_id, &session);
-    // The session ended on its own (not via `teardown_peer`, which
-    // already would have removed this entry) — clean up the
-    // bookkeeping `teardown_peer` would otherwise use to find a
-    // channel that no longer has a live session behind it. This task's
-    // own `session_tasks` entry stays live (this is one attempt of an
-    // ongoing supervisor loop, not the task ending) -- only
-    // `teardown_peer`'s abort or process shutdown ends the supervisor
-    // itself.
-    // M3 Pass 3: `remove_channel_if_current`, not a bare key-only
-    // `remove` -- see that method's own doc comment for the ABA race
-    // this closes (a second, newer supervisor for the same peer briefly
-    // coexisting with this one during `teardown_peer`'s not-yet-effective
-    // `abort()`). Guarded by comparing against `channel`, the exact
-    // `Arc<PeerChannel>` THIS attempt itself created and inserted above --
-    // never anyone else's.
-    let removed = diff_state.remove_channel_if_current(peer_device_id, &channel_for_cleanup);
-    if removed {
-        // M3 Pass 5: mirrors `diff_state.channels`'s own removal onto
-        // `DaemonState`, guarded by the SAME `removed` check (only this
-        // generation's own cleanup, having won the ABA race above, may
-        // clear the mirror) -- see `DaemonState::set_direct_channel`'s own
-        // doc comment for why the relay-admission path needs this at all.
-        state.remove_direct_channel(peer_device_id);
-    }
-    let removed_channel = removed.then_some(channel_for_cleanup);
-    // `revoke()` (not just dropping the `Arc`) is what's needed here --
-    // `PeerChannel` has no `Drop` impl, so a channel whose owner just stops
-    // holding it keeps running forever: still registered under this peer's
-    // static key, still answering every future handshake initiation for
-    // this same peer with its OWN (stale) session index. `revoke()` itself
-    // (see its own doc comment) only sets a flag synchronously and wakes
-    // the actor loop to exit -- the actor's own unregistration of its
-    // transport-hub demux slot happens once that loop actually observes
-    // the flag and exits, not synchronously before this call returns.
-    // Confirmed via `reconnect_handshake_stress.rs`: the shared transport
-    // hub broadcasts a handshake initiation to every channel registered
-    // for a matching key, so this zombie channel and the NEXT generation's
-    // fresh channel would both decapsulate and respond to the same
-    // initiation, racing the reconnecting peer's single Tunn with two
-    // competing handshake_response datagrams (`WrongKey`/`UnexpectedPacket`
-    // decapsulate errors, `exact-generation handshake: exhausted bounded
-    // retries` on the reconnecting side) -- every time, not intermittently,
-    // since the zombie never goes away on its own.
-    if let Some(channel) = removed_channel {
-        channel.revoke();
+    outcome
+}
+
+/// Ends one generation: closes its connection and, if it was carried by a
+/// relay session this device opened, tears that session down too.
+///
+/// Closing is explicit rather than left to `Drop`. A superseded generation's
+/// `PeerSyncSession` may still be reachable from the peer registry for a
+/// moment, so dropping this scope's handle is not necessarily dropping the
+/// last one, and two live connections to one peer is the state the
+/// connect-role rule exists to prevent.
+fn discard_generation(
+    state: &Arc<DaemonState>,
+    peer_device_id: &str,
+    established: Established,
+) {
+    // Guarded by identity: a newer generation may already have registered
+    // its own route under this key, and a key-only removal would delete the
+    // live one -- leaving the relay layer believing this device has no
+    // direct path to a peer it is actively talking to.
+    state.remove_direct_channel_if_current(peer_device_id, &established.channel);
+    established.channel.close_superseded();
+    if let Some(relay) = &established.relay {
+        crate::relay_carrier::close_relay_path(state, relay);
     }
 }
 
-/// Reflects the channel's reachability into status, waking on each change
-/// via the transport's reachability watch (with a periodic re-check so it
-/// also notices session teardown promptly).
+/// Resolves once a strictly better path than `established` has been
+/// established, and never otherwise -- so it can be raced against a running
+/// session without ever being the thing that ends it.
 ///
-/// Exits as soon as `end_session` removes this peer's
-/// `peer_statuses` entry, which drops this task's `Arc<PeerChannel>`
-/// clone — the other clone (held by `PeerSyncSession`) is dropped at the
-/// same time via the `sessions` map, so once both this task and the
-/// `sessions` entry are gone, nothing keeps a disconnected peer's
-/// `PeerChannel` (and the actor task/UDP socket it owns) alive.
-async fn poll_reachability(
-    state: Arc<DaemonState>,
-    peer_device_id: String,
-    channel: Arc<PeerChannel>,
-) {
-    let mut reachability_rx = channel.reachability_watch();
-    let mut previous: Option<PeerReachability> = None;
+/// "Better" is only ever one of two things, and both are triggered by
+/// evidence rather than by a timer alone:
+///
+/// - a relayed generation becomes a direct one, because a direct path is
+///   always preferable: it costs no other device's bandwidth and occupies
+///   none of its bounded relay slots;
+/// - a direct generation whose address the coordination plane has stopped
+///   advertising is re-established against the addresses it now advertises,
+///   falling back to a relay only if none of them answer.
+///
+/// A direct generation still sitting on an advertised address is left
+/// completely alone. That restraint is deliberate: an address a peer is
+/// demonstrably answering on is better evidence than any snapshot, and a
+/// working connection is never torn down for a path that has not been
+/// proven to exist. If nothing better can be established, this simply keeps
+/// waiting, and the current generation goes on carrying traffic.
+async fn await_better_path(
+    state: &Arc<DaemonState>,
+    endpoint: &Arc<QuicPeerEndpoint>,
+    diff_state: &NetmapDiffState,
+    peer_device_id: &str,
+    peer_public_key: [u8; 32],
+    role: ConnectRole,
+    established: &Established,
+) -> Established {
+    // The accepting side has no dial to make. Which side dials is fixed by
+    // device-id ordering so a pair ends up with one connection rather than
+    // two, and a probe is a dial like any other -- an accepting device that
+    // probed would produce connections no session ever claims.
+    if role != ConnectRole::Dial {
+        return std::future::pending().await;
+    }
+
+    let mut netmap_epoch = diff_state.netmap_epoch.subscribe();
+    let mut probe = tokio::time::interval(RELAY_DIRECT_PROBE_INTERVAL);
+    // The immediate first tick is consumed here rather than acted on: this
+    // generation was established moments ago, and on a relayed one that
+    // means a direct dial was *just* tried and failed.
+    probe.tick().await;
+
     loop {
-        // Snapshot the current reachability and, when connected, the class
-        // of the confirmed path. Computed inside this block so the watch
-        // borrow guard is dropped before any lock or `.await` below.
-        let (current, connected_class) = {
-            let reachability = reachability_rx.borrow_and_update();
-            let connected_class = match &*reachability {
-                yadorilink_transport::PeerReachability::Connected { path } => {
-                    Some(candidate_class_to_address(*path))
-                }
-                _ => None,
-            };
-            (map_transport_reachability(&reachability), connected_class)
-        };
-        if !state.peers.update_reachability_if_present(&peer_device_id, current) {
-            break; // session ended
-        }
-        // A reachability transition is itself a meaningful connection event
-        // (a confirmed direct path, or the loss of one) — recorded once per
-        // transition, not once per change notification.
-        if previous != Some(current) {
-            record_reachability_transition(&state, &peer_device_id, current, connected_class);
-        }
-        previous = Some(current);
-        // Wake immediately on a reachability change, but also re-check at
-        // least every couple of seconds so this task still exits promptly
-        // once `end_session` removes the status entry, even if the channel
-        // never reports another change.
-        tokio::select! {
-            changed = reachability_rx.changed() => {
-                if changed.is_err() {
-                    break; // the channel's actor (watch sender) is gone
-                }
+        if established.route == RouteKind::Relay {
+            tokio::select! {
+                _ = netmap_epoch.changed() => {}
+                _ = probe.tick() => {}
             }
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+        } else {
+            // A direct generation is only ever reconsidered when the
+            // coordination plane says something new. Polling would be
+            // pointless -- the answer cannot change without a netmap push.
+            if netmap_epoch.changed().await.is_err() {
+                return std::future::pending().await;
+            }
+        }
+
+        if let Some(better) = try_better_path(
+            state,
+            endpoint,
+            diff_state,
+            peer_device_id,
+            peer_public_key,
+            role,
+            established,
+        )
+        .await
+        {
+            return better;
         }
     }
 }
+
+/// One evaluation of whether a better path than `established` can be had
+/// right now. See [`await_better_path`] for what counts as better.
+async fn try_better_path(
+    state: &Arc<DaemonState>,
+    endpoint: &Arc<QuicPeerEndpoint>,
+    diff_state: &NetmapDiffState,
+    peer_device_id: &str,
+    peer_public_key: [u8; 32],
+    role: ConnectRole,
+    established: &Established,
+) -> Option<Established> {
+    let candidates: Vec<SocketAddr> = diff_state
+        .desired_peers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(peer_device_id)
+        .map(|spec| spec.candidates.clone())
+        .unwrap_or_default();
+
+    if established.route == RouteKind::Direct {
+        // Still connected on an address the plane advertises: there is
+        // nothing here that a new connection could improve on.
+        let current = established.channel.remote_address();
+        if candidates.iter().any(|candidate| *candidate == current) {
+            return None;
+        }
+    }
+
+    if let Some((channel, dialed)) =
+        probe_direct(endpoint, peer_device_id, peer_public_key, &candidates).await
+    {
+        return Some(Established::from_connection(channel, dialed, None));
+    }
+
+    // Already relayed and still no direct path: a second relay session would
+    // be no better than the one already carrying traffic, and opening one
+    // would cost the relaying device another slot for nothing.
+    if established.route == RouteKind::Relay {
+        return None;
+    }
+
+    connect_via_relay(state, endpoint, peer_device_id, peer_public_key, role).await
+}
+
+/// Dials `candidates` in order, bounded by [`PATH_PROBE_TIMEOUT`], and stops
+/// at the first that answers with an authenticated connection.
+async fn probe_direct(
+    endpoint: &Arc<QuicPeerEndpoint>,
+    peer_device_id: &str,
+    peer_public_key: [u8; 32],
+    candidates: &[SocketAddr],
+) -> Option<(Arc<QuicPeerChannel>, Option<SocketAddr>)> {
+    if candidates.is_empty() {
+        return None;
+    }
+    // Raced, for exactly the reason a first connection is raced: a silent
+    // address costs a full handshake timeout, which is longer than this
+    // probe's whole budget, so walking the list would mean only ever trying
+    // the first candidate. That is worse here than on a first connection,
+    // not better -- this is the path that promotes a relayed connection back
+    // to direct, so a peer whose first advertised address does not work
+    // would stay on a relay for as long as it kept advertising it.
+    //
+    // The budget is deliberately shorter than the race's own worst case: a
+    // probe runs while a working generation is still carrying traffic, so
+    // giving up early costs a retry rather than a connection, and a live
+    // candidate behind dead ones is found in stagger time regardless.
+    match tokio::time::timeout(
+        PATH_PROBE_TIMEOUT,
+        endpoint.connect_racing(candidates, peer_public_key),
+    )
+    .await
+    {
+        Ok(Ok((connection, candidate))) => {
+            Some((QuicPeerChannel::new(connection, ConnectRole::Dial), Some(candidate)))
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(
+                peer = %peer_device_id,
+                failure = error.category(),
+                "no candidate answered a direct path probe"
+            );
+            None
+        }
+        Err(_elapsed) => {
+            tracing::debug!(peer = %peer_device_id, "direct path probe timed out");
+            None
+        }
+    }
+}
+
+/// Opens a relay path to `peer_device_id` and dials the peer over it.
+///
+/// The synthetic address the transport hands back is dialed exactly like any
+/// other endpoint: the handshake, the peer-key pinning and the authorization
+/// checks are the same ones a direct dial runs, because to everything above
+/// the transport hub this *is* a direct dial. What differs is only where the
+/// packets physically go.
+///
+/// `None` covers every ordinary reason a relay is unavailable -- no
+/// relay-capable peer, no grant, the relay refusing admission, or the peer
+/// not answering over the path once it exists. A relay session opened for a
+/// dial that then fails is closed again here rather than left occupying a
+/// slot on the relaying device.
+async fn connect_via_relay(
+    state: &Arc<DaemonState>,
+    endpoint: &Arc<QuicPeerEndpoint>,
+    peer_device_id: &str,
+    peer_public_key: [u8; 32],
+    role: ConnectRole,
+) -> Option<Established> {
+    if role != ConnectRole::Dial {
+        return None;
+    }
+    let opened =
+        crate::relay_carrier::open_relay_path(state, peer_device_id, &peer_public_key).await?;
+    let synthetic = opened.path.synthetic_addr();
+    match tokio::time::timeout(
+        PATH_PROBE_TIMEOUT,
+        endpoint.connect(synthetic, peer_public_key),
+    )
+    .await
+    {
+        Ok(Ok(connection)) => Some(Established::from_connection(
+            QuicPeerChannel::new(connection, ConnectRole::Dial),
+            None,
+            Some(opened),
+        )),
+        Ok(Err(error)) => {
+            tracing::debug!(
+                peer = %peer_device_id,
+                failure = error.category(),
+                "the peer did not answer a dial over a relay path"
+            );
+            crate::relay_carrier::close_relay_path(state, &opened);
+            None
+        }
+        Err(_elapsed) => {
+            tracing::debug!(peer = %peer_device_id, "a dial over a relay path timed out");
+            crate::relay_carrier::close_relay_path(state, &opened);
+            None
+        }
+    }
+}
+
+/// Dials a relay-capable peer that this device is supposed to be *accepting*
+/// from, because nobody is managing to reach this device.
+///
+/// Which side dials is fixed by device-id ordering so a pair ends up with
+/// one connection rather than two. That rule assumes both sides can be
+/// reached, and says nothing useful when one cannot: a device whose
+/// advertised address does not work -- a stale endpoint, a NAT that has
+/// stopped forwarding, an address the coordination plane observed on a
+/// network it is no longer on -- will never be dialled successfully by
+/// anyone, and if it only ever waits, it drops out of the mesh entirely.
+///
+/// The way back in is a relay, and a relay can only forward to a
+/// destination it has a live direct route to. So a device in that position
+/// has to establish that route itself. It dials **only** its relay-capable
+/// peers, and that restriction is the whole design rather than a
+/// convenience:
+///
+/// - it is sufficient. Once a relay can reach this device, every other peer
+///   can reach it through that relay, which is what relays are for.
+/// - it is necessary to stop there. Dialling every peer would mean dialling
+///   the very peers that are supposed to be dialling this device, which is
+///   how a pair ends up with two connections and each side's session on a
+///   different one.
+///
+/// Only reached after this device's own accept has already timed out for
+/// this peer and no relay path was available, so it is a last resort rather
+/// than a second opinion. The peer, for its part, claims the resulting
+/// connection from its inbox once its own dial has failed -- see
+/// `connect_to_peer`'s dialling arm.
+async fn connect_to_relay_anchor(
+    state: &Arc<DaemonState>,
+    endpoint: &Arc<QuicPeerEndpoint>,
+    spec: &PeerConnectSpec,
+    peer_device_id: &str,
+    peer_public_key: [u8; 32],
+    role: ConnectRole,
+) -> Option<Established> {
+    if role != ConnectRole::Accept {
+        return None;
+    }
+    if !state.peer_relay_capability(peer_device_id).is_capable() {
+        return None;
+    }
+    if spec.candidates.is_empty() {
+        return None;
+    }
+    let (channel, dialed) =
+        probe_direct(endpoint, peer_device_id, peer_public_key, &spec.candidates).await?;
+    tracing::info!(
+        peer = %peer_device_id,
+        "dialled a relay-capable peer because nothing is reaching this device"
+    );
+    Some(Established::from_connection(channel, dialed, None))
+}
+
+/// Resolves once the peer itself has established a NEW, already-selected
+/// inbound connection to this device, and never at all on the dialing
+/// side.
+///
+/// The accepting side of a generation has neither of `run_one_generation`'s
+/// other two watch arms available to it: `await_better_path` returns
+/// `pending` for a non-`Dial` role (probing is a dial like any other, and
+/// which side dials is fixed), and `await_relay_session_loss` also returns
+/// `pending` for it, because `Established::relay` is only ever `Some` on
+/// the side that opened the relay session -- the destination holds
+/// nothing to watch (see that field's own doc comment). Without this arm,
+/// an accepting generation has nothing to select on but its own still-
+/// running `PeerSyncSession`, so when the peer's OWN generation ends
+/// (its relay session lost, most commonly) and it reconnects, the fresh
+/// connection it dials sits claimed-but-unclaimed in `QuicPeerEndpoint`'s
+/// own per-peer inbound queue (see that struct's `accept`'s own doc
+/// comment) with nothing on this side ever calling `accept` again to take
+/// it -- until the stale generation's QUIC connection eventually hits its
+/// own idle timeout the slow way, tens of seconds later.
+///
+/// This is a generation *replacement*, not a *better path*: the new
+/// connection is not a direct/relay upgrade this device sought out, it is
+/// the peer's own selection-preface-confirmed reconnection, so it flows
+/// through the same `GenerationOutcome::Replaced` machinery
+/// `await_better_path` already uses rather than becoming a new outcome
+/// variant. `Established::from_connection` derives `RouteKind` from the
+/// connection's own remote address exactly as it does for any other
+/// accepted connection, so this covers a relayed reconnect or a direct
+/// one identically.
+async fn await_inbound_replacement(
+    endpoint: &Arc<QuicPeerEndpoint>,
+    peer_public_key: [u8; 32],
+    role: ConnectRole,
+) -> Established {
+    if role != ConnectRole::Accept {
+        return std::future::pending().await;
+    }
+    match endpoint.accept(peer_public_key).await {
+        Some(connection) => Established::from_connection(
+            QuicPeerChannel::new(connection, ConnectRole::Accept),
+            None,
+            None,
+        ),
+        // `None` only means this device's own endpoint is gone (shutdown).
+        // Nothing for this arm to report -- `running`'s own end (the
+        // session it drives shares the same dead endpoint) is what should
+        // decide the outcome, not a spurious `Replaced` racing it.
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolves once the relay session carrying `established` has gone, and
+/// never at all for a direct generation.
+///
+/// A relay session ends on its own schedule -- its grant expires, the relay
+/// closes it, or the relay itself disconnects -- and when it does, the QUIC
+/// connection riding it has no path underneath it any more. Noticing by
+/// polling this device's own bookkeeping is what makes that prompt; waiting
+/// for the connection's idle timeout to notice instead would leave a peer
+/// looking connected for tens of seconds after it demonstrably is not.
+async fn await_relay_session_loss(state: &Arc<DaemonState>, established: &Established) {
+    let Some(relay) = &established.relay else {
+        return std::future::pending().await;
+    };
+    let mut tick = tokio::time::interval(RELAY_SESSION_LIVENESS_INTERVAL);
+    loop {
+        tick.tick().await;
+        if state.requester_relay_path(&relay.relay_device_id, relay.session_id).is_none() {
+            return;
+        }
+    }
+}
+
+/// Reports a failed connection attempt: the status entry stays so
+/// `yadorilink status` shows why, and this peer's supervisor retries after
+/// its own backoff.
+fn report_unreachable(
+    state: &Arc<DaemonState>,
+    peer_device_id: &str,
+    category: UnreachableCategory,
+) {
+    set_reachability(state, peer_device_id, PeerReachability::Unreachable(category));
+    record_reachability_transition(
+        state,
+        peer_device_id,
+        PeerReachability::Unreachable(category),
+        None,
+    );
+}
+
+/// How long the dialling side looks for a connection the peer made in the
+/// other direction, once none of the peer's own advertised addresses have
+/// answered.
+///
+/// A check rather than a wait: such a connection has either already been
+/// accepted and queued, in which case this returns immediately, or it has
+/// not, in which case there is nothing to wait for and the next attempt will
+/// find it. Waiting longer would only add latency to the ordinary case where
+/// the peer is simply gone.
+const QUEUED_INBOUND_GRACE: Duration = Duration::from_millis(100);
+
+/// How long one connection attempt may take before this supervisor gives up
+/// and backs off.
+///
+/// Derived from the transport's own worst case rather than restated as a
+/// number, because the relation between the two is what matters and a
+/// literal would let them drift apart -- silently, and in the direction that
+/// removes behaviour. A race of candidates that all stay silent takes
+/// [`RACED_DIAL_WORST_CASE`](yadorilink_transport::RACED_DIAL_WORST_CASE):
+/// the last candidate starts one stagger interval per predecessor after the
+/// first, and then costs a whole handshake timeout of its own. Anything
+/// shorter and this supervisor's clock -- not the transport -- ends every
+/// failing attempt, which does two bad things: it throws away the
+/// transport's reason for the failure, and it makes everything the attempt
+/// does *after* the race unreachable rather than merely late.
+///
+/// The accepting side needs a bound for a different reason: it is waiting on
+/// a peer that may never dial, and without one it would wait forever, never
+/// re-reading a netmap update that changed the peer's parameters.
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(
+    yadorilink_transport::RACED_DIAL_WORST_CASE.as_millis() as u64
+        + QUEUED_INBOUND_GRACE.as_millis() as u64
+        + 5_000,
+);
+
+/// The relation the constant above exists to hold, checked at compile time
+/// rather than left to the arithmetic staying right. The previous value was
+/// a literal that happened to equal the handshake timeout, and nothing said
+/// so; this fails the build instead.
+const _: () = assert!(
+    CONNECT_ATTEMPT_TIMEOUT.as_millis()
+        > yadorilink_transport::RACED_DIAL_WORST_CASE.as_millis(),
+    "a connection attempt must outlast the candidate race it contains, or the race's own \
+     failure -- and everything the attempt does after it -- is unreachable"
+);
 
 /// Records the connection trace for a reachability transition. Only the
 /// terminal states are worth a trace; `Connecting` is a transient racing
@@ -2257,26 +3116,6 @@ fn record_reachability_transition(
     }
 }
 
-// depends on the transport's reachability/candidate-class type shapes.
-fn map_transport_reachability(
-    reachability: &yadorilink_transport::PeerReachability,
-) -> PeerReachability {
-    use yadorilink_transport::PeerReachability as Transport;
-    match reachability {
-        Transport::Connecting { .. } => PeerReachability::Connecting,
-        Transport::Connected { .. } => PeerReachability::Connected(crate::route::RouteKind::Direct),
-        // M3 Pass 6: `PeerChannel`'s own reachability watch reports this
-        // when authenticated WireGuard traffic is flowing but not from a
-        // known direct candidate -- see `yadorilink_transport::
-        // PeerReachability::ConnectedRelay`'s own doc comment for why that
-        // can only mean a relaying peer, never a spoofed source.
-        Transport::ConnectedRelay => PeerReachability::Connected(crate::route::RouteKind::Relay),
-        Transport::Unreachable { category, .. } => {
-            PeerReachability::Unreachable(map_transport_category(category))
-        }
-    }
-}
-
 fn candidate_class_to_address(class: yadorilink_transport::CandidateClass) -> AddressClass {
     use yadorilink_transport::CandidateClass as Transport;
     match class {
@@ -2284,18 +3123,6 @@ fn candidate_class_to_address(class: yadorilink_transport::CandidateClass) -> Ad
         Transport::PortMapped => AddressClass::PortMapped,
         Transport::Ipv6Host => AddressClass::Ipv6,
         Transport::ServerReflexive => AddressClass::ServerReflexive,
-    }
-}
-
-fn map_transport_category(
-    category: &yadorilink_transport::UnreachableCategory,
-) -> UnreachableCategory {
-    use yadorilink_transport::UnreachableCategory as Transport;
-    match category {
-        Transport::NoCandidates => UnreachableCategory::NoCandidates,
-        Transport::NoResponse => UnreachableCategory::NoResponse,
-        Transport::UdpBlocked => UnreachableCategory::UdpBlocked,
-        Transport::HandshakeRefused => UnreachableCategory::HandshakeRefused,
     }
 }
 
@@ -2312,6 +3139,62 @@ fn map_transport_category(
 /// coordination-side authorization is gone and must never be handed back as a
 /// valid write target; the primitive filters those out.
 /// Every `PeerSyncSessionDeps` field this device's own daemon state can
+/// Always-deny relay handler used in place of `DaemonState`'s own
+/// `RelaySessionHandler` impl under the deterministic simulator, where
+/// `relay_forwarder`/`relay_session_handler` are not built at all (they bind
+/// a real UDP socket, which the simulator has no model for -- see
+/// `relay_forwarder`'s module-gating comment in `lib.rs`). Behaviorally
+/// identical to `yadorilink_peer_session::peer_session`'s own internal
+/// default relay handler: every open is refused, data/close are silent
+/// no-ops -- exactly what a device with no relay support at all already
+/// looks like to a peer.
+#[cfg(madsim)]
+struct SimNoRelaySessionHandler;
+
+#[cfg(madsim)]
+impl yadorilink_peer_session::peer_session::RelaySessionHandler for SimNoRelaySessionHandler {
+    fn handle_relay_open<'a>(
+        &'a self,
+        open: yadorilink_sync_wire::RelayOpenFrame,
+        _authenticated_peer_device_id: &'a str,
+        _reply_sink: Arc<dyn yadorilink_peer_session::peer_session::RelayReplySink>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = yadorilink_sync_wire::RelayOpenedFrame> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            yadorilink_sync_wire::RelayOpenedFrame {
+                grant_id: open.grant_id,
+                granted: false,
+                session_id: 0,
+            }
+        })
+    }
+
+    fn handle_relay_data<'a>(
+        &'a self,
+        _data: yadorilink_sync_wire::RelayDataFrame,
+        _authenticated_peer_device_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+
+    fn handle_relay_close<'a>(
+        &'a self,
+        _close: yadorilink_sync_wire::RelayCloseFrame,
+        _authenticated_peer_device_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+
+    fn handle_relay_opened<'a>(
+        &'a self,
+        _opened: yadorilink_sync_wire::RelayOpenedFrame,
+        _authenticated_peer_device_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+}
+
 /// supply, identical for every `PeerSyncSession` this device constructs --
 /// factored out of what used to be two independently-maintained inline
 /// literals (the outbound-connect and inbound-accept paths below) that had
@@ -2338,8 +3221,13 @@ pub(crate) fn peer_sync_session_deps(state: &Arc<DaemonState>) -> PeerSyncSessio
         pending_local_change_flush: state.clone(),
         root_commit_authority_provider: state.clone(),
         // M3 Pass 5: `impl RelaySessionHandler for DaemonState` --
-        // `relay_session_handler.rs`.
+        // `relay_session_handler.rs`. Not built under the deterministic
+        // simulator (see that module's own gating comment in `lib.rs`);
+        // `SimNoRelaySessionHandler` above stands in for it there.
+        #[cfg(not(madsim))]
         relay_session_handler: state.clone(),
+        #[cfg(madsim)]
+        relay_session_handler: Arc::new(SimNoRelaySessionHandler),
         // Admit incoming change-history changes only when this device
         // has pinned the author's signing key and the author is an
         // authorized writer for the change's group — both mirrored from
@@ -2417,17 +3305,19 @@ pub(crate) fn sync_roots_for_groups(
 // simulation, and the netmap WebSocket subscription above rides a live
 // connection to it. So instead of discovering peers over that stream, an
 // in-sim harness injects a *static* netmap
-// directly (each peer's device id, public key, and pre-bound direct
-// endpoint), and this seam opens the exact same `PeerChannel` /
-// `PeerSyncSession` those discovered peers would have gotten -- every stage
-// below `run_netmap_attempt` (session construction, forwarding, rate
-// limiting, materialization) is the identical production code path.
+// directly (each peer's device id, keys, and pre-bound direct
+// endpoint), and this seam opens a real, mutually authenticated peer
+// connection and the exact same `PeerSyncSession` those discovered peers
+// would have gotten -- every stage below `run_netmap_attempt` (session
+// construction, forwarding, rate limiting, materialization) is the
+// identical production code path.
 //
 // The pre-bound-socket pairing mirrors the way the sync-core two-device DST
 // harness pairs devices in-sim: two UDP sockets bound on the loopback of a
-// single simulation node, each side dialing the other's address. All of
-// this is compiled only under `--cfg madsim`; production has no such seam
-// and its behavior is byte-for-byte unchanged.
+// single simulation node, each device's QUIC endpoint sharing its own
+// socket, and the pair's one connection opened from whichever side
+// `connect_role` names. All of this is compiled only under `--cfg madsim`;
+// production has no such seam and its behavior is byte-for-byte unchanged.
 
 /// One already-authorized peer in a harness-supplied static netmap, plus
 /// the pre-bound local UDP socket this device uses to reach it. Compiled
@@ -2435,12 +3325,21 @@ pub(crate) fn sync_roots_for_groups(
 #[cfg(madsim)]
 pub struct SimPeer {
     pub device_id: String,
-    pub public_key: boringtun::x25519::PublicKey,
     pub shared_group_ids: Vec<String>,
-    /// The peer's direct endpoint address(es) to dial. The harness has told
-    /// the peer this device's single shared-socket address (see
-    /// [`SimDiscovery::local_socket`]) as its candidate, so both sides can dial
-    /// each other directly.
+    /// This peer's pinned Ed25519 device key. The real netmap carries one
+    /// per device: it authenticates the connection to that peer, and the
+    /// change authenticator refuses to admit a `Change` it cannot verify
+    /// against the claimed
+    /// author's pinned key, so a harness that omits it cannot reach
+    /// convergence at all. Supplied by the harness here because the
+    /// simulator has no coordination plane to learn it from.
+    pub signing_public_key: [u8; 32],
+    /// The peer's direct endpoint address(es). The harness gives each side
+    /// the other's single shared-socket address (see
+    /// [`SimDiscovery::local_socket`]), so whichever side `connect_role`
+    /// names as the dialer has somewhere to dial. Supplied to both sides
+    /// rather than only to the dialer because which side that is depends on
+    /// the device ids, which the harness does not need to reason about.
     pub peer_candidates: Vec<SocketAddr>,
 }
 
@@ -2450,14 +3349,51 @@ pub struct SimPeer {
 /// real [`run`].
 #[cfg(madsim)]
 pub struct SimDiscovery {
-    pub keypair: Arc<DeviceKeyPair>,
+    /// This device's own Ed25519 change-history signing key. Production
+    /// loads this from disk next to the transport keypair and wires it in
+    /// `app::run`; the simulator's daemons have no on-disk device config, so
+    /// the harness supplies it here instead. Without it a linked folder
+    /// fails closed -- `ensure_initial_change_history` treats a registered
+    /// device with no signing key as corrupt state rather than quietly
+    /// indexing local edits that would never become `Change`s.
+    pub signing_key: ed25519_dalek::SigningKey,
     pub local_device_id: String,
     pub peers: Vec<SimPeer>,
+    /// The Ed25519 public key of the policy signing authority that produced
+    /// [`group_policy_logs`](Self::group_policy_logs). This is the trust root
+    /// `record_group_policy_states` pins and verifies every policy record
+    /// against, exactly as it does with the service key a real netmap update
+    /// carries. The harness holds the matching private key; the simulated
+    /// daemon never sees it, just as a production daemon never sees the
+    /// coordination plane's.
+    pub policy_service_public_key: [u8; 32],
+    /// The signed group policy logs the coordination plane would have
+    /// delivered alongside the netmap: for each group this device takes part
+    /// in, the hash-chained Grant/Revoke chain naming its authorized writers.
+    ///
+    /// Without these a simulated group is *introduced* (a peer is named as a
+    /// writer for it, and it is linked locally) but has no verified
+    /// `GroupPolicyState`, which is precisely the combination
+    /// `DaemonState::resolve_group_policy` answers with `Withhold` -- a
+    /// deliberate fail-closed state meaning "this group's real policy has not
+    /// been resolved yet this run". The daemon then revokes the group from
+    /// every session and drops every heads announcement for it, so nothing
+    /// ever converges. Supplying the signed logs here lets the simulator reach
+    /// the same `Verified` resolution a shipped daemon reaches, through the
+    /// same verification and anti-rollback code.
+    pub group_policy_logs: Vec<crate::change_policy::GroupPolicyLog>,
     /// This device's single pre-bound shared UDP socket (one per device, not
     /// one per peer). Every peer channel demultiplexes off it, and each peer's
     /// candidate list points at its address.
     pub local_socket: tokio::net::UdpSocket,
 }
+
+/// The coordination endpoint the simulated daemon pins its policy authority
+/// key under. Production uses `DaemonConfig::coordination_addr`; the simulator
+/// has no coordination plane to address, but the pinning code is keyed by
+/// endpoint, so it needs a stable, non-colliding name to key by.
+#[cfg(madsim)]
+const SIM_COORDINATION_ENDPOINT: &str = "sim://deterministic-simulation";
 
 /// The `--cfg madsim` counterpart to [`run`]: opens a `PeerChannel` /
 /// `PeerSyncSession` for each peer in the harness-supplied static netmap,
@@ -2470,31 +3406,98 @@ pub struct SimDiscovery {
 pub async fn run_sim(discovery: SimDiscovery, state: Arc<DaemonState>) -> Result<(), DaemonError> {
     let session_index = Arc::new(AtomicU32::new(0));
     let diff_state = NetmapDiffState::new();
-    let SimDiscovery { keypair, local_device_id, peers, local_socket } = discovery;
+    let SimDiscovery {
+        signing_key,
+        local_device_id,
+        peers,
+        policy_service_public_key,
+        group_policy_logs,
+        local_socket,
+    } = discovery;
 
-    // Seed the device static key (for the hub's MAC1 gate), then install this
-    // device's single shared socket before opening any channel so every peer
-    // session demultiplexes off the one binding.
-    let device_public = boringtun::x25519::PublicKey::from(&keypair.secret);
-    state.set_device_static_public(device_public.to_bytes());
-    // M3 Pass 2: closes the O(N^2) handshake-fan-in cost measured by
-    // `handshake_fan_in.rs` -- see `DaemonState::set_device_static_secret`'s
-    // own doc comment. The DST/madsim harness benefits from this the same
-    // as production: a simulated many-peers-to-one-device fan-in scenario
-    // should exercise the real O(1) identification path too, not silently
-    // fall back to broadcast just because this is a test harness.
-    state.set_device_static_secret(keypair.secret.clone());
-    let hub = yadorilink_transport::TransportHub::from_socket(local_socket, Some(device_public));
-    hub.set_device_identity(keypair.secret.clone());
-    state.set_shared_socket(hub);
+    // Same wiring `app::run` does for a registered production device, from
+    // the harness instead of from disk -- see `SimDiscovery::signing_key`.
+    // Cloned first because the same Ed25519 key does double duty: it signs
+    // change history, and it is the identity that authenticates this
+    // device's QUIC connections. That reuse is deliberate -- it is the only
+    // signature-capable key a device already holds and already distributes
+    // through the netmap, and TLS 1.3 domain-separates its own signatures by
+    // construction, so a transcript signature cannot be replayed as
+    // authorship.
+    let quic_device_key = yadorilink_transport::DeviceSigningKeyPair {
+        verifying: signing_key.verifying_key(),
+        signing: signing_key.clone(),
+    };
+    state.set_device_signing_key(signing_key);
 
+    // Install the harness-supplied group policy through the SAME function the
+    // netmap subscription calls -- signature verification against the pinned
+    // authority key, the persisted anti-rollback watermark, and the stale/
+    // trusted bookkeeping all included. Nothing here reaches around those
+    // checks: the harness plays the coordination plane by signing a real
+    // policy log, and this daemon verifies it like any other.
+    //
+    // This has to happen before any peer metadata is applied below, because
+    // `apply_authoritative_peer_metadata` -> `effective_servable_groups`
+    // withholds any group whose policy resolves to `Withhold`, and a group
+    // with no verified policy state that some peer is already a writer for
+    // resolves to exactly that.
+    let mut service_key_pins = load_service_key_pins()?;
+    record_group_policy_states(
+        &state,
+        SIM_COORDINATION_ENDPOINT,
+        &mut service_key_pins,
+        &policy_service_public_key,
+        &group_policy_logs,
+    )?;
+
+    // This device's single shared socket, installed before any connection is
+    // opened so every peer rides the one binding.
+    let hub = yadorilink_transport::TransportHub::from_socket(local_socket);
+    state.set_shared_socket(hub.clone());
+
+    // One QUIC endpoint for the whole device, over that same one socket --
+    // not one per peer. A `quinn::Endpoint` is the demultiplexer that owns a
+    // UDP binding; peers are separated inside it by QUIC connection id, so
+    // there is no need for a second endpoint or a second binding, and a
+    // NAT candidate is only meaningful because it names the exact socket data
+    // flows on.
+    let quic_endpoint = QuicPeerEndpoint::new(hub, quic_device_key)?;
+    // The static sim netmap is this harness's whole coordination plane, so
+    // this is its one and only netmap push: every peer it names becomes
+    // authorized before any connection can arrive, and nobody else ever is.
+    // The endpoint is built before this, authorizing nobody, so there is no
+    // window in which it would accept an unknown device.
+    quic_endpoint.replace_authorized(peers.iter().map(|peer| peer.signing_public_key));
+
+    // Shared across peers exactly as the real netmap pass shares it, so one
+    // group's retained-history validation is not repeated per peer.
+    let validation_cache = std::sync::Mutex::new(HashMap::new());
     for peer in peers {
+        // The static sim netmap is this harness's whole coordination plane, so
+        // it has to produce what a real netmap pass produces: the peer's
+        // pinned signing key, and its authorized groups run through the same
+        // policy + retained-history validator. Calling the production function
+        // rather than setting the fields directly is deliberate -- a harness
+        // that authorized groups by a shortcut would be testing a path no
+        // shipped daemon takes, and `effective_servable_groups` is exactly
+        // where a group gets withheld for a reason worth catching in
+        // simulation.
+        let authorized_groups: HashSet<String> = peer.shared_group_ids.iter().cloned().collect();
+        let effective_group_ids = apply_authoritative_peer_metadata(
+            &state,
+            &peer.device_id,
+            Some(peer.signing_public_key),
+            &authorized_groups,
+            &HashSet::new(),
+            false,
+            &validation_cache,
+        );
         diff_state.desired_peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(
             peer.device_id.clone(),
             PeerConnectSpec {
-                peer_public: peer.public_key,
                 candidates: peer.peer_candidates,
-                effective_group_ids: peer.shared_group_ids,
+                effective_group_ids: effective_group_ids.into_iter().collect(),
             },
         );
         if peer_already_connected(&state, &peer.device_id)
@@ -2504,9 +3507,10 @@ pub async fn run_sim(discovery: SimDiscovery, state: Arc<DaemonState>) -> Result
         }
         let handle = spawn_direct_peer_session(
             state.clone(),
-            keypair.clone(),
             local_device_id.clone(),
             peer.device_id.clone(),
+            peer.signing_public_key,
+            quic_endpoint.clone(),
             diff_state.clone(),
             session_index.clone(),
         );
@@ -2531,11 +3535,13 @@ pub async fn run_sim(discovery: SimDiscovery, state: Arc<DaemonState>) -> Result
 /// function's own doc comment for why the reconnect loop runs inline in
 /// this one task rather than via `supervise::spawn_restarting`.
 #[cfg(madsim)]
+#[allow(clippy::too_many_arguments)]
 fn spawn_direct_peer_session(
     state: Arc<DaemonState>,
-    keypair: Arc<DeviceKeyPair>,
     local_device_id: String,
     peer_device_id: String,
+    peer_signing_public_key: [u8; 32],
+    quic_endpoint: Arc<QuicPeerEndpoint>,
     diff_state: NetmapDiffState,
     session_index: Arc<AtomicU32>,
 ) -> JoinHandle<()> {
@@ -2546,9 +3552,10 @@ fn spawn_direct_peer_session(
             let this_generation = session_index.fetch_add(1, Ordering::Relaxed);
             run_one_direct_peer_session_attempt(
                 &state,
-                &keypair,
                 &local_device_id,
                 &peer_device_id,
+                peer_signing_public_key,
+                &quic_endpoint,
                 &diff_state,
                 this_generation,
             )
@@ -2575,11 +3582,13 @@ fn spawn_direct_peer_session(
 /// One connect-then-run cycle of [`spawn_direct_peer_session`]'s reconnect
 /// loop -- mirrors `run_one_peer_session_attempt`'s own doc comment.
 #[cfg(madsim)]
+#[allow(clippy::too_many_arguments)]
 async fn run_one_direct_peer_session_attempt(
     state: &Arc<DaemonState>,
-    keypair: &Arc<DeviceKeyPair>,
     local_device_id: &str,
     peer_device_id: &str,
+    peer_signing_public_key: [u8; 32],
+    quic_endpoint: &Arc<QuicPeerEndpoint>,
     diff_state: &NetmapDiffState,
     session_index: u32,
 ) {
@@ -2599,42 +3608,33 @@ async fn run_one_direct_peer_session_attempt(
 
     mark_connecting(state, peer_device_id);
 
-    // `run_sim` installed the device's shared socket before spawning any
-    // session, so it is always present here.
-    let shared =
-        state.shared_socket().expect("run_sim installs the shared socket before opening channels");
-
-    // M3 Pass 6: same relay-carrier wiring as the production path above.
-    let channel = match PeerChannel::connect_with_relay(
-        keypair.secret.clone(),
-        spec.peer_public,
-        session_index,
-        spec.candidates,
-        shared,
-        state.clone() as Arc<dyn yadorilink_transport::RelayCarrier>,
+    // The SAME connect path production takes, deliberately: the dial rule
+    // and the candidate walk are one implementation, so a simulated run
+    // exercises the shipped one rather than a parallel copy that could drift
+    // from it.
+    let role = connect_role(local_device_id, peer_device_id);
+    let channel = match connect_to_peer(
+        quic_endpoint,
+        role,
+        peer_device_id,
+        peer_signing_public_key,
+        &spec.candidates,
     )
     .await
     {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            tracing::warn!(peer = %peer_device_id, error = %e, "failed to establish direct peer channel in-sim");
+        Ok((channel, _dialed_candidate)) => channel,
+        Err(_category) => {
             end_session(state, peer_device_id);
             return;
         }
     };
 
-    // See `insert_channel_revoking_superseded`'s own doc comment (M5-A
-    // soak-closure finding) for why a plain `insert` here is unsafe.
-    diff_state.insert_channel_revoking_superseded(
-        peer_device_id.to_string(),
-        channel.clone(),
-        session_index,
-    );
-
-    // Reflect the channel's live reachability into status: it starts
-    // `Connecting` while candidates race, becomes `Connected` once a
-    // direct path is confirmed, or `Unreachable` if the race is lost.
-    tokio::spawn(poll_reachability(state.clone(), peer_device_id.to_string(), channel.clone()));
+    // A QUIC connection either exists or it does not, so there is no
+    // candidate race to reflect and no separate reachability watch to poll:
+    // reaching this point *is* the confirmed direct path. When the
+    // connection dies, the session's `recv` ends, the session returns, and
+    // `end_session_if_current` below clears the status.
+    set_reachability(state, peer_device_id, PeerReachability::Connected(RouteKind::Direct));
 
     // The static netmap can race the harness linking the shared folder
     // (in production a device knows its links before a netmap peer
@@ -2673,23 +3673,19 @@ async fn run_one_direct_peer_session_attempt(
         tracing::warn!(peer = %peer_device_id, generation = session_index, error = %e, "peer sync session ended with an error");
     }
     end_session_if_current(state, peer_device_id, &session);
-    // See `run_one_peer_session_attempt`'s identical fix for why `revoke()`
-    // (not just dropping the `Arc`) is required here.
-    let removed_channel = diff_state
-        .channels
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(peer_device_id);
-    if let Some(channel) = removed_channel {
-        channel.revoke();
-    }
+    // No channel registry to clean up, and nothing to revoke: the session
+    // and this scope held the only handles to the `QuicPeerChannel`, and its
+    // `Drop` closes the connection and stops its stream driver. The
+    // zombie-channel class that made `revoke()` mandatory for the transport
+    // this replaces cannot arise -- a QUIC connection is not registered in a
+    // per-key demux table that a superseded generation could go on answering
+    // from.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::replica_coordinator::ReplicaCoordinator;
-    use boringtun::x25519::{PublicKey as X25519PublicKey, StaticSecret};
     use std::net::SocketAddr as StdSocketAddr;
     use yadorilink_local_storage::FsBlockStore;
 
@@ -2730,25 +3726,38 @@ mod tests {
         assert_eq!(decision, PolicyServiceKeyPinDecision::RotationRequired);
     }
 
-    /// The Ed25519 signing key is pinned with the same refuse-on-change
-    /// rule as the WireGuard key; a peer that never advertised one is simply
-    /// accepted (change-history signing is unavailable with it, not an
-    /// error). The persisting `NewlyPinned` path is exercised by the
-    /// WireGuard-key store above, which shares the same code.
+    /// `pin_peer_signing_key` is a thin wrapper around `verify_or_pin_peer_key`,
+    /// so its refuse-on-change behavior is the same generic pin/verify logic
+    /// `peer_key_pinning_detects_key_changes` above already exercises
+    /// directly; the persisting `NewlyPinned` path is covered there.
     #[test]
-    fn signing_key_pinning_refuses_a_changed_key_and_tolerates_absence() {
+    fn device_key_pinning_refuses_a_changed_key() {
         let mut pins = HashMap::new();
-
-        // No signing key advertised: nothing to pin, peer accepted.
-        assert!(!pin_peer_signing_key(&mut pins, "device-a", None).unwrap());
-        assert!(pins.is_empty());
 
         // Already-pinned matching key: accepted, no change.
         pins.insert("device-a".to_string(), hex::encode([7u8; 32]));
-        assert!(!pin_peer_signing_key(&mut pins, "device-a", Some(vec![7u8; 32])).unwrap());
+        assert!(!pin_peer_signing_key(&mut pins, "device-a", &[7u8; 32]).unwrap());
 
         // Changed key: refused.
-        assert!(pin_peer_signing_key(&mut pins, "device-a", Some(vec![9u8; 32])).unwrap());
+        assert!(pin_peer_signing_key(&mut pins, "device-a", &[9u8; 32]).unwrap());
+    }
+
+    /// Everything that is not a 32-byte Ed25519 key is one outcome:
+    /// unusable. There is no shape of netmap entry in which a peer without
+    /// a device key is admissible, because that key is what authenticates
+    /// its transport -- so absence is not a weaker form of presence, it is
+    /// an invalid entry.
+    #[test]
+    fn a_peer_without_a_usable_device_key_is_not_admissible() {
+        use base64::Engine;
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+        assert_eq!(decode_peer_signing_key(None), None, "absent");
+        assert_eq!(decode_peer_signing_key(Some("")), None, "empty");
+        assert_eq!(decode_peer_signing_key(Some("not base64!!")), None, "undecodable");
+        assert_eq!(decode_peer_signing_key(Some(&encode(&[1u8; 31]))), None, "too short");
+        assert_eq!(decode_peer_signing_key(Some(&encode(&[1u8; 33]))), None, "too long");
+        assert_eq!(decode_peer_signing_key(Some(&encode(&[1u8; 32]))), Some([1u8; 32]));
     }
 
     /// The netmap WebSocket URL builder's loopback/scheme validation:
@@ -2790,8 +3799,8 @@ mod tests {
     // couple of these tests build one real (but peer-less) `PeerChannel`
     // against a candidate address that never answers — a lightweight "fake
     // transport": `PeerChannel::connect` registers on the shared socket and
-    // spawns its actor without blocking on a WireGuard handshake with a live
-    // peer, so no second device is needed.
+    // spawns its actor without blocking on completing a handshake with a
+    // live peer, so no second device is needed.
 
     fn test_state() -> Arc<DaemonState> {
         let store_dir = tempfile::tempdir().unwrap();
@@ -2867,35 +3876,148 @@ mod tests {
         assert_eq!(roots.get("group-2"), Some(&PathBuf::from("/home/alice/Docs")));
     }
 
-    fn gen_keypair() -> (StaticSecret, X25519PublicKey) {
-        let mut bytes = [0u8; 32];
-        rand::fill(&mut bytes);
-        let secret = StaticSecret::from(bytes);
-        let public = X25519PublicKey::from(&secret);
-        (secret, public)
+    /// One live QUIC channel, on a real connection between two loopback
+    /// endpoints created for it.
+    ///
+    /// These are session-lifecycle, teardown and registry tests: what they
+    /// need is a channel object with the production type and the production
+    /// lifecycle, not one whose bytes go anywhere. The accepting side is
+    /// deliberately dropped, so nothing is ever read off the other end.
+    async fn fake_channel() -> Arc<QuicPeerChannel> {
+        async fn device() -> (Arc<QuicPeerEndpoint>, [u8; 32], StdSocketAddr) {
+            let hub = yadorilink_transport::TransportHub::bind(
+                (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            )
+            .await
+            .unwrap();
+            let addr = hub.local_addr();
+            let signing = DeviceSigningKeyPair::generate();
+            let public = signing.public_bytes();
+            (QuicPeerEndpoint::new(hub, signing).unwrap(), public, addr)
+        }
+        let (dialer, dialer_key, _) = device().await;
+        let (acceptor, acceptor_key, acceptor_addr) = device().await;
+        dialer.authorize(acceptor_key);
+        acceptor.authorize(dialer_key);
+        let connection = tokio::time::timeout(
+            Duration::from_secs(10),
+            dialer.connect(acceptor_addr, acceptor_key),
+        )
+        .await
+        .expect("the dial must resolve")
+        .expect("the dial must succeed");
+        QuicPeerChannel::new(connection, ConnectRole::Dial)
     }
 
-    /// A `PeerChannel` that's real enough to exercise `state.peers.sessions`'s
-    /// concrete type and to be handed to `poll_reachability`, but doesn't
-    /// need (or wait for) an actual peer on the other end — its candidate
-    /// address never answers, so the channel just races it and stays
-    /// unconnected, which is all these lifecycle/teardown tests need.
-    async fn fake_channel() -> Arc<PeerChannel> {
-        let (secret, _public) = gen_keypair();
-        let (_peer_secret, peer_public) = gen_keypair();
-        let candidate: StdSocketAddr = "127.0.0.1:9".parse().unwrap();
-        let shared = yadorilink_transport::TransportHub::bind(
+    /// The accept-side generation-replacement fix this test exists for:
+    /// `await_inbound_replacement` must claim a peer's freshly-dialed,
+    /// already-selected second connection while an earlier one to the
+    /// same peer is still live -- not only after that earlier one ends.
+    /// Before this fix, `run_one_generation`'s select had nothing to
+    /// notice a second inbound connection with (`await_better_path`/
+    /// `await_relay_session_loss` both return `pending` for a non-`Dial`
+    /// role), so the fresh connection would sit unclaimed in
+    /// `QuicPeerEndpoint`'s own per-peer inbound queue until the stale
+    /// generation's QUIC connection hit its own idle timeout.
+    ///
+    /// The 10s bound is deliberately far under `PEER_IDLE_TIMEOUT`'s 30s:
+    /// a test that only asserted "eventually reconnects" would still pass
+    /// via that slow path, silently reintroducing the tens-of-seconds
+    /// stall this fix exists to remove.
+    #[tokio::test]
+    async fn accept_side_claims_a_fresh_selected_connection_without_waiting_for_the_old_one_to_end()
+    {
+        async fn device() -> (Arc<QuicPeerEndpoint>, [u8; 32], StdSocketAddr) {
+            let hub = yadorilink_transport::TransportHub::bind(
+                (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            )
+            .await
+            .unwrap();
+            let addr = hub.local_addr();
+            let signing = DeviceSigningKeyPair::generate();
+            let public = signing.public_bytes();
+            (QuicPeerEndpoint::new(hub, signing).unwrap(), public, addr)
+        }
+        let (dialer, dialer_key, _) = device().await;
+        let (acceptor, acceptor_key, acceptor_addr) = device().await;
+        dialer.authorize(acceptor_key);
+        acceptor.authorize(dialer_key);
+
+        // Old generation: dial once, and claim it exactly the way
+        // `run_one_generation`'s own initial `connect_to_peer` call does.
+        let first_connection = tokio::time::timeout(
+            Duration::from_secs(10),
+            dialer.connect(acceptor_addr, acceptor_key),
+        )
+        .await
+        .expect("the first dial must resolve")
+        .expect("the first dial must succeed");
+        let first_accepted = tokio::time::timeout(
+            Duration::from_secs(10),
+            acceptor.accept(dialer_key),
+        )
+        .await
+        .expect("the acceptor must claim the first connection")
+        .expect("the acceptor's endpoint must still be alive");
+        let old_channel = QuicPeerChannel::new(first_accepted, ConnectRole::Accept);
+        // Held for the rest of this test -- nothing here ever closes it,
+        // matching "an earlier connection is still live" exactly.
+        let _first_connection = first_connection;
+
+        // The peer's own reconnect: a second, independent dial to the
+        // same acceptor while the first is still held above.
+        let dialer_for_second = dialer.clone();
+        let second_dial = tokio::spawn(async move {
+            dialer_for_second.connect(acceptor_addr, acceptor_key).await
+        });
+
+        let started = tokio::time::Instant::now();
+        let replacement = tokio::time::timeout(
+            Duration::from_secs(10),
+            await_inbound_replacement(&acceptor, dialer_key, ConnectRole::Accept),
+        )
+        .await
+        .expect(
+            "accept-side replacement must resolve well within the QUIC idle timeout, not by \
+             falling through to it",
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "replacement took {elapsed:?} -- too close to (or past) the 30s idle timeout this \
+             fix exists to avoid waiting for"
+        );
+        assert!(
+            !Arc::ptr_eq(&replacement.channel, &old_channel),
+            "the replacement must be a genuinely distinct connection from the original \
+             generation, not the same one observed twice"
+        );
+
+        second_dial.await.unwrap().expect("the second dial must succeed");
+    }
+
+    /// This device's QUIC endpoint, installed into `diff_state` the way
+    /// `ensure_quic_endpoint` would, so teardown tests can observe the
+    /// authorized set revocation actually acts on.
+    async fn install_test_quic_endpoint(diff_state: &NetmapDiffState) -> Arc<QuicPeerEndpoint> {
+        let hub = yadorilink_transport::TransportHub::bind(
             (std::net::Ipv4Addr::LOCALHOST, 0).into(),
-            None,
         )
         .await
         .unwrap();
-        Arc::new(
-            PeerChannel::connect(secret, peer_public, 0, vec![candidate], shared).await.unwrap(),
-        )
+        let endpoint = QuicPeerEndpoint::new(hub, DeviceSigningKeyPair::generate()).unwrap();
+        diff_state
+            .quic_endpoint
+            .set(endpoint.clone())
+            .unwrap_or_else(|_| panic!("this test installs the endpoint exactly once"));
+        endpoint
     }
 
-    fn fake_session(state: &Arc<DaemonState>, channel: Arc<PeerChannel>) -> Arc<PeerSyncSession> {
+    fn fake_session(
+        state: &Arc<DaemonState>,
+        channel: Arc<QuicPeerChannel>,
+    ) -> Arc<PeerSyncSession> {
         PeerSyncSession::new_with_forwarding(
             channel,
             "local-device".into(),
@@ -3028,13 +4150,13 @@ mod tests {
             "peers": [
                 {
                     "deviceId": "device-b",
-                    "wireguardPublicKeyBase64": "AA==",
+                    "signingPublicKeyBase64": "AA==",
                     "endpoints": [],
                     "sharedGroupIds": []
                 },
                 {
                     "deviceId": "device-b",
-                    "wireguardPublicKeyBase64": "AQ==",
+                    "signingPublicKeyBase64": "AQ==",
                     "endpoints": [],
                     "sharedGroupIds": []
                 }
@@ -3054,13 +4176,13 @@ mod tests {
             "peers": [
                 {
                     "deviceId": "device-b",
-                    "wireguardPublicKeyBase64": "AA==",
+                    "signingPublicKeyBase64": "AA==",
                     "endpoints": [],
                     "sharedGroupIds": []
                 },
                 {
                     "deviceId": "device-c",
-                    "wireguardPublicKeyBase64": "AQ==",
+                    "signingPublicKeyBase64": "AQ==",
                     "endpoints": [],
                     "sharedGroupIds": []
                 }
@@ -3162,13 +4284,15 @@ mod tests {
         }
     }
 
-    /// Cleanup on session drop: ending a session
-    /// removes both the `sessions` and `peer_statuses` entries, and that
-    /// removal is what makes a still-running `poll_reachability` task exit
-    /// (dropping its `Arc<PeerChannel>` clone) instead of polling a dead
-    /// peer forever.
+    /// A session ending must remove BOTH the session and its status entry.
+    ///
+    /// The status entry is the one that used to be easy to leave behind:
+    /// re-marking a peer "disconnected" forever, rather than removing it,
+    /// left `yadorilink status` reporting a peer that no longer has a
+    /// session at all, and kept the session's own transport channel alive
+    /// through the registry entry holding it.
     #[tokio::test]
-    async fn session_end_removes_state_and_stops_the_status_poller() {
+    async fn session_end_removes_both_the_session_and_its_status() {
         let state = test_state();
         let channel = fake_channel().await;
         let session = fake_session(&state, channel.clone());
@@ -3181,9 +4305,6 @@ mod tests {
         );
         state.peers.register_session("device-b".into(), session.clone());
 
-        let poller =
-            tokio::spawn(poll_reachability(state.clone(), "device-b".into(), channel.clone()));
-
         assert!(state.peers.has_session("device-b"));
         assert!(state.peers.reachability("device-b").is_some());
 
@@ -3192,17 +4313,8 @@ mod tests {
         assert!(!state.peers.has_session("device-b"));
         assert!(state.peers.reachability("device-b").is_none());
 
-        // `poll_reachability` only checks every 2s; give it a couple of
-        // ticks to observe the removed entry and exit.
-        tokio::time::timeout(Duration::from_secs(5), poller)
-            .await
-            .expect("poll_reachability task must exit once its peer_statuses entry is removed")
-            .unwrap();
-
-        // Every strong reference this module held (`sessions` entry,
-        // `poll_reachability`'s clone) is gone; only this test's own
-        // `session`/`channel` locals and the channel clone inside
-        // `session` remain.
+        // Every strong reference this module held is gone; only this test's
+        // own locals and the clone inside `session` remain.
         drop(session);
         assert_eq!(Arc::strong_count(&channel), 1);
     }
@@ -3211,7 +4323,7 @@ mod tests {
 
     fn fake_session_for(
         state: &Arc<DaemonState>,
-        channel: Arc<PeerChannel>,
+        channel: Arc<QuicPeerChannel>,
         peer_device_id: &str,
         shared_group_ids: Vec<String>,
     ) -> Arc<PeerSyncSession> {
@@ -3229,16 +4341,20 @@ mod tests {
         )
     }
 
-    /// Registers a fake connected peer the same way `spawn_peer_session`
-    /// would once `PeerChannel::connect` succeeds: `state.peers.sessions`,
-    /// `state.peers.peer_statuses`, and `diff_state.channels` all populated —
-    /// everything `teardown_peer`/`apply_netmap_diff` act on.
+    /// Registers a connected peer the way a successful connect attempt
+    /// would: a live connection in the direct-route registry, a session and
+    /// status entry, its pinned signing key recorded, and that key
+    /// authorized on this device's endpoint -- everything
+    /// `teardown_peer`/`apply_netmap_diff` act on. Returns both halves
+    /// revocation has to reach: the key, and the live connection.
     async fn register_fake_peer(
         state: &Arc<DaemonState>,
         diff_state: &NetmapDiffState,
+        endpoint: &Arc<QuicPeerEndpoint>,
         peer_device_id: &str,
         shared_group_ids: Vec<String>,
-    ) -> Arc<PeerChannel> {
+    ) -> ([u8; 32], Arc<QuicPeerChannel>) {
+        let _ = diff_state;
         let channel = fake_channel().await;
         let session = fake_session_for(state, channel.clone(), peer_device_id, shared_group_ids);
         set_reachability(
@@ -3247,30 +4363,32 @@ mod tests {
             PeerReachability::Connected(crate::route::RouteKind::Direct),
         );
         state.peers.register_session(peer_device_id.to_string(), session);
-        diff_state
-            .channels
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(peer_device_id.to_string(), channel.clone());
-        channel
+        let peer_public_key = DeviceSigningKeyPair::generate().public_bytes();
+        state.record_peer_signing_key(peer_device_id, peer_public_key);
+        endpoint.authorize(peer_public_key);
+        state.set_direct_channel(peer_device_id.to_string(), channel.clone(), 1);
+        (peer_public_key, channel)
     }
 
-    /// A whole-device removal (`diff.removed_devices`) tears
-    /// the tunnel down entirely — `PeerChannel::revoke` is called (handshake-refusal
-    /// primitive; exercised cryptographically for
-    /// real in `yadorilink_transport::peer_channel`'s own tests) — *and*
-    /// immediately drops the peer from `state.peers.sessions`, which is exactly
-    /// what is required: `hydration.rs`'s `candidate_sessions` reads
-    /// `state.peers.sessions` live, so removing it here is what makes the
-    /// device stop being offered as a hydration candidate right away,
-    /// not merely once its session times out on its own.
+    /// A whole-device removal (`diff.removed_devices`) withdraws the
+    /// device's key from the endpoint's authorized set -- which is what
+    /// revocation *is* with raw public keys, there being no CA, CRL or OCSP
+    /// to express it -- *and* immediately drops the peer from
+    /// `state.peers.sessions`. The second half matters on its own:
+    /// `hydration.rs`'s `candidate_sessions` reads that map live, so
+    /// removing it here is what makes a revoked device stop being offered
+    /// as a hydration candidate right away rather than once its session
+    /// times out on its own.
     #[tokio::test]
-    async fn full_device_revocation_tears_down_channel_and_drops_hydration_candidate() {
+    async fn full_device_revocation_withdraws_authorization_and_drops_hydration_candidate() {
         let state = test_state();
         let diff_state = NetmapDiffState::new();
-        let channel =
-            register_fake_peer(&state, &diff_state, "device-b", vec!["group-1".into()]).await;
-        assert!(!channel.is_revoked());
+        let endpoint = install_test_quic_endpoint(&diff_state).await;
+        let (peer_public_key, channel) =
+            register_fake_peer(&state, &diff_state, &endpoint, "device-b", vec!["group-1".into()])
+                .await;
+        assert!(endpoint.is_authorized(&peer_public_key));
+        assert!(channel.is_open());
 
         let diff = NetmapDiff {
             removed_devices: vec!["device-b".to_string()],
@@ -3278,34 +4396,41 @@ mod tests {
         };
         apply_netmap_diff(&diff, &state, &diff_state);
 
-        assert!(channel.is_revoked(), "whole-device revocation must revoke its PeerChannel");
+        assert!(
+            !endpoint.is_authorized(&peer_public_key),
+            "whole-device revocation must withdraw the device's key, so a fresh handshake from \
+             it is refused rather than merely its current connection ended"
+        );
+        assert!(
+            !channel.is_open(),
+            "whole-device revocation must also END the connection the device already has -- \
+             withdrawing the key alone only refuses its NEXT handshake, and would leave a \
+             revoked device's live session carrying traffic until it idled out"
+        );
+        assert!(state.direct_channel("device-b").is_none());
         assert!(
             !state.peers.has_session("device-b"),
             "revoked device must be immediately gone from the peer registry, which hydration's \
              candidate_sessions reads live"
         );
         assert!(state.peers.reachability("device-b").is_none());
-        assert!(!diff_state
-            .channels
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key("device-b"));
     }
 
-    /// A group-edge-only removal (the device is still
-    /// present in `removed_group_edges` but *not* in `removed_devices`,
-    /// because it still shares another group) must leave the
-    /// tunnel/`PeerChannel` up and the session connected — distinct from
-    /// the whole-device case above, proving `apply_netmap_diff` really
-    /// does treat the two differently rather than tearing down on any
-    /// diff entry at all.
+    /// A group-edge-only removal (the device is still present in
+    /// `removed_group_edges` but *not* in `removed_devices`, because it
+    /// still shares another group) must leave the connection authorized and
+    /// the session up -- distinct from the whole-device case above, proving
+    /// `apply_netmap_diff` really does treat the two differently rather
+    /// than tearing down on any diff entry at all.
     #[tokio::test]
-    async fn group_edge_revocation_leaves_tunnel_and_session_up() {
+    async fn group_edge_revocation_leaves_the_connection_and_session_up() {
         let state = test_state();
         let diff_state = NetmapDiffState::new();
-        let channel = register_fake_peer(
+        let endpoint = install_test_quic_endpoint(&diff_state).await;
+        let (peer_public_key, channel) = register_fake_peer(
             &state,
             &diff_state,
+            &endpoint,
             "device-b",
             vec!["group-1".into(), "group-2".into()],
         )
@@ -3318,18 +4443,17 @@ mod tests {
         apply_netmap_diff(&diff, &state, &diff_state);
 
         assert!(
-            !channel.is_revoked(),
-            "a device that still shares another group must keep its tunnel up"
+            endpoint.is_authorized(&peer_public_key),
+            "a device that still shares another group must stay authorized"
+        );
+        assert!(
+            channel.is_open(),
+            "a group-edge-only revocation must leave the connection itself up"
         );
         assert!(
             state.peers.has_session("device-b"),
             "a group-edge-only revocation must not remove the still-authorized session"
         );
-        assert!(diff_state
-            .channels
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key("device-b"));
     }
 
     /// the gap section 2 explicitly left open — a group-edge-only
@@ -3345,9 +4469,11 @@ mod tests {
     async fn group_edge_revocation_calls_session_revoke_group() {
         let state = test_state();
         let diff_state = NetmapDiffState::new();
-        let _channel = register_fake_peer(
+        let endpoint = install_test_quic_endpoint(&diff_state).await;
+        let (_peer_public_key, _channel) = register_fake_peer(
             &state,
             &diff_state,
+            &endpoint,
             "device-b",
             vec!["group-1".into(), "group-2".into()],
         )
@@ -3475,11 +4601,9 @@ mod tests {
     async fn teardown_peer_clears_the_desired_connect_spec() {
         let state = test_state();
         let diff_state = NetmapDiffState::new();
-        let (_secret, peer_public) = gen_keypair();
         diff_state.desired_peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(
             "device-b".to_string(),
             PeerConnectSpec {
-                peer_public,
                 candidates: vec!["127.0.0.1:9".parse().unwrap()],
                 effective_group_ids: vec!["group-1".to_string()],
             },
@@ -3509,56 +4633,301 @@ mod tests {
     async fn run_one_peer_session_attempt_is_a_no_op_with_no_desired_spec() {
         let state = test_state();
         let diff_state = NetmapDiffState::new();
-        let keypair = Arc::new(DeviceKeyPair::generate());
 
-        run_one_peer_session_attempt(&state, &keypair, "local-device", "device-b", &diff_state, 0)
-            .await;
+        run_one_peer_session_attempt(
+            &state,
+            "local-device",
+            "device-b",
+            &diff_state,
+            0,
+            &Arc::new(AtomicU32::new(1)),
+        )
+        .await;
 
         assert!(
             !state.peers.has_session("device-b"),
             "an attempt with no desired connect spec for the peer must never establish a session"
         );
-        assert!(!diff_state
-            .channels
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key("device-b"));
+        assert!(state.direct_channel("device-b").is_none());
+    }
+
+    /// LAN discovery's regression: an announced address must become a
+    /// GENUINE dial candidate through the real production path -- not just
+    /// sit recorded in a side map -- and a connection that actually
+    /// succeeds via one must produce a real `CandidateSource::LocalDiscovery`
+    /// trace entry, not merely the `#[cfg(test)]`-only fixture
+    /// `connection_trace.rs`'s own enum-shape tests construct by hand.
+    /// Exercises `handle_lan_announcement` and `run_one_peer_session_attempt`
+    /// exactly as `run`/`spawn_peer_session` call them, not a hand-rolled
+    /// substitute for either.
+    #[tokio::test]
+    async fn a_lan_discovered_candidate_becomes_a_genuine_dial_candidate_and_is_traced() {
+        let state = test_state();
+        let diff_state = NetmapDiffState::new();
+
+        // The acceptor: a real, independently-bound QUIC endpoint -- the
+        // peer this test's dialer must actually reach.
+        let acceptor_hub =
+            yadorilink_transport::TransportHub::bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+                .await
+                .unwrap();
+        let acceptor_addr = acceptor_hub.local_addr();
+        let acceptor_signing = DeviceSigningKeyPair::generate();
+        let acceptor_key = acceptor_signing.public_bytes();
+        let acceptor = QuicPeerEndpoint::new(acceptor_hub, acceptor_signing).unwrap();
+
+        // The dialer's own endpoint, pre-installed the same way
+        // `install_test_quic_endpoint` does for other tests, authorized
+        // against the acceptor's key exactly as the real handshake needs.
+        let dialer_hub =
+            yadorilink_transport::TransportHub::bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+                .await
+                .unwrap();
+        let dialer_signing = DeviceSigningKeyPair::generate();
+        let dialer_key = dialer_signing.public_bytes();
+        let dialer = QuicPeerEndpoint::new(dialer_hub, dialer_signing).unwrap();
+        dialer.authorize(acceptor_key);
+        acceptor.authorize(dialer_key);
+        diff_state
+            .quic_endpoint
+            .set(dialer)
+            .unwrap_or_else(|_| panic!("this test installs the endpoint exactly once"));
+
+        state.record_peer_signing_key("device-b", acceptor_key);
+
+        // A coordination-provided candidate that goes nowhere -- a discard
+        // address, the same convention
+        // `spawn_peer_session_reconnects_after_the_session_ends_naturally`
+        // uses -- so the ONLY way this attempt can possibly succeed is
+        // through the LAN-discovered candidate below.
+        let discard: StdSocketAddr = "127.0.0.1:9".parse().unwrap();
+        diff_state.desired_peers.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            "device-b".to_string(),
+            PeerConnectSpec { candidates: vec![discard], effective_group_ids: vec![] },
+        );
+
+        // Exercises the real announcement-handling path end to end, not a
+        // hand-populated `lan_discovered` map.
+        handle_lan_announcement(
+            yadorilink_transport::PeerAnnouncement {
+                public_key: acceptor_key,
+                addr: acceptor_addr,
+            },
+            &state,
+            &diff_state,
+        );
+        assert_eq!(
+            diff_state
+                .lan_discovered
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get("device-b")
+                .map(|entries| entries.iter().map(|(addr, _)| *addr).collect::<Vec<_>>()),
+            Some(vec![acceptor_addr]),
+            "a LAN announcement from an already-pinned peer with an existing connect spec must \
+             be recorded as a candidate for that peer"
+        );
+
+        let accept_handle = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(10), acceptor.accept(dialer_key)).await
+        });
+
+        // Spawned, not awaited directly: a successful attempt proceeds into
+        // `run_one_generation`, which runs the session until it ends --
+        // this test only needs the connect-and-trace side effects that
+        // happen before that point, not the session's whole lifetime.
+        let state_for_attempt = state.clone();
+        let diff_state_for_attempt = diff_state.clone();
+        let attempt_handle = tokio::spawn(async move {
+            // "device-a" (not the other tests' usual "local-device") is
+            // deliberate: `connect_role` picks `Dial` only for the
+            // lexicographically smaller id, and this test specifically
+            // needs the Dial branch -- the one that actually consults
+            // `attempt_candidates` -- to be exercised, not the symmetric
+            // "both sides wait to accept, so a timeout proves nothing
+            // about candidates" case a same-shaped-but-role-agnostic test
+            // like the reconnect test above tolerates.
+            run_one_peer_session_attempt(
+                &state_for_attempt,
+                "device-a",
+                "device-b",
+                &diff_state_for_attempt,
+                0,
+                &Arc::new(AtomicU32::new(1)),
+            )
+            .await;
+        });
+
+        accept_handle
+            .await
+            .unwrap()
+            .expect("the acceptor must observe an inbound connection within its timeout")
+            .expect("the acceptor's endpoint must still be alive");
+
+        // Poll rather than sleep a fixed guess: the trace entry is written
+        // synchronously right after `connect_to_peer` resolves, well before
+        // `run_one_generation` (which this test never waits on) does
+        // anything session-shaped.
+        let mut traces = Vec::new();
+        for _ in 0..100 {
+            traces = state.telemetry.recent_connection_attempts(Some("device-b"));
+            if traces.iter().any(|t| t.candidate_source == "local_discovery") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            traces
+                .iter()
+                .any(|t| t.candidate_source == "local_discovery" && t.outcome == "connected"),
+            "a successful connection over a LAN-discovered candidate must produce a real (not \
+             test-fixture-only) CandidateSource::LocalDiscovery trace entry, got: {traces:?}"
+        );
+
+        attempt_handle.abort();
+    }
+
+    /// The core bug an adversarial review caught in this file's first LAN-
+    /// discovery wiring attempt: `start_lan_discovery` used to snapshot the
+    /// authorized-key set ONCE at call time, via a set-of-keys collected
+    /// before the netmap loop -- the ONLY production writer of that set --
+    /// had ever run. The snapshot was therefore always empty, and every
+    /// real announcement was silently and permanently dropped, regardless
+    /// of anything pinned afterward. This test goes through the REAL seam
+    /// (`start_lan_discovery` itself, exactly as `run` calls it, over a
+    /// real UDP socket) rather than `handle_lan_announcement` directly --
+    /// deliberately reproducing the exact timing gap the bug depended on:
+    /// discovery starts with ZERO peers pinned, and only afterward is a
+    /// peer key pinned, to prove the authorization check is genuinely
+    /// live rather than a startup-time snapshot.
+    #[tokio::test]
+    async fn lan_discovery_started_before_any_peer_is_pinned_still_authorizes_one_pinned_later()
+    {
+        use prost::Message as _;
+
+        let state = test_state();
+        state.set_device_signing_key(DeviceSigningKeyPair::generate().signing);
+        let diff_state = NetmapDiffState::new();
+
+        // Port 0: an OS-assigned ephemeral port, so this test cannot
+        // collide with the real `LAN_DISCOVERY_BROADCAST_PORT` or with any
+        // other test doing the same.
+        let bound_addr = start_lan_discovery(&state, &diff_state, 0)
+            .await
+            .expect("discovery must start even with zero peers pinned yet");
+
+        // Only NOW is a peer actually pinned -- the real ordering `run`'s
+        // own startup produces, since the netmap loop populates
+        // `peer_netmap_metadata` asynchronously, well after
+        // `start_lan_discovery` has already returned and started listening.
+        let peer_signing = DeviceSigningKeyPair::generate();
+        let peer_key = peer_signing.public_bytes();
+        state.record_peer_signing_key("device-b", peer_key);
+        diff_state.desired_peers.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            "device-b".to_string(),
+            PeerConnectSpec { candidates: vec![], effective_group_ids: vec![] },
+        );
+
+        // A real UDP announcement sent to the real bound socket -- not a
+        // direct call into daemon-side handling -- so this exercises the
+        // actual `DiscoveryFilters::allows` check the bug lived in.
+        let announced_port = 51820u16;
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let msg = yadorilink_ipc_proto::local_discovery::LocalAnnouncement {
+            public_key: peer_key.to_vec(),
+            wg_port: announced_port as u32,
+        };
+        sender.send_to(&msg.encode_to_vec(), bound_addr).await.unwrap();
+
+        let mut candidates = Vec::new();
+        for _ in 0..100 {
+            candidates = diff_state
+                .lan_discovered
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get("device-b")
+                .map(|entries| entries.iter().map(|(addr, _)| *addr).collect::<Vec<_>>())
+                .unwrap_or_default();
+            if !candidates.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(
+            candidates.len(),
+            1,
+            "an announcement from a peer pinned AFTER discovery started must still be accepted \
+             -- if this is empty, the authorization check regressed back to a startup-time \
+             snapshot"
+        );
+        assert_eq!(candidates[0].port(), announced_port);
+    }
+
+    /// The exact gap an adversarial review's own simulation found: the TTL
+    /// used to be enforced only on the WRITE path
+    /// (`handle_lan_announcement`'s prune-on-insert), so an entry that was
+    /// announced once and never again -- an attacker gone quiet, or a real
+    /// peer that left the network -- stayed handed out to every dialer
+    /// forever, since nothing ever wrote to that peer's entry again to
+    /// trigger a prune. No sleeping or paused clock needed: `Instant`
+    /// arithmetic constructs a synthetic "now" on both sides of the TTL
+    /// boundary directly, so this is fast and exact rather than
+    /// timing-sensitive.
+    #[test]
+    fn ttl_filtered_lan_candidates_excludes_an_entry_past_its_ttl_even_without_a_rewrite() {
+        let addr: StdSocketAddr = "203.0.113.9:51820".parse().unwrap();
+        let announced_at = Instant::now();
+        let mut lan_discovered = HashMap::new();
+        lan_discovered.insert("device-b".to_string(), vec![(addr, announced_at)]);
+
+        let still_within_ttl = announced_at + LAN_DISCOVERED_CANDIDATE_TTL - Duration::from_secs(1);
+        assert_eq!(
+            ttl_filtered_lan_candidates(&lan_discovered, "device-b", still_within_ttl),
+            vec![addr],
+            "an entry read just before its TTL expires must still be offered as a candidate"
+        );
+
+        let past_ttl = announced_at + LAN_DISCOVERED_CANDIDATE_TTL + Duration::from_secs(1);
+        assert_eq!(
+            ttl_filtered_lan_candidates(&lan_discovered, "device-b", past_ttl),
+            Vec::<StdSocketAddr>::new(),
+            "an entry read past its TTL must be excluded from the candidate list even though \
+             nothing ever re-wrote it -- read-path enforcement, not just write-path pruning"
+        );
     }
 
     /// The end-to-end reconnect contract `spawn_peer_session`'s doc comment
-    /// promises: a session that ends NATURALLY (here, the exact-generation
-    /// handshake's own bounded retries all timing out against a peer that
-    /// never answers -- not a `teardown_peer` revoke) must be followed by a
-    /// second connect attempt, not silence. `session_index` incrementing
-    /// past its first value is the observable proof a second
-    /// `PeerChannel::connect` actually happened; a paused clock advanced in
-    /// steps makes the real ~11s handshake-timeout budget plus reconnect
-    /// backoff resolve without the test taking anywhere near that long in
-    /// wall-clock time.
+    /// promises: a session that ends NATURALLY -- here, a dial to an address
+    /// that never answers -- must be followed by a second connect attempt,
+    /// not silence. `session_index` incrementing past its first value is the
+    /// observable proof a second attempt actually happened; a paused clock
+    /// advanced in steps makes the real connect-timeout budget plus
+    /// reconnect backoff resolve without the test taking anywhere near that
+    /// long in wall-clock time.
     #[tokio::test(start_paused = true)]
     async fn spawn_peer_session_reconnects_after_the_session_ends_naturally() {
         let state = test_state();
         let diff_state = NetmapDiffState::new();
-        let keypair = Arc::new(DeviceKeyPair::generate());
-        let (_peer_secret, peer_public) = gen_keypair();
-        // Never answers -- so the exact-generation handshake preflight
-        // exhausts its own bounded retries and the session ends on its
-        // own, exactly the "natural end" case this reconnect loop exists
-        // for (as opposed to a revoke, which a different test already
-        // covers via `teardown_peer_aborts_the_session_task`).
+        // Both identities the QUIC handshake needs: this device's own, and
+        // the peer's pinned key to verify the answer against. Without the
+        // second the attempt short-circuits before ever dialling, which
+        // would make this test pass for the wrong reason.
+        state.set_device_signing_key(DeviceSigningKeyPair::generate().signing);
+        state.record_peer_signing_key("device-b", DeviceSigningKeyPair::generate().public_bytes());
+        // Discard, TCP-style: nothing listens there, so the handshake never
+        // completes and the attempt ends on its own timeout -- exactly the
+        // "natural end" case this reconnect loop exists for, as opposed to a
+        // teardown, which a different test covers.
         let candidate: StdSocketAddr = "127.0.0.1:9".parse().unwrap();
         diff_state.desired_peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(
             "device-b".to_string(),
-            PeerConnectSpec {
-                peer_public,
-                candidates: vec![candidate],
-                effective_group_ids: vec![],
-            },
+            PeerConnectSpec { candidates: vec![candidate], effective_group_ids: vec![] },
         );
         let session_index = Arc::new(AtomicU32::new(0));
         let _handle = spawn_peer_session(
             state.clone(),
-            keypair,
             "local-device".to_string(),
             "device-b".to_string(),
             diff_state.clone(),
@@ -3566,13 +4935,13 @@ mod tests {
         );
 
         // Advance in bounded steps (not one giant jump) so every timer this
-        // loop sets along the way -- each of the 4 handshake-attempt
-        // timeouts, then the reconnect backoff sleep -- actually gets to
-        // fire and let the supervisor task re-poll and set its next timer,
-        // rather than the paused clock racing past several of them before
-        // the task has had a chance to observe any of them elapsing.
+        // loop sets along the way -- the connect attempt's own timeout, then
+        // the reconnect backoff sleep -- actually gets to fire and let the
+        // supervisor task re-poll and set its next timer, rather than the
+        // paused clock racing past several of them before the task has had a
+        // chance to observe any of them elapsing.
         let mut observed_second_attempt = false;
-        for _ in 0..80 {
+        for _ in 0..120 {
             tokio::time::advance(Duration::from_secs(1)).await;
             tokio::task::yield_now().await;
             if session_index.load(Ordering::Relaxed) >= 2 {
@@ -3583,239 +4952,64 @@ mod tests {
 
         assert!(
             observed_second_attempt,
-            "the supervisor must start a second connect attempt after the first session ends \
-             naturally (handshake timeout, not a revoke) -- got session_index={}",
+            "the supervisor must start a second connect attempt after the first one ends on its \
+             own -- got session_index={}",
             session_index.load(Ordering::Relaxed)
         );
     }
 
-    /// Pins the actual bug this session's fix closes, directly and
-    /// deterministically: a channel whose session ends naturally (same
-    /// never-answering-peer handshake-timeout setup as the sibling test
-    /// above) must be `revoke()`d, not merely dropped from bookkeeping.
-    /// Without the fix, `PeerChannel` has no `Drop` impl, so this exact
-    /// channel object would stay live and un-revoked forever -- still
-    /// registered in the transport hub's demux under its own stale session
-    /// index, still able to answer a handshake initiation for this same
-    /// peer and race the next reconnect generation with a second responder
-    /// (confirmed via `reconnect_handshake_stress.rs`'s own real-daemon
-    /// mesh: `WrongKey`/`UnexpectedPacket` decapsulate errors, the
-    /// reconnecting side's exact-generation handshake reliably exhausting
-    /// its bounded retries). This test deliberately never calls
-    /// `channel.revoke()` itself -- doing so would pre-empt the very
-    /// cleanup path under test -- it only observes whether the fix's own
-    /// call happened, via `PeerChannel::is_revoked()`.
-    #[tokio::test(start_paused = true)]
-    async fn natural_session_end_revokes_the_stale_channel() {
-        let state = test_state();
-        let diff_state = NetmapDiffState::new();
-        let keypair = Arc::new(DeviceKeyPair::generate());
-        let (_peer_secret, peer_public) = gen_keypair();
-        let candidate: StdSocketAddr = "127.0.0.1:9".parse().unwrap();
-        diff_state.desired_peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(
-            "device-b".to_string(),
-            PeerConnectSpec {
-                peer_public,
-                candidates: vec![candidate],
-                effective_group_ids: vec![],
-            },
-        );
-        let session_index = Arc::new(AtomicU32::new(0));
-        let _handle = spawn_peer_session(
-            state.clone(),
-            keypair,
-            "local-device".to_string(),
-            "device-b".to_string(),
-            diff_state.clone(),
-            session_index.clone(),
-        );
-
-        // Capture generation 1's own channel before its handshake preflight
-        // times out and natural-end cleanup would remove it from
-        // `diff_state.channels` -- by generation 2, that map holds a
-        // DIFFERENT channel object, so this must be grabbed early.
-        let mut first_generation_channel = None;
-        for _ in 0..10 {
-            tokio::time::advance(Duration::from_millis(100)).await;
-            tokio::task::yield_now().await;
-            if let Some(channel) = diff_state
-                .channels
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get("device-b")
-                .cloned()
-            {
-                first_generation_channel = Some(channel);
-                break;
-            }
-        }
-        let first_generation_channel =
-            first_generation_channel.expect("generation 1 should register a channel promptly");
-        assert!(
-            !first_generation_channel.is_revoked(),
-            "sanity: a freshly connected channel must not start out revoked"
-        );
-
-        // Advance through the handshake preflight's own bounded retries
-        // (~11s) plus reconnect backoff until a second generation starts --
-        // identical to the sibling test's own wait loop.
-        let mut observed_second_attempt = false;
-        for _ in 0..80 {
-            tokio::time::advance(Duration::from_secs(1)).await;
-            tokio::task::yield_now().await;
-            if session_index.load(Ordering::Relaxed) >= 2 {
-                observed_second_attempt = true;
-                break;
-            }
-        }
-        assert!(
-            observed_second_attempt,
-            "the supervisor must reach a second generation for this assertion to be meaningful \
-             -- got session_index={}",
-            session_index.load(Ordering::Relaxed)
-        );
-
-        assert!(
-            first_generation_channel.is_revoked(),
-            "generation 1's channel must be revoked once its session ends naturally -- \
-             otherwise it stays registered in the transport hub's demux forever, still able to \
-             answer a handshake initiation for this peer under its own stale session index and \
-             race the next reconnect generation (the exact bug this fix closes)"
-        );
-    }
-
+    /// The direct-route registry's two ordering rules, together, because
+    /// they close the same race from opposite ends: a stale supervisor
+    /// generation must neither replace a newer generation's route nor evict
+    /// it on the way out.
+    ///
+    /// The race is real rather than theoretical: `teardown_peer`'s
+    /// `handle.abort()` only cancels the old supervisor at its next
+    /// `.await`, so a new supervisor can connect and register while the old
+    /// one is still running its own cleanup. Since the relay layer consults
+    /// this registry to decide whether an unchained direct path exists, an
+    /// entry lost or replaced by a stale generation is a correctness
+    /// problem, not untidiness.
     #[tokio::test]
-    async fn stale_supervisor_cleanup_does_not_evict_a_newer_generations_channel() {
-        // Directly exercises the ABA race `remove_channel_if_current` closes,
-        // without waiting on the full supervisor/backoff machinery: an old
-        // supervisor generation's channel is registered, then "replaced" by
-        // a newer generation's channel under the same key (exactly what
-        // happens when a new supervisor connects while `teardown_peer`'s
-        // `handle.abort()` on the old one hasn't taken effect yet, since
-        // `abort()` only cancels at the next `.await` point). The old
-        // generation's own natural-session-end cleanup must then be a no-op
-        // against the newer entry -- not evict it by key.
-        let diff_state = NetmapDiffState::new();
+    async fn a_stale_generation_can_neither_replace_nor_evict_a_newer_route() {
+        let state = test_state();
         let old_channel = fake_channel().await;
         let new_channel = fake_channel().await;
 
-        // `insert_channel_revoking_superseded`, the SAME method both real
-        // `spawn_peer_session` call sites use -- exercising this test
-        // against the plain `HashMap`/`insert` directly (as it read
-        // before the M5-A soak-closure fix) would make this test pass
-        // for a bug production no longer has.
-        assert!(diff_state.insert_channel_revoking_superseded(
-            "device-b".to_string(),
-            old_channel.clone(),
-            1
-        ));
-        assert!(diff_state.insert_channel_revoking_superseded(
-            "device-b".to_string(),
-            new_channel.clone(),
-            2
-        ));
+        state.set_direct_channel("device-b".to_string(), old_channel.clone(), 1);
+        state.set_direct_channel("device-b".to_string(), new_channel.clone(), 2);
         assert!(
-            old_channel.is_revoked(),
-            "a channel silently replaced by a newer generation's insert must be revoked -- \
-             otherwise it stays registered in the transport hub's demux forever, still able to \
-             answer a handshake initiation for this peer under its own stale session index, with \
-             no Arc anywhere left to ever revoke it again (confirmed live via the soak lane's \
-             rapid repeated-restart chaos: this exact gap left W's/N's sessions with a rapidly-\
-             restarted peer permanently stuck, unable to ever re-handshake)"
-        );
-
-        let removed = diff_state.remove_channel_if_current("device-b", &old_channel);
-        assert!(!removed, "cleanup keyed to the OLD generation's channel must not report removal");
-
-        let current = diff_state
-            .channels
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get("device-b")
-            .cloned();
-        assert!(
-            current.is_some_and(|c| Arc::ptr_eq(&c, &new_channel)),
-            "the newer generation's channel must still be registered under its key -- the ABA \
-             race this test targets is the old generation's cleanup wrongly evicting it"
-        );
-
-        let removed = diff_state.remove_channel_if_current("device-b", &new_channel);
-        assert!(removed, "cleanup keyed to the CURRENT channel must succeed");
-        assert!(
-            diff_state
-                .channels
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get("device-b")
-                .is_none(),
-            "the entry must actually be gone once the current generation's own cleanup runs"
-        );
-    }
-
-    /// M5-A review follow-up (blocker #55): the ABA race an earlier version
-    /// of the zombie-channel fix left open -- the primary map
-    /// (`NetmapDiffState::channels`) and its mirror (`DaemonState::
-    /// direct_channels`) are updated by two SEPARATE lock acquisitions, so
-    /// a stale (older) generation's publish landing SECOND in real time
-    /// could win the mirror's own revoke-superseded race even after having
-    /// already lost the primary map's. Sequence: A publishes (generation
-    /// 1) to the primary map; B publishes (generation 2) to the primary
-    /// map, correctly superseding A there; B's own mirror publish lands;
-    /// finally A's STALE mirror publish arrives late (its own generation 1
-    /// again, now well behind the mirror's already-recorded generation 2)
-    /// -- must be rejected outright (no insert, no revoke), not silently
-    /// win because the mirror is a separate map with no memory of what the
-    /// primary map already decided.
-    #[tokio::test]
-    async fn stale_generation_publish_cannot_revoke_a_newer_channel_in_either_map() {
-        let state = test_state();
-        let diff_state = NetmapDiffState::new();
-        let a_channel = fake_channel().await;
-        let b_channel = fake_channel().await;
-
-        // A primary publish.
-        assert!(diff_state.insert_channel_revoking_superseded(
-            "device-b".to_string(),
-            a_channel.clone(),
-            1
-        ));
-        // B primary publish -- correctly supersedes A in the primary map.
-        assert!(diff_state.insert_channel_revoking_superseded(
-            "device-b".to_string(),
-            b_channel.clone(),
-            2
-        ));
-        // B mirror publish.
-        state.set_direct_channel("device-b".to_string(), b_channel.clone(), 2);
-        // A stale mirror publish -- must be rejected by the mirror's own
-        // independent generation guard.
-        state.set_direct_channel("device-b".to_string(), a_channel.clone(), 1);
-
-        assert!(
-            !b_channel.is_revoked(),
-            "B must remain live -- a stale generation's publish must never revoke the current \
-             channel in either map"
+            state.direct_channel("device-b").is_some_and(|c| Arc::ptr_eq(&c, &new_channel)),
+            "the newer generation's publish must win"
         );
         assert!(
-            a_channel.is_revoked(),
-            "A was correctly superseded (and revoked) by B's own primary-map publish -- this is \
-             the pre-existing, already-correct half of the fix"
+            !old_channel.is_open(),
+            "the superseded generation's connection must be CLOSED, not merely unregistered -- \
+             the old session still holds a reference to it, so dropping the map entry would \
+             leave two live connections to one peer"
         );
-        assert_eq!(
-            diff_state
-                .channels
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get("device-b")
-                .map(|c| Arc::ptr_eq(c, &b_channel)),
-            Some(true),
-            "the primary map must still hold B"
+        assert!(new_channel.is_open(), "the winning generation's connection must stay up");
+
+        // The stale generation publishing SECOND in real time, which is what
+        // an aborted-but-not-yet-cancelled supervisor produces.
+        state.set_direct_channel("device-b".to_string(), old_channel.clone(), 1);
+        assert!(
+            state.direct_channel("device-b").is_some_and(|c| Arc::ptr_eq(&c, &new_channel)),
+            "a stale generation's publish must be rejected outright, not overwrite the live route"
         );
-        assert_eq!(
-            state.direct_channel("device-b").map(|c| Arc::ptr_eq(&c, &b_channel)),
-            Some(true),
-            "the mirror (the direct-route view RelaySessionHandler consults) must still hold B \
-             too -- A's stale publish must not have replaced it, and the two maps must agree"
+
+        // The stale generation's own natural-end cleanup must be a no-op
+        // against the newer entry rather than removing it by key.
+        state.remove_direct_channel_if_current("device-b", &old_channel);
+        assert!(
+            state.direct_channel("device-b").is_some_and(|c| Arc::ptr_eq(&c, &new_channel)),
+            "cleanup keyed to the OLD generation's channel must not evict the newer one"
+        );
+
+        state.remove_direct_channel_if_current("device-b", &new_channel);
+        assert!(
+            state.direct_channel("device-b").is_none(),
+            "the entry must actually go once the current generation's own cleanup runs"
         );
     }
 
@@ -3823,12 +5017,18 @@ mod tests {
     async fn pinned_peer_key_mismatch_tears_down_session_and_authorization() {
         let state = test_state();
         let diff_state = NetmapDiffState::new();
-        let channel =
-            register_fake_peer(&state, &diff_state, "device-b", vec!["group-1".into()]).await;
+        let endpoint = install_test_quic_endpoint(&diff_state).await;
+        let (peer_public_key, _channel) =
+            register_fake_peer(&state, &diff_state, &endpoint, "device-b", vec!["group-1".into()])
+                .await;
+        // The peer's own key, not an arbitrary one: `teardown_peer` revokes
+        // whatever key the netmap currently records for the device, so a
+        // fixture whose metadata disagreed with its registration would be
+        // asserting against a key nothing ever authorized.
         apply_authoritative_peer_metadata(
             &state,
             "device-b",
-            Some([7; 32]),
+            Some(peer_public_key),
             &HashSet::from(["group-1".to_string()]),
             &HashSet::from(["group-1".to_string()]),
             false,
@@ -3852,7 +5052,7 @@ mod tests {
             _ => panic!("changed pinned key must be rejected as a mismatch"),
         }
 
-        assert!(channel.is_revoked());
+        assert!(!endpoint.is_authorized(&peer_public_key));
         assert!(!state.peers.has_session("device-b"));
         assert!(!diff_state
             .session_tasks
@@ -3920,14 +5120,13 @@ mod tests {
         }
 
         let state = test_state();
-        let keypair = Arc::new(DeviceKeyPair::generate());
         let config = OrchestratorConfig {
             coordination_addr: format!("http://{addr}"),
             access_token: "test-token".into(),
             device_id: "local-device".into(),
         };
 
-        let handle = tokio::spawn(run(config, keypair, state));
+        let handle = tokio::spawn(run(config, state));
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while accept_count.load(Ordering::SeqCst) == 0 {
@@ -3992,14 +5191,13 @@ mod tests {
         }
 
         let state = test_state();
-        let keypair = Arc::new(DeviceKeyPair::generate());
         let config = OrchestratorConfig {
             coordination_addr: format!("http://{addr}"),
             access_token: "test-token".into(),
             device_id: "local-device".into(),
         };
 
-        let handle = tokio::spawn(run(config, keypair, state));
+        let handle = tokio::spawn(run(config, state));
 
         let first_batch_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while accept_count.load(Ordering::SeqCst) == 0 {

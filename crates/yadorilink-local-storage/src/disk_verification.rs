@@ -55,6 +55,14 @@ pub fn intent_target_hash(blocks: &[BlockInfo]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
+/// [`intent_target_hash`]'s counterpart for a materialization intent whose
+/// target is not a block list at all -- a symlink's raw target bytes.
+/// SHA-256 over the bytes directly, matching `intent_target_hash`'s own
+/// "stable content-derived identifier" shape.
+pub fn intent_target_hash_for_bytes(target: &[u8]) -> Vec<u8> {
+    Sha256::digest(target).to_vec()
+}
+
 /// The three distinct ways a path's on-disk content can relate to a set of
 /// indexed blocks. Collapsing `PresentButDifferent` and `Absent` into one
 /// `false` is what let a pre-materialize guard misread "this path's parent

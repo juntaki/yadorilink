@@ -50,7 +50,7 @@
 //! indexed. This scan is purely path-level (which directories exist and
 //! are/aren't already watched) and never touches file content or the
 //! index — deliberately not implemented by reusing the watcher-channel-
-//! overflow/`DebounceFlush::BurstFallback` full index-vs-disk
+//! overflow/`DebounceFlush::RescanRequired` full index-vs-disk
 //! reconciliation, which was tried first and found unsafe: triggering a
 //! full `scan_existing_files_with_ignore` this often can re-derive and
 //! re-version a file that's concurrently mid-conflict-resolution between
@@ -235,6 +235,11 @@ pub fn watch_folder_with_capacity_and_ignore(
                 // receiving task is gone (shutdown race), never because
                 // it's full; either way there is nothing more to do here.
                 let _ = callback_new_dir_tx.send(path.clone());
+            }
+            // M6-2 phase-timing diagnostic (temporary): see chunker.rs's
+            // matching M6PHASE comment for why this exists.
+            if matches!(kind, FsChangeKind::CreatedOrModified) {
+                tracing::warn!("M6PHASE T_watch: raw filesystem watcher event received");
             }
             if tx.try_send(FsChangeEvent { path, kind }).is_err() {
                 callback_overflowed.store(true, Ordering::Relaxed);
@@ -445,7 +450,7 @@ impl FolderWatchSource for SimulatedFolderWatchSource {
 /// `root`), calling `watcher.watch` only for directories not already in
 /// `watched_dirs`; every already-known directory is untouched. This
 /// deliberately does *not* reuse the watcher-channel-overflow /
-/// `DebounceFlush::BurstFallback` full index-vs-disk reconciliation
+/// `DebounceFlush::RescanRequired` full index-vs-disk reconciliation
 /// (`local_change.rs::scan_existing_files_with_ignore`) as the recovery
 /// mechanism — confirmed via direct experiment that doing so is unsafe:
 /// triggering it this often (once per directory-watch registration, not

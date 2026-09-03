@@ -15,8 +15,8 @@ mod protobuf;
 pub use codec::PeerWireCodec;
 pub use error::WireError;
 pub use frame::{
-    BlockReplyFrame, BlockReplyOutboundFrame, BlockReplyOutboundOutcome, BlockReplyOutcomeFrame,
-    BlockRequestFrame, ChangeBatchFrame, ChangeBatchOutboundFrame, ChangeRequestFrame,
+    BlockRequestHeaderFrame, BlockResponseHeaderFrame, BlockResponseOutcomeFrame,
+    ChangeBatchFrame, ChangeBatchOutboundFrame, ChangeRequestFrame,
     ClusterConfigFrame, ClusterConfigOutboundFrame, HandoffLeaseGrantFrame,
     HandoffLeaseReleaseFrame, HandoffLeaseReleaseOutboundFrame, HandoffLeaseRequestFrame,
     HandoffTicketGrantFrame, HandoffTicketReleaseFrame, HandoffTicketReleaseOutboundFrame,
@@ -31,6 +31,11 @@ pub use protobuf::ProtobufPeerWireCodec;
 /// `yadorilink_ipc_proto::sync::Compression` at call sites) so that
 /// consumers needing only these two values don't need to reach through a
 /// generated protobuf type to name them.
+///
+/// These are not a negotiated capability: every peer that reaches a session
+/// is the same protocol generation and understands both. A sender picks
+/// between them per payload, choosing raw whenever compressing would make
+/// the payload larger.
 pub const COMPRESSION_NONE: i32 = 0;
 pub const COMPRESSION_ZSTD: i32 = 1;
 
@@ -83,38 +88,19 @@ mod tests {
             }),
             InboundFrame::ChangeRequest(ChangeRequestFrame {
                 folder_group_id: "g".to_string(),
-                want: vec![vec![0u8; 32]],
+                want_heads: vec![vec![0u8; 32]],
+                have_heads: vec![vec![1u8; 32]],
             }),
             InboundFrame::ChangeBatch(ChangeBatchFrame {
                 folder_group_id: "g".to_string(),
                 changes: vec![vec![1, 2, 3]],
-                compressed_changes: Vec::new(),
                 file_versions: vec![vec![4, 5, 6]],
+                more: true,
             }),
             InboundFrame::ClusterConfig(ClusterConfigFrame {
                 acked_peer_cluster_config: true,
-                supported_compression: vec![COMPRESSION_ZSTD],
-                supports_reliable_delivery: true,
-                supports_change_dag: true,
-                supports_version_present: true,
-                supports_version_hash_exact: true,
                 max_inflight_requests: 1,
                 max_inflight_bytes: 1,
-                protocol_version: 1,
-            }),
-            InboundFrame::BlockRequest(BlockRequestFrame {
-                folder_group_id: "g".to_string(),
-                file_path: "f".to_string(),
-                block_hash: vec![0u8; 32],
-                request_id: 1,
-            }),
-            InboundFrame::BlockReply(BlockReplyFrame {
-                block_hash: vec![0u8; 32],
-                outcome: Some(BlockReplyOutcomeFrame::Found {
-                    data: vec![1, 2, 3],
-                    compression: COMPRESSION_NONE,
-                }),
-                request_id: 1,
             }),
             InboundFrame::HandoffLeaseRequest(HandoffLeaseRequestFrame {
                 request_id: 1,
@@ -158,55 +144,31 @@ mod tests {
                 required_encoded: vec![1, 2, 3],
                 snapshot_bytes: vec![4, 5, 6],
             }),
-            InboundFrame::Unknown { message_kind: Some(99) },
         ];
-        assert_eq!(inbound.len(), 17);
+        assert_eq!(inbound.len(), 14);
 
         let outbound: Vec<OutboundFrame> = vec![
             OutboundFrame::ClusterConfig(ClusterConfigOutboundFrame {
-                folder_group_ids: vec!["g".to_string()],
-                known_peer_device_ids: vec!["d".to_string()],
-                supported_compression: vec![COMPRESSION_ZSTD],
-                supports_reliable_delivery: true,
                 acked_peer_cluster_config: true,
-                supports_change_dag: true,
-                supports_version_present: true,
-                supports_version_hash_exact: true,
                 max_inflight_requests: 1,
                 max_inflight_bytes: 1,
-                available_worker_slots: 1,
-                estimated_queue_delay_ms: 0,
-                protocol_version: 1,
             }),
             OutboundFrame::HeadsAnnounce(HeadsAnnounceOutboundFrame {
                 folder_group_id: "g".to_string(),
                 heads: vec![vec![0u8; 32]],
-                frontier_hint: vec![0u8; 32],
             }),
             OutboundFrame::ChangeRequest(ChangeRequestFrame {
                 folder_group_id: "g".to_string(),
-                want: vec![vec![0u8; 32]],
+                want_heads: vec![vec![0u8; 32]],
+                have_heads: vec![vec![1u8; 32]],
             }),
             OutboundFrame::ChangeBatch(ChangeBatchOutboundFrame {
                 folder_group_id: "g".to_string(),
                 changes: vec![vec![1, 2, 3]],
-                compressed_changes: Vec::new(),
                 file_versions: vec![vec![4, 5, 6]],
+                more: true,
             }),
-            OutboundFrame::BlockRequest(BlockRequestFrame {
-                folder_group_id: "g".to_string(),
-                file_path: "f".to_string(),
-                block_hash: vec![0u8; 32],
-                request_id: 1,
-            }),
-            OutboundFrame::BlockReply(BlockReplyOutboundFrame {
-                block_hash: vec![0u8; 32],
-                outcome: BlockReplyOutboundOutcome::Found {
-                    data: vec![1, 2, 3],
-                    compression: COMPRESSION_NONE,
-                },
-                request_id: 1,
-            }),
+
             OutboundFrame::VersionPresentQuery(VersionPresentQueryFrame {
                 request_id: 1,
                 folder_group_id: "g".to_string(),
@@ -218,10 +180,7 @@ mod tests {
             }),
             OutboundFrame::VersionPresentAck(VersionPresentAckOutboundFrame {
                 request_id: 1,
-                folder_group_id: "g".to_string(),
-                file_path: "f".to_string(),
                 present: true,
-                signature: Vec::new(),
             }),
             OutboundFrame::HandoffLeaseRequest(HandoffLeaseRequestFrame {
                 request_id: 1,
@@ -235,7 +194,6 @@ mod tests {
                 expires_at_unix: 0,
             }),
             OutboundFrame::HandoffLeaseRelease(HandoffLeaseReleaseOutboundFrame {
-                request_id: 1,
                 folder_group_id: "g".to_string(),
                 lease_id: "l".to_string(),
             }),
@@ -251,7 +209,6 @@ mod tests {
                 target_device_id: "d".to_string(),
             }),
             OutboundFrame::HandoffTicketRelease(HandoffTicketReleaseOutboundFrame {
-                request_id: 1,
                 folder_group_id: "g".to_string(),
                 target_device_id: "d".to_string(),
                 lease_id: "l".to_string(),
@@ -267,7 +224,29 @@ mod tests {
                 required_encoded: vec![1, 2, 3],
                 snapshot_bytes: vec![4, 5, 6],
             }),
+            OutboundFrame::RelayOpen(RelayOpenFrame {
+                version: 1,
+                grant_id: "gr".to_string(),
+                group_id: "g".to_string(),
+                source_device_id: "d0".to_string(),
+                relay_device_id: "d1".to_string(),
+                destination_device_id: "d2".to_string(),
+                not_before_unix: 0,
+                expires_at_unix: 0,
+                max_session_bytes: 0,
+                signature: Vec::new(),
+            }),
+            OutboundFrame::RelayOpened(RelayOpenedFrame {
+                grant_id: "gr".to_string(),
+                granted: true,
+                session_id: 1,
+            }),
+            OutboundFrame::RelayData(RelayDataFrame { session_id: 1, payload: vec![1, 2, 3] }),
+            OutboundFrame::RelayClose(RelayCloseFrame {
+                session_id: 1,
+                reason: "r".to_string(),
+            }),
         ];
-        assert_eq!(outbound.len(), 16);
+        assert_eq!(outbound.len(), 18);
     }
 }

@@ -19,7 +19,8 @@ use crate::error::LocalCaptureError;
 use yadorilink_filesystem_sync::debounce::DebounceFlush;
 use yadorilink_filesystem_sync::watcher::{FsChangeEvent, FsChangeKind};
 use yadorilink_local_storage::{
-    chunk_file, chunk_file_content_defined, owner_exec_bit_from_metadata, CDC_SIZE_THRESHOLD,
+    chunk_file, chunk_file_content_defined, read_replicated_xattrs, unix_mode_from_metadata,
+    CDC_SIZE_THRESHOLD,
 };
 use yadorilink_replica_domain::change::{encoded_op_len, Op, PutOrigin};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
@@ -27,6 +28,7 @@ use yadorilink_replica_domain::file::{FileRecord, RecordKind};
 use yadorilink_replica_domain::ids::{BlockHash, SyncPath};
 use yadorilink_replica_domain::session_state::MaterializationState;
 use yadorilink_replica_domain::session_state::{ChangeContent, LocalFileMetaColumns};
+use yadorilink_root_authority::fs_identity::FileIdentity;
 use yadorilink_root_authority::ignore_patterns::{
     is_ignore_file_relative_path, EffectiveIgnoreSet,
 };
@@ -65,6 +67,30 @@ fn disk_race_fingerprint(path: &Path) -> Option<(u64, Option<std::time::SystemTi
     #[cfg(not(unix))]
     let (ctime, ctime_nsec) = (0i64, 0i64);
     Some((meta.len(), meta.modified().ok(), ctime, ctime_nsec))
+}
+
+/// A strong `FileIdentity` for `path`, freshly observed, but ONLY if
+/// `disk_race_fingerprint(path)` still matches `fingerprint_before_read`
+/// (a fingerprint captured before this event's own content was read) --
+/// `None` for either a fingerprint mismatch (something touched this path
+/// during the read/prepare window) or a failed observation. Feeds
+/// `SyncState::upsert_file_emitting_change`'s `filesystem_identity`
+/// parameter: `None` here always means "publish no actual-state proof for
+/// this commit," never a hard failure of the capture itself -- see that
+/// parameter's own doc comment. This is deliberately a SEPARATE, later
+/// stat than `fingerprint_before_read` itself: closing the race requires
+/// two independent observations bracketing the read, not reusing one.
+fn fresh_actual_state_identity_if_unraced(
+    path: &Path,
+    fingerprint_before_read: Option<(u64, Option<std::time::SystemTime>, i64, i64)>,
+) -> Option<FileIdentity> {
+    if fingerprint_before_read.is_none() {
+        return None;
+    }
+    if disk_race_fingerprint(path) != fingerprint_before_read {
+        return None;
+    }
+    FileIdentity::observe_path(path).ok()
 }
 
 /// True when a filesystem `Metadata`'s mtime equals the mtime an index row
@@ -206,6 +232,12 @@ fn path_is_within_failed_subtree(rel_path: &str, failed_prefixes: &[String]) -> 
     failed_prefixes.iter().any(|prefix| candidate.starts_with(Path::new(prefix)))
 }
 
+/// [`build_record_for_created_or_modified`]'s Unix-mode-to-persist output:
+/// the outer `None` means nothing to persist (a symlink, or nothing
+/// changed); the inner `Option<u32>` is `unix_mode_from_metadata`'s own
+/// value (itself `None` on a platform with no Unix permission-bits model).
+type PendingUnixModeUpdate = Option<Option<u32>>;
+
 /// What one filesystem event turned out to mean, once interpreted —
 /// `process_event`'s result.
 #[derive(Debug, Clone, PartialEq)]
@@ -227,6 +259,50 @@ pub enum LocalChangeOutcome {
     /// child has now been tombstoned; each is reported here so the
     /// caller broadcasts all of them, not just one.
     FilesChanged(Vec<FileRecord>),
+}
+
+/// `process_event_with_ignore_at`'s outcome once batching exists: either
+/// the event was fully classified and its mutation committed synchronously,
+/// exactly as this function always behaved before batching (`Ready` --
+/// what every caller other than the `DebounceFlush::Paths` loop always
+/// gets, since they pass `pending_batch: None`), or the simple,
+/// DAG-emitting create/modify/delete case applied and a mutation was
+/// prepared and pushed onto `pending_batch` instead of being committed
+/// here (`Deferred`) -- only the `DebounceFlush::Paths` loop ever sees
+/// this, and it alone is responsible for resolving every `Deferred` path
+/// once its batch's `flush_pending_batch` call runs.
+#[derive(Debug)]
+enum EventOutcome {
+    Ready(LocalChangeOutcome),
+    Deferred,
+}
+
+/// One path's authoritative mutation, prepared during a batched flush's
+/// per-path pass (chunked, hashed, and decided against the state read at
+/// that moment) but not yet committed, together with everything
+/// `flush_pending_batch` needs to prove it is still current before
+/// including it in the shared transaction: the disk identity and index row
+/// this preparation was based on, so a change to either between
+/// preparation and commit excludes this mutation from the batch rather
+/// than authoring stale bytes or clobbering a concurrent peer update (see
+/// `flush_pending_batch`'s own doc for the full argument -- this is the
+/// SAME `disk_race_fingerprint` scheme `peer_session::PeerSyncSession::
+/// hydrate_inner` already relies on for the identical class of "is what I
+/// prepared still current" question, applied here to local capture instead
+/// of peer materialization).
+struct PendingBatchedCommit {
+    rel_path: String,
+    event_path: PathBuf,
+    observed_at_unix_nanos: i64,
+    index_state_at_prepare: Option<FileRecord>,
+    // A `FileRecord` comparison alone cannot catch a peer commit whose new
+    // version's size/mtime/blocks happen to coincide with the old one (a
+    // metadata-only change, or content that happens to hash the same) --
+    // see `LocalMutationStore::get_authoring_change_hash`'s own doc for why
+    // this is compared too.
+    authoring_change_hash_at_prepare: Option<yadorilink_replica_domain::ids::ChangeHash>,
+    disk_fingerprint_at_prepare: Option<(u64, Option<std::time::SystemTime>, i64, i64)>,
+    mutation: yadorilink_replica_domain::session_state::PreparedLocalMutation,
 }
 
 /// Extra classification produced when `build_record_for_created_or_modified`
@@ -268,20 +344,26 @@ struct SymlinkClassification {
 /// `FileVersion`.
 fn metadata_columns_for(
     classification: &Option<SymlinkClassification>,
-    exec_bit: Option<bool>,
+    unix_mode: Option<Option<u32>>,
+    xattrs: Vec<(String, Vec<u8>)>,
 ) -> LocalFileMetaColumns {
     match classification {
         Some(c) => LocalFileMetaColumns {
             record_kind: RecordKind::Symlink,
             symlink_target: Some(c.target.clone()),
             symlink_out_of_root: c.out_of_root,
-            exec_bit: false,
+            unix_mode: None,
+            // A symlink is not scanned for xattrs either, for the
+            // identical reason `unix_mode` is `None` here -- matches
+            // `single_pass_capture.rs`'s own symlink branch.
+            xattrs: Vec::new(),
         },
         None => LocalFileMetaColumns {
             record_kind: RecordKind::File,
             symlink_target: None,
             symlink_out_of_root: false,
-            exec_bit: exec_bit.unwrap_or(false),
+            unix_mode: unix_mode.flatten(),
+            xattrs,
         },
     }
 }
@@ -306,6 +388,107 @@ pub struct LocalChangeProcessor {
     root_lease: Arc<yadorilink_root_authority::root_commit::RootLease>,
 }
 
+/// Runs one of this module's long synchronous capture passes — a whole-file
+/// chunk-and-hash, or a whole-file re-verify against the indexed block
+/// hashes — without leaving it holding the tokio worker core it was called
+/// on.
+///
+/// The bound this establishes is on the CORE, not on `f`. On a
+/// multi-threaded runtime `block_in_place` moves this worker's core, and
+/// every task already queued on it, to a replacement thread *before* `f`
+/// starts; the calling thread becomes an ordinary blocking thread for the
+/// duration. So no worker core is held for longer than that one handoff,
+/// however long `f` itself runs — which matters because these passes are
+/// not measured in milliseconds. Chunking, hashing and durably committing a
+/// 1 GiB file measures 13-20s; re-verifying one against its indexed hashes
+/// is a full sequential read plus a SHA-256 per block. A held core,
+/// meanwhile, can't service anything else queued on it -- including this
+/// device's own QUIC endpoint driver, which has to run promptly enough to
+/// send ACKs and keepalives before quinn's own loss-detection and peer
+/// idle timeout react to the silence -- and it is time-to-schedule, not
+/// poll turnaround, that decides whether they go out in time.
+///
+/// `block_in_place` rather than `spawn_blocking`, deliberately, and for the
+/// same reason `peer_session::record_materialized_fingerprint_off_runtime`
+/// chose it: every pass wrapped here runs inside a *synchronous* fn holding
+/// a plain `&LocalChangeProcessor` (never an `Arc<Self>`), reachable from
+/// this crate's own synchronous public API (`scan_existing_files` ->
+/// `reconcile_disk_with_ignore`). `spawn_blocking` wants a `Send + 'static`
+/// closure and an `.await` to join it, and there is no `.await` to be had
+/// here without turning that whole public API async. A scoped closure needs
+/// neither.
+///
+/// The runtime guard mirrors `peer_session::record_materialized_
+/// fingerprint_off_runtime`, `daemon_state::run_blocking_sweep_offloaded`
+/// and `gc::run_sweep_with_grace_cutoff`, and it is load-bearing rather
+/// than defensive: `block_in_place` PANICS unless a multi-threaded runtime
+/// is current, and these call sites are genuinely reached from a
+/// current-thread runtime and from no runtime at all. Where there is no
+/// multi-threaded worker to hand off to there is also no worker pool to
+/// starve, so the plain synchronous call is already the right answer there,
+/// not a degraded one.
+///
+/// Nesting costs nothing and needs no guarding of its own: tokio only hands
+/// off a core this thread actually holds, so reaching here from a thread
+/// that has none — a `spawn_blocking` thread (how the daemon runs the whole
+/// initial scan), or a thread whose core an outer offload already took (the
+/// daemon's flush task wraps all of `process_flush_with_ignore` in its own
+/// `block_in_place`) — simply runs `f` in place.
+fn run_capture_pass_off_worker<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(not(madsim))]
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(f)
+            }
+            _ => f(),
+        }
+    }
+    // The deterministic simulator runs a single-threaded runtime whose
+    // tokio shim exposes neither `runtime_flavor()` nor `block_in_place` —
+    // referring to the latter at all does not even compile there. Always
+    // take the plain synchronous path, identical to the `_ =>` branch
+    // above.
+    #[cfg(madsim)]
+    {
+        f()
+    }
+}
+
+/// At or above this size, a "is the on-disk content still exactly what is
+/// indexed" re-verification is handed off the calling worker's core by
+/// [`disk_bytes_match_indexed_blocks_off_worker`] instead of running in
+/// place. Below it the read-and-hash pass is short enough that the handoff
+/// would cost more than it saves — and `reconcile_disk_with_ignore` runs
+/// this verification once per already-current file across a whole tree, so
+/// a per-file handoff there is not free.
+///
+/// Shares the chunker's own large-file threshold rather than inventing a
+/// second notion of "big file": a file large enough to be worth
+/// content-defined chunking is exactly a file large enough that a full
+/// re-read plus per-block SHA-256 is worth getting off a worker.
+const OFF_WORKER_VERIFY_MIN_BYTES: u64 = CDC_SIZE_THRESHOLD;
+
+/// [`yadorilink_local_storage::disk_bytes_match_indexed_blocks`], off the
+/// calling tokio worker's core when `size` says the pass is big enough to
+/// be worth the handoff — see [`run_capture_pass_off_worker`] for the bound
+/// that buys and [`OFF_WORKER_VERIFY_MIN_BYTES`] for the cutoff.
+///
+/// Identical verdict either way: this only decides which thread the
+/// (unchanged) read-and-compare runs on, never what it concludes.
+fn disk_bytes_match_indexed_blocks_off_worker(
+    path: &Path,
+    blocks: &[yadorilink_replica_domain::file::BlockInfo],
+    size: u64,
+) -> Result<bool, yadorilink_local_storage::StorageError> {
+    if size < OFF_WORKER_VERIFY_MIN_BYTES {
+        return yadorilink_local_storage::disk_bytes_match_indexed_blocks(path, blocks);
+    }
+    run_capture_pass_off_worker(|| {
+        yadorilink_local_storage::disk_bytes_match_indexed_blocks(path, blocks)
+    })
+}
+
 /// Max ops in a single reconciliation-emitted change. Matches the initial
 /// import's [`yadorilink_replica_domain::change::IMPORT_BATCH_OP_LIMIT`] so a
 /// bulk offline diff converts into a chain of same-sized changes whichever
@@ -316,9 +499,9 @@ const RECONCILE_CHUNK_OP_LIMIT: usize = yadorilink_replica_domain::change::IMPOR
 
 /// Max canonical op-bytes in a single reconciliation-emitted change. A change
 /// cannot be wire-split, so one change must fit in one delivered
-/// `ChangeBatch` message; the transport rejects any inbound message larger
-/// than `MAX_INBOUND_FRAGMENTS_PER_MESSAGE` (1024) * `MAX_FRAGMENT_PAYLOAD`
-/// (1200 B) ≈ 1.2 MiB. 256 KiB stays well under that (leaving room for the
+/// `ChangeBatch` message; the transport rejects any inbound control frame
+/// larger than `yadorilink_transport::quic_peer_channel::MAX_CONTROL_FRAME_
+/// BYTES` (2 MiB). 256 KiB stays well under that (leaving room for the
 /// change's fixed header, parents, and signature, and letting several changes
 /// still share one batch message) while a pathological run of long paths — up
 /// to `RECONCILE_CHUNK_OP_LIMIT` * ~4 KiB ≈ 4 MiB if bounded by op-count
@@ -386,7 +569,7 @@ impl LocalChangeProcessor {
     /// sufficient on its own.
     fn begin_operation(
         &self,
-    ) -> Result<yadorilink_root_authority::root_commit::LinkOperation<'_>, LocalCaptureError> {
+    ) -> Result<yadorilink_root_authority::root_commit::LinkOperation, LocalCaptureError> {
         Ok(self.root_lease.begin_operation()?)
     }
 
@@ -407,8 +590,9 @@ impl LocalChangeProcessor {
     fn content_op(
         &self,
         record: &FileRecord,
-        exec_bit: bool,
+        unix_mode: Option<u32>,
         symlink_target: Option<Vec<u8>>,
+        xattrs: Vec<(String, Vec<u8>)>,
     ) -> (Op, FileVersion) {
         // The chunker's real per-block sizes are in scope here, so the version
         // carries each block's exact length; a receiver rebuilds offsets from
@@ -422,9 +606,10 @@ impl LocalChangeProcessor {
             if symlink_target.is_some() { RecordKind::Symlink } else { RecordKind::File };
         let meta = FileMeta {
             mtime_unix_nanos: record.mtime_unix_nanos,
-            exec_bit,
+            unix_mode,
             symlink_target,
             record_kind,
+            xattrs,
         };
         let version = FileVersion::new(blocks, record.size, meta);
         let version_hash = version.version_hash;
@@ -473,6 +658,29 @@ impl LocalChangeProcessor {
             &root,
             ignore_set,
             ReconcileMode::Full { emit_tombstones: true },
+            None,
+        )
+    }
+
+    /// Streaming sibling of `scan_existing_files_with_ignore`: identical
+    /// scan/commit behavior and return value, but `on_chunk_committed` is
+    /// called once per reconciliation chunk right after that chunk's own
+    /// durable commit -- see `reconcile_disk_with_ignore`'s own doc for the
+    /// exact guarantee (never before a commit, never for a withheld chunk).
+    pub fn scan_existing_files_with_ignore_streaming(
+        &self,
+        group_id: &str,
+        root: &Path,
+        ignore_set: &EffectiveIgnoreSet,
+        on_chunk_committed: &mut dyn FnMut(&[FileRecord]),
+    ) -> Result<Vec<FileRecord>, LocalCaptureError> {
+        let root = self.verified_root(group_id, root)?;
+        self.reconcile_disk_with_ignore(
+            group_id,
+            &root,
+            ignore_set,
+            ReconcileMode::Full { emit_tombstones: true },
+            Some(on_chunk_committed),
         )
     }
 
@@ -507,6 +715,7 @@ impl LocalChangeProcessor {
             &root,
             ignore_set,
             ReconcileMode::Full { emit_tombstones },
+            None,
         )
     }
 
@@ -598,7 +807,7 @@ impl LocalChangeProcessor {
         // the recurring backstop for an already-running watch, not the
         // one-time initial scan — see that method's own doc.
         let root = self.verified_root_of_established_link(group_id, root)?;
-        self.reconcile_disk_with_ignore(group_id, &root, ignore_set, ReconcileMode::AddOnly)
+        self.reconcile_disk_with_ignore(group_id, &root, ignore_set, ReconcileMode::AddOnly, None)
     }
 
     /// Like `reconcile_added_files_with_ignore`, but loads `root`'s ignore
@@ -632,12 +841,28 @@ impl LocalChangeProcessor {
     /// internally, or `strip_prefix` silently fails for every entry (the same
     /// class of mismatch that function's own doc comment warns about for OS
     /// watchers).
+    /// `on_chunk_committed`, when present, is called synchronously once per
+    /// reconciliation chunk immediately after that chunk's own durable
+    /// commit succeeds (right where `committed.extend_from_slice` already
+    /// runs below) -- never before, and never for a chunk withheld by
+    /// `PolicyUnavailable`. This lets a caller (see `scan_existing_files_
+    /// with_ignore_streaming`) observe already-durable progress before the
+    /// whole scan returns, without this function's own return contract
+    /// changing at all: every existing caller passes `None` and sees
+    /// byte-identical behavior. See the C4 15k live-burst investigation
+    /// (2026-09-01): a full reconciliation already commits in bounded
+    /// chunks (this loop's own doc comment above), but nothing surfaced
+    /// that progress until this function returned -- for a real 15k-file
+    /// scan, that withheld peer visibility for the whole scan's length
+    /// (tens of seconds) even though most of the work was already durable
+    /// far earlier.
     fn reconcile_disk_with_ignore(
         &self,
         group_id: &str,
         root: &VerifiedRoot,
         ignore_set: &EffectiveIgnoreSet,
         mode: ReconcileMode,
+        mut on_chunk_committed: Option<&mut dyn FnMut(&[FileRecord])>,
     ) -> Result<Vec<FileRecord>, LocalCaptureError> {
         let root = root.path();
 
@@ -696,9 +921,16 @@ impl LocalChangeProcessor {
         // exec-bit updates for paths
         // whose content (size) is unchanged this scan, applied after the
         // batch write below for the same reason `pending_symlinks` is —
-        // `SyncState::set_exec_bit` is `UPDATE`-only and requires the row
+        // `SyncState::set_unix_mode` is `UPDATE`-only and requires the row
         // to already exist.
-        let mut pending_exec_bits: Vec<(String, bool)> = Vec::new();
+        let mut pending_unix_modes: Vec<(String, Option<u32>)> = Vec::new();
+        // C1.2a: same reasoning and lifecycle as `pending_unix_modes` --
+        // applied as an ordinary post-write setter (`already_current`'s
+        // fast path below) or folded into the emitted `FileVersion`/index
+        // metadata (the `build_record_for_created_or_modified` path
+        // below), never dropped on the floor the way an earlier version
+        // of this scan unconditionally did.
+        let mut pending_xattrs: Vec<(String, Vec<(String, Vec<u8>)>)> = Vec::new();
         // `follow_links(false)` is walkdir's default, but stated
         // explicitly here — verified (not assumed) that this default is
         // what makes a symlinked directory get enumerated as a single
@@ -840,15 +1072,27 @@ impl LocalChangeProcessor {
             // startup/burst-fallback scan — the high-frequency `AddOnly`
             // backstop never reaches this path for an already-indexed file
             // (it `continue`s above at `existing.is_some()`).
+            //
+            // Bounded in total work is not the same as bounded per hold,
+            // though. The daemon runs the *initial* scan inside its own
+            // `spawn_blocking`, but the disk-reconcile backstop reaches
+            // this same loop by awaiting `reconcile_added_files_from_disk`
+            // straight from a runtime task — so on that route every large
+            // already-current file would re-read and re-hash itself with a
+            // worker core held. `disk_bytes_match_indexed_blocks_off_
+            // worker` hands the core off for exactly those files and leaves
+            // small ones inline, so this per-file loop pays no handoff for
+            // the files that do not need one.
             let already_current = match (&existing, &entry_metadata) {
                 (Some(existing), Some(metadata)) => {
                     !existing.deleted
                         && existing.size == metadata.len()
                         && metadata_mtime_matches(metadata, existing.mtime_unix_nanos)
                         && (!file_type.is_file()
-                            || yadorilink_local_storage::disk_bytes_match_indexed_blocks(
+                            || disk_bytes_match_indexed_blocks_off_worker(
                                 path,
                                 &existing.blocks,
+                                metadata.len(),
                             )?)
                 }
                 _ => false,
@@ -857,7 +1101,7 @@ impl LocalChangeProcessor {
                 // content (size) is
                 // unchanged, but this file's exec bit may never have been
                 // captured at all (it predates this change and the
-                // `exec_bit` column defaults to `false`), or may have been
+                // `unix_mode` column defaults to `false`), or may have been
                 // chmod-only-changed since the last scan with no live
                 // watcher running to catch it via
                 // `build_record_for_created_or_modified`'s own fast path.
@@ -869,12 +1113,25 @@ impl LocalChangeProcessor {
                 // applies to a genuine regular file.
                 if file_type.is_file() {
                     if let (Some(existing), Some(metadata)) = (&existing, &entry_metadata) {
-                        let on_disk_exec_bit = owner_exec_bit_from_metadata(metadata);
-                        let indexed_exec_bit = self.state.get_exec_bit(group_id, &rel_path)?;
-                        if on_disk_exec_bit != indexed_exec_bit {
+                        let on_disk_unix_mode = unix_mode_from_metadata(metadata);
+                        let indexed_unix_mode = self.state.get_unix_mode(group_id, &rel_path)?;
+                        // Same reasoning as the exec-bit check just
+                        // above, for extended attributes (C1.2a): an
+                        // offline `setxattr`-only edit changes neither
+                        // size, mtime, content, nor unix_mode, so it must
+                        // be checked here too or a re-scan can never
+                        // discover it.
+                        let on_disk_xattrs = std::fs::File::open(path)
+                            .map(|f| read_replicated_xattrs(&f))
+                            .unwrap_or_default();
+                        let indexed_xattrs = self.state.get_xattrs(group_id, &rel_path)?;
+                        if on_disk_unix_mode != indexed_unix_mode
+                            || on_disk_xattrs != indexed_xattrs
+                        {
                             let record = existing.clone();
                             records.push(record);
-                            pending_exec_bits.push((rel_path.clone(), on_disk_exec_bit));
+                            pending_unix_modes.push((rel_path.clone(), on_disk_unix_mode));
+                            pending_xattrs.push((rel_path.clone(), on_disk_xattrs));
                         }
                     }
                 }
@@ -883,7 +1140,7 @@ impl LocalChangeProcessor {
 
             let materialization_state = materialization_by_path.get(&rel_path).copied();
             let placeholder_generation = placeholder_generation_by_path.get(&rel_path).cloned();
-            let (outcome, classification, exec_bit) = self.build_record_for_created_or_modified(
+            let (outcome, classification, unix_mode) = self.build_record_for_created_or_modified(
                 group_id,
                 root,
                 rel_path.clone(),
@@ -894,11 +1151,24 @@ impl LocalChangeProcessor {
             )?;
             if let LocalChangeOutcome::FileChanged(record) = outcome {
                 records.push(record);
+                // Same reasoning as `local_change.rs`'s live single-event
+                // path: a fresh open, not the same handle
+                // `build_record_for_created_or_modified` chunked through
+                // above -- a weaker same-bytes guarantee, but xattrs are
+                // best-effort metadata, never content integrity. Never
+                // scanned for a symlink, matching `unix_mode`'s own `None`
+                // there.
+                if classification.is_none() {
+                    let xattrs = std::fs::File::open(path)
+                        .map(|f| read_replicated_xattrs(&f))
+                        .unwrap_or_default();
+                    pending_xattrs.push((rel_path.clone(), xattrs));
+                }
                 if let Some(classification) = classification {
                     pending_symlinks.push((rel_path.clone(), classification));
                 }
-                if let Some(exec_bit) = exec_bit {
-                    pending_exec_bits.push((rel_path, exec_bit));
+                if let Some(unix_mode) = unix_mode {
+                    pending_unix_modes.push((rel_path, unix_mode));
                 }
             }
         }
@@ -958,27 +1228,25 @@ impl LocalChangeProcessor {
                 }
                 // M5-A finding: an open intent alone is not enough. A
                 // path can have a durably-committed, non-deleted index
-                // row whose materialization JOB is still queued (e.g.
-                // `Pending`/`Backoff` after a transient dispatch
-                // failure right after the DAG record was admitted) --
-                // no intent has ever been opened for it (that only
-                // happens once `materialize()` itself actually runs),
-                // but it is exactly as "not yet known to be deleted" as
-                // an in-flight intent is. Without this check, a restart
-                // landing between DAG-record admission and that job's
-                // first successful `materialize()` attempt reads this
-                // as an offline deletion and tombstones a file the
-                // device never even finished receiving once. Same
-                // fail-closed contract as the intent check above: an
-                // errored lookup propagates via `?`.
-                if self.state.has_pending_materialization_job(group_id, path)? {
+                // row whose projection obligation is still unsettled
+                // (right after the DAG record was admitted, before
+                // `materialize()` itself has ever run) -- no intent has
+                // ever been opened for it, but it is exactly as "not yet
+                // known to be deleted" as an in-flight intent is. Without
+                // this check, a restart landing between DAG-record
+                // admission and the obligation's first successful
+                // materialize reads this as an offline deletion and
+                // tombstones a file the device never even finished
+                // receiving once. Same fail-closed contract as the intent
+                // check above: an errored lookup propagates via `?`.
+                if self.state.has_unsettled_projection_obligation(group_id, path)? {
                     continue;
                 }
                 tracing::info!(
                     group_id,
                     path,
                     "startup reconciliation scan is tombstoning a locally-missing path (no open \
-                     intent, no pending materialization job) as an offline deletion"
+                     intent, no unsettled projection obligation) as an offline deletion"
                 );
                 let mut tombstone = existing.clone();
                 tombstone.deleted = true;
@@ -999,8 +1267,8 @@ impl LocalChangeProcessor {
         if has_dag_history && !records.is_empty() {
             // Present only when `has_dag_history` already required it.
             let emitter = self.change_emitter.as_ref().expect("emitter present");
-            let exec_by_path: std::collections::HashMap<&str, bool> =
-                pending_exec_bits.iter().map(|(p, b)| (p.as_str(), *b)).collect();
+            let exec_by_path: std::collections::HashMap<&str, Option<u32>> =
+                pending_unix_modes.iter().map(|(p, b)| (p.as_str(), *b)).collect();
             let classification_by_path: std::collections::HashMap<&str, &SymlinkClassification> =
                 pending_symlinks.iter().map(|(p, c)| (p.as_str(), c)).collect();
 
@@ -1019,24 +1287,44 @@ impl LocalChangeProcessor {
                     versions.push(None);
                     metas.push(None);
                 } else {
-                    let exec_bit = exec_by_path.get(record.path.as_str()).copied().unwrap_or(false);
+                    let unix_mode = exec_by_path.get(record.path.as_str()).copied().flatten();
                     let classification: Option<SymlinkClassification> =
                         classification_by_path.get(record.path.as_str()).map(|c| (*c).clone());
                     let symlink_target = classification.as_ref().map(|c| c.target.clone());
-                    let (op, version) = self.content_op(record, exec_bit, symlink_target);
+                    // C1.2a: re-read this record's current on-disk xattrs
+                    // for the same reason `exec_for_meta` reads a fresh
+                    // exec bit below -- an earlier version of this scan
+                    // instead emitted `Vec::new()` unconditionally, which
+                    // did not just miss an offline xattr edit: it
+                    // authored a version and index row with NO xattrs for
+                    // every offline content/mode change this scan
+                    // detects, silently erasing attributes this same file
+                    // already carried and had never actually lost. Never
+                    // scanned for a symlink, matching `exec_for_meta`'s
+                    // own `None` there.
+                    let xattrs = if classification.is_none() {
+                        std::fs::File::open(root.join(&record.path))
+                            .map(|f| read_replicated_xattrs(&f))
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    let (op, version) =
+                        self.content_op(record, unix_mode, symlink_target, xattrs.clone());
                     let exec_for_meta =
-                        if classification.is_some() { None } else { Some(exec_bit) };
+                        if classification.is_some() { None } else { Some(unix_mode) };
                     ops.push(op);
                     versions.push(Some(version));
-                    metas.push(Some(metadata_columns_for(&classification, exec_for_meta)));
+                    metas.push(Some(metadata_columns_for(&classification, exec_for_meta, xattrs)));
                 }
             }
 
             // A bulk offline diff (e.g. deleting or renaming 100k files while
             // the daemon was stopped) would otherwise become a single change
             // with 100k ops — which no peer can decode (over `change::MAX_OPS`)
-            // and no wire message can carry (over the transport fragment cap),
-            // stranding that head permanently un-propagatable. Split it into
+            // and no wire message can carry (over the transport's control
+            // frame size cap), stranding that head permanently
+            // un-propagatable. Split it into
             // op-count- and byte-bounded chunks, each committed as its own
             // change. Because `dag_store::emit_local_change` takes the group's
             // current heads as parents and each chunk commits before the next
@@ -1092,7 +1380,12 @@ impl LocalChangeProcessor {
                         permit: &self.begin_operation()?.permit(),
                     },
                 ) {
-                    Ok(_) => committed.extend_from_slice(chunk_records),
+                    Ok(_) => {
+                        committed.extend_from_slice(chunk_records);
+                        if let Some(ref mut cb) = on_chunk_committed {
+                            cb(chunk_records);
+                        }
+                    }
                     // The group's policy is stale or has not loaded yet this
                     // run, so the emit withheld this chunk rather than stamp a
                     // placeholder-auth change every valid-policy peer would
@@ -1166,13 +1459,16 @@ impl LocalChangeProcessor {
             for (path, classification) in &pending_symlinks {
                 self.apply_symlink_classification(group_id, path, classification)?;
             }
-            for (path, exec_bit) in &pending_exec_bits {
-                self.state.set_exec_bit(
+            for (path, unix_mode) in &pending_unix_modes {
+                self.state.set_unix_mode(
                     group_id,
                     path,
-                    *exec_bit,
+                    *unix_mode,
                     &self.begin_operation()?.permit(),
                 )?;
+            }
+            for (path, xattrs) in &pending_xattrs {
+                self.state.set_xattrs(group_id, path, xattrs, &self.begin_operation()?.permit())?;
             }
             self.record_local_commit_fingerprints(group_id, root, &records);
             Ok(records)
@@ -1248,7 +1544,16 @@ impl LocalChangeProcessor {
         event: &FsChangeEvent,
         ignore_set: &EffectiveIgnoreSet,
     ) -> Result<LocalChangeOutcome, LocalCaptureError> {
-        self.process_event_with_ignore_at(group_id, root, event, ignore_set, None).await
+        // `pending_batch: None` always yields `EventOutcome::Ready` --
+        // `Deferred` is only ever produced when a batch sink is supplied,
+        // which only `process_flush_with_ignore`'s `DebounceFlush::Paths`
+        // loop ever does.
+        match self.process_event_with_ignore_at(group_id, root, event, ignore_set, None, None).await? {
+            EventOutcome::Ready(outcome) => Ok(outcome),
+            EventOutcome::Deferred => unreachable!(
+                "process_event_with_ignore_at only defers when given a pending_batch sink"
+            ),
+        }
     }
 
     /// Like `process_event_with_ignore`, but for a `Removed` event lets the
@@ -1262,6 +1567,14 @@ impl LocalChangeProcessor {
     /// undebounced call, every existing test) keeps getting `None` =>
     /// "now", identical to this method's behavior before this parameter
     /// existed.
+    ///
+    /// `pending_batch`, when `Some`, lets the simple, DAG-emitting
+    /// create/modify/delete case (not a symlink, an emitter configured)
+    /// defer its commit into a shared batch instead of committing here --
+    /// see [`EventOutcome::Deferred`]/[`PendingBatchedCommit`]'s own docs.
+    /// `None` (every caller but `process_flush_with_ignore`'s
+    /// `DebounceFlush::Paths` loop) always yields `EventOutcome::Ready`,
+    /// identical to this function's behavior before batching existed.
     async fn process_event_with_ignore_at(
         &self,
         group_id: &str,
@@ -1269,7 +1582,8 @@ impl LocalChangeProcessor {
         event: &FsChangeEvent,
         ignore_set: &EffectiveIgnoreSet,
         observed_at_unix_nanos: Option<i64>,
-    ) -> Result<LocalChangeOutcome, LocalCaptureError> {
+        pending_batch: Option<&mut Vec<PendingBatchedCommit>>,
+    ) -> Result<EventOutcome, LocalCaptureError> {
         // OS-level watchers (notify's FSEvents backend on macOS in
         // particular) report fully-resolved paths — e.g. `/private/var/...`
         // rather than the `/var/...` symlink most callers construct their
@@ -1287,7 +1601,7 @@ impl LocalChangeProcessor {
         // before anything else below touches the index or DAG.
         self.verified_root_of_established_link(group_id, &root)?;
         let Ok(rel_path) = event.path.strip_prefix(&root) else {
-            return Ok(LocalChangeOutcome::None);
+            return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
         };
         // A name that cannot be represented losslessly as this crate's
         // UTF-8 wire path (see `path_to_wire_relative_string`'s own doc
@@ -1302,17 +1616,17 @@ impl LocalChangeProcessor {
                 "skipping a local change event for a path that cannot be represented \
                  losslessly as this crate's UTF-8 wire path"
             );
-            return Ok(LocalChangeOutcome::None);
+            return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
         };
         if rel_path.is_empty() {
-            return Ok(LocalChangeOutcome::None);
+            return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
         }
         if is_ignore_file_relative_path(Path::new(&rel_path)) {
-            return Ok(LocalChangeOutcome::None);
+            return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
         }
 
         if is_excluded_from_sync(&rel_path, event.path.is_dir(), ignore_set) {
-            return Ok(LocalChangeOutcome::None);
+            return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
         }
 
         // hold the per-(group,path) lock for the whole
@@ -1370,7 +1684,8 @@ impl LocalChangeProcessor {
                 // never had, accumulating mesh-wide junk over repeated
                 // saves. Only mark-deleted (and broadcast) a path that
                 // already has an index entry.
-                if self.state.get_file(group_id, &rel_path)?.is_none() {
+                let existing_for_delete = self.state.get_file(group_id, &rel_path)?;
+                if existing_for_delete.is_none() {
                     // `rel_path` itself was never a tracked file (a
                     // directory is never its own index row), but it may
                     // just have been a directory that disappeared —
@@ -1400,7 +1715,7 @@ impl LocalChangeProcessor {
                         .map(|r| r.path)
                         .collect();
                     if orphaned.is_empty() {
-                        return Ok(LocalChangeOutcome::None);
+                        return Ok(EventOutcome::Ready(LocalChangeOutcome::None));
                     }
                     let now = observed_at_unix_nanos.unwrap_or_else(now_unix_nanos);
                     let mut records = Vec::with_capacity(orphaned.len());
@@ -1412,6 +1727,19 @@ impl LocalChangeProcessor {
                                     orphan_path,
                                     &self.device_id,
                                     now,
+                                    // No Absent proof here: the path lock
+                                    // this call holds (`_guard`, acquired
+                                    // above) covers `rel_path` (the
+                                    // directory that vanished), not
+                                    // `orphan_path` itself -- `orphaned`
+                                    // was a lock-free snapshot read
+                                    // (`list_files`), so there is no
+                                    // revalidation-under-this-path's-own-
+                                    // lock guarantee to publish a proof
+                                    // against. Always safe to decline;
+                                    // costs nothing on this already-rare
+                                    // orphaned-directory-cleanup path.
+                                    false,
                                     emitter,
                                     &self.begin_operation()?.permit(),
                                 )?;
@@ -1430,16 +1758,61 @@ impl LocalChangeProcessor {
                             records.push(record);
                         }
                     }
-                    return Ok(LocalChangeOutcome::FilesChanged(records));
+                    return Ok(EventOutcome::Ready(LocalChangeOutcome::FilesChanged(records)));
                 }
                 let observed = observed_at_unix_nanos.unwrap_or_else(now_unix_nanos);
                 match &self.change_emitter {
                     Some(emitter) => {
+                        // The simple, common delete case: an existing row,
+                        // a real emitter -- eligible to defer into a shared
+                        // batch commit instead of committing here. Builds
+                        // the exact same tombstone `FileRecord`
+                        // `mark_deleted_emitting_change` builds internally
+                        // (deleted=true, mtime stamped with this event's
+                        // observed time, everything else carried forward
+                        // from the current row) so the batched and
+                        // immediate paths produce byte-identical rows.
+                        if let Some(batch) = pending_batch {
+                            let mut record = existing_for_delete.clone().unwrap_or_else(|| FileRecord {
+                                path: rel_path.clone(),
+                                size: 0,
+                                mtime_unix_nanos: 0,
+                                blocks: vec![],
+                                deleted: false,
+                            });
+                            record.deleted = true;
+                            record.mtime_unix_nanos = observed;
+                            let op = Op::Delete { path: SyncPath(rel_path.clone()) };
+                            let authoring_change_hash_at_prepare =
+                                self.state.get_authoring_change_hash(group_id, &rel_path)?;
+                            batch.push(PendingBatchedCommit {
+                                rel_path: rel_path.clone(),
+                                event_path: event.path.clone(),
+                                observed_at_unix_nanos: observed,
+                                index_state_at_prepare: existing_for_delete,
+                                authoring_change_hash_at_prepare,
+                                disk_fingerprint_at_prepare: disk_race_fingerprint(&event.path),
+                                mutation:
+                                    yadorilink_replica_domain::session_state::PreparedLocalMutation::Delete {
+                                        record,
+                                        op,
+                                    },
+                            });
+                            return Ok(EventOutcome::Deferred);
+                        }
                         self.state.mark_deleted_emitting_change(
                             group_id,
                             &rel_path,
                             &self.device_id,
                             observed,
+                            // Safe to publish an Absent proof here:
+                            // `effective_kind`'s own `symlink_metadata`
+                            // re-check (this function's entry) confirmed
+                            // `rel_path` -- the SAME path `_guard` above
+                            // locks for this whole call -- is gone from
+                            // disk, immediately before this branch and
+                            // under that same lock the whole way through.
+                            true,
                             emitter,
                             &self.begin_operation()?.permit(),
                         )?;
@@ -1454,10 +1827,10 @@ impl LocalChangeProcessor {
                         )?;
                     }
                 }
-                Ok(match self.state.get_file(group_id, &rel_path)? {
+                Ok(EventOutcome::Ready(match self.state.get_file(group_id, &rel_path)? {
                     Some(record) => LocalChangeOutcome::FileChanged(record),
                     None => LocalChangeOutcome::None,
-                })
+                }))
             }
             FsChangeKind::CreatedOrModified => {
                 let materialization_state =
@@ -1465,7 +1838,24 @@ impl LocalChangeProcessor {
                 let placeholder_generation =
                     self.state.get_placeholder_generation(group_id, &rel_path)?;
                 let existing = self.state.get_file(group_id, &rel_path)?;
-                let (outcome, classification, exec_bit) = self
+                // Cloned before the call below moves `existing` --
+                // `PendingBatchedCommit` needs its own snapshot of the
+                // index state this preparation was based on, to revalidate
+                // against later at batch-commit time. Captured together so
+                // both reflect the identical moment.
+                let existing_at_prepare = existing.clone();
+                let authoring_change_hash_at_prepare =
+                    self.state.get_authoring_change_hash(group_id, &rel_path)?;
+                // Captured before this event's own content read below, so
+                // the eventual commit-time proof-publication check
+                // (`fingerprint_before_content_read == disk_race_
+                // fingerprint(&event.path)` immediately before the
+                // single-immediate commit call, further down) can detect a
+                // race across the WHOLE read-through-commit window, not
+                // just the narrower prepare-to-commit window the batched
+                // path's own `disk_fingerprint_at_prepare` already covers.
+                let fingerprint_before_content_read = disk_race_fingerprint(&event.path);
+                let (outcome, classification, unix_mode) = self
                     .build_record_for_created_or_modified(
                         group_id,
                         &root,
@@ -1497,10 +1887,29 @@ impl LocalChangeProcessor {
                     match &self.change_emitter {
                         Some(emitter) => {
                             let symlink_target = classification.as_ref().map(|c| c.target.clone());
+                            // A fresh open, not the same handle
+                            // `build_record_for_created_or_modified` chunked
+                            // through above -- a weaker same-bytes guarantee
+                            // than `single_pass_capture.rs`'s own xattr read,
+                            // but xattrs are a best-effort metadata capture
+                            // (see `read_replicated_xattrs`'s own doc
+                            // comment), not content integrity, so a rare
+                            // race here reads as "no attributes this time,"
+                            // never a corrupt result. Never scanned for a
+                            // symlink, matching `unix_mode`'s own `None`
+                            // there.
+                            let xattrs = if classification.is_none() {
+                                std::fs::File::open(&event.path)
+                                    .map(|file| read_replicated_xattrs(&file))
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
                             let (op, version) = self.content_op(
                                 record,
-                                exec_bit.unwrap_or(false),
+                                unix_mode.flatten(),
                                 symlink_target.clone(),
+                                xattrs.clone(),
                             );
                             // The record kind / symlink target / out-of-root
                             // flag / exec bit are written in the SAME
@@ -1511,7 +1920,46 @@ impl LocalChangeProcessor {
                             // leave the index row's metadata columns lagging
                             // the change's `FileVersion` — the old post-commit
                             // `set_*` setters are gone from this emit path.
-                            let meta = metadata_columns_for(&classification, exec_bit);
+                            let meta = metadata_columns_for(&classification, unix_mode, xattrs);
+                            // The simple, common create/modify case: not a
+                            // symlink, a real emitter -- eligible to defer
+                            // into a shared batch commit instead of
+                            // committing here. A symlink
+                            // (`classification.is_some()`) always commits
+                            // immediately below, unbatched -- rare enough
+                            // that it is not worth the added complexity of
+                            // proving its batched revalidation covers the
+                            // same identity/target checks this path relies
+                            // on elsewhere.
+                            if classification.is_none() {
+                                if let Some(batch) = pending_batch {
+                                    batch.push(PendingBatchedCommit {
+                                        rel_path: rel_path.clone(),
+                                        event_path: event.path.clone(),
+                                        observed_at_unix_nanos: observed_at_unix_nanos
+                                            .unwrap_or_else(now_unix_nanos),
+                                        index_state_at_prepare: existing_at_prepare,
+                                        authoring_change_hash_at_prepare,
+                                        disk_fingerprint_at_prepare: disk_race_fingerprint(&event.path),
+                                        mutation:
+                                            yadorilink_replica_domain::session_state::PreparedLocalMutation::Upsert {
+                                                record: record.clone(),
+                                                op,
+                                                version,
+                                                meta: Some(meta),
+                                            },
+                                    });
+                                    return Ok(EventOutcome::Deferred);
+                                }
+                            }
+                            // M6-2 phase-timing diagnostic (temporary): see
+                            // chunker.rs's matching M6PHASE comment for why
+                            // this exists.
+                            tracing::warn!("M6PHASE T_author_start: authoritative FileRecord/DAG commit begins");
+                            let filesystem_identity = fresh_actual_state_identity_if_unraced(
+                                &event.path,
+                                fingerprint_before_content_read,
+                            );
                             self.state.upsert_file_emitting_change(
                                 group_id,
                                 record,
@@ -1521,19 +1969,23 @@ impl LocalChangeProcessor {
                                     versions: std::slice::from_ref(&version),
                                 },
                                 Some(&meta),
+                                filesystem_identity.as_ref(),
                                 crate::ports::LocalChangeEmission {
                                     emitter,
                                     permit: &self.begin_operation()?.permit(),
                                 },
                             )?;
+                            tracing::warn!("M6PHASE T_author_done: authoritative FileRecord/DAG commit completes");
                         }
                         None => {
+                            tracing::warn!("M6PHASE T_author_start: authoritative FileRecord/DAG commit begins");
                             self.state.upsert_file_with_origin(
                                 group_id,
                                 record,
                                 &self.device_id,
                                 &self.begin_operation()?.permit(),
                             )?;
+                            tracing::warn!("M6PHASE T_author_done: authoritative FileRecord/DAG commit completes");
                             // No DAG emission here (no signing key provisioned),
                             // so there is no DAG/index divergence hazard: apply
                             // the metadata columns as ordinary post-write
@@ -1546,18 +1998,18 @@ impl LocalChangeProcessor {
                                     classification,
                                 )?;
                             }
-                            if let Some(exec_bit) = exec_bit {
-                                self.state.set_exec_bit(
+                            if let Some(unix_mode) = unix_mode {
+                                self.state.set_unix_mode(
                                     group_id,
                                     &rel_path,
-                                    exec_bit,
+                                    unix_mode,
                                     &self.begin_operation()?.permit(),
                                 )?;
                             }
                         }
                     }
                 }
-                Ok(outcome)
+                Ok(EventOutcome::Ready(outcome))
             }
         }
     }
@@ -1571,11 +2023,11 @@ impl LocalChangeProcessor {
     /// (`scan_existing_files`) never issues a per-file query for them.
     ///
     /// The third element of the returned tuple
-    /// is the owner-exec bit to persist via `SyncState::set_exec_bit`, when
-    /// this call determined one needs capturing — `None` for a symlink
-    /// (no exec bit of its own) or when nothing changed. Returned rather
+    /// (see [`PendingUnixModeUpdate`]) is the Unix permission bits to
+    /// persist via `SyncState::set_unix_mode`, when this call determined a
+    /// value needs capturing. Returned rather
     /// than applied directly here, mirroring `SymlinkClassification`'s own
-    /// "apply after write" shape: `set_exec_bit` is `UPDATE`-only and the
+    /// "apply after write" shape: `set_unix_mode` is `UPDATE`-only and the
     /// index row may not exist yet at this point (a brand-new file, not
     /// written until the caller's `upsert_file_with_origin`/
     /// `upsert_files_batch` runs).
@@ -1595,8 +2047,11 @@ impl LocalChangeProcessor {
         existing: Option<FileRecord>,
         materialization_state: Option<MaterializationState>,
         placeholder_generation: Option<yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
-    ) -> Result<(LocalChangeOutcome, Option<SymlinkClassification>, Option<bool>), LocalCaptureError>
+    ) -> Result<(LocalChangeOutcome, Option<SymlinkClassification>, PendingUnixModeUpdate), LocalCaptureError>
     {
+        // M6-2 phase-timing diagnostic (temporary): see chunker.rs's
+        // matching M6PHASE comment for why this exists.
+        tracing::warn!("M6PHASE T_capture_start: local capture entry (build_record_for_created_or_modified)");
         // classify via an lstat-equivalent check first —
         // `symlink_metadata` never follows the final path component,
         // unlike `Path::is_file`/`std::fs::metadata` (used further below,
@@ -1607,6 +2062,16 @@ impl LocalChangeProcessor {
         let Ok(lstat) = std::fs::symlink_metadata(path) else {
             return Ok((LocalChangeOutcome::None, None, None)); // already gone again
         };
+
+        // Test-only synchronization seam: deterministically reproduces the
+        // TOCTOU race this function's own chunk attempt further below can
+        // hit against a write-then-rename save landing between this lstat
+        // (which just proved `path` exists) and the chunker's later
+        // `fs::metadata`/`File::open` on the same `path` — see
+        // `is_source_path_vanished_error`'s doc comment for the full
+        // explanation. No effect outside `#[cfg(test)]` builds.
+        #[cfg(test)]
+        fire_race_after_lstat_hook(path);
 
         if lstat.file_type().is_symlink() {
             let (outcome, classification) =
@@ -1711,7 +2176,14 @@ impl LocalChangeProcessor {
         // early-exits on the first mismatch, without re-chunking (no
         // content-defined boundary search) and without writing any block to
         // the store — much cheaper than the full chunk path, and it runs
-        // only for files that already passed the cheap size+mtime gate. If
+        // only for files that already passed the cheap size+mtime gate.
+        // Cheaper is not cheap, though: for a large file it is still a full
+        // sequential read plus a SHA-256 per indexed block, and this fast
+        // path sits on the live `process_event` route, awaited directly on
+        // a tokio worker with nothing above it offloading anything. Hence
+        // `disk_bytes_match_indexed_blocks_off_worker` rather than the bare
+        // verifier — identical verdict, but a large file's pass no longer
+        // runs with a worker core held for its duration. If
         // the bytes differ, this whole fast-path is skipped and the edit
         // falls through to the full chunk-and-compare path below, which
         // re-versions the record and emits the change.
@@ -1722,9 +2194,10 @@ impl LocalChangeProcessor {
                         metadata_mtime_matches(&metadata, existing.mtime_unix_nanos);
                     if existing.size == metadata.len()
                         && current_mtime_matches
-                        && yadorilink_local_storage::disk_bytes_match_indexed_blocks(
+                        && disk_bytes_match_indexed_blocks_off_worker(
                             path,
                             &existing.blocks,
+                            metadata.len(),
                         )?
                     {
                         // size, mtime, AND content are all verified
@@ -1741,10 +2214,24 @@ impl LocalChangeProcessor {
                         // peer's advertised bit — mirrored here for local
                         // capture: bump the version (broadcast-worthy)
                         // without re-chunking.
-                        let on_disk_exec_bit = owner_exec_bit_from_metadata(&metadata);
-                        let indexed_exec_bit = self.state.get_exec_bit(group_id, &rel_path)?;
-                        if on_disk_exec_bit == indexed_exec_bit {
-                            // size, mtime, AND exec bit all
+                        let on_disk_unix_mode = unix_mode_from_metadata(&metadata);
+                        let indexed_unix_mode = self.state.get_unix_mode(group_id, &rel_path)?;
+                        // Same reasoning as the exec bit just above, for
+                        // extended attributes (C1.2a): a `setxattr`-only
+                        // edit touches none of size/mtime/content/unix_mode
+                        // either, so it must be checked here too, or it is
+                        // silently and permanently dropped -- never
+                        // captured, never emitted, and a peer's next sync
+                        // would overwrite this device's real xattr edit
+                        // with the stale indexed value.
+                        let on_disk_xattrs = std::fs::File::open(path)
+                            .map(|f| read_replicated_xattrs(&f))
+                            .unwrap_or_default();
+                        let indexed_xattrs = self.state.get_xattrs(group_id, &rel_path)?;
+                        if on_disk_unix_mode == indexed_unix_mode
+                            && on_disk_xattrs == indexed_xattrs
+                        {
+                            // size, mtime, exec bit, AND xattrs all
                             // unchanged — preserve the existing no-op
                             // behavior exactly.
                             return Ok((LocalChangeOutcome::None, None, None));
@@ -1753,7 +2240,7 @@ impl LocalChangeProcessor {
                         return Ok((
                             LocalChangeOutcome::FileChanged(record),
                             None,
-                            Some(on_disk_exec_bit),
+                            Some(on_disk_unix_mode),
                         ));
                     }
                 }
@@ -1768,10 +2255,87 @@ impl LocalChangeProcessor {
         // produced against what's indexed, so it needs no algorithm-
         // awareness either way.
         let use_cdc = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) >= CDC_SIZE_THRESHOLD;
-        let blocks = if use_cdc {
-            chunk_file_content_defined(self.store.as_ref(), path)?
-        } else {
-            chunk_file(self.store.as_ref(), path)?
+        // Offloaded, not a bare synchronous call — for a large
+        // (CDC-eligible) file this scan (chunk + hash + a real
+        // `fsync`-backed `store.put` per block) runs long enough (13-20s
+        // for 1 GiB, confirmed via timing diagnostics) that running it
+        // in place on a tokio worker would occupy that worker for the
+        // whole span, exactly the class of bug `reconstruct_file_off_
+        // runtime` (peer_session.rs) already fixed on the receive side.
+        // Via `run_capture_pass_off_worker`, NOT a bare
+        // `tokio::task::block_in_place`. Same primitive underneath, and
+        // for the same reason (a scoped closure needs no `Send + 'static`
+        // ownership transfer, so it fits `self` being a plain
+        // `&LocalChangeProcessor` at both call sites with zero refactor of
+        // `self`/`store` access) — but the bare form
+        // was a latent panic and a build break. `block_in_place` panics
+        // unless a multi-threaded runtime is current, and it does not
+        // exist at all in the deterministic simulator's tokio shim, so the
+        // bare call failed to compile under `--cfg madsim` and would have
+        // panicked outright had this path ever been reached from a
+        // current-thread runtime — which it can be: this whole function is
+        // reachable from the synchronous `scan_existing_files` public API.
+        // See that helper's own doc comment for the guard and for the
+        // bound it buys.
+        //
+        // `YADORILINK_DIAGNOSTIC_FORCE_FIXED_CHUNKING=1`
+        // routes a file that would normally take the CDC branch (`use_cdc`)
+        // through `chunk_file_fixed_with_callback` instead of content-
+        // defined chunking -- same hash-once/bulk-commit pipeline, only the
+        // boundary-selection algorithm differs.
+        // Isolates whether `fastcdc`'s own rolling-hash cost, specifically,
+        // is what dominates `capture -> chunk EOF` (found to be 73-86% of
+        // `T_detect` for a real 1 GiB transfer). Not a production
+        // chunking-policy change -- `use_cdc`'s own decision is untouched
+        // when this env var is unset (every existing caller/test).
+        let force_fixed = use_cdc
+            && std::env::var("YADORILINK_DIAGNOSTIC_FORCE_FIXED_CHUNKING").as_deref() == Ok("1");
+        let chunk_result = run_capture_pass_off_worker(|| -> Result<_, LocalCaptureError> {
+            Ok(if force_fixed {
+                yadorilink_local_storage::chunk_file_fixed_with_callback(
+                    self.store.as_ref(),
+                    path,
+                    |_, _: std::sync::Arc<[u8]>| {},
+                )?
+            } else if use_cdc {
+                chunk_file_content_defined(self.store.as_ref(), path)?
+            } else {
+                chunk_file(self.store.as_ref(), path)?
+            })
+        });
+        let blocks = match chunk_result {
+            Ok(blocks) => blocks,
+            // The lstat above already confirmed `path` existed when this
+            // attempt started, but a write-then-rename save pattern (write
+            // to a sibling temp path, then `fs::rename` onto the final
+            // name — used by both ordinary atomic-save editors and this
+            // benchmark's own large-file writer) can complete its rename
+            // in the narrow window between that lstat and the chunker's
+            // own `fs::metadata`/`File::open` a few lines later —
+            // especially for a large file, where the debounce
+            // accumulator's per-path quiet period can legitimately elapse
+            // for the temp path's own "modified" events just as the
+            // writer finishes and renames it away. When `path` is proven
+            // GONE (see `is_source_path_vanished_error`: the `NotFound`
+            // error shape alone does NOT prove that — it re-stats `path`
+            // itself, because a block-store fault produces the identical
+            // error shape and must stay on the retry/journal path), this
+            // is the exact same benign, expected race the lstat guard
+            // above already treats as "already gone again" rather than an
+            // error, so extend that same verdict here. Falling through to
+            // `is_retriable_block_store_error` instead would waste up to
+            // `MAX_LOCAL_INDEX_RETRIES` retries against a path that can
+            // never come back, or — worse — occasionally "succeed" against
+            // a since-fully-rewritten file, indexing a spurious record
+            // under what was only ever a transient rename artifact. The
+            // rename's own watcher event independently queues a fresh
+            // `CreatedOrModified` for the file's real final name (see
+            // `watcher.rs`'s `RenameMode::To`/`Both` handling), so nothing
+            // is silently dropped here.
+            Err(e) if is_source_path_vanished_error(&e, path) => {
+                return Ok((LocalChangeOutcome::None, None, None));
+            }
+            Err(e) => return Err(e),
         };
         // Chunking has read these bytes from this group's local filesystem,
         // hashed them, and durably put them in the shared physical store.
@@ -1809,9 +2373,17 @@ impl LocalChangeProcessor {
         if let Some(existing) = &existing {
             if !existing.deleted && existing.blocks == blocks {
                 if let Ok(metadata) = std::fs::metadata(path) {
-                    let on_disk_exec_bit = owner_exec_bit_from_metadata(&metadata);
-                    let indexed_exec_bit = self.state.get_exec_bit(group_id, &rel_path)?;
-                    if on_disk_exec_bit != indexed_exec_bit {
+                    let on_disk_unix_mode = unix_mode_from_metadata(&metadata);
+                    let indexed_unix_mode = self.state.get_unix_mode(group_id, &rel_path)?;
+                    // Same reasoning as the exec-bit check just above, for
+                    // extended attributes (C1.2a) -- see the size+mtime
+                    // fast path's own identical comment for the full
+                    // rationale.
+                    let on_disk_xattrs = std::fs::File::open(path)
+                        .map(|f| read_replicated_xattrs(&f))
+                        .unwrap_or_default();
+                    let indexed_xattrs = self.state.get_xattrs(group_id, &rel_path)?;
+                    if on_disk_unix_mode != indexed_unix_mode || on_disk_xattrs != indexed_xattrs {
                         // Content is genuinely unchanged (so no re-chunk,
                         // no re-versioned block list), but the exec bit is
                         // a real, local, user-initiated divergence — bump
@@ -1821,7 +2393,7 @@ impl LocalChangeProcessor {
                         return Ok((
                             LocalChangeOutcome::FileChanged(existing.clone()),
                             None,
-                            Some(on_disk_exec_bit),
+                            Some(on_disk_unix_mode),
                         ));
                     }
                 }
@@ -1842,7 +2414,7 @@ impl LocalChangeProcessor {
         // fetched for `mtime_unix_nanos`, so a brand-new executable file's
         // exec bit is indexed from its first appearance rather than only
         // discoverable later via a subsequent metadata-only update.
-        let exec_bit = owner_exec_bit_from_metadata(&metadata);
+        let unix_mode = unix_mode_from_metadata(&metadata);
 
         let record = FileRecord {
             path: rel_path,
@@ -1851,7 +2423,7 @@ impl LocalChangeProcessor {
             blocks,
             deleted: false,
         };
-        Ok((LocalChangeOutcome::FileChanged(record), None, Some(exec_bit)))
+        Ok((LocalChangeOutcome::FileChanged(record), None, Some(unix_mode)))
     }
 
     /// Builds a symlink leaf record: the target's raw text
@@ -1948,7 +2520,7 @@ impl LocalChangeProcessor {
     /// indexed records — the executor half of 's accumulator/executor
     /// split. `DebounceFlush::Paths` is processed one path at a time via
     /// `process_event` (each individually indexed and self-echo-checked,
-    /// exactly as a live single-event call would be); `DebounceFlush::BurstFallback`
+    /// exactly as a live single-event call would be); `DebounceFlush::RescanRequired`
     /// runs a full `scan_existing_files` reconciliation instead.
     ///
     /// Each path in a
@@ -1983,41 +2555,114 @@ impl LocalChangeProcessor {
     ) -> Result<FlushOutcome, LocalCaptureError> {
         match flush {
             DebounceFlush::Paths(paths) => {
-                let mut records = Vec::new();
-                for (path, kind, observed_at) in paths {
-                    // Journal this detected edit durably *before* any
-                    // block-store/index work runs. The debounce accumulator
-                    // has already drained the path, so if the process below
-                    // crashes, restarts, or hits a multi-second disk-full/EIO
-                    // and the retry loop eventually gives up, the in-memory
-                    // knowledge that this path changed would otherwise be lost
-                    // — a permanent split-brain. The row survives until the
-                    // read/blockify/put/index+DAG step commits (cleared on the
-                    // `Ok` arms below); a startup rescan and the on-failure
-                    // retry both re-drive whatever is still journaled. Keyed by
-                    // the same relative path the index uses, so the
-                    // materialization-repair quarantine (`is_path_dirty`) sees
-                    // it too. A journal write failure is itself only logged:
-                    // losing the belt-and-suspenders row must not abort
-                    // processing the edit the normal way.
-                    let dirty_key = relative_key(root, &path);
-                    if let Some(key) = &dirty_key {
-                        if let Err(e) = self.state.record_dirty_path(
-                            group_id,
-                            key,
-                            dirty_kind_str(kind),
-                            observed_at,
-                            &self.begin_operation()?.permit(),
-                        ) {
-                            tracing::warn!(
-                                error = %e,
-                                path = %path.display(),
+                // Precompute each path's dirty-journal key once (`relative_key`
+                // canonicalizes `root`, a syscall) and carry it alongside the
+                // rest of the tuple through both the batch-journal step below
+                // and the per-path processing loop that follows, instead of
+                // recomputing it twice per path.
+                let paths: Vec<(PathBuf, FsChangeKind, i64, Option<String>)> = paths
+                    .into_iter()
+                    .map(|(path, kind, observed_at)| {
+                        let dirty_key = relative_key(root, &path);
+                        (path, kind, observed_at, dirty_key)
+                    })
+                    .collect();
+
+                // Journal the whole known batch durably in one transaction
+                // *before* any path's block-store/index work runs — see
+                // `record_dirty_paths_batch`'s own doc for why one commit for
+                // the batch is equivalent to one commit per path here. The
+                // debounce accumulator has already drained every path in this
+                // flush, so if processing below crashes, restarts, or hits a
+                // multi-second disk-full/EIO and the retry loop eventually
+                // gives up, the in-memory knowledge that these paths changed
+                // would otherwise be lost — a permanent split-brain. Rows
+                // survive until the read/blockify/put/index+DAG step commits
+                // (cleared on the `Ok` arms below); a startup rescan and the
+                // on-failure retry both re-drive whatever is still journaled.
+                // If the batch call itself fails, fall back to the previous
+                // per-path journal calls rather than invent new failure
+                // semantics — either way a journal write failure is only
+                // logged: losing the belt-and-suspenders row must not abort
+                // processing the edits the normal way.
+                let batch_entries: Vec<(String, String, i64)> = paths
+                    .iter()
+                    .filter_map(|(_, kind, observed_at, dirty_key)| {
+                        dirty_key
+                            .as_ref()
+                            .map(|key| (key.clone(), dirty_kind_str(*kind).to_string(), *observed_at))
+                    })
+                    .collect();
+                if let Err(e) = self.state.record_dirty_paths_batch(
+                    group_id,
+                    &batch_entries,
+                    &self.begin_operation()?.permit(),
+                ) {
+                    tracing::warn!(
+                        error = %e,
+                        group_id,
+                        path_count = batch_entries.len(),
+                        "failed to batch-journal a debounced flush before processing; \
+                         falling back to journaling each path individually"
+                    );
+                    for (path, kind, observed_at, dirty_key) in &paths {
+                        if let Some(key) = dirty_key {
+                            if let Err(e) = self.state.record_dirty_path(
                                 group_id,
-                                "failed to journal a dirty local path before processing; \
-                                 proceeding with best-effort in-memory handling"
-                            );
+                                key,
+                                dirty_kind_str(*kind),
+                                *observed_at,
+                                &self.begin_operation()?.permit(),
+                            ) {
+                                tracing::warn!(
+                                    error = %e,
+                                    path = %path.display(),
+                                    group_id,
+                                    "failed to journal a dirty local path before processing; \
+                                     proceeding with best-effort in-memory handling"
+                                );
+                            }
                         }
                     }
+                }
+
+                let mut records = Vec::new();
+                // Successfully processed `(path, observed_at_unix_nanos)`
+                // pairs, cleared from the dirty journal in bounded batches
+                // (`DIRTY_CLEAR_BATCH_SIZE` at a time) rather than one
+                // `write()`/fsync per path — see `clear_dirty_paths_conditional_batch`
+                // for why each clear stays conditioned on its own
+                // `observed_at_unix_nanos` rather than becoming an
+                // unconditional `DELETE ... WHERE path IN (...)`.
+                let mut pending_clears: Vec<(String, i64)> = Vec::new();
+                let flush_pending_clears = |pending_clears: &mut Vec<(String, i64)>| {
+                    if pending_clears.is_empty() {
+                        return;
+                    }
+                    let result = self.begin_operation().and_then(|op| {
+                        self.state
+                            .clear_dirty_paths_conditional_batch(group_id, pending_clears, &op.permit())
+                            .map_err(LocalCaptureError::from)
+                    });
+                    if let Err(e) = result {
+                        tracing::warn!(
+                            error = %e,
+                            group_id,
+                            path_count = pending_clears.len(),
+                            "failed to clear a batch of processed dirty-path journal rows; \
+                             a later rescan will re-verify and clear them"
+                        );
+                    }
+                    pending_clears.clear();
+                };
+                // Prepared, not-yet-committed authoritative mutations for
+                // the simple create/modify/delete case -- drained into one
+                // shared `commit_local_mutations_batch` transaction every
+                // `AUTHORITATIVE_COMMIT_BATCH_SIZE` paths (and once more
+                // after this loop, for whatever remains) by
+                // `flush_pending_batch`, instead of one commit per path.
+                let mut pending_batch: Vec<PendingBatchedCommit> = Vec::new();
+                for (path, kind, observed_at, dirty_key) in paths {
                     // A path's chunk/index step reads and writes content-
                     // addressed blocks through the block store. A *transient*
                     // block-store fault there — a disk-full
@@ -2051,6 +2696,7 @@ impl LocalChangeProcessor {
                                 &FsChangeEvent { path: path.clone(), kind },
                                 ignore_set,
                                 Some(observed_at),
+                                Some(&mut pending_batch),
                             )
                             .await;
                         // The read/blockify/put/index+DAG step for this path
@@ -2060,37 +2706,35 @@ impl LocalChangeProcessor {
                         // delete just leaves the row for the next rescan, which
                         // re-reads the path, finds disk == index, and clears it
                         // as a `None` outcome: idempotent, never a lost edit.
-                        let clear_dirty = || {
+                        let mut clear_dirty = || {
                             if let Some(key) = &dirty_key {
-                                let result = self.begin_operation().and_then(|op| {
-                                    self.state
-                                        .clear_dirty_path(group_id, key, &op.permit())
-                                        .map_err(LocalCaptureError::from)
-                                });
-                                if let Err(e) = result {
-                                    tracing::warn!(
-                                        error = %e,
-                                        path = %key,
-                                        group_id,
-                                        "failed to clear a processed dirty-path journal row; \
-                                         a later rescan will re-verify and clear it"
-                                    );
+                                pending_clears.push((key.clone(), observed_at));
+                                if pending_clears.len() >= DIRTY_CLEAR_BATCH_SIZE {
+                                    flush_pending_clears(&mut pending_clears);
                                 }
                             }
                         };
                         match result {
-                            Ok(LocalChangeOutcome::FileChanged(record)) => {
+                            Ok(EventOutcome::Ready(LocalChangeOutcome::FileChanged(record))) => {
                                 records.push(record);
                                 clear_dirty();
                                 break;
                             }
-                            Ok(LocalChangeOutcome::FilesChanged(orphaned)) => {
+                            Ok(EventOutcome::Ready(LocalChangeOutcome::FilesChanged(orphaned))) => {
                                 records.extend(orphaned);
                                 clear_dirty();
                                 break;
                             }
-                            Ok(LocalChangeOutcome::None) => {
+                            Ok(EventOutcome::Ready(LocalChangeOutcome::None)) => {
                                 clear_dirty();
+                                break;
+                            }
+                            Ok(EventOutcome::Deferred) => {
+                                // Prepared into `pending_batch`; this path's
+                                // record/dirty-clear resolve once
+                                // `flush_pending_batch` runs below (either
+                                // right after this path, once the batch is
+                                // full, or at the end of this flush).
                                 break;
                             }
                             Err(LocalCaptureError::SyncCore(
@@ -2183,14 +2827,258 @@ impl LocalChangeProcessor {
                             }
                         }
                     }
+                    if pending_batch.len() >= AUTHORITATIVE_COMMIT_BATCH_SIZE {
+                        for (record, key, observed_at) in
+                            self.flush_pending_batch(group_id, &mut pending_batch).await?
+                        {
+                            records.push(record);
+                            pending_clears.push((key, observed_at));
+                            if pending_clears.len() >= DIRTY_CLEAR_BATCH_SIZE {
+                                flush_pending_clears(&mut pending_clears);
+                            }
+                        }
+                    }
                 }
+                for (record, key, observed_at) in
+                    self.flush_pending_batch(group_id, &mut pending_batch).await?
+                {
+                    records.push(record);
+                    pending_clears.push((key, observed_at));
+                }
+                flush_pending_clears(&mut pending_clears);
                 Ok(FlushOutcome { records })
             }
-            DebounceFlush::BurstFallback => {
+            DebounceFlush::RescanRequired => {
                 let records = self.scan_existing_files_with_ignore(group_id, root, ignore_set)?;
                 Ok(FlushOutcome { records })
             }
         }
+    }
+
+    /// Streaming sibling of `process_flush_with_ignore`: for
+    /// `DebounceFlush::Paths`, identical (each path is already processed
+    /// and indexed individually, so there is no monolithic-batch delay to
+    /// fix). For `DebounceFlush::RescanRequired`, `on_chunk_committed` is
+    /// called once per durably-committed reconciliation chunk instead of
+    /// withholding all of them until the whole scan returns -- see
+    /// `scan_existing_files_with_ignore_streaming`'s own doc. The final
+    /// `Ok(FlushOutcome)` is unchanged (still the whole scan's aggregate);
+    /// a caller that streams per-chunk must not also re-announce this
+    /// return value's `records` for `RescanRequired`, or every chunk would
+    /// be announced twice.
+    pub async fn process_flush_with_ignore_streaming(
+        &self,
+        group_id: &str,
+        root: &Path,
+        flush: DebounceFlush,
+        ignore_set: &EffectiveIgnoreSet,
+        on_chunk_committed: &mut dyn FnMut(&[FileRecord]),
+    ) -> Result<FlushOutcome, LocalCaptureError> {
+        match flush {
+            DebounceFlush::Paths(_) => {
+                self.process_flush_with_ignore(group_id, root, flush, ignore_set).await
+            }
+            DebounceFlush::RescanRequired => {
+                let records = self.scan_existing_files_with_ignore_streaming(
+                    group_id,
+                    root,
+                    ignore_set,
+                    on_chunk_committed,
+                )?;
+                Ok(FlushOutcome { records })
+            }
+        }
+    }
+
+    /// Commits a bounded batch of prepared authoritative mutations
+    /// (`PendingBatchedCommit`, produced by `process_event_with_ignore_at`'s
+    /// simple create/modify/delete case): acquires every member's per-path
+    /// lock, revalidates each is still current, and commits only the
+    /// still-valid subset in one `commit_local_mutations_batch` transaction
+    /// — the C4 storm investigation's Stage 2 fix for the writer_gate
+    /// contention Stage 1 (batched dirty-journal writes) alone did not
+    /// close.
+    ///
+    /// Correctness rests on three things, none of which
+    /// `commit_local_mutations_batch` itself can enforce (it has no
+    /// filesystem/tokio dependency):
+    ///
+    /// 1. **Locks are held for the whole call, never released early and
+    ///    re-acquired.** Releasing a path's lock between preparing its
+    ///    mutation and committing it would let a concurrent peer
+    ///    materialization (or another local capture) write to that exact
+    ///    path in the gap — reintroducing the stale-materialization race
+    ///    class this project has repeatedly had to close elsewhere.
+    ///    Acquired in lexicographic path order (not the batch's original
+    ///    order) so two concurrent holders of overlapping path sets can
+    ///    never form a lock-order cycle; nothing else in this daemon ever
+    ///    holds more than one path lock at a time (`PeerSyncSession`'s own
+    ///    per-path reconcile locks, releases, then moves to the next path),
+    ///    so ordering here is sufficient on its own.
+    /// 2. **Revalidation immediately before commit, still under lock.**
+    ///    Preparing a mutation (chunk/hash/decide) happens with no lock
+    ///    held at all, so by the time this function acquires a path's
+    ///    lock, disk or index state may have moved on. Re-checking both
+    ///    (`disk_race_fingerprint`, `get_file`) against what preparation
+    ///    observed — the same scheme `peer_session::PeerSyncSession::
+    ///    hydrate_inner` already relies on for the identical question —
+    ///    catches a stale mutation before it authors bytes that are no
+    ///    longer current; a mismatch excludes it from this batch entirely
+    ///    rather than committing it anyway.
+    /// 3. **One signed `Change` per mutation, in original order.** Passed
+    ///    to `commit_local_mutations_batch` in the batch's original
+    ///    (flush) order, not the lock-acquisition order, so the resulting
+    ///    causal chain is identical to what committing each mutation
+    ///    separately, in sequence, would have produced.
+    ///
+    /// Drains `pending` unconditionally. Returns `(record, rel_path,
+    /// observed_at_unix_nanos)` for every mutation that actually committed
+    /// — the caller pushes each into its own `records`/dirty-clear
+    /// bookkeeping. A mutation dropped for staleness, or every mutation in
+    /// this batch if the shared commit itself fails, is simply absent from
+    /// the return value: its dirty-journal row is left untouched (this
+    /// function never clears one), so the normal re-drive path picks it up
+    /// again with fresh state — this mirrors Stage 1's own "a failure here
+    /// is only logged, never fatal to the rest of the flush" philosophy.
+    async fn flush_pending_batch(
+        &self,
+        group_id: &str,
+        pending: &mut Vec<PendingBatchedCommit>,
+    ) -> Result<Vec<(FileRecord, String, i64)>, LocalCaptureError> {
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let batch = std::mem::take(pending);
+        let Some(emitter) = self.change_emitter.clone() else {
+            // `process_event_with_ignore_at` only ever defers into a
+            // batch when `self.change_emitter` is `Some` -- see its own
+            // "simple case" gating. An empty emitter here would mean a
+            // mutation was queued despite that gate, which is a logic
+            // error in this module, not a runtime condition to recover
+            // from.
+            unreachable!(
+                "a batched mutation was prepared without a change_emitter configured"
+            );
+        };
+
+        // Acquire every member's path lock in lexicographic order --
+        // deadlock safety against any other concurrent holder of a
+        // different subset of these same locks (see this function's own
+        // doc comment, point 1).
+        let mut sorted_paths: Vec<&str> = batch.iter().map(|p| p.rel_path.as_str()).collect();
+        sorted_paths.sort_unstable();
+        let mut guards: std::collections::HashMap<String, tokio::sync::OwnedMutexGuard<()>> =
+            std::collections::HashMap::with_capacity(batch.len());
+        for rel_path in sorted_paths {
+            if guards.contains_key(rel_path) {
+                // The same path cannot appear twice in one debounce flush
+                // (`DebounceFlush::Paths` is keyed by path -- see its own
+                // doc comment), so this only guards against a future
+                // caller violating that invariant rather than double-
+                // locking a path against itself here.
+                continue;
+            }
+            let lock = self.state.path_lock(group_id, rel_path);
+            guards.insert(rel_path.to_string(), lock.lock_owned().await);
+        }
+
+        // Revalidate each, in the batch's original order — see this
+        // function's own doc comment, point 2.
+        let mut keep = Vec::with_capacity(batch.len());
+        // Actual-state evidence for a KEPT item, or `None` for "commit the
+        // Change/index exactly as before, publish no proof" -- computed
+        // here, under this same revalidation pass, so a fresh
+        // `FileIdentity` observation for an Upsert entry is taken at the
+        // exact moment `current_disk` was already confirmed to still
+        // match `disk_fingerprint_at_prepare`, not a separately-timed
+        // stat that could itself race a change this loop's own disk read
+        // already closed the window on. Meaningless (never read) for an
+        // excluded item.
+        let mut evidence_if_kept = Vec::with_capacity(batch.len());
+        for pending_commit in &batch {
+            let current_disk = disk_race_fingerprint(&pending_commit.event_path);
+            let current_index = self.state.get_file(group_id, &pending_commit.rel_path)?;
+            // `current_index == index_state_at_prepare` alone cannot catch
+            // a peer commit whose new version's size/mtime/blocks happen
+            // to coincide with the old one (a metadata-only change, or
+            // content that happens to hash the same) -- comparing the
+            // row's authoring identity too closes that gap (a Codex review
+            // finding on this exact batching boundary): every commit,
+            // local or peer, stamps a fresh, distinct authoring hash.
+            let current_authoring_change_hash =
+                self.state.get_authoring_change_hash(group_id, &pending_commit.rel_path)?;
+            let still_current = current_disk == pending_commit.disk_fingerprint_at_prepare
+                && current_index == pending_commit.index_state_at_prepare
+                && current_authoring_change_hash == pending_commit.authoring_change_hash_at_prepare;
+            if !still_current {
+                tracing::info!(
+                    path = %pending_commit.rel_path,
+                    group_id,
+                    "excluding a batched local mutation: disk or index state changed between \
+                     preparation and commit; left journaled dirty for normal re-drive"
+                );
+            }
+            use yadorilink_sync_sqlite::file_index::LocalCaptureActualStateEvidence as Evidence;
+            let evidence = if still_current {
+                match &pending_commit.mutation {
+                    yadorilink_replica_domain::session_state::PreparedLocalMutation::Upsert {
+                        ..
+                    } => FileIdentity::observe_path(&pending_commit.event_path)
+                        .ok()
+                        .map(|filesystem_identity| Evidence::Present { filesystem_identity }),
+                    yadorilink_replica_domain::session_state::PreparedLocalMutation::Delete {
+                        ..
+                    } => Some(Evidence::Absent),
+                }
+            } else {
+                None
+            };
+            keep.push(still_current);
+            evidence_if_kept.push(evidence);
+        }
+
+        let mut resolved = Vec::with_capacity(batch.len());
+        let mut valid_mutations = Vec::with_capacity(batch.len());
+        let mut valid_evidence = Vec::with_capacity(batch.len());
+        for ((pending_commit, ok), evidence) in
+            batch.into_iter().zip(keep).zip(evidence_if_kept)
+        {
+            if ok {
+                resolved.push((
+                    pending_commit.mutation.record().clone(),
+                    pending_commit.rel_path,
+                    pending_commit.observed_at_unix_nanos,
+                ));
+                valid_mutations.push(pending_commit.mutation);
+                valid_evidence.push(evidence);
+            }
+        }
+
+        if !valid_mutations.is_empty() {
+            let commit_result = self.state.commit_local_mutations_batch(
+                group_id,
+                &valid_mutations,
+                &valid_evidence,
+                &self.device_id,
+                crate::ports::LocalChangeEmission {
+                    emitter: &emitter,
+                    permit: &self.begin_operation()?.permit(),
+                },
+            );
+            if let Err(e) = commit_result {
+                tracing::warn!(
+                    error = %e,
+                    group_id,
+                    batch_len = valid_mutations.len(),
+                    "failed to commit a batched group of local mutations; left journaled dirty \
+                     for re-drive"
+                );
+                return Ok(Vec::new());
+            }
+        }
+        Ok(resolved)
+        // `guards` drops here, releasing every path lock this batch held —
+        // only after the shared commit above has returned.
     }
 
     /// Re-drives every path still journaled dirty for `group_id` through the
@@ -2247,6 +3135,21 @@ impl LocalChangeProcessor {
 /// guard's own bound.
 const MAX_LOCAL_INDEX_RETRIES: u32 = 20;
 
+/// How many processed paths' dirty-journal clears accumulate before
+/// `process_flush_with_ignore` flushes them as one
+/// `clear_dirty_paths_conditional_batch` transaction, instead of committing
+/// (and fsyncing) each path's clear separately.
+const DIRTY_CLEAR_BATCH_SIZE: usize = 32;
+
+/// How many prepared authoritative mutations (`PendingBatchedCommit`)
+/// accumulate before `flush_pending_batch` commits them as one
+/// `commit_local_mutations_batch` transaction, instead of committing (and
+/// fsyncing) each path's mutation separately. Deliberately small relative
+/// to `DIRTY_CLEAR_BATCH_SIZE`: every member's path lock is held for the
+/// whole batch, so a large batch would hold many locks simultaneously for
+/// longer than necessary.
+const AUTHORITATIVE_COMMIT_BATCH_SIZE: usize = 16;
+
 /// Backoff between local-index retry attempts (see `MAX_LOCAL_INDEX_RETRIES`).
 const LOCAL_INDEX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -2270,6 +3173,132 @@ fn is_retriable_block_store_error(e: &LocalCaptureError) -> bool {
                 | yadorilink_local_storage::StorageError::Io(_)
         ))
     )
+}
+
+/// Whether the failed chunk attempt for `path` failed *because `path`
+/// itself no longer exists* — as opposed to because the block store it was
+/// writing into faulted. Both questions are asked of the same error type,
+/// and that is precisely the trap this function exists to avoid walking
+/// into.
+///
+/// The error shape alone is NECESSARY BUT NOT SUFFICIENT, and it is worth
+/// being blunt about why, because the shape check reads like it ought to be
+/// enough. `chunk_file`, `chunk_file_content_defined_with_callback`, and
+/// `chunk_file_fixed_with_callback` (`yadorilink-local-storage`'s
+/// `chunker.rs`) read the source file via a bare `?` on `fs::metadata`/
+/// `fs::File::open`, so a source-path `NotFound` arrives here as
+/// `Storage(Io(NotFound))`. But `StorageError::Io` is a blanket
+/// `#[from] std::io::Error` over EVERY filesystem call the block store
+/// itself makes, and the block store has its own real `NotFound` paths —
+/// e.g. `FsBlockStore::commit_batch` runs its free-space preflight
+/// (`check_headroom` -> `free_space::classify_volume`, which stats the
+/// block-store root) BEFORE any `create_dir_all` could recreate anything,
+/// so a block-store root that has been deleted or whose volume was
+/// unmounted also surfaces as `Storage(Io(NotFound))`; so does a
+/// concurrent removal racing `commit_block_staged`'s
+/// `exists()`-then-`fs::read` of an already-present block file. The error
+/// value carries no path, so the two fault domains are genuinely
+/// indistinguishable from the error alone — which is exactly why
+/// `is_retriable_block_store_error` above does not try.
+///
+/// Getting that wrong is not a cosmetic misclassification. A `true` verdict
+/// makes the caller return `LocalChangeOutcome::None`, and `process_flush`
+/// treats `None` as a clean no-op: it CLEARS the durable
+/// `local_dirty_paths` journal row for this path. For a genuinely vanished
+/// source path that is right (there is nothing left to index, and the
+/// rename's own watcher event queues a fresh `CreatedOrModified` for the
+/// final name — see `watcher.rs`'s `RenameMode::To`/`Both` handling). For a
+/// block-store fault it is a silent, permanent loss of an already-detected
+/// local edit: the file is still sitting on disk, changed, with nothing
+/// left to re-drive it — the exact split-brain the retry/journal machinery
+/// in `process_flush` exists to prevent.
+///
+/// So the verdict is taken from the PATH, not from the error: the
+/// `NotFound` shape only gets us as far as "one of the two files involved
+/// went missing", and the `symlink_metadata` re-stat below decides which
+/// one. `symlink_metadata`, not `metadata`, so a dangling symlink — whose
+/// target is missing but which is itself very much still there, and is
+/// handled by `build_symlink_record`, not by chunking — is never misread as
+/// a vanished path.
+///
+/// The re-stat can of course race in its turn, and both directions of that
+/// race are safe. If `path` came back between the chunk attempt and this
+/// stat (a write-then-rename that has already put a NEW file at the same
+/// name), the stat succeeds, this returns `false`, and the error falls
+/// through to `is_retriable_block_store_error`'s bounded retry — which
+/// re-derives everything from a fresh lstat and indexes whatever is
+/// actually there now. A stat that fails for any reason OTHER than
+/// `NotFound` likewise returns `false` and falls through to the retry
+/// path. Both are the conservative direction: the worst case is some
+/// wasted retries, never a dropped edit.
+///
+/// FUTURE READER: do not "simplify" this back into a pure match on the
+/// error shape. That form looks equivalent, compiles, passes the
+/// happy-path rename test, and silently drops local edits whenever the
+/// block store is the thing that is missing. See
+/// `a_block_store_not_found_while_the_source_file_still_exists_stays_dirty`
+/// for the regression test that pins this down.
+fn is_source_path_vanished_error(e: &LocalCaptureError, path: &Path) -> bool {
+    let kind = match e {
+        LocalCaptureError::SyncCore(SyncSqliteError::Storage(
+            yadorilink_local_storage::StorageError::Io(io_err),
+        )) => Some(io_err.kind()),
+        LocalCaptureError::SyncCore(SyncSqliteError::Io(io_err)) => Some(io_err.kind()),
+        _ => None,
+    };
+    if kind != Some(std::io::ErrorKind::NotFound) {
+        return false;
+    }
+    // The shape is only half the verdict — confirm against `path` itself.
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(stat_err) if stat_err.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// Test-only synchronization seam backing `fire_race_after_lstat_hook`
+/// below: a global, path-keyed table (not a thread-local — the chunk
+/// attempt this races against runs inside `tokio::task::block_in_place`
+/// under a multi-thread runtime, which is free to resume the calling task
+/// on a different OS worker thread than whichever one armed the hook) so a
+/// test can deterministically inject a filesystem mutation (e.g. a rename)
+/// at exactly the point between `build_record_for_created_or_modified`'s
+/// own lstat guard and its later chunk attempt where production code has
+/// no synchronization point to hook into otherwise, without resorting to a
+/// real, flaky wall-clock race. Keyed by the exact `path` a test arms so
+/// concurrently-running unrelated tests (every other test in this module
+/// that also exercises this same function, via its own distinct temp
+/// directory) can never consume each other's armed hook. The hook closure
+/// returns whether it should stay armed for a later attempt on the same
+/// path (`true`) or be consumed (`false`) — every current use is one-shot
+/// (a real-world race only ever fires once, and `process_event_with_
+/// ignore_at`'s own fresh per-attempt existence re-check already recovers
+/// a retry on its own once the path is truly gone — see that function's
+/// doc comment), but a future test targeting a different window could
+/// still want the hook to keep firing.
+#[cfg(test)]
+static RACE_AFTER_LSTAT_HOOKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Box<dyn FnMut() -> bool + Send>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn arm_race_after_lstat_hook(path: PathBuf, f: impl FnMut() -> bool + Send + 'static) {
+    let map = RACE_AFTER_LSTAT_HOOKS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(path, Box::new(f));
+}
+
+#[cfg(test)]
+fn fire_race_after_lstat_hook(path: &Path) {
+    let Some(map) = RACE_AFTER_LSTAT_HOOKS.get() else { return };
+    let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let keep_armed = match guard.get_mut(path) {
+        Some(f) => f(),
+        None => return,
+    };
+    if !keep_armed {
+        guard.remove(path);
+    }
 }
 
 /// The link-relative, forward-slash-normalized key for `path` under `root` —
@@ -2687,6 +3716,103 @@ mod tests {
             store_dir,
             root_dir,
         )
+    }
+
+    // --- `run_capture_pass_off_worker`'s runtime guard ---
+
+    /// The bound the offload exists to establish: however long a capture
+    /// pass runs, it must not hold the tokio worker core it was called on.
+    ///
+    /// `worker_threads = 1` is the whole point of the test, not an
+    /// economy. With a single worker, a pass that held its core would leave
+    /// the ticker spawned below with nowhere to run at all until the pass
+    /// returned, and the tick count would not move.
+    ///
+    /// The pass is `tokio::spawn`ed rather than run in the test body for
+    /// the same reason: `#[tokio::test]` drives the body on `block_on`'s
+    /// own thread, which is not a worker and holds no core, so blocking
+    /// there would pin nothing at all. Both tick reads happen on the
+    /// spawned task's own thread, immediately either side of the blocking
+    /// call, so the window measured is exactly the pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_capture_pass_does_not_hold_the_worker_core_it_runs_on() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker_ticks = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                ticker_ticks.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+        // Let the ticker reach its first await, so the worker is genuinely
+        // free to pick the pass up next.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let pass_ticks = Arc::clone(&ticks);
+        let (before, after) = tokio::spawn(async move {
+            let before = pass_ticks.load(Ordering::SeqCst);
+            run_capture_pass_off_worker(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            });
+            (before, pass_ticks.load(Ordering::SeqCst))
+        })
+        .await
+        .unwrap();
+        ticker.abort();
+
+        // ~60 ticks are expected in 300ms; assert on a small fraction of
+        // that so a loaded machine cannot make this flaky, while still
+        // failing outright on the "nothing ran at all" behavior it pins.
+        assert!(
+            after >= before + 5,
+            "the sole worker made no progress while a capture pass ran on it \
+             ({before} -> {after} ticks): the pass held its core instead of \
+             handing it off"
+        );
+    }
+
+    /// `block_in_place` panics unless a multi-threaded runtime is current,
+    /// and these passes are reachable from a current-thread one (this
+    /// module's own function is called from the synchronous
+    /// `scan_existing_files` public API, which an embedder may drive from
+    /// any runtime flavor). The guard must degrade to a plain synchronous
+    /// call there — where there is no worker pool, there is nothing to
+    /// starve — rather than take the process down.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_capture_pass_runs_inline_on_a_current_thread_runtime() {
+        assert_eq!(run_capture_pass_off_worker(|| 42), 42);
+    }
+
+    /// The same degradation with no tokio runtime in the picture at all —
+    /// the shape the daemon's own initial scan already produces by running
+    /// `scan_existing_files_with_ignore_gated` inside `spawn_blocking`.
+    #[test]
+    fn a_capture_pass_runs_inline_with_no_runtime_at_all() {
+        assert_eq!(run_capture_pass_off_worker(|| 42), 42);
+    }
+
+    /// The size gate decides only which thread the verification runs on,
+    /// never what it concludes — both sides of the cutoff must agree with
+    /// the unwrapped verifier on the same inputs.
+    #[test]
+    fn the_off_worker_verify_gate_does_not_change_the_verdict() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = FsBlockStore::new(store_dir.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.bin");
+        std::fs::write(&path, b"hello world").unwrap();
+        let blocks = yadorilink_local_storage::chunk_file(&store, &path).unwrap();
+
+        for size in [0, OFF_WORKER_VERIFY_MIN_BYTES] {
+            assert!(disk_bytes_match_indexed_blocks_off_worker(&path, &blocks, size).unwrap());
+        }
+
+        std::fs::write(&path, b"hello worlds").unwrap();
+        for size in [0, OFF_WORKER_VERIFY_MIN_BYTES] {
+            assert!(!disk_bytes_match_indexed_blocks_off_worker(&path, &blocks, size).unwrap());
+        }
     }
 
     // --- Startup-scan vs incoming-peer-apply race (group startup barrier) ---
@@ -3140,7 +4266,7 @@ mod tests {
     /// content edit can't slip through), but that verification streams and
     /// compares without ever re-chunking or writing a block — exactly what
     /// the unchanged `put` count proves: no store churn, no re-index.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unchanged_size_and_mtime_skips_rechunking_entirely() {
         let (proc, state, store, _store_dir, root_dir) = processor_with_counting_store();
         let root = canonical_root(&root_dir);
@@ -3193,7 +4319,7 @@ mod tests {
     /// hashes before concluding "no-op", so this edit is detected and
     /// re-indexed rather than silently pinning the index at the stale
     /// version while disk holds new bytes.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn identical_size_and_mtime_with_different_bytes_is_now_detected() {
         let (proc, state, store, _store_dir, root_dir) = processor_with_counting_store();
         let root = canonical_root(&root_dir);
@@ -3312,7 +4438,7 @@ mod tests {
             PEER_AUTHORED_MTIME,
         )
         .unwrap();
-        yadorilink_local_storage::apply_exec_bit(&file_path, false).unwrap();
+        yadorilink_local_storage::apply_unix_mode(&file_path, Some(0o644)).unwrap();
 
         let record = FileRecord {
             path: "received.sh".to_string(),
@@ -3331,10 +4457,10 @@ mod tests {
             .unwrap();
         state
             .file_index_repository()
-            .set_exec_bit(
+            .set_unix_mode(
                 "group-1",
                 "received.sh",
-                false,
+                Some(0o644),
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
@@ -3393,8 +4519,9 @@ mod tests {
             "a chmod-only edit on a materialized file must reach the size+mtime fast path (gap 1 \
              fixed), not fall through to a full re-chunk"
         );
-        assert!(
-            state.file_index_repository().get_exec_bit("group-1", "received.sh").unwrap(),
+        assert_eq!(
+            state.file_index_repository().get_unix_mode("group-1", "received.sh").unwrap(),
+            Some(0o755),
             "the real chmod +x must be captured and indexed, not silently dropped"
         );
         assert_eq!(
@@ -3411,7 +4538,7 @@ mod tests {
     /// touching the file) must still be captured, not dropped by a
     /// content-only comparison that never looked at the exec bit.
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn chmod_only_edit_reaching_the_content_only_self_echo_path_is_still_captured() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3432,7 +4559,11 @@ mod tests {
             .unwrap(),
         );
         assert!(
-            !state.file_index_repository().get_exec_bit("group-1", "script.sh").unwrap(),
+            !state
+                .file_index_repository()
+                .get_unix_mode("group-1", "script.sh")
+                .unwrap()
+                .is_some_and(|mode| mode & 0o100 != 0),
             "sanity: a freshly-written file is not executable by default"
         );
 
@@ -3472,8 +4603,9 @@ mod tests {
             record_after_chmod.blocks, record_after_create.blocks,
             "content is genuinely unchanged"
         );
-        assert!(
-            state.file_index_repository().get_exec_bit("group-1", "script.sh").unwrap(),
+        assert_eq!(
+            state.file_index_repository().get_unix_mode("group-1", "script.sh").unwrap(),
+            Some(0o755),
             "the chmod +x reaching the content-only self-echo comparison must still be captured, \
              not silently dropped (gap 2)"
         );
@@ -3488,7 +4620,7 @@ mod tests {
     /// change.
     #[cfg(unix)]
     #[tokio::test]
-    async fn materialize_echo_with_matching_content_and_exec_bit_stays_a_no_op() {
+    async fn materialize_echo_with_matching_content_and_unix_mode_stays_a_no_op() {
         let (proc, state, store, _store_dir, root_dir) = processor_with_counting_store();
         let root = canonical_root(&root_dir);
         adopt_root(&state, "group-1", &root);
@@ -3501,7 +4633,7 @@ mod tests {
         const PEER_MTIME: i64 = 1_650_000_000_000_000_000;
         yadorilink_local_storage::reconstruct_file(store.as_ref(), &file_path, &blocks, PEER_MTIME)
             .unwrap();
-        yadorilink_local_storage::apply_exec_bit(&file_path, true).unwrap();
+        yadorilink_local_storage::apply_unix_mode(&file_path, Some(0o755)).unwrap();
 
         let record = FileRecord {
             path: "mirrored.txt".to_string(),
@@ -3520,10 +4652,10 @@ mod tests {
             .unwrap();
         state
             .file_index_repository()
-            .set_exec_bit(
+            .set_unix_mode(
                 "group-1",
                 "mirrored.txt",
-                true,
+                Some(0o755),
                 &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
             )
             .unwrap();
@@ -3562,7 +4694,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn created_file_is_chunked_and_indexed() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
@@ -3590,7 +4722,7 @@ mod tests {
         assert_eq!(versions[0].origin_device_id.as_deref(), Some("device-a"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rename_produces_identical_block_hashes_as_the_original() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
@@ -3636,7 +4768,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn removed_file_is_marked_deleted_with_incremented_version() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
@@ -3801,7 +4933,7 @@ mod tests {
     /// to the SAME mtime -- indistinguishable from an untouched placeholder
     /// by size and mtime alone, but the rename mints a fresh inode. Unix-
     /// only, same reason as the sibling placeholder tests above.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]
     async fn atomic_replace_edit_at_the_placeholders_exact_size_and_mtime_is_captured() {
         let (proc, state, _store_dir, root_dir) = processor();
@@ -3885,7 +5017,7 @@ mod tests {
     /// finding: an identity-only comparison LOSES that coverage, since an
     /// in-place write never changes the inode. This pins the fix requiring
     /// BOTH identity match and continued sparseness.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]
     async fn in_place_edit_that_keeps_the_same_inode_is_still_captured() {
         let (proc, state, _store_dir, root_dir) = processor();
@@ -4044,7 +5176,7 @@ mod tests {
     /// is still correctly ignored; this one proves a REAL edit (here,
     /// simulated as different-length content landing at the placeholder's
     /// path) is not.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_direct_edit_to_a_placeholder_file_is_captured_not_silently_discarded() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
@@ -4110,7 +5242,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_edit_while_hydrating_is_captured() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
@@ -4520,7 +5652,7 @@ mod tests {
         // The durable "materialization write in progress" signal a crash left
         // behind — the disambiguator that makes this a crash, not a deletion.
         state
-            .materialization_job_repository()
+            .materialization_intent_repository()
             .begin_materialization_intent(
                 "group-1",
                 "doc.txt",
@@ -4750,7 +5882,7 @@ mod tests {
     /// batch-processing changes (executor half): a `Paths` flush
     /// indexes every listed path and returns the resulting records,
     /// exactly as individual `process_event` calls would.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn process_flush_paths_indexes_each_path_and_returns_records() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
@@ -4770,7 +5902,824 @@ mod tests {
         assert_eq!(state.file_index_repository().list_files("group-1").unwrap().len(), 2);
     }
 
+    /// Regression test for the write-then-rename TOCTOU race: a debounced
+    /// `CreatedOrModified` event for a path can begin processing (this
+    /// module's own lstat guard, in `build_record_for_created_or_modified`,
+    /// confirms the path exists) and then have that exact path renamed out
+    /// from under it before the chunk attempt's own `fs::metadata`/
+    /// `File::open` runs -- exactly what an ordinary write-to-a-sibling-
+    /// temp-path-then-rename save does (including the benchmark's own
+    /// large-file writer, `yadorilink-bench`'s `l1.rs::write_seeded_file_
+    /// with_digest`, which writes to a `*.bench-write-tmp` sibling and
+    /// renames it onto the real name once fully written), whenever the
+    /// debounce accumulator's per-path quiet period happens to elapse for
+    /// the temp path's own "modified" events right as the writer finishes
+    /// and renames it away.
+    ///
+    /// `arm_race_after_lstat_hook`/`fire_race_after_lstat_hook` make this
+    /// fully deterministic -- no sleep, no real wall-clock race, no
+    /// flakiness -- by renaming the temp path away at the exact instant
+    /// (right after this function's own lstat guard has just confirmed it
+    /// exists) production code has no other synchronization point to hook
+    /// into.
+    ///
+    /// This only needs to race the *first* attempt: `process_event_with_
+    /// ignore_at` already re-derives a path's effective kind from a fresh
+    /// `symlink_metadata` call on every attempt (see its own doc comment,
+    /// "the watcher is a trigger to re-examine a path, not a source of
+    /// truth"), so once the path is truly gone a retry recovers cleanly on
+    /// its own -- the residual gap this test and fix close is narrower:
+    /// the single, unavoidable TOCTOU window *within* one attempt, between
+    /// that outer re-check and this function's own later chunk step, where
+    /// production code has no re-check at all.
+    ///
+    /// Before the fix: the resulting `NotFound` surfaces as the identical
+    /// `StorageError::Io(_)` shape a genuine block-store fault would, so
+    /// `is_retriable_block_store_error` treats it as retriable -- the
+    /// first attempt fails, sleeps a full `LOCAL_INDEX_RETRY_BACKOFF`, and
+    /// only then recovers via the retry's own fresh re-check above. After
+    /// the fix: `is_source_path_vanished_error` re-stats the path, finds
+    /// it genuinely gone, and classifies it immediately, resolving as a
+    /// clean no-op on the very first attempt with no retry and no backoff
+    /// sleep at all -- the differentiating assertion below is exactly that
+    /// elapsed-time gap. Its counterpart,
+    /// `a_block_store_not_found_while_the_source_file_still_exists_stays_
+    /// dirty`, pins the other side of that same re-stat: the identical
+    /// error shape with the source file still present must NOT be
+    /// classified this way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_path_renamed_away_between_lstat_and_chunk_resolves_cleanly() {
+        let (proc, state, _store_dir, root_dir) = processor();
+        let root = canonical_root(&root_dir);
+        adopt_root(&state, "group-1", &root);
+
+        let tmp_path = root.join("payload.bench-write-tmp");
+        let final_path = root.join("payload.bin");
+        std::fs::write(&tmp_path, vec![0x7Au8; 4096]).unwrap();
+
+        let tmp_for_hook = tmp_path.clone();
+        arm_race_after_lstat_hook(tmp_path.clone(), move || {
+            std::fs::rename(&tmp_for_hook, &final_path).unwrap();
+            false // one-shot: only the first attempt needs to race
+        });
+
+        let flush = yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![(
+            tmp_path,
+            FsChangeKind::CreatedOrModified,
+            0,
+        )]);
+        let started = std::time::Instant::now();
+        let outcome = proc.process_flush("group-1", &root, flush).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.records.is_empty(),
+            "a source path that vanished mid-attempt must not produce a spurious record"
+        );
+        assert!(
+            state.dirty_path_repository().list_dirty_paths("group-1").unwrap().is_empty(),
+            "a source path proven to have vanished (renamed away), not merely faulting, must \
+             resolve as a clean no-op"
+        );
+        assert!(
+            state
+                .file_index_repository()
+                .get_file("group-1", "payload.bench-write-tmp")
+                .unwrap()
+                .is_none(),
+            "the transient temp-file path must never be indexed as a real synced file"
+        );
+        assert!(
+            elapsed < LOCAL_INDEX_RETRY_BACKOFF,
+            "a vanished source path must resolve on the very first attempt, with no retry \
+             backoff sleep at all -- took {elapsed:?}, which is at or beyond one \
+             LOCAL_INDEX_RETRY_BACKOFF ({LOCAL_INDEX_RETRY_BACKOFF:?}), the signature of falling \
+             through to the generic retriable-block-store-error path instead of being \
+             classified as a vanished source path on the first attempt"
+        );
+    }
+
+    /// The other half of `is_source_path_vanished_error`'s verdict, and
+    /// the one that actually needs a test: a `NotFound` raised by the
+    /// BLOCK STORE while the source file is still sitting on disk,
+    /// unchanged and unindexed, must never be mistaken for a vanished
+    /// source path.
+    ///
+    /// The two are indistinguishable from the error value alone -- the
+    /// chunker reads the source file through the same
+    /// `StorageError::Io(#[from] std::io::Error)` blanket the block store
+    /// raises its own filesystem faults through, and neither carries a
+    /// path. This test drives the block-store side of that ambiguity
+    /// through real production code rather than a hand-built error:
+    /// headroom enforcement on (as `DaemonState::enable_disk_headroom_
+    /// enforcement` turns it on for the real daemon) plus a block-store
+    /// root that has been removed out from under the store (a deleted
+    /// store directory, or an unmounted volume hosting it). A file at or
+    /// above `CDC_SIZE_THRESHOLD` takes `FsBlockStore::commit_batch`,
+    /// whose free-space preflight stats that now-missing root BEFORE any
+    /// `create_dir_all` could recreate it -- so the block store really
+    /// does hand back `Storage(Io(NotFound))` here, with the source file
+    /// untouched.
+    ///
+    /// The assertion that matters is the surviving `local_dirty_paths`
+    /// row. Classifying this as a vanished source path resolves it as
+    /// `LocalChangeOutcome::None`, which `process_flush` treats as a clean
+    /// no-op and CLEARS the journal row -- silently and permanently
+    /// dropping an already-detected local edit whose bytes are still on
+    /// disk, with nothing left to re-drive it. Keeping it on the
+    /// retriable-block-store-error path instead leaves the row journaled
+    /// dirty, so the startup rescan re-drives the file once the store is
+    /// back.
+    ///
+    /// Deliberately pays for the full `MAX_LOCAL_INDEX_RETRIES` schedule
+    /// (a real block-store fault SHOULD be retried), so this is one of the
+    /// slower tests in this module -- it runs in parallel with its
+    /// neighbours and the durability property it pins is worth it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_block_store_not_found_while_the_source_file_still_exists_stays_dirty() {
+        use yadorilink_local_storage::BlockStore as _;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let state = Arc::new(TestReplica::open_in_memory().unwrap());
+        let root_dir = tempfile::tempdir().unwrap();
+        let proc = LocalChangeProcessor::new(
+            state.clone(),
+            store.clone(),
+            "device-a".into(),
+            std::sync::Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+        );
+        let root = canonical_root(&root_dir);
+        adopt_root(&state, "group-1", &root);
+
+        // At or above `CDC_SIZE_THRESHOLD`, so the chunk attempt takes the
+        // bulk-ingest batch path whose headroom preflight stats the store
+        // root first.
+        let source = root.join("big.bin");
+        let size = yadorilink_local_storage::CDC_SIZE_THRESHOLD as usize + 1;
+        std::fs::write(&source, vec![0xABu8; size]).unwrap();
+
+        store.set_headroom_enforced(true);
+        std::fs::remove_dir_all(store_dir.path()).unwrap();
+
+        let flush = yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![(
+            source.clone(),
+            FsChangeKind::CreatedOrModified,
+            0,
+        )]);
+        let outcome = proc.process_flush("group-1", &root, flush).await.unwrap();
+
+        assert!(
+            source.exists(),
+            "test precondition: the SOURCE file must still be on disk -- the only thing that \
+             went missing is the block store"
+        );
+        assert!(
+            outcome.records.is_empty(),
+            "a block-store fault must not produce a record for content it never durably stored"
+        );
+        assert_eq!(
+            state.dirty_path_repository().list_dirty_paths("group-1").unwrap().len(),
+            1,
+            "a block-store NotFound is a durability fault, not a vanished source path: the \
+             file's dirty-journal row must SURVIVE so the startup rescan re-drives it. An empty \
+             journal here means the edit was silently and permanently dropped while its bytes \
+             were still sitting on disk -- the signature of classifying by error shape alone \
+             instead of re-stating the source path"
+        );
+        assert!(
+            state.file_index_repository().get_file("group-1", "big.bin").unwrap().is_none(),
+            "nothing may be indexed when the blocks were never durably stored"
+        );
+    }
+
+    /// Stage-1 dirty-journal batching regression: a single `DebounceFlush::
+    /// Paths` batch mixing successful and failing paths must clear ONLY the
+    /// paths that actually succeeded from the dirty journal, even though all
+    /// three were batch-journaled together up front
+    /// (`record_dirty_paths_batch`) and the successes are cleared through
+    /// `clear_dirty_paths_conditional_batch` rather than one
+    /// `clear_dirty_path` call per path. Reuses the exact mechanism the test
+    /// above pins: a small `put`'s single-block commit creates its shard
+    /// directory (recreating the removed store root) BEFORE its own
+    /// headroom check, so it succeeds; a big file's bulk-ingest batch
+    /// checks headroom BEFORE any directory creation, against the
+    /// still-missing root, so it fails and must remain journaled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mixed_outcome_batch_clears_only_the_successfully_processed_paths() {
+        use yadorilink_local_storage::BlockStore as _;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let state = Arc::new(TestReplica::open_in_memory().unwrap());
+        let root_dir = tempfile::tempdir().unwrap();
+        let proc = LocalChangeProcessor::new(
+            state.clone(),
+            store.clone(),
+            "device-a".into(),
+            std::sync::Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+        );
+        let root = canonical_root(&root_dir);
+        adopt_root(&state, "group-1", &root);
+
+        let small_a = root.join("a.txt");
+        let small_b = root.join("b.txt");
+        std::fs::write(&small_a, b"aaa").unwrap();
+        std::fs::write(&small_b, b"bbb").unwrap();
+
+        let big = root.join("big.bin");
+        let size = yadorilink_local_storage::CDC_SIZE_THRESHOLD as usize + 1;
+        std::fs::write(&big, vec![0xABu8; size]).unwrap();
+
+        store.set_headroom_enforced(true);
+        std::fs::remove_dir_all(store_dir.path()).unwrap();
+
+        // `big` is processed first, deliberately: a small file's single-
+        // block `put` recreates the store root as a side effect of
+        // succeeding (see this test's own doc comment), which would mask
+        // the fault for anything processed after it in the same batch.
+        let flush = yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![
+            (big, FsChangeKind::CreatedOrModified, 0),
+            (small_a, FsChangeKind::CreatedOrModified, 0),
+            (small_b, FsChangeKind::CreatedOrModified, 0),
+        ]);
+        let outcome = proc.process_flush("group-1", &root, flush).await.unwrap();
+
+        let mut succeeded: Vec<&str> = outcome.records.iter().map(|r| r.path.as_str()).collect();
+        succeeded.sort();
+        assert_eq!(
+            succeeded,
+            vec!["a.txt", "b.txt"],
+            "the two small files must still succeed even though the batch also contained a \
+             failing path"
+        );
+
+        let dirty = state.dirty_path_repository().list_dirty_paths("group-1").unwrap();
+        assert_eq!(
+            dirty.len(),
+            1,
+            "only the failing path may remain journaled once the batch's successes are cleared -- \
+             a bulk unconditional clear here would have wrongly swept the failure's row too"
+        );
+        assert_eq!(dirty[0].path, "big.bin");
+    }
+
+    /// Stage-2 authoritative-mutation group commit: a batch of N independent
+    /// path mutations (each its own file, no relation to the others) must
+    /// still author N DISTINCT signed `Change`s, chained in the exact causal
+    /// order sequential (one-transaction-per-path) authoring would have
+    /// produced — `commit_local_mutations_batch` must never collapse them
+    /// into one multi-op `Change` (that shape is `upsert_files_batch_emitting_change`'s,
+    /// deliberately not reused here). Also pins the ordinary success path:
+    /// every path's dirty-journal row clears once its batch actually commits.
     #[tokio::test]
+    async fn batched_authoritative_commit_produces_n_distinct_changes_in_sequential_causal_order() {
+        let (proc, state, _policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
+        state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(ChangeAuth::PLACEHOLDER)));
+        let root = canonical_root(&root_dir);
+        let group = "group-1";
+        adopt_root(&state, group, &root);
+
+        const N: usize = 16;
+        let mut paths = Vec::with_capacity(N);
+        for i in 0..N {
+            let p = root.join(format!("f-{i:02}.txt"));
+            std::fs::write(&p, format!("content-{i}")).unwrap();
+            paths.push((p, FsChangeKind::CreatedOrModified, 0));
+        }
+        let flush = yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(paths);
+        let outcome = proc.process_flush(group, &root, flush).await.unwrap();
+        assert_eq!(outcome.records.len(), N, "every path in the batch must be committed and reported");
+        assert!(
+            state.dirty_path_repository().list_dirty_paths(group).unwrap().is_empty(),
+            "every successfully batch-committed path's dirty-journal row must clear"
+        );
+
+        let heads = state.sqlite().dag_group_heads(group).unwrap();
+        assert_eq!(
+            heads.len(),
+            1,
+            "a batch of independent path mutations must chain onto ONE linear head, not fork"
+        );
+
+        // Walk the chain backward from the head, collecting N distinct
+        // hashes, each with exactly one op and exactly one parent (its
+        // predecessor in the chain) — proving the batch's causal order
+        // matches what committing each mutation sequentially would have
+        // produced.
+        let mut hash = heads[0].clone();
+        let mut seen = std::collections::HashSet::new();
+        for step in 0..N {
+            let change = state.sqlite().dag_get_change(&hash).unwrap().expect("change must exist");
+            assert_eq!(
+                change.ops.len(),
+                1,
+                "each batched mutation must author its OWN single-op Change, never collapsed \
+                 into one multi-op Change"
+            );
+            assert!(seen.insert(hash.clone()), "every mutation in the batch must produce a distinct Change hash");
+            if step == N - 1 {
+                // The batch's very first mutation authors onto whatever
+                // the group's history already was -- empty here (a fresh
+                // group), so this last hop legitimately has zero parents;
+                // every other hop must chain onto exactly its predecessor.
+                assert!(change.parents.len() <= 1);
+                break;
+            }
+            assert_eq!(
+                change.parents.len(),
+                1,
+                "each non-final Change in the chain must have exactly one parent, forming a \
+                 linear chain"
+            );
+            hash = change.parents[0].clone();
+        }
+        assert_eq!(seen.len(), N);
+    }
+
+    /// If the shared batch commit itself fails (standing in for a crash
+    /// between preparing every mutation and the transaction that would
+    /// commit them), NOTHING may be committed — every mutation's
+    /// dirty-journal row must survive untouched for a normal re-drive, not
+    /// a partial subset.
+    #[tokio::test]
+    async fn batch_commit_failure_leaves_nothing_committed_and_every_dirty_row_survives() {
+        use ed25519_dalek::SigningKey;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let state = Arc::new(TestReplica::open_in_memory().unwrap());
+        state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(ChangeAuth::PLACEHOLDER)));
+        let lease = Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests());
+        let emitter = Arc::new(ChangeEmitter::new("device-a", SigningKey::from_bytes(&[9u8; 32])));
+        let proc =
+            LocalChangeProcessor::new(state.clone(), store, "device-a".into(), lease.clone())
+                .with_change_emitter(emitter);
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&root_dir);
+        let group = "group-1";
+        adopt_root(&state, group, &root);
+
+        let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+        let mut pending = Vec::new();
+        for i in 0..3 {
+            let name = format!("f-{i}.txt");
+            let p = root.join(&name);
+            std::fs::write(&p, format!("content-{i}")).unwrap();
+            // Mirrors Stage 1's own batch-journal-before-processing step
+            // (normally done by `process_flush_with_ignore`, bypassed here
+            // since this test calls `process_event_with_ignore_at`
+            // directly to control the exact timing against `lease.
+            // begin_stopping()` below).
+            state
+                .dirty_path_repository()
+                .record_dirty_path(
+                    group,
+                    &name,
+                    dirty_kind_str(FsChangeKind::CreatedOrModified),
+                    0,
+                    &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+                )
+                .unwrap();
+            let outcome = proc
+                .process_event_with_ignore_at(
+                    group,
+                    &root,
+                    &FsChangeEvent { path: p, kind: FsChangeKind::CreatedOrModified },
+                    &ignore_set,
+                    Some(0),
+                    Some(&mut pending),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(outcome, EventOutcome::Deferred), "test precondition: must defer into the batch");
+        }
+        assert_eq!(pending.len(), 3);
+
+        // Simulate the link/process stopping between preparation and
+        // commit -- `begin_operation` (which `flush_pending_batch` needs
+        // for its own permit) now fails for every subsequent caller.
+        lease.begin_stopping();
+
+        let resolved = proc.flush_pending_batch(group, &mut pending).await;
+        let resolved = resolved.unwrap_or_default();
+        assert!(resolved.is_empty(), "no mutation may resolve as committed once admission is revoked");
+
+        for i in 0..3 {
+            let path = format!("f-{i}.txt");
+            assert!(
+                state.file_index_repository().get_file(group, &path).unwrap().is_none(),
+                "no row may exist for a mutation whose batch commit never ran"
+            );
+            assert!(
+                state.dirty_path_repository().is_path_dirty(group, &path).unwrap(),
+                "every mutation's dirty-journal row must survive a commit that never ran"
+            );
+        }
+    }
+
+    /// A concurrent peer materialization superseding a path's index row
+    /// between this path's preparation (Phase A) and its batch's validation
+    /// (Phase B) must exclude that mutation from the batch entirely, not
+    /// silently commit stale bytes over the peer's own update.
+    #[tokio::test]
+    async fn a_peer_mutation_between_preparation_and_validation_excludes_the_stale_mutation() {
+        let (proc, state, _policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
+        state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(ChangeAuth::PLACEHOLDER)));
+        let root = canonical_root(&root_dir);
+        let group = "group-1";
+        adopt_root(&state, group, &root);
+
+        let path = root.join("doc.txt");
+        std::fs::write(&path, b"local-v1").unwrap();
+
+        // Mirrors Stage 1's own batch-journal-before-processing step
+        // (normally done by `process_flush_with_ignore`, bypassed here
+        // since this test calls `process_event_with_ignore_at` directly to
+        // control the exact timing of the peer write below).
+        state
+            .dirty_path_repository()
+            .record_dirty_path(
+                group,
+                "doc.txt",
+                dirty_kind_str(FsChangeKind::CreatedOrModified),
+                0,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+
+        let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+        let mut pending = Vec::new();
+        let outcome = proc
+            .process_event_with_ignore_at(
+                group,
+                &root,
+                &FsChangeEvent { path: path.clone(), kind: FsChangeKind::CreatedOrModified },
+                &ignore_set,
+                Some(0),
+                Some(&mut pending),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, EventOutcome::Deferred));
+        assert_eq!(pending.len(), 1);
+
+        // A concurrent peer materialization commits its own row for this
+        // path while this device's mutation sat prepared but not yet
+        // committed -- nothing was indexed for it before (preparation only
+        // reads/chunks, it never writes), so `index_state_at_prepare` is
+        // `None`; this peer write alone is enough to make Phase B's
+        // revalidation observe a change.
+        let peer_record = FileRecord {
+            path: "doc.txt".to_string(),
+            size: 999,
+            mtime_unix_nanos: 123_456_789,
+            blocks: vec![],
+            deleted: false,
+        };
+        state
+            .file_index_repository()
+            .upsert_file_with_origin(
+                group,
+                &peer_record,
+                "device-b",
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+
+        let resolved = proc.flush_pending_batch(group, &mut pending).await.unwrap();
+        assert!(
+            resolved.is_empty(),
+            "a prepared mutation must not commit once the index row it was based on has changed"
+        );
+
+        let current = state.file_index_repository().get_file(group, "doc.txt").unwrap().unwrap();
+        assert_eq!(
+            current.size, 999,
+            "the peer's own write must survive; the stale local mutation must not overwrite it"
+        );
+        assert!(state.dirty_path_repository().is_path_dirty(group, "doc.txt").unwrap());
+    }
+
+    /// Codex review regression (Stage 2): a peer commit whose new version's
+    /// `FileRecord` fields (size/mtime/blocks/deleted) happen to be
+    /// byte-identical to what preparation observed — but which is a
+    /// genuinely different, freshly-authored `Change` — must still exclude
+    /// the stale prepared mutation. A `FileRecord`-only comparison cannot
+    /// see this at all (every field matches); only comparing the row's
+    /// authoring identity too catches it.
+    #[tokio::test]
+    async fn a_peer_rewrite_with_byte_identical_file_record_fields_still_excludes_the_stale_mutation()
+    {
+        use ed25519_dalek::SigningKey;
+
+        let (proc, state, _policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
+        state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(ChangeAuth::PLACEHOLDER)));
+        let root = canonical_root(&root_dir);
+        let group = "group-1";
+        adopt_root(&state, group, &root);
+
+        let path = root.join("doc.txt");
+        std::fs::write(&path, b"v1").unwrap();
+        let setup_flush = yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![(
+            path.clone(),
+            FsChangeKind::CreatedOrModified,
+            0,
+        )]);
+        proc.process_flush(group, &root, setup_flush).await.unwrap();
+        let record_after_setup = state.file_index_repository().get_file(group, "doc.txt").unwrap().unwrap();
+
+        // Prepare a local modification, deferring it into the batch.
+        std::fs::write(&path, b"v2-local").unwrap();
+        state
+            .dirty_path_repository()
+            .record_dirty_path(
+                group,
+                "doc.txt",
+                dirty_kind_str(FsChangeKind::CreatedOrModified),
+                1,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+        let mut pending = Vec::new();
+        let outcome = proc
+            .process_event_with_ignore_at(
+                group,
+                &root,
+                &FsChangeEvent { path: path.clone(), kind: FsChangeKind::CreatedOrModified },
+                &ignore_set,
+                Some(1),
+                Some(&mut pending),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, EventOutcome::Deferred));
+
+        // A peer republishes its own genuinely distinct signed Change for
+        // this path, but the resulting row's `FileRecord` fields are
+        // deliberately set byte-identical to what preparation above
+        // observed (`record_after_setup`) -- the `Op` content here is a
+        // throwaway placeholder; only the row's resulting authoring
+        // identity, not this op's own semantics, is what this test
+        // exercises.
+        let peer_emitter = ChangeEmitter::new("device-b", SigningKey::from_bytes(&[42u8; 32]));
+        state
+            .file_index_repository()
+            .upsert_file_emitting_change(
+                group,
+                &record_after_setup,
+                "device-b",
+                ChangeContent {
+                    ops: vec![Op::Delete { path: SyncPath("peer-marker".to_string()) }],
+                    versions: &[],
+                },
+                None,
+                None,
+                yadorilink_sync_sqlite::file_index::ChangeEmissionContext {
+                    emitter: &peer_emitter,
+                    permit: &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+                    auth: ChangeAuth::PLACEHOLDER,
+                },
+            )
+            .unwrap();
+
+        let resolved = proc.flush_pending_batch(group, &mut pending).await.unwrap();
+        assert!(
+            resolved.is_empty(),
+            "a prepared mutation must not commit once the row's authoring identity has changed, \
+             even when its FileRecord fields still coincide with what preparation observed"
+        );
+        assert!(state.dirty_path_repository().is_path_dirty(group, "doc.txt").unwrap());
+    }
+
+    /// A raw external write to the same path (an editor, not this daemon)
+    /// between preparation and validation must exclude the stale mutation
+    /// even though the INDEX row never changed — only the disk fingerprint
+    /// has. Mirrors `peer_session::PeerSyncSession::hydrate_inner`'s own
+    /// `disk_race_fingerprint` re-check before its physical write.
+    #[tokio::test]
+    async fn a_raw_disk_write_between_preparation_and_validation_excludes_the_stale_mutation() {
+        let (proc, state, _policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
+        state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(ChangeAuth::PLACEHOLDER)));
+        let root = canonical_root(&root_dir);
+        let group = "group-1";
+        adopt_root(&state, group, &root);
+
+        let path = root.join("doc.txt");
+        std::fs::write(&path, b"local-v1").unwrap();
+
+        // Mirrors Stage 1's own batch-journal-before-processing step
+        // (normally done by `process_flush_with_ignore`, bypassed here
+        // since this test calls `process_event_with_ignore_at` directly to
+        // control the exact timing of the disk rewrite below).
+        state
+            .dirty_path_repository()
+            .record_dirty_path(
+                group,
+                "doc.txt",
+                dirty_kind_str(FsChangeKind::CreatedOrModified),
+                0,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+
+        let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+        let mut pending = Vec::new();
+        let outcome = proc
+            .process_event_with_ignore_at(
+                group,
+                &root,
+                &FsChangeEvent { path: path.clone(), kind: FsChangeKind::CreatedOrModified },
+                &ignore_set,
+                Some(0),
+                Some(&mut pending),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, EventOutcome::Deferred));
+
+        // A different size guarantees `disk_race_fingerprint` observes a
+        // change regardless of filesystem mtime granularity.
+        std::fs::write(&path, b"externally rewritten while this mutation was pending").unwrap();
+
+        let resolved = proc.flush_pending_batch(group, &mut pending).await.unwrap();
+        assert!(
+            resolved.is_empty(),
+            "a prepared mutation must not author stale bytes once the on-disk file has changed \
+             since preparation"
+        );
+        assert!(
+            state.file_index_repository().get_file(group, "doc.txt").unwrap().is_none(),
+            "nothing may be indexed for content that was never durably authored"
+        );
+        assert!(
+            state
+                .sqlite()
+                .dag_lookup_materialized_generation(group, "doc.txt")
+                .unwrap()
+                .is_none(),
+            "mandatory race regression A: a path excluded by prepare-vs-commit \
+             revalidation must publish no actual-state proof, not a proof for the \
+             stale content it almost authored"
+        );
+        assert!(state.dirty_path_repository().is_path_dirty(group, "doc.txt").unwrap());
+    }
+
+    /// Two overlapping-path batches (prepared in opposite path order, so
+    /// neither happens to already match `flush_pending_batch`'s own
+    /// lexicographic acquisition order) run concurrently must never
+    /// deadlock — `flush_pending_batch` sorts its own lock acquisition
+    /// regardless of preparation order, so both converge on the same
+    /// acquisition order and can only ever wait in line, never cycle.
+    #[tokio::test]
+    async fn concurrent_overlapping_batches_never_deadlock_regardless_of_preparation_order() {
+        let (proc, state, _policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
+        state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(ChangeAuth::PLACEHOLDER)));
+        let root = canonical_root(&root_dir);
+        let group = "group-1";
+        adopt_root(&state, group, &root);
+
+        let path_a = root.join("a.txt");
+        let path_b = root.join("b.txt");
+        std::fs::write(&path_a, b"aaa").unwrap();
+        std::fs::write(&path_b, b"bbb").unwrap();
+        let ignore_set = EffectiveIgnoreSet::from_user_patterns("");
+
+        let mut batch1 = Vec::new();
+        for p in [&path_a, &path_b] {
+            proc.process_event_with_ignore_at(
+                group,
+                &root,
+                &FsChangeEvent { path: (*p).clone(), kind: FsChangeKind::CreatedOrModified },
+                &ignore_set,
+                Some(0),
+                Some(&mut batch1),
+            )
+            .await
+            .unwrap();
+        }
+        let mut batch2 = Vec::new();
+        for p in [&path_b, &path_a] {
+            proc.process_event_with_ignore_at(
+                group,
+                &root,
+                &FsChangeEvent { path: (*p).clone(), kind: FsChangeKind::CreatedOrModified },
+                &ignore_set,
+                Some(0),
+                Some(&mut batch2),
+            )
+            .await
+            .unwrap();
+        }
+
+        let (r1, r2) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                proc.flush_pending_batch(group, &mut batch1),
+                proc.flush_pending_batch(group, &mut batch2),
+            )
+        })
+        .await
+        .expect("two concurrent overlapping batches must not deadlock");
+        r1.unwrap();
+        r2.unwrap();
+    }
+
+    /// More paths in one flush than `AUTHORITATIVE_COMMIT_BATCH_SIZE` must
+    /// still all commit correctly, across however many bounded batch
+    /// commits that takes — bounding the batch size must never drop or
+    /// duplicate a path.
+    #[tokio::test]
+    async fn more_than_one_authoritative_batch_worth_of_paths_all_commit_correctly() {
+        let (proc, state, _policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
+        state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(ChangeAuth::PLACEHOLDER)));
+        let root = canonical_root(&root_dir);
+        let group = "group-1";
+        adopt_root(&state, group, &root);
+
+        const N: usize = 40; // more than 2x AUTHORITATIVE_COMMIT_BATCH_SIZE
+        let mut paths = Vec::with_capacity(N);
+        for i in 0..N {
+            let p = root.join(format!("f-{i:03}.txt"));
+            std::fs::write(&p, format!("content-{i}")).unwrap();
+            paths.push((p, FsChangeKind::CreatedOrModified, 0));
+        }
+        let flush = yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(paths);
+        let outcome = proc.process_flush(group, &root, flush).await.unwrap();
+        assert_eq!(
+            outcome.records.len(),
+            N,
+            "batching internally into bounded groups must not drop or duplicate any path"
+        );
+        assert!(state.dirty_path_repository().list_dirty_paths(group).unwrap().is_empty());
+        for i in 0..N {
+            assert!(state
+                .file_index_repository()
+                .get_file(group, &format!("f-{i:03}.txt"))
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    /// A batch mixing creates/modifies AND deletes must commit both
+    /// `PreparedLocalMutation` variants together, in one shared
+    /// transaction — `commit_local_mutations_batch`'s `Delete` arm is
+    /// otherwise never exercised by this module's other Stage-2 batching
+    /// tests, which are create/modify-only.
+    #[tokio::test]
+    async fn a_batch_mixing_creates_and_deletes_commits_both_variants_together() {
+        let (proc, state, _policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
+        state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(ChangeAuth::PLACEHOLDER)));
+        let root = canonical_root(&root_dir);
+        let group = "group-1";
+        adopt_root(&state, group, &root);
+
+        // Two pre-existing files, indexed via their own ordinary flush
+        // first, then one is deleted and the other modified in the SAME
+        // later flush, alongside a brand-new third file -- a create, a
+        // modify, and a delete, all in one batch.
+        let to_delete = root.join("to-delete.txt");
+        let to_modify = root.join("to-modify.txt");
+        std::fs::write(&to_delete, b"gone-soon").unwrap();
+        std::fs::write(&to_modify, b"v1").unwrap();
+        let setup_flush = yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![
+            (to_delete.clone(), FsChangeKind::CreatedOrModified, 0),
+            (to_modify.clone(), FsChangeKind::CreatedOrModified, 0),
+        ]);
+        let setup_outcome = proc.process_flush(group, &root, setup_flush).await.unwrap();
+        assert_eq!(setup_outcome.records.len(), 2);
+
+        std::fs::remove_file(&to_delete).unwrap();
+        std::fs::write(&to_modify, b"v2-modified").unwrap();
+        let to_create = root.join("to-create.txt");
+        std::fs::write(&to_create, b"brand-new").unwrap();
+
+        let flush = yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![
+            (to_delete, FsChangeKind::Removed, 1),
+            (to_modify, FsChangeKind::CreatedOrModified, 1),
+            (to_create, FsChangeKind::CreatedOrModified, 1),
+        ]);
+        let outcome = proc.process_flush(group, &root, flush).await.unwrap();
+        assert_eq!(outcome.records.len(), 3, "the create, the modify, and the delete must all commit");
+        assert!(state.dirty_path_repository().list_dirty_paths(group).unwrap().is_empty());
+
+        assert!(
+            state.file_index_repository().get_file(group, "to-delete.txt").unwrap().unwrap().deleted,
+            "the batched delete must tombstone the row"
+        );
+        let modified =
+            state.file_index_repository().get_file(group, "to-modify.txt").unwrap().unwrap();
+        assert!(!modified.deleted);
+        assert_eq!(modified.size, "v2-modified".len() as u64);
+        assert!(state.file_index_repository().get_file(group, "to-create.txt").unwrap().is_some());
+
+        // Every mutation authored its own signed Change (3 more on top of
+        // the setup flush's 1), still chained onto one linear head.
+        let heads = state.sqlite().dag_group_heads(group).unwrap();
+        assert_eq!(heads.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn process_flush_paths_skips_ignored_files_and_ignore_config_file() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
@@ -4802,9 +6751,9 @@ mod tests {
             .is_none());
     }
 
-    /// A `BurstFallback` flush runs a full reconciliation scan instead of
+    /// A `RescanRequired` flush runs a full reconciliation scan instead of
     /// per-path processing.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn process_flush_burst_fallback_runs_full_scan() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
@@ -4816,7 +6765,7 @@ mod tests {
             .process_flush(
                 "group-1",
                 &root,
-                yadorilink_filesystem_sync::debounce::DebounceFlush::BurstFallback,
+                yadorilink_filesystem_sync::debounce::DebounceFlush::RescanRequired,
             )
             .await
             .unwrap();
@@ -4833,7 +6782,7 @@ mod tests {
     /// (as if a peer-applied write's own resulting event landed in this
     /// debounce window) produces no record, exactly as an immediate
     /// single-event `process_event` call would.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn process_flush_paths_applies_self_echo_suppression_per_path() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
@@ -4924,11 +6873,11 @@ mod tests {
     /// the flag directly — see `watcher::watch_folder_with_capacity`'s
     /// own tests for proof the flag is set correctly under a genuine
     /// full channel) reaches the debouncer and, once flushed through
-    /// `process_flush`'s `BurstFallback` handling, produces a fully
+    /// `process_flush`'s `RescanRequired` handling, produces a fully
     /// correct index — including files whose individual creation events
     /// were never tracked at all, because the whole point of this
     /// recovery path is not needing them.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn watcher_overflow_recovers_to_a_fully_correct_index_via_full_rescan() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
@@ -4965,7 +6914,7 @@ mod tests {
             .await
             .expect("overflow never produced a flush")
             .unwrap();
-        assert_eq!(flush, yadorilink_filesystem_sync::debounce::DebounceFlush::BurstFallback);
+        assert_eq!(flush, yadorilink_filesystem_sync::debounce::DebounceFlush::RescanRequired);
 
         let outcome = proc.process_flush("group-1", &root, flush).await.unwrap();
         assert_eq!(outcome.records.len(), FILE_COUNT, "the full rescan must discover every file");
@@ -4987,7 +6936,7 @@ mod tests {
     /// indexed as live, and the old path never resurrected by a later
     /// scan (idempotency: nothing about a stable, already-tombstoned
     /// path should look "new" to a subsequent rescan).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scan_existing_files_recovers_a_dropped_rename_without_resurrecting_the_old_path() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
@@ -5060,7 +7009,7 @@ mod tests {
     /// `scan_existing_files` (which does re-version/tombstone those two
     /// cases, and is documented — `watcher.rs`'s module doc — as unsafe to
     /// run that often against a possibly-mid-conflict-resolution index).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconcile_added_files_only_indexes_disk_files_with_no_existing_row() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
@@ -5141,13 +7090,22 @@ mod tests {
     /// once the accumulator's internal
     /// delivery queue is forced past capacity by a backlog
     /// (see `debounce`'s own `executor_backlog_trigger_...` test for the
-    /// queue-collapse mechanism in isolation), the resulting
-    /// `BurstFallback` still recovers a fully-correct index end to end,
-    /// exactly like the watcher-overflow path.
-    #[tokio::test]
-    async fn executor_backlog_recovers_to_a_fully_correct_index_via_full_rescan() {
+    /// queue-merge mechanism in isolation), every file still ends up
+    /// correctly indexed end to end -- via the merged `Paths` batch the
+    /// queue collapses into now (no watcher overflow occurs in this
+    /// scenario, so no information was ever lost; see `push_ready`'s own
+    /// doc comment for why this no longer falls back to a full rescan).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn executor_backlog_recovers_to_a_fully_correct_index() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
+        // Unlike the full-rescan-fallback scenarios (which never call
+        // `adopt_root`), this test now genuinely exercises PER-PATH
+        // capture (see `push_ready`'s own doc comment on why a mere
+        // backlog no longer falls back to a full rescan), and per-path
+        // capture needs the group's policy actually adopted to author
+        // anything at all.
+        adopt_root(&state, "group-1", &root);
         let proc = Arc::new(proc);
 
         const FILE_COUNT: usize = 30;
@@ -5156,8 +7114,9 @@ mod tests {
         }
 
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(256);
-        // Never drained: forces the internal ready_queue to collapse into
-        // a BurstFallback once it exceeds DEFAULT_EXECUTOR_CHANNEL_CAPACITY.
+        // Never drained: forces the internal ready_queue to merge into a
+        // single Paths batch once it exceeds DEFAULT_EXECUTOR_CHANNEL_CAPACITY
+        // (no watcher overflow here, so the merge stays Paths, not RescanRequired).
         let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(1);
         let config = yadorilink_filesystem_sync::debounce::DebounceConfig {
             quiet_period: std::time::Duration::from_millis(15),
@@ -5178,15 +7137,22 @@ mod tests {
         // Many separate, well-spaced single-path windows — each one is a
         // *real* file (so a non-fallback flush would also reconstruct
         // correctly), but there are enough of them, undrained, that the
-        // delivery queue must eventually collapse. The gap needs real
-        // headroom above quiet_period (15ms): on a slower/more contended
-        // CI runner (observed on windows-latest at the old 25ms gap), a
+        // delivery queue must eventually merge. Every one of the
+        // `FILE_COUNT` files gets its own event -- unlike the old
+        // full-rescan-fallback version of this test, nothing here is
+        // "unknown"; the whole point of the merge (see `push_ready`'s own
+        // doc comment) is that a backlog of fully-known changes must
+        // still deliver every one of them, not silently rely on a
+        // directory walk to discover files this accumulator was never
+        // even told about. The gap between sends needs real headroom
+        // above quiet_period (15ms): on a slower/more contended CI
+        // runner (observed on windows-latest at the old 25ms gap), a
         // slow-to-be-polled debouncer task can let several sends queue up
         // and then process them back-to-back, merging windows that were
-        // meant to stay separate and never reaching the collapse this
-        // test means to exercise (same root cause as, and fixed the same
-        // way as, debounce.rs's sibling test).
-        for i in 0..(yadorilink_filesystem_sync::debounce::DEFAULT_EXECUTOR_CHANNEL_CAPACITY + 5) {
+        // meant to stay separate and never reaching the merge this test
+        // means to exercise (same root cause as, and fixed the same way
+        // as, debounce.rs's sibling test).
+        for i in 0..FILE_COUNT {
             events_tx
                 .send(FsChangeEvent {
                     path: root.join(format!("obj-{i}.bin")),
@@ -5214,9 +7180,9 @@ mod tests {
             total_records.extend(outcome.records);
         }
 
-        // Whether via individually-tracked paths or the collapsed
-        // fallback's full rescan, every file must end up correctly
-        // indexed — no permanent gaps from the collapse.
+        // Whether via individually-tracked paths or a merged backlog
+        // batch, every file must end up correctly indexed — no permanent
+        // gaps from the merge.
         assert_eq!(state.file_index_repository().list_files("group-1").unwrap().len(), FILE_COUNT);
         for i in [0, FILE_COUNT / 2, FILE_COUNT - 1] {
             assert!(
@@ -5233,7 +7199,7 @@ mod tests {
     /// a file below the size threshold is chunked with the fixed-size
     /// chunker — the automatic size-based decision picks fixed for small
     /// files with no per-folder configuration involved.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn small_file_uses_fixed_size_chunking() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
@@ -5265,7 +7231,7 @@ mod tests {
     /// `chunk_file_content_defined`'s direct output (deterministic for the
     /// same content/parameters), and confirming it differs from what
     /// fixed-size chunking would have produced for the same content.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn large_file_uses_content_defined_chunking() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
@@ -5302,6 +7268,96 @@ mod tests {
         assert_ne!(
             record.blocks, expected_fixed,
             "CDC output must differ from what fixed-size chunking would have produced"
+        );
+    }
+
+    /// M6-2B2 crash-safety property 4: `flush_durable`'s `staged ->
+    /// durable` boundary structurally gates the `durable -> authoritative`
+    /// half too -- a source capture must not publish a `FileRecord` for
+    /// blocks that are not yet durable. Deterministic via `FsBlockStore::
+    /// install_bulk_ingest_barrier_hook_for_tests`, which fires exactly
+    /// once `commit_batch` has finished all of a batch's durability work
+    /// but before it returns to its caller (`chunk_file_content_defined`,
+    /// still inside `build_record_for_created_or_modified`'s own
+    /// `block_in_place`) -- pausing there and observing no indexed
+    /// `FileRecord` yet, then releasing and observing one appear only
+    /// afterward, is a real ordering proof, not a timing-sensitive guess.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_durable_gates_authoritative_publication_deterministically() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let state = Arc::new(TestReplica::open_in_memory().unwrap());
+        let root_dir = tempfile::tempdir().unwrap();
+        let proc = LocalChangeProcessor::new(
+            state.clone(),
+            store.clone(),
+            "device-a".into(),
+            std::sync::Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+        );
+        let root = canonical_root(&root_dir);
+        adopt_root(&state, "group-1", &root);
+
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(21);
+        let content: Vec<u8> = (0..yadorilink_local_storage::CDC_SIZE_THRESHOLD as usize)
+            .map(|_| rng.random())
+            .collect();
+        let file_path = root.join("gated.bin");
+        std::fs::write(&file_path, &content).unwrap();
+
+        let reached_barrier = Arc::new(Latch::new());
+        let release_barrier = Arc::new(Latch::new());
+        {
+            let reached_barrier = reached_barrier.clone();
+            let release_barrier = release_barrier.clone();
+            store.install_bulk_ingest_barrier_hook_for_tests(move || {
+                reached_barrier.raise();
+                release_barrier.wait();
+            });
+        }
+
+        let capture_task = tokio::spawn(async move {
+            expect_file_changed(
+                proc.process_event(
+                    "group-1",
+                    &root,
+                    &FsChangeEvent {
+                        path: file_path.clone(),
+                        kind: FsChangeKind::CreatedOrModified,
+                    },
+                )
+                .await
+                .unwrap(),
+            )
+        });
+
+        assert!(
+            reached_barrier.wait_timeout(std::time::Duration::from_secs(20)),
+            "capture never reached the bulk-ingest barrier within 20s"
+        );
+
+        // The batch's blocks are already durable on disk at this exact
+        // point (that's when the hook fires) -- but nothing has published
+        // a FileRecord referencing them yet, because `commit_batch` has
+        // not returned to `build_record_for_created_or_modified`, which
+        // has not returned to `process_event`, which is what actually
+        // calls `upsert_file`. If this assertion ever fails, it means
+        // some future change let authoritative publication race ahead of
+        // (rather than strictly follow) the durability barrier.
+        assert!(
+            state.file_index_repository().get_file("group-1", "gated.bin").unwrap().is_none(),
+            "no FileRecord may exist while flush_durable is still blocked mid-batch"
+        );
+
+        release_barrier.raise();
+        let record = capture_task.await.unwrap();
+
+        let published =
+            state.file_index_repository().get_file("group-1", "gated.bin").unwrap().unwrap();
+        assert_eq!(
+            published.blocks, record.blocks,
+            "the FileRecord becomes visible only after flush_durable released, and matches what \
+             process_event returned"
         );
     }
 
@@ -5873,11 +7929,57 @@ mod tests {
         );
     }
 
+    /// A restart re-drive that fully clears the dirty journal must leave a
+    /// second, immediately-following re-drive a true no-op: no records
+    /// produced, no journal rows re-appear, and no duplicate DAG head. This
+    /// pins `redrive_dirty_journal`'s empty-journal short-circuit against
+    /// Stage-1's batched journal/clear path specifically, since a batching
+    /// bug that left a stray row behind (or resurrected one) would only
+    /// show up on this second call, not the first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redriving_an_already_cleared_dirty_journal_twice_in_a_row_is_a_no_op() {
+        let (proc, state, _store_dir, root_dir) = processor();
+        let root = canonical_root(&root_dir);
+        let group = "group-1";
+        adopt_root(&state, group, &root);
+
+        std::fs::write(root.join("a.txt"), b"aaa").unwrap();
+        std::fs::write(root.join("b.txt"), b"bbb").unwrap();
+        let flush = yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![
+            (root.join("a.txt"), FsChangeKind::CreatedOrModified, 0),
+            (root.join("b.txt"), FsChangeKind::CreatedOrModified, 0),
+        ]);
+        proc.process_flush(group, &root, flush).await.unwrap();
+        assert!(
+            state.dirty_path_repository().list_dirty_paths(group).unwrap().is_empty(),
+            "both paths must have succeeded and cleared their journal rows"
+        );
+        let heads_after_flush = state.sqlite().dag_group_heads(group).unwrap();
+
+        let first_redrive = proc.redrive_dirty_journal(group, &root).await.unwrap();
+        assert!(
+            first_redrive.records.is_empty(),
+            "an already-empty journal must produce no records on re-drive"
+        );
+
+        let second_redrive = proc.redrive_dirty_journal(group, &root).await.unwrap();
+        assert!(
+            second_redrive.records.is_empty(),
+            "a second, immediately-following re-drive must remain a no-op"
+        );
+        assert!(state.dirty_path_repository().list_dirty_paths(group).unwrap().is_empty());
+        assert_eq!(
+            state.sqlite().dag_group_heads(group).unwrap(),
+            heads_after_flush,
+            "re-driving an empty journal twice must never move the DAG head"
+        );
+    }
+
     /// Once the policy heals — the provider flips from `Err(PolicyUnavailable)`
     /// to `Ok(auth)` — re-driving the dirty journal emits the previously
     /// withheld edit as a real, non-placeholder-auth change and clears the
     /// journal row, so the deferred edit replicates normally.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn healed_policy_reemits_the_withheld_edit_with_real_auth_and_clears_the_journal() {
         use std::sync::atomic::Ordering;
 
@@ -5935,7 +8037,7 @@ mod tests {
     /// re-drive re-emits the change and the DAG head advances once policy
     /// heals. This test fails on the old silent fallback (the DAG head never
     /// advances past the pre-edit head).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stale_policy_scan_withholds_index_write_then_reemits_offline_edit_once_healed() {
         use std::sync::atomic::Ordering;
 
@@ -6050,6 +8152,387 @@ mod tests {
         (proc, state, emitter, store_dir, root_dir)
     }
 
+    /// Section 9A of the 2026-09 device-A local-origin fix's regression
+    /// suite: a disk change between the content read and the final
+    /// pre-commit revalidation must suppress the proof entirely (never a
+    /// hard failure of the capture itself -- see `fresh_actual_state_
+    /// identity_if_unraced`'s own doc comment). Exercises the exact
+    /// helper `process_event_with_ignore_at`'s single-immediate commit
+    /// path calls, directly and deterministically -- no wall-clock race,
+    /// no real concurrent writer, just the two fingerprint states that
+    /// helper actually compares.
+    #[test]
+    fn fresh_actual_state_identity_if_unraced_suppresses_on_a_fingerprint_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.bin");
+        std::fs::write(&path, b"v1").unwrap();
+        let fingerprint_before_read = disk_race_fingerprint(&path);
+        assert!(fingerprint_before_read.is_some(), "sanity: a real file must fingerprint");
+
+        // Matching fingerprint: identity IS observed.
+        assert!(
+            fresh_actual_state_identity_if_unraced(&path, fingerprint_before_read).is_some(),
+            "an unchanged file between the two observations must still produce an identity"
+        );
+
+        // A write between "before read" and "final revalidation" changes
+        // the fingerprint (size, at minimum) -- the helper must suppress,
+        // not merely warn.
+        std::fs::write(&path, b"v2, raced in").unwrap();
+        assert!(
+            fresh_actual_state_identity_if_unraced(&path, fingerprint_before_read).is_none(),
+            "a disk fingerprint mismatch between the pre-read and pre-commit observations must \
+             suppress the identity entirely -- publishing a proof here would attest to content \
+             that was never actually read/hashed for this commit"
+        );
+
+        // No file at all (e.g. deleted in the same window): also
+        // suppressed, not a panic/error.
+        std::fs::remove_file(&path).unwrap();
+        assert!(fresh_actual_state_identity_if_unraced(&path, fingerprint_before_read).is_none());
+
+        // A `None` "before" fingerprint (the read itself raced a delete)
+        // must never be treated as "nothing to compare against, so
+        // trust it" -- always suppressed.
+        assert!(fresh_actual_state_identity_if_unraced(&path, None).is_none());
+    }
+
+    /// The RED->GREEN regression for the 2026-09 device-A local-origin
+    /// zero-work fix. Before this fix (RED, provable by reverting
+    /// `file_index.rs`'s `adopt_local_capture_actual_state` call and
+    /// re-running this test): a local capture never wrote a
+    /// `path_materialized_generations` row for its own freshly-authored
+    /// content, so `dag_zero_work_settlement_if_already_current`'s
+    /// `lookup_materialized_generation` call always returned `None`, and
+    /// the ordinary reconcile path (`materialize_dag_content_head`) was
+    /// the only way this device's own already-correct file could ever
+    /// settle its projection obligation.
+    ///
+    /// GREEN (this fix): local capture publishes a usable exact
+    /// actual-state proof in the SAME transaction as the DAG/index
+    /// commit. This test asserts the durable state directly -- never a
+    /// wall-clock/call-count proxy -- via the exact three preconditions
+    /// `dag_zero_work_settlement_if_already_current` itself checks:
+    /// (1) a projection obligation exists for the path (the universal
+    /// admission invariant, unaffected by this fix), (2)
+    /// `dag_lookup_materialized_generation` returns `Some` (the proof is
+    /// USABLE right now, not merely present-but-stale against the
+    /// mutation fence), and (3) that row's `resolved_path_state_hash`
+    /// equals what `dag_desired_resolved_path_state_hash` independently
+    /// derives for the group's own current DAG-resolved state --
+    /// precisely the equality `dag_zero_work_settlement_if_already_
+    /// current` gates a real settlement on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_capture_of_new_content_publishes_a_usable_exact_actual_state_proof() {
+        let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+        let root = canonical_root(&root_dir);
+        let group = "group-1";
+        adopt_root(&state, group, &root);
+        let file_path = root.join("report.txt");
+
+        std::fs::write(&file_path, b"locally authored content").unwrap();
+        expect_file_changed(
+            proc.process_event(
+                group,
+                &root,
+                &FsChangeEvent { path: file_path.clone(), kind: FsChangeKind::CreatedOrModified },
+            )
+            .await
+            .unwrap(),
+        );
+
+        // (1) Admission's own universal invariant: not-admitted -> admitted
+        // must have created/bumped a runnable projection obligation for
+        // this path, exactly as it would for ANY admitted change,
+        // regardless of this fix.
+        let obligation =
+            state.sqlite().dag_lookup_projection_obligation(group, "report.txt").unwrap();
+        assert!(
+            obligation.is_some(),
+            "sanity: the Convergence Engine's own universal admission invariant must still hold \
+             -- this fix must never special-case local admission by suppressing obligation \
+             creation"
+        );
+
+        // (2) The proof this fix publishes must be immediately usable --
+        // not merely present, which `lookup_materialized_generation`'s own
+        // fail-closed contract (its `published_under_mutation_generation`
+        // CAS against the live fence) would refuse to return at all if
+        // this fix's fence-then-write ordering were wrong.
+        let basis = state.sqlite().dag_lookup_materialized_generation(group, "report.txt").unwrap();
+        let basis = basis.expect(
+            "GREEN behavior missing: local capture of new content must publish a USABLE exact \
+             actual-state proof in the same transaction as its DAG/index commit -- if this is \
+             None, either the fix regressed to not publishing at all, or it published under a \
+             stale/mismatched mutation-fence epoch",
+        );
+        assert_eq!(
+            basis.object_kind,
+            yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::RegularFile
+        );
+        assert!(basis.version.is_some(), "a present object's proof must carry its version hash");
+        assert!(
+            basis.filesystem_identity.is_some(),
+            "a present object's proof must carry a strong FileIdentity"
+        );
+
+        // (3) The exact equality `dag_zero_work_settlement_if_already_
+        // current` gates a real settlement on: the published proof's
+        // resolved_path_state_hash must equal what the group's own
+        // CURRENT DAG-resolved desired state independently derives --
+        // computed here via the same production hash builder
+        // (`dag_desired_resolved_path_state_hash`), not re-derived by
+        // this test's own logic, so this assertion fails if either side
+        // of that real equality check ever drifts.
+        let resolution = yadorilink_replica_engine::conflict::PathResolution::Present {
+            winner: 0,
+            conflict_copies: vec![],
+        };
+        let desired_hash = state
+            .sqlite()
+            .dag_desired_resolved_path_state_hash(
+                group,
+                "report.txt",
+                &resolution,
+                basis.version.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(
+            basis.resolved_path_state_hash, desired_hash,
+            "the published proof's resolved_path_state_hash must match the group's own current \
+             desired-state hash -- this exact equality is what \
+             dag_zero_work_settlement_if_already_current gates a real zero-work close on, so a \
+             mismatch here means the Convergence Engine would still fall through to the \
+             ordinary (non-zero-work) reconcile path despite this fix"
+        );
+    }
+
+    /// Section 9E of the 2026-09 device-A local-origin fix's regression
+    /// suite: a locally observed deletion must publish an exact `Absent`
+    /// proof in the same transaction as its tombstone admission, so a
+    /// peer's own reconcile of this now-deleted path can zero-work close
+    /// (recognize "already absent") without a redundant remove syscall --
+    /// the same GREEN behavior as content capture, but for
+    /// `MaterializedObjectKind::Absent` rather than `RegularFile`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_capture_of_a_deletion_publishes_a_usable_exact_absent_proof() {
+        let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+        let root = canonical_root(&root_dir);
+        let group = "group-1";
+        adopt_root(&state, group, &root);
+        let file_path = root.join("report.txt");
+
+        std::fs::write(&file_path, b"locally authored content").unwrap();
+        expect_file_changed(
+            proc.process_event(
+                group,
+                &root,
+                &FsChangeEvent { path: file_path.clone(), kind: FsChangeKind::CreatedOrModified },
+            )
+            .await
+            .unwrap(),
+        );
+
+        std::fs::remove_file(&file_path).unwrap();
+        let tombstone = expect_file_changed(
+            proc.process_event(
+                group,
+                &root,
+                &FsChangeEvent { path: file_path.clone(), kind: FsChangeKind::Removed },
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(tombstone.deleted, "sanity: the deletion must have been admitted as a tombstone");
+
+        // Admission's own universal invariant still holds for a deletion,
+        // exactly as it does for content capture.
+        let obligation =
+            state.sqlite().dag_lookup_projection_obligation(group, "report.txt").unwrap();
+        assert!(
+            obligation.is_some(),
+            "a locally observed deletion must still create/bump a runnable projection \
+             obligation for its path -- this fix must never special-case local admission by \
+             suppressing obligation creation, deletion included"
+        );
+
+        let basis = state.sqlite().dag_lookup_materialized_generation(group, "report.txt").unwrap();
+        let basis = basis.expect(
+            "GREEN behavior missing: a locally observed deletion must publish a USABLE exact \
+             Absent proof in the same transaction as its tombstone admission",
+        );
+        assert_eq!(
+            basis.object_kind,
+            yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::Absent,
+            "a locally observed deletion's proof must describe absence, not a stale present kind"
+        );
+        assert!(basis.version.is_none(), "an absent object's proof must carry no version hash");
+        assert!(
+            basis.filesystem_identity.is_none(),
+            "an absent object's proof must carry no filesystem identity"
+        );
+
+        let desired_hash = state
+            .sqlite()
+            .dag_desired_resolved_path_state_hash(
+                group,
+                "report.txt",
+                &yadorilink_replica_engine::conflict::PathResolution::Absent,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            basis.resolved_path_state_hash, desired_hash,
+            "the published Absent proof's resolved_path_state_hash must match the group's own \
+             current desired-state hash for absence -- this exact equality is what \
+             dag_zero_work_settlement_if_already_current gates a real zero-work close on"
+        );
+    }
+
+    /// Section 9D of the 2026-09 device-A local-origin fix's regression
+    /// suite: a second local edit's own captured proof must fully
+    /// supersede the first's, never leave the first's stale
+    /// `resolved_path_state_hash` sitting around able to authorize
+    /// zero-work settlement of content it no longer describes. Only
+    /// covers correctness from the point the second edit is OBSERVED by
+    /// local capture (an ordinary second `process_event` call) --
+    /// nothing here claims pre-watcher linearizability against the
+    /// external write itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_local_capture_supersedes_the_first_captures_stale_proof() {
+        let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+        let root = canonical_root(&root_dir);
+        let group = "group-1";
+        adopt_root(&state, group, &root);
+        let file_path = root.join("report.txt");
+
+        std::fs::write(&file_path, b"version one").unwrap();
+        expect_file_changed(
+            proc.process_event(
+                group,
+                &root,
+                &FsChangeEvent { path: file_path.clone(), kind: FsChangeKind::CreatedOrModified },
+            )
+            .await
+            .unwrap(),
+        );
+        let basis_v1 = state
+            .sqlite()
+            .dag_lookup_materialized_generation(group, "report.txt")
+            .unwrap()
+            .expect("sanity: v1's own capture must publish a usable proof");
+
+        // A second, genuinely different local edit -- observed by local
+        // capture exactly like the first, an ordinary second event, not a
+        // race this test needs to simulate specially.
+        std::fs::write(&file_path, b"version two, a real second edit").unwrap();
+        expect_file_changed(
+            proc.process_event(
+                group,
+                &root,
+                &FsChangeEvent { path: file_path.clone(), kind: FsChangeKind::CreatedOrModified },
+            )
+            .await
+            .unwrap(),
+        );
+        let basis_v2 = state
+            .sqlite()
+            .dag_lookup_materialized_generation(group, "report.txt")
+            .unwrap()
+            .expect("v2's own capture must also publish a usable proof");
+
+        assert_ne!(
+            basis_v2.version, basis_v1.version,
+            "the second capture's proof must carry v2's own version hash, not v1's"
+        );
+        assert_ne!(
+            basis_v2.resolved_path_state_hash, basis_v1.resolved_path_state_hash,
+            "v1's stale resolved_path_state_hash must not still be the row's live value after \
+             v2's own capture published its own -- a stale hash surviving here could let a \
+             leftover v1 proof wrongly authorize zero-work settlement of v2's obligation"
+        );
+
+        // v1's own hash, independently recomputed, must no longer match
+        // ANYTHING the live row now describes -- confirms this isn't just
+        // "a different row exists somewhere," but that the ONE row
+        // `dag_lookup_materialized_generation` returns for this path is
+        // unambiguously v2's, not v1's under a still-live guise.
+        let resolution = yadorilink_replica_engine::conflict::PathResolution::Present {
+            winner: 0,
+            conflict_copies: vec![],
+        };
+        let v1_hash_recomputed = state
+            .sqlite()
+            .dag_desired_resolved_path_state_hash(
+                group,
+                "report.txt",
+                &resolution,
+                basis_v1.version.as_ref(),
+            )
+            .unwrap();
+        assert_ne!(
+            basis_v2.resolved_path_state_hash, v1_hash_recomputed,
+            "v2's live proof must not happen to match v1's own content hash recomputed fresh -- \
+             confirms this test's two versions are genuinely distinct content, not a false \
+             positive from picking two edits that happen to hash the same"
+        );
+    }
+
+    /// Batch-path counterpart to `local_capture_of_new_content_publishes_a_
+    /// usable_exact_actual_state_proof`: the SAME GREEN behavior must hold
+    /// through `commit_local_mutations_batch` (a `Paths` flush with more
+    /// than one non-symlink file, the shape a real debounced multi-file
+    /// save/import batches into), not just the single-immediate commit --
+    /// section 10's own requirement that each successfully-revalidated
+    /// batched mutation gets its own exact proof inputs, and a path
+    /// excluded by revalidation gets none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batched_local_capture_of_new_content_publishes_usable_exact_actual_state_proofs() {
+        let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+        let root = canonical_root(&root_dir);
+        let group = "group-1";
+        adopt_root(&state, group, &root);
+        std::fs::write(root.join("a.txt"), b"aaa content").unwrap();
+        std::fs::write(root.join("b.txt"), b"bbb content").unwrap();
+
+        let flush = yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![
+            (root.join("a.txt"), FsChangeKind::CreatedOrModified, 0),
+            (root.join("b.txt"), FsChangeKind::CreatedOrModified, 0),
+        ]);
+        let outcome = proc.process_flush(group, &root, flush).await.unwrap();
+        assert_eq!(outcome.records.len(), 2, "sanity: both files must have been captured");
+
+        for path in ["a.txt", "b.txt"] {
+            let basis = state
+                .sqlite()
+                .dag_lookup_materialized_generation(group, path)
+                .unwrap()
+                .unwrap_or_else(|| panic!("batched capture of {path} must publish a usable proof"));
+            assert_eq!(
+                basis.object_kind,
+                yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::RegularFile
+            );
+            let resolution = yadorilink_replica_engine::conflict::PathResolution::Present {
+                winner: 0,
+                conflict_copies: vec![],
+            };
+            let desired_hash = state
+                .sqlite()
+                .dag_desired_resolved_path_state_hash(
+                    group,
+                    path,
+                    &resolution,
+                    basis.version.as_ref(),
+                )
+                .unwrap();
+            assert_eq!(
+                basis.resolved_path_state_hash, desired_hash,
+                "{path}'s batched proof must satisfy the same zero-work equality as the \
+                 single-immediate path"
+            );
+        }
+    }
+
     /// Reproduces the restart gap in the change-history DAG: a file edited
     /// while the daemon isn't running is picked up by the startup disk-vs-
     /// index reconciliation scan (`scan_existing_files_with_ignore`), which
@@ -6064,7 +8547,7 @@ mod tests {
     /// module doc) and so is a no-op once real history already exists. The
     /// on-disk file and the local index both show the new content, but the
     /// DAG head a change-history-aware peer negotiates against never moves.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn offline_edit_after_existing_dag_history_must_append_new_head_on_restart() {
         let (proc, state, emitter, _store_dir, root_dir) = processor_with_emitter();
         let root = canonical_root(&root_dir);
@@ -6131,7 +8614,7 @@ mod tests {
     /// scan tombstones the local index row for a file removed while the
     /// daemon wasn't running, but that tombstone never becomes a `Delete`
     /// change in the group's history DAG.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn offline_delete_after_existing_dag_history_must_append_delete_change() {
         let (proc, state, emitter, _store_dir, root_dir) = processor_with_emitter();
         let root = canonical_root(&root_dir);
@@ -6189,7 +8672,7 @@ mod tests {
     /// stay advanced past the pre-edit head and remain a single head — the
     /// redrive must never silently leave the group's history stuck, nor fork
     /// or drop the change it just emitted.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dirty_journal_redrive_must_not_clear_a_change_missing_from_dag() {
         let (proc, state, emitter, _store_dir, root_dir) = processor_with_emitter();
         let root = canonical_root(&root_dir);
@@ -6353,7 +8836,7 @@ mod tests {
             Some(b"../outside".to_vec())
         );
         assert!(state.file_index_repository().get_symlink_out_of_root(group, "link").unwrap());
-        assert!(!state.file_index_repository().get_exec_bit(group, "link").unwrap());
+        assert_eq!(state.file_index_repository().get_unix_mode(group, "link").unwrap(), None);
 
         // ...and the DAG `FileVersion` the emitted change references agrees
         // exactly (same single committed state, not a later reconciliation).
@@ -6364,7 +8847,7 @@ mod tests {
         let version = state.sqlite().dag_get_file_version(group, &vh).unwrap().unwrap();
         assert_eq!(version.meta.record_kind, RecordKind::Symlink);
         assert_eq!(version.meta.symlink_target.as_deref(), Some(b"../outside".as_slice()));
-        assert!(!version.meta.exec_bit);
+        assert_eq!(version.meta.unix_mode, None);
         // The two views are one and the same commit — the whole point of FIX A.
         assert_eq!(
             state.file_index_repository().get_record_kind(group, "link").unwrap(),
@@ -6377,12 +8860,12 @@ mod tests {
     }
 
     /// Exec-bit counterpart of the symlink case above: an executable regular
-    /// file picked up by the emitting scan must have its `exec_bit` index column set
+    /// file picked up by the emitting scan must have its `unix_mode` index column set
     /// in the same commit as the change's `FileVersion` — not by a separate
-    /// `set_exec_bit` after the commit.
+    /// `set_unix_mode` after the commit.
     #[cfg(unix)]
     #[test]
-    fn scan_emits_exec_bit_atomically_with_its_file_version() {
+    fn scan_emits_unix_mode_atomically_with_its_file_version() {
         use std::os::unix::fs::PermissionsExt;
 
         let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
@@ -6406,8 +8889,9 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
 
-        assert!(
-            state.file_index_repository().get_exec_bit(group, "run.sh").unwrap(),
+        assert_eq!(
+            state.file_index_repository().get_unix_mode(group, "run.sh").unwrap(),
+            Some(0o755),
             "exec bit set right after the emit"
         );
         assert_eq!(
@@ -6423,10 +8907,69 @@ mod tests {
         let chain = linear_chain_back_to(&state, heads_after[0], &heads_before[0]);
         let vh = version_hash_for_path(&chain[chain.len() - 1], "run.sh");
         let version = state.sqlite().dag_get_file_version(group, &vh).unwrap().unwrap();
-        assert!(version.meta.exec_bit, "the emitted FileVersion carries the exec bit too");
         assert_eq!(
-            state.file_index_repository().get_exec_bit(group, "run.sh").unwrap(),
-            version.meta.exec_bit
+            version.meta.unix_mode,
+            Some(0o755),
+            "the emitted FileVersion carries the exec bit too"
+        );
+        assert_eq!(
+            state.file_index_repository().get_unix_mode(group, "run.sh").unwrap(),
+            version.meta.unix_mode
+        );
+    }
+
+    /// Codex review finding (C1.2a metadata-semantics checkpoint): the
+    /// startup reconciliation scan used to emit `Vec::new()` for every
+    /// record it re-authored, regardless of whether that path already
+    /// carried real xattrs -- so an OFFLINE exec-bit-only change (content
+    /// untouched) to a file that separately already had a replicated
+    /// xattr silently wiped that attribute the moment the scan picked up
+    /// the exec-bit divergence, in both the index and the emitted
+    /// `FileVersion`. This proves the fix: the xattr must survive an
+    /// unrelated offline metadata change discovered by the same scan.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scan_preserves_existing_xattrs_across_an_unrelated_offline_exec_bit_change() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+        let root = canonical_root(&root_dir);
+        let group = "group-1";
+        let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+
+        let script = root.join("run.sh");
+        std::fs::write(&script, b"#!/bin/sh\n").unwrap();
+        yadorilink_local_storage::apply_xattrs(
+            &script,
+            &[("user.yadorilink-test".to_string(), b"keep-me".to_vec())],
+        )
+        .unwrap();
+        proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
+        yadorilink_daemon::dag_import::ensure_initial_import(
+            state.coordinator(),
+            group,
+            proc.change_emitter.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            state.file_index_repository().get_xattrs(group, "run.sh").unwrap(),
+            vec![("user.yadorilink-test".to_string(), b"keep-me".to_vec())],
+            "precondition: the xattr is indexed after the first scan"
+        );
+
+        // Offline: only the exec bit changes; the xattr is untouched.
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
+
+        assert_eq!(
+            state.file_index_repository().get_unix_mode(group, "run.sh").unwrap(),
+            Some(0o755),
+            "the offline exec-bit change was picked up"
+        );
+        assert_eq!(
+            state.file_index_repository().get_xattrs(group, "run.sh").unwrap(),
+            vec![("user.yadorilink-test".to_string(), b"keep-me".to_vec())],
+            "an unrelated offline metadata change must never erase an already-indexed xattr"
         );
     }
 
@@ -6485,6 +9028,76 @@ mod tests {
             total_ops += change.ops.len();
         }
         assert_eq!(total_ops, n, "the chain's ops must cover every changed path exactly once");
+    }
+
+    /// C4 15k live-burst investigation (2026-09-01): before this fix,
+    /// `process_flush_with_ignore`'s `RescanRequired` arm withheld every
+    /// peer announcement until the WHOLE scan's `Vec<FileRecord>` was
+    /// returned, even though `reconcile_disk_with_ignore`'s own chunk loop
+    /// (proven by `bulk_offline_reconcile_chunks_by_op_count_into_a_chain`
+    /// above) already commits each chunk durably to the DAG as it goes --
+    /// a real 15,000-file scan measured this as ~75 seconds of zero
+    /// peer-visible progress despite the source device's own index/DAG
+    /// visibly advancing the entire time. Proves the streaming sibling
+    /// surfaces each durably-committed chunk via `on_chunk_committed`
+    /// DURING the scan (multiple callback invocations, each with a proper
+    /// subset of the total), not only once at the very end. Confirmed
+    /// genuinely RED by temporarily removing the `cb(chunk_records)` call
+    /// in `reconcile_disk_with_ignore`'s chunk loop: `sizes.len()` becomes
+    /// `0` even though the scan still completes and returns the same
+    /// records.
+    #[test]
+    fn streaming_reconciliation_surfaces_each_durable_chunk_before_the_whole_scan_returns() {
+        let (proc, state, _emitter, _store_dir, root_dir) = processor_with_emitter();
+        let root = canonical_root(&root_dir);
+        let group = "group-1";
+        let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+
+        let n = RECONCILE_CHUNK_OP_LIMIT + 3;
+        for i in 0..n {
+            std::fs::write(root.join(format!("f{i}")), b"a").unwrap();
+        }
+        proc.scan_existing_files_with_ignore(group, &root, &ignore_set).unwrap();
+        yadorilink_daemon::dag_import::ensure_initial_import(
+            state.coordinator(),
+            group,
+            proc.change_emitter.as_ref().unwrap(),
+        )
+        .unwrap();
+
+        // Offline-modify every file so the second scan's diff is non-empty
+        // and routes through the chunked change-emission path (the same
+        // setup `bulk_offline_reconcile_chunks_by_op_count_into_a_chain`
+        // uses, just observed through the streaming API instead).
+        for i in 0..n {
+            std::fs::write(root.join(format!("f{i}")), b"abc").unwrap();
+        }
+
+        let observed_chunk_sizes = std::cell::RefCell::new(Vec::<usize>::new());
+        let mut on_chunk = |records: &[FileRecord]| {
+            observed_chunk_sizes.borrow_mut().push(records.len());
+        };
+        let records = proc
+            .scan_existing_files_with_ignore_streaming(group, &root, &ignore_set, &mut on_chunk)
+            .unwrap();
+
+        let sizes = observed_chunk_sizes.into_inner();
+        assert!(
+            sizes.len() >= 2,
+            "{n} changed paths must stream as >= 2 chunk callbacks, got {}",
+            sizes.len()
+        );
+        assert_eq!(
+            sizes.iter().sum::<usize>(),
+            n,
+            "streamed chunk sizes must cover every changed path exactly once, with no overlap \
+             or gap"
+        );
+        assert_eq!(
+            records.len(),
+            n,
+            "the final aggregate return value must stay byte-identical to the non-streaming path"
+        );
     }
 
     /// Byte cap: a diff of FEWER than the op-count

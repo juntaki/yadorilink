@@ -154,6 +154,34 @@ pub(crate) fn madsim_or_default_pool(
 /// `E::is_locked`), up to a small bounded number of attempts with a short
 /// linear backoff. Every other error (any genuine data error) propagates
 /// immediately, unretried.
+///
+/// The backoff blocks the calling thread (`std::thread::sleep`), for up to
+/// 225ms across a fully contended call, and this is deliberate on both
+/// counts:
+///
+/// * Blocking, because every entry point into this crate
+///   (`SyncDatabase::read`/`write`/`write_immediate`) is synchronous, as
+///   are the ~200 repository call sites that reach them. There is no
+///   runtime here to yield to -- this crate has no dependency on tokio or
+///   any other async runtime, by design, since it is shared by callers
+///   that are not async at all.
+/// * 225ms, because that worst case only materializes when the lock
+///   genuinely stayed held for that long, in which case the alternative to
+///   waiting is failing. This window has already been widened once in
+///   response to a reproduced convergence gap where real concurrent load
+///   pushed `SQLITE_BUSY` straight past it; shortening it trades a bounded
+///   wait for an unbounded correctness risk.
+///
+/// What follows for callers: an async caller must not reach `read`/
+/// `write`/`write_immediate` inline on a runtime worker. A worker blocked
+/// here is not parked -- it runs no other task at all for the duration,
+/// which surfaces as time-to-schedule for everything else sharing that
+/// runtime, up to and including this device's own QUIC endpoint driver
+/// missing the window to send an ack promptly, provoking the peer's own
+/// loss detection into retransmitting a datagram that was never lost.
+/// Async callers must wrap these calls in
+/// `block_in_place` or `spawn_blocking`, on their own side, where the
+/// runtime is actually visible.
 pub(crate) fn retry_on_database_locked<T, E: SqlOperationError>(
     mut op: impl FnMut() -> Result<T, E>,
 ) -> Result<T, E> {

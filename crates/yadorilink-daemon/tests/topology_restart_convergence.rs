@@ -9,7 +9,7 @@
 //! evidence can exist again.
 //!
 //! **Oracle discipline**: `fully_connected` (`peer_handshake_received`/
-//! `change_dag_negotiated`) reads sticky `AtomicBool`s on
+//! handshake) reads a sticky `AtomicBool` on
 //! `PeerSyncSession` that, once set, never reset for that session
 //! object's lifetime -- a valid "has this session EVER negotiated"
 //! check, but NOT a valid "is the CURRENT session fresh" check, since a
@@ -35,7 +35,7 @@ use yadorilink_peer_session::peer_session::PeerSyncSession;
 /// generation lifecycle this file's own module doc comment describes:
 /// supervisor generation start, `PeerChannel`/`PeerSyncSession`
 /// creation, registry insert, actor exit reason, `PeerSyncSession::run`
-/// exit, reconnect-loop backoff/next-attempt, WireGuard handshake
+/// exit, reconnect-loop backoff/next-attempt, QUIC handshake
 /// initiation/authentication. Test-local only (matches this crate's
 /// established `relay_failover.rs`-style pattern) -- no new production-
 /// visible tracing was added; every event below already exists in
@@ -151,7 +151,7 @@ async fn n_restart_never_shows_a_stale_protected_status() {
     // nodes' -- a bare `tokio::spawn` here (an earlier version of this
     // test) would leak them the same way finding #2 of an M5-A Pass 5
     // Codex review found for the ORIGINAL design.
-    register_with_fake(&fake, &n.state, &n.device_id, n.keypair.public_bytes(), &[group_id]).await;
+    register_with_fake(&fake, &n.state, &n.device_id, &[group_id]).await;
     let n_runtime = support::topology::spawn_orchestrator(fake.addr(), &n);
     handles.insert(n.device_id.clone(), n_runtime);
     tracing::info!("TEST: N's fresh orchestrator spawned, re-registered with coordination plane");
@@ -199,20 +199,14 @@ async fn n_restart_never_shows_a_stale_protected_status() {
         Duration::from_secs(60),
         || {
             format!(
-                "fresh sessions never completed negotiation: m={:?} w={:?}",
-                m.state
-                    .peers
-                    .session(&n.device_id)
-                    .map(|s| (s.peer_handshake_received(), s.change_dag_negotiated())),
-                w.state
-                    .peers
-                    .session(&n.device_id)
-                    .map(|s| (s.peer_handshake_received(), s.change_dag_negotiated())),
+                "fresh sessions never completed their handshake: m={:?} w={:?}",
+                m.state.peers.session(&n.device_id).map(|s| s.peer_handshake_received()),
+                w.state.peers.session(&n.device_id).map(|s| s.peer_handshake_received()),
             )
         },
     )
     .await;
-    tracing::info!("TEST: fresh sessions negotiated -- proceeding to real traffic");
+    tracing::info!("TEST: fresh sessions handshook -- proceeding to real traffic");
 
     // Step 3: real application traffic over the fresh session, exact
     // content verified -- not just "a session object exists." M is
@@ -387,14 +381,14 @@ async fn on_demand_node_restart_recovers_and_resyncs(restart_w: bool) {
     if restart_w {
         handles.take_and_shutdown(&w.device_id).await;
         w = restart_node(w).await;
-        register_with_fake(&fake, &w.state, &w.device_id, w.keypair.public_bytes(), &[group_id])
+        register_with_fake(&fake, &w.state, &w.device_id, &[group_id])
             .await;
         let runtime = support::topology::spawn_orchestrator(fake.addr(), &w);
         handles.insert(w.device_id.clone(), runtime);
     } else {
         handles.take_and_shutdown(&m.device_id).await;
         m = restart_node(m).await;
-        register_with_fake(&fake, &m.state, &m.device_id, m.keypair.public_bytes(), &[group_id])
+        register_with_fake(&fake, &m.state, &m.device_id, &[group_id])
             .await;
         let runtime = support::topology::spawn_orchestrator(fake.addr(), &m);
         handles.insert(m.device_id.clone(), runtime);
@@ -482,17 +476,13 @@ async fn w_restart_recovers_and_resyncs_with_both_peers() {
 /// transport epoch, and must still converge to the EXACT byte content --
 /// not merely "some content", the way the other restart tests' small
 /// single-write payloads could pass even with a subtly corrupted byte or
-/// two lost in transit. A large (multi-megabyte) payload forces the real
-/// reliable-delivery (ARQ) layer to actually chunk and multi-round the
-/// transfer over loopback, giving a real (if not perfectly deterministic)
-/// window for N's restart to land mid-transfer rather than either before
-/// it starts or comfortably after it finishes. Every restarted node's own
-/// `PeerChannel`/`ActorState` -- and with it `ReliableSend`/
-/// `ReliableRecv` -- is constructed fresh only for a genuinely NEW
-/// generation (never reused across a restart, per `peer_channel.rs`'s own
-/// established invariant this whole M5-A Pass 5 fix protects), so a
-/// correct implementation must recover to exact content regardless of
-/// exactly when the restart lands relative to the transfer; this test
+/// two lost in transit. A large (multi-megabyte) payload takes many rounds
+/// over loopback, giving a real (if not perfectly deterministic) window for
+/// N's restart to land mid-transfer rather than either before it starts or
+/// comfortably after it finishes. Every restarted node's connection is
+/// established fresh for a genuinely NEW generation, never reused across a
+/// restart, so a correct implementation must recover to exact content
+/// regardless of when the restart lands relative to the transfer; this test
 /// exercises that live, rather than only asserting the invariant
 /// statically.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -536,7 +526,7 @@ async fn n_restart_mid_transfer_still_converges_exactly() {
         "TEST: N restarted mid-transfer -- old orchestrator/link runtime torn down, fresh \
          DaemonState opened"
     );
-    register_with_fake(&fake, &n.state, &n.device_id, n.keypair.public_bytes(), &[group_id]).await;
+    register_with_fake(&fake, &n.state, &n.device_id, &[group_id]).await;
     let n_runtime = support::topology::spawn_orchestrator(fake.addr(), &n);
     handles.insert(n.device_id.clone(), n_runtime);
 

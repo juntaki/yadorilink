@@ -28,10 +28,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
-use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use yadorilink_peer_session::rate_limiter::TokenBucket;
 
-/// Generous for a WireGuard datagram (typical MTU well under this); rejects
+/// Generous for a QUIC packet (path MTU keeps it well under this); rejects
 /// anything larger outright rather than silently truncating.
 const MAX_RELAY_PACKET_SIZE: usize = 2048;
 /// No traffic in EITHER direction for this long closes the session --
@@ -312,8 +312,8 @@ impl RelayForwarder {
 
         byte_bucket.acquire(payload.len() as u64).await;
         packet_bucket.acquire(1).await;
-        // M3 Pass 8 closeout: wraps the opaque WireGuard bytes in a relay
-        // envelope (`yadorilink_transport::wrap_relay_envelope`) before
+        // M3 Pass 8 closeout: wraps the opaque forwarded peer-traffic bytes
+        // in a relay envelope (`yadorilink_transport::wrap_relay_envelope`) before
         // sending raw -- see that function's own doc comment. Payload
         // opacity is unaffected (the envelope wraps the OUTER transport
         // framing only, `payload` itself is never inspected here, same
@@ -413,6 +413,71 @@ impl Default for RelayForwarder {
 /// partially.
 const MAX_UDP_DATAGRAM_SIZE: usize = 65_507;
 
+/// Depth of the bounded channel between [`run_relay_socket_reader`] and
+/// this session's own rate-limited forwarding loop -- roughly one second's
+/// worth of packets at [`RELAY_MAX_PACKETS_PER_SEC`], the same "one
+/// second's burst" capacity `TokenBucket` itself already uses. Bounded
+/// (not unbounded) so a sender that keeps outrunning the rate limit still
+/// hits real, finite backpressure rather than unbounded memory growth --
+/// once full, the reader's own `send` simply waits, which is the same
+/// "stop reading until there's room" backpressure the single-loop version
+/// applied by construction, just no longer coupled to the RATE LIMITER
+/// specifically (see [`run_relay_forwarder_actor`]'s own doc comment for
+/// why that coupling was the actual bug).
+const RELAY_INBOUND_QUEUE_DEPTH: usize = RELAY_MAX_PACKETS_PER_SEC as usize;
+
+/// Reads datagrams off `socket` and hands them to `packet_tx`, until the
+/// socket errors or the receiver side is gone. Deliberately its own task,
+/// separate from [`run_relay_forwarder_actor`]'s rate-limited forwarding
+/// loop -- see that function's own doc comment for why the two must never
+/// share one sequential loop.
+async fn run_relay_socket_reader(socket: Arc<UdpSocket>, packet_tx: mpsc::Sender<Vec<u8>>) {
+    let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
+    loop {
+        let Ok(n) = socket.recv(&mut buf).await else { return };
+        if n == 0 {
+            continue;
+        }
+        if n > MAX_RELAY_PACKET_SIZE {
+            // Oversized: dropped WHOLE, never forwarded partially -- see
+            // `MAX_UDP_DATAGRAM_SIZE`'s own doc comment. Dropped here
+            // (before queuing) rather than after, so a burst of oversized
+            // datagrams can never itself fill the bounded queue and stall
+            // legitimate ones behind it.
+            tracing::debug!(n, "oversized relay datagram dropped");
+            continue;
+        }
+        if packet_tx.send(buf[..n].to_vec()).await.is_err() {
+            return; // Forwarding loop has ended; nothing left to read for.
+        }
+    }
+}
+
+/// Forwards this relay session's destination-to-source traffic (raw bytes
+/// arriving on `socket` from C, the destination) back to the source via
+/// `reply_sink`, rate-limited by `byte_bucket`/`packet_bucket`.
+///
+/// Reading the socket and rate-limited forwarding are deliberately two
+/// separate tasks ([`run_relay_socket_reader`] and this loop's own,
+/// connected only by a bounded channel) -- an earlier version did both in
+/// one sequential loop, with `socket.recv()` and `byte_bucket.acquire()`/
+/// `packet_bucket.acquire()` as sibling arms of the same `select!`. That
+/// coupling meant a rate-limiter wait (ordinary and expected once this
+/// session's own traffic exceeds its per-session cap) also stopped the
+/// NEXT `recv()` from happening at all: incoming datagrams then piled up
+/// in the OS's own UDP receive buffer instead of this device's memory,
+/// silently overflowed and were dropped by the kernel once that filled,
+/// and the resulting QUIC-layer retransmissions added to the very backlog
+/// causing the stall -- a real, reproduced head-of-line-blocking bug, not
+/// a merely slow one: `topology_relay_post_recovery_block_fetch_
+/// diagnostic.rs`'s case E found 8 CONCURRENT block fetches through one
+/// relay session universally missing their 5s per-block deadline (0/8,
+/// every one stalled to the deadline with 25s of a 30s allowance still
+/// unused), while the identical 8-lane concurrency direct to a
+/// non-relayed peer (case F) and a single lane through this same relay
+/// session (case B) both completed in well under a second. Decoupling the
+/// two removes the coupling that made rate-limiting (a normal, intended
+/// throttle) indistinguishable from total service loss.
 #[allow(clippy::too_many_arguments)]
 async fn run_relay_forwarder_actor(
     session_id: u64,
@@ -428,7 +493,8 @@ async fn run_relay_forwarder_actor(
     registry: Arc<RelayForwarder>,
     _slot_permit: OwnedSemaphorePermit,
 ) {
-    let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
+    let (packet_tx, mut packet_rx) = mpsc::channel(RELAY_INBOUND_QUEUE_DEPTH);
+    let reader = tokio::spawn(run_relay_socket_reader(socket, packet_tx));
     let reason = loop {
         let now_unix = now_unix_seconds();
         if now_unix > expires_at_unix {
@@ -446,27 +512,20 @@ async fn run_relay_forwarder_actor(
                 }
                 continue;
             }
-            recv = socket.recv(&mut buf) => {
-                let Ok(n) = recv else { break "socket_error".to_string() };
-                if n == 0 {
-                    continue;
-                }
-                if n > MAX_RELAY_PACKET_SIZE {
-                    // Oversized: dropped WHOLE, never forwarded partially
-                    // -- see `MAX_UDP_DATAGRAM_SIZE`'s own doc comment.
-                    tracing::debug!(session_id, n, "oversized relay datagram dropped");
-                    continue;
-                }
+            packet = packet_rx.recv() => {
+                let Some(packet) = packet else { break "socket_error".to_string() };
+                let n = packet.len();
                 if !try_reserve_bytes(&bytes_forwarded, n as u64, max_session_bytes) {
                     break "byte_limit_reached".to_string();
                 }
                 byte_bucket.acquire(n as u64).await;
                 packet_bucket.acquire(1).await;
                 last_activity_unix_ms.store(now_unix_millis(), Ordering::Relaxed);
-                reply_sink.send_relay_data(session_id, buf[..n].to_vec());
+                reply_sink.send_relay_data(session_id, packet);
             }
         }
     };
+    reader.abort();
     registry.remove_session(session_id);
     reply_sink.send_relay_close(session_id, &reason);
 }
@@ -568,9 +627,9 @@ mod tests {
         // forwarder relays to `sink` is the WRAPPED bytes, not the raw
         // payload. This is unique to this test's echo-server double: a
         // real destination peer never echoes B's own envelope back --
-        // it sends its own genuinely raw WireGuard reply, unwrapped
-        // (see `relay_failover.rs`'s own real-WireGuard-peer tests in
-        // `yadorilink-transport` for that side).
+        // it sends its own genuinely raw QUIC reply, unwrapped (see
+        // `yadorilink-transport`'s own relay-envelope-with-a-real-QUIC-peer
+        // tests, e.g. `quic_socket_bridge.rs`, for that side).
         let expected = yadorilink_transport::wrap_relay_envelope(session_id, b"hello from A");
         let data = sink.data.lock().unwrap().clone();
         assert_eq!(data, vec![(session_id, expected)]);

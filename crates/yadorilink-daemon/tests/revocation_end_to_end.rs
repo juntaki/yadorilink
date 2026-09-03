@@ -22,7 +22,6 @@ use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_orchestrator;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_transport::DeviceKeyPair;
 
 static TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -49,7 +48,6 @@ fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
 fn spawn_orchestrator(
     coordination_addr: String,
     device_id: String,
-    keypair: Arc<DeviceKeyPair>,
     state: Arc<DaemonState>,
 ) {
     let config = peer_orchestrator::OrchestratorConfig {
@@ -58,7 +56,7 @@ fn spawn_orchestrator(
         device_id,
     };
     tokio::spawn(async move {
-        let _ = peer_orchestrator::run(config, keypair, state).await;
+        let _ = peer_orchestrator::run(config, state).await;
     });
 }
 
@@ -76,9 +74,6 @@ async fn share_revoke_mid_session_stops_serving_the_revoked_group_but_not_others
     support::ensure_isolated_config_dir();
     let fake = FakeCoordination::start().await;
     fake.enable_signed_policy();
-
-    let keypair_a = Arc::new(DeviceKeyPair::generate());
-    let keypair_b = Arc::new(DeviceKeyPair::generate());
     let device_a_id = "device-a-share-revoke";
     let device_b_id = "device-b-share-revoke";
     let group_revoked = "group-revoked";
@@ -96,7 +91,6 @@ async fn share_revoke_mid_session_stops_serving_the_revoked_group_but_not_others
         &fake,
         &daemon_a.state,
         device_a_id,
-        keypair_a.public_bytes(),
         &[group_revoked, group_control],
     )
     .await;
@@ -104,7 +98,6 @@ async fn share_revoke_mid_session_stops_serving_the_revoked_group_but_not_others
         &fake,
         &daemon_b.state,
         device_b_id,
-        keypair_b.public_bytes(),
         &[group_revoked, group_control],
     )
     .await;
@@ -114,8 +107,8 @@ async fn share_revoke_mid_session_stops_serving_the_revoked_group_but_not_others
     link(&daemon_b.state, root_b_revoked.path(), group_revoked);
     link(&daemon_b.state, root_b_control.path(), group_control);
 
-    spawn_orchestrator(fake.addr(), device_a_id.to_string(), keypair_a, daemon_a.state.clone());
-    spawn_orchestrator(fake.addr(), device_b_id.to_string(), keypair_b, daemon_b.state.clone());
+    spawn_orchestrator(fake.addr(), device_a_id.to_string(), daemon_a.state.clone());
+    spawn_orchestrator(fake.addr(), device_b_id.to_string(), daemon_b.state.clone());
 
     wait_until(
         || {
@@ -123,7 +116,7 @@ async fn share_revoke_mid_session_stops_serving_the_revoked_group_but_not_others
                 .state
                 .peers
                 .session(device_b_id)
-                .is_some_and(|session| session.change_dag_negotiated())
+                .is_some_and(|session| session.peer_handshake_received())
         },
         Duration::from_secs(40),
     )
@@ -197,10 +190,6 @@ async fn device_remove_while_peer_offline_is_reflected_on_its_next_subscribe() {
     support::ensure_isolated_config_dir();
     let fake = FakeCoordination::start().await;
     fake.enable_signed_policy();
-
-    let keypair_a = Arc::new(DeviceKeyPair::generate());
-    let keypair_b = Arc::new(DeviceKeyPair::generate());
-    let keypair_c = Arc::new(DeviceKeyPair::generate());
     let device_a_id = "device-a-offline";
     let device_b_id = "device-b-removed";
     let device_c_id = "device-c-control";
@@ -211,15 +200,15 @@ async fn device_remove_while_peer_offline_is_reflected_on_its_next_subscribe() {
     let root_a = tempfile::tempdir().unwrap();
     let root_c = tempfile::tempdir().unwrap();
 
-    register_with_fake(&fake, &daemon_a.state, device_a_id, keypair_a.public_bytes(), &[group_id])
+    register_with_fake(&fake, &daemon_a.state, device_a_id, &[group_id])
         .await;
-    register_with_fake(&fake, &daemon_c.state, device_c_id, keypair_c.public_bytes(), &[group_id])
+    register_with_fake(&fake, &daemon_c.state, device_c_id, &[group_id])
         .await;
     // B is a member, then removed entirely before A's daemon ever subscribes.
     fake.register_device(
         device_b_id,
-        keypair_b.public_bytes(),
-        keypair_b.public_bytes(),
+        [9u8; 32],
+        [9u8; 32],
         "127.0.0.1:1".to_string(),
         &[group_id],
     );
@@ -228,8 +217,8 @@ async fn device_remove_while_peer_offline_is_reflected_on_its_next_subscribe() {
     link(&daemon_a.state, root_a.path(), group_id);
     link(&daemon_c.state, root_c.path(), group_id);
 
-    spawn_orchestrator(fake.addr(), device_a_id.to_string(), keypair_a, daemon_a.state.clone());
-    spawn_orchestrator(fake.addr(), device_c_id.to_string(), keypair_c, daemon_c.state.clone());
+    spawn_orchestrator(fake.addr(), device_a_id.to_string(), daemon_a.state.clone());
+    spawn_orchestrator(fake.addr(), device_c_id.to_string(), daemon_c.state.clone());
 
     // Positive control: A connects normally to the still-authorized peer C.
     wait_until(|| daemon_a.state.peers.has_session(device_c_id), Duration::from_secs(40)).await;
@@ -259,9 +248,6 @@ async fn already_authorized_devices_keep_syncing_while_coordination_plane_is_unr
     let fake = FakeCoordination::start().await;
     fake.enable_signed_policy();
     let fake_host = fake.addr().trim_start_matches("http://").to_string();
-
-    let keypair_a = Arc::new(DeviceKeyPair::generate());
-    let keypair_b = Arc::new(DeviceKeyPair::generate());
     let device_a_id = "device-a-outage";
     let device_b_id = "device-b-outage";
     let group_id = "shared";
@@ -271,16 +257,16 @@ async fn already_authorized_devices_keep_syncing_while_coordination_plane_is_unr
     let root_a = tempfile::tempdir().unwrap();
     let root_b = tempfile::tempdir().unwrap();
 
-    register_with_fake(&fake, &daemon_a.state, device_a_id, keypair_a.public_bytes(), &[group_id])
+    register_with_fake(&fake, &daemon_a.state, device_a_id, &[group_id])
         .await;
-    register_with_fake(&fake, &daemon_b.state, device_b_id, keypair_b.public_bytes(), &[group_id])
+    register_with_fake(&fake, &daemon_b.state, device_b_id, &[group_id])
         .await;
 
     link(&daemon_a.state, root_a.path(), group_id);
     link(&daemon_b.state, root_b.path(), group_id);
 
-    spawn_orchestrator(fake.addr(), device_a_id.to_string(), keypair_a, daemon_a.state.clone());
-    spawn_orchestrator(fake.addr(), device_b_id.to_string(), keypair_b, daemon_b.state.clone());
+    spawn_orchestrator(fake.addr(), device_a_id.to_string(), daemon_a.state.clone());
+    spawn_orchestrator(fake.addr(), device_b_id.to_string(), daemon_b.state.clone());
 
     wait_until(
         || {
@@ -288,7 +274,7 @@ async fn already_authorized_devices_keep_syncing_while_coordination_plane_is_unr
                 .state
                 .peers
                 .session(device_b_id)
-                .is_some_and(|session| session.change_dag_negotiated())
+                .is_some_and(|session| session.peer_handshake_received())
         },
         Duration::from_secs(40),
     )

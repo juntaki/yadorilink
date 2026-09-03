@@ -62,7 +62,7 @@
 //!    §5.1's index, `deleted = 0`, any `state`) whose `authoring_change_hash`
 //!    equals `last_captured_change_hash` **and** whose own content columns
 //!    (`blocks_json`/`size`/`mtime_unix_nanos`/`record_kind`/
-//!    `symlink_target`/`exec_bit`) re-derive, via the same
+//!    `symlink_target`/`unix_mode`) re-derive, via the same
 //!    [`yadorilink_replica_domain::file::FileVersion::from_index_row`] the durability-root
 //!    enumeration already trusts, the exact `last_captured_version_hash`
 //!    this obligation recorded at capture time. Column equality on
@@ -1031,7 +1031,7 @@ pub fn verify_durable_representation(
     }
 
     let mut stmt = conn.prepare(
-        "SELECT blocks_json, size, mtime_unix_nanos, record_kind, symlink_target, exec_bit \
+        "SELECT blocks_json, size, mtime_unix_nanos, record_kind, symlink_target, unix_mode, xattrs_json \
          FROM files WHERE group_id = ?1 AND authoring_change_hash = ?2 AND deleted = 0",
     )?;
     let mut candidates = stmt.query(rusqlite::params![group_id, &captured_change_hash.0[..]])?;
@@ -1041,7 +1041,8 @@ pub fn verify_durable_representation(
         let mtime_unix_nanos: i64 = row.get(2)?;
         let record_kind: String = row.get(3)?;
         let symlink_target: Option<Vec<u8>> = row.get(4)?;
-        let exec_bit: i64 = row.get(5)?;
+        let unix_mode: i64 = row.get(5)?;
+        let xattrs_json: String = row.get(6)?;
 
         // Fail closed on a corrupt stored block list rather than skipping
         // the row silently — matching `index.rs`'s own convention for this
@@ -1057,8 +1058,9 @@ pub fn verify_durable_representation(
             size,
             mtime_unix_nanos,
             RecordKind::from_db_str(&record_kind),
-            exec_bit != 0,
+            crate::file_index::decode_unix_mode_column(unix_mode),
             symlink_target,
+            crate::file_index::decode_xattrs_column(&xattrs_json)?,
         )
         .version_hash;
         if &row_version_hash == captured_version_hash {

@@ -97,9 +97,11 @@ impl RelaySessionHandler for DaemonState {
             let Some(direct_channel) = self.direct_channel(&grant.destination_device_id) else {
                 return denied(grant_id);
             };
-            let Some(destination_addr) = direct_channel.confirmed_direct_addr() else {
-                return denied(grant_id);
-            };
+            // The address the destination's own authenticated connection is
+            // currently on. Read from the live connection rather than from a
+            // candidate list, so this device forwards to the path the
+            // destination is demonstrably answering on.
+            let destination_addr = direct_channel.remote_address();
 
             let ctx = RelayAdmissionContext {
                 this_device_id: &self.device_id,
@@ -124,23 +126,14 @@ impl RelaySessionHandler for DaemonState {
                 // device must never dial or wait for a new connection on
                 // the relay's own behalf).
                 //
-                // M3 Pass 8 (closeout, B-side): reads `direct_channel`'s
-                // OWN live `reachability()` -- the SAME `Arc<PeerChannel>`
-                // already fetched above for `confirmed_direct_addr()` --
-                // not `self.peers.reachability()`, which is only an
-                // asynchronously updated mirror of it (`poll_reachability`'s
-                // background task is what copies one into the other). The
-                // A-side requester check (`DaemonState::is_directly_
-                // reachable`) hit the identical staleness class first;
-                // this closes the same gap on B's own admission side --
-                // without it, B could admit a RelayOpen during the window
-                // where its OWN route to C had already stopped being
-                // direct (started relaying through some other device D),
-                // silently chaining A->B->D->C.
-                has_direct_route_to_destination: matches!(
-                    direct_channel.reachability(),
-                    yadorilink_transport::PeerReachability::Connected { .. }
-                ),
+                // Reads the SAME live connection already fetched above for
+                // its address -- not `self.peers.reachability()`, which is
+                // only an asynchronously updated mirror of it. Without
+                // that, B could admit a RelayOpen during the window where
+                // its OWN route to C had already gone, and a stale
+                // "direct" verdict is exactly what the no-chaining rule
+                // cannot tolerate.
+                has_direct_route_to_destination: direct_channel.is_open(),
                 active_relay_session_count: self.relay_forwarder.active_session_count(),
                 max_concurrent_relay_sessions:
                     crate::relay_forwarder::RELAY_MAX_CONCURRENT_SESSIONS,
@@ -173,6 +166,31 @@ impl RelaySessionHandler for DaemonState {
                         grant.group_id.clone(),
                         grant.destination_device_id.clone(),
                     );
+                    // Independent-review finding (Phase D relay-revocation
+                    // investigation): `admit_relay_open` above checked
+                    // capability/membership/direct-route against the state
+                    // read moments ago, but `open_session`+`record_relay_
+                    // session` are not atomic with that read -- a
+                    // capability disablement (or membership/route change)
+                    // landing in between would otherwise open a session
+                    // this device's own CURRENT state already refuses.
+                    // Re-running the exact same per-datagram check
+                    // (`revalidate_relay_session`) once, right here,
+                    // closes that admission race the same way it already
+                    // closes the analogous per-datagram one.
+                    if let Err(reason) = self.revalidate_relay_session(session_id) {
+                        tracing::warn!(
+                            grant_id = %grant.grant_id,
+                            source = %grant.source_device_id,
+                            destination = %grant.destination_device_id,
+                            session_id,
+                            reason,
+                            "relay session failed revalidation immediately after admission; closing"
+                        );
+                        self.relay_forwarder.close_session(session_id, reason);
+                        self.forget_relay_session(session_id);
+                        return denied(grant_id);
+                    }
                     tracing::info!(
                         grant_id = %grant.grant_id,
                         source = %grant.source_device_id,
@@ -211,7 +229,7 @@ impl RelaySessionHandler for DaemonState {
             }
 
             // M3 Pass 6: this device opened `data.session_id` itself, as
-            // relay REQUESTER (`RelayCarrier::send_via_relay`) -- an
+            // relay REQUESTER (`relay_carrier::open_relay_path`) -- an
             // inbound `RelayData` for it is the destination's reply routed
             // back by the relay, never a forward request THIS device is
             // being asked to admit. Checked first, and returns either way,
@@ -250,10 +268,34 @@ impl RelaySessionHandler for DaemonState {
                     );
                     return;
                 }
-                if let Some(device_id) = self.device_id_for_peer_public(&destination_peer_public) {
-                    if let Some(channel) = self.direct_channel(&device_id) {
-                        channel.deliver_relay_datagram(data.payload);
+                // The destination's reply, routed back by the relay. It is
+                // injected into this device's QUIC endpoint under this
+                // session's own synthetic address -- never under the
+                // relaying device's, which is where it physically came from
+                // and which quinn would read as the peer migrating its path
+                // on every single packet.
+                let _ = &destination_peer_public;
+                match self.requester_relay_path(authenticated_peer_device_id, data.session_id) {
+                    Some(path) => {
+                        if !path.inject(&data.payload) {
+                            // The path closed, or the endpoint's inbound
+                            // queue is full. Both are ordinary datagram loss
+                            // from the inner connection's point of view, and
+                            // it recovers the same way it recovers from any
+                            // other lost packet.
+                            tracing::debug!(
+                                session_id = data.session_id,
+                                "relay reply not delivered to the endpoint"
+                            );
+                        }
                     }
+                    // Recorded as a requester session a moment ago and gone
+                    // now: it closed between the two lookups. Dropping is
+                    // the whole response.
+                    None => tracing::debug!(
+                        session_id = data.session_id,
+                        "relay reply for a session with no live path"
+                    ),
                 }
                 return;
             }
@@ -406,7 +448,7 @@ impl RelaySessionHandler for DaemonState {
                         .await;
                 }
             }
-            // M3 Pass 6: resolves the oneshot `RelayCarrier::send_via_relay`
+            // M3 Pass 6: resolves the oneshot `relay_carrier::open_relay_path`
             // registered under `opened.grant_id` before sending the
             // matching `RelayOpen` -- see `pending_relay_opens`'s and
             // `resolve_pending_relay_open`'s own doc comments for the

@@ -1,44 +1,41 @@
 //! The capability surface `PeerSyncSession` (`peer_session.rs`) needs from
-//! `yadorilink_transport::PeerChannel`: encoded-message send/receive,
-//! reliable-delivery negotiation, and coordination-candidate refresh. Every
-//! method below is called by `peer_session.rs` today via
-//! `self.channel.<method>`, surveyed directly from that file (`grep -n
-//! "\.channel\." crates/yadorilink-sync-core/src/peer_session.rs`) rather
-//! than sketched from `PeerChannel`'s full method surface, which also
-//! exposes `reachability`/`reachability_watch` and internal actor plumbing
-//! this crate never touches.
+//! its transport: encoded-message send/receive to one peer, and block
+//! streams to and from that same peer.
 //!
-//! `#[async_trait]` because `send`, `recv`, and
-//! `replace_coordination_candidates` are async on the real `PeerChannel`;
-//! `try_send` and `enable_reliable_delivery` stay plain sync fns, matching
-//! `PeerChannel`'s own shape.
+//! `peer_session.rs` holds `Arc<dyn PeerMessageChannel>` and names no
+//! concrete transport type. `QuicPeerChannel` implements this trait, and so
+//! do `InMemoryPeerChannel` (this module's sibling, for simulation and
+//! tests) and the daemon's inert loopback channel.
 //!
-//! `send`/`try_send` take `Vec<u8>` rather than `PeerChannel`'s generic
-//! `impl Into<Bytes>` parameter: a `dyn`-safe trait can't have a generic
-//! method, and every real call site (`peer_session.rs`'s `send`/`try_send`
-//! wrappers) already passes a freshly encoded `Vec<u8>`
-//! (`msg.encode_to_vec()`), so narrowing to the concrete type both call
-//! sites use loses nothing.
+//! `#[async_trait]` because `send` and `recv` are async; `try_send` is a
+//! plain sync fn because it is a best-effort admission-control call that
+//! must never wait.
 //!
-//! Implemented directly for the concrete `PeerChannel` struct, matching
-//! `peer_replica_state.rs`'s direct-impl-on-`SyncState` approach rather than
-//! `block_store.rs`'s blanket impl: `PeerChannel` is a concrete struct with
-//! one production implementation (unlike `BlockStore`, a foreign trait with
-//! several), so there's no dispatch-over-multiple-impls need a blanket impl
-//! would serve.
+//! `send`/`try_send` take `Vec<u8>` rather than a generic `impl Into<Bytes>`:
+//! a `dyn`-safe trait cannot have a generic method, and every real call site
+//! already passes a freshly encoded `Vec<u8>` (`msg.encode_to_vec()`).
 //!
-//! Same scaffolding discipline as this module's siblings: every method here
-//! is a thin, same-signature delegate to the `PeerChannel` method it wraps.
-//! No consumer is migrated to use this trait yet — `peer_session.rs` still
-//! holds `channel: Arc<PeerChannel>` directly. A later commit swaps that
-//! field's type to `Arc<dyn PeerMessageChannel>`.
+//! ## The boundary
+//!
+//! - the orchestrator owns candidates, reconnection, reachability and
+//!   revocation -- everything about establishing and re-establishing a path
+//!   to a peer;
+//! - this port owns data exchange with a peer that is already connected and
+//!   authenticated, and nothing else.
+//!
+//! It used to carry two more methods, `enable_reliable_delivery` and
+//! `replace_coordination_candidates`, because it was written by surveying
+//! what the previous transport happened to expose. Both described connection
+//! lifecycle rather than communication, and both went away with that
+//! transport: reliability is not optional under QUIC and is not negotiated
+//! mid-session, and which candidate reached a peer is settled before a
+//! channel exists. Read that as a constraint on new capabilities: one that
+//! belongs to connection lifecycle does not belong here.
 
-use yadorilink_transport::{PeerChannel, TransportError};
+use yadorilink_transport::{QuicBlockStream, QuicPeerChannel, TransportError};
 
 /// Capability surface `PeerSyncSession` needs from its transport-layer
-/// channel to a single peer: send/receive encoded sync messages, negotiate
-/// reliable-delivery framing, and refresh coordination-server-learned
-/// candidates.
+/// channel to a single peer.
 #[async_trait::async_trait]
 pub trait PeerMessageChannel: Send + Sync {
     /// Sends one encoded `SyncMessage`, awaiting outbound-queue capacity.
@@ -58,40 +55,101 @@ pub trait PeerMessageChannel: Send + Sync {
     /// `SyncMessage`.
     async fn recv(&self) -> Option<Vec<u8>>;
 
-    /// Enables reliable-delivery (seq/ack) framing for this device's own
-    /// outbound sends. `peer_session.rs`'s
-    /// `record_peer_reliable_delivery_support` calls this once the
-    /// `ClusterConfig` handshake confirms both sides advertised
-    /// `supports_reliable_delivery`.
-    fn enable_reliable_delivery(&self);
+    /// Opens a stream for one block request.
+    ///
+    /// This is data exchange with a connected peer, not connection
+    /// lifecycle, which is why it belongs here alongside `send`/`recv`
+    /// rather than with the orchestrator: nothing about it decides *which*
+    /// path reached the peer, only what is said over the one that did.
+    ///
+    /// A transport that cannot carry block content answers
+    /// `TransportError::ChannelClosed` rather than pretending to open a
+    /// stream. That is a real state -- the daemon's inert loopback session
+    /// is bound to no peer at all -- and a requester treats it exactly like
+    /// any other failed fetch.
+    async fn open_block_stream(&self) -> Result<Box<dyn PeerBlockStream>, TransportError>;
 
-    /// Replaces the set of coordination-server-learned direct candidates
-    /// this channel probes. `peer_session.rs`'s
-    /// `PeerSyncSession::replace_coordination_candidates` forwards its own
-    /// caller's refreshed candidate list here unchanged.
-    async fn replace_coordination_candidates(&self, candidates: Vec<std::net::SocketAddr>);
+    /// Awaits the next block stream the peer opened, or `None` once the
+    /// channel has closed -- the block-serving counterpart to `recv`, and
+    /// the same end-of-stream meaning.
+    async fn accept_block_stream(&self) -> Option<Box<dyn PeerBlockStream>>;
+}
+
+/// One block request's stream, from whichever side is driving it.
+///
+/// Deliberately narrow: two length-prefixed header messages and one raw
+/// body, which is the entire block exchange. It is not a general byte-pipe
+/// abstraction, because a general byte pipe would invite protocols that the
+/// framing bound and the declared-length check below could not police.
+#[async_trait::async_trait]
+pub trait PeerBlockStream: Send {
+    /// Writes one length-prefixed header message.
+    async fn send_message(&mut self, payload: &[u8]) -> Result<(), TransportError>;
+
+    /// Reads one length-prefixed header message, refusing a declared length
+    /// above `max_len` before allocating for it.
+    async fn recv_message(&mut self, max_len: usize) -> Result<Vec<u8>, TransportError>;
+
+    /// Writes the raw body bytes and ends this direction of the stream. An
+    /// empty body just ends it, which is how every non-`Found` response
+    /// finishes.
+    async fn send_body(&mut self, body: &[u8]) -> Result<(), TransportError>;
+
+    /// Reads exactly `len` raw body bytes, where `len` is the size the
+    /// response header declared and the caller has already bounded against
+    /// its own maximum block size.
+    async fn recv_body(&mut self, len: usize) -> Result<Vec<u8>, TransportError>;
+
+    /// Ends this side's sending direction with nothing further to send --
+    /// what the requester does immediately after its header.
+    fn finish_send(&mut self);
 }
 
 #[async_trait::async_trait]
-impl PeerMessageChannel for PeerChannel {
+impl PeerBlockStream for QuicBlockStream {
+    async fn send_message(&mut self, payload: &[u8]) -> Result<(), TransportError> {
+        QuicBlockStream::send_message(self, payload).await
+    }
+
+    async fn recv_message(&mut self, max_len: usize) -> Result<Vec<u8>, TransportError> {
+        QuicBlockStream::recv_message(self, max_len).await
+    }
+
+    async fn send_body(&mut self, body: &[u8]) -> Result<(), TransportError> {
+        QuicBlockStream::send_body(self, body).await
+    }
+
+    async fn recv_body(&mut self, len: usize) -> Result<Vec<u8>, TransportError> {
+        QuicBlockStream::recv_body(self, len).await
+    }
+
+    fn finish_send(&mut self) {
+        QuicBlockStream::finish_send(self)
+    }
+}
+
+/// The QUIC control stream as a session channel.
+#[async_trait::async_trait]
+impl PeerMessageChannel for QuicPeerChannel {
     async fn send(&self, payload: Vec<u8>) -> Result<(), TransportError> {
-        PeerChannel::send(self, payload).await
+        QuicPeerChannel::send(self, payload).await
     }
 
     fn try_send(&self, payload: Vec<u8>) -> bool {
-        PeerChannel::try_send(self, payload)
+        QuicPeerChannel::try_send(self, payload)
     }
 
     async fn recv(&self) -> Option<Vec<u8>> {
-        PeerChannel::recv(self).await
+        QuicPeerChannel::recv(self).await
     }
 
-    fn enable_reliable_delivery(&self) {
-        PeerChannel::enable_reliable_delivery(self)
+    async fn open_block_stream(&self) -> Result<Box<dyn PeerBlockStream>, TransportError> {
+        Ok(Box::new(QuicPeerChannel::open_block_stream(self).await?))
     }
 
-    async fn replace_coordination_candidates(&self, candidates: Vec<std::net::SocketAddr>) {
-        PeerChannel::replace_coordination_candidates(self, candidates).await
+    async fn accept_block_stream(&self) -> Option<Box<dyn PeerBlockStream>> {
+        let stream = QuicPeerChannel::accept_block_stream(self).await?;
+        Some(Box::new(stream))
     }
 }
 
@@ -99,33 +157,45 @@ impl PeerMessageChannel for PeerChannel {
 mod tests {
     use std::sync::Arc;
 
-    use boringtun::x25519::{PublicKey, StaticSecret};
+    use yadorilink_transport::{
+        ConnectRole, DeviceSigningKeyPair, QuicPeerEndpoint, TransportHub,
+    };
 
     use super::*;
 
-    /// Proves the direct impl above lets a real, production `Arc<PeerChannel>`
-    /// (the same type `peer_orchestrator.rs` holds per connected peer)
-    /// unsize-coerce to `Arc<dyn PeerMessageChannel>`, and that a call
-    /// through the coerced handle still dispatches to the real channel.
-    /// No mutual handshake is needed for this: `PeerChannel::connect`
-    /// succeeds immediately even with no reachable candidate, and
-    /// `try_send`/`enable_reliable_delivery` don't require an established
-    /// path.
+    /// Proves the impl above lets a real, production `Arc<QuicPeerChannel>`
+    /// -- the same type the orchestrator holds per connected peer --
+    /// unsize-coerce to `Arc<dyn PeerMessageChannel>`, the coercion
+    /// `peer_session.rs`'s own field depends on, and that a call through the
+    /// coerced handle still dispatches to the real channel.
+    ///
+    /// A live peer is deliberately not part of it: `try_send` is the
+    /// best-effort admission-control path, so a channel with nobody at the
+    /// other end reports a dropped send rather than blocking. What is being
+    /// proven is dispatch, not delivery.
     #[tokio::test]
-    async fn arc_peer_channel_coerces_to_port_trait() {
-        let local_secret = StaticSecret::from([1u8; 32]);
-        let peer_public = PublicKey::from(&StaticSecret::from([2u8; 32]));
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let hub = yadorilink_transport::TransportHub::from_socket(socket, None);
-        let channel: Arc<PeerChannel> = Arc::new(
-            PeerChannel::connect(local_secret, peer_public, 0, Vec::new(), hub).await.unwrap(),
-        );
+    async fn arc_quic_peer_channel_coerces_to_port_trait() {
+        let dialer_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let acceptor_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let acceptor_addr = acceptor_socket.local_addr().unwrap();
+
+        let dialer_key = DeviceSigningKeyPair::generate();
+        let acceptor_key = DeviceSigningKeyPair::generate();
+        let dialer_public = dialer_key.public_bytes();
+        let acceptor_public = acceptor_key.public_bytes();
+
+        let dialer = QuicPeerEndpoint::new(TransportHub::from_socket(dialer_socket), dialer_key)
+            .unwrap();
+        let acceptor =
+            QuicPeerEndpoint::new(TransportHub::from_socket(acceptor_socket), acceptor_key)
+                .unwrap();
+        dialer.authorize(acceptor_public);
+        acceptor.authorize(dialer_public);
+
+        let connection = dialer.connect(acceptor_addr, acceptor_public).await.unwrap();
+        let channel = QuicPeerChannel::new(connection, ConnectRole::Dial);
 
         let port: Arc<dyn PeerMessageChannel> = channel;
-        port.enable_reliable_delivery();
-        // No peer is reachable, so this is expected to report a dropped
-        // best-effort send rather than block or panic -- proving dispatch
-        // reached the real `PeerChannel::try_send`, not asserting delivery.
-        let _ = port.try_send(b"port coercion proof".to_vec());
+        assert!(port.try_send(b"port coercion proof".to_vec()));
     }
 }

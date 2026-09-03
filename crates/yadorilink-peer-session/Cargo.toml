@@ -41,12 +41,21 @@ caseless = "0.2.2"
 zstd = { workspace = true }
 # Retry-jitter randomness and session-secret generation.
 rand = "0.10.2"
+# C4_ATTR (temporary, remove after investigation): `c4_diag::stats()`'s
+# writer_gate wait-time counter, read from `flush_provenance_hashes`/
+# `try_commit_ordinary_batch`'s own batch-write calls to split
+# `writer_gate_wait_ms` from `sqlite_transaction_ms` for the C4 attribution
+# pass's per-`reconcile_group_paths`-call report -- see `c4_attr`'s own
+# module doc. Was previously reachable only in this crate's dev-dependency
+# graph (via `yadorilink-sync-sqlite`, for `real_auth_dag_paging_tests`);
+# promoted to a real dependency here since this read now happens from
+# production code, not a test.
+yadorilink-sqlite-runtime = { path = "../yadorilink-sqlite-runtime" }
 
 [dev-dependencies]
 tempfile = "3"
 # Signs test fixture changes.
 ed25519-dalek = "3"
-boringtun = { version = "0.7", default-features = false }
 # This crate's own #[cfg(test)] tests need `RootCommitPermit::for_tests`/
 # `RootLease::for_tests` (both `#[cfg(any(test, feature = "test-support"))]`
 # in yadorilink-root-authority), but `cfg(test)` is crate-local -- building
@@ -92,6 +101,7 @@ yadorilink-daemon = { path = "../yadorilink-daemon", features = ["test-support"]
 # `dag_store` types -- a normal public surface, so no `test-support` feature
 # needed here (unlike the `yadorilink-sync-core` back-edge above).
 yadorilink-sync-sqlite = { path = "../yadorilink-sync-sqlite" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `LocalChangeProcessor`/`LocalChangeOutcome` construction in the moved
 # fixtures -- same dev-only back-edge shape as `yadorilink-sync-core`'s own
 # identical dependency on this crate for its (now-moved) test binaries.

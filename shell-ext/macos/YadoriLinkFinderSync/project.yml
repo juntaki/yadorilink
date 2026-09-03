@@ -10,6 +10,11 @@ settings:
     MACOSX_DEPLOYMENT_TARGET: "11.0"
     DEVELOPMENT_TEAM: 594UQF7QX3
     CODE_SIGN_STYLE: Automatic
+    # Required for notarization: Apple's notary service rejects any
+    # unsigned/non-hardened-runtime executable in a submitted .pkg, and
+    # xcodebuild does not turn this on by default. Applies to the host
+    # app and both extensions via this shared base block.
+    ENABLE_HARDENED_RUNTIME: YES
 
 targets:
   # NOTE: this.xcodeproj/project.yml keeps its
@@ -57,7 +62,10 @@ targets:
         script: |
           set -euo pipefail
           cd "$SRCROOT/../fileprovider-core"
-          cargo build --release --target aarch64-apple-darwin
+          # See the matching comment on YadoriLinkFinderSync's own
+          # prebuild script above: explicit --target-dir keeps this
+          # build immune to a machine-local cargo target-dir override.
+          cargo build --release --target aarch64-apple-darwin --target-dir target
         basedOnDependencyAnalysis: false
     frameworks:
       - Cocoa.framework
@@ -88,7 +96,14 @@ targets:
         script: |
           set -euo pipefail
           cd "$SRCROOT/../core"
-          cargo build --release --target aarch64-apple-darwin
+          # Explicit --target-dir: a machine-local `.cargo/config.toml`
+          # `[build] target-dir` override (e.g. redirecting builds to an
+          # external disk) would otherwise silently move this crate's
+          # output away from the relative `target/` path
+          # LIBRARY_SEARCH_PATHS below expects, breaking the link step
+          # with a "library not found" error that gives no hint the
+          # cause is a target-dir mismatch rather than a missing build.
+          cargo build --release --target aarch64-apple-darwin --target-dir target
         basedOnDependencyAnalysis: false
     frameworks:
       - Cocoa.framework
@@ -132,7 +147,10 @@ targets:
         script: |
           set -euo pipefail
           cd "$SRCROOT/../fileprovider-core"
-          cargo build --release --target aarch64-apple-darwin
+          # See the matching comment on YadoriLinkFinderSync's own
+          # prebuild script above: explicit --target-dir keeps this
+          # build immune to a machine-local cargo target-dir override.
+          cargo build --release --target aarch64-apple-darwin --target-dir target
         basedOnDependencyAnalysis: false
     frameworks:
       - FileProvider.framework

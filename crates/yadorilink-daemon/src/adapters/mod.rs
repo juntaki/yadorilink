@@ -266,12 +266,10 @@ mod ports_reachability {
     use std::sync::Arc;
 
     use crate::replica_coordinator::ReplicaCoordinator;
-    use boringtun::x25519::{PublicKey, StaticSecret};
     use yadorilink_local_capture::ports::LocalMutationStore;
     use yadorilink_local_storage::{BlockContentStore, BlockReclamationStore};
     use yadorilink_peer_session::ports::{PeerMessageChannel, PeerReplicaStatePort};
     use yadorilink_sync_sqlite::MaterializationStatePort;
-    use yadorilink_transport::PeerChannel;
 
     use crate::adapters::block_store_ports::BlockStorePortsAdapter;
 
@@ -302,15 +300,28 @@ mod ports_reachability {
         let _block_reclamation: Arc<dyn BlockReclamationStore> =
             Arc::new(BlockStorePortsAdapter::new(block_store));
 
-        // `PeerChannel` backs `PeerMessageChannel` directly. No mutual
-        // handshake is needed for `connect` to succeed.
-        let local_secret = StaticSecret::from([1u8; 32]);
-        let peer_public = PublicKey::from(&StaticSecret::from([2u8; 32]));
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let hub = yadorilink_transport::TransportHub::from_socket(socket, None);
-        let channel: Arc<PeerChannel> = Arc::new(
-            PeerChannel::connect(local_secret, peer_public, 0, Vec::new(), hub).await.unwrap(),
-        );
+        // `QuicPeerChannel` backs `PeerMessageChannel` directly. Proving the
+        // coercion needs a real connection, since a QUIC channel wraps one
+        // that has already completed a handshake.
+        use yadorilink_transport::{
+            ConnectRole, DeviceSigningKeyPair, QuicPeerChannel, QuicPeerEndpoint, TransportHub,
+        };
+        let dialer_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let acceptor_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let acceptor_addr = acceptor_socket.local_addr().unwrap();
+        let dialer_key = DeviceSigningKeyPair::generate();
+        let acceptor_key = DeviceSigningKeyPair::generate();
+        let dialer_public = dialer_key.public_bytes();
+        let acceptor_public = acceptor_key.public_bytes();
+        let dialer =
+            QuicPeerEndpoint::new(TransportHub::from_socket(dialer_socket), dialer_key).unwrap();
+        let acceptor =
+            QuicPeerEndpoint::new(TransportHub::from_socket(acceptor_socket), acceptor_key)
+                .unwrap();
+        dialer.authorize(acceptor_public);
+        acceptor.authorize(dialer_public);
+        let connection = dialer.connect(acceptor_addr, acceptor_public).await.unwrap();
+        let channel = QuicPeerChannel::new(connection, ConnectRole::Dial);
         let _peer_message: Arc<dyn PeerMessageChannel> = channel;
     }
 }

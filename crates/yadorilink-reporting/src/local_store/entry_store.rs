@@ -41,8 +41,27 @@ impl EntryStore {
         EntryStore { dir: dir.into(), policy }
     }
 
-    fn entry_path(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("{id}.json"))
+    /// `id` reaches this store directly from IPC/CLI input
+    /// (`report queue show/delete <id>`), unvalidated by anything upstream
+    /// -- rejects anything that isn't a single plain path component before
+    /// building a path from it, so `id` can never escape `self.dir`: a
+    /// path separator would make `format!("{id}.json")` more than one
+    /// component, and a leading `/` would make `PathBuf::join` treat it as
+    /// absolute and discard `self.dir` entirely (the `.json` suffix always
+    /// appended below means a bare `.`/`..` can never resolve to either
+    /// special path component on its own, but they're rejected too, as a
+    /// plain well-formed-id sanity check). A legitimate id is always the
+    /// UUID `insert` generates, which satisfies all of this trivially.
+    fn entry_path(&self, id: &str) -> ReportingResult<PathBuf> {
+        if id.is_empty()
+            || id == "."
+            || id == ".."
+            || id.contains('/')
+            || id.contains('\\')
+        {
+            return Err(ReportingStorageError::InvalidEntryId(id.to_string()));
+        }
+        Ok(self.dir.join(format!("{id}.json")))
     }
 
     /// Persists `envelope` as a new entry with a fresh, locally-generated
@@ -62,7 +81,8 @@ impl EntryStore {
         };
         let entry = StoredEntry { metadata: metadata.clone(), envelope };
         let json = serde_json::to_string_pretty(&entry)?;
-        let path = self.entry_path(&report_id);
+        // Always a freshly-generated UUID above -- never fails validation.
+        let path = self.entry_path(&report_id)?;
         let tmp_path = path.with_extension("json.tmp");
         std::fs::write(&tmp_path, json)?;
         std::fs::rename(&tmp_path, &path)?;
@@ -121,7 +141,14 @@ impl EntryStore {
     }
 
     pub fn show(&self, id: &str) -> ReportingResult<Option<ReportEnvelope>> {
-        let path = self.entry_path(id);
+        // A syntactically-invalid id (see `entry_path`'s doc comment) can
+        // never have a corresponding entry -- treated the same as a
+        // genuine NotFound, not surfaced as a distinct error.
+        let path = match self.entry_path(id) {
+            Ok(path) => path,
+            Err(ReportingStorageError::InvalidEntryId(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
         match self.read_entry(&path) {
             Ok(stored) => Ok(Some(stored.envelope)),
             Err(ReportingStorageError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -134,9 +161,15 @@ impl EntryStore {
     /// Returns `true` if an entry existed and was removed, `false` if
     /// there was nothing to delete (not an error — deleting an
     /// already-gone entry, e.g. from a concurrent retention sweep, is a
-    /// no-op, not a failure).
+    /// no-op, not a failure; a syntactically-invalid id, see
+    /// `entry_path`'s doc comment, is treated the same way, since it can
+    /// never have a corresponding entry either).
     pub fn delete(&self, id: &str) -> ReportingResult<bool> {
-        let path = self.entry_path(id);
+        let path = match self.entry_path(id) {
+            Ok(path) => path,
+            Err(ReportingStorageError::InvalidEntryId(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -166,7 +199,11 @@ impl EntryStore {
     /// being retried is exactly the kind of entry that shouldn't be
     /// evicted for "looking old" while still under active retry.
     pub fn increment_submit_attempts(&self, id: &str) -> ReportingResult<Option<u32>> {
-        let path = self.entry_path(id);
+        let path = match self.entry_path(id) {
+            Ok(path) => path,
+            Err(ReportingStorageError::InvalidEntryId(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
         let mut stored = match self.read_entry(&path) {
             Ok(s) => s,
             Err(ReportingStorageError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -243,6 +280,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = EntryStore::new(dir.path(), RetentionPolicy::default());
         assert_eq!(store.show("does-not-exist").unwrap(), None);
+    }
+
+    /// `id` reaches `show`/`delete` directly from unvalidated IPC/CLI
+    /// input -- a path-traversal or absolute-path id must not let either
+    /// operation reach a file outside the store directory. Reproduces the
+    /// exact shape a real attacker string would take (`../../../../tmp/
+    /// victim`), against a real file placed outside `dir` on disk, so a
+    /// regression that reopens the escape would actually delete/read that
+    /// file rather than merely fail an assertion on `id`'s shape.
+    #[test]
+    fn an_id_that_would_escape_the_store_directory_is_rejected_not_traversed() {
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("queue");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let store = EntryStore::new(&store_dir, RetentionPolicy::default());
+
+        let victim = root.path().join("victim.json");
+        std::fs::write(&victim, "not a report, must survive").unwrap();
+
+        for malicious_id in [
+            "../victim",
+            "../../victim",
+            "some/../../victim",
+            "/etc/passwd",
+            ".",
+            "..",
+            "sub/dir",
+        ] {
+            assert_eq!(
+                store.show(malicious_id).unwrap(),
+                None,
+                "show({malicious_id:?}) must not read anything, real or synthetic"
+            );
+            assert!(
+                !store.delete(malicious_id).unwrap(),
+                "delete({malicious_id:?}) must report nothing removed"
+            );
+        }
+
+        assert!(victim.exists(), "an id outside the store must never reach a real file on disk");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "not a report, must survive",
+            "the file outside the store must be untouched"
+        );
     }
 
     /// queue deletion.

@@ -580,8 +580,9 @@ impl GlobalOracle {
                             current.size,
                             current.mtime_unix_nanos,
                             current.record_kind,
-                            current.exec_bit,
+                            current.unix_mode,
                             current.symlink_target.clone(),
+                            current.xattrs.clone(),
                         )
                         .version_hash;
                     // The authoring-identity invariant is defined over LIVE
@@ -620,7 +621,7 @@ impl GlobalOracle {
                                     "one authoring change identifies different content: device \
                                      {other_device}={}, device {device_idx}={} \
                                      (author={} row: size={} mtime={} blocks={} kind={:?} \
-                                     exec={} deleted={})",
+                                     exec={:?} deleted={})",
                                     hex::encode(other_hash.0),
                                     hex::encode(version_hash.0),
                                     hex::encode(&authoring_hash.0[..8]),
@@ -628,7 +629,7 @@ impl GlobalOracle {
                                     current.mtime_unix_nanos,
                                     current.blocks.len(),
                                     current.record_kind,
-                                    current.exec_bit,
+                                    current.unix_mode,
                                     record.deleted,
                                 ),
                             });
@@ -1214,9 +1215,10 @@ mod tests {
             0,
             FileMeta {
                 mtime_unix_nanos: mtime,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         );
         let emitter = ChangeEmitter::new(

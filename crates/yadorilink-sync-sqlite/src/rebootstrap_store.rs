@@ -338,8 +338,9 @@ pub fn build_compaction_snapshot(
             file.record.size,
             file.record.mtime_unix_nanos,
             file.record_kind,
-            file.exec_bit,
+            file.unix_mode,
             file.symlink_target.clone(),
+            file.xattrs.clone(),
         );
         versions.insert(version.version_hash, version.canonical_encoding());
     }
@@ -744,7 +745,7 @@ fn read_snapshot_files(
     let mut stmt = conn.prepare(
         "SELECT path, size, mtime_unix_nanos, blocks_json, deleted, \
                 version_seq, state, origin_device_id, record_kind, symlink_target, \
-                exec_bit, symlink_out_of_root \
+                unix_mode, symlink_out_of_root, xattrs_json \
          FROM files WHERE group_id = ?1 ORDER BY path, version_seq",
     )?;
     let rows = stmt.query_map([group_id], |row| {
@@ -783,8 +784,18 @@ fn read_snapshot_files(
                 &row.get::<_, String>(8)?,
             ),
             symlink_target: row.get(9)?,
-            exec_bit: row.get::<_, i64>(10)? != 0,
+            unix_mode: crate::file_index::decode_unix_mode_column(row.get::<_, i64>(10)?),
             symlink_out_of_root: row.get::<_, i64>(11)? != 0,
+            xattrs: {
+                let xattrs_json: String = row.get(12)?;
+                crate::file_index::decode_xattrs_column(&xattrs_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        12,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?
+            },
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -850,7 +861,7 @@ fn replace_group_files_from_snapshot(
             "INSERT INTO files \
              (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, \
               version_seq, state, origin_device_id, materialization_state, pinned, \
-              record_kind, symlink_target, exec_bit, symlink_out_of_root) \
+              record_kind, symlink_target, unix_mode, symlink_out_of_root) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12, ?13, ?14)",
             params![
                 group_id,
@@ -865,7 +876,7 @@ fn replace_group_files_from_snapshot(
                 materialization_state,
                 file.record_kind.as_db_str(),
                 file.symlink_target.as_deref(),
-                file.exec_bit as i64,
+                crate::file_index::encode_unix_mode_column(file.unix_mode),
                 file.symlink_out_of_root as i64,
             ],
         )?;

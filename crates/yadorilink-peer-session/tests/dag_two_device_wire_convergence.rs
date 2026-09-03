@@ -28,12 +28,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use boringtun::x25519::{PublicKey, StaticSecret};
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::FsBlockStore;
 use yadorilink_peer_session::peer_session::{PeerSyncSession, PeerSyncSessionDeps};
 use yadorilink_replica_domain::file::FileRecord;
-use yadorilink_transport::PeerChannel;
+use yadorilink_transport::QuicPeerChannel;
 
 use dag_wire_support::{pinned_authenticator, AlwaysValidRootCommitAuthorityProvider, DagProducer};
 use ed25519_dalek::SigningKey;
@@ -49,20 +48,12 @@ const OLD_MTIME: i64 = 1_000;
 const NEW_MTIME: i64 = 9_000;
 const WARMUP_MTIME: i64 = 500;
 
-/// Prefix marking "the handshake never negotiated the change DAG within the
+/// Prefix marking "the two sessions never exchanged handshakes within the
 /// budget" — a transport/host-timing skip (the real-UDP loopback handshake can
 /// be slow under load), distinct from a genuine convergence failure. Only the
-/// handshake is allowed to be treated as a skip; once negotiated, a failure to
-/// converge is a real finding, never an env skip.
+/// handshake is allowed to be treated as a skip; once it has landed, a failure
+/// to converge is a real finding, never an env skip.
 const NEGOTIATE_TIMEOUT_MARKER: &str = "NEGOTIATE_TIMEOUT: ";
-
-fn gen_keypair() -> (StaticSecret, PublicKey) {
-    let mut bytes = [0u8; 32];
-    rand::fill(&mut bytes);
-    let secret = StaticSecret::from(bytes);
-    let public = PublicKey::from(&secret);
-    (secret, public)
-}
 
 struct Device {
     state: Arc<ReplicaCoordinator>,
@@ -95,7 +86,7 @@ fn setup_device(device_id: &str, signing_key: SigningKey) -> Device {
     Device { state, store, producer, _root: root_dir, _store_dir: store_dir }
 }
 
-/// Connects two loopback `PeerChannel`s and wraps each in a `PeerSyncSession`,
+/// Connects two loopback QUIC channels and wraps each in a `PeerSyncSession`,
 /// exactly as the daemon's peer orchestrator does (minus coordination-plane
 /// candidate discovery — here the candidates are the two bound loopback
 /// addresses). Gate ON and the pinned authenticator wired on both sides.
@@ -104,35 +95,7 @@ async fn connect_sessions(
     b: &Device,
     authenticator: &Arc<dyn yadorilink_peer_session::peer_session::ChangeAuthenticator>,
 ) -> (Arc<PeerSyncSession>, Arc<PeerSyncSession>) {
-    let (secret_a, public_a) = gen_keypair();
-    let (secret_b, public_b) = gen_keypair();
-    let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr_a = socket_a.local_addr().unwrap();
-    let addr_b = socket_b.local_addr().unwrap();
-
-    let channel_a = Arc::new(
-        PeerChannel::connect(
-            secret_a,
-            public_b,
-            0,
-            vec![addr_b],
-            yadorilink_transport::TransportHub::from_socket(socket_a, Some(public_a)),
-        )
-        .await
-        .unwrap(),
-    );
-    let channel_b = Arc::new(
-        PeerChannel::connect(
-            secret_b,
-            public_a,
-            1,
-            vec![addr_a],
-            yadorilink_transport::TransportHub::from_socket(socket_b, Some(public_b)),
-        )
-        .await
-        .unwrap(),
-    );
+    let (channel_a, channel_b) = connect_quic_pair().await;
 
     let sync_roots_a = HashMap::from([(GROUP.to_string(), a._root.path().canonicalize().unwrap())]);
     let sync_roots_b = HashMap::from([(GROUP.to_string(), b._root.path().canonicalize().unwrap())]);
@@ -250,28 +213,29 @@ async fn run_scenario(announce_a_first: bool) -> Result<(i64, i64, String, Strin
     let run_a = tokio::spawn(session_a.clone().run());
     let run_b = tokio::spawn(session_b.clone().run());
 
-    // Wait for the automatic change-DAG negotiation the handshake performs
-    // (both sides advertise `supports_change_dag`). Only this handshake step is
-    // allowed to be treated as an environment skip.
+    // Wait for each side to see the other's handshake -- the single "the
+    // peer is talking to us" signal every announce path is gated on. Only
+    // this handshake step is allowed to be treated as an environment skip.
     poll_until(Duration::from_secs(20), || {
         run_a.is_finished()
             || run_b.is_finished()
-            || (session_a.change_dag_negotiated() && session_b.change_dag_negotiated())
+            || (session_a.peer_handshake_received() && session_b.peer_handshake_received())
     })
     .await;
     if run_a.is_finished() || run_b.is_finished() {
         return Err(format!(
-            "a session's run() loop exited early during negotiation (a_finished={}, b_finished={})",
+            "a session's run() loop exited early during the handshake (a_finished={}, \
+             b_finished={})",
             run_a.is_finished(),
             run_b.is_finished()
         ));
     }
-    if !(session_a.change_dag_negotiated() && session_b.change_dag_negotiated()) {
+    if !(session_a.peer_handshake_received() && session_b.peer_handshake_received()) {
         return Err(format!(
-            "{NEGOTIATE_TIMEOUT_MARKER}sessions did not negotiate the change DAG in time \
-             (a={}, b={})",
-            session_a.change_dag_negotiated(),
-            session_b.change_dag_negotiated()
+            "{NEGOTIATE_TIMEOUT_MARKER}sessions did not exchange handshakes in time (a={}, \
+             b={})",
+            session_a.peer_handshake_received(),
+            session_b.peer_handshake_received()
         ));
     }
 
@@ -324,11 +288,32 @@ async fn run_scenario(announce_a_first: bool) -> Result<(i64, i64, String, Strin
             // `materialization_jobs` row -- it no longer projects the
             // resolved winner onto the index/disk inline. This
             // sync-core-only test has no daemon-level engine to pick that
-            // row up on its own background schedule, so each poll
-            // iteration drives the same materialization audit the engine
-            // would otherwise run before checking `converged` (which
-            // reads `get_file`'s index-projected state, not raw admitted
-            // DAG heads).
+            // row up on its own background schedule. The periodic
+            // maintenance audit's own ordinary reprojection
+            // (`reproject_unapplied_changes`) has been retired in favor
+            // of the daemon's obligation-driven engine
+            // -- which this test also does not have -- so each poll
+            // iteration must drive `reconcile_paths_directly` itself for
+            // whatever the DAG still shows admitted-but-unapplied, the
+            // same way `spawn_test_convergence_driver`
+            // (`tests/peer_session.rs`) does, before checking `converged`
+            // (which reads `get_file`'s index-projected state, not raw
+            // admitted DAG heads).
+            for (session, state) in [(&session_a, &device_a.state), (&session_b, &device_b.state)] {
+                if let Ok(unapplied) =
+                    state.change_history_repository().dag_list_unapplied_changes(GROUP)
+                {
+                    let mut paths = std::collections::BTreeSet::new();
+                    for change in &unapplied {
+                        for op in &change.ops {
+                            yadorilink_replica_engine::change_ops::collect_op_paths(op, &mut paths);
+                        }
+                    }
+                    if !paths.is_empty() {
+                        let _ = session.clone().reconcile_paths_directly(GROUP, paths).await;
+                    }
+                }
+            }
             let _ = session_a.clone().reconcile_local_materialization_audit(GROUP).await;
             let _ = session_b.clone().reconcile_local_materialization_audit(GROUP).await;
             if converged(&device_a.state, &winner_hash, &loser_hash)
@@ -424,4 +409,31 @@ async fn dag_two_sessions_converge_to_lamport_winner_over_the_wire() {
             Err(e) => panic!("announce_a_first={announce_a_first}: {e}"),
         }
     }
+}
+
+/// One authenticated QUIC connection between two loopback endpoints, as a
+/// channel on each side.
+async fn connect_quic_pair() -> (Arc<QuicPeerChannel>, Arc<QuicPeerChannel>) {
+    use yadorilink_transport::{ConnectRole, DeviceSigningKeyPair, QuicPeerEndpoint, TransportHub};
+    let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = socket_b.local_addr().unwrap();
+    let key_a = DeviceSigningKeyPair::generate();
+    let key_b = DeviceSigningKeyPair::generate();
+    let public_a = key_a.public_bytes();
+    let public_b = key_b.public_bytes();
+    let endpoint_a = QuicPeerEndpoint::new(TransportHub::from_socket(socket_a), key_a).unwrap();
+    let endpoint_b = QuicPeerEndpoint::new(TransportHub::from_socket(socket_b), key_b).unwrap();
+    endpoint_a.authorize(public_b);
+    endpoint_b.authorize(public_a);
+    let accepting = {
+        let endpoint_b = endpoint_b.clone();
+        tokio::spawn(async move { endpoint_b.accept(public_a).await })
+    };
+    let dialed = endpoint_a.connect(addr_b, public_b).await.unwrap();
+    let accepted = accepting.await.unwrap().unwrap();
+    (
+        QuicPeerChannel::new(dialed, ConnectRole::Dial),
+        QuicPeerChannel::new(accepted, ConnectRole::Accept),
+    )
 }

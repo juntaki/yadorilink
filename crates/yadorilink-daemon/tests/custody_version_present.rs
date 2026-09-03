@@ -13,7 +13,6 @@ use support::{
 };
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::{BlockStore, FsBlockStore};
-use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
 use yadorilink_replica_domain::ids::{BlockHash, VersionHash};
@@ -108,9 +107,10 @@ fn version_and_blocks(hash_bytes: Vec<u8>, size: u64) -> (VersionHash, Vec<Versi
     let blocks = vec![VersionBlock { hash: BlockHash(hash_bytes), size: size as u32 }];
     let meta = FileMeta {
         mtime_unix_nanos: 0,
-        exec_bit: false,
+        unix_mode: None,
         symlink_target: None,
         record_kind: RecordKind::File,
+        xattrs: Vec::new(),
     };
     let version = FileVersion::new(blocks.clone(), size, meta);
     (version.version_hash, blocks)
@@ -315,68 +315,6 @@ async fn membership_generation_bumps_only_on_real_authorization_changes() {
         d.state.membership_generation(),
         g3,
         "removing an already-absent edge must not bump"
-    );
-}
-
-/// A peer that never advertised `supports_version_present` in its handshake
-/// `ClusterConfig` must be skipped by `confirm_version_present_via_peer`
-/// entirely, not queried and waited out — an old peer silently drops a
-/// `VersionPresentQuery` it doesn't understand instead of replying, so
-/// querying it anyway would spend its full per-request timeout for nothing.
-/// Stands the non-supporting peer's session up on a channel with no reachable
-/// far end (so an unskipped query really would run out its own ~10s timeout
-/// rather than fail fast) and asserts the call returns quickly regardless.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn confirm_version_present_skips_a_peer_that_never_advertised_the_capability() {
-    support::ensure_isolated_config_dir();
-    let b = new_daemon("device-b");
-
-    b.state
-        .replica_coordinator
-        .file_index_repository()
-        .upsert_file(
-            GROUP,
-            &record_referencing("held.bin", vec![9u8; 32], 4),
-            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
-        )
-        .unwrap();
-
-    // A session that never ran a `ClusterConfig` handshake at all — the same
-    // starting state as one that did run it against an old peer that predates
-    // `supports_version_present` (the field defaults to, and an old peer
-    // leaves it, `false`).
-    let fake_channel = support::unreachable_channel().await;
-    let fake_session = PeerSyncSession::new(
-        fake_channel,
-        "device-b".to_string(),
-        "device-a".to_string(),
-        b.state.replica_coordinator.clone(),
-        std::sync::Arc::new(
-            yadorilink_daemon::adapters::block_store_ports::BlockStorePortsAdapter::new(
-                b.state.block_store.clone(),
-            ),
-        ),
-        vec![GROUP.to_string()],
-        std::collections::HashMap::new(),
-    );
-    assert!(
-        !fake_session.version_present_negotiated(),
-        "a session that never completed the handshake must default to unsupported"
-    );
-    b.state.peers.register_session("device-a".to_string(), fake_session);
-    b.state.set_peer_group_full_replica("device-a", GROUP, true);
-    b.state.set_peer_group_writer("device-a", GROUP, true);
-
-    let (held_vh, held_blocks) = version_and_blocks(vec![9u8; 32], 4);
-    let start = std::time::Instant::now();
-    let confirmed =
-        b.state.confirm_version_present_via_peer(GROUP, "held.bin", held_vh, &held_blocks).await;
-    let elapsed = start.elapsed();
-
-    assert!(!confirmed, "no peer advertised the capability, so nothing can confirm custody");
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "a non-supporting peer must be skipped, not queried and waited out (took {elapsed:?})"
     );
 }
 
@@ -693,9 +631,10 @@ async fn custody_rejects_a_query_whose_version_hash_differs_despite_matching_blo
     // a DIFFERENT mtime than device-a's real record actually has.
     let wrong_meta = FileMeta {
         mtime_unix_nanos: 999,
-        exec_bit: false,
+        unix_mode: None,
         symlink_target: None,
         record_kind: RecordKind::File,
+        xattrs: Vec::new(),
     };
     let wrong_vh = FileVersion::new(blocks.clone(), content.len() as u64, wrong_meta).version_hash;
     assert_ne!(
@@ -706,7 +645,7 @@ async fn custody_rejects_a_query_whose_version_hash_differs_despite_matching_blo
     assert!(
         !b.state.confirm_version_present_via_peer(GROUP, "meta.bin", wrong_vh, &blocks).await,
         "identical block hashes/sizes must NOT confirm when the version_hash (bound to \
-         mtime/exec_bit/symlink_target/record_kind too) doesn't match device-a's real record"
+         mtime/unix_mode/symlink_target/record_kind too) doesn't match device-a's real record"
     );
 }
 
@@ -714,12 +653,12 @@ async fn custody_rejects_a_query_whose_version_hash_differs_despite_matching_blo
 /// the identity it recomputes, which is only possible if it reads that column
 /// from the same atomic current-row snapshot as the blocks (not a stitched
 /// multi-read). device-a's real current row has the exec bit SET; a query
-/// whose `version_hash` assumes exec_bit=false (same blocks, same size, same
-/// mtime) must be rejected, while the exec_bit=true hash confirms. If the
+/// whose `version_hash` assumes unix_mode=false (same blocks, same size, same
+/// mtime) must be rejected, while the unix_mode=true hash confirms. If the
 /// responder ignored the exec bit — or read it from a torn/hybrid snapshot —
-/// the exec_bit=false query would wrongly confirm.
+/// the unix_mode=false query would wrongly confirm.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn custody_binds_the_exec_bit_from_the_atomic_current_row() {
+async fn custody_binds_the_unix_mode_from_the_atomic_current_row() {
     support::ensure_isolated_config_dir();
     let a = new_daemon("device-a"); // full replica: current row has exec bit set
     let b = new_daemon("device-b");
@@ -746,14 +685,14 @@ async fn custody_binds_the_exec_bit_from_the_atomic_current_row() {
         )
         .unwrap();
     // Set the exec bit on device-a's CURRENT row, so its real version identity
-    // is over exec_bit=true.
+    // is over unix_mode=true.
     a.state
         .replica_coordinator
         .file_index_repository()
-        .set_exec_bit(
+        .set_unix_mode(
             GROUP,
             "script.sh",
-            true,
+            Some(0o755),
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -766,27 +705,28 @@ async fn custody_binds_the_exec_bit_from_the_atomic_current_row() {
         vec![VersionBlock { hash: BlockHash(hash_bytes.clone()), size: content.len() as u32 }];
     let meta_with_exec = FileMeta {
         mtime_unix_nanos: 0,
-        exec_bit: true,
+        unix_mode: Some(0o755),
         symlink_target: None,
         record_kind: RecordKind::File,
+        xattrs: Vec::new(),
     };
-    let meta_no_exec = FileMeta { exec_bit: false, ..meta_with_exec.clone() };
+    let meta_no_exec = FileMeta { unix_mode: Some(0o644), ..meta_with_exec.clone() };
     let vh_exec =
         FileVersion::new(blocks.clone(), content.len() as u64, meta_with_exec).version_hash;
     let vh_no_exec =
         FileVersion::new(blocks.clone(), content.len() as u64, meta_no_exec).version_hash;
     assert_ne!(vh_exec, vh_no_exec, "the exec bit must change the version_hash");
 
-    // The exec_bit=true hash matches device-a's real current row → confirms,
+    // The unix_mode=true hash matches device-a's real current row → confirms,
     // proving the responder read the exec bit from the atomic row.
     assert!(
         b.state.confirm_version_present_via_peer(GROUP, "script.sh", vh_exec, &blocks).await,
-        "the version_hash bound to exec_bit=true matches device-a's real current row"
+        "the version_hash bound to unix_mode=true matches device-a's real current row"
     );
-    // The exec_bit=false hash (identical blocks/size/mtime) must fail closed.
+    // The unix_mode=false hash (identical blocks/size/mtime) must fail closed.
     assert!(
         !b.state.confirm_version_present_via_peer(GROUP, "script.sh", vh_no_exec, &blocks).await,
-        "a version_hash assuming exec_bit=false must NOT confirm against a current row whose \
+        "a version_hash assuming unix_mode=false must NOT confirm against a current row whose \
          exec bit is set"
     );
 }

@@ -235,7 +235,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\ncd \"$SRCROOT/../core\"\ncargo build --release --target aarch64-apple-darwin\n";
+			shellScript = "set -euo pipefail\ncd \"$SRCROOT/../core\"\ncargo build --release --target aarch64-apple-darwin --target-dir target\n";
 		};
 		F0C2896918ACFE193248F77B /* Build Rust FFI core (fileprovider-core) */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -254,7 +254,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\ncd \"$SRCROOT/../fileprovider-core\"\ncargo build --release --target aarch64-apple-darwin\n";
+			shellScript = "set -euo pipefail\ncd \"$SRCROOT/../fileprovider-core\"\ncargo build --release --target aarch64-apple-darwin --target-dir target\n";
 		};
 		F48F3196D6498B69E2224E2A /* Build Rust FFI core (fileprovider-core) */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -273,7 +273,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\ncd \"$SRCROOT/../fileprovider-core\"\ncargo build --release --target aarch64-apple-darwin\n";
+			shellScript = "set -euo pipefail\ncd \"$SRCROOT/../fileprovider-core\"\ncargo build --release --target aarch64-apple-darwin --target-dir target\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

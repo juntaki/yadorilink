@@ -188,6 +188,23 @@ impl StartupReadinessRegistry {
         }
     }
 
+    /// Whether `group_id`'s latest startup generation is still running, read
+    /// without parking. `false` for a group that never entered startup (no
+    /// gate, nothing in flight) and for one that has settled either way
+    /// (`Ready` or `Failed`).
+    ///
+    /// This is deliberately NOT a second way to gate peer apply -- that stays
+    /// on `wait_group_ready`, which must park rather than skip. It exists for
+    /// periodic background repair passes, which have no useful notion of
+    /// waiting: a repair that fires while startup is still building the index
+    /// is not merely early, it races the one-shot work startup is in the
+    /// middle of doing (see `DaemonState::backfill_missing_change_history`).
+    pub fn group_startup_in_progress(&self, group_id: &str) -> bool {
+        let Some(gate) = self.gate(group_id) else { return false };
+        let state = gate.inner.lock().unwrap_or_else(|p| p.into_inner());
+        matches!(state.phase, GroupStartupPhase::Starting)
+    }
+
     /// Awaits `group_id`'s startup gate, if one is registered. Returns
     /// `None` when no gate exists for the group at all — the caller must
     /// then decide what an absent gate means (a group with no link on this
@@ -222,5 +239,47 @@ impl StartupReadinessRegistry {
             }
             notified.await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The non-parking status read background repair passes gate on. An
+    /// unknown group is not "in progress" (nothing is running for it), a
+    /// group mid-startup is, and either terminal phase clears it -- including
+    /// `Failed`, so a group whose startup genuinely failed still gets its
+    /// long-horizon repair passes rather than being skipped forever.
+    #[test]
+    fn group_startup_in_progress_tracks_only_the_starting_phase() {
+        let registry = StartupReadinessRegistry::new();
+        assert!(!registry.group_startup_in_progress("never-started"));
+
+        let generation = registry.begin_group_startup("g");
+        assert!(registry.group_startup_in_progress("g"));
+
+        registry.mark_group_ready("g", generation);
+        assert!(!registry.group_startup_in_progress("g"));
+
+        let retry = registry.begin_group_startup("g");
+        assert!(registry.group_startup_in_progress("g"), "a retry re-closes the gate");
+        registry.mark_group_failed("g", retry, "disk full");
+        assert!(
+            !registry.group_startup_in_progress("g"),
+            "a failed startup is settled, not still running"
+        );
+    }
+
+    /// A stale completion must not make a newer generation look settled --
+    /// otherwise a repair pass could run against a half-built index while the
+    /// current startup is still writing it.
+    #[test]
+    fn a_stale_completion_leaves_a_newer_generation_in_progress() {
+        let registry = StartupReadinessRegistry::new();
+        let stale = registry.begin_group_startup("g");
+        let _current = registry.begin_group_startup("g");
+        registry.mark_group_ready("g", stale);
+        assert!(registry.group_startup_in_progress("g"));
     }
 }

@@ -3,20 +3,20 @@
 //! protobuf messages, real `DaemonState`-backed admission (`relay_grant`::
 //! `verify_relay_grant` + `relay_session::admit_relay_open`, using B's own
 //! REAL netmap-derived group membership/relay-capability and a REAL
-//! confirmed direct WireGuard path to C) -- not just `relay_forwarder.rs`'s
+//! confirmed direct QUIC path to C) -- not just `relay_forwarder.rs`'s
 //! own unit tests (which drive `RelayForwarder` directly, never touching a
 //! `PeerSyncSession` or the wire protocol at all) or `relay_grant.rs`/
 //! `relay_session.rs`'s own unit tests (which drive pure functions with
 //! synthetic contexts, never live daemon state).
 //!
 //! **What this file deliberately does NOT prove:** that C's own real
-//! WireGuard stack meaningfully processes the relayed bytes -- the relay
+//! QUIC connection meaningfully processes the relayed bytes -- the relay
 //! forwards them opaquely, exactly as this whole mechanism's own design
 //! requires (see `relay_forwarder`'s own doc comment), so this file
 //! confirms the bytes actually reached the socket bound toward C's REAL
-//! confirmed address, not that C's own tunnel decrypted them as valid
-//! WireGuard traffic. Making A's own relayed traffic be genuine WireGuard
-//! ciphertext C's tunnel actually understands is Pass 6's job (wiring
+//! confirmed address, not that C's own connection decrypted them as
+//! valid QUIC traffic. Making A's own relayed traffic be genuine QUIC
+//! ciphertext C's connection actually understands is Pass 6's job (wiring
 //! relay in as a real `PeerChannel` transport route), not this
 //! "standalone primitive" pass's.
 
@@ -33,12 +33,10 @@ use yadorilink_daemon::peer_orchestrator;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::FsBlockStore;
 use yadorilink_sync_wire::RelayOpenFrame;
-use yadorilink_transport::DeviceKeyPair;
 
 struct TestDaemon {
     device_id: String,
     state: Arc<DaemonState>,
-    keypair: Arc<DeviceKeyPair>,
     _root: tempfile::TempDir,
 }
 
@@ -50,7 +48,6 @@ fn new_test_daemon(device_id: &str) -> TestDaemon {
     TestDaemon {
         device_id: device_id.to_string(),
         state,
-        keypair: Arc::new(DeviceKeyPair::generate()),
         _root: tempfile::tempdir().unwrap(),
     }
 }
@@ -64,7 +61,6 @@ fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
 fn spawn_orchestrator(
     coordination_addr: String,
     device_id: String,
-    keypair: Arc<DeviceKeyPair>,
     state: Arc<DaemonState>,
 ) {
     let log_device_id = device_id.clone();
@@ -74,7 +70,7 @@ fn spawn_orchestrator(
         device_id,
     };
     tokio::spawn(async move {
-        if let Err(error) = peer_orchestrator::run(config, keypair, state).await {
+        if let Err(error) = peer_orchestrator::run(config, state).await {
             eprintln!("peer orchestrator for {log_device_id} stopped: {error}");
         }
     });
@@ -84,7 +80,7 @@ fn fully_connected(state: &Arc<DaemonState>, peer_device_id: &str) -> bool {
     state
         .peers
         .session(peer_device_id)
-        .is_some_and(|s| s.peer_handshake_received() && s.change_dag_negotiated())
+        .is_some_and(|s| s.peer_handshake_received())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -102,7 +98,6 @@ async fn opaque_bytes_flow_from_a_through_b_to_cs_real_address_over_the_real_wir
             &fake,
             &daemon.state,
             &daemon.device_id,
-            daemon.keypair.public_bytes(),
             &[group_id],
         )
         .await;
@@ -114,14 +109,14 @@ async fn opaque_bytes_flow_from_a_through_b_to_cs_real_address_over_the_real_wir
     b.state.set_local_relay_capable(true);
     fake.set_relay_capable(&b.device_id, true);
 
-    spawn_orchestrator(fake.addr(), a.device_id.clone(), a.keypair.clone(), a.state.clone());
-    spawn_orchestrator(fake.addr(), b.device_id.clone(), b.keypair.clone(), b.state.clone());
-    spawn_orchestrator(fake.addr(), c.device_id.clone(), c.keypair.clone(), c.state.clone());
+    spawn_orchestrator(fake.addr(), a.device_id.clone(), a.state.clone());
+    spawn_orchestrator(fake.addr(), b.device_id.clone(), b.state.clone());
+    spawn_orchestrator(fake.addr(), c.device_id.clone(), c.state.clone());
 
     // Both hops the relay needs -- A<->B (the channel `RelayOpen`/
     // `RelayData` travel over) and B<->C (the REAL confirmed direct path
     // B's own admission check requires and forwards toward) -- must be
-    // genuine, fully-negotiated WireGuard sessions before the relay
+    // genuine, fully-negotiated QUIC sessions before the relay
     // protocol exchange below means anything.
     wait_until_with_context(
         || fully_connected(&a.state, &b.device_id) && fully_connected(&b.state, &c.device_id),
@@ -184,7 +179,7 @@ async fn opaque_bytes_flow_from_a_through_b_to_cs_real_address_over_the_real_wir
     // address. See this file's own module doc comment for why this test
     // stops at "the bytes reached the socket toward C", not "C understood
     // them".
-    let payload = b"opaque WireGuard-shaped bytes, never parsed by B".to_vec();
+    let payload = b"opaque QUIC-shaped bytes, never parsed by B".to_vec();
     session_a_to_b.send_relay_data(session_id, payload.clone());
 
     wait_until_with_context(
@@ -213,22 +208,21 @@ async fn opaque_bytes_flow_from_a_through_b_to_cs_real_address_over_the_real_wir
     .await;
 }
 
-/// M3 Pass 6b acceptance: `DaemonState`'s own `RelayCarrier`/`RelayGrantSource`
-/// implementation, driven exactly the way `PeerChannel::send_batch_direct`
-/// drives it -- picks B as a relay candidate, obtains a grant, opens a
-/// session, and forwards -- over the SAME real orchestrator-managed
-/// sessions/sockets the rest of this file already proves the wire
-/// protocol and B's admission pipeline work over. This is the requester
-/// ("A") side; `opaque_bytes_flow_from_a_through_b_to_cs_real_address_
-/// over_the_real_wire` above already proves the provider ("B") side --
-/// together they cover the full A<->B<->C round trip this pass's
-/// `RelayCarrier` seam exists to drive.
+/// The requester ("A") side of the relay protocol, driven exactly the way
+/// the connection supervisor drives it -- pick B as a relay candidate,
+/// obtain a grant, open a path, and send -- over the SAME real
+/// orchestrator-managed sessions and sockets the rest of this file already
+/// proves the wire protocol and B's admission pipeline work over.
+/// `opaque_bytes_flow_from_a_through_b_to_cs_real_address_over_the_real_
+/// wire` above proves the provider ("B") side; together they cover the full
+/// A<->B<->C round trip.
 ///
-/// Calls `send_via_relay` directly (as `PeerChannel` itself would once
-/// direct is `Unreachable`) rather than forcing A's real direct path to
-/// C to fail via network topology -- that natural trigger belongs to
-/// Pass 6c's failover tests; this test isolates the requester mechanism
-/// itself: candidate selection, grant issuance, open, and forwarding.
+/// Opens the path directly rather than forcing A's real direct route to C
+/// to fail, so what is under test is the requester mechanism itself:
+/// candidate selection, grant issuance, admission, and forwarding.
+/// `topology_relay_failover.rs` covers the natural trigger, and
+/// `relay_path_quic.rs` covers a real QUIC connection running over the
+/// resulting path.
 struct TestGrantSource {
     fake: FakeCoordination,
     source_device_id: String,
@@ -267,7 +261,6 @@ async fn requester_relay_carrier_opens_a_session_and_forwards_via_a_real_relay()
             &fake,
             &daemon.state,
             &daemon.device_id,
-            daemon.keypair.public_bytes(),
             &[group_id],
         )
         .await;
@@ -276,9 +269,9 @@ async fn requester_relay_carrier_opens_a_session_and_forwards_via_a_real_relay()
     b.state.set_local_relay_capable(true);
     fake.set_relay_capable(&b.device_id, true);
 
-    spawn_orchestrator(fake.addr(), a.device_id.clone(), a.keypair.clone(), a.state.clone());
-    spawn_orchestrator(fake.addr(), b.device_id.clone(), b.keypair.clone(), b.state.clone());
-    spawn_orchestrator(fake.addr(), c.device_id.clone(), c.keypair.clone(), c.state.clone());
+    spawn_orchestrator(fake.addr(), a.device_id.clone(), a.state.clone());
+    spawn_orchestrator(fake.addr(), b.device_id.clone(), b.state.clone());
+    spawn_orchestrator(fake.addr(), c.device_id.clone(), c.state.clone());
 
     // A<->B (what `RelayOpen`/`RelayData` travel over) and B<->C (what
     // B's admission requires and forwards toward) must both be real,
@@ -302,15 +295,27 @@ async fn requester_relay_carrier_opens_a_session_and_forwards_via_a_real_relay()
         source_device_id: a.device_id.clone(),
     }));
 
-    let c_peer_public = c.keypair.public_bytes();
-    let payload = b"real relay-carrier payload, opaque to B".to_vec();
-    let sent = yadorilink_transport::RelayCarrier::send_via_relay(
-        &*a.state,
+    // The peer key the relay layer routes by is C's Ed25519 device key --
+    // a device has one key, and it is the one that authenticated C's
+    // connection.
+    let c_peer_public =
+        c.state.device_signing_key().expect("C has a device key").verifying_key().to_bytes();
+    // Shaped like a QUIC long-header packet (the fixed bit set in byte 0)
+    // because that is what a relay path carries and what the destination's
+    // demux requires of anything it will route to one. Opaque to B either
+    // way -- it never looks at a payload.
+    let mut payload = vec![0xC0u8];
+    payload.extend_from_slice(b"real relay-path payload, opaque to B");
+    let opened = yadorilink_daemon::relay_carrier::open_relay_path_for_test(
+        &a.state,
+        &c.device_id,
         &c_peer_public,
-        bytes::Bytes::from(payload.clone()),
     )
-    .await;
-    assert!(sent, "send_via_relay should have found B, opened a session, and forwarded");
+    .await
+    .expect("opening a relay path should have found B, obtained a grant, and been admitted");
+    let hub = a.state.shared_socket().expect("A has a bound transport hub");
+    hub.try_send_datagram(&payload, opened.path.synthetic_addr())
+        .expect("A's hub accepts a datagram addressed to a live relay path");
 
     // The exact same admission/forwarding pipeline the provider-side test
     // above already proves in detail -- here just confirming THIS attempt
@@ -345,22 +350,18 @@ async fn requester_relay_carrier_opens_a_session_and_forwards_via_a_real_relay()
     )
     .await;
 
-    // A second call for the same destination must reuse the existing
-    // requester session rather than opening a redundant one -- proves
-    // `requester_relay_session_for_destination`'s reuse path, not just
-    // the open path.
-    let second_payload = b"second payload on the same requester session".to_vec();
-    let sent_again = yadorilink_transport::RelayCarrier::send_via_relay(
-        &*a.state,
-        &c_peer_public,
-        bytes::Bytes::from(second_payload.clone()),
-    )
-    .await;
-    assert!(sent_again);
+    // A relay path is a path, so every datagram addressed to it rides the
+    // one session it opened -- a second send must not conjure a second
+    // session on B, which would double the slots this pair occupies on a
+    // device whose slots are a bounded resource it lends out.
+    let mut second_payload = vec![0xC0u8];
+    second_payload.extend_from_slice(b"second payload on the same relay path");
+    hub.try_send_datagram(&second_payload, opened.path.synthetic_addr())
+        .expect("A's hub accepts a second datagram on the same relay path");
     assert_eq!(
         b.state.relay_forwarder.active_session_count(),
         1,
-        "a second send for the same destination must reuse the existing session, not open another"
+        "a second datagram on the same path must ride the existing session, not open another"
     );
     wait_until_with_context(
         || {
@@ -368,9 +369,13 @@ async fn requester_relay_carrier_opens_a_session_and_forwards_via_a_real_relay()
                 >= Some((payload.len() + second_payload.len()) as u64)
         },
         Duration::from_secs(10),
-        || "B never forwarded the second payload on the reused session".to_string(),
+        || "B never forwarded the second payload on the same relay path".to_string(),
     )
     .await;
+
+    // Dropping the handle is what closes the path -- a relay route cannot
+    // outlive the bookkeeping that describes it.
+    drop(opened);
 }
 
 /// Cleanup regression: when B's own direct route to the DESTINATION is
@@ -393,7 +398,6 @@ async fn relay_session_closes_promptly_when_the_destination_route_is_lost() {
             &fake,
             &daemon.state,
             &daemon.device_id,
-            daemon.keypair.public_bytes(),
             &[group_id],
         )
         .await;
@@ -402,9 +406,9 @@ async fn relay_session_closes_promptly_when_the_destination_route_is_lost() {
     b.state.set_local_relay_capable(true);
     fake.set_relay_capable(&b.device_id, true);
 
-    spawn_orchestrator(fake.addr(), a.device_id.clone(), a.keypair.clone(), a.state.clone());
-    spawn_orchestrator(fake.addr(), b.device_id.clone(), b.keypair.clone(), b.state.clone());
-    spawn_orchestrator(fake.addr(), c.device_id.clone(), c.keypair.clone(), c.state.clone());
+    spawn_orchestrator(fake.addr(), a.device_id.clone(), a.state.clone());
+    spawn_orchestrator(fake.addr(), b.device_id.clone(), b.state.clone());
+    spawn_orchestrator(fake.addr(), c.device_id.clone(), c.state.clone());
 
     wait_until_with_context(
         || fully_connected(&a.state, &b.device_id) && fully_connected(&b.state, &c.device_id),
@@ -481,7 +485,6 @@ async fn relay_open_is_refused_when_the_relay_never_declared_capability() {
             &fake,
             &daemon.state,
             &daemon.device_id,
-            daemon.keypair.public_bytes(),
             &[group_id],
         )
         .await;
@@ -490,9 +493,9 @@ async fn relay_open_is_refused_when_the_relay_never_declared_capability() {
     // Deliberately NOT called: b.state.set_local_relay_capable(true) /
     // fake.set_relay_capable(&b.device_id, true).
 
-    spawn_orchestrator(fake.addr(), a.device_id.clone(), a.keypair.clone(), a.state.clone());
-    spawn_orchestrator(fake.addr(), b.device_id.clone(), b.keypair.clone(), b.state.clone());
-    spawn_orchestrator(fake.addr(), c.device_id.clone(), c.keypair.clone(), c.state.clone());
+    spawn_orchestrator(fake.addr(), a.device_id.clone(), a.state.clone());
+    spawn_orchestrator(fake.addr(), b.device_id.clone(), b.state.clone());
+    spawn_orchestrator(fake.addr(), c.device_id.clone(), c.state.clone());
 
     wait_until_with_context(
         || fully_connected(&a.state, &b.device_id) && fully_connected(&b.state, &c.device_id),
@@ -579,7 +582,6 @@ async fn relay_session_closes_on_stale_group_authorization_while_the_channel_sta
             &fake,
             &daemon.state,
             &daemon.device_id,
-            daemon.keypair.public_bytes(),
             &[group_relay, group_keepalive],
         )
         .await;
@@ -599,9 +601,9 @@ async fn relay_session_closes_on_stale_group_authorization_while_the_channel_sta
     b.state.set_local_relay_capable(true);
     fake.set_relay_capable(&b.device_id, true);
 
-    spawn_orchestrator(fake.addr(), a.device_id.clone(), a.keypair.clone(), a.state.clone());
-    spawn_orchestrator(fake.addr(), b.device_id.clone(), b.keypair.clone(), b.state.clone());
-    spawn_orchestrator(fake.addr(), c.device_id.clone(), c.keypair.clone(), c.state.clone());
+    spawn_orchestrator(fake.addr(), a.device_id.clone(), a.state.clone());
+    spawn_orchestrator(fake.addr(), b.device_id.clone(), b.state.clone());
+    spawn_orchestrator(fake.addr(), c.device_id.clone(), c.state.clone());
 
     wait_until_with_context(
         || fully_connected(&a.state, &b.device_id) && fully_connected(&b.state, &c.device_id),

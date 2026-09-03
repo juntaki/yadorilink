@@ -24,7 +24,6 @@ use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_orchestrator;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_transport::DeviceKeyPair;
 
 struct TestDaemon {
     state: Arc<DaemonState>,
@@ -74,7 +73,6 @@ fn describe_index_state(state: &DaemonState, group_id: &str, path: &str) -> Stri
 fn spawn_orchestrator(
     coordination_addr: String,
     device_id: String,
-    keypair: Arc<DeviceKeyPair>,
     state: Arc<DaemonState>,
 ) {
     let log_device_id = device_id.clone();
@@ -84,7 +82,7 @@ fn spawn_orchestrator(
         device_id,
     };
     tokio::spawn(async move {
-        if let Err(error) = peer_orchestrator::run(config, keypair, state).await {
+        if let Err(error) = peer_orchestrator::run(config, state).await {
             eprintln!("peer orchestrator for {log_device_id} stopped: {error}");
         }
     });
@@ -97,9 +95,6 @@ async fn peers_keep_syncing_after_coordination_plane_goes_unreachable() {
     let fake = FakeCoordination::start().await;
     fake.enable_signed_policy();
     let fake_host = fake.addr().trim_start_matches("http://").to_string();
-
-    let keypair_a = Arc::new(DeviceKeyPair::generate());
-    let keypair_b = Arc::new(DeviceKeyPair::generate());
     let device_a_id = "device-a";
     let device_b_id = "device-b";
     let group_id = "chaos-group";
@@ -109,9 +104,9 @@ async fn peers_keep_syncing_after_coordination_plane_goes_unreachable() {
     let root_a = tempfile::tempdir().unwrap();
     let root_b = tempfile::tempdir().unwrap();
 
-    register_with_fake(&fake, &daemon_a.state, device_a_id, keypair_a.public_bytes(), &[group_id])
+    register_with_fake(&fake, &daemon_a.state, device_a_id, &[group_id])
         .await;
-    register_with_fake(&fake, &daemon_b.state, device_b_id, keypair_b.public_bytes(), &[group_id])
+    register_with_fake(&fake, &daemon_b.state, device_b_id, &[group_id])
         .await;
 
     // Seed the healthy-sync probe before linking so the deterministic initial
@@ -121,8 +116,8 @@ async fn peers_keep_syncing_after_coordination_plane_goes_unreachable() {
     link(&daemon_a.state, root_a.path(), group_id);
     link(&daemon_b.state, root_b.path(), group_id);
 
-    spawn_orchestrator(fake.addr(), device_a_id.to_string(), keypair_a, daemon_a.state.clone());
-    spawn_orchestrator(fake.addr(), device_b_id.to_string(), keypair_b, daemon_b.state.clone());
+    spawn_orchestrator(fake.addr(), device_a_id.to_string(), daemon_a.state.clone());
+    spawn_orchestrator(fake.addr(), device_b_id.to_string(), daemon_b.state.clone());
 
     // Establish both peer sessions before checking the healthy-sync probe.
     wait_until_with_context(

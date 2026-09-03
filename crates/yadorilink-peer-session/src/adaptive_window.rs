@@ -29,7 +29,7 @@
 //! of the old fixed lane constant.
 
 use std::sync::Mutex as StdMutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// AIMD "AI" (additive increase) step applied to the window on every
 /// `on_success` call that does *not* show RTT inflation — one more
@@ -56,6 +56,29 @@ const RTT_EWMA_ALPHA: f64 = 0.25;
 /// congestion; only a genuine, sustained latency increase does.
 const RTT_INFLATION_FACTOR: f64 = 1.5;
 
+/// Fallback debounce window for collapsing repeated multiplicative-
+/// decrease signals into one, used until a real RTT sample exists (see
+/// `WindowState::last_backoff`'s own doc comment) -- standard TCP-
+/// congestion-control practice ("at most one window reduction per RTT")
+/// applied here because several concurrent in-flight requests launched
+/// together share one underlying congestion event: if that event causes
+/// N of them to time out, treating each as an INDEPENDENT signal
+/// collapses the window N times for what is really ONE episode. Confirmed
+/// directly as a real bug, not a theoretical one: an initial 8-request
+/// burst (`topology_simultaneous_reconnect_and_relay_hydration_failure.
+/// rs`'s relay-recovery scenario) produced 4 near-simultaneous timeouts,
+/// collapsing a window of 4 to its floor of 1 within a single dispatch
+/// attempt -- even though the window never saw a genuinely NEW congestion
+/// signal after the first. Once a real RTT sample exists, that baseline
+/// -- not this fallback -- is the debounce window (the textbook choice);
+/// this fixed fallback only covers the gap before any sample exists,
+/// which is exactly the first-burst case above. Chosen comfortably
+/// shorter than any real, separate congestion episode would need to
+/// develop, but comfortably longer than how far apart several timeouts
+/// from ONE simultaneous burst actually land (observed: within the same
+/// polling tick of each other).
+const BACKOFF_DEBOUNCE_FALLBACK: Duration = Duration::from_millis(500);
+
 struct WindowState {
     /// Fractional so additive growth/multiplicative backoff compose
     /// smoothly across many calls instead of getting stuck at an integer
@@ -63,6 +86,12 @@ struct WindowState {
     /// for callers.
     window: f64,
     smoothed_rtt: Option<Duration>,
+    /// When the most recent multiplicative decrease was actually applied
+    /// -- `None` until the first one. See `BACKOFF_DEBOUNCE_FALLBACK`'s
+    /// own doc comment for why repeated timeout/congestion signals within
+    /// one debounce window collapse into a single backoff instead of each
+    /// halving the window independently.
+    last_backoff: Option<Instant>,
 }
 
 /// Per-peer AIMD in-flight window controller. `min`/`max` are fixed for
@@ -88,7 +117,11 @@ impl AdaptiveWindow {
         Self {
             min,
             max,
-            state: StdMutex::new(WindowState { window: initial as f64, smoothed_rtt: None }),
+            state: StdMutex::new(WindowState {
+                window: initial as f64,
+                smoothed_rtt: None,
+                last_backoff: None,
+            }),
         }
     }
 
@@ -108,8 +141,52 @@ impl AdaptiveWindow {
     /// the same "or RTT inflation" back-off trigger `on_timeout` also
     /// uses, just observed via latency rather than an outright missing
     /// reply.
-    pub fn on_success(&self, rtt: Duration) {
+    ///
+    /// `queue_position` is how many requests to this same peer were
+    /// outstanding at the moment THIS one was sent, this one included (so
+    /// `1` means it had no live sibling at send time, i.e. an ISOLATED
+    /// round trip).
+    ///
+    /// It matters because this controller's whole reason for existing is
+    /// to size a PIPELINE (see this module's own doc comment): once more
+    /// than one request to a peer is in flight at once, that peer's own
+    /// dispatch order need not match send order at all -- confirmed
+    /// directly, a real 8-request burst answered in positions
+    /// `8,6,1,7,4,5,2,3` relative to send order, not the strictly serial
+    /// FIFO a naive model assumes. A pipelined reply's elapsed time is
+    /// therefore not attributable to any fixed share of "this request's
+    /// real round trip" -- it is contaminated by however much of every
+    /// OTHER concurrently in-flight request's own service time happened
+    /// to land ahead of it, in an order this controller cannot recover
+    /// after the fact. Reading that contaminated latency as RTT inflation
+    /// used to collapse the window to `min` on the very first real
+    /// multi-block transfer regardless of how healthy the link actually
+    /// was -- the opposite of this controller's purpose.
+    ///
+    /// So a pipelined sample (`queue_position > 1`) never touches the RTT
+    /// baseline and never triggers the inflation back-off -- there is no
+    /// way to tell, from latency alone, whether it reflects the link or
+    /// simply its siblings' own work ahead of it. It still grows the
+    /// window additively: a successful reply under real concurrent load
+    /// IS positive evidence this many requests in flight is sustainable,
+    /// regardless of the shape of any one reply's latency. Only an
+    /// ISOLATED sample (`queue_position <= 1`, no sibling in flight when
+    /// it was sent) is trustworthy evidence of the link's own RTT, so
+    /// only isolated samples update the smoothed baseline and can trigger
+    /// the multiplicative back-off. Real degradation under concurrent
+    /// load is still caught -- just via `on_timeout`/`on_congestion`
+    /// (explicit loss and explicit `Busy`), which this change does not
+    /// touch, rather than via inferring it from a queued reply's latency.
+    pub fn on_success(&self, rtt: Duration, queue_position: usize) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if queue_position > 1 {
+            // Pipelined: real success, but its latency proves nothing
+            // about the link on its own (see this function's own doc
+            // comment) -- grow, but leave the RTT baseline and the
+            // inflation check alone.
+            state.window = (state.window + ADDITIVE_INCREASE_STEP).min(self.max as f64);
+            return;
+        }
         let rtt_secs = rtt.as_secs_f64();
         let inflated = match state.smoothed_rtt {
             Some(baseline) if baseline.as_secs_f64() > 0.0 => {
@@ -126,7 +203,7 @@ impl AdaptiveWindow {
             ),
         });
         if inflated {
-            state.window = (state.window * MULTIPLICATIVE_DECREASE_FACTOR).max(self.min as f64);
+            self.apply_debounced_backoff(&mut state);
         } else {
             state.window = (state.window + ADDITIVE_INCREASE_STEP).min(self.max as f64);
         }
@@ -141,7 +218,7 @@ impl AdaptiveWindow {
     /// not just above).
     pub fn on_timeout(&self) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        state.window = (state.window * MULTIPLICATIVE_DECREASE_FACTOR).max(self.min as f64);
+        self.apply_debounced_backoff(&mut state);
     }
 
     /// Records an explicit congestion signal that is neither a healthy
@@ -158,7 +235,26 @@ impl AdaptiveWindow {
     /// healthy RTT -> window grows -> more requests sent -> more Busy).
     pub fn on_congestion(&self) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        self.apply_debounced_backoff(&mut state);
+    }
+
+    /// Applies one multiplicative decrease, unless a backoff already
+    /// landed within the current debounce window (the smoothed RTT once
+    /// known, `BACKOFF_DEBOUNCE_FALLBACK` before that) -- see
+    /// `WindowState::last_backoff` and `BACKOFF_DEBOUNCE_FALLBACK`'s own
+    /// doc comments for why. Debounced calls are a deliberate no-op: they
+    /// still represent real signals (the peer/link genuinely is
+    /// congested), just not NEW evidence beyond what the most recent
+    /// backoff already accounted for.
+    fn apply_debounced_backoff(&self, state: &mut WindowState) {
+        let debounce_window = state.smoothed_rtt.unwrap_or(BACKOFF_DEBOUNCE_FALLBACK);
+        let debounced =
+            state.last_backoff.is_some_and(|last| last.elapsed() < debounce_window);
+        if debounced {
+            return;
+        }
         state.window = (state.window * MULTIPLICATIVE_DECREASE_FACTOR).max(self.min as f64);
+        state.last_backoff = Some(Instant::now());
     }
 }
 
@@ -197,7 +293,7 @@ mod tests {
         let w = AdaptiveWindow::new(4, 1, ceiling, ceiling);
         let before = w.current();
         for _ in 0..5 {
-            w.on_success(Duration::from_millis(10));
+            w.on_success(Duration::from_millis(10), 1);
         }
         let after_five = w.current();
         assert!(after_five > before, "window should have grown: {before} -> {after_five}");
@@ -206,7 +302,7 @@ mod tests {
         // ceiling holds even under sustained "ideal" input, not just a
         // handful of samples.
         for _ in 0..500 {
-            w.on_success(Duration::from_millis(10));
+            w.on_success(Duration::from_millis(10), 1);
         }
         assert!(
             w.current() <= ceiling,
@@ -224,16 +320,28 @@ mod tests {
     /// proof: grow the window under good conditions, then inject
     /// timeouts (simulating packet loss / an unresponsive peer) and show
     /// the window actually shrinks, floored at `min`.
+    ///
+    /// Each injected timeout is spaced past the debounce window (see
+    /// `apply_debounced_backoff`'s own doc comment): this test is about
+    /// SEPARATE, real congestion episodes over time, distinct from
+    /// `repeated_timeouts_from_one_burst_collapse_to_a_single_backoff`
+    /// below, which specifically proves several timeouts arriving
+    /// together do NOT each apply their own backoff.
     #[test]
     fn shrinks_multiplicatively_on_injected_timeouts_and_floors_at_min() {
         let w = AdaptiveWindow::new(4, 1, 64, 64);
         for _ in 0..20 {
-            w.on_success(Duration::from_millis(10));
+            w.on_success(Duration::from_millis(10), 1);
         }
         let grown = w.current();
         assert!(grown > 4, "should have grown from the initial 4 first, got {grown}");
 
-        for _ in 0..30 {
+        // The growth phase above established a ~10ms smoothed RTT, which
+        // `on_timeout` itself never touches but which IS what the
+        // debounce window reads -- so a real gap comfortably above 10ms
+        // between calls is enough for each to count as a separate episode.
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(20));
             w.on_timeout();
         }
         let shrunk = w.current();
@@ -244,6 +352,45 @@ mod tests {
         assert_eq!(shrunk, 1, "sustained loss should floor the window at min, got {shrunk}");
     }
 
+    /// R3g: several concurrent requests launched together share ONE
+    /// underlying congestion event -- if that event causes more than one
+    /// of them to time out, each `on_timeout` call is a signal about the
+    /// SAME episode, not independent evidence of repeated NEW congestion.
+    /// Confirmed as a real bug, not a theoretical one: an initial 8-
+    /// request burst produced 4 near-simultaneous timeouts, collapsing a
+    /// window of 4 to its floor of 1 within a single dispatch attempt
+    /// (`topology_simultaneous_reconnect_and_relay_hydration_failure.rs`'s
+    /// relay-recovery scenario).
+    #[test]
+    fn repeated_timeouts_from_one_burst_collapse_to_a_single_backoff() {
+        let w = AdaptiveWindow::new(4, 1, 64, 64);
+        // No RTT baseline yet (`on_timeout` never sets one), so the
+        // debounce window is `BACKOFF_DEBOUNCE_FALLBACK` -- these 4 calls,
+        // fired back-to-back with no delay, land well inside it.
+        for _ in 0..4 {
+            w.on_timeout();
+        }
+        assert_eq!(
+            w.current(),
+            2,
+            "4 near-simultaneous timeouts from one burst must apply exactly one halving \
+             (4 -> 2), not one independent halving per signal (which would floor to 1)"
+        );
+    }
+
+    /// The debounce window is not a permanent latch: once it genuinely
+    /// elapses, the NEXT timeout is treated as a new episode and backs
+    /// off again.
+    #[test]
+    fn a_timeout_after_the_debounce_window_elapses_applies_a_new_backoff() {
+        let w = AdaptiveWindow::new(4, 1, 64, 64);
+        w.on_timeout();
+        assert_eq!(w.current(), 2, "first timeout must apply its own halving");
+        std::thread::sleep(BACKOFF_DEBOUNCE_FALLBACK + Duration::from_millis(50));
+        w.on_timeout();
+        assert_eq!(w.current(), 1, "a timeout genuinely after the debounce window must back off again");
+    }
+
     /// Regression: `Busy` (an explicit, fast congestion signal -- see
     /// `on_congestion`'s own doc comment for why this must never reach
     /// `on_success`) must shrink the window like a timeout, not grow it
@@ -251,16 +398,21 @@ mod tests {
     /// calls specifically (not `on_timeout`) so this test would catch a
     /// regression that routed `Busy` through the wrong method even if
     /// `on_timeout` itself stayed correct.
+    ///
+    /// Spaced past the debounce window for the same reason `shrinks_
+    /// multiplicatively_on_injected_timeouts_and_floors_at_min` is -- see
+    /// that test's own doc comment.
     #[test]
     fn on_congestion_shrinks_multiplicatively_and_never_grows_the_window() {
         let w = AdaptiveWindow::new(4, 1, 64, 64);
         for _ in 0..20 {
-            w.on_success(Duration::from_millis(10));
+            w.on_success(Duration::from_millis(10), 1);
         }
         let grown = w.current();
         assert!(grown > 4, "should have grown from the initial 4 first, got {grown}");
 
-        for _ in 0..30 {
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(20));
             w.on_congestion();
         }
         let shrunk = w.current();
@@ -294,7 +446,7 @@ mod tests {
     fn shrinks_on_rtt_inflation_without_any_explicit_timeout() {
         let w = AdaptiveWindow::new(4, 1, 64, 64);
         for _ in 0..10 {
-            w.on_success(Duration::from_millis(10));
+            w.on_success(Duration::from_millis(10), 1);
         }
         let grown = w.current();
         assert!(grown > 4);
@@ -303,11 +455,74 @@ mod tests {
         // round trip is now several times slower than the established
         // baseline (RTT inflation, not loss).
         for _ in 0..10 {
-            w.on_success(Duration::from_millis(200));
+            w.on_success(Duration::from_millis(200), 1);
         }
         assert!(
             w.current() < grown,
             "RTT inflation alone (no explicit timeout) should still shrink the window: {grown} -> {}",
+            w.current()
+        );
+    }
+
+    /// Regression: a healthy link served through a deep, REAL pipeline
+    /// (replies arriving out of send order, not the strictly serial FIFO a
+    /// naive model would assume) must not read as RTT inflation just
+    /// because a queued reply's own elapsed time is large. This is a real
+    /// captured 8-request burst, `(elapsed_us, queue_position_at_send)` in
+    /// actual arrival order -- notice positions arrive as `8,6,1,7,4,5,2,3`
+    /// relative to send order, and elapsed time does not track position at
+    /// all (see `on_success`'s own doc comment for how this was captured).
+    /// Under the naive per-reply-RTT design this controller shipped with,
+    /// several of these would have read as inflation and collapsed the
+    /// window to `min`; here every entry but the one true isolated sample
+    /// (`queue_position == 1`) must be treated as pipelined and grow the
+    /// window regardless of its own elapsed time.
+    #[test]
+    fn pipelined_replies_out_of_send_order_never_read_as_inflation() {
+        let w = AdaptiveWindow::new(4, 1, 64, 64);
+        let before = w.current();
+        const REAL_BURST: [(u64, usize); 8] = [
+            (11_903, 8),
+            (18_616, 6),
+            (29_922, 1),
+            (40_668, 7),
+            (51_561, 4),
+            (60_998, 5),
+            (64_522, 2),
+            (68_075, 3),
+        ];
+        for (elapsed_us, queue_position) in REAL_BURST {
+            w.on_success(Duration::from_micros(elapsed_us), queue_position);
+        }
+        assert!(
+            w.current() > before,
+            "a real pipelined burst, however out of order or however large any single \
+             reply's own latency, must never collapse the window: {before} -> {}",
+            w.current()
+        );
+    }
+
+    /// Complementary regression: an ISOLATED reply (`queue_position == 1`,
+    /// no sibling in flight at send time) is the one case where a large
+    /// latency IS trustworthy evidence of real degradation, and must still
+    /// shrink the window exactly as before this change -- otherwise this
+    /// fix would have traded a false-negative-proof controller (always
+    /// grows) for the false-positive-proof one it replaced.
+    #[test]
+    fn an_isolated_slow_reply_still_shrinks_the_window() {
+        let w = AdaptiveWindow::new(4, 1, 64, 64);
+        for _ in 0..10 {
+            w.on_success(Duration::from_millis(10), 1);
+        }
+        let grown = w.current();
+        assert!(grown > 4);
+        for _ in 0..10 {
+            w.on_success(Duration::from_millis(200), 1);
+        }
+        assert!(
+            w.current() < grown,
+            "an isolated (unpipelined) slow reply must still read as RTT inflation: \
+             {grown} -> {}",
             w.current()
         );
     }
@@ -319,7 +534,7 @@ mod tests {
     fn recovers_and_grows_again_after_conditions_improve() {
         let w = AdaptiveWindow::new(4, 1, 64, 64);
         for _ in 0..20 {
-            w.on_success(Duration::from_millis(10));
+            w.on_success(Duration::from_millis(10), 1);
         }
         let grown = w.current();
 
@@ -334,7 +549,7 @@ mod tests {
         // stable samples (the EWMA re-converges) and confirm real growth
         // resumes from the shrunk point.
         for _ in 0..40 {
-            w.on_success(Duration::from_millis(10));
+            w.on_success(Duration::from_millis(10), 1);
         }
         assert!(
             w.current() > shrunk,
@@ -355,7 +570,13 @@ mod tests {
     #[test]
     fn min_floor_is_at_least_one_even_if_zero_is_requested() {
         let w = AdaptiveWindow::new(4, 0, 64, 64);
-        for _ in 0..1000 {
+        // No RTT baseline (`on_timeout` never sets one), so each call must
+        // be spaced past `BACKOFF_DEBOUNCE_FALLBACK` to count as a
+        // separate episode -- see `repeated_timeouts_from_one_burst_
+        // collapse_to_a_single_backoff`'s own doc comment for why rapid
+        // repeated calls no longer each apply their own halving.
+        for _ in 0..4 {
+            std::thread::sleep(BACKOFF_DEBOUNCE_FALLBACK + Duration::from_millis(50));
             w.on_timeout();
         }
         assert_eq!(w.current(), 1, "a peer must always get at least one in-flight slot");

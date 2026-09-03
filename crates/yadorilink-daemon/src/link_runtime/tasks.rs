@@ -88,6 +88,160 @@ pub(crate) fn spawn_accumulator_task(
     })
 }
 
+/// Whether tombstone suppression may be cleared after checking (and, if
+/// actually pending, running) duplicate-root recovery for this startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DuplicateRecoveryOutcome {
+    /// Nothing was pending, or a pending set fully resolved: suppression
+    /// may be cleared.
+    Complete,
+    /// A pending set still has unresolved paths: keep suppression armed.
+    StillPending,
+    /// The durable pending state could not be read at all: fail closed,
+    /// keep suppression armed.
+    UnknownFailClosed,
+}
+
+/// The duplicate-root recovery gate: `corroborate_and_resolve` (the
+/// expensive per-live-row pass -- re-reading/re-hashing every live indexed
+/// file against disk) must run ONLY when durable state says duplicate-root
+/// recovery is actually pending for this group. An ordinary startup with
+/// nothing pending must not pay for a full content pass over the linked
+/// folder just to find out there is nothing to do.
+///
+/// Every real dependency is taken as an already-resolved value or an
+/// injected closure precisely so a unit test can prove
+/// `corroborate_and_resolve` is never invoked on the "not pending" path
+/// without needing a real index or disk -- see `tests` below.
+fn resolve_duplicate_recovery_gate<E: std::fmt::Display>(
+    group_id: &str,
+    pending: Result<bool, E>,
+    corroborate_and_resolve: impl FnOnce(),
+    recheck_pending: impl FnOnce() -> Result<bool, E>,
+) -> DuplicateRecoveryOutcome {
+    match pending {
+        Ok(false) => DuplicateRecoveryOutcome::Complete,
+        Ok(true) => {
+            corroborate_and_resolve();
+            match recheck_pending() {
+                Ok(false) => DuplicateRecoveryOutcome::Complete,
+                Ok(true) => DuplicateRecoveryOutcome::StillPending,
+                Err(error) => {
+                    tracing::warn!(
+                        group_id = %group_id,
+                        error = %error,
+                        "could not re-check duplicate-recovery state after corroboration; \
+                         keeping deletion suppression fail-closed"
+                    );
+                    DuplicateRecoveryOutcome::UnknownFailClosed
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                group_id = %group_id,
+                error = %error,
+                "could not determine duplicate-recovery state; keeping deletion \
+                 suppression fail-closed"
+            );
+            DuplicateRecoveryOutcome::UnknownFailClosed
+        }
+    }
+}
+
+/// The synchronous pass that runs immediately after a link's initial scan:
+/// re-checks disk/index convergence for the duplicate-root recovery gate, then
+/// bootstraps this group's change history from the rows the scan just wrote.
+/// Returns the startup failure string, if any, for the caller's retry loop.
+///
+/// Extracted from `spawn_executor_task` so it can be handed to `spawn_blocking`
+/// whole. Both halves are open-ended in exactly the way the scan that precedes
+/// them is: `list_files` reads this group's entire index,
+/// `indexed_path_is_corroborated` re-reads and re-hashes every live indexed
+/// file against its recorded blocks (a full content pass over the linked
+/// folder) -- but only when `resolve_duplicate_recovery_gate` determines
+/// duplicate-root recovery is actually pending -- and
+/// `ensure_initial_change_history` converts the whole index into signed
+/// history. Run inline on the executor task, all of that holds the polling
+/// worker for its duration on every link start.
+fn post_scan_convergence_and_history(
+    deps: &Arc<LinkRuntimeDependencies>,
+    local_path: &str,
+    group_id: &str,
+    root: &std::path::Path,
+    records_is_empty: bool,
+) -> Option<String> {
+    let mut history_failure = None;
+    // A successful *additive* scan proves only that present
+    // disk entries were indexed. It deliberately leaves live
+    // rows originating at the departed duplicate root intact,
+    // so it does not prove disk/index convergence. Keep the
+    // deletion gate armed until every live indexed path is
+    // present; otherwise the next authoritative scan would
+    // tombstone precisely the rows recovery preserved.
+    let outcome = resolve_duplicate_recovery_gate(
+        group_id,
+        deps.replica_coordinator.link_repository().duplicate_recovery_pending(group_id),
+        || {
+            if let Ok(rows) = deps.replica_coordinator.file_index_repository().list_files(group_id)
+            {
+                for row in rows.into_iter().filter(|row| !row.deleted) {
+                    if matches!(
+                        deps.replica_coordinator.indexed_path_is_corroborated(root, group_id, &row),
+                        Ok(true)
+                    ) {
+                        if let Err(error) = deps
+                            .replica_coordinator
+                            .link_repository()
+                            .resolve_duplicate_recovery_path(group_id, &row.path)
+                        {
+                            tracing::warn!(group_id = %group_id, path = %row.path, error = %error, "could not persist duplicate-recovery path progress");
+                        }
+                    }
+                }
+            }
+        },
+        || deps.replica_coordinator.link_repository().duplicate_recovery_pending(group_id),
+    );
+    if outcome == DuplicateRecoveryOutcome::Complete {
+        if let Err(e) =
+            deps.replica_coordinator.link_repository().set_suppress_tombstones(local_path, false)
+        {
+            tracing::warn!(
+                local_path = %local_path,
+                error = %e,
+                "could not clear this link's additive-scan flag after disk/index \
+                 convergence; its deletions stay suppressed until this succeeds"
+            );
+        }
+    }
+    // `scan_existing_files_with_ignore` uses the batched index
+    // writer and therefore does not append DAG changes itself.
+    // Re-run the idempotent import after the rows exist so a peer
+    // that negotiates change-history sync has heads to request.
+    if !records_is_empty {
+        // Re-establish DAG heads now that the batched scan's rows
+        // exist, so a peer negotiating change-history sync has heads
+        // to request. `ensure_initial_change_history` fails closed
+        // (a registered device with no signing key is a
+        // configuration error, not a legitimate no-emitter path --
+        // see its own doc comment), so any error here is surfaced
+        // rather than silently discarded, keeping a missing
+        // post-scan history bootstrap observable instead of failing
+        // invisibly.
+        if let Err(error) = ensure_initial_change_history(deps, group_id) {
+            tracing::error!(
+                local_path = %local_path,
+                group_id = %group_id,
+                error = %error,
+                "post-scan change-history bootstrap failed; group startup remains closed"
+            );
+            history_failure = Some(format!("post-scan change-history bootstrap failed: {error}"));
+        }
+    }
+    history_failure
+}
+
 /// The executor task: this link's startup scan+redrive retry loop (which
 /// resolves `startup_ready_guard`), then the live flush loop that consumes
 /// `flush_rx` for the rest of this link's lifetime.
@@ -191,86 +345,52 @@ pub(crate) fn spawn_executor_task(
             };
             let scan_failure: Option<String> = match scan_result {
                 Ok(Ok(records)) => {
-                    let mut history_failure = None;
-                    // A successful *additive* scan proves only that present
-                    // disk entries were indexed. It deliberately leaves live
-                    // rows originating at the departed duplicate root intact,
-                    // so it does not prove disk/index convergence. Keep the
-                    // deletion gate armed until every live indexed path is
-                    // present; otherwise the next authoritative scan would
-                    // tombstone precisely the rows recovery preserved.
-                    if let Ok(rows) = executor_deps
-                        .replica_coordinator
-                        .file_index_repository()
-                        .list_files(&executor_group_id)
-                    {
-                        for row in rows.into_iter().filter(|row| !row.deleted) {
-                            if matches!(
-                                executor_deps.replica_coordinator.indexed_path_is_corroborated(
-                                    executor_root.as_path(),
-                                    &executor_group_id,
-                                    &row,
-                                ),
-                                Ok(true)
-                            ) {
-                                if let Err(error) = executor_deps
-                                    .replica_coordinator
-                                    .link_repository()
-                                    .resolve_duplicate_recovery_path(&executor_group_id, &row.path)
-                                {
-                                    tracing::warn!(group_id = %executor_group_id, path = %row.path, error = %error, "could not persist duplicate-recovery path progress");
-                                }
+                    // Offloaded for the same reason the scan above is, with
+                    // the same deterministic-simulator exception -- see
+                    // `post_scan_convergence_and_history`'s own doc for what
+                    // runs in there. A panicking blocking task is folded into
+                    // the same startup-failure string the scan task's own
+                    // `JoinError` produces, so this link's bounded startup
+                    // retry can re-run it rather than wedging the group's gate.
+                    #[cfg(not(madsim))]
+                    let history_failure = {
+                        let deps = executor_deps.clone();
+                        let local_path = executor_local_path.clone();
+                        let group_id = executor_group_id.clone();
+                        let root = executor_root.clone();
+                        let records_is_empty = records.is_empty();
+                        match tokio::task::spawn_blocking(move || {
+                            post_scan_convergence_and_history(
+                                &deps,
+                                &local_path,
+                                &group_id,
+                                &root,
+                                records_is_empty,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(history_failure) => history_failure,
+                            Err(join_err) => {
+                                tracing::warn!(
+                                    error = %join_err,
+                                    local_path = %executor_local_path,
+                                    "post-scan convergence/history task panicked"
+                                );
+                                Some(format!(
+                                    "post-scan convergence/history task panicked: {join_err}"
+                                ))
                             }
                         }
-                    }
-                    let recovery_complete = matches!(
-                        executor_deps
-                            .replica_coordinator
-                            .link_repository()
-                            .duplicate_recovery_pending(&executor_group_id),
-                        Ok(false)
+                    };
+                    #[cfg(madsim)]
+                    let history_failure = post_scan_convergence_and_history(
+                        &executor_deps,
+                        &executor_local_path,
+                        &executor_group_id,
+                        &executor_root,
+                        records.is_empty(),
                     );
-                    if recovery_complete {
-                        if let Err(e) = executor_deps
-                            .replica_coordinator
-                            .link_repository()
-                            .set_suppress_tombstones(&executor_local_path, false)
-                        {
-                            tracing::warn!(
-                                local_path = %executor_local_path,
-                                error = %e,
-                                "could not clear this link's additive-scan flag after disk/index \
-                                 convergence; its deletions stay suppressed until this succeeds"
-                            );
-                        }
-                    }
-                    // `scan_existing_files_with_ignore` uses the batched index
-                    // writer and therefore does not append DAG changes itself.
-                    // Re-run the idempotent import after the rows exist so a peer
-                    // that negotiates change-history sync has heads to request.
-                    if !records.is_empty() {
-                        // Re-establish DAG heads now that the batched scan's rows
-                        // exist, so a peer negotiating change-history sync has heads
-                        // to request. `ensure_initial_change_history` fails closed
-                        // (a registered device with no signing key is a
-                        // configuration error, not a legitimate no-emitter path --
-                        // see its own doc comment), so any error here is surfaced
-                        // rather than silently discarded, keeping a missing
-                        // post-scan history bootstrap observable instead of failing
-                        // invisibly.
-                        if let Err(error) =
-                            ensure_initial_change_history(&executor_deps, &executor_group_id)
-                        {
-                            tracing::error!(
-                                local_path = %executor_local_path,
-                                group_id = %executor_group_id,
-                                error = %error,
-                                "post-scan change-history bootstrap failed; group startup remains closed"
-                            );
-                            history_failure =
-                                Some(format!("post-scan change-history bootstrap failed: {error}"));
-                        }
-                    }
                     // One batched broadcast for the whole initial scan
                     // (batch processing) instead of one peer message per
                     // pre-existing file.
@@ -394,8 +514,27 @@ pub(crate) fn spawn_executor_task(
                 startup_ready_guard.mark_failed(reason);
             }
         }
+        // Kept at `debug!` (downgraded 2026-09-01 from an investigation-era
+        // `warn!`, which fired on every debounced flush -- too noisy for
+        // production `warn!` on an active sync): is the executor task
+        // still alive and draining flushes, or stuck?
+        let mut c4_attr_flushes_received: u64 = 0;
+        let mut c4_attr_flushes_completed: u64 = 0;
         while let Some(flush) = flush_rx.recv().await {
-            let burst_fallback = matches!(flush, DebounceFlush::BurstFallback);
+            c4_attr_flushes_received += 1;
+            let c4_attr_flush_kind = if matches!(flush, DebounceFlush::RescanRequired) {
+                "RescanRequired"
+            } else {
+                "Paths"
+            };
+            let c4_attr_start = std::time::Instant::now();
+            tracing::debug!(
+                flush_kind = c4_attr_flush_kind,
+                flushes_received_total = c4_attr_flushes_received,
+                flushes_completed_total = c4_attr_flushes_completed,
+                "C4_ATTR_EXECUTOR flush received"
+            );
+            let burst_fallback = matches!(flush, DebounceFlush::RescanRequired);
             let ignore_file_changed = flush_touches_ignore_file(&executor_canonical_root, &flush);
             if burst_fallback || ignore_file_changed {
                 match EffectiveIgnoreSet::load_for_link_root(&executor_root) {
@@ -413,20 +552,25 @@ pub(crate) fn spawn_executor_task(
                     group_id = %executor_group_id,
                     "ignore patterns changed; running a full reconciliation scan"
                 );
-                DebounceFlush::BurstFallback
+                DebounceFlush::RescanRequired
             } else {
                 flush
             };
             if burst_fallback {
-                // Every fallback trigger is logged, not silent.
+                // Every fallback trigger is logged, not silent. A large but
+                // fully-known event burst no longer reaches `RescanRequired`
+                // at all (see `debounce.rs`'s own doc comment) -- reaching
+                // this arm now means precision was genuinely lost (a real
+                // watcher-channel overflow, or the executor backlog merge
+                // already having absorbed one).
                 tracing::warn!(
                     local_path = %executor_local_path,
                     group_id = %executor_group_id,
-                    "event burst exceeded the debounce threshold; falling back to a full reconciliation scan"
+                    "debounce reported a full reconciliation scan is required"
                 );
             }
             // `process_flush` chunks every
-            // touched file (or, for a `BurstFallback`, runs the same
+            // touched file (or, for a `RescanRequired`, runs the same
             // full-scan chunking as above) directly on whatever worker
             // polls this future — same blocking-runtime hazard as the
             // initial scan. `process_flush` is `async` (it holds an async
@@ -443,46 +587,147 @@ pub(crate) fn spawn_executor_task(
             // across the whole `block_in_place`/`block_on` call so an
             // update install never starts mid-flush.
             let _write_activity = executor_deps.begin_write_activity();
-            #[cfg(not(madsim))]
-            let flush_result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(
-                    executor_processor.process_flush_with_ignore(
+            if burst_fallback {
+                // A `RescanRequired` full-reconciliation scan already commits
+                // its detected changes to the DAG in durable, bounded chunks
+                // as it walks (`reconcile_disk_with_ignore`'s own chunk
+                // loop) -- but until this fix, nothing surfaced that
+                // progress to connected peers until the WHOLE scan returned.
+                // For a real 15,000-file scan that withheld peer visibility
+                // for the scan's entire length (measured: ~75s of zero
+                // peer-visible progress, C4 15k live-burst investigation,
+                // 2026-09-01) even though the source device's own index/DAG
+                // kept advancing the whole time -- a head-of-line-blocking
+                // bug, not a correctness one. Streaming each durably-
+                // committed chunk to `announce_local_change` as it lands
+                // fixes this without changing what gets committed, in what
+                // order, or when: only when each already-durable chunk
+                // becomes peer-visible.
+                let (chunk_tx, mut chunk_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<Vec<yadorilink_replica_domain::file::FileRecord>>();
+                let announce_deps = executor_deps.clone();
+                let announce_local_path = executor_local_path.clone();
+                let announce_group_id = executor_group_id.clone();
+                let announce_task = tokio::spawn(async move {
+                    while let Some(records) = chunk_rx.recv().await {
+                        announce_local_change(
+                            &announce_deps,
+                            &announce_local_path,
+                            &announce_group_id,
+                            records,
+                        )
+                        .await;
+                    }
+                });
+
+                #[cfg(not(madsim))]
+                let flush_result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        executor_processor.process_flush_with_ignore_streaming(
+                            &executor_group_id,
+                            &executor_root,
+                            flush,
+                            executor_ignore_set.as_ref(),
+                            &mut |chunk_records| {
+                                let _ = chunk_tx.send(chunk_records.to_vec());
+                            },
+                        ),
+                    )
+                });
+                // See the non-streaming arm below for why madsim awaits
+                // directly instead of using `block_in_place`.
+                #[cfg(madsim)]
+                let flush_result = executor_processor
+                    .process_flush_with_ignore_streaming(
                         &executor_group_id,
                         &executor_root,
                         flush,
                         executor_ignore_set.as_ref(),
-                    ),
-                )
-            });
-            // The deterministic simulator runs a single-threaded runtime:
-            // `block_in_place` and a nested `Handle::block_on` both panic
-            // there. `process_flush_with_ignore` is already `async`, so
-            // awaiting it directly drives the exact same work to the exact
-            // same result — the `block_in_place` wrapper above is only a
-            // multi-thread runtime-hygiene optimization (offloading the
-            // synchronous chunk/hash/write bursts onto a sibling worker),
-            // which has no meaning under the single-threaded simulator.
-            #[cfg(madsim)]
-            let flush_result = executor_processor
-                .process_flush_with_ignore(
-                    &executor_group_id,
-                    &executor_root,
-                    flush,
-                    executor_ignore_set.as_ref(),
-                )
-                .await;
-            match flush_result {
-                Ok(outcome) => {
-                    announce_local_change(
-                        &executor_deps,
-                        &executor_local_path,
-                        &executor_group_id,
-                        outcome.records,
+                        &mut |chunk_records| {
+                            let _ = chunk_tx.send(chunk_records.to_vec());
+                        },
                     )
                     .await;
-                }
-                Err(e) => {
+                // Closes the channel so `announce_task`'s `while let Some`
+                // ends once every already-sent chunk is drained, then waits
+                // for that draining to actually finish before this flush is
+                // considered complete (so `flushes_completed_total`/the
+                // completion log below stay accurate, and so a later flush's
+                // own writes never race this one's still-in-flight
+                // announcements).
+                drop(chunk_tx);
+                let _ = announce_task.await;
+
+                c4_attr_flushes_completed += 1;
+                tracing::debug!(
+                    flush_kind = c4_attr_flush_kind,
+                    flushes_received_total = c4_attr_flushes_received,
+                    flushes_completed_total = c4_attr_flushes_completed,
+                    elapsed_ms = c4_attr_start.elapsed().as_millis() as u64,
+                    ok = flush_result.is_ok(),
+                    records = flush_result.as_ref().map(|o| o.records.len()).unwrap_or(0),
+                    "C4_ATTR_EXECUTOR flush completed"
+                );
+                // `outcome.records` is deliberately NOT passed to
+                // `announce_local_change` again here -- every record it
+                // contains was already announced, per chunk, as
+                // `on_chunk_committed` fired above. Doing so again would
+                // double-announce the whole scan.
+                if let Err(e) = flush_result {
                     tracing::warn!(error = %e, local_path = %executor_local_path, "failed to process a local-change batch")
+                }
+            } else {
+                #[cfg(not(madsim))]
+                let flush_result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        executor_processor.process_flush_with_ignore(
+                            &executor_group_id,
+                            &executor_root,
+                            flush,
+                            executor_ignore_set.as_ref(),
+                        ),
+                    )
+                });
+                // The deterministic simulator runs a single-threaded runtime:
+                // `block_in_place` and a nested `Handle::block_on` both panic
+                // there. `process_flush_with_ignore` is already `async`, so
+                // awaiting it directly drives the exact same work to the exact
+                // same result — the `block_in_place` wrapper above is only a
+                // multi-thread runtime-hygiene optimization (offloading the
+                // synchronous chunk/hash/write bursts onto a sibling worker),
+                // which has no meaning under the single-threaded simulator.
+                #[cfg(madsim)]
+                let flush_result = executor_processor
+                    .process_flush_with_ignore(
+                        &executor_group_id,
+                        &executor_root,
+                        flush,
+                        executor_ignore_set.as_ref(),
+                    )
+                    .await;
+                c4_attr_flushes_completed += 1;
+                tracing::debug!(
+                    flush_kind = c4_attr_flush_kind,
+                    flushes_received_total = c4_attr_flushes_received,
+                    flushes_completed_total = c4_attr_flushes_completed,
+                    elapsed_ms = c4_attr_start.elapsed().as_millis() as u64,
+                    ok = flush_result.is_ok(),
+                    records = flush_result.as_ref().map(|o| o.records.len()).unwrap_or(0),
+                    "C4_ATTR_EXECUTOR flush completed"
+                );
+                match flush_result {
+                    Ok(outcome) => {
+                        announce_local_change(
+                            &executor_deps,
+                            &executor_local_path,
+                            &executor_group_id,
+                            outcome.records,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, local_path = %executor_local_path, "failed to process a local-change batch")
+                    }
                 }
             }
         }
@@ -548,6 +793,98 @@ pub(crate) fn flush_touches_ignore_file(root: &std::path::Path, flush: &Debounce
         DebounceFlush::Paths(paths) => paths.iter().any(|(path, _, _)| {
             path.strip_prefix(root).ok().is_some_and(is_ignore_file_relative_path)
         }),
-        DebounceFlush::BurstFallback => false,
+        DebounceFlush::RescanRequired => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_duplicate_recovery_gate, DuplicateRecoveryOutcome};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FakeError;
+
+    impl std::fmt::Display for FakeError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "fake error")
+        }
+    }
+
+    // Ordinary startup: nothing pending. The expensive corroboration pass
+    // must never run -- proven directly (not via timing) by panicking if
+    // the closure is ever invoked, and `recheck_pending` must likewise
+    // never be consulted since there was nothing to recheck.
+    #[test]
+    fn no_recovery_pending_skips_corroboration_and_completes_immediately() {
+        let outcome = resolve_duplicate_recovery_gate::<FakeError>(
+            "group",
+            Ok(false),
+            || panic!("corroborate_and_resolve must not run when nothing is pending"),
+            || panic!("recheck_pending must not run when nothing was pending to begin with"),
+        );
+        assert_eq!(outcome, DuplicateRecoveryOutcome::Complete);
+    }
+
+    // Armed recovery, fully resolved this pass: corroboration runs exactly
+    // once and, since the durable pending set is now empty, the gate
+    // reports Complete so suppression may clear.
+    #[test]
+    fn pending_recovery_runs_corroboration_once_and_completes_when_pending_clears() {
+        let mut corroborate_calls = 0;
+        let outcome = resolve_duplicate_recovery_gate(
+            "group",
+            Ok::<bool, FakeError>(true),
+            || corroborate_calls += 1,
+            || Ok(false),
+        );
+        assert_eq!(corroborate_calls, 1);
+        assert_eq!(outcome, DuplicateRecoveryOutcome::Complete);
+    }
+
+    // Armed recovery, still unresolved after this pass (some paths were
+    // not corroborated): suppression must stay armed.
+    #[test]
+    fn pending_recovery_stays_pending_when_recheck_still_reports_pending() {
+        let mut corroborate_calls = 0;
+        let outcome = resolve_duplicate_recovery_gate(
+            "group",
+            Ok::<bool, FakeError>(true),
+            || corroborate_calls += 1,
+            || Ok(true),
+        );
+        assert_eq!(corroborate_calls, 1);
+        assert_eq!(outcome, DuplicateRecoveryOutcome::StillPending);
+    }
+
+    // Corroboration ran, but the post-corroboration recheck itself could
+    // not be read: fail closed exactly like the initial-read failure does,
+    // not optimistically treated as resolved.
+    #[test]
+    fn unreadable_recheck_after_corroboration_fails_closed() {
+        let mut corroborate_calls = 0;
+        let outcome = resolve_duplicate_recovery_gate(
+            "group",
+            Ok::<bool, FakeError>(true),
+            || corroborate_calls += 1,
+            || Err(FakeError),
+        );
+        assert_eq!(corroborate_calls, 1, "corroboration must still run once pending was true");
+        assert_eq!(outcome, DuplicateRecoveryOutcome::UnknownFailClosed);
+    }
+
+    // The durable pending state itself could not be read: fail closed.
+    // Corroboration must not run against an unknown state, and
+    // suppression must stay armed rather than being cleared optimistically.
+    #[test]
+    fn unreadable_pending_state_fails_closed_without_running_corroboration() {
+        let outcome = resolve_duplicate_recovery_gate(
+            "group",
+            Err(FakeError),
+            || panic!("corroborate_and_resolve must not run when pending state is unknown"),
+            || -> Result<bool, FakeError> {
+                panic!("recheck_pending must not run when the initial read already failed")
+            },
+        );
+        assert_eq!(outcome, DuplicateRecoveryOutcome::UnknownFailClosed);
     }
 }

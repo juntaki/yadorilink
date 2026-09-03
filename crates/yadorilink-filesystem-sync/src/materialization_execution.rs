@@ -209,17 +209,48 @@ impl From<yadorilink_local_storage::StorageError> for MaterializationExecutionEr
 pub type MaterializedFingerprint = (u64, Option<std::time::SystemTime>, i64, i64);
 
 pub trait MaterializationExecutionPort: Send + Sync {
-    fn get_exec_bit(
+    fn get_unix_mode(
         &self,
         group_id: &str,
         path: &str,
-    ) -> Result<bool, MaterializationExecutionError>;
+    ) -> Result<Option<u32>, MaterializationExecutionError>;
+
+    /// See `yadorilink_replica_domain::file::FileMeta::xattrs`'s own doc
+    /// comment -- the same allow-listed extended attributes `get_unix_mode`
+    /// above applies for the recorded permission bits.
+    fn get_xattrs(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, MaterializationExecutionError>;
 
     fn get_file(
         &self,
         group_id: &str,
         path: &str,
     ) -> Result<Option<FileRecord>, MaterializationExecutionError>;
+
+    /// The raw, unresolved symlink target bytes recorded for `path` --
+    /// `None` when there is no row, the row is not a symlink, or no
+    /// target was ever recorded for a symlink-classified row. Repair's
+    /// own symlink-recovery path (`materialization_repair.rs`) uses this
+    /// to know what to recreate.
+    fn get_symlink_target(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, MaterializationExecutionError>;
+
+    /// Whether `group_id`'s link has opted in to writing real Windows
+    /// symlinks -- see `yadorilink-peer-session`'s identically-named
+    /// method (the live materialize path's own policy source) for the
+    /// full reasoning. Repair's symlink-recovery path must respect the
+    /// same policy the live path does, or it could write a real symlink
+    /// on a Windows link that has explicitly opted out.
+    fn windows_symlink_opt_in_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<bool, MaterializationExecutionError>;
 
     /// Hydrated, unpinned, non-deleted files for `group_id`, ordered
     /// least-recently-accessed first -- the automatic eviction sweep's
@@ -256,13 +287,26 @@ pub trait MaterializationExecutionPort: Send + Sync {
         path: &str,
     ) -> Result<bool, MaterializationExecutionError>;
 
+    /// Every path in `group_id` that currently carries a materialization
+    /// intent, as one read.
+    ///
+    /// The intent journal is empty in steady state -- an intent exists only
+    /// between a materialize opening one and the same materialize clearing it,
+    /// or after a crash in that window. A sweep over the whole group therefore
+    /// wants to know the (tiny) set ONCE rather than asking, or blindly
+    /// writing, per path: see `materialization_repair`'s own use of this.
+    fn list_materialization_intent_paths(
+        &self,
+        group_id: &str,
+    ) -> Result<std::collections::HashSet<String>, MaterializationExecutionError>;
+
     /// Clears the durable materialization-write-in-progress intent once the
     /// write + rename + fsync has completed for `(group_id, path)`.
     fn clear_materialization_intent(
         &self,
         group_id: &str,
         path: &str,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), MaterializationExecutionError>;
 
     /// Records the durable materialization-write-in-progress intent, which
@@ -273,7 +317,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
         group_id: &str,
         path: &str,
         target_version_hash: &[u8],
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), MaterializationExecutionError>;
 
     /// Tombstones a path and appends the signed `Delete` change describing
@@ -286,8 +330,9 @@ pub trait MaterializationExecutionPort: Send + Sync {
         path: &str,
         device_id: &str,
         observed_at_unix_nanos: i64,
+        publish_absent_proof: bool,
         emitter: &ChangeEmitter,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<yadorilink_replica_domain::ids::ChangeHash, MaterializationExecutionError>;
 
     fn record_dirty_path(
@@ -296,7 +341,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
         path: &str,
         change_kind: &str,
         observed_at_unix_nanos: i64,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), MaterializationExecutionError>;
 
     fn set_materialization_state(
@@ -304,7 +349,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
         group_id: &str,
         path: &str,
         state: MaterializationState,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), MaterializationExecutionError>;
 
     /// Atomically changes a current file's materialization state only when
@@ -315,7 +360,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
         path: &str,
         expected: MaterializationState,
         next: MaterializationState,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<bool, MaterializationExecutionError>;
 
     /// M5-A review follow-up (blocker #56, second round): records the disk
@@ -333,7 +378,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
         group_id: &str,
         path: &str,
         fingerprint: Option<MaterializedFingerprint>,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), MaterializationExecutionError>;
 
     /// Records the identity of the exact on-disk object a `write_placeholder`
@@ -348,7 +393,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
         path: &str,
         identity: PlaceholderDiskIdentity,
         provider_kind: &str,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), MaterializationExecutionError>;
 
     /// Like [`Self::record_placeholder_generation`], but only if nothing is
@@ -370,7 +415,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
         path: &str,
         candidate: PlaceholderDiskIdentity,
         provider_kind: &str,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<PlaceholderDiskIdentity, MaterializationExecutionError>;
 
     /// Clears any placeholder identity recorded for `(group_id, path)` -- a
@@ -381,7 +426,7 @@ pub trait MaterializationExecutionPort: Send + Sync {
         &self,
         group_id: &str,
         path: &str,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), MaterializationExecutionError>;
 
     /// The identity currently recorded on `(group_id, path)`'s row,
@@ -550,4 +595,20 @@ pub trait MaterializationExecutionPort: Send + Sync {
         custody: VerifiedCustody<'_>,
         store: &dyn BlockReclamationStore,
     ) -> Result<GcReport, MaterializationExecutionError>;
+
+    /// Bumps `path`'s filesystem-side mutation fence, invalidating any
+    /// actual-state proof
+    /// `path_materialized_generations` may hold for it. `evict_file` has no
+    /// DAG-frontier proof of its own to publish under (it is a pure
+    /// disk-state transition, hydrated content -> placeholder), so it only
+    /// ever calls this, never a publish -- same treatment as on-demand
+    /// hydration (`PeerReplicaStatePort::dag_bump_mutation_fence`, this
+    /// port's sibling in `yadorilink-peer-session`). Must be called inside
+    /// `path`'s lock, before the first mutating syscall.
+    fn dag_bump_mutation_fence(
+        &self,
+        group_id: &str,
+        path: &str,
+        mutation_kind: &str,
+    ) -> Result<i64, MaterializationExecutionError>;
 }

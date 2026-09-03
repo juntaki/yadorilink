@@ -54,7 +54,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use boringtun::x25519::{PublicKey, StaticSecret};
 use dst_support::case_ir::{
     Case, ContentTable, DeviceTimeline, FaultPlan, LinkTopology, Op, Topology,
 };
@@ -70,7 +69,6 @@ use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
 use yadorilink_replica_domain::file::{FileMeta, FileVersion, VersionBlock};
 use yadorilink_replica_domain::ids::{BlockHash, DeviceId, FolderGroupId, SyncPath};
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_transport::PeerChannel;
 
 const GROUP_ID: &str = "dst-hydration-group";
 const CANARY_PATH: &str = "hydration-canary.bin";
@@ -189,17 +187,6 @@ impl HydrationFaultProfile {
     }
 }
 
-fn gen_keypair(rng: &mut StdRng) -> (StaticSecret, PublicKey) {
-    // Same seed-derived derivation the migrated DST scenarios use (rand
-    // 0.10 / boringtun 0.7 bound `random_from_rng` out under `--cfg
-    // madsim`; `From<[u8; 32]>` is equally deterministic per seed).
-    let mut bytes = [0u8; 32];
-    rng.fill(&mut bytes);
-    let secret = StaticSecret::from(bytes);
-    let public = PublicKey::from(&secret);
-    (secret, public)
-}
-
 /// One device: an in-memory index, an on-disk block store, a synced root,
 /// and (after `connect`) a running `PeerSyncSession` to its single peer.
 struct Device {
@@ -272,9 +259,10 @@ fn seed_holder_file(dev: &Device, path: &str, content: &[u8]) -> Result<SeededFi
         content.len() as u64,
         FileMeta {
             mtime_unix_nanos: 1,
-            exec_bit: false,
+            unix_mode: None,
             symlink_target: None,
             record_kind: RecordKind::File,
+            xattrs: Vec::new(),
         },
     );
     let change = Change::create_signed(
@@ -373,36 +361,10 @@ fn seed_placeholder(dev: &Device, seeded: &SeededFile) -> Result<(), String> {
     Ok(())
 }
 
-async fn connect(rng: &mut StdRng, a: &Device, b: &Device) -> Result<(), String> {
-    let (secret_a, public_a) = gen_keypair(rng);
-    let (secret_b, public_b) = gen_keypair(rng);
+async fn connect(a: &Device, b: &Device) -> Result<(), String> {
     let socket_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
     let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
-    let addr_a = socket_a.local_addr().map_err(|e| e.to_string())?;
-    let addr_b = socket_b.local_addr().map_err(|e| e.to_string())?;
-
-    let channel_a = Arc::new(
-        PeerChannel::connect(
-            secret_a,
-            public_b,
-            0,
-            vec![addr_b],
-            yadorilink_transport::TransportHub::from_socket(socket_a, Some(public_a)),
-        )
-        .await
-        .map_err(|e| e.to_string())?,
-    );
-    let channel_b = Arc::new(
-        PeerChannel::connect(
-            secret_b,
-            public_a,
-            1,
-            vec![addr_a],
-            yadorilink_transport::TransportHub::from_socket(socket_b, Some(public_b)),
-        )
-        .await
-        .map_err(|e| e.to_string())?,
-    );
+    let (channel_a, channel_b) = quic_channel_pair(socket_a, socket_b).await;
 
     let device_ids_for_auth = [a.id.as_str(), b.id.as_str()];
     let authenticator = dst_dag_migrate_b2::PinnedAuthenticator::new(device_ids_for_auth);
@@ -466,6 +428,46 @@ async fn connect(rng: &mut StdRng, a: &Device, b: &Device) -> Result<(), String>
     Ok(())
 }
 
+/// One authenticated QUIC connection between two loopback endpoints, as a
+/// channel on each side -- the real transport, so a simulated run exercises
+/// what ships rather than a substitute for it. Mirrors the identical helper
+/// duplicated across this crate's other `dst_*.rs` scenarios (e.g.
+/// `dst_network_fault_chaos.rs`). The block-fetch fault injection this
+/// scenario relies on (see the module doc's "Bold note (fault seam)") is
+/// `madsim::net::NetSim` packet loss/partition at the UDP layer, which QUIC
+/// runs over via the same `TransportHub`-shimmed socket the old raw
+/// `PeerChannel` did -- the fault seam is unchanged by this migration.
+async fn quic_channel_pair(
+    socket_a: tokio::net::UdpSocket,
+    socket_b: tokio::net::UdpSocket,
+) -> (
+    Arc<yadorilink_transport::QuicPeerChannel>,
+    Arc<yadorilink_transport::QuicPeerChannel>,
+) {
+    use yadorilink_transport::{
+        ConnectRole, DeviceSigningKeyPair, QuicPeerChannel, QuicPeerEndpoint, TransportHub,
+    };
+    let addr_b = socket_b.local_addr().unwrap();
+    let key_a = DeviceSigningKeyPair::generate();
+    let key_b = DeviceSigningKeyPair::generate();
+    let public_a = key_a.public_bytes();
+    let public_b = key_b.public_bytes();
+    let endpoint_a = QuicPeerEndpoint::new(TransportHub::from_socket(socket_a), key_a).unwrap();
+    let endpoint_b = QuicPeerEndpoint::new(TransportHub::from_socket(socket_b), key_b).unwrap();
+    endpoint_a.authorize(public_b);
+    endpoint_b.authorize(public_a);
+    let accepting = {
+        let endpoint_b = endpoint_b.clone();
+        tokio::spawn(async move { endpoint_b.accept(public_a).await })
+    };
+    let dialed = endpoint_a.connect(addr_b, public_b).await.unwrap();
+    let accepted = accepting.await.unwrap().unwrap();
+    (
+        QuicPeerChannel::new(dialed, ConnectRole::Dial),
+        QuicPeerChannel::new(accepted, ConnectRole::Accept),
+    )
+}
+
 /// Retries `hydrate_file_with_timeout` until the path reaches `Hydrated` or
 /// `HYDRATE_DEADLINE` of simulated time elapses. Each failed attempt
 /// reverts the row to `Placeholder` (never leaving it at `Hydrating`), so
@@ -506,7 +508,6 @@ async fn hydrate_with_retry(dev: &Device, path: &str) -> bool {
 async fn run_scenario(seed: u64, fault_profile: HydrationFaultProfile) -> Result<(), String> {
     let _ = tracing_subscriber::fmt::try_init();
     let debug = std::env::var("DST_HYDRATION_DEBUG").is_ok();
-    let mut rng = StdRng::seed_from_u64(seed);
 
     let (device_a, _root_a_dir, _store_a_dir) = Device::setup("device-a")?;
     let (device_b, _root_b_dir, _store_b_dir) = Device::setup("device-b")?;
@@ -595,7 +596,7 @@ async fn run_scenario(seed: u64, fault_profile: HydrationFaultProfile) -> Result
     let canary_record = seed_holder_file(&device_a, CANARY_PATH, &canary_content)?;
     seed_placeholder(&device_b, &canary_record)?;
 
-    connect(&mut rng, &device_a, &device_b).await?;
+    connect(&device_a, &device_b).await?;
     // Baseline gate: hydrate the canary with no faults injected yet.
     if !hydrate_with_retry(&device_b, CANARY_PATH).await {
         return Err(format!(

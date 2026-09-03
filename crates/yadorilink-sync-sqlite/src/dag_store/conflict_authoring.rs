@@ -219,6 +219,104 @@ pub fn path_heads_at_frontier(
     path: &str,
     frontier: &[ChangeHash],
 ) -> Result<Vec<PathHead>, SyncSqliteError> {
+    path_heads_at_frontier_memoized(conn, path, frontier, &mut FrontierWalkMemo::default())
+}
+
+/// A cheap, order-insensitive fingerprint of one path, used only as a negative
+/// filter (see [`MemoizedChange`]).
+fn path_fingerprint(path: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// One retained change, decoded once, plus the fingerprints of every path it
+/// touches.
+///
+/// The fingerprint set answers "could this change touch `path`?" in O(1). A
+/// miss is conclusive (the exact path was definitely not among its ops); a hit
+/// is re-checked exactly with [`change_touches_path`], so a fingerprint
+/// collision costs one extra scan and can never change the answer. Storing
+/// fingerprints rather than the path strings keeps the memo proportional to the
+/// op count (8 bytes/op) instead of duplicating every path already held in the
+/// decoded change.
+struct MemoizedChange {
+    change: Change,
+    touched_path_fingerprints: HashSet<u64>,
+}
+
+/// Decoded-change memo for ONE derivation, shared across every path that
+/// derivation resolves.
+///
+/// [`path_heads_at_frontier`] walks the frontier-reachable DAG once *per path*,
+/// and at each step fetches a change's stored encoding, decodes it, then scans
+/// all of its ops. [`derive_required_conflict_copy_ops`] drives that walk once per
+/// path the new change touches -- so a bulk emission (the one-shot initial
+/// import of an existing folder, a large offline diff, or the peer-side
+/// admission validation of either) re-walks the same handful of changes once
+/// for every one of its ops, re-decoding each of them every time.
+///
+/// That is quadratic in the emission's own size and it is not a small constant:
+/// measured on a 20k-file initial import, the resulting single write
+/// transaction held the process-wide writer gate for 124 seconds, during which
+/// every tokio worker in the daemon was parked waiting for that gate and the
+/// device's own QUIC sessions timed out. Extrapolated to ~100k files it is tens
+/// of minutes. Memoizing per call makes each reachable change cost one decode
+/// regardless of how many paths the emission touches, without changing which
+/// changes the walk visits or what it concludes.
+///
+/// Scoped to a single call on purpose: the frontier it is valid for is the
+/// caller's, and a memo outliving one derivation would serve a stale DAG.
+#[derive(Default)]
+struct FrontierWalkMemo {
+    /// `None` records a hash that is not retained (a compacted parent, i.e. a
+    /// traversal boundary), so it is not re-queried per path either.
+    changes: std::collections::HashMap<[u8; 32], Option<MemoizedChange>>,
+}
+
+impl FrontierWalkMemo {
+    fn get(
+        &mut self,
+        conn: &Connection,
+        hash: &ChangeHash,
+    ) -> Result<Option<&MemoizedChange>, SyncSqliteError> {
+        if !self.changes.contains_key(&hash.0) {
+            let entry = match get_change(conn, hash)? {
+                Some(change) => {
+                    let mut touched_path_fingerprints = HashSet::with_capacity(change.ops.len());
+                    for op in &change.ops {
+                        match op {
+                            Op::Put { path, .. } | Op::Delete { path } => {
+                                touched_path_fingerprints.insert(path_fingerprint(path.as_str()));
+                            }
+                            Op::Move { from, to, .. } => {
+                                touched_path_fingerprints.insert(path_fingerprint(from.as_str()));
+                                touched_path_fingerprints.insert(path_fingerprint(to.as_str()));
+                            }
+                        }
+                    }
+                    Some(MemoizedChange { change, touched_path_fingerprints })
+                }
+                None => None,
+            };
+            self.changes.insert(hash.0, entry);
+        }
+        Ok(self.changes.get(&hash.0).and_then(|entry| entry.as_ref()))
+    }
+}
+
+/// [`path_heads_at_frontier`] against a caller-owned [`FrontierWalkMemo`], so
+/// several paths resolved against the SAME frontier share one decode of each
+/// change the walk passes. Visits exactly the changes the unmemoized walk
+/// visits and returns exactly what it returns.
+fn path_heads_at_frontier_memoized(
+    conn: &Connection,
+    path: &str,
+    frontier: &[ChangeHash],
+    memo: &mut FrontierWalkMemo,
+) -> Result<Vec<PathHead>, SyncSqliteError> {
+    let fingerprint = path_fingerprint(path);
     let mut candidates: Vec<Change> = Vec::new();
     let mut visited: HashSet<[u8; 32]> = HashSet::new();
     let mut stack: Vec<ChangeHash> = frontier.to_vec();
@@ -226,13 +324,13 @@ pub fn path_heads_at_frontier(
         if !visited.insert(h.0) {
             continue;
         }
-        let Some(change) = get_change(conn, &h)? else { continue };
-        if change_touches_path(&change, path) {
-            candidates.push(change);
+        let Some(entry) = memo.get(conn, &h)? else { continue };
+        if entry.touched_path_fingerprints.contains(&fingerprint)
+            && change_touches_path(&entry.change, path)
+        {
+            candidates.push(entry.change.clone());
         } else {
-            for parent in &change.parents {
-                stack.push(*parent);
-            }
+            stack.extend(entry.change.parents.iter().copied());
         }
     }
     let hashes: Vec<ChangeHash> = candidates.iter().map(|c| c.change_hash()).collect();
@@ -314,9 +412,13 @@ fn derive_required_conflict_copy_ops_with(
 ) -> Result<Vec<Op>, SyncSqliteError> {
     let touched_paths = decision::collect_touched_paths(direct_ops);
 
+    // One memo for the whole derivation: every path below resolves against the
+    // same `parents` frontier, so each change the walk passes is decoded once
+    // here instead of once per touched path (see `FrontierWalkMemo`).
+    let mut memo = FrontierWalkMemo::default();
     let mut derived_ops = Vec::new();
     for path in touched_paths {
-        let heads = path_heads_at_frontier(conn, &path, parents)?;
+        let heads = path_heads_at_frontier_memoized(conn, &path, parents, &mut memo)?;
         for candidate in decision::conflict_copy_candidates(&path, &heads) {
             let losing_change = candidate.losing_change;
             if already_provisioned(conn, &path, &losing_change)? {
@@ -353,7 +455,8 @@ fn derive_required_conflict_copy_ops_with(
             // edits/deletes/renames the conflict-copy path only after it
             // exists, so any such action necessarily has `losing_change` as
             // an ancestor).
-            let target_heads = path_heads_at_frontier(conn, &candidate.target_path, parents)?;
+            let target_heads =
+                path_heads_at_frontier_memoized(conn, &candidate.target_path, parents, &mut memo)?;
             // Fallible loop, not `.any(...).unwrap_or(false)`: a DB error or
             // corrupted ancestry index here must fail closed, not silently
             // read as "not already acted on" -- that would let this
@@ -634,9 +737,10 @@ mod tests {
             0,
             FileMeta {
                 mtime_unix_nanos: mtime,
-                exec_bit: false,
+                unix_mode: None,
                 symlink_target: None,
                 record_kind: RecordKind::File,
+                xattrs: Vec::new(),
             },
         )
     }

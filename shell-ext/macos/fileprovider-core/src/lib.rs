@@ -158,6 +158,34 @@ pub unsafe extern "C" fn yadorilink_fp_hydrate(path: *const c_char) -> bool {
     catch_unwind(|| ipc_client::hydrate(&path)).unwrap_or(false)
 }
 
+/// The specific reason the most recent `yadorilink_fp_hydrate` call on
+/// this thread returned `false`, if any (e.g. "the daemon reported a
+/// hydration failure: no peer currently holds this content" vs. "timed
+/// out waiting for the daemon" vs. "could not reach the daemon: ...") --
+/// see `ipc_client::last_hydrate_error`'s own doc comment for the exact
+/// P0-A/P0-B gap this closes (a `fetchContents` failure and a
+/// peer-unavailable failure used to look identical to Explorer/Finder).
+/// Empty string if the most recent call on this thread succeeded, or no
+/// call has been made yet.
+///
+/// Deliberately NOT called anywhere in `FileProviderExtension.swift` yet:
+/// this crate's Swift side has no working build/test path today (no
+/// `.xcodeproj`, no build script producing the File Provider extension
+/// target -- see this repo's P0-B investigation), so wiring
+/// `fetchContents`'s completion handler to actually surface this detail
+/// is left for whoever first stands up that build, rather than guessing
+/// at Swift changes with no way to verify them compile or behave
+/// correctly. Caller must free a non-NULL result with
+/// `yadorilink_fp_free_string`.
+#[no_mangle]
+pub extern "C" fn yadorilink_fp_last_hydrate_error() -> *mut c_char {
+    let result = catch_unwind(ipc_client::last_hydrate_error);
+    match result {
+        Ok(Some(msg)) => CString::new(msg).unwrap_or_else(|_| CString::new("").unwrap()).into_raw(),
+        _ => CString::new("").unwrap().into_raw(),
+    }
+}
+
 /// Notifies the daemon of a local write (backs `createItem`/`modifyItem`
 /// via `kind == 0`, `deleteItem` via `kind == 1`) already landed on disk
 /// at `local_path`/`relative_path` -- see `ipc_client::notify_local_write`'s

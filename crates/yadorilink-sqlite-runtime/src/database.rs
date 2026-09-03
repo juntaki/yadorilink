@@ -19,6 +19,148 @@ use crate::pool::{
     checkout, madsim_or_default_pool, retry_on_database_locked, ConnectionPool, BUSY_TIMEOUT,
 };
 
+// `stats`/`reset`/`record_gate_acquisition` below are a small, PERMANENT
+// writer-gate observability primitive -- not temporary C4 investigation
+// scaffolding, even though they started that way. Repository-level tests
+// (e.g. `materialization_job_repository`'s `enqueue_pending_writer_gate_
+// tests`) rely on `reset()`/`stats()` to assert that a specific operation
+// does or does not take the process-wide write lock at all -- a property
+// no amount of row-state inspection alone can observe, since a no-op SQL
+// UPDATE and a call that never opens a transaction leave identical
+// on-disk state.
+//
+// `call_sites`/`record_call_site`/`call_site_stats` below are PERMANENT
+// too (reclassified 2026-09-01 after a second investigation -- the
+// decision-9 dual-scheduler cutover -- relied on them again; see their
+// own doc comment for why re-deriving this every time is wasted effort).
+//
+// `record_gate_hold`/`hold_site_stats` are PERMANENT too, for a reason the
+// wait-side counters structurally cannot cover: `record_gate_acquisition`
+// times how long a caller WAITED, which by construction never names the
+// caller that was holding the gate and made it wait. Every writer-gate
+// starvation investigated on this codebase so far has turned on exactly that
+// question, and answering it by inference from a wait histogram wasted real
+// time twice. Cost is one `Instant::elapsed` and one hash-map update per
+// write transaction, inside the gate the caller already holds.
+pub mod c4_diag {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static GATE_ACQUISITIONS: AtomicU64 = AtomicU64::new(0);
+    static GATE_WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn record_gate_acquisition(wait: Duration) {
+        GATE_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
+        GATE_WAIT_NANOS.fetch_add(wait.as_nanos() as u64, Ordering::Relaxed);
+        if wait > Duration::from_millis(500) {
+            tracing::warn!(
+                wait_ms = wait.as_millis() as u64,
+                "C4_DIAG: writer_gate acquisition took a long time"
+            );
+        }
+    }
+
+    /// Total `locked_write` invocations (one per fsync-backed DB write
+    /// transaction, regardless of how many rows/paths the caller's closure
+    /// covers) and cumulative time spent waiting to acquire `writer_gate`,
+    /// since process start or the last [`reset`].
+    pub fn stats() -> (u64, Duration) {
+        (
+            GATE_ACQUISITIONS.load(Ordering::Relaxed),
+            Duration::from_nanos(GATE_WAIT_NANOS.load(Ordering::Relaxed)),
+        )
+    }
+
+    /// Zeroes every counter in this module -- call before a measured storm so
+    /// [`stats`], [`call_site_stats`] and [`hold_site_stats`] all reflect only
+    /// that run, not whatever earlier setup did.
+    pub fn reset() {
+        GATE_ACQUISITIONS.store(0, Ordering::Relaxed);
+        GATE_WAIT_NANOS.store(0, Ordering::Relaxed);
+        call_sites().lock().unwrap_or_else(|p| p.into_inner()).clear();
+        hold_sites().lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    // PERMANENT per-call-site attribution (reclassified from an earlier
+    // "temporary, remove after investigation" framing: this pulled its
+    // weight across two separate C4 investigations on this codebase --
+    // the original storm re-measurement that motivated it, and the
+    // decision-9 dual-scheduler cutover -- and costs a `#[track_caller]`
+    // plus one hash-map update inside a lock the caller already holds, so
+    // there is no reason to keep re-adding it every time a new writer-gate
+    // question comes up). `record_gate_acquisition` above only counts and
+    // times acquisitions in aggregate, which cannot say WHICH of
+    // `SyncDatabase::write`/`write_immediate`'s many call sites is
+    // actually driving that volume. `#[track_caller]` on both public
+    // entry points (and on this function) makes `Location::caller()`
+    // resolve to the caller's own call site (file:line), not this
+    // module's -- recorded here, inside `locked_write`'s own already-held
+    // `writer_gate`, so this adds no additional lock contention beyond
+    // what already exists.
+    fn call_sites() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+        static SITES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+            std::sync::OnceLock::new();
+        SITES.get_or_init(Default::default)
+    }
+
+    #[track_caller]
+    pub(crate) fn record_call_site() {
+        let location = std::panic::Location::caller().to_string();
+        let mut sites = call_sites().lock().unwrap_or_else(|p| p.into_inner());
+        *sites.entry(location).or_insert(0) += 1;
+    }
+
+    // Per-call-site writer_gate HOLD time -- the other half of
+    // `record_gate_acquisition` above, which can only ever say that a caller
+    // waited, never who made it wait. See this module's own header comment.
+    fn hold_sites() -> &'static std::sync::Mutex<std::collections::HashMap<String, (u64, u128)>> {
+        static SITES: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, (u64, u128)>>,
+        > = std::sync::OnceLock::new();
+        SITES.get_or_init(Default::default)
+    }
+
+    pub(crate) fn record_gate_hold(
+        location: &'static std::panic::Location<'static>,
+        held: Duration,
+    ) {
+        let mut sites = hold_sites().lock().unwrap_or_else(|p| p.into_inner());
+        let entry = sites.entry(location.to_string()).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += held.as_micros();
+        if held > Duration::from_millis(500) {
+            tracing::warn!(
+                held_ms = held.as_millis() as u64,
+                call_site = %location,
+                "C4_DIAG: writer_gate was HELD for a long time"
+            );
+        }
+    }
+
+    /// Every distinct `write`/`write_immediate` call site seen since process
+    /// start or the last [`reset`], with `(count, total_held_micros)`, sorted
+    /// by total held time descending.
+    pub fn hold_site_stats() -> Vec<(String, u64, u128)> {
+        let sites = hold_sites().lock().unwrap_or_else(|p| p.into_inner());
+        let mut v: Vec<(String, u64, u128)> =
+            sites.iter().map(|(k, (n, micros))| (k.clone(), *n, *micros)).collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2));
+        v
+    }
+
+    /// Every distinct `write`/`write_immediate` call site seen since
+    /// process start or the last [`reset`], with its own acquisition
+    /// count, sorted by count descending -- answers "who is actually
+    /// calling `SyncDatabase::write*` this many times" directly instead of
+    /// by inference.
+    pub fn call_site_stats() -> Vec<(String, u64)> {
+        let sites = call_sites().lock().unwrap_or_else(|p| p.into_inner());
+        let mut v: Vec<(String, u64)> = sites.iter().map(|(k, n)| (k.clone(), *n)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    }
+}
+
 pub struct SyncDatabase {
     /// Each call checks out its own pooled connection (`r2d2` +
     /// `r2d2_sqlite`) against a WAL-mode database, so multiple readers
@@ -191,11 +333,13 @@ impl SyncDatabase {
     /// already gives multi-statement transactional writers, now available to
     /// callers that just need one `execute`/`query_row` without opening
     /// their own transaction.
+    #[track_caller]
     pub fn write<T, E: SqlOperationError>(
         &self,
         mut operation: impl FnMut(&mut Connection) -> Result<T, E>,
     ) -> Result<T, E> {
-        self.locked_write(|| {
+        c4_diag::record_call_site();
+        self.locked_write(std::panic::Location::caller(), || {
             let mut conn = checkout::<E>(&self.pool)?;
             operation(&mut conn)
         })
@@ -205,11 +349,13 @@ impl SyncDatabase {
     /// IMMEDIATE transaction (see `new_immediate_write_transaction`'s own
     /// doc comment for why IMMEDIATE, not the rusqlite default DEFERRED),
     /// serialized against the writer_gate and retried, commits on `Ok`.
+    #[track_caller]
     pub fn write_immediate<T, E: SqlOperationError>(
         &self,
         mut operation: impl FnMut(&rusqlite::Transaction<'_>) -> Result<T, E>,
     ) -> Result<T, E> {
-        self.locked_write(|| {
+        c4_diag::record_call_site();
+        self.locked_write(std::panic::Location::caller(), || {
             let mut conn = checkout::<E>(&self.pool)?;
             let tx = new_immediate_write_transaction(&mut conn)?;
             let result = operation(&tx)?;
@@ -232,6 +378,7 @@ impl SyncDatabase {
     /// runtime; a panicking closure restores it via the drop guard.
     fn locked_write<T, E: SqlOperationError>(
         &self,
+        c4_diag_location: &'static std::panic::Location<'static>,
         op: impl FnMut() -> Result<T, E>,
     ) -> Result<T, E> {
         thread_local! {
@@ -246,10 +393,25 @@ impl SyncDatabase {
         if IN_WRITE.with(|f| f.get()) {
             return retry_on_database_locked(op);
         }
+        // PERMANENT writer-gate observability (see this module's `c4_diag`
+        // header comment): total write-transaction count and cumulative
+        // time spent waiting to acquire `writer_gate` -- one outer
+        // (non-reentrant) `locked_write` call is exactly one fsync-backed
+        // commit, regardless of how many rows or paths the caller's
+        // closure covers, so this count directly answers "how many DB
+        // write transactions has this process done, and how much time did
+        // callers spend waiting for the gate" for any future writer-gate
+        // contention investigation, not just the one that motivated it.
+        let c4_diag_wait_started = std::time::Instant::now();
         let _gate = self.writer_gate.lock().unwrap_or_else(|p| p.into_inner());
+        let c4_diag_wait_elapsed = c4_diag_wait_started.elapsed();
+        c4_diag::record_gate_acquisition(c4_diag_wait_elapsed);
         IN_WRITE.with(|f| f.set(true));
         let _reset = Reset;
-        retry_on_database_locked(op)
+        let c4_diag_held_started = std::time::Instant::now();
+        let result = retry_on_database_locked(op);
+        c4_diag::record_gate_hold(c4_diag_location, c4_diag_held_started.elapsed());
+        result
     }
 }
 

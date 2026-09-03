@@ -59,7 +59,6 @@ use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeCo
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::peer_orchestrator;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_transport::DeviceKeyPair;
 
 struct TestDevice {
     device_id: String,
@@ -76,7 +75,6 @@ struct TestDevice {
 fn spawn_orchestrator(
     coordination_addr: String,
     device_id: String,
-    keypair: Arc<DeviceKeyPair>,
     state: Arc<DaemonState>,
 ) {
     let config = peer_orchestrator::OrchestratorConfig {
@@ -85,7 +83,7 @@ fn spawn_orchestrator(
         device_id,
     };
     tokio::spawn(async move {
-        let _ = peer_orchestrator::run(config, keypair, state).await;
+        let _ = peer_orchestrator::run(config, state).await;
     });
 }
 
@@ -97,7 +95,6 @@ fn spawn_orchestrator(
 /// orchestrator against the fake. The fake pushes a fresh netmap on
 /// registration, so co-group devices discover and connect to this one.
 async fn setup_device(fake: &FakeCoordination, device_id: &str, groups: &[&str]) -> TestDevice {
-    let keypair = Arc::new(DeviceKeyPair::generate());
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
@@ -105,7 +102,7 @@ async fn setup_device(fake: &FakeCoordination, device_id: &str, groups: &[&str])
     let state = DaemonState::new(device_id.to_string(), sync_state, store);
     let root = tempfile::tempdir().unwrap();
 
-    register_with_fake(fake, &state, device_id, keypair.public_bytes(), groups).await;
+    register_with_fake(fake, &state, device_id, groups).await;
 
     let local_path = root.path().to_string_lossy().to_string();
     for group_id in groups {
@@ -115,7 +112,7 @@ async fn setup_device(fake: &FakeCoordination, device_id: &str, groups: &[&str])
             .unwrap();
     }
 
-    spawn_orchestrator(fake.addr(), device_id.to_string(), keypair, state.clone());
+    spawn_orchestrator(fake.addr(), device_id.to_string(), state.clone());
 
     TestDevice {
         device_id: device_id.to_string(),
@@ -140,7 +137,7 @@ async fn wait_for_mesh(devices: &[&TestDevice]) {
                     d.state
                         .peers
                         .session(&o.device_id)
-                        .is_some_and(|session| session.change_dag_negotiated())
+                        .is_some_and(|session| session.peer_handshake_received())
                 })
             })
         },
@@ -261,7 +258,7 @@ fn relative_target_path(level: u8) -> std::path::PathBuf {
 }
 
 #[cfg(unix)]
-fn set_exec_bit(path: &std::path::Path, exec: bool) {
+fn set_unix_mode(path: &std::path::Path, exec: bool) {
     use std::os::unix::fs::PermissionsExt;
     let mut perms = std::fs::metadata(path).unwrap().permissions();
     perms.set_mode(if exec { 0o755 } else { 0o644 });
@@ -269,16 +266,16 @@ fn set_exec_bit(path: &std::path::Path, exec: bool) {
 }
 
 #[cfg(not(unix))]
-fn set_exec_bit(_path: &std::path::Path, _exec: bool) {}
+fn set_unix_mode(_path: &std::path::Path, _exec: bool) {}
 
 #[cfg(unix)]
-fn read_exec_bit(path: &std::path::Path) -> bool {
+fn read_unix_mode(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).map(|m| m.permissions().mode() & 0o100 != 0).unwrap_or(false)
 }
 
 #[cfg(not(unix))]
-fn read_exec_bit(_path: &std::path::Path) -> bool {
+fn read_unix_mode(_path: &std::path::Path) -> bool {
     false
 }
 
@@ -286,11 +283,11 @@ fn read_exec_bit(_path: &std::path::Path) -> bool {
 /// device's initial write. Level 4 (toggle-after-convergence) is handled
 /// separately, as a second round, in `run_taguchi_v2_row` -- there is
 /// nothing to do here for it yet.
-fn apply_initial_exec_bit(exec_level: u8, device_idx: usize, path: &std::path::Path) {
+fn apply_initial_unix_mode(exec_level: u8, device_idx: usize, path: &std::path::Path) {
     match exec_level {
         1 => {} // never set -- leave whatever `std::fs::write` produced.
-        2 => set_exec_bit(path, true),
-        3 => set_exec_bit(path, device_idx.is_multiple_of(2)),
+        2 => set_unix_mode(path, true),
+        3 => set_unix_mode(path, device_idx.is_multiple_of(2)),
         4 => {} // toggled later, after initial convergence.
         _ => unreachable!(),
     }
@@ -339,11 +336,11 @@ async fn wait_for_content_convergence(
         || {
             let reference_path = active[0].root.path().join(rel_path);
             let reference_hash = file_hash(&reference_path);
-            let reference_exec = read_exec_bit(&reference_path);
+            let reference_exec = read_unix_mode(&reference_path);
             reference_hash.is_some()
                 && active[1..].iter().all(|d| {
                     let path = d.root.path().join(rel_path);
-                    file_hash(&path) == reference_hash && read_exec_bit(&path) == reference_exec
+                    file_hash(&path) == reference_hash && read_unix_mode(&path) == reference_exec
                 })
         },
         timeout,
@@ -357,7 +354,7 @@ async fn wait_for_content_convergence(
                         "device-{i} exists={} hash={:?} exec={}",
                         p.exists(),
                         file_hash(&p),
-                        read_exec_bit(&p)
+                        read_unix_mode(&p)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -411,7 +408,7 @@ async fn run_taguchi_v2_row(
         }
         let content = generate_content(size_level, pattern_level, idx);
         std::fs::write(&full_path, &content).unwrap();
-        apply_initial_exec_bit(exec_level, idx, &full_path);
+        apply_initial_unix_mode(exec_level, idx, &full_path);
     }
 
     // --- FACTOR E (device churn), applied right after the initial round
@@ -479,8 +476,8 @@ async fn run_taguchi_v2_row(
         // (before any watcher has captured the chmod), then creates several
         // concurrent metadata changes after the wait has already returned.
         let full_path = active_refs[0].root.path().join(&rel_path);
-        let current = read_exec_bit(&full_path);
-        set_exec_bit(&full_path, !current);
+        let current = read_unix_mode(&full_path);
+        set_unix_mode(&full_path, !current);
         wait_for_content_convergence(
             &active_refs,
             &rel_path,
@@ -503,7 +500,7 @@ async fn run_taguchi_v2_row(
              churn_level={churn_level})"
         )
     });
-    let reference_exec = read_exec_bit(&reference_path);
+    let reference_exec = read_unix_mode(&reference_path);
 
     for (i, device) in active_refs.iter().enumerate().skip(1) {
         let full_path = device.root.path().join(&rel_path);
@@ -515,7 +512,7 @@ async fn run_taguchi_v2_row(
              pattern_level={pattern_level}, path_level={path_level}, exec_level={exec_level}, \
              churn_level={churn_level})"
         );
-        let exec = read_exec_bit(&full_path);
+        let exec = read_unix_mode(&full_path);
         assert_eq!(
             exec, reference_exec,
             "{row_name}: device-{i} exec-bit diverged from device-0 (size_level={size_level}, \

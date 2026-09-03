@@ -1,7 +1,7 @@
 //! Load/soak test: a folder tree with many small files must
 //! survive initial pairing (full index exchange + per-file block fetch)
 //! and a subsequent incremental change, through the full daemon stack
-//! (real coordination plane, directly-paired peer sessions, real WireGuard).
+//! (real coordination plane, directly-paired peer sessions, real QUIC).
 
 mod support;
 
@@ -13,7 +13,6 @@ use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeCo
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_transport::DeviceKeyPair;
 
 const FILE_COUNT: usize = 200;
 
@@ -38,13 +37,10 @@ async fn many_small_files_survive_initial_sync_and_incremental_update() {
     let _ = tracing_subscriber::fmt::try_init();
     let coordination_addr = support::start_coordination_server().await;
     let account = support::register_and_login(&coordination_addr, "load-test@example.com").await;
-
-    let keypair_a = Arc::new(DeviceKeyPair::generate());
     let device_a_id =
-        support::register_device(&account, "device-a", keypair_a.public_bytes()).await;
-    let keypair_b = Arc::new(DeviceKeyPair::generate());
+        support::register_device(&account, "device-a", [0u8; 32]).await;
     let device_b_id =
-        support::register_device(&account, "device-b", keypair_b.public_bytes()).await;
+        support::register_device(&account, "device-b", [0u8; 32]).await;
 
     let group_id = support::create_folder_group(&account, "load-test-group").await;
     support::grant_access(&account, &group_id, &device_a_id).await;

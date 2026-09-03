@@ -40,7 +40,13 @@ use yadorilink_replica_domain::file::FileVersion;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
 use yadorilink_replica_domain::ids::{ChangeHash, FolderGroupId, VersionHash};
 
-const SNAPSHOT_DOMAIN: &[u8; 8] = b"YLNKsnp\x03";
+// \x04 (Competitive Hardening C1.1): `unix_mode` widened from a single
+// owner-exec bool byte to the full replicated-permission-bits encoding
+// (a flag byte plus an optional u32) -- see `FileMeta::encode_into`'s
+// identical shape for `unix_mode`. \x05 (Competitive Hardening C1.2a)
+// added `xattrs` (a count followed by sorted name/value pairs) -- see
+// `FileMeta::encode_into`'s identical shape for `xattrs`.
+const SNAPSHOT_DOMAIN: &[u8; 8] = b"YLNKsnp\x05";
 const MAX_SNAPSHOT_FILES: usize = 1_000_000;
 const MAX_FRONTIER_CHANGES: usize = 4096;
 const MAX_FILE_VERSIONS: usize = 1_000_000;
@@ -48,6 +54,7 @@ const MAX_BOUNDARY_EDGES: usize = 1_000_000;
 const MAX_STRING_BYTES: usize = 1024 * 1024;
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BLOCKS_PER_FILE: usize = 1_000_000;
+const MAX_XATTRS_PER_FILE: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SnapshotVersionState {
@@ -103,7 +110,8 @@ pub struct SnapshotFile {
     pub record_kind: RecordKind,
     pub symlink_target: Option<Vec<u8>>,
     pub symlink_out_of_root: bool,
-    pub exec_bit: bool,
+    pub unix_mode: Option<u32>,
+    pub xattrs: Vec<(String, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -273,7 +281,22 @@ impl RebootstrapSnapshot {
             });
             put_opt_bytes(&mut out, file.symlink_target.as_deref());
             out.push(file.symlink_out_of_root as u8);
-            out.push(file.exec_bit as u8);
+            match file.unix_mode {
+                None => out.push(0),
+                Some(mode) => {
+                    out.push(1);
+                    put_u32(&mut out, mode);
+                }
+            }
+            // Caller-guaranteed sorted by name (`FileMeta::xattrs`'s own
+            // invariant) -- this snapshot format trusts it, same as it
+            // already trusts every other field it re-encodes from this
+            // device's own already-validated index rows.
+            put_u32(&mut out, file.xattrs.len() as u32);
+            for (name, value) in &file.xattrs {
+                put_str(&mut out, name);
+                put_bytes(&mut out, value);
+            }
         }
 
         put_u32(&mut out, self.frontier_changes.len() as u32);
@@ -335,7 +358,22 @@ impl RebootstrapSnapshot {
             };
             let symlink_target = reader.opt_bytes(MAX_STRING_BYTES)?;
             let symlink_out_of_root = reader.bool()?;
-            let exec_bit = reader.bool()?;
+            let unix_mode = match reader.byte()? {
+                0 => None,
+                1 => Some(reader.u32()?),
+                _ => {
+                    return Err(ReplicaEngineError::CorruptState(
+                        "re-bootstrap snapshot has unknown unix mode flag".into(),
+                    ));
+                }
+            };
+            let xattr_count = reader.count(MAX_XATTRS_PER_FILE)?;
+            let mut xattrs = Vec::with_capacity(xattr_count);
+            for _ in 0..xattr_count {
+                let name = reader.string(MAX_STRING_BYTES)?;
+                let value = reader.bytes(MAX_BLOB_BYTES)?;
+                xattrs.push((name, value));
+            }
 
             files.push(SnapshotFile {
                 record: FileRecord { path, size, mtime_unix_nanos, blocks, deleted },
@@ -345,7 +383,8 @@ impl RebootstrapSnapshot {
                 record_kind,
                 symlink_target,
                 symlink_out_of_root,
-                exec_bit,
+                unix_mode,
+                xattrs,
             });
         }
 
@@ -630,7 +669,8 @@ mod tests {
                 mtime_unix_nanos: 11,
                 record_kind: RecordKind::File,
                 symlink_target: None,
-                exec_bit: false,
+                unix_mode: None,
+                xattrs: Vec::new(),
             },
         );
         let change = Change::create_signed(
@@ -662,7 +702,8 @@ mod tests {
                 record_kind: RecordKind::File,
                 symlink_target: None,
                 symlink_out_of_root: false,
-                exec_bit: false,
+                unix_mode: None,
+                xattrs: Vec::new(),
             }],
             vec![change.to_wire_bytes()],
             vec![version.canonical_encoding()],
@@ -703,7 +744,8 @@ mod tests {
                     record_kind: RecordKind::File,
                     symlink_target: None,
                     symlink_out_of_root: false,
-                    exec_bit: false,
+                    unix_mode: None,
+                    xattrs: Vec::new(),
                 },
                 SnapshotFile {
                     record: record(2),
@@ -713,7 +755,8 @@ mod tests {
                     record_kind: RecordKind::File,
                     symlink_target: None,
                     symlink_out_of_root: false,
-                    exec_bit: false,
+                    unix_mode: None,
+                    xattrs: Vec::new(),
                 },
             ],
             vec![],

@@ -60,8 +60,10 @@ static CREDENTIALED_URL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s/:@]+:[^\s/@]+@[^\s]+").unwrap());
 static BEARER_TOKEN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bbearer\s+[A-Za-z0-9\-_.=]{8,}").unwrap());
-// WireGuard keys are 32 raw bytes, base64-encoded with padding: exactly
-// 44 characters, always ending in a single `=`. This deliberately also
+// This device's keys (the Ed25519 signing key, and the coordination
+// plane's legacy transport-key field, which now just carries a copy of
+// it) are 32 raw bytes, base64-encoded with padding: exactly 44
+// characters, always ending in a single `=`. This deliberately also
 // matches other unrelated base64 blobs of the same shape — an accepted
 // false positive per this module's doc comment. No trailing `\b`: `=`
 // is a non-word character, so a word boundary can never reliably fire

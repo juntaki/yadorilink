@@ -107,7 +107,7 @@ use crate::error::DatabaseError;
 /// withhold forever for the two writers this change exists to separate out.
 /// Same no-compat-path policy as versions 15 and 16: refused at open.
 /// Version 18 adds `restore_operations.record_kind`/`symlink_target`/
-/// `symlink_out_of_root`/`exec_bit`, so a restored symlink or executable
+/// `symlink_out_of_root`/`unix_mode`, so a restored symlink or executable
 /// version's classification can be journaled and committed to the
 /// `current` row's own metadata columns, not just its `FileRecord`
 /// content. A v17 database's in-flight restore journal rows (if any)
@@ -160,7 +160,25 @@ use crate::error::DatabaseError;
 /// database's rows are missing these columns entirely; same no-compat-path
 /// policy as every version above: refused at open, not silently reread
 /// with columns absent.
-pub const SCHEMA_VERSION: i32 = 22;
+/// Version 23 (Competitive Hardening C1.1) reinterprets `files.unix_mode`/
+/// `restore_operations.unix_mode`: previously a boolean owner-exec flag
+/// (`0`/`1`), now the file's full replicated permission bits
+/// (`yadorilink_replica_domain::file::REPLICATED_MODE_MASK`, `0..=0o777`),
+/// with `-1` as the explicit "no Unix permission info" sentinel (a Windows-
+/// authored version) rather than the bare column default silently reading
+/// back as a fake `Some(0)`. A v22 database's `unix_mode = 1` rows meant
+/// "was executable," which under v23's reading is the nonsensical mode
+/// `0o001` (world-execute only, nothing else) — the two encodings are
+/// incompatible, not layerable, so this is a no-compat-path version: a v22
+/// database is refused at open, not silently reread with its old boolean
+/// values misinterpreted as mode bits.
+/// Version 24 (Competitive Hardening C1.2a) adds `files.xattrs_json` --
+/// see that column's own migration comment. Purely additive (default
+/// `'[]'`), so unlike v23 this genuinely could have been read forward
+/// from a v23 database, but this codebase's own stated no-compat-path
+/// policy (see this function's own doc comment) applies uniformly to
+/// every version bump, not case-by-case.
+pub const SCHEMA_VERSION: i32 = 24;
 
 /// Reads `PRAGMA user_version` and
 /// errors if it's newer than this binary's [`SCHEMA_VERSION`] — an older
@@ -345,7 +363,11 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
             record_kind       TEXT NOT NULL DEFAULT 'file',
             symlink_target    BLOB,
             symlink_out_of_root INTEGER NOT NULL DEFAULT 0,
-            exec_bit          INTEGER NOT NULL DEFAULT 0
+            -- `-1` = no Unix permission info (see `SCHEMA_VERSION` v23's
+            -- own doc comment); `0..=0o777` = actual replicated mode bits.
+            unix_mode          INTEGER NOT NULL DEFAULT -1,
+            -- See `files.xattrs_json`'s own comment (`SCHEMA_VERSION` v24).
+            xattrs_json        TEXT NOT NULL DEFAULT '[]'
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_restore_operations_path
             ON restore_operations(group_id, path);
@@ -564,15 +586,16 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
         // Every pre-existing row
         // defaults to `record_kind = 'file'` (the only kind scan/watch
         // ever produced before this change) with no symlink target,
-        // `exec_bit = 0` (no workflow depended on the bit being set,
-        // since it was never captured or propagated at all), and no
-        // held state (nothing was ever held before hazard detection
-        // existed) — every existing installation keeps behaving
-        // exactly as it did, matching the "no behavior change without
-        // opt-in" guarantee already established above.
+        // `unix_mode = -1` (v23: no Unix permission info -- no workflow
+        // depended on any of this before this change, since it was never
+        // captured or propagated at all), and no held state (nothing was
+        // ever held before hazard detection existed) — every existing
+        // installation keeps behaving exactly as it did, matching the "no
+        // behavior change without opt-in" guarantee already established
+        // above.
         "ALTER TABLE files ADD COLUMN record_kind TEXT NOT NULL DEFAULT 'file'",
         "ALTER TABLE files ADD COLUMN symlink_target BLOB",
-        "ALTER TABLE files ADD COLUMN exec_bit INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE files ADD COLUMN unix_mode INTEGER NOT NULL DEFAULT -1",
         "ALTER TABLE files ADD COLUMN held_reason TEXT",
         "ALTER TABLE files ADD COLUMN held_since_unix_nanos INTEGER",
         // Whether a symlink's raw target is
@@ -725,6 +748,38 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
         "ALTER TABLE files ADD COLUMN materialized_fingerprint_mtime_nanos INTEGER",
         "ALTER TABLE files ADD COLUMN materialized_fingerprint_ctime INTEGER",
         "ALTER TABLE files ADD COLUMN materialized_fingerprint_ctime_nsec INTEGER",
+        // Version 24 (Competitive Hardening C1.2a): replicated extended
+        // attributes (`yadorilink_replica_domain::file::FileMeta::
+        // xattrs`), a JSON array of `[name, value_bytes]` pairs sorted by
+        // name, already filtered to the capture-side per-platform
+        // allow-list. Purely additive, unlike v23's unix_mode
+        // reinterpretation -- `'[]'` (no attributes) is a sound default
+        // for every pre-existing row, so this needs no no-compat-path
+        // refusal of its own.
+        "ALTER TABLE files ADD COLUMN xattrs_json TEXT NOT NULL DEFAULT '[]'",
+        // `restore_operations`'s own `CREATE TABLE IF NOT EXISTS` above
+        // already lists `record_kind`/`symlink_target`/`unix_mode`/
+        // `symlink_out_of_root`/`xattrs_json` -- correct for a genuinely
+        // fresh database, but wrong for one where an EARLIER, interrupted
+        // `init` call already created this table (at whatever column set
+        // that earlier binary's `CREATE TABLE` literal carried) before
+        // crashing or being upgraded past. `CREATE TABLE IF NOT EXISTS`
+        // is then a silent no-op on every later `init`, so a database that
+        // stalled between creating this table and completing its first
+        // run can reach a stamped, "supported" schema version while this
+        // table is still missing a column every later query assumes is
+        // there -- surfacing as a runtime `no such column` failure on the
+        // documented crash-recovery restore path, not a friendly refusal
+        // at startup. Idempotent and additive like every ALTER above:
+        // harmless on a table that already has the column (the same
+        // "duplicate column name" catch below), and every pre-existing
+        // row gets the same default the fresh `CREATE TABLE` would have
+        // given it.
+        "ALTER TABLE restore_operations ADD COLUMN record_kind TEXT NOT NULL DEFAULT 'file'",
+        "ALTER TABLE restore_operations ADD COLUMN symlink_target BLOB",
+        "ALTER TABLE restore_operations ADD COLUMN symlink_out_of_root INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE restore_operations ADD COLUMN unix_mode INTEGER NOT NULL DEFAULT -1",
+        "ALTER TABLE restore_operations ADD COLUMN xattrs_json TEXT NOT NULL DEFAULT '[]'",
     ] {
         match conn.execute(stmt, []) {
             Ok(_) => {}
@@ -922,7 +977,7 @@ pub(crate) fn migrate_files_table_widen_primary_key(
         ("last_accessed_unix", "NULL"),
         ("record_kind", "'file'"),
         ("symlink_target", "NULL"),
-        ("exec_bit", "0"),
+        ("unix_mode", "-1"),
         ("held_reason", "NULL"),
         ("held_since_unix_nanos", "NULL"),
         ("symlink_out_of_root", "0"),
@@ -968,7 +1023,7 @@ pub(crate) fn migrate_files_table_widen_primary_key(
             last_accessed_unix      INTEGER,
             record_kind             TEXT NOT NULL DEFAULT 'file',
             symlink_target          BLOB,
-            exec_bit                INTEGER NOT NULL DEFAULT 0,
+            unix_mode                INTEGER NOT NULL DEFAULT -1,
             held_reason             TEXT,
             held_since_unix_nanos   INTEGER,
             symlink_out_of_root     INTEGER NOT NULL DEFAULT 0,

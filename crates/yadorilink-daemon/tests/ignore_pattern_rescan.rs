@@ -5,7 +5,7 @@
 //! wires this (confirmed by reading
 //! the daemon's own link-runtime task wiring): a debounced flush that
 //! touches the ignore file reloads the effective pattern set and forces a
-//! full `BurstFallback` reconciliation scan. This test exercises that path
+//! full `RescanRequired` reconciliation scan. This test exercises that path
 //! end-to-end via the real OS-level watcher (not a direct call into
 //! `local_change`), across two networked devices, the same shape as
 //! `live_burst_batching.rs`.
@@ -20,20 +20,16 @@ use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeCo
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_transport::DeviceKeyPair;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn editing_yadorilinkignore_rescans_and_reconverges_without_daemon_restart() {
     let coordination_addr = support::start_coordination_server().await;
     let account =
         support::register_and_login(&coordination_addr, "ignore-rescan@example.com").await;
-
-    let keypair_a = Arc::new(DeviceKeyPair::generate());
     let device_a_id =
-        support::register_device(&account, "device-a", keypair_a.public_bytes()).await;
-    let keypair_b = Arc::new(DeviceKeyPair::generate());
+        support::register_device(&account, "device-a", [0u8; 32]).await;
     let device_b_id =
-        support::register_device(&account, "device-b", keypair_b.public_bytes()).await;
+        support::register_device(&account, "device-b", [0u8; 32]).await;
 
     let group_id = support::create_folder_group(&account, "ignore-rescan-group").await;
     support::grant_access(&account, &group_id, &device_a_id).await;

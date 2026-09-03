@@ -19,12 +19,18 @@ pub struct DeviceConfig {
     /// individual settings may still be omitted and filled from `NatConfig`'s
     /// defaults so manual configuration stays practical.
     pub nat: NatConfig,
-    /// Base64-encoded public half of this device's registered WireGuard/X25519
-    /// key. Required: a config that cannot identify the registered key is not a
-    /// valid current config.
+    /// Base64-encoded copy of this device's Ed25519 signing key, stored a
+    /// second time under the field name the coordination plane's
+    /// registration schema still requires for its retired transport-key
+    /// column (`NOT NULL` there; the CLI's device-registration flow sends
+    /// the same key under both names and this device ignores what comes
+    /// back in this one). Required: a config that cannot identify the
+    /// registered key is not a valid current config.
     pub wireguard_public_key: String,
     /// Base64-encoded public half of this device's registered Ed25519
-    /// change-signing key. Required for the same reason as the transport key.
+    /// change-signing key -- this device's one real key, and the one
+    /// actually used to authenticate its transport. Required for the
+    /// same reason as the field above.
     pub signing_public_key: String,
     /// Current config shape marker. Missing markers are rejected by serde;
     /// configs written by newer builds are rejected explicitly below.

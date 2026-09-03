@@ -407,6 +407,16 @@ impl From<yadorilink_sync_sqlite::SyncSqliteError> for SyncError {
             yadorilink_sync_sqlite::SyncSqliteError::InvalidInput(msg) => {
                 SyncError::InvalidInput(msg)
             }
+            // `dag_store::admit_change`'s causal-auth-monotonicity check
+            // (C4-10) -- the cleanup this variant exists to let
+            // `ChangeHistoryRepository` trigger specifically already
+            // happens below this boundary, so nothing here needs to
+            // distinguish it further than `InvalidInput` already conveys.
+            yadorilink_sync_sqlite::SyncSqliteError::CausalAuthViolation => {
+                SyncError::InvalidInput(
+                    "change pins an authorization coordinate older than its causal parent".into(),
+                )
+            }
             yadorilink_sync_sqlite::SyncSqliteError::Io(e) => SyncError::Io(e),
             // `filesystem_transaction`'s execution gate and journal-schema
             // errors (Phase 7D-7.2) -- see `SyncSqliteError`'s own doc

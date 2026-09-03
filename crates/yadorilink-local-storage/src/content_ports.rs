@@ -86,7 +86,7 @@
 use std::collections::HashSet;
 use std::time::SystemTime;
 
-use crate::{BlockStore, ContentHash, GcReport, StorageError};
+use crate::{BlockStore, ContentHash, GcReport, LocallyHashedBlock, StorageError};
 
 /// Content-addressed read/write for the sync/materialization hot path.
 /// Every method here is called from this crate today — see this module's
@@ -97,6 +97,16 @@ pub trait BlockContentStore: Send + Sync {
     /// `single_pass_capture.rs`'s single-pass branches while a file is
     /// captured.
     fn put(&self, data: &[u8]) -> Result<ContentHash, StorageError>;
+
+    /// See `BlockStore::put_prepared`'s own doc comment — same contract,
+    /// forwarded through this port for `chunker.rs`'s `&dyn
+    /// BlockContentStore` callers.
+    fn put_prepared(&self, prepared: &LocallyHashedBlock) -> Result<(), StorageError>;
+
+    /// See `BlockStore::put_prepared_batch`'s own doc comment — same
+    /// contract, forwarded through this port for `chunker.rs`'s `&dyn
+    /// BlockContentStore` callers.
+    fn put_prepared_batch(&self, prepared: &[LocallyHashedBlock]) -> Result<(), StorageError>;
 
     /// Reads a block back by hash, called from `chunker.rs::reconstruct_file`
     /// while assembling a file from its index-recorded blocks, and from
@@ -114,6 +124,14 @@ pub trait BlockContentStore: Send + Sync {
 impl<T: BlockStore + ?Sized> BlockContentStore for T {
     fn put(&self, data: &[u8]) -> Result<ContentHash, StorageError> {
         BlockStore::put(self, data)
+    }
+
+    fn put_prepared(&self, prepared: &LocallyHashedBlock) -> Result<(), StorageError> {
+        BlockStore::put_prepared(self, prepared)
+    }
+
+    fn put_prepared_batch(&self, prepared: &[LocallyHashedBlock]) -> Result<(), StorageError> {
+        BlockStore::put_prepared_batch(self, prepared)
     }
 
     fn get(&self, hash: &str) -> Result<Vec<u8>, StorageError> {

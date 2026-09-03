@@ -141,6 +141,102 @@ async fn pause_all_and_resume_all_affect_every_linked_folder() {
     assert!(!status.links[0].paused, "resume_all should have resumed the link");
 }
 
+/// `actions::list_conflicts_for`/`list_trash_for` (the folder-status
+/// window's Conflicts/Trash panels) both round-trip through the real
+/// daemon and correctly filter down to a freshly-linked, empty folder --
+/// they must return an empty list, not an error, since the daemon-side
+/// requests span every link at once and this crate does the filtering.
+#[tokio::test]
+async fn list_conflicts_for_and_list_trash_for_return_empty_for_a_fresh_link() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (dir, _state) = start_daemon().await;
+
+    let folder = dir.path().join("synced");
+    std::fs::create_dir_all(&folder).unwrap();
+    let local_path = folder.to_string_lossy().to_string();
+    ipc_client::send(ReqPayload::Link(LinkRequest {
+        local_path: local_path.clone(),
+        group_id: "group-conflicts".into(),
+        on_demand: false,
+        max_local_size_bytes: None,
+        acknowledge_risks: true,
+        pending_enrollment_operation_id: String::new(),
+        pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
+        pending_enrollment_device_id: String::new(),
+    }))
+    .await
+    .expect("linking a fresh folder should succeed");
+
+    let conflicts = actions::list_conflicts_for(&local_path).await.expect("should succeed");
+    assert!(conflicts.is_empty());
+    let trash = actions::list_trash_for(&local_path).await.expect("should succeed");
+    assert!(trash.is_empty());
+}
+
+/// `actions::materialization_status` correctly maps
+/// `MaterializationStatusResponse.known == false` for a path the daemon
+/// has never indexed -- the folder-status window's selective-sync panel
+/// relies on this to render "not currently tracked" rather than a
+/// fabricated state.
+#[tokio::test]
+async fn materialization_status_reports_unknown_for_an_unindexed_path() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (dir, _state) = start_daemon().await;
+
+    let folder = dir.path().join("synced");
+    std::fs::create_dir_all(&folder).unwrap();
+    ipc_client::send(ReqPayload::Link(LinkRequest {
+        local_path: folder.to_string_lossy().to_string(),
+        group_id: "group-materialization".into(),
+        on_demand: false,
+        max_local_size_bytes: None,
+        acknowledge_risks: true,
+        pending_enrollment_operation_id: String::new(),
+        pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
+        pending_enrollment_device_id: String::new(),
+    }))
+    .await
+    .expect("linking a fresh folder should succeed");
+
+    let never_touched = folder.join("never-touched.bin").to_string_lossy().to_string();
+    let status = actions::materialization_status(never_touched)
+        .await
+        .expect("a MaterializationStatusResponse, even for an unknown path");
+    assert!(!status.known);
+}
+
+/// The mutating file-tools actions (`pin_file`/`hydrate_file`/
+/// `restore_version`/`restore_trash`) each surface a clear daemon error
+/// for a path that was never indexed -- same "not found" contract the
+/// daemon's own `control_socket.rs` tests already pin for the raw IPC
+/// requests, exercised here through this crate's own wrapper functions.
+#[tokio::test]
+async fn mutating_file_actions_return_a_clear_error_for_an_unknown_path() {
+    let _guard = TEST_MUTEX.lock().await;
+    let (dir, _state) = start_daemon().await;
+
+    let folder = dir.path().join("synced");
+    std::fs::create_dir_all(&folder).unwrap();
+    ipc_client::send(ReqPayload::Link(LinkRequest {
+        local_path: folder.to_string_lossy().to_string(),
+        group_id: "group-actions".into(),
+        on_demand: false,
+        max_local_size_bytes: None,
+        acknowledge_risks: true,
+        pending_enrollment_operation_id: String::new(),
+        pending_enrollment_kind: PendingEnrollmentKind::Unspecified as i32,
+        pending_enrollment_device_id: String::new(),
+    }))
+    .await
+    .expect("linking a fresh folder should succeed");
+
+    let nope = folder.join("nope.bin").to_string_lossy().to_string();
+    assert!(actions::pin_file(nope.clone()).await.is_err());
+    assert!(actions::hydrate_file(nope.clone()).await.is_err());
+    assert!(actions::restore_version(nope.clone(), None).await.is_err());
+    assert!(actions::restore_trash(nope).await.is_err());
+}
+
 /// `actions::export_diagnostics` writes a
 /// real file with the daemon-assembled bundle contents under the config
 /// directory.

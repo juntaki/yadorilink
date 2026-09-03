@@ -78,7 +78,7 @@ impl MaterializationStateRepository {
         group_id: &str,
         path: &str,
         state: MaterializationState,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError> {
         let affected = self.database.write::<_, SyncSqliteError>(|conn| {
             permit.verify()?;
@@ -103,7 +103,7 @@ impl MaterializationStateRepository {
         path: &str,
         expected: MaterializationState,
         next: MaterializationState,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<bool, SyncSqliteError> {
         let affected = self.database.write::<_, SyncSqliteError>(|conn| {
             permit.verify()?;
@@ -724,6 +724,30 @@ impl MaterializationStateRepository {
         })
     }
 
+    /// Every currently-held path in `group_id` — the candidate set for a
+    /// periodic hazard re-check sweep. Nothing today re-evaluates a held
+    /// path's hazard on its own once the SIBLING path that caused the
+    /// collision changes (deleted, renamed, or itself re-admitted under a
+    /// name that no longer collides): `clear_held` only ever runs as a side
+    /// effect of a fresh incoming record for the SAME path, so a hold whose
+    /// cause has already cleared can otherwise persist forever with no
+    /// re-arm event. This listing exists to make that sweep possible; it is
+    /// not itself the recheck.
+    pub fn list_held_paths(&self, group_id: &str) -> Result<Vec<String>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT path FROM files \
+                 WHERE group_id = ?1 AND state = 'current' AND held_reason IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![group_id], |r| r.get::<_, String>(0))?;
+            let mut paths = Vec::new();
+            for row in rows {
+                paths.push(row?);
+            }
+            Ok(paths)
+        })
+    }
+
     /// Clears a file's held state. A no-op, not an error, if the file
     /// wasn't held (or the row doesn't exist) — callers tombstoning a
     /// record don't first need to check whether it was ever held.
@@ -736,6 +760,23 @@ impl MaterializationStateRepository {
             )?;
             Ok(())
         })
+    }
+
+    /// `_in_tx` counterpart of [`Self::clear_held`], for a caller that
+    /// already holds an open transaction spanning more writes than just
+    /// this one (C4-6: bounded batching of receiver-side materialization
+    /// commits). Identical SQL/semantics.
+    pub fn clear_held_in_tx(
+        tx: &rusqlite::Transaction,
+        group_id: &str,
+        path: &str,
+    ) -> Result<(), SyncSqliteError> {
+        tx.execute(
+            "UPDATE files SET held_reason = NULL, held_since_unix_nanos = NULL \
+             WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
+            rusqlite::params![group_id, path],
+        )?;
+        Ok(())
     }
 
     /// Records the identity of the exact on-disk object a `write_placeholder`
@@ -751,7 +792,7 @@ impl MaterializationStateRepository {
         path: &str,
         identity: yadorilink_local_storage::PlaceholderDiskIdentity,
         provider_kind: &str,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError> {
         let affected = self.database.write::<_, SyncSqliteError>(|conn| {
             permit.verify()?;
@@ -801,7 +842,7 @@ impl MaterializationStateRepository {
         path: &str,
         candidate: yadorilink_local_storage::PlaceholderDiskIdentity,
         provider_kind: &str,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<yadorilink_local_storage::PlaceholderDiskIdentity, SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
             permit.verify()?;
@@ -853,7 +894,7 @@ impl MaterializationStateRepository {
         &self,
         group_id: &str,
         path: &str,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError> {
         self.database.write::<_, SyncSqliteError>(|conn| {
             permit.verify()?;
@@ -1056,7 +1097,7 @@ impl MaterializationStateRepository {
         group_id: &str,
         path: &str,
         fingerprint: Option<MaterializedFingerprint>,
-        permit: &RootCommitPermit<'_>,
+        permit: &RootCommitPermit,
     ) -> Result<(), SyncSqliteError> {
         let (len, mtime_nanos, ctime, ctime_nsec) = match fingerprint {
             Some((len, mtime, ctime, ctime_nsec)) => (
@@ -1080,6 +1121,37 @@ impl MaterializationStateRepository {
             )?;
             Ok(())
         })
+    }
+
+    /// `_in_tx` counterpart of [`Self::record_materialized_fingerprint`],
+    /// for a caller that already holds an open transaction spanning more
+    /// writes than just this one (C4-6: bounded batching of receiver-side
+    /// materialization commits). Identical decomposition/SQL/semantics.
+    pub fn record_materialized_fingerprint_in_tx(
+        tx: &rusqlite::Transaction,
+        group_id: &str,
+        path: &str,
+        fingerprint: Option<MaterializedFingerprint>,
+    ) -> Result<(), SyncSqliteError> {
+        let (len, mtime_nanos, ctime, ctime_nsec) = match fingerprint {
+            Some((len, mtime, ctime, ctime_nsec)) => (
+                Some(len as i64),
+                mtime.and_then(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_nanos() as i64)
+                }),
+                Some(ctime),
+                Some(ctime_nsec),
+            ),
+            None => (None, None, None, None),
+        };
+        tx.execute(
+            "UPDATE files SET materialized_fingerprint_len = ?1, \
+             materialized_fingerprint_mtime_nanos = ?2, materialized_fingerprint_ctime = ?3, \
+             materialized_fingerprint_ctime_nsec = ?4 \
+             WHERE group_id = ?5 AND path = ?6 AND state = 'current'",
+            rusqlite::params![len, mtime_nanos, ctime, ctime_nsec, group_id, path],
+        )?;
+        Ok(())
     }
 
     /// The materialized-content fingerprint recorded for `group_id`/`path`,
@@ -1304,5 +1376,77 @@ mod block_fetch_refusal_tests {
             std::collections::HashSet::from([peer.to_string()]),
             "v2's independent refusal must be untouched by clearing v1's"
         );
+    }
+}
+
+/// `list_held_paths` is the candidate set a hazard re-check sweep walks --
+/// nothing today re-evaluates a held path's hazard once the sibling that
+/// caused it changes, so this listing is the piece that makes such a sweep
+/// possible at all (see the method's own doc comment).
+#[cfg(test)]
+mod held_state_tests {
+    use super::*;
+
+    /// Full schema: DAG tables first (`yadorilink_sqlite_runtime::
+    /// init_schema` assumes `changes`/`pruned_changes` already exist, per
+    /// its own doc comment), then the real `files` table.
+    fn open_full_test_db() -> Arc<SyncDatabase> {
+        Arc::new(
+            SyncDatabase::open_in_memory(|conn| {
+                crate::dag_store::init_dag_schema(conn)
+                    .map_err(|e| yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(e.to_string()))?;
+                yadorilink_sqlite_runtime::init_schema(conn)
+            })
+            .expect("open in-memory db"),
+        )
+    }
+
+    fn seed_file_row(conn: &rusqlite::Connection, group_id: &str, path: &str) {
+        conn.execute(
+            "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json) \
+             VALUES (?1, ?2, 0, 0, '[]')",
+            rusqlite::params![group_id, path],
+        )
+        .unwrap();
+    }
+
+    /// Only currently-held paths in the requested group are listed -- an
+    /// unheld path, and a held path from a DIFFERENT group, must not leak
+    /// in.
+    #[test]
+    fn lists_only_currently_held_paths_in_the_requested_group() {
+        let db = open_full_test_db();
+        db.write::<_, SyncSqliteError>(|conn| {
+            seed_file_row(conn, "group-1", "held.txt");
+            seed_file_row(conn, "group-1", "not-held.txt");
+            seed_file_row(conn, "group-2", "held-in-other-group.txt");
+            Ok(())
+        })
+        .unwrap();
+        let repo = MaterializationStateRepository::new(db);
+        repo.set_held("group-1", "held.txt", "case_collision", 1000).unwrap();
+        repo.set_held("group-2", "held-in-other-group.txt", "case_collision", 1000).unwrap();
+
+        assert_eq!(repo.list_held_paths("group-1").unwrap(), vec!["held.txt".to_string()]);
+    }
+
+    /// Once a hold is cleared, the path must disappear from the listing --
+    /// otherwise a sweep built on this method would keep re-visiting a path
+    /// that no longer needs it.
+    #[test]
+    fn a_cleared_hold_disappears_from_the_listing() {
+        let db = open_full_test_db();
+        db.write::<_, SyncSqliteError>(|conn| {
+            seed_file_row(conn, "group-1", "was-held.txt");
+            Ok(())
+        })
+        .unwrap();
+        let repo = MaterializationStateRepository::new(db);
+        repo.set_held("group-1", "was-held.txt", "case_collision", 1000).unwrap();
+        assert_eq!(repo.list_held_paths("group-1").unwrap(), vec!["was-held.txt".to_string()]);
+
+        repo.clear_held("group-1", "was-held.txt").unwrap();
+
+        assert!(repo.list_held_paths("group-1").unwrap().is_empty());
     }
 }

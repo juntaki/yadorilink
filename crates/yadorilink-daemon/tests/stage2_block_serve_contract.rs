@@ -274,9 +274,10 @@ fn seed_block(device: &Device, group: &str, path: &str, data: Vec<u8>) -> Seeded
         data.len() as u64,
         FileMeta {
             mtime_unix_nanos: 0,
-            exec_bit: false,
+            unix_mode: None,
             symlink_target: None,
             record_kind: RecordKind::File,
+            xattrs: Vec::new(),
         },
     );
 
@@ -585,10 +586,13 @@ async fn late_small_requests_from_another_peer_and_group_cut_ahead_of_a_large_ba
 }
 
 #[test]
-fn stage2_wire_schema_exposes_credit_and_explicit_congestion_outcomes() {
+fn wire_schema_exposes_serve_credit_and_explicit_congestion_outcomes() {
     let schema = include_str!("../../yadorilink-ipc-proto/proto/sync.proto");
     let lower = schema.to_ascii_lowercase();
 
+    let cluster_start = lower.find("message clusterconfig").unwrap();
+    let cluster_end = lower.find("message blockrequestheader").unwrap();
+    let cluster = &lower[cluster_start..cluster_end];
     for required in [
         "max_inflight_requests",
         "max_inflight_bytes",
@@ -596,28 +600,52 @@ fn stage2_wire_schema_exposes_credit_and_explicit_congestion_outcomes() {
         "estimated_queue_delay_ms",
     ] {
         assert!(
-            lower.contains(required),
+            cluster.contains(required),
             "serve-credit advertisement is missing required field {required:?}"
         );
     }
-
-    let cluster_start = lower.find("message clusterconfig").unwrap();
-    let block_request_start = lower.find("message blockrequest").unwrap();
-    let cluster = &lower[cluster_start..block_request_start];
     assert!(
         cluster.contains("reserved \"supports_block_serve_credit\""),
-        "the removed capability bit must stay reserved so the v2 protocol has no fallback path"
+        "the removed capability bit must stay reserved so no fallback serving path can return"
     );
-    assert!(cluster.contains("uint32 protocol_version"));
-    assert!(!cluster
-        .lines()
-        .any(|line| line.trim_start().starts_with("bool supports_block_serve_credit =")));
+    // The protocol generation lives in exactly one place, and it is not
+    // here: it rides the ALPN, where a mismatch is refused inside the TLS
+    // handshake rather than after it. A `protocol_version` field reappearing
+    // on this message would be a second definition of the same number.
+    assert!(
+        cluster.contains("reserved \"protocol_version\""),
+        "the protocol generation must stay reserved on ClusterConfig -- the ALPN defines it"
+    );
+    for gone in [
+        "supported_compression",
+        "supports_change_dag",
+        "supports_version_present",
+        "supports_version_hash_exact",
+    ] {
+        assert!(
+            !cluster.lines().any(|line| {
+                let line = line.trim_start();
+                !line.starts_with("//")
+                    && !line.starts_with("reserved")
+                    && line.contains(&format!("{gone} ="))
+            }),
+            "the removed capability bit {gone:?} must not be declared on ClusterConfig"
+        );
+    }
 
-    let response_start = lower.find("message blockresponse").unwrap();
-    let response_end = lower[response_start..]
-        .find("// change-history dag exchange")
-        .map(|relative| response_start + relative)
-        .unwrap_or(lower.len());
+    // One block request is one bidirectional stream, so the request and
+    // response headers are their own messages rather than `SyncMessage`
+    // payload variants, and neither carries a correlation id.
+    let request_start = lower.find("message blockrequestheader").unwrap();
+    let request_end = lower.find("message blockfound").unwrap();
+    let request = &lower[request_start..request_end];
+    assert!(
+        !request.contains("request_id"),
+        "a block request header must carry no correlation id -- the stream is the correlation"
+    );
+
+    let response_start = lower.find("message blockfound").unwrap();
+    let response_end = lower.find("// change-history dag exchange").unwrap();
     let response = &lower[response_start..response_end];
     for required in [
         "busy",
@@ -627,10 +655,17 @@ fn stage2_wire_schema_exposes_credit_and_explicit_congestion_outcomes() {
         "candidate_device_ids",
         "rejected",
         "reason",
+        "dont_have",
     ] {
         assert!(
             response.contains(required),
-            "BlockResponse is missing explicit stage-2 outcome field/variant {required:?}"
+            "the block response header is missing outcome field/variant {required:?}"
+        );
+    }
+    for gone in ["chunk_offset", "total_size"] {
+        assert!(
+            !response.contains(gone),
+            "inline block-reply chunking is gone; {gone:?} must not reappear"
         );
     }
 }

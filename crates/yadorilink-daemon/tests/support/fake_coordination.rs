@@ -9,6 +9,13 @@
 //!     peer sessions.
 //!   - `POST /devices/:id/endpoint`, `/netmap/rendezvous`,
 //!     `/devices/:id/signing-key`: answered `204` (best-effort on the daemon).
+//!   - `POST /shares/groups/:groupId/relay/grant` (P0-A): the one route this
+//!     fake actually implements over real HTTP rather than a blanket `204`
+//!     -- see `serve_relay_grant`'s own doc comment for why: it is what lets
+//!     [`crate::coordination_client::request_relay_grant`] and
+//!     [`crate::relay_carrier::ProductionRelayGrantSource`] be exercised
+//!     against something other than the in-process `FakeGrantSource` bypass
+//!     every other relay-scenario test uses (`tests/support/topology.rs`).
 //!
 //! Revocation is expressed exactly as the real plane expresses it: recompute
 //! the netmap without the revoked peer or group and push it; the orchestrator
@@ -36,7 +43,14 @@ use tokio_tungstenite::WebSocketStream;
 struct DeviceInfo {
     wireguard_public_key_b64: String,
     signing_public_key_b64: String,
-    endpoint: String,
+    /// Every address this device advertises, in the order the netmap
+    /// presents them. A real coordination plane publishes each address a
+    /// device might be reachable at -- its LAN interfaces, its reflexive
+    /// address, a port-mapped one -- because it cannot know which of them a
+    /// given peer can actually use. A list rather than one address
+    /// specifically so a test can express the shape that matters: a peer
+    /// whose FIRST advertised endpoint does not work.
+    endpoints: Vec<String>,
     groups: HashSet<String>,
     full_replica_groups: HashSet<String>,
     /// M3 Pass 4: device-scoped (not group-scoped, unlike
@@ -55,6 +69,21 @@ struct Inner {
     /// after the coordination connection disappears. Other fake users keep the
     /// legacy policy-free frame so their revocation semantics stay unchanged.
     policy_service_key: Option<SigningKey>,
+    /// `(viewer_device_id, target_device_id) -> endpoints`, overriding what
+    /// `target_device_id`'s own `DeviceInfo::endpoints` would otherwise
+    /// publish, but ONLY in the netmap frame `viewer_device_id` itself
+    /// receives -- see `FakeCoordination::set_peer_view_endpoints`'s own
+    /// doc comment for why this exists (asymmetric reachability, not a
+    /// device-global property). Deliberately separate storage from
+    /// `DeviceInfo`, not a field on it: a real coordination plane has
+    /// exactly one advertised-endpoints list per device, and conflating an
+    /// asymmetric test override with that would make `update_endpoints`
+    /// (which mutates `DeviceInfo` and models a device's own candidate
+    /// republish) silently clobber or be clobbered by this. Survives
+    /// `register_device` re-registering `target_device_id` with a fresh
+    /// real endpoint -- restart tests specifically need a viewer's view of
+    /// a peer to stay overridden across that peer's own reconnect.
+    endpoint_view_overrides: HashMap<(String, String), Vec<String>>,
 }
 
 /// A handle to the running fake. Cloneable; every clone shares one server.
@@ -116,13 +145,17 @@ impl FakeCoordination {
         let mut inner = self.inner.lock().unwrap();
         inner.subscribers.clear();
         inner.devices.clear();
+        inner.endpoint_view_overrides.clear();
     }
 
     /// Records a device's identity and initial group membership, then pushes a
-    /// fresh netmap to everyone. `wireguard_public_key` must be the device's
-    /// real transport public key and `signing_public_key` its real change-
-    /// signing verifying key — the orchestrator pins both from the netmap and
-    /// verifies every incoming change against the pinned signing key.
+    /// fresh netmap to everyone. A device has one real key now (its Ed25519
+    /// signing key), so callers pass the same key for both `wireguard_public_key`
+    /// and `signing_public_key` here — the two parameters exist only because
+    /// this fake mirrors the coordination plane's real registration schema,
+    /// which still names one column after the retired transport key. The
+    /// orchestrator pins both from the netmap and verifies every incoming
+    /// change against the pinned signing key.
     pub fn register_device(
         &self,
         device_id: &str,
@@ -135,7 +168,7 @@ impl FakeCoordination {
         let info = DeviceInfo {
             wireguard_public_key_b64: b64.encode(wireguard_public_key),
             signing_public_key_b64: b64.encode(signing_public_key),
-            endpoint,
+            endpoints: vec![endpoint],
             groups: groups.iter().map(|g| g.to_string()).collect(),
             full_replica_groups: HashSet::new(),
             relay_capable: false,
@@ -162,22 +195,85 @@ impl FakeCoordination {
 
     /// M5-A: republishes `device_id`'s advertised endpoint -- mirroring
     /// what a real coordination plane would push over the netmap
-    /// subscription if a device's network conditions changed (e.g. its
-    /// direct path became unreachable). Lets a test force a live
-    /// direct<->relay failover on an ALREADY-connected pair by pointing
-    /// one side at a real-but-refused address (the same deterministic
-    /// technique `yadorilink-transport`'s `relay_failover.rs` uses for
-    /// its own lower-layer proof: an immediately-refused destination,
-    /// not silence, so `PeerChannel`'s candidate race fails fast and
-    /// reproducibly rather than relying on a timeout alone) and later
-    /// restore it to force promotion back.
+    /// subscription if a device's network conditions changed (e.g. a new
+    /// reflexive address). This is a device-GLOBAL candidate republish,
+    /// the same information every peer's netmap subscription receives --
+    /// it does not, and cannot, tear down a live QUIC connection any peer
+    /// already has to `device_id`. Production's own orchestrator only
+    /// consults candidates when it has no live session (initial dial,
+    /// post-failure reconnect): an established connection is left alone
+    /// by a bare candidate update, precisely so that address churn during
+    /// a live session does not itself cause disruption. A test that needs
+    /// to force a genuinely dead path for one specific peer pair, or to
+    /// force a currently-live direct connection down, needs
+    /// `set_peer_view_endpoints` and/or an explicit live-connection
+    /// teardown seam respectively -- see that method's own doc comment.
     #[allow(dead_code)]
     pub fn update_endpoint(&self, device_id: &str, endpoint: String) {
+        self.update_endpoints(device_id, vec![endpoint]);
+    }
+
+    /// Republishes `device_id`'s advertised endpoints as a whole ordered
+    /// list, so a test can express a peer that advertises several addresses
+    /// of which only some work -- in particular one whose FIRST advertised
+    /// address does not. Device-global, like `update_endpoint`'s own doc
+    /// comment explains -- every subscriber sees the same list, subject to
+    /// `set_peer_view_endpoints`'s per-viewer override below.
+    #[allow(dead_code)]
+    pub fn update_endpoints(&self, device_id: &str, endpoints: Vec<String>) {
         {
             let mut inner = self.inner.lock().unwrap();
             if let Some(dev) = inner.devices.get_mut(device_id) {
-                dev.endpoint = endpoint;
+                dev.endpoints = endpoints;
             }
+        }
+        self.push();
+    }
+
+    /// Overrides the endpoints `viewer_device_id`'s OWN netmap reports for
+    /// `target_device_id`, independent of what every other subscriber
+    /// sees. A real coordination plane cannot generally do this (it
+    /// publishes one endpoint list per device to everyone), but this test
+    /// fixture needs it anyway: a relay scenario wants `M` and `W` to be
+    /// mutually unreachable while both stay reachable from `N`, and
+    /// `update_endpoints`'s device-global republish cannot express that
+    /// asymmetry at all -- setting `W`'s endpoint dead would make `N` lose
+    /// its own real direct path to `W` too.
+    ///
+    /// Overriding here has no effect on group membership, full-replica
+    /// status, or relay-grant issuance -- purely which address(es)
+    /// `viewer_device_id`'s netmap names for `target_device_id`. Survives
+    /// `target_device_id` re-registering via `register_device` (a restart
+    /// pushing a fresh real endpoint does not implicitly clear a viewer's
+    /// override of it -- exactly the shape a restart-while-relayed test
+    /// needs: the restarted peer's real address must stay invisible to
+    /// the one specific viewer this override targets).
+    #[allow(dead_code)]
+    pub fn set_peer_view_endpoints(
+        &self,
+        viewer_device_id: &str,
+        target_device_id: &str,
+        endpoints: Vec<String>,
+    ) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner
+                .endpoint_view_overrides
+                .insert((viewer_device_id.to_string(), target_device_id.to_string()), endpoints);
+        }
+        self.push();
+    }
+
+    /// Removes a `set_peer_view_endpoints` override, reverting
+    /// `viewer_device_id`'s view of `target_device_id` to that device's
+    /// own globally-advertised endpoints.
+    #[allow(dead_code)]
+    pub fn clear_peer_view_endpoints(&self, viewer_device_id: &str, target_device_id: &str) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner
+                .endpoint_view_overrides
+                .remove(&(viewer_device_id.to_string(), target_device_id.to_string()));
         }
         self.push();
     }
@@ -281,7 +377,13 @@ impl FakeCoordination {
     /// Removes a device entirely (device removal) and pushes the new netmap;
     /// peers see it vanish and tear the session down.
     pub fn remove_device(&self, device_id: &str) {
-        self.inner.lock().unwrap().devices.remove(device_id);
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.devices.remove(device_id);
+            inner
+                .endpoint_view_overrides
+                .retain(|(viewer, target), _| viewer != device_id && target != device_id);
+        }
         self.push();
     }
 
@@ -319,11 +421,20 @@ fn netmap_frame_for(inner: &mut Inner, subscriber_id: &str) -> String {
         }
         let full_replica: Vec<String> =
             dev.full_replica_groups.intersection(&self_groups).cloned().collect();
+        // Per-viewer override wins over the device's own global endpoint
+        // list -- see `set_peer_view_endpoints`'s own doc comment.
+        let visible_endpoints = inner
+            .endpoint_view_overrides
+            .get(&(subscriber_id.to_string(), device_id.to_string()))
+            .unwrap_or(&dev.endpoints);
         peers.push(serde_json::json!({
             "deviceId": device_id,
             "wireguardPublicKeyBase64": dev.wireguard_public_key_b64,
             "signingPublicKeyBase64": dev.signing_public_key_b64,
-            "endpoints": [ { "address": dev.endpoint } ],
+            "endpoints": visible_endpoints
+                .iter()
+                .map(|address| serde_json::json!({ "address": address }))
+                .collect::<Vec<_>>(),
             "sharedGroupIds": shared,
             "fullReplicaGroupIds": full_replica,
             "relayCapable": dev.relay_capable,
@@ -378,14 +489,219 @@ async fn handle_connection(mut stream: TcpStream, inner: Arc<Mutex<Inner>>) -> s
     let is_ws_upgrade = head.to_ascii_lowercase().contains("upgrade: websocket");
     if method == "GET" && target.starts_with("/netmap/subscribe") && is_ws_upgrade {
         serve_netmap_subscription(stream, &head, &target, inner).await
+    } else if method == "POST" {
+        if let Some(group_id) = parse_relay_grant_target(&target) {
+            serve_relay_grant(stream, &head, leftover, group_id, inner).await
+        } else {
+            // Every other endpoint the daemon calls (endpoint report,
+            // rendezvous, signing-key backfill) is best-effort: a 204 is all
+            // it needs. Drain any request body first so the socket closes
+            // cleanly.
+            drain_body(&mut stream, &head, leftover).await?;
+            stream.write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n").await?;
+            stream.flush().await
+        }
     } else {
-        // Every other endpoint the daemon calls (endpoint report, rendezvous,
-        // signing-key backfill) is best-effort: a 204 is all it needs. Drain any
-        // request body first so the socket closes cleanly.
         drain_body(&mut stream, &head, leftover).await?;
         stream.write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n").await?;
         stream.flush().await
     }
+}
+
+/// Matches `/shares/groups/{groupId}/relay/grant` and extracts `groupId`, or
+/// `None` for anything else (including a group id that itself contains a
+/// `/`, which cannot be a real path segment).
+fn parse_relay_grant_target(target: &str) -> Option<String> {
+    let path = target.split('?').next().unwrap_or(target);
+    let group_id = path.strip_prefix("/shares/groups/")?.strip_suffix("/relay/grant")?;
+    (!group_id.is_empty() && !group_id.contains('/')).then(|| group_id.to_string())
+}
+
+/// Serves `POST /shares/groups/:groupId/relay/grant` for real, over the same
+/// HTTP connection `coordination_client::request_relay_grant` speaks --
+/// unlike every other route this fake answers, which is a blanket `204`
+/// the daemon treats as best-effort. This route exists specifically so
+/// `ProductionRelayGrantSource` can be exercised end-to-end (request ->
+/// real HTTP -> signed response -> `verify_relay_grant`) rather than only
+/// through `FakeGrantSource`'s synchronous in-process bypass of
+/// `issue_relay_grant`, which every other relay-scenario test uses.
+///
+/// The authorization performed here mirrors `coordination-worker`'s own
+/// `issueRelayGrant` (`src/relay/service.ts`): all three device ids must be
+/// registered and current members of `group_id`, the three ids must be
+/// pairwise distinct, and `relay_device_id` must have declared relay
+/// capability. `not_before_unix`/`expires_at_unix` use the same 30s
+/// clock-skew allowance and 60s TTL as the real Worker
+/// (`RELAY_GRANT_CLOCK_SKEW_ALLOWANCE_SECONDS`/`RELAY_GRANT_TTL_SECONDS` in
+/// `coordination-worker/src/relay/service.ts`), so a test exercising this
+/// path sees the same margins production grants actually carry.
+async fn serve_relay_grant(
+    mut stream: TcpStream,
+    head: &str,
+    leftover: Vec<u8>,
+    group_id: String,
+    inner: Arc<Mutex<Inner>>,
+) -> std::io::Result<()> {
+    let body = read_body(&mut stream, head, leftover).await?;
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Req {
+        source_device_id: String,
+        relay_device_id: String,
+        destination_device_id: String,
+    }
+
+    let outcome = match serde_json::from_slice::<Req>(&body) {
+        Ok(req) => authorize_and_issue_relay_grant(
+            &inner,
+            &group_id,
+            &req.source_device_id,
+            &req.relay_device_id,
+            &req.destination_device_id,
+        ),
+        Err(_) => Err((400, "invalid request body".to_string())),
+    };
+
+    match outcome {
+        Ok(grant) => {
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let body = serde_json::json!({
+                "grantId": grant.grant_id,
+                "version": grant.version,
+                "notBeforeUnix": grant.not_before_unix,
+                "expiresAtUnix": grant.expires_at_unix,
+                "maxSessionBytes": grant.max_session_bytes,
+                "signatureBase64": b64.encode(&grant.signature),
+            })
+            .to_string();
+            respond_json(&mut stream, 200, "OK", &body).await
+        }
+        Err((status, message)) => {
+            let body = serde_json::json!({ "error": message }).to_string();
+            let reason = match status {
+                400 => "Bad Request",
+                500 => "Internal Server Error",
+                _ => "Error",
+            };
+            respond_json(&mut stream, status, reason, &body).await
+        }
+    }
+}
+
+/// The synchronous half of [`serve_relay_grant`]: every authorization check
+/// plus signing, none of it requiring `.await` -- kept separate so the
+/// `Inner` mutex guard never needs to live across an await point.
+fn authorize_and_issue_relay_grant(
+    inner: &Arc<Mutex<Inner>>,
+    group_id: &str,
+    source_device_id: &str,
+    relay_device_id: &str,
+    destination_device_id: &str,
+) -> Result<yadorilink_daemon::relay_grant::RelayGrant, (u16, String)> {
+    if source_device_id == relay_device_id
+        || relay_device_id == destination_device_id
+        || source_device_id == destination_device_id
+    {
+        return Err((
+            400,
+            "sourceDeviceId, relayDeviceId, and destinationDeviceId must be pairwise distinct"
+                .to_string(),
+        ));
+    }
+
+    let guard = inner.lock().unwrap();
+    let signing_key = guard
+        .policy_service_key
+        .clone()
+        .ok_or((500, "no service signing key installed".to_string()))?;
+    let source = guard
+        .devices
+        .get(source_device_id)
+        .ok_or((400, "sourceDeviceId is not registered".to_string()))?;
+    if !source.groups.contains(group_id) {
+        return Err((400, "sourceDeviceId is not an active member of this group".to_string()));
+    }
+    let relay = guard
+        .devices
+        .get(relay_device_id)
+        .ok_or((400, "relayDeviceId is not registered".to_string()))?;
+    if !relay.groups.contains(group_id) {
+        return Err((400, "relayDeviceId is not an active member of this group".to_string()));
+    }
+    if !relay.relay_capable {
+        return Err((400, "relayDeviceId has not declared relay capability".to_string()));
+    }
+    let destination = guard
+        .devices
+        .get(destination_device_id)
+        .ok_or((400, "destinationDeviceId is not registered".to_string()))?;
+    if !destination.groups.contains(group_id) {
+        return Err((400, "destinationDeviceId is not an active member of this group".to_string()));
+    }
+    drop(guard);
+
+    let issued_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let now = issued_at.as_secs() as i64;
+    let grant_id =
+        format!("grant-{source_device_id}-{destination_device_id}-{}", issued_at.as_nanos());
+    let grant = yadorilink_daemon::relay_grant::RelayGrant {
+        version: 1,
+        grant_id,
+        group_id: group_id.to_string(),
+        source_device_id: source_device_id.to_string(),
+        relay_device_id: relay_device_id.to_string(),
+        destination_device_id: destination_device_id.to_string(),
+        not_before_unix: now - 30,
+        expires_at_unix: now + 60,
+        max_session_bytes: None,
+        signature: Vec::new(),
+    };
+    Ok(yadorilink_daemon::relay_grant::sign_relay_grant(grant, &signing_key))
+}
+
+async fn respond_json(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await
+}
+
+/// Like `drain_body`, but returns the collected bytes instead of discarding
+/// them -- `serve_relay_grant` needs the request body itself, unlike every
+/// other route this fake answers.
+async fn read_body(
+    stream: &mut TcpStream,
+    head: &str,
+    already_read: Vec<u8>,
+) -> std::io::Result<Vec<u8>> {
+    let content_length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim().eq_ignore_ascii_case("content-length").then(|| value.trim().to_string())
+        })
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = already_read;
+    let mut chunk = [0u8; 1024];
+    while body.len() < content_length {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    body.truncate(content_length.min(body.len()));
+    Ok(body)
 }
 
 /// Reads bytes until the end of the HTTP request head (`\r\n\r\n`). Returns the

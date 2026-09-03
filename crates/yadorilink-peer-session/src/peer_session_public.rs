@@ -9,7 +9,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -24,7 +24,6 @@ use yadorilink_replica_domain::file::VersionBlock;
 use yadorilink_replica_domain::ids::{ChangeHash, VersionHash};
 use yadorilink_replica_domain::rebootstrap::RebootstrapRequired;
 use yadorilink_replica_engine::conflict::PathHead;
-use yadorilink_sync_wire::PeerWireCodec;
 
 #[cfg(madsim)]
 pub use crate::peer_session_impl::set_test_clock_override;
@@ -35,13 +34,10 @@ pub use crate::peer_session_impl::{
     HandoffTicketResponder, HydrationOutcome, PeerHandoffLeaseGrant, PeerHandoffTicketGrant,
     PendingLocalChangeFlush, PendingLocalFlushOutcome, PreparedRebootstrap, ProjectionAttempt,
     RebootstrapHandler, RelayReplySink, RelaySessionHandler, RootCommitAuthorityProvider,
-    DEFAULT_HYDRATION_TIMEOUT, DEFAULT_MAINTENANCE_RECONCILE_INTERVAL,
+    SettlementEvidence, DEFAULT_HYDRATION_TIMEOUT, DEFAULT_MAINTENANCE_RECONCILE_INTERVAL,
 };
 
 use crate::peer_session_impl::PeerSyncSession as InnerPeerSyncSession;
-
-const EXACT_HANDSHAKE_ATTEMPTS: u32 = 4;
-const EXACT_HANDSHAKE_BASE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct PeerSyncSessionDeps {
@@ -49,7 +45,7 @@ pub struct PeerSyncSessionDeps {
     pub block_serve_engine: Arc<BlockServeEngine>,
     pub headroom_override_bytes: Option<u64>,
     pub headroom_enforced: bool,
-    pub full_index_resync_interval: Duration,
+    pub maintenance_reconcile_interval: Duration,
     pub pending_local_change_flush: Arc<dyn PendingLocalChangeFlush>,
     pub change_authenticator: Arc<dyn ChangeAuthenticator>,
     pub handoff_lease_responder: Arc<dyn HandoffLeaseResponder>,
@@ -81,7 +77,7 @@ impl PeerSyncSessionDeps {
             block_serve_engine: BlockServeEngine::new(64 * GIB, 16 * GIB, 32 * GIB, 64),
             headroom_override_bytes: None,
             headroom_enforced: false,
-            full_index_resync_interval: DEFAULT_MAINTENANCE_RECONCILE_INTERVAL,
+            maintenance_reconcile_interval: DEFAULT_MAINTENANCE_RECONCILE_INTERVAL,
             pending_local_change_flush: Arc::new(NoopPendingLocalChangeFlush),
             change_authenticator: Arc::new(DenyAllChangeAuthenticator),
             handoff_lease_responder: Arc::new(DenyHandoffLeaseResponder),
@@ -113,24 +109,10 @@ impl PeerSyncSessionDeps {
 
 pub struct PeerSyncSession {
     inner: Arc<InnerPeerSyncSession>,
-    channel: Arc<dyn crate::ports::PeerMessageChannel>,
-    codec: yadorilink_sync_wire::ProtobufPeerWireCodec,
-    exact_cluster_config: StdMutex<yadorilink_sync_wire::ClusterConfigOutboundFrame>,
     started: AtomicBool,
-    /// Kept alongside `inner`'s own copy purely for the handshake
-    /// preflight's own tracing (below) -- `inner`'s copy is private to
-    /// `peer_session_impl`, a sibling module this one has no field access
-    /// into.
-    peer_device_id: String,
 }
 
 impl PeerSyncSession {
-    /// The raw implementation also emits this value. Breaking compatibility is
-    /// expressed by requiring the complete current capability set below; using
-    /// a wrapper-only generation would be self-contradictory because the inner
-    /// session re-announces its own `ClusterConfig` after this preflight.
-    pub const PROTOCOL_VERSION: u32 = InnerPeerSyncSession::PROTOCOL_VERSION;
-
     pub fn new(
         channel: Arc<dyn crate::ports::PeerMessageChannel>,
         local_device_id: String,
@@ -189,26 +171,9 @@ impl PeerSyncSession {
         forward_tx: Option<mpsc::UnboundedSender<(String, FileRecord)>>,
         dependencies: PeerSyncSessionDeps,
     ) -> Arc<Self> {
-        let hints = dependencies.block_serve_engine.advertised_hints();
-        let exact_cluster_config = yadorilink_sync_wire::ClusterConfigOutboundFrame {
-            folder_group_ids: shared_group_ids.clone(),
-            known_peer_device_ids: vec![local_device_id.clone()],
-            supported_compression: vec![yadorilink_sync_wire::COMPRESSION_ZSTD],
-            supports_reliable_delivery: true,
-            acked_peer_cluster_config: false,
-            supports_change_dag: true,
-            supports_version_present: true,
-            supports_version_hash_exact: true,
-            max_inflight_requests: hints.max_inflight_requests,
-            max_inflight_bytes: hints.max_inflight_bytes,
-            available_worker_slots: hints.available_worker_slots,
-            estimated_queue_delay_ms: hints.estimated_queue_delay_ms,
-            protocol_version: Self::PROTOCOL_VERSION,
-        };
         let one_time_deps = dependencies.one_time_deps();
-        let peer_device_id_for_wrapper = peer_device_id.clone();
         let inner = InnerPeerSyncSession::new_with_forwarding(
-            channel.clone(),
+            channel,
             local_device_id,
             peer_device_id,
             state,
@@ -222,15 +187,8 @@ impl PeerSyncSession {
         inner.set_block_serve_engine(dependencies.block_serve_engine.clone());
         inner.set_headroom_override_bytes(dependencies.headroom_override_bytes);
         inner.set_headroom_enforced(dependencies.headroom_enforced);
-        inner.set_full_index_resync_interval(dependencies.full_index_resync_interval);
-        Arc::new(Self {
-            inner,
-            channel,
-            codec: yadorilink_sync_wire::ProtobufPeerWireCodec,
-            exact_cluster_config: StdMutex::new(exact_cluster_config),
-            started: AtomicBool::new(false),
-            peer_device_id: peer_device_id_for_wrapper,
-        })
+        inner.set_maintenance_reconcile_interval(dependencies.maintenance_reconcile_interval);
+        Arc::new(Self { inner, started: AtomicBool::new(false) })
     }
 
     fn assert_not_started(&self) {
@@ -247,13 +205,7 @@ impl PeerSyncSession {
 
     pub fn set_block_serve_engine(&self, value: Arc<BlockServeEngine>) {
         self.assert_not_started();
-        let hints = value.advertised_hints();
         self.inner.set_block_serve_engine(value);
-        let mut config = self.exact_cluster_config.lock().unwrap_or_else(|p| p.into_inner());
-        config.max_inflight_requests = hints.max_inflight_requests;
-        config.max_inflight_bytes = hints.max_inflight_bytes;
-        config.available_worker_slots = hints.available_worker_slots;
-        config.estimated_queue_delay_ms = hints.estimated_queue_delay_ms;
     }
 
     pub fn set_headroom_override_bytes(&self, value: Option<u64>) {
@@ -266,9 +218,9 @@ impl PeerSyncSession {
         self.inner.set_headroom_enforced(value);
     }
 
-    pub fn set_full_index_resync_interval(&self, value: Duration) {
+    pub fn set_maintenance_reconcile_interval(&self, value: Duration) {
         self.assert_not_started();
-        self.inner.set_full_index_resync_interval(value);
+        self.inner.set_maintenance_reconcile_interval(value);
     }
 
     /// M3 Pass 5: sends a `RelayOpen` over this channel, asking the peer
@@ -288,165 +240,44 @@ impl PeerSyncSession {
     /// forwarding a reply back. Exposed on the wrapper so a requester can
     /// drive its own outbound side directly, symmetric with `send_relay_
     /// open` above.
-    pub fn send_relay_data(&self, session_id: u64, payload: Vec<u8>) {
-        RelayReplySink::send_relay_data(&*self.inner, session_id, payload);
+    ///
+    /// Returns whether the channel took it. The requesting side needs that
+    /// answer where the forwarding side does not: it is standing in for a
+    /// UDP socket on behalf of a QUIC connection, and a carrier that
+    /// silently discards is indistinguishable to that connection from one
+    /// that works, so a refusal has to be visible rather than inferred from
+    /// the traffic that never arrives.
+    pub fn send_relay_data(&self, session_id: u64, payload: Vec<u8>) -> bool {
+        self.inner.try_send_relay_data(session_id, payload)
     }
 
-    pub fn send_relay_close(&self, session_id: u64, reason: &str) {
-        RelayReplySink::send_relay_close(&*self.inner, session_id, reason);
+    pub fn send_relay_close(&self, session_id: u64, reason: &str) -> bool {
+        self.inner.send_relay_close_frame(session_id, reason)
     }
 
-    fn validate_exact_peer_config(
-        config: &yadorilink_sync_wire::ClusterConfigFrame,
-    ) -> Result<(), PeerSessionError> {
-        let supports_zstd =
-            config.supported_compression.contains(&yadorilink_sync_wire::COMPRESSION_ZSTD);
-        let exact = config.protocol_version == Self::PROTOCOL_VERSION
-            && config.supports_reliable_delivery
-            && config.supports_change_dag
-            && config.supports_version_present
-            && config.supports_version_hash_exact
-            && supports_zstd
-            && config.max_inflight_requests > 0
-            && config.max_inflight_bytes > 0;
-        if exact {
-            return Ok(());
-        }
-        Err(PeerSessionError::InvalidInput(format!(
-            "peer protocol is not the exact current generation {}: version={}, reliable={}, \
-             dag={}, custody={}, exact_hash={}, zstd={}, max_requests={}, max_bytes={}",
-            Self::PROTOCOL_VERSION,
-            config.protocol_version,
-            config.supports_reliable_delivery,
-            config.supports_change_dag,
-            config.supports_version_present,
-            config.supports_version_hash_exact,
-            supports_zstd,
-            config.max_inflight_requests,
-            config.max_inflight_bytes,
-        )))
-    }
-
-    /// Discriminant name only (never the payload -- an unexpected frame
-    /// here may carry another group's data) -- observability for the
-    /// "first peer message was not ClusterConfig" failure mode, which
-    /// otherwise gives no way to tell a stale message left over from a
-    /// prior connection attempt's channel apart from a genuine protocol
-    /// desync.
-    fn inbound_frame_kind_name(frame: &yadorilink_sync_wire::InboundFrame) -> &'static str {
-        use yadorilink_sync_wire::InboundFrame;
-        match frame {
-            InboundFrame::VersionPresentQuery(_) => "VersionPresentQuery",
-            InboundFrame::VersionPresentAck(_) => "VersionPresentAck",
-            InboundFrame::HeadsAnnounce(_) => "HeadsAnnounce",
-            InboundFrame::ChangeRequest(_) => "ChangeRequest",
-            InboundFrame::ChangeBatch(_) => "ChangeBatch",
-            InboundFrame::ClusterConfig(_) => "ClusterConfig",
-            InboundFrame::BlockRequest(_) => "BlockRequest",
-            InboundFrame::BlockReply(_) => "BlockReply",
-            InboundFrame::HandoffLeaseRequest(_) => "HandoffLeaseRequest",
-            InboundFrame::HandoffLeaseGrant(_) => "HandoffLeaseGrant",
-            InboundFrame::HandoffLeaseRelease(_) => "HandoffLeaseRelease",
-            InboundFrame::HandoffTicketRequest(_) => "HandoffTicketRequest",
-            InboundFrame::HandoffTicketGrant(_) => "HandoffTicketGrant",
-            InboundFrame::HandoffTicketRelease(_) => "HandoffTicketRelease",
-            InboundFrame::RebootstrapSnapshotRequest(_) => "RebootstrapSnapshotRequest",
-            InboundFrame::RebootstrapSnapshotResponse(_) => "RebootstrapSnapshotResponse",
-            InboundFrame::RelayOpen(_) => "RelayOpen",
-            InboundFrame::RelayOpened(_) => "RelayOpened",
-            InboundFrame::RelayData(_) => "RelayData",
-            InboundFrame::RelayClose(_) => "RelayClose",
-            InboundFrame::Unknown { .. } => "Unknown",
-        }
-    }
-
-    async fn exact_generation_preflight(&self) -> Result<(), PeerSessionError> {
-        let preflight_started = std::time::Instant::now();
-        for attempt in 0..EXACT_HANDSHAKE_ATTEMPTS {
-            let config =
-                self.exact_cluster_config.lock().unwrap_or_else(|p| p.into_inner()).clone();
-            let bytes = self
-                .codec
-                .encode(yadorilink_sync_wire::OutboundFrame::ClusterConfig(config))
-                .map_err(|e| PeerSessionError::InvalidInput(e.to_string()))?;
-            self.channel.send(bytes).await?;
-
-            let multiplier = 1u32 << attempt.min(2);
-            let timeout = EXACT_HANDSHAKE_BASE_TIMEOUT * multiplier;
-            match tokio::time::timeout(timeout, self.channel.recv()).await {
-                Ok(Some(bytes)) => {
-                    let frame = self
-                        .codec
-                        .decode(bytes.as_slice())
-                        .map_err(|e| PeerSessionError::InvalidInput(e.to_string()))?;
-                    let config = match frame {
-                        yadorilink_sync_wire::InboundFrame::ClusterConfig(config) => config,
-                        other => {
-                            let kind = Self::inbound_frame_kind_name(&other);
-                            tracing::warn!(
-                                peer = %self.peer_device_id,
-                                attempt,
-                                first_message_kind = kind,
-                                elapsed_ms = preflight_started.elapsed().as_millis(),
-                                "exact-generation handshake: first peer message was not \
-                                 ClusterConfig"
-                            );
-                            return Err(PeerSessionError::InvalidInput(format!(
-                                "first peer message was not ClusterConfig (got {kind})"
-                            )));
-                        }
-                    };
-                    Self::validate_exact_peer_config(&config)?;
-                    self.channel.enable_reliable_delivery();
-                    tracing::debug!(
-                        peer = %self.peer_device_id,
-                        attempt,
-                        elapsed_ms = preflight_started.elapsed().as_millis(),
-                        "exact-generation handshake completed"
-                    );
-                    return Ok(());
-                }
-                Ok(None) => {
-                    tracing::warn!(
-                        peer = %self.peer_device_id,
-                        attempt,
-                        elapsed_ms = preflight_started.elapsed().as_millis(),
-                        "exact-generation handshake: peer channel closed before completion"
-                    );
-                    return Err(PeerSessionError::InvalidInput(
-                        "peer channel closed before the exact-generation handshake".to_string(),
-                    ));
-                }
-                Err(_) => {
-                    tracing::debug!(
-                        peer = %self.peer_device_id,
-                        attempt,
-                        timeout_ms = timeout.as_millis(),
-                        elapsed_ms = preflight_started.elapsed().as_millis(),
-                        "exact-generation handshake: attempt timed out waiting for peer reply"
-                    );
-                }
-            }
-        }
-        tracing::warn!(
-            peer = %self.peer_device_id,
-            attempts = EXACT_HANDSHAKE_ATTEMPTS,
-            elapsed_ms = preflight_started.elapsed().as_millis(),
-            "exact-generation handshake: exhausted bounded retries"
-        );
-        Err(PeerSessionError::InvalidInput(
-            "peer did not complete the exact-generation handshake after bounded retries"
-                .to_string(),
-        ))
-    }
-
+    /// Handshake consolidation (2026-09-02): this facade used to run its
+    /// own separate handshake preflight here (`peer_handshake_preflight`,
+    /// `validate_peer_handshake`) BEFORE ever calling `self.inner.run()`
+    /// -- a second, outer "send ClusterConfig, wait for the peer's first
+    /// frame, validate it" cycle layered on top of `PeerSyncSession::run`
+    /// (`peer_session_impl`)'s own, already-complete one. Worse than
+    /// merely redundant: the outer preflight's own `channel.recv()` READ
+    /// AND DISCARDED the peer's genuinely first `ClusterConfig` off the
+    /// wire without ever feeding it into the inner session's
+    /// `handle_cluster_config`/`peer_handshake_received` state, so that
+    /// state could only ever become true from a SECOND, wasted exchange
+    /// (see `peer_session_impl::wait_for_and_process_peer_first_frame`'s
+    /// own doc comment for the full history and the confirmed-real test
+    /// workaround this forced). The inner implementation now owns the
+    /// whole handshake -- send, receive, first-frame validation
+    /// (including the exact serve-budget check this facade used to do),
+    /// and the state transition -- so this is a pure passthrough again.
     pub async fn run(self: Arc<Self>) -> Result<(), PeerSessionError> {
         if self.started.swap(true, Ordering::AcqRel) {
             return Err(PeerSessionError::InvalidInput(
                 "PeerSyncSession::run may only be started once".to_string(),
             ));
         }
-        self.exact_generation_preflight().await?;
         self.inner.clone().run().await
     }
 
@@ -474,16 +305,14 @@ impl PeerSyncSession {
         self.inner.reconcile_paths_directly(group_id, paths).await
     }
 
-    /// Whether this peer has advertised support for the
-    /// `VersionPresentQuery`/`VersionPresentAck` exchange.
-    pub fn version_present_negotiated(&self) -> bool {
-        self.inner.version_present_negotiated()
-    }
-
-    /// Whether this peer has advertised that its `VersionPresentQuery`
-    /// responder enforces an exact `change::VersionHash` match.
-    pub fn version_hash_exact_negotiated(&self) -> bool {
-        self.inner.version_hash_exact_negotiated()
+    /// See `peer_session_impl::PeerSyncSession::zero_work_settlement_for_path`'s
+    /// own doc comment.
+    pub fn zero_work_settlement_for_path(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<SettlementEvidence>, PeerSessionError> {
+        self.inner.zero_work_settlement_for_path(group_id, path)
     }
 
     /// The current recommended number of concurrent in-flight `fetch_block`
@@ -515,10 +344,6 @@ impl PeerSyncSession {
         self.inner.grant_group(group_id)
     }
 
-    pub async fn replace_coordination_candidates(&self, candidates: Vec<std::net::SocketAddr>) {
-        self.inner.replace_coordination_candidates(candidates).await
-    }
-
     /// Replaces the entire live-authorized-group set at once.
     pub fn set_authorized_groups(&self, group_ids: impl IntoIterator<Item = String>) {
         self.inner.set_authorized_groups(group_ids)
@@ -534,6 +359,14 @@ impl PeerSyncSession {
         path: &str,
     ) -> Result<Vec<PathHead>, PeerSessionError> {
         self.inner.diagnostic_path_heads(group_id, path)
+    }
+
+    /// Public wrapper over the pure ignore-policy verdict alone -- see
+    /// `is_path_locally_ignored`'s own doc comment on the inner type for
+    /// why the Convergence Engine's ignore-recheck sweep must use this
+    /// instead of a reconcile/materialize attempt.
+    pub fn is_path_locally_ignored(&self, group_id: &str, path: &str) -> bool {
+        self.inner.is_path_locally_ignored(group_id, path)
     }
 
     /// Sends a `VersionPresentQuery` to this peer and awaits its answer,
@@ -552,10 +385,10 @@ impl PeerSyncSession {
             .await
     }
 
-    /// Whether this session reconciles via the change-history DAG -- reduces
-    /// to "has the peer advertised support too."
-    pub fn change_dag_negotiated(&self) -> bool {
-        self.inner.change_dag_negotiated()
+    /// Cumulative block body bytes received from this peer so far -- see
+    /// `InnerPeerSyncSession::content_bytes_received`'s own doc comment.
+    pub fn content_bytes_received(&self) -> u64 {
+        self.inner.content_bytes_received()
     }
 
     /// True once the peer has sent any cluster configuration.
@@ -563,8 +396,14 @@ impl PeerSyncSession {
         self.inner.peer_handshake_received()
     }
 
+    /// See `InnerPeerSyncSession::mark_peer_handshake_received_for_tests`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn mark_peer_handshake_received_for_tests(&self) {
+        self.inner.mark_peer_handshake_received_for_tests()
+    }
+
     /// Announces this device's current DAG heads for `group_id` to the peer.
-    /// Only announces to a peer this session has negotiated the DAG with.
+    /// Only announces to a peer whose own handshake has already arrived.
     pub async fn announce_local_commit(&self, group_id: &str) -> Result<(), PeerSessionError> {
         self.inner.announce_local_commit(group_id).await
     }
@@ -578,10 +417,26 @@ impl PeerSyncSession {
         self.inner.fetch_block(group_id, file_path, hash).await
     }
 
-    /// Whether this session should compress outgoing block/index payloads
-    /// to this peer.
-    pub fn compression_negotiated(&self) -> bool {
-        self.inner.compression_negotiated()
+    /// Like `fetch_block`, sized to `expected_size` -- see
+    /// `InnerPeerSyncSession::fetch_block_sized`'s own doc comment.
+    pub async fn fetch_block_sized(
+        &self,
+        group_id: &str,
+        file_path: &str,
+        hash: &[u8],
+        expected_size: u64,
+    ) -> Result<Option<Bytes>, PeerSessionError> {
+        self.inner.fetch_block_sized(group_id, file_path, hash, expected_size).await
+    }
+
+    /// See `InnerPeerSyncSession::fetch_response_timeout_for`'s own doc
+    /// comment. A free-standing size-to-deadline computation (no `&self`
+    /// needed), forwarded here so callers outside this crate that only
+    /// ever see the public `PeerSyncSession` (this wrapper, not the
+    /// doc-hidden inner type) can still reach it as `PeerSyncSession::
+    /// fetch_response_timeout_for(..)`.
+    pub fn fetch_response_timeout_for(expected_size: u64) -> std::time::Duration {
+        InnerPeerSyncSession::fetch_response_timeout_for(expected_size)
     }
 
     /// On-access hydration: fetches a placeholder file's blocks from this

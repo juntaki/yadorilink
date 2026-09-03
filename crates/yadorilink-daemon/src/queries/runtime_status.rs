@@ -130,10 +130,14 @@ impl RuntimeStatusQueryService {
             .snapshot()
             .into_iter()
             .map(|snapshot| {
-                let mut reachability = snapshot.reachability;
-                if reachability.is_connected() && snapshot.protocol_incompatible {
-                    reachability = PeerReachability::ProtocolIncompatible;
-                }
+                // A connected peer used to be promoted to
+                // `ProtocolIncompatible` here when its handshake arrived
+                // without the change-DAG capability bit. There is no such
+                // peer any more: the protocol generation rides the ALPN, so
+                // one that does not speak this generation is refused inside
+                // the TLS handshake and never becomes connected in the
+                // first place.
+                let reachability = snapshot.reachability;
                 let relay_capability = self.relay_capability.relay_capability(&snapshot.device_id);
                 PeerStatusView { device_id: snapshot.device_id, reachability, relay_capability }
             })

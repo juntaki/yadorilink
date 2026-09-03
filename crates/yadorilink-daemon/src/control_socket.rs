@@ -19,21 +19,22 @@ use yadorilink_ipc_proto::daemonctl::{
     remove_device_command_response, revoke_device_command_response, revoke_edge_command_response,
     ActiveTransferProgress, ApplicationCommandError, ApplicationErrorCode,
     CheckFullReplicaHandoffReadyExcludingResponse, CheckFullReplicaHandoffReadyResponse,
-    ConnectionAttemptTrace, ConnectivityDoctorCategory, ConnectivityDoctorResponse,
-    CreateAndLinkCommandResponse, DaemonControlRequest, DaemonControlResponse,
-    EnrollmentCommandOutcome, EvictResponse, FetchAvailability, FileVersionInfo, GcResponse,
-    GroupDurabilityStatus, HandoffResult, HealthResponse, HeldFile, HydrateResponse,
-    JoinAndLinkCommandResponse, LatchGroupDurabilityUnknownResponse, LimitsSetResponse,
-    LimitsShowResponse, LinkRequest, LinkResponse, LinkStatus, ListConnectionTracesResponse,
-    ListLinksResponse, ListQueueItemsResponse, ListRecoveryOperationsResponse, ListTrashResponse,
-    ListVersionsResponse, LocalStorageState, MembershipHandoffResult, ObtainHandoffTicketResponse,
-    PauseResponse, PeerStatus, PendingEnrollmentKind, PinResponse, QueueItem, RecentSyncError,
-    ReleaseHandoffTicketResponse, RemoveDeviceCommandResponse, RemovePendingEnrollmentResponse,
-    ReplicaMembershipCommandOutcome, ReportingConsentState, ReportingStatusResponse,
-    RequestHandoffLeaseResponse, RestoreTrashResponse, RestoreVersionResponse, ResumeResponse,
-    RevokeDeviceCommandResponse, RevokeEdgeCommandResponse, SetStorageModeResponse,
-    ShowQueueItemResponse, ShutdownResponse, StatusResponse, TaskLiveness, TrashedFileInfo,
-    UnlinkResponse, UnpinResponse, VolumeFreeSpace,
+    ConflictedFileInfo, ConnectionAttemptTrace, ConnectivityDoctorCategory,
+    ConnectivityDoctorResponse, CreateAndLinkCommandResponse, DaemonControlRequest,
+    DaemonControlResponse, EnrollmentCommandOutcome, EvictResponse, FetchAvailability,
+    FileVersionInfo, GcResponse, GroupDurabilityStatus, HandoffResult, HealthResponse, HeldFile,
+    HydrateResponse, JoinAndLinkCommandResponse, LatchGroupDurabilityUnknownResponse,
+    LimitsSetResponse, LimitsShowResponse, LinkRequest, LinkResponse, LinkStatus,
+    ListConflictsResponse, ListConnectionTracesResponse, ListLinksResponse, ListQueueItemsResponse,
+    ListRecoveryOperationsResponse, ListTrashResponse, ListVersionsResponse, LocalStorageState,
+    MaterializationState as WireMaterializationState, MaterializationStatusResponse,
+    MembershipHandoffResult, ObtainHandoffTicketResponse, PauseResponse, PeerStatus,
+    PendingEnrollmentKind, PinResponse, QueueItem, RecentSyncError, ReleaseHandoffTicketResponse,
+    RemoveDeviceCommandResponse, RemovePendingEnrollmentResponse, ReplicaMembershipCommandOutcome,
+    ReportingConsentState, ReportingStatusResponse, RequestHandoffLeaseResponse,
+    RestoreTrashResponse, RestoreVersionResponse, ResumeResponse, RevokeDeviceCommandResponse,
+    RevokeEdgeCommandResponse, SetStorageModeResponse, ShowQueueItemResponse, ShutdownResponse,
+    StatusResponse, TaskLiveness, TrashedFileInfo, UnlinkResponse, UnpinResponse, VolumeFreeSpace,
 };
 use yadorilink_ipc_proto::framing::{read_message, write_message};
 #[cfg(windows)]
@@ -331,6 +332,15 @@ async fn handle_request(
             Err(e) => RespPayload::Error(e.to_string()),
         },
 
+        // `yadorilink conflicts list`. Same "spans every linked folder at
+        // once" shape as `ListTrash` above.
+        Some(ReqPayload::ListConflicts(_)) => match context.queries.file_history.list_conflicts() {
+            Ok(files) => RespPayload::ListConflicts(ListConflictsResponse {
+                files: files.into_iter().map(conflicted_file_view_to_proto).collect(),
+            }),
+            Err(e) => RespPayload::Error(e.to_string()),
+        },
+
         // `yadorilink trash restore <path>`.
         Some(ReqPayload::RestoreTrash(r)) => {
             match context.queries.linked_path.resolve(&r.absolute_path) {
@@ -430,6 +440,32 @@ async fn handle_request(
             }
             None => RespPayload::Error("path is not under any linked folder".into()),
         },
+
+        Some(ReqPayload::MaterializationStatus(r)) => {
+            match context.queries.linked_path.resolve(&r.absolute_path) {
+                Some((group_id, path)) => {
+                    let application = context.application.clone();
+                    match application.materialization.status(&group_id, &path) {
+                        Ok(Some(status)) => {
+                            RespPayload::MaterializationStatus(MaterializationStatusResponse {
+                                known: true,
+                                state: materialization_state_to_proto(status.state) as i32,
+                                pinned: status.pinned,
+                            })
+                        }
+                        Ok(None) => {
+                            RespPayload::MaterializationStatus(MaterializationStatusResponse {
+                                known: false,
+                                state: WireMaterializationState::Unspecified as i32,
+                                pinned: false,
+                            })
+                        }
+                        Err(e) => RespPayload::Error(e.to_string()),
+                    }
+                }
+                None => RespPayload::Error("path is not under any linked folder".into()),
+            }
+        }
 
         Some(ReqPayload::Shutdown(_)) => {
             tracing::info!("shutdown requested via control socket");
@@ -1074,6 +1110,7 @@ fn version_to_proto(v: yadorilink_replica_domain::session_state::VersionRecord) 
         mtime_unix_nanos: v.mtime_unix_nanos,
         state: v.state.as_db_str().to_string(),
         origin_device_id: v.origin_device_id.unwrap_or_default(),
+        unix_mode: v.unix_mode,
     }
 }
 
@@ -1121,6 +1158,18 @@ fn trashed_file_view_to_proto(
         last_known_size: view.trashed.last_known_size as i64,
         origin_device_id: view.trashed.origin_device_id.unwrap_or_default(),
         deleted_at_unix_nanos: view.trashed.deleted_at_unix_nanos,
+    }
+}
+
+/// `queries::file_history::ConflictedFileView` -> `ConflictedFileInfo` (proto).
+fn conflicted_file_view_to_proto(
+    view: crate::queries::file_history::ConflictedFileView,
+) -> ConflictedFileInfo {
+    ConflictedFileInfo {
+        local_path: view.local_path,
+        path: view.path,
+        size: view.size as i64,
+        mtime_unix_nanos: view.mtime_unix_nanos,
     }
 }
 
@@ -1175,6 +1224,18 @@ fn relay_capability_to_proto(
     match capability {
         crate::route::RelayCapability::Capable => Wire::Capable,
         crate::route::RelayCapability::Disabled => Wire::Disabled,
+    }
+}
+
+fn materialization_state_to_proto(
+    state: crate::application::ports::MaterializationStateSummary,
+) -> WireMaterializationState {
+    use crate::application::ports::MaterializationStateSummary as Daemon;
+    match state {
+        Daemon::Hydrated => WireMaterializationState::Hydrated,
+        Daemon::Placeholder => WireMaterializationState::Placeholder,
+        Daemon::Hydrating => WireMaterializationState::Hydrating,
+        Daemon::Evicting => WireMaterializationState::Evicting,
     }
 }
 

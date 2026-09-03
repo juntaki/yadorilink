@@ -1,6 +1,6 @@
 # Release signing credentials
 
-The signed-release pipeline (`.github/workflows/ci.yml`, jobs
+The signed-release pipeline (`oss-public/.github/workflows/release.yml`, jobs
 `macos-signed-artifacts` and `windows-signed-artifacts`) signs the macOS `.pkg`
 and the Windows installer in CI from a fixed set of GitHub Actions
 **`release-signing` Environment secrets**. This document is the
@@ -106,5 +106,5 @@ happens before that failure.
    (`pkgutil --check-signature` + `spctl` on macOS; `signtool verify /pa /all`
    on Windows).
 
-No change to `ci.yml`, `build-pkg.sh`, or `yadorilink.iss` is required to rotate
+No change to `release.yml`, `build-pkg.sh`, or `yadorilink.iss` is required to rotate
 — only the secret values change.

@@ -932,15 +932,13 @@ mod tests {
         }
 
         #[test]
-        fn control_protocol_version_is_6() {
-            // M4 Pass 4: bumped from 5 -- `EvictResponse` gained semantically
-            // required fields (`dehydrated`/`blocks_reclaimed`/
-            // `bytes_reclaimed`); a version mismatch must fail clearly
-            // rather than let mixed CLI/daemon binaries silently
-            // misinterpret the old empty response as `dehydrated: false`
-            // (or an old CLI ignore the new field entirely) -- see this
+        fn control_protocol_version_is_7() {
+            // C5: bumped from 6 -- the `ListConflicts` request/response
+            // oneof variants are new wire fields; a version mismatch must
+            // fail clearly rather than let an old daemon silently decode
+            // the new request as an empty/unknown payload -- see this
             // constant's own doc comment.
-            assert_eq!(yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION, 6);
+            assert_eq!(yadorilink_ipc_proto::daemonctl::CONTROL_PROTOCOL_VERSION, 7);
         }
     }
 }

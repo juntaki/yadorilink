@@ -23,12 +23,10 @@ use yadorilink_daemon::peer_orchestrator;
 use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
 use yadorilink_daemon::route::RelayCapability;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_transport::DeviceKeyPair;
 
 struct TestDaemon {
     device_id: String,
     state: Arc<DaemonState>,
-    keypair: Arc<DeviceKeyPair>,
     _root: tempfile::TempDir,
 }
 
@@ -40,7 +38,6 @@ fn new_test_daemon(device_id: &str) -> TestDaemon {
     TestDaemon {
         device_id: device_id.to_string(),
         state,
-        keypair: Arc::new(DeviceKeyPair::generate()),
         _root: tempfile::tempdir().unwrap(),
     }
 }
@@ -54,7 +51,6 @@ fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
 fn spawn_orchestrator(
     coordination_addr: String,
     device_id: String,
-    keypair: Arc<DeviceKeyPair>,
     state: Arc<DaemonState>,
 ) {
     let log_device_id = device_id.clone();
@@ -64,7 +60,7 @@ fn spawn_orchestrator(
         device_id,
     };
     tokio::spawn(async move {
-        if let Err(error) = peer_orchestrator::run(config, keypair, state).await {
+        if let Err(error) = peer_orchestrator::run(config, state).await {
             eprintln!("peer orchestrator for {log_device_id} stopped: {error}");
         }
     });
@@ -78,7 +74,7 @@ async fn relay_capable_propagates_over_the_real_netmap_wire_independent_of_full_
     let group_id = "route-model-group";
 
     let hub = new_test_daemon("route-model-hub");
-    register_with_fake(&fake, &hub.state, &hub.device_id, hub.keypair.public_bytes(), &[group_id])
+    register_with_fake(&fake, &hub.state, &hub.device_id, &[group_id])
         .await;
     let hub_root = tempfile::tempdir().unwrap();
     link(&hub.state, hub_root.path(), group_id);
@@ -87,7 +83,7 @@ async fn relay_capable_propagates_over_the_real_netmap_wire_independent_of_full_
     // not necessarily a storage anchor" case this pass's design explicitly
     // keeps separable.
     let nas = new_test_daemon("route-model-nas");
-    register_with_fake(&fake, &nas.state, &nas.device_id, nas.keypair.public_bytes(), &[group_id])
+    register_with_fake(&fake, &nas.state, &nas.device_id, &[group_id])
         .await;
     link(&nas.state, nas._root.path(), group_id);
     fake.set_relay_capable(&nas.device_id, true);
@@ -99,19 +95,17 @@ async fn relay_capable_propagates_over_the_real_netmap_wire_independent_of_full_
         &fake,
         &archivist.state,
         &archivist.device_id,
-        archivist.keypair.public_bytes(),
         &[group_id],
     )
     .await;
     link(&archivist.state, archivist._root.path(), group_id);
     fake.set_full_replica(&archivist.device_id, group_id, true);
 
-    spawn_orchestrator(fake.addr(), hub.device_id.clone(), hub.keypair.clone(), hub.state.clone());
-    spawn_orchestrator(fake.addr(), nas.device_id.clone(), nas.keypair.clone(), nas.state.clone());
+    spawn_orchestrator(fake.addr(), hub.device_id.clone(), hub.state.clone());
+    spawn_orchestrator(fake.addr(), nas.device_id.clone(), nas.state.clone());
     spawn_orchestrator(
         fake.addr(),
         archivist.device_id.clone(),
-        archivist.keypair.clone(),
         archivist.state.clone(),
     );
 

@@ -1,11 +1,6 @@
-fn keypair_path() -> std::path::PathBuf {
-    crate::device_config::config_dir().join("wg_key")
-}
-
-/// The device's Ed25519 change-history signing key, kept next to the
-/// WireGuard key and generated on first use. Its public half is registered
-/// alongside the WireGuard key so peers can pin it and verify this device's
-/// signed change history.
+/// The device's Ed25519 key, generated on first use. It is the device's
+/// whole identity: its public half is registered so peers can pin it, verify
+/// this device's signed change history, and authenticate its connections.
 fn signing_keypair_path() -> std::path::PathBuf {
     crate::device_config::config_dir().join("signing_key")
 }
@@ -52,17 +47,20 @@ mod http {
     /// assigned `device_id` as a typed result instead of printing it.
     pub async fn register_device(device_name: String) -> Result<String, CliError> {
         let access_token = require_access_token()?;
-        let keypair = yadorilink_transport::DeviceKeyPair::load_or_generate(super::keypair_path())
-            .map_err(|e| CliError::Other(e.to_string()))?;
         let signing_keypair = yadorilink_transport::DeviceSigningKeyPair::load_or_generate(
             super::signing_keypair_path(),
         )
         .map_err(|e| CliError::Other(e.to_string()))?;
 
-        let wireguard_public_key_base64 =
-            base64::engine::general_purpose::STANDARD.encode(keypair.public_bytes());
         let signing_public_key_base64 =
             base64::engine::general_purpose::STANDARD.encode(signing_keypair.public_bytes());
+        // A device has one key now. The coordination plane's registration
+        // schema still requires a value under the retired transport key's
+        // name -- its column is `NOT NULL` -- so the same Ed25519 key is
+        // sent there too, and the daemon ignores what comes back in that
+        // field. Folding the column out of the canonical schema is a
+        // coordination-plane change and belongs with one.
+        let wireguard_public_key_base64 = signing_public_key_base64.clone();
 
         let resp: RegisterDeviceResponse = post_json(
             "/devices/register",

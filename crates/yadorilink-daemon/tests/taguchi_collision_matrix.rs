@@ -26,7 +26,6 @@ use support::{
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::daemon_state::DaemonState;
 use yadorilink_local_storage::FsBlockStore;
-use yadorilink_transport::DeviceKeyPair;
 
 /// Hard overall ceiling shared by every row -- see `run_taguchi_row`'s doc
 /// comment for why this can be generous for all 16 rows (most converge in
@@ -67,8 +66,7 @@ struct TestDevice {
 }
 
 async fn setup_device(account: &TestAccount, name: &str) -> TestDevice {
-    let keypair = Arc::new(DeviceKeyPair::generate());
-    let device_id = support::register_device(account, name, keypair.public_bytes()).await;
+    let device_id = support::register_device(account, name, [0u8; 32]).await;
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
@@ -323,7 +321,7 @@ async fn run_taguchi_row(
         4 => 6,
         _ => unreachable!(),
     };
-    let (devices, group_id) = n_synced_devices(device_count, row_name).await;
+    let (devices, _group_id) = n_synced_devices(device_count, row_name).await;
     let pattern = op_pattern(op_pattern_level);
     let stagger = Duration::from_millis(stagger_ms(stagger_level));
     let round_count = rounds(rounds_level);
@@ -367,61 +365,12 @@ async fn run_taguchi_row(
         ABSOLUTE_CONVERGENCE_TIMEOUT,
         STALL_TIMEOUT,
         || {
-            let entries = devices_ref
+            devices_ref
                 .iter()
                 .enumerate()
                 .map(|(i, d)| format!("device-{i}={:?}", real_entry_names(d.root.path())))
                 .collect::<Vec<_>>()
-                .join("; ");
-            // Diagnostic-only, for the `taguchi_row_14` intermittent-stall
-            // investigation (see
-            // `fix/conflict-copy-convergence-obligation-20260723`): dump the
-            // actual `materialization_jobs` row (state/attempt/next_retry_at/
-            // updated_at/waiting_reason) every device holds for every path
-            // that appears on ANY device's disk right now. Log-based tracing
-            // alone could not explain why a job re-armed to `Pending` was
-            // never reclaimed by a later tick despite low per-tick
-            // contention -- this reads the actual persisted row directly,
-            // instead of inferring it from log lines.
-            let mut all_paths: std::collections::BTreeSet<String> =
-                std::collections::BTreeSet::new();
-            for d in devices_ref {
-                all_paths.extend(real_entry_names(d.root.path()));
-            }
-            let job_dump = all_paths
-                .iter()
-                .map(|path| {
-                    let per_device = devices_ref
-                        .iter()
-                        .enumerate()
-                        .map(|(i, d)| {
-                            match d
-                                .state
-                                .replica_coordinator
-                                .materialization_job_repository()
-                                .materialization_get_job(&group_id, path)
-                            {
-                                Ok(Some(job)) => format!(
-                                    "device-{i}=(state={:?}, attempt={}, next_retry_at={:?}, \
-                                     updated_at={}, waiting_reason={:?}, version_hash={})",
-                                    job.state,
-                                    job.attempt,
-                                    job.next_retry_at,
-                                    job.updated_at,
-                                    job.waiting_reason,
-                                    hex::encode(&job.version_hash)
-                                ),
-                                Ok(None) => format!("device-{i}=(no job row)"),
-                                Err(e) => format!("device-{i}=(job read error: {e})"),
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("  path={path:?}: {per_device}")
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("{entries}\njob table dump:\n{job_dump}")
+                .join("; ")
         },
     )
     .await;

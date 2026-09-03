@@ -121,12 +121,10 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 prost = "0.14.4"
-tokio-stream = { version = "0.1", features = ["net"] }
 hex = "0.4"
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
 serde.workspace = true
 serde_json = "1"
-boringtun = { version = "0.7", default-features = false }
 # `commit_orchestration::orchestrator`/`plan_driver` (moved from
 # yadorilink-sync-core, 7D-9E) drive the commit boundary directly against an
 # open `&mut Connection` -- matches the version yadorilink-sync-core links so

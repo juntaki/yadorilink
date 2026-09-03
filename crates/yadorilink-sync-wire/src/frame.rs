@@ -127,9 +127,6 @@ pub struct RebootstrapSnapshotRequestFrame {
 }
 
 /// A peer's announcement of its current DAG heads for a folder group.
-/// `frontier_hint` is on the wire message but `handle_heads_announce` never
-/// reads it today, so it is not carried here -- same "only what's needed"
-/// principle as `peer_replica_engine::DurableVersionQuery`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeadsAnnounceFrame {
     pub folder_group_id: String,
@@ -137,93 +134,93 @@ pub struct HeadsAnnounceFrame {
 }
 
 /// A peer's request for the encoded changes behind a set of change hashes
-/// it is missing. Plain field mirror -- `handle_change_request` delegates
-/// the hash decode and ancestry expansion to `PeerReplicaEngine`.
+/// it is missing, alongside the requester's own current local heads
+/// (`have_heads`, untrusted -- see `PeerReplicaEngine::changes_for_request`'s
+/// own doc comment for how the responder must treat it). Plain field mirror
+/// -- `handle_change_request` delegates the hash decode and delta
+/// computation to `PeerReplicaEngine`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeRequestFrame {
     pub folder_group_id: String,
-    pub want: Vec<Vec<u8>>,
+    pub want_heads: Vec<Vec<u8>>,
+    pub have_heads: Vec<Vec<u8>>,
 }
 
 /// A bounded batch of encoded changes answering a `ChangeRequest`, or sent
 /// unsolicited as part of ordinary replication. Plain field mirror --
-/// `handle_change_batch` reads all four of these fields (`changes.len()`,
-/// iterating `changes`, an emptiness check on `compressed_changes`, and
-/// `file_versions`); `compression` itself is on the wire message but never
-/// read (only `compressed_changes`'s emptiness matters today), so it is not
-/// carried here.
+/// `handle_change_batch` reads all four of these fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeBatchFrame {
     pub folder_group_id: String,
     pub changes: Vec<Vec<u8>>,
-    pub compressed_changes: Vec<u8>,
     pub file_versions: Vec<Vec<u8>>,
+    pub more: bool,
 }
 
-/// The mandatory capability-negotiation handshake message. Omits
-/// `folder_group_ids` / `known_peer_device_ids` (advertised outbound only,
-/// nothing on any receiving side consults them) and 2 of the 4 serve-
-/// engine advisory hints, `available_worker_slots` / `estimated_queue_
-/// delay_ms` (outbound-only today, no receiving-side consumer exists
-/// yet). `max_inflight_requests` / `max_inflight_bytes` ARE carried,
-/// despite `handle_cluster_config` itself not reading them: the public
-/// wrapper's `PeerSyncSession::validate_exact_peer_config` (`peer_session_
-/// public.rs`) is a second, independent inbound consumer of this same
-/// wire message, and it does check both (`> 0`) as part of the exact-
-/// generation handshake preflight -- this frame type is shared by both
-/// consumers rather than split further per-consumer.
+/// The session-start handshake message. Omits `folder_group_ids` /
+/// `known_peer_device_ids` (advertised outbound only, nothing on any
+/// receiving side consults them) and 2 of the 4 serve-engine advisory
+/// hints, `available_worker_slots` / `estimated_queue_delay_ms`
+/// (outbound-only today, no receiving-side consumer exists yet).
+///
+/// What it no longer carries is a capability set. Compression support, the
+/// change DAG, the custody query and its exact-version check were all
+/// advertised here and all required by the handshake that read them, so no
+/// two peers that could reach a running session could differ on any of
+/// them; they went with the generation check itself, which now rides the
+/// ALPN. What is left is the genuinely dynamic part -- how loaded the
+/// peer's serve engine is right now -- plus the delivery confirmation the
+/// handshake retry loop needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterConfigFrame {
     pub acked_peer_cluster_config: bool,
-    pub supported_compression: Vec<i32>,
-    pub supports_reliable_delivery: bool,
-    pub supports_change_dag: bool,
-    pub supports_version_present: bool,
-    pub supports_version_hash_exact: bool,
     pub max_inflight_requests: u32,
     pub max_inflight_bytes: u64,
-    pub protocol_version: u32,
 }
 
-/// A peer's request for one block's content. Plain field mirror of every
-/// field on the wire message -- `handle_block_request` and
-/// `handle_block_request_with_credit` (and their shared helpers) read all
-/// four: `folder_group_id`/`file_path` for the authorization/reference/
-/// declared-size lookups, `block_hash` for the store read and reply
-/// correlation payload, `request_id` for reply correlation.
+/// A peer's request for one block's content: the first message on a block
+/// stream.
+///
+/// Plain field mirror of the wire message, and all three fields are read:
+/// `folder_group_id`/`file_path` for the authorization/reference/
+/// declared-size lookups, `block_hash` for the store read. There is no
+/// correlation id, because the stream is the correlation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockRequestFrame {
+pub struct BlockRequestHeaderFrame {
     pub folder_group_id: String,
     pub file_path: String,
     pub block_hash: Vec<u8>,
-    pub request_id: u64,
 }
 
-/// Domain form of `proto::block_reply::Outcome`'s oneof. Each variant
-/// carries only the fields `handle_block_reply` actually reads:
-/// `BlockReplyBusy.queue_depth` is on the wire but unread there, so `Busy`
-/// only carries `retry_after_ms`; `BlockReplyDontHave`'s wire value is
-/// always `true` and unread (only the variant itself matters), so `DontHave`
-/// carries nothing.
+/// Domain form of `proto::block_response_header::Outcome`'s oneof.
+///
+/// Both directions use this one type, unlike the inline reply it replaces,
+/// which needed a separate sending-side enum because the receiver ignored
+/// fields the sender always set. Every field here is read on both sides:
+/// the requester acts on `queue_depth` when choosing a source, and `Found`
+/// carries exactly what the receiver needs to read the body that follows.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BlockReplyOutcomeFrame {
-    Found { data: Vec<u8>, compression: i32 },
+pub enum BlockResponseOutcomeFrame {
+    /// `size` is the number of raw body bytes that follow on the stream --
+    /// post-compression, so it is what to read, not what will be left after
+    /// decompressing. `hash` is echoed from the request so the requester can
+    /// refuse a response bound to a different block than the one it asked
+    /// for.
+    Found { size: u64, hash: Vec<u8>, compression: i32 },
     DontHave,
-    Busy { retry_after_ms: u32 },
-    Redirect { candidate_device_ids: Vec<String> },
+    Busy { retry_after_ms: u32, queue_depth: u32 },
     Rejected { reason: String },
 }
 
-/// A peer's answer to a `BlockRequest`. `outcome` mirrors the wire
-/// message's own `Option` -- a genuinely absent oneof (an old peer, or a
-/// forward-incompatible reply this build doesn't recognize) is treated
-/// identically to `DontHave` by `handle_block_reply`, same as the proto
-/// side's own `None` arm.
+/// A peer's answer to a block request: the second message on a block
+/// stream. Under exact-generation ALPN a same-generation peer's
+/// `BlockResponseHeader` always sets exactly one `outcome`; an absent oneof
+/// is malformed for this generation and is rejected at decode time (see
+/// `ProtobufPeerWireCodec::decode_block_response_header`), never treated as
+/// `DontHave`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockReplyFrame {
-    pub block_hash: Vec<u8>,
-    pub outcome: Option<BlockReplyOutcomeFrame>,
-    pub request_id: u64,
+pub struct BlockResponseHeaderFrame {
+    pub outcome: BlockResponseOutcomeFrame,
 }
 
 /// M3 Pass 5: a serialized `relay_grant::RelayGrant`, opening a relay
@@ -278,12 +275,13 @@ pub struct RelayCloseFrame {
     pub reason: String,
 }
 
-/// A decoded inbound wire message, in domain form. Grows one variant per
-/// migrated message family; `Unknown` covers both a genuinely-empty
-/// `SyncMessage.payload` and a forward-incompatible oneof case (a newer
-/// peer's message type this build doesn't recognize) -- mirrors
-/// `handle_message`'s existing `None => Ok(())` silent-ignore behavior for
-/// both, not yet distinguishing them at this layer.
+/// A decoded inbound wire message, in domain form. Every current
+/// `SyncMessage.payload` oneof variant has an explicit case here. There is
+/// no `Unknown` fallback: under exact-generation ALPN, a same-generation
+/// peer's `SyncMessage` always sets a recognized `payload`, so a genuinely
+/// empty or unrecognized payload is a protocol violation, rejected at
+/// decode time (see `ProtobufPeerWireCodec::decode`) rather than silently
+/// ignored.
 #[derive(Debug, Clone)]
 pub enum InboundFrame {
     VersionPresentQuery(VersionPresentQueryFrame),
@@ -292,8 +290,6 @@ pub enum InboundFrame {
     ChangeRequest(ChangeRequestFrame),
     ChangeBatch(ChangeBatchFrame),
     ClusterConfig(ClusterConfigFrame),
-    BlockRequest(BlockRequestFrame),
-    BlockReply(BlockReplyFrame),
     HandoffLeaseRequest(HandoffLeaseRequestFrame),
     HandoffLeaseGrant(HandoffLeaseGrantFrame),
     HandoffLeaseRelease(HandoffLeaseReleaseFrame),
@@ -306,125 +302,64 @@ pub enum InboundFrame {
     RelayOpened(RelayOpenedFrame),
     RelayData(RelayDataFrame),
     RelayClose(RelayCloseFrame),
-    Unknown { message_kind: Option<u32> },
 }
 
 /// This build's handshake advertisement -- every field `cluster_config_
-/// message` (the sole production constructor) actually sets, unlike the
-/// inbound `ClusterConfigFrame`, which omits everything the receiving side
-/// never reads. Outbound and inbound diverge here on purpose: the sender
-/// and receiver of the same wire message read different subsets of it.
+/// message` (the sole production constructor) actually sets. Identical to
+/// the inbound `ClusterConfigFrame` -- both directions of this message read
+/// and write the same fields today.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterConfigOutboundFrame {
-    pub folder_group_ids: Vec<String>,
-    pub known_peer_device_ids: Vec<String>,
-    pub supported_compression: Vec<i32>,
-    pub supports_reliable_delivery: bool,
     pub acked_peer_cluster_config: bool,
-    pub supports_change_dag: bool,
-    pub supports_version_present: bool,
-    pub supports_version_hash_exact: bool,
     pub max_inflight_requests: u32,
     pub max_inflight_bytes: u64,
-    pub available_worker_slots: u32,
-    pub estimated_queue_delay_ms: u32,
-    pub protocol_version: u32,
 }
 
-/// This device's own DAG heads announcement -- unlike the inbound
-/// `HeadsAnnounceFrame` (which omits `frontier_hint`, unread by
-/// `handle_heads_announce`), the sending side always sets it.
+/// This device's own DAG heads announcement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeadsAnnounceOutboundFrame {
     pub folder_group_id: String,
     pub heads: Vec<Vec<u8>>,
-    pub frontier_hint: Vec<u8>,
 }
 
 /// A bounded batch of encoded changes, as sent by `send_change_batch`.
-/// `compression` is not a field here because the one production sender
-/// always sends uncompressed (`Compression::None`) -- see
-/// `ProtobufPeerWireCodec::encode`'s `ChangeBatch` arm, which hardcodes it
-/// to match exactly, rather than modeling a choice nothing ever makes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeBatchOutboundFrame {
     pub folder_group_id: String,
     pub changes: Vec<Vec<u8>>,
-    pub compressed_changes: Vec<u8>,
     pub file_versions: Vec<Vec<u8>>,
+    pub more: bool,
 }
 
-/// `handle_version_present_query`'s reply -- unlike the inbound
-/// `VersionPresentAckFrame` (which omits `folder_group_id`/`file_path`/
-/// `signature`, unread by `handle_version_present_ack`), the sending side
-/// echoes the query's own `folder_group_id`/`file_path` and always sets
-/// `signature` to empty (reserved for a future signed attestation; see the
-/// production constructor's own comment).
+/// `handle_version_present_query`'s reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionPresentAckOutboundFrame {
     pub request_id: u64,
-    pub folder_group_id: String,
-    pub file_path: String,
     pub present: bool,
-    pub signature: Vec<u8>,
 }
 
-/// `release_handoff_lease_to_peer`'s message -- unlike the inbound
-/// `HandoffLeaseReleaseFrame` (which omits `request_id`, unread by
-/// `handle_handoff_lease_release`, a fire-and-forget release with no
-/// reply), the sending side always assigns one from its own counter.
+/// `release_handoff_lease_to_peer`'s message -- fire-and-forget, identical
+/// to the inbound `HandoffLeaseReleaseFrame`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandoffLeaseReleaseOutboundFrame {
-    pub request_id: u64,
     pub folder_group_id: String,
     pub lease_id: String,
 }
 
-/// `release_handoff_ticket_to_peer`'s message -- same rationale as
-/// `HandoffLeaseReleaseOutboundFrame` for why `request_id` is present here
-/// but not on the inbound `HandoffTicketReleaseFrame`.
+/// `release_handoff_ticket_to_peer`'s message -- fire-and-forget, identical
+/// to the inbound `HandoffTicketReleaseFrame`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandoffTicketReleaseOutboundFrame {
-    pub request_id: u64,
     pub folder_group_id: String,
     pub target_device_id: String,
     pub lease_id: String,
 }
 
-/// Domain form of `proto::block_reply::Outcome`'s oneof, for the SENDING
-/// side. Unlike the inbound `BlockReplyOutcomeFrame` (which omits `Busy`'s
-/// `queue_depth`, unread by `handle_block_reply`, and carries no payload
-/// for `DontHave`), the sending side sets every field the wire message
-/// has: `block_reply_busy_message` always supplies a real `queue_depth`,
-/// and `block_request_dont_have_message` always sends the wire's `true`
-/// explicitly (kept here for schema-completeness even though the only
-/// value ever sent is `true` -- the receiving side already treats the
-/// variant itself as the signal, not this value, per
-/// `BlockReplyOutcomeFrame::DontHave`'s own doc comment).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BlockReplyOutboundOutcome {
-    Found { data: Vec<u8>, compression: i32 },
-    DontHave,
-    Busy { retry_after_ms: u32, queue_depth: u32 },
-    Redirect { candidate_device_ids: Vec<String> },
-    Rejected { reason: String },
-}
-
-/// A block-serving reply, for the SENDING side -- see
-/// `BlockReplyOutboundOutcome`'s own doc comment for why this needs its
-/// own outcome enum rather than reusing `BlockReplyOutcomeFrame`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockReplyOutboundFrame {
-    pub block_hash: Vec<u8>,
-    pub outcome: BlockReplyOutboundOutcome,
-    pub request_id: u64,
-}
-
 /// An outbound wire message, in domain form, ready to be encoded and sent.
-/// All 16 `SyncMessage.payload` oneof variants are represented -- 9 reuse
+/// Every `SyncMessage.payload` oneof variant is represented -- most reuse
 /// their corresponding inbound `*Frame` type exactly (the sending side
-/// happens to set every field that type carries: `BlockRequestFrame`,
-/// `ChangeRequestFrame`, `VersionPresentQueryFrame`,
+/// happens to set every field that type carries: `ChangeRequestFrame`,
+/// `VersionPresentQueryFrame`,
 /// `HandoffLeaseRequestFrame`, `HandoffLeaseGrantFrame`,
 /// `HandoffTicketRequestFrame`, `HandoffTicketGrantFrame`,
 /// `RebootstrapSnapshotRequestFrame`, `RebootstrapSnapshotResponseFrame`);
@@ -437,8 +372,6 @@ pub enum OutboundFrame {
     HeadsAnnounce(HeadsAnnounceOutboundFrame),
     ChangeRequest(ChangeRequestFrame),
     ChangeBatch(ChangeBatchOutboundFrame),
-    BlockRequest(BlockRequestFrame),
-    BlockReply(BlockReplyOutboundFrame),
     VersionPresentQuery(VersionPresentQueryFrame),
     VersionPresentAck(VersionPresentAckOutboundFrame),
     HandoffLeaseRequest(HandoffLeaseRequestFrame),

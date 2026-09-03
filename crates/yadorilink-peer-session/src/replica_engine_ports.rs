@@ -105,6 +105,34 @@ impl ChangeAdmissionPort for PeerReplicaStateAdapter {
             Err(error) => Err(AdmissionStoreError::Other(error.to_string())),
         }
     }
+
+    fn admit_unprojected_change_batch(
+        &self,
+        items: &[(&Change, &[FileVersion])],
+    ) -> Vec<Result<AdmissionStoreResult, AdmissionStoreError>> {
+        let port_items: Vec<(&Change, &[FileVersion], bool)> =
+            items.iter().map(|(change, versions)| (*change, *versions, false)).collect();
+        self.0
+            .dag_admit_change_batch_with_versions(&port_items)
+            .into_iter()
+            .map(|result| match result {
+                Ok(result) => Ok(AdmissionStoreResult {
+                    outcome: match result.outcome {
+                        AdmitOutcome::Applied => AdmissionStoreOutcome::Applied,
+                        AdmitOutcome::Orphaned => AdmissionStoreOutcome::Orphaned,
+                    },
+                    newly_admitted: result.newly_admitted,
+                }),
+                Err(PeerSessionError::ReservedNamespaceCollision(path)) => {
+                    Err(AdmissionStoreError::ReservedNamespaceCollision { path })
+                }
+                Err(PeerSessionError::NonPortablePath(path)) => {
+                    Err(AdmissionStoreError::NonPortablePath { path })
+                }
+                Err(error) => Err(AdmissionStoreError::Other(error.to_string())),
+            })
+            .collect()
+    }
 }
 
 impl FrontierStorePort for PeerReplicaStateAdapter {
@@ -172,8 +200,9 @@ impl DurabilityEvidencePort for DurabilityEvidenceAdapter {
                     record.size,
                     record.mtime_unix_nanos,
                     record.record_kind,
-                    record.exec_bit,
+                    record.unix_mode,
                     record.symlink_target,
+                    record.xattrs,
                 ),
             })
             .collect())

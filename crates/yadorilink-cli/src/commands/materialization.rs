@@ -4,7 +4,9 @@
 
 use yadorilink_ipc_proto::daemonctl::daemon_control_request::Payload as ReqPayload;
 use yadorilink_ipc_proto::daemonctl::daemon_control_response::Payload as RespPayload;
-use yadorilink_ipc_proto::daemonctl::{EvictRequest, PinRequest, UnpinRequest};
+use yadorilink_ipc_proto::daemonctl::{
+    EvictRequest, MaterializationState, MaterializationStatusRequest, PinRequest, UnpinRequest,
+};
 
 use crate::control_client;
 use crate::error::CliError;
@@ -52,6 +54,37 @@ pub async fn evict(local_path: String) -> Result<(), CliError> {
                 "{local_path} was not evicted -- it may be pinned, busy, not fully synced, or \
                  was just modified. Nothing was freed."
             );
+        }
+        _ => {
+            return Err(CliError::Other("unexpected daemon response".into()));
+        }
+    }
+    Ok(())
+}
+
+/// P0-B: the per-file analogue of `yadorilink status`'s aggregate
+/// hydrated/placeholder/hydrating counts -- what state THIS file is in
+/// right now.
+pub async fn status(local_path: String) -> Result<(), CliError> {
+    let absolute_path = absolute_path(&local_path)?;
+    let resp = control_client::send(ReqPayload::MaterializationStatus(
+        MaterializationStatusRequest { absolute_path },
+    ))
+    .await?;
+    match resp.payload {
+        Some(RespPayload::MaterializationStatus(status)) if status.known => {
+            let state = match status.state() {
+                MaterializationState::Hydrated => "hydrated",
+                MaterializationState::Placeholder => "placeholder",
+                MaterializationState::Hydrating => "hydrating",
+                MaterializationState::Evicting => "evicting",
+                MaterializationState::Unspecified => "unknown",
+            };
+            let pinned = if status.pinned { ", pinned" } else { "" };
+            println!("{local_path}: {state}{pinned}");
+        }
+        Some(RespPayload::MaterializationStatus(_)) => {
+            println!("{local_path}: not currently tracked (not indexed, or not under a linked folder)");
         }
         _ => {
             return Err(CliError::Other("unexpected daemon response".into()));

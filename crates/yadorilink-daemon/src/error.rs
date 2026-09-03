@@ -17,7 +17,7 @@ pub enum DaemonError {
     #[error("device identity load error: {0}")]
     KeyLoad(#[from] yadorilink_transport::KeyLoadError),
 
-    /// Peer WireGuard-key-pin persistence (`peer_key_pins.json`) failed to
+    /// Peer signing-key-pin persistence (`signing_keys.json`) failed to
     /// parse/serialize.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),

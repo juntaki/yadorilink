@@ -93,7 +93,7 @@ const OP_JITTER_MAX_MS: u64 = 120;
 /// M5-A soak-closure finding: this file's two tests
 /// (`randomized_soak_converges_with_no_leaks_or_stuck_state`, `replay_
 /// known_failing_seeds`) each spin up a real multi-node topology with
-/// real orchestrators, real UDP sockets, and real WireGuard handshakes
+/// real orchestrators, real UDP sockets, and real QUIC handshakes
 /// across `flavor = "multi_thread", worker_threads = 8` -- genuinely
 /// CPU-heavy. `cargo test`'s default parallelism runs both `#[test]`s in
 /// this binary concurrently, which reproducibly starved convergence
@@ -127,7 +127,14 @@ impl yadorilink_daemon::relay_carrier::RelayGrantSource for FakeGrantSource {
                 + 'a,
         >,
     > {
-        let grant = self.fake.issue_relay_grant(&self.source_device_id, destination_device_id, 60);
+        // Generous relative to even `SETTLE_TIMEOUT`'s own 600s bound
+        // (which a soak run can hit more than once): a 60s grant expiring
+        // mid-settle is the same class of flake R3's relay-recovery tests
+        // hit and fixed by bumping their own grant TTLs to 900s -- this
+        // file's runs are longer-running and less predictable than any of
+        // those, so it gets more headroom rather than the same number.
+        let grant =
+            self.fake.issue_relay_grant(&self.source_device_id, destination_device_id, 3600);
         Box::pin(async move { grant })
     }
 }
@@ -417,7 +424,6 @@ impl SoakWorld {
                     &self.fake,
                     &restarted.state,
                     &restarted.device_id,
-                    restarted.keypair.public_bytes(),
                     &[&self.group_id],
                 )
                 .await;
@@ -435,7 +441,6 @@ impl SoakWorld {
                     &self.fake,
                     &restarted.state,
                     &restarted.device_id,
-                    restarted.keypair.public_bytes(),
                     &[&self.group_id],
                 )
                 .await;
@@ -453,7 +458,6 @@ impl SoakWorld {
                     &self.fake,
                     &restarted.state,
                     &restarted.device_id,
-                    restarted.keypair.public_bytes(),
                     &[&self.group_id],
                 )
                 .await;
@@ -478,7 +482,6 @@ impl SoakWorld {
             &self.fake,
             &spare.state,
             &spare.device_id,
-            spare.keypair.public_bytes(),
             &[&self.group_id],
         )
         .await;
@@ -758,7 +761,7 @@ async fn run_soak(seed: u64) {
     // once the restarted peer's new endpoint is learned, with no new
     // `PeerSyncSession` ever created -- confirmed live: a 6x-rapid-restart
     // repro reproducibly left `Arc::ptr_eq` true while `peer_handshake_
-    // received()`/`change_dag_negotiated()` were both true and both
+    // received()` was true and both
     // sides' reachability was `Connected(Direct)`, a fully recovered
     // session that was never replaced because it never needed to be. The
     // real leak this soak cares about is a restarted node's OLD detached
@@ -794,7 +797,6 @@ async fn run_soak(seed: u64) {
                     continue;
                 }
                 let healthy = current.peer_handshake_received()
-                    && current.change_dag_negotiated()
                     && matches!(
                         observer.state.peers.reachability(restarted_id),
                         Some(PeerReachability::Connected(_))
@@ -803,9 +805,8 @@ async fn run_soak(seed: u64) {
                     leaked.push(format!(
                         "{observer_id}'s session with {restarted_id} was never replaced across \
                          its restart, and is not currently healthy (handshake_received={}, \
-                         dag_negotiated={}, reachability={:?})",
+                         reachability={:?})",
                         current.peer_handshake_received(),
-                        current.change_dag_negotiated(),
                         observer.state.peers.reachability(restarted_id)
                     ));
                 }

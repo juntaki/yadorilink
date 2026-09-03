@@ -14,8 +14,8 @@ use super::error::WireError;
 // inner type's name in scope.
 #[allow(unused_imports)]
 use super::frame::{
-    BlockReplyFrame, BlockReplyOutboundFrame, BlockReplyOutboundOutcome, BlockReplyOutcomeFrame,
-    BlockRequestFrame, ChangeBatchFrame, ChangeBatchOutboundFrame, ChangeRequestFrame,
+    BlockRequestHeaderFrame, BlockResponseHeaderFrame, BlockResponseOutcomeFrame,
+    ChangeBatchFrame, ChangeBatchOutboundFrame, ChangeRequestFrame,
     ClusterConfigFrame, ClusterConfigOutboundFrame, HandoffLeaseGrantFrame,
     HandoffLeaseReleaseFrame, HandoffLeaseReleaseOutboundFrame, HandoffLeaseRequestFrame,
     HandoffTicketGrantFrame, HandoffTicketReleaseFrame, HandoffTicketReleaseOutboundFrame,
@@ -137,7 +137,11 @@ impl TryFrom<proto::ChangeRequest> for ChangeRequestFrame {
     type Error = WireError;
 
     fn try_from(value: proto::ChangeRequest) -> Result<Self, Self::Error> {
-        Ok(Self { folder_group_id: value.folder_group_id, want: value.want })
+        Ok(Self {
+            folder_group_id: value.folder_group_id,
+            want_heads: value.want_heads,
+            have_heads: value.have_heads,
+        })
     }
 }
 
@@ -148,8 +152,8 @@ impl TryFrom<proto::ChangeBatch> for ChangeBatchFrame {
         Ok(Self {
             folder_group_id: value.folder_group_id,
             changes: value.changes,
-            compressed_changes: value.compressed_changes,
             file_versions: value.file_versions,
+            more: value.more,
         })
     }
 }
@@ -160,52 +164,70 @@ impl TryFrom<proto::ClusterConfig> for ClusterConfigFrame {
     fn try_from(value: proto::ClusterConfig) -> Result<Self, Self::Error> {
         Ok(Self {
             acked_peer_cluster_config: value.acked_peer_cluster_config,
-            supported_compression: value.supported_compression,
-            supports_reliable_delivery: value.supports_reliable_delivery,
-            supports_change_dag: value.supports_change_dag,
-            supports_version_present: value.supports_version_present,
-            supports_version_hash_exact: value.supports_version_hash_exact,
             max_inflight_requests: value.max_inflight_requests,
             max_inflight_bytes: value.max_inflight_bytes,
-            protocol_version: value.protocol_version,
         })
     }
 }
 
-impl TryFrom<proto::BlockRequest> for BlockRequestFrame {
+impl TryFrom<proto::BlockRequestHeader> for BlockRequestHeaderFrame {
     type Error = WireError;
 
-    fn try_from(value: proto::BlockRequest) -> Result<Self, Self::Error> {
+    fn try_from(value: proto::BlockRequestHeader) -> Result<Self, Self::Error> {
         Ok(Self {
             folder_group_id: value.folder_group_id,
             file_path: value.file_path,
             block_hash: value.block_hash,
-            request_id: value.request_id,
         })
     }
 }
 
-impl TryFrom<proto::BlockReply> for BlockReplyFrame {
+impl TryFrom<proto::BlockResponseHeader> for BlockResponseHeaderFrame {
     type Error = WireError;
 
-    fn try_from(value: proto::BlockReply) -> Result<Self, Self::Error> {
-        use proto::block_reply::Outcome;
-        let outcome = value.outcome.map(|outcome| match outcome {
-            Outcome::Found(found) => {
-                BlockReplyOutcomeFrame::Found { data: found.data, compression: found.compression }
-            }
-            Outcome::DontHave(_) => BlockReplyOutcomeFrame::DontHave,
-            Outcome::Busy(busy) => {
-                BlockReplyOutcomeFrame::Busy { retry_after_ms: busy.retry_after_ms }
-            }
-            Outcome::Redirect(redirect) => BlockReplyOutcomeFrame::Redirect {
-                candidate_device_ids: redirect.candidate_device_ids,
+    fn try_from(value: proto::BlockResponseHeader) -> Result<Self, Self::Error> {
+        use proto::block_response_header::Outcome;
+        let Some(outcome) = value.outcome else {
+            return Err(WireError::Decode(
+                "BlockResponseHeader with no outcome is malformed for this generation"
+                    .to_string(),
+            ));
+        };
+        let outcome = match outcome {
+            Outcome::Found(found) => BlockResponseOutcomeFrame::Found {
+                size: found.size,
+                hash: found.hash,
+                compression: found.compression,
+            },
+            Outcome::DontHave(_) => BlockResponseOutcomeFrame::DontHave,
+            Outcome::Busy(busy) => BlockResponseOutcomeFrame::Busy {
+                retry_after_ms: busy.retry_after_ms,
+                queue_depth: busy.queue_depth,
             },
             Outcome::Rejected(rejected) => {
-                BlockReplyOutcomeFrame::Rejected { reason: rejected.reason }
+                BlockResponseOutcomeFrame::Rejected { reason: rejected.reason }
             }
-        });
-        Ok(Self { block_hash: value.block_hash, outcome, request_id: value.request_id })
+        };
+        Ok(Self { outcome })
+    }
+}
+
+impl From<BlockResponseHeaderFrame> for proto::BlockResponseHeader {
+    fn from(value: BlockResponseHeaderFrame) -> Self {
+        use proto::block_response_header::Outcome;
+        let outcome = match value.outcome {
+            BlockResponseOutcomeFrame::Found { size, hash, compression } => {
+                Outcome::Found(proto::BlockFound { size, hash, compression })
+            }
+            BlockResponseOutcomeFrame::DontHave => Outcome::DontHave(true),
+            BlockResponseOutcomeFrame::Busy { retry_after_ms, queue_depth } => {
+                Outcome::Busy(proto::BlockBusy { retry_after_ms, queue_depth })
+            }
+            BlockResponseOutcomeFrame::Rejected { reason } => {
+                Outcome::Rejected(proto::BlockRejected { reason })
+            }
+        };
+        Self { outcome: Some(outcome) }
     }
 }
 
@@ -331,12 +353,6 @@ impl PeerWireCodec for ProtobufPeerWireCodec {
             Some(proto::sync_message::Payload::ClusterConfig(config)) => {
                 Ok(InboundFrame::ClusterConfig(config.try_into()?))
             }
-            Some(proto::sync_message::Payload::BlockRequest(req)) => {
-                Ok(InboundFrame::BlockRequest(req.try_into()?))
-            }
-            Some(proto::sync_message::Payload::BlockReply(reply)) => {
-                Ok(InboundFrame::BlockReply(reply.try_into()?))
-            }
             Some(proto::sync_message::Payload::HandoffLeaseRequest(req)) => {
                 Ok(InboundFrame::HandoffLeaseRequest(req.try_into()?))
             }
@@ -373,12 +389,15 @@ impl PeerWireCodec for ProtobufPeerWireCodec {
             Some(proto::sync_message::Payload::RelayClose(close)) => {
                 Ok(InboundFrame::RelayClose(close.try_into()?))
             }
-            // Every other still-unmigrated payload variant, and a genuinely
-            // empty oneof (an old peer, or a forward-incompatible message
-            // this build doesn't recognize -- prost decodes both the same
-            // way) -- not yet distinguished from each other, matching
-            // InboundFrame::Unknown's own doc comment.
-            _ => Ok(InboundFrame::Unknown { message_kind: None }),
+            // Every current `SyncMessage.payload` oneof variant has an
+            // explicit arm above. Under exact-generation ALPN, a
+            // same-generation peer always sets a recognized `payload`, so
+            // reaching here means a genuinely empty oneof -- a protocol
+            // violation for this generation, not a legitimate
+            // forward-compatible case to silently ignore.
+            None => Err(WireError::Decode(
+                "SyncMessage with no payload is malformed for this generation".to_string(),
+            )),
         }
     }
 
@@ -386,84 +405,30 @@ impl PeerWireCodec for ProtobufPeerWireCodec {
         let payload = match frame {
             OutboundFrame::ClusterConfig(config) => {
                 proto::sync_message::Payload::ClusterConfig(proto::ClusterConfig {
-                    folder_group_ids: config.folder_group_ids,
-                    known_peer_device_ids: config.known_peer_device_ids,
-                    supported_compression: config.supported_compression,
-                    supports_reliable_delivery: config.supports_reliable_delivery,
                     acked_peer_cluster_config: config.acked_peer_cluster_config,
-                    supports_change_dag: config.supports_change_dag,
-                    supports_version_present: config.supports_version_present,
-                    supports_version_hash_exact: config.supports_version_hash_exact,
                     max_inflight_requests: config.max_inflight_requests,
                     max_inflight_bytes: config.max_inflight_bytes,
-                    available_worker_slots: config.available_worker_slots,
-                    estimated_queue_delay_ms: config.estimated_queue_delay_ms,
-                    protocol_version: config.protocol_version,
                 })
             }
             OutboundFrame::HeadsAnnounce(announce) => {
                 proto::sync_message::Payload::HeadsAnnounce(proto::HeadsAnnounce {
                     folder_group_id: announce.folder_group_id,
                     heads: announce.heads,
-                    frontier_hint: announce.frontier_hint,
                 })
             }
             OutboundFrame::ChangeRequest(req) => {
                 proto::sync_message::Payload::ChangeRequest(proto::ChangeRequest {
                     folder_group_id: req.folder_group_id,
-                    want: req.want,
+                    want_heads: req.want_heads,
+                    have_heads: req.have_heads,
                 })
             }
             OutboundFrame::ChangeBatch(batch) => {
                 proto::sync_message::Payload::ChangeBatch(proto::ChangeBatch {
                     folder_group_id: batch.folder_group_id,
                     changes: batch.changes,
-                    // The one production sender always sends uncompressed
-                    // -- see ChangeBatchOutboundFrame's own doc comment for
-                    // why this is not a field.
-                    compression: proto::Compression::None as i32,
-                    compressed_changes: batch.compressed_changes,
                     file_versions: batch.file_versions,
-                })
-            }
-            OutboundFrame::BlockRequest(req) => {
-                proto::sync_message::Payload::BlockRequest(proto::BlockRequest {
-                    folder_group_id: req.folder_group_id,
-                    file_path: req.file_path,
-                    block_hash: req.block_hash,
-                    request_id: req.request_id,
-                })
-            }
-            OutboundFrame::BlockReply(reply) => {
-                let outcome = match reply.outcome {
-                    BlockReplyOutboundOutcome::Found { data, compression } => {
-                        proto::block_reply::Outcome::Found(proto::BlockReplyFound {
-                            data,
-                            compression,
-                        })
-                    }
-                    BlockReplyOutboundOutcome::DontHave => {
-                        proto::block_reply::Outcome::DontHave(true)
-                    }
-                    BlockReplyOutboundOutcome::Busy { retry_after_ms, queue_depth } => {
-                        proto::block_reply::Outcome::Busy(proto::BlockReplyBusy {
-                            retry_after_ms,
-                            queue_depth,
-                        })
-                    }
-                    BlockReplyOutboundOutcome::Redirect { candidate_device_ids } => {
-                        proto::block_reply::Outcome::Redirect(proto::BlockReplyRedirect {
-                            candidate_device_ids,
-                        })
-                    }
-                    BlockReplyOutboundOutcome::Rejected { reason } => {
-                        proto::block_reply::Outcome::Rejected(proto::BlockReplyRejected { reason })
-                    }
-                };
-                proto::sync_message::Payload::BlockReply(proto::BlockReply {
-                    block_hash: reply.block_hash,
-                    outcome: Some(outcome),
-                    request_id: reply.request_id,
+                    more: batch.more,
                 })
             }
             OutboundFrame::VersionPresentQuery(query) => {
@@ -480,10 +445,7 @@ impl PeerWireCodec for ProtobufPeerWireCodec {
             OutboundFrame::VersionPresentAck(ack) => {
                 proto::sync_message::Payload::VersionPresentAck(proto::VersionPresentAck {
                     request_id: ack.request_id,
-                    folder_group_id: ack.folder_group_id,
-                    file_path: ack.file_path,
                     present: ack.present,
-                    signature: ack.signature,
                 })
             }
             OutboundFrame::HandoffLeaseRequest(req) => {
@@ -497,7 +459,6 @@ impl PeerWireCodec for ProtobufPeerWireCodec {
             }
             OutboundFrame::HandoffLeaseRelease(release) => {
                 proto::sync_message::Payload::HandoffLeaseRelease(proto::HandoffLeaseRelease {
-                    request_id: release.request_id,
                     folder_group_id: release.folder_group_id,
                     lease_id: release.lease_id,
                 })
@@ -513,7 +474,6 @@ impl PeerWireCodec for ProtobufPeerWireCodec {
             }
             OutboundFrame::HandoffTicketRelease(release) => {
                 proto::sync_message::Payload::HandoffTicketRelease(proto::HandoffTicketRelease {
-                    request_id: release.request_id,
                     folder_group_id: release.folder_group_id,
                     target_device_id: release.target_device_id,
                     lease_id: release.lease_id,
@@ -567,6 +527,43 @@ impl PeerWireCodec for ProtobufPeerWireCodec {
         };
         Ok(proto::SyncMessage { payload: Some(payload) }.encode_to_vec())
     }
+
+    fn encode_block_request_header(
+        &self,
+        frame: BlockRequestHeaderFrame,
+    ) -> Result<Vec<u8>, WireError> {
+        Ok(proto::BlockRequestHeader {
+            folder_group_id: frame.folder_group_id,
+            file_path: frame.file_path,
+            block_hash: frame.block_hash,
+        }
+        .encode_to_vec())
+    }
+
+    fn decode_block_request_header(
+        &self,
+        bytes: &[u8],
+    ) -> Result<BlockRequestHeaderFrame, WireError> {
+        proto::BlockRequestHeader::decode(bytes)
+            .map_err(|e| WireError::Decode(e.to_string()))?
+            .try_into()
+    }
+
+    fn encode_block_response_header(
+        &self,
+        frame: BlockResponseHeaderFrame,
+    ) -> Result<Vec<u8>, WireError> {
+        Ok(proto::BlockResponseHeader::from(frame).encode_to_vec())
+    }
+
+    fn decode_block_response_header(
+        &self,
+        bytes: &[u8],
+    ) -> Result<BlockResponseHeaderFrame, WireError> {
+        proto::BlockResponseHeader::decode(bytes)
+            .map_err(|e| WireError::Decode(e.to_string()))?
+            .try_into()
+    }
 }
 
 /// Byte-parity tests: for every outbound message family, the new
@@ -585,49 +582,22 @@ impl PeerWireCodec for ProtobufPeerWireCodec {
 mod outbound_parity_tests {
     use super::*;
 
-    /// Mirrors `PeerSyncSession::PROTOCOL_VERSION`'s current value -- that
-    /// const is private on a type this module doesn't depend on (by
-    /// design; see this file's own module doc for why only `peer_wire`
-    /// may reference `proto::*`), so this is a plain literal rather than
-    /// importing it.
-    const PROTOCOL_VERSION: u32 = 2;
-
     #[test]
     fn cluster_config_matches_the_legacy_wire_encoding() {
         let legacy = proto::SyncMessage {
             payload: Some(proto::sync_message::Payload::ClusterConfig(proto::ClusterConfig {
-                folder_group_ids: vec!["g1".to_string(), "g2".to_string()],
-                known_peer_device_ids: vec!["device-local".to_string()],
-                supported_compression: vec![proto::Compression::Zstd as i32],
-                supports_reliable_delivery: true,
                 acked_peer_cluster_config: false,
-                supports_change_dag: true,
-                supports_version_present: true,
-                supports_version_hash_exact: true,
                 max_inflight_requests: 7,
                 max_inflight_bytes: 1_000_000,
-                available_worker_slots: 3,
-                estimated_queue_delay_ms: 12,
-                protocol_version: PROTOCOL_VERSION,
             })),
         }
         .encode_to_vec();
 
         let migrated = ProtobufPeerWireCodec
             .encode(OutboundFrame::ClusterConfig(ClusterConfigOutboundFrame {
-                folder_group_ids: vec!["g1".to_string(), "g2".to_string()],
-                known_peer_device_ids: vec!["device-local".to_string()],
-                supported_compression: vec![proto::Compression::Zstd as i32],
-                supports_reliable_delivery: true,
                 acked_peer_cluster_config: false,
-                supports_change_dag: true,
-                supports_version_present: true,
-                supports_version_hash_exact: true,
                 max_inflight_requests: 7,
                 max_inflight_bytes: 1_000_000,
-                available_worker_slots: 3,
-                estimated_queue_delay_ms: 12,
-                protocol_version: PROTOCOL_VERSION,
             }))
             .unwrap();
 
@@ -640,7 +610,6 @@ mod outbound_parity_tests {
             payload: Some(proto::sync_message::Payload::HeadsAnnounce(proto::HeadsAnnounce {
                 folder_group_id: "g1".to_string(),
                 heads: vec![vec![1u8; 32], vec![2u8; 32]],
-                frontier_hint: vec![3u8; 32],
             })),
         }
         .encode_to_vec();
@@ -649,29 +618,6 @@ mod outbound_parity_tests {
             .encode(OutboundFrame::HeadsAnnounce(HeadsAnnounceOutboundFrame {
                 folder_group_id: "g1".to_string(),
                 heads: vec![vec![1u8; 32], vec![2u8; 32]],
-                frontier_hint: vec![3u8; 32],
-            }))
-            .unwrap();
-
-        assert_eq!(migrated, legacy);
-    }
-
-    #[test]
-    fn heads_announce_matches_the_legacy_wire_encoding_with_empty_frontier_hint() {
-        let legacy = proto::SyncMessage {
-            payload: Some(proto::sync_message::Payload::HeadsAnnounce(proto::HeadsAnnounce {
-                folder_group_id: "g1".to_string(),
-                heads: vec![],
-                frontier_hint: Vec::new(),
-            })),
-        }
-        .encode_to_vec();
-
-        let migrated = ProtobufPeerWireCodec
-            .encode(OutboundFrame::HeadsAnnounce(HeadsAnnounceOutboundFrame {
-                folder_group_id: "g1".to_string(),
-                heads: vec![],
-                frontier_hint: Vec::new(),
             }))
             .unwrap();
 
@@ -684,9 +630,8 @@ mod outbound_parity_tests {
             payload: Some(proto::sync_message::Payload::ChangeBatch(proto::ChangeBatch {
                 folder_group_id: "g1".to_string(),
                 changes: vec![vec![1, 2, 3], vec![4, 5]],
-                compression: proto::Compression::None as i32,
-                compressed_changes: Vec::new(),
                 file_versions: vec![vec![9, 9]],
+                more: true,
             })),
         }
         .encode_to_vec();
@@ -695,8 +640,8 @@ mod outbound_parity_tests {
             .encode(OutboundFrame::ChangeBatch(ChangeBatchOutboundFrame {
                 folder_group_id: "g1".to_string(),
                 changes: vec![vec![1, 2, 3], vec![4, 5]],
-                compressed_changes: Vec::new(),
                 file_versions: vec![vec![9, 9]],
+                more: true,
             }))
             .unwrap();
 
@@ -708,7 +653,8 @@ mod outbound_parity_tests {
         let legacy = proto::SyncMessage {
             payload: Some(proto::sync_message::Payload::ChangeRequest(proto::ChangeRequest {
                 folder_group_id: "g1".to_string(),
-                want: vec![vec![1u8; 32], vec![2u8; 32]],
+                want_heads: vec![vec![1u8; 32], vec![2u8; 32]],
+                have_heads: vec![vec![3u8; 32]],
             })),
         }
         .encode_to_vec();
@@ -716,162 +662,63 @@ mod outbound_parity_tests {
         let migrated = ProtobufPeerWireCodec
             .encode(OutboundFrame::ChangeRequest(ChangeRequestFrame {
                 folder_group_id: "g1".to_string(),
-                want: vec![vec![1u8; 32], vec![2u8; 32]],
+                want_heads: vec![vec![1u8; 32], vec![2u8; 32]],
+                have_heads: vec![vec![3u8; 32]],
             }))
             .unwrap();
 
         assert_eq!(migrated, legacy);
     }
 
+    /// One block request, one bidirectional stream: the headers are their
+    /// own encoding namespace rather than `SyncMessage` variants, so their
+    /// round trip is what pins them rather than parity against a control
+    /// message that no longer carries them.
     #[test]
-    fn block_request_matches_the_legacy_wire_encoding() {
-        let legacy = proto::SyncMessage {
-            payload: Some(proto::sync_message::Payload::BlockRequest(proto::BlockRequest {
-                folder_group_id: "g1".to_string(),
-                file_path: "a.bin".to_string(),
-                block_hash: vec![7u8; 32],
-                request_id: 42,
-            })),
-        }
-        .encode_to_vec();
-
-        let migrated = ProtobufPeerWireCodec
-            .encode(OutboundFrame::BlockRequest(BlockRequestFrame {
-                folder_group_id: "g1".to_string(),
-                file_path: "a.bin".to_string(),
-                block_hash: vec![7u8; 32],
-                request_id: 42,
-            }))
-            .unwrap();
-
-        assert_eq!(migrated, legacy);
+    fn a_block_request_header_round_trips() {
+        let frame = BlockRequestHeaderFrame {
+            folder_group_id: "g1".to_string(),
+            file_path: "a.bin".to_string(),
+            block_hash: vec![7u8; 32],
+        };
+        let bytes = ProtobufPeerWireCodec.encode_block_request_header(frame.clone()).unwrap();
+        assert_eq!(ProtobufPeerWireCodec.decode_block_request_header(&bytes).unwrap(), frame);
     }
 
     #[test]
-    fn block_reply_found_matches_the_legacy_wire_encoding() {
-        let legacy = proto::SyncMessage {
-            payload: Some(proto::sync_message::Payload::BlockReply(proto::BlockReply {
-                block_hash: vec![1u8; 32],
-                outcome: Some(proto::block_reply::Outcome::Found(proto::BlockReplyFound {
-                    data: vec![9, 9, 9],
-                    compression: proto::Compression::Zstd as i32,
-                })),
-                request_id: 5,
-            })),
+    fn every_block_response_outcome_round_trips() {
+        let outcomes = [
+            BlockResponseOutcomeFrame::Found {
+                size: 3,
+                hash: vec![1u8; 32],
+                compression: proto::Compression::Zstd as i32,
+            },
+            BlockResponseOutcomeFrame::DontHave,
+            BlockResponseOutcomeFrame::Busy { retry_after_ms: 150, queue_depth: 4 },
+            BlockResponseOutcomeFrame::Rejected { reason: "not authorized".to_string() },
+        ];
+        for outcome in outcomes {
+            let frame = BlockResponseHeaderFrame { outcome };
+            let bytes =
+                ProtobufPeerWireCodec.encode_block_response_header(frame.clone()).unwrap();
+            assert_eq!(
+                ProtobufPeerWireCodec.decode_block_response_header(&bytes).unwrap(),
+                frame
+            );
         }
-        .encode_to_vec();
-
-        let migrated = ProtobufPeerWireCodec
-            .encode(OutboundFrame::BlockReply(BlockReplyOutboundFrame {
-                block_hash: vec![1u8; 32],
-                outcome: BlockReplyOutboundOutcome::Found {
-                    data: vec![9, 9, 9],
-                    compression: proto::Compression::Zstd as i32,
-                },
-                request_id: 5,
-            }))
-            .unwrap();
-
-        assert_eq!(migrated, legacy);
     }
 
+    /// Under exact-generation ALPN a same-generation peer's
+    /// `BlockResponseHeader` always sets exactly one `outcome`; an absent
+    /// oneof is malformed for this generation and must be rejected at
+    /// decode time, never treated as `DontHave`.
     #[test]
-    fn block_reply_dont_have_matches_the_legacy_wire_encoding() {
-        let legacy = proto::SyncMessage {
-            payload: Some(proto::sync_message::Payload::BlockReply(proto::BlockReply {
-                block_hash: vec![2u8; 32],
-                outcome: Some(proto::block_reply::Outcome::DontHave(true)),
-                request_id: 6,
-            })),
-        }
-        .encode_to_vec();
-
-        let migrated = ProtobufPeerWireCodec
-            .encode(OutboundFrame::BlockReply(BlockReplyOutboundFrame {
-                block_hash: vec![2u8; 32],
-                outcome: BlockReplyOutboundOutcome::DontHave,
-                request_id: 6,
-            }))
-            .unwrap();
-
-        assert_eq!(migrated, legacy);
-    }
-
-    #[test]
-    fn block_reply_busy_matches_the_legacy_wire_encoding() {
-        let legacy = proto::SyncMessage {
-            payload: Some(proto::sync_message::Payload::BlockReply(proto::BlockReply {
-                block_hash: vec![3u8; 32],
-                outcome: Some(proto::block_reply::Outcome::Busy(proto::BlockReplyBusy {
-                    retry_after_ms: 250,
-                    queue_depth: 4,
-                })),
-                request_id: 7,
-            })),
-        }
-        .encode_to_vec();
-
-        let migrated = ProtobufPeerWireCodec
-            .encode(OutboundFrame::BlockReply(BlockReplyOutboundFrame {
-                block_hash: vec![3u8; 32],
-                outcome: BlockReplyOutboundOutcome::Busy { retry_after_ms: 250, queue_depth: 4 },
-                request_id: 7,
-            }))
-            .unwrap();
-
-        assert_eq!(migrated, legacy);
-    }
-
-    #[test]
-    fn block_reply_redirect_matches_the_legacy_wire_encoding() {
-        let legacy = proto::SyncMessage {
-            payload: Some(proto::sync_message::Payload::BlockReply(proto::BlockReply {
-                block_hash: vec![4u8; 32],
-                outcome: Some(proto::block_reply::Outcome::Redirect(proto::BlockReplyRedirect {
-                    candidate_device_ids: vec!["device-x".to_string()],
-                })),
-                request_id: 8,
-            })),
-        }
-        .encode_to_vec();
-
-        let migrated = ProtobufPeerWireCodec
-            .encode(OutboundFrame::BlockReply(BlockReplyOutboundFrame {
-                block_hash: vec![4u8; 32],
-                outcome: BlockReplyOutboundOutcome::Redirect {
-                    candidate_device_ids: vec!["device-x".to_string()],
-                },
-                request_id: 8,
-            }))
-            .unwrap();
-
-        assert_eq!(migrated, legacy);
-    }
-
-    #[test]
-    fn block_reply_rejected_matches_the_legacy_wire_encoding() {
-        let legacy = proto::SyncMessage {
-            payload: Some(proto::sync_message::Payload::BlockReply(proto::BlockReply {
-                block_hash: vec![5u8; 32],
-                outcome: Some(proto::block_reply::Outcome::Rejected(proto::BlockReplyRejected {
-                    reason: "not authorized".to_string(),
-                })),
-                request_id: 9,
-            })),
-        }
-        .encode_to_vec();
-
-        let migrated = ProtobufPeerWireCodec
-            .encode(OutboundFrame::BlockReply(BlockReplyOutboundFrame {
-                block_hash: vec![5u8; 32],
-                outcome: BlockReplyOutboundOutcome::Rejected {
-                    reason: "not authorized".to_string(),
-                },
-                request_id: 9,
-            }))
-            .unwrap();
-
-        assert_eq!(migrated, legacy);
+    fn an_absent_block_response_outcome_is_a_decode_error() {
+        let bytes = proto::BlockResponseHeader { outcome: None }.encode_to_vec();
+        assert!(matches!(
+            ProtobufPeerWireCodec.decode_block_response_header(&bytes),
+            Err(WireError::Decode(_))
+        ));
     }
 
     #[test]
@@ -908,18 +755,9 @@ mod outbound_parity_tests {
 
     #[test]
     fn version_present_ack_matches_the_legacy_wire_encoding() {
-        // handle_version_present_query always sends signature empty
-        // (reserved for a future signed attestation -- see that
-        // function's own comment).
         let legacy = proto::SyncMessage {
             payload: Some(proto::sync_message::Payload::VersionPresentAck(
-                proto::VersionPresentAck {
-                    request_id: 11,
-                    folder_group_id: "g1".to_string(),
-                    file_path: "a.bin".to_string(),
-                    present: true,
-                    signature: Vec::new(),
-                },
+                proto::VersionPresentAck { request_id: 11, present: true },
             )),
         }
         .encode_to_vec();
@@ -927,10 +765,7 @@ mod outbound_parity_tests {
         let migrated = ProtobufPeerWireCodec
             .encode(OutboundFrame::VersionPresentAck(VersionPresentAckOutboundFrame {
                 request_id: 11,
-                folder_group_id: "g1".to_string(),
-                file_path: "a.bin".to_string(),
                 present: true,
-                signature: Vec::new(),
             }))
             .unwrap();
 
@@ -989,7 +824,6 @@ mod outbound_parity_tests {
         let legacy = proto::SyncMessage {
             payload: Some(proto::sync_message::Payload::HandoffLeaseRelease(
                 proto::HandoffLeaseRelease {
-                    request_id: 22,
                     folder_group_id: "g1".to_string(),
                     lease_id: "lease-1".to_string(),
                 },
@@ -999,7 +833,6 @@ mod outbound_parity_tests {
 
         let migrated = ProtobufPeerWireCodec
             .encode(OutboundFrame::HandoffLeaseRelease(HandoffLeaseReleaseOutboundFrame {
-                request_id: 22,
                 folder_group_id: "g1".to_string(),
                 lease_id: "lease-1".to_string(),
             }))
@@ -1060,7 +893,6 @@ mod outbound_parity_tests {
         let legacy = proto::SyncMessage {
             payload: Some(proto::sync_message::Payload::HandoffTicketRelease(
                 proto::HandoffTicketRelease {
-                    request_id: 24,
                     folder_group_id: "g2".to_string(),
                     target_device_id: "device-y".to_string(),
                     lease_id: "lease-2".to_string(),
@@ -1071,7 +903,6 @@ mod outbound_parity_tests {
 
         let migrated = ProtobufPeerWireCodec
             .encode(OutboundFrame::HandoffTicketRelease(HandoffTicketReleaseOutboundFrame {
-                request_id: 24,
                 folder_group_id: "g2".to_string(),
                 target_device_id: "device-y".to_string(),
                 lease_id: "lease-2".to_string(),
@@ -1171,13 +1002,7 @@ mod tests {
     #[test]
     fn version_present_ack_round_trips_through_the_wire() {
         let codec = ProtobufPeerWireCodec;
-        let outbound = VersionPresentAckOutboundFrame {
-            request_id: 7,
-            folder_group_id: "g1".to_string(),
-            file_path: "a.bin".to_string(),
-            present: true,
-            signature: Vec::new(),
-        };
+        let outbound = VersionPresentAckOutboundFrame { request_id: 7, present: true };
 
         let bytes = codec.encode(OutboundFrame::VersionPresentAck(outbound)).unwrap();
         let decoded = codec.decode(&bytes).unwrap();
@@ -1193,13 +1018,7 @@ mod tests {
     #[test]
     fn version_present_ack_round_trips_false_present() {
         let codec = ProtobufPeerWireCodec;
-        let outbound = VersionPresentAckOutboundFrame {
-            request_id: 99,
-            folder_group_id: String::new(),
-            file_path: String::new(),
-            present: false,
-            signature: Vec::new(),
-        };
+        let outbound = VersionPresentAckOutboundFrame { request_id: 99, present: false };
 
         let bytes = codec.encode(OutboundFrame::VersionPresentAck(outbound)).unwrap();
         let decoded = codec.decode(&bytes).unwrap();
@@ -1347,7 +1166,6 @@ mod tests {
             payload: Some(proto::sync_message::Payload::HeadsAnnounce(proto::HeadsAnnounce {
                 folder_group_id: "g1".to_string(),
                 heads: vec![vec![1u8; 32], vec![2u8; 32]],
-                frontier_hint: vec![3u8; 32],
             })),
         };
 
@@ -1367,7 +1185,8 @@ mod tests {
         let message = proto::SyncMessage {
             payload: Some(proto::sync_message::Payload::ChangeRequest(proto::ChangeRequest {
                 folder_group_id: "g1".to_string(),
-                want: vec![vec![4u8; 32]],
+                want_heads: vec![vec![4u8; 32]],
+                have_heads: vec![vec![5u8; 32]],
             })),
         };
 
@@ -1375,7 +1194,8 @@ mod tests {
         match decoded {
             InboundFrame::ChangeRequest(req) => {
                 assert_eq!(req.folder_group_id, "g1");
-                assert_eq!(req.want, vec![vec![4u8; 32]]);
+                assert_eq!(req.want_heads, vec![vec![4u8; 32]]);
+                assert_eq!(req.have_heads, vec![vec![5u8; 32]]);
             }
             other => panic!("expected ChangeRequest, got {other:?}"),
         }
@@ -1388,9 +1208,8 @@ mod tests {
             payload: Some(proto::sync_message::Payload::ChangeBatch(proto::ChangeBatch {
                 folder_group_id: "g1".to_string(),
                 changes: vec![vec![1, 2, 3]],
-                compression: proto::Compression::None as i32,
-                compressed_changes: Vec::new(),
                 file_versions: vec![vec![4, 5, 6]],
+                more: true,
             })),
         };
 
@@ -1399,8 +1218,8 @@ mod tests {
             InboundFrame::ChangeBatch(batch) => {
                 assert_eq!(batch.folder_group_id, "g1");
                 assert_eq!(batch.changes, vec![vec![1, 2, 3]]);
-                assert!(batch.compressed_changes.is_empty());
                 assert_eq!(batch.file_versions, vec![vec![4, 5, 6]]);
+                assert!(batch.more);
             }
             other => panic!("expected ChangeBatch, got {other:?}"),
         }
@@ -1411,19 +1230,9 @@ mod tests {
         let codec = ProtobufPeerWireCodec;
         let message = proto::SyncMessage {
             payload: Some(proto::sync_message::Payload::ClusterConfig(proto::ClusterConfig {
-                folder_group_ids: vec!["g1".to_string()],
-                known_peer_device_ids: vec!["device-x".to_string()],
-                supported_compression: vec![proto::Compression::Zstd as i32],
-                supports_reliable_delivery: true,
                 acked_peer_cluster_config: true,
-                supports_change_dag: true,
-                supports_version_present: true,
-                supports_version_hash_exact: true,
                 max_inflight_requests: 7,
                 max_inflight_bytes: 8,
-                available_worker_slots: 9,
-                estimated_queue_delay_ms: 10,
-                protocol_version: 2,
             })),
         };
 
@@ -1431,169 +1240,10 @@ mod tests {
         match decoded {
             InboundFrame::ClusterConfig(config) => {
                 assert!(config.acked_peer_cluster_config);
-                assert_eq!(config.supported_compression, vec![proto::Compression::Zstd as i32]);
-                assert!(config.supports_reliable_delivery);
-                assert!(config.supports_change_dag);
-                assert!(config.supports_version_present);
-                assert!(config.supports_version_hash_exact);
                 assert_eq!(config.max_inflight_requests, 7);
                 assert_eq!(config.max_inflight_bytes, 8);
-                assert_eq!(config.protocol_version, 2);
             }
             other => panic!("expected ClusterConfig, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn block_request_decodes_from_the_wire() {
-        let codec = ProtobufPeerWireCodec;
-        let message = proto::SyncMessage {
-            payload: Some(proto::sync_message::Payload::BlockRequest(proto::BlockRequest {
-                folder_group_id: "g1".to_string(),
-                file_path: "a.bin".to_string(),
-                block_hash: vec![7u8; 32],
-                request_id: 42,
-            })),
-        };
-
-        let decoded = codec.decode(&message.encode_to_vec()).unwrap();
-        match decoded {
-            InboundFrame::BlockRequest(req) => {
-                assert_eq!(req.folder_group_id, "g1");
-                assert_eq!(req.file_path, "a.bin");
-                assert_eq!(req.block_hash, vec![7u8; 32]);
-                assert_eq!(req.request_id, 42);
-            }
-            other => panic!("expected BlockRequest, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn block_reply_found_decodes_from_the_wire() {
-        let codec = ProtobufPeerWireCodec;
-        let message = proto::SyncMessage {
-            payload: Some(proto::sync_message::Payload::BlockReply(proto::BlockReply {
-                block_hash: vec![1u8; 32],
-                outcome: Some(proto::block_reply::Outcome::Found(proto::BlockReplyFound {
-                    data: vec![9, 9, 9],
-                    compression: proto::Compression::None as i32,
-                })),
-                request_id: 5,
-            })),
-        };
-
-        let decoded = codec.decode(&message.encode_to_vec()).unwrap();
-        match decoded {
-            InboundFrame::BlockReply(reply) => {
-                assert_eq!(reply.block_hash, vec![1u8; 32]);
-                assert_eq!(reply.request_id, 5);
-                assert_eq!(
-                    reply.outcome,
-                    Some(BlockReplyOutcomeFrame::Found {
-                        data: vec![9, 9, 9],
-                        compression: proto::Compression::None as i32,
-                    })
-                );
-            }
-            other => panic!("expected BlockReply, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn block_reply_dont_have_decodes_from_the_wire() {
-        let codec = ProtobufPeerWireCodec;
-        let message = proto::SyncMessage {
-            payload: Some(proto::sync_message::Payload::BlockReply(proto::BlockReply {
-                block_hash: vec![2u8; 32],
-                outcome: Some(proto::block_reply::Outcome::DontHave(true)),
-                request_id: 6,
-            })),
-        };
-
-        let decoded = codec.decode(&message.encode_to_vec()).unwrap();
-        match decoded {
-            InboundFrame::BlockReply(reply) => {
-                assert_eq!(reply.outcome, Some(BlockReplyOutcomeFrame::DontHave));
-            }
-            other => panic!("expected BlockReply, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn block_reply_busy_decodes_from_the_wire() {
-        let codec = ProtobufPeerWireCodec;
-        let message = proto::SyncMessage {
-            payload: Some(proto::sync_message::Payload::BlockReply(proto::BlockReply {
-                block_hash: vec![3u8; 32],
-                outcome: Some(proto::block_reply::Outcome::Busy(proto::BlockReplyBusy {
-                    retry_after_ms: 250,
-                    queue_depth: 4,
-                })),
-                request_id: 7,
-            })),
-        };
-
-        let decoded = codec.decode(&message.encode_to_vec()).unwrap();
-        match decoded {
-            InboundFrame::BlockReply(reply) => {
-                assert_eq!(
-                    reply.outcome,
-                    Some(BlockReplyOutcomeFrame::Busy { retry_after_ms: 250 })
-                );
-            }
-            other => panic!("expected BlockReply, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn block_reply_redirect_decodes_from_the_wire() {
-        let codec = ProtobufPeerWireCodec;
-        let message = proto::SyncMessage {
-            payload: Some(proto::sync_message::Payload::BlockReply(proto::BlockReply {
-                block_hash: vec![4u8; 32],
-                outcome: Some(proto::block_reply::Outcome::Redirect(proto::BlockReplyRedirect {
-                    candidate_device_ids: vec!["device-x".to_string()],
-                })),
-                request_id: 8,
-            })),
-        };
-
-        let decoded = codec.decode(&message.encode_to_vec()).unwrap();
-        match decoded {
-            InboundFrame::BlockReply(reply) => {
-                assert_eq!(
-                    reply.outcome,
-                    Some(BlockReplyOutcomeFrame::Redirect {
-                        candidate_device_ids: vec!["device-x".to_string()],
-                    })
-                );
-            }
-            other => panic!("expected BlockReply, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn block_reply_rejected_decodes_from_the_wire() {
-        let codec = ProtobufPeerWireCodec;
-        let message = proto::SyncMessage {
-            payload: Some(proto::sync_message::Payload::BlockReply(proto::BlockReply {
-                block_hash: vec![5u8; 32],
-                outcome: Some(proto::block_reply::Outcome::Rejected(proto::BlockReplyRejected {
-                    reason: "not authorized".to_string(),
-                })),
-                request_id: 9,
-            })),
-        };
-
-        let decoded = codec.decode(&message.encode_to_vec()).unwrap();
-        match decoded {
-            InboundFrame::BlockReply(reply) => {
-                assert_eq!(
-                    reply.outcome,
-                    Some(BlockReplyOutcomeFrame::Rejected { reason: "not authorized".to_string() })
-                );
-            }
-            other => panic!("expected BlockReply, got {other:?}"),
         }
     }
 
@@ -1622,7 +1272,6 @@ mod tests {
         let message = proto::SyncMessage {
             payload: Some(proto::sync_message::Payload::HandoffLeaseRelease(
                 proto::HandoffLeaseRelease {
-                    request_id: 22,
                     folder_group_id: "g1".to_string(),
                     lease_id: "lease-1".to_string(),
                 },
@@ -1664,7 +1313,6 @@ mod tests {
         let message = proto::SyncMessage {
             payload: Some(proto::sync_message::Payload::HandoffTicketRelease(
                 proto::HandoffTicketRelease {
-                    request_id: 24,
                     folder_group_id: "g2".to_string(),
                     target_device_id: "device-y".to_string(),
                     lease_id: "lease-2".to_string(),
@@ -1707,22 +1355,19 @@ mod tests {
         }
     }
 
-    // `an_unrelated_payload_decodes_as_unknown` (a recognized-but-not-yet-
-    // migrated proto payload falling through to `Unknown`) is retired as of
-    // this commit: every `SyncMessage.payload` oneof variant is now wired
-    // into `decode`'s match, so there is no remaining recognized-but-
-    // unmigrated case left to construct. `an_empty_payload_decodes_as_
-    // unknown` below still covers the genuinely-empty-oneof case; the
-    // forward-incompatible-future-variant case cannot be constructed
-    // against this build's own generated types.
+    // Every `SyncMessage.payload` oneof variant is wired into `decode`'s
+    // match. Under exact-generation ALPN a same-generation peer always sets
+    // a recognized `payload`, so a genuinely empty oneof is a protocol
+    // violation for this generation -- `an_empty_payload_is_a_decode_error`
+    // below covers it; the forward-incompatible-future-variant case cannot
+    // be constructed against this build's own generated types.
 
     #[test]
-    fn an_empty_payload_decodes_as_unknown() {
+    fn an_empty_payload_is_a_decode_error() {
         let codec = ProtobufPeerWireCodec;
         let message = proto::SyncMessage { payload: None };
 
-        let decoded = codec.decode(&message.encode_to_vec()).unwrap();
-        assert!(matches!(decoded, InboundFrame::Unknown { .. }));
+        assert!(matches!(codec.decode(&message.encode_to_vec()), Err(WireError::Decode(_))));
     }
 
     #[test]

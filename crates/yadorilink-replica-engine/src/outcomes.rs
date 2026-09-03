@@ -28,10 +28,15 @@ pub enum CausalAuthOutcome {
     Exempt,
     /// The pinned coordinate is non-decreasing relative to every parent's.
     Accepted,
-    /// A parent's pinned auth coordinate could not be read (missing or
-    /// unreadable) -- the change must be held, not admitted, until the full
-    /// missing ancestor frontier (already computed here) arrives.
-    Hold { missing_parents: Vec<ChangeHash> },
+    /// A parent's pinned auth coordinate could not be read live (missing or
+    /// unreadable) -- the caller must not treat this as `Accepted` at THIS
+    /// point, but should still proceed to admission: the DAG-level orphan
+    /// buffer re-verifies this exact invariant at promotion time (or, for a
+    /// parent already structurally present via pruning, at direct-apply
+    /// time), once every parent's coordinate is actually resolvable. See
+    /// `yadorilink-sync-sqlite::dag_store::retained_history_integrity::
+    /// check_causal_auth_monotonicity_at_promotion`'s own doc comment.
+    Hold,
     /// The change pins an auth coordinate older than one of its parents'.
     Rejected {
         auth_seq: u64,

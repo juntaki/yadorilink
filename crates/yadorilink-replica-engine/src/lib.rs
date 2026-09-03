@@ -20,7 +20,6 @@ pub mod custody;
 mod engine;
 pub mod error;
 pub mod handoff_lease;
-pub mod materialization_plan;
 pub mod optimistic_placement;
 pub mod outcomes;
 pub mod ports;
@@ -32,7 +31,7 @@ pub mod retained_obligation;
 
 use std::sync::Arc;
 
-pub use engine::{DurableVersionQuery, PeerReplicaEngine};
+pub use engine::{AntiEntropyPage, DurableVersionQuery, PeerReplicaEngine};
 pub use ports::{
     ChangeAdmissionPort, DurabilityEvidencePort, FrontierStorePort, ReplicaHistoryPort,
 };

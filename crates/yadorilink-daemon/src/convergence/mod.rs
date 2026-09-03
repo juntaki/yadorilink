@@ -20,12 +20,13 @@ pub mod retirement_service;
 // `planner`/`job_store` are deliberately NOT separate modules here: the
 // pure path-resolution logic they'd contain already exists, unchanged, as
 // `PeerSyncSession::reconcile_group_paths` (called via
-// `reconcile_local_materialization_audit`/`reproject_unapplied_changes`),
-// and the job-table CRUD already lives in `yadorilink-sync-sqlite`
-// (`yadorilink_sync_sqlite::materialization_jobs`, wrapped by `SyncState` on
-// this crate's side) alongside this codebase's other DAG/index persistence.
-// `engine.rs`
-// drives both via `DaemonState`.
+// `reconcile_paths_directly`, this engine's own bounded direct path --
+// the legacy `reproject_unapplied_changes` executor has been retired;
+// ordinary projection now has exactly this one scheduling source and one
+// driver), and the worklist itself is
+// `yadorilink_sync_sqlite::projection_obligations` (`materialization_jobs`
+// is a retired, no-longer-scheduled-off-of table). `engine.rs` drives
+// both via `DaemonState`.
 //
 // `availability`/`scheduler` as their own modules are stage-3/stage-2
 // concerns (block-availability advertisement, source-side serve credit) not

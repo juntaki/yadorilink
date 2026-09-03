@@ -6,7 +6,7 @@
 //! binding success response, and the XOR-MAPPED-ADDRESS attribute. No TURN
 //! allocations, no long-term credentials, no message integrity: a binding
 //! response only tells us our own mapping, and the connection it enables is
-//! still gated on a real WireGuard handshake, so a forged binding response
+//! still gated on a real authenticated handshake, so a forged binding response
 //! can at worst waste one candidate slot. Message encode/decode and
 //! transaction-id matching go through the `stun` crate's audit-reviewed RFC
 //! 8489 codec; the prober loop, refresh policy, and observation recording

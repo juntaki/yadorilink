@@ -160,6 +160,47 @@ impl SqliteSyncStore {
         })
     }
 
+    /// M6-2B1.2: batched form of [`group_has_block_provenance`] -- a single
+    /// `IN (...)` query instead of one round-trip per hash. `ensure_blocks_
+    /// present`'s dedup loop previously called the single-hash form once
+    /// per block (up to ~hundreds of separate SQLite queries
+    /// for one large file), the same per-block-round-trip pattern already
+    /// identified and fixed for `present_blocks` (M6-2A's own doc comment
+    /// on that batching). Returns the SUBSET of `block_hashes` that have
+    /// recorded provenance for `group` -- callers check `set.contains(hash)`
+    /// in place of a per-hash call. Empty input returns an empty set without
+    /// touching the database (SQLite's `IN ()` is invalid syntax, and an
+    /// empty query set is common at the tail of a mostly-deduped batch).
+    pub fn group_has_block_provenance_batch(
+        &self,
+        group: &FolderGroupId,
+        block_hashes: &[Vec<u8>],
+    ) -> Result<HashSet<Vec<u8>>, SyncSqliteError> {
+        if block_hashes.is_empty() {
+            return Ok(HashSet::new());
+        }
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            let placeholders = std::iter::repeat("?").take(block_hashes.len()).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT block_hash FROM group_block_provenance \
+                 WHERE group_id = ? AND block_hash IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + block_hashes.len());
+            let group_str = group.as_str();
+            params.push(&group_str);
+            for hash in block_hashes {
+                params.push(hash);
+            }
+            let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, Vec<u8>>(0))?;
+            let mut found = HashSet::with_capacity(block_hashes.len());
+            for row in rows {
+                found.insert(row?);
+            }
+            Ok(found)
+        })
+    }
+
     /// The true missing frontier reachable from `roots`, walking through any
     /// buffered orphans in between. A one-level "is this hash known"
     /// check is not enough for a multi-generation orphan chain: an orphan
@@ -189,7 +230,7 @@ impl SqliteSyncStore {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT version_seq, size, mtime_unix_nanos, blocks_json, deleted, state, \
-                        origin_device_id, record_kind, symlink_target, exec_bit \
+                        origin_device_id, record_kind, symlink_target, unix_mode, xattrs_json \
                  FROM files WHERE group_id = ?1 AND path = ?2 ORDER BY version_seq DESC",
             )?;
             let rows = stmt.query_map(rusqlite::params![group.as_str(), path], |r| {
@@ -204,6 +245,7 @@ impl SqliteSyncStore {
                     r.get::<_, String>(7)?,
                     r.get::<_, Option<Vec<u8>>>(8)?,
                     r.get::<_, i64>(9)?,
+                    r.get::<_, String>(10)?,
                 ))
             })?;
             let mut out = Vec::new();
@@ -218,7 +260,8 @@ impl SqliteSyncStore {
                     origin_device_id,
                     record_kind,
                     symlink_target,
-                    exec_bit,
+                    unix_mode,
+                    xattrs_json,
                 ) = row?;
                 let blocks: Vec<BlockInfo> =
                     serde_json::from_str(&blocks_json).map_err(|error| {
@@ -237,7 +280,8 @@ impl SqliteSyncStore {
                     origin_device_id,
                     record_kind: RecordKind::from_db_str(&record_kind),
                     symlink_target,
-                    exec_bit: exec_bit != 0,
+                    unix_mode: crate::file_index::decode_unix_mode_column(unix_mode),
+                    xattrs: crate::file_index::decode_xattrs_column(&xattrs_json)?,
                 });
             }
             Ok(out)
@@ -252,10 +296,10 @@ impl SqliteSyncStore {
     ) -> Result<Option<CurrentVersionSnapshot>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             #[allow(clippy::type_complexity)]
-            let row: Option<(u64, i64, String, i64, String, Option<Vec<u8>>, i64)> = conn
+            let row: Option<(u64, i64, String, i64, String, Option<Vec<u8>>, i64, String)> = conn
                 .query_row(
                     "SELECT size, mtime_unix_nanos, blocks_json, deleted, record_kind, \
-                            symlink_target, exec_bit \
+                            symlink_target, unix_mode, xattrs_json \
                      FROM files WHERE group_id = ?1 AND path = ?2 AND state = 'current'",
                     rusqlite::params![group.as_str(), path],
                     |r| {
@@ -267,27 +311,31 @@ impl SqliteSyncStore {
                             r.get(4)?,
                             r.get(5)?,
                             r.get(6)?,
+                            r.get(7)?,
                         ))
                     },
                 )
                 .optional()?;
-            row.map(|(size, mtime, blocks_json, deleted, record_kind, symlink_target, exec_bit)| {
-                let blocks: Vec<BlockInfo> =
-                    serde_json::from_str(&blocks_json).map_err(|error| {
-                        SyncSqliteError::CorruptState(format!(
-                            "stored block list for current version of {path} is corrupt: {error}"
-                        ))
-                    })?;
-                Ok(CurrentVersionSnapshot {
-                    blocks,
-                    size,
-                    mtime_unix_nanos: mtime,
-                    deleted: deleted != 0,
-                    record_kind: RecordKind::from_db_str(&record_kind),
-                    symlink_target,
-                    exec_bit: exec_bit != 0,
-                })
-            })
+            row.map(
+                |(size, mtime, blocks_json, deleted, record_kind, symlink_target, unix_mode, xattrs_json)| {
+                    let blocks: Vec<BlockInfo> =
+                        serde_json::from_str(&blocks_json).map_err(|error| {
+                            SyncSqliteError::CorruptState(format!(
+                                "stored block list for current version of {path} is corrupt: {error}"
+                            ))
+                        })?;
+                    Ok(CurrentVersionSnapshot {
+                        blocks,
+                        size,
+                        mtime_unix_nanos: mtime,
+                        deleted: deleted != 0,
+                        record_kind: RecordKind::from_db_str(&record_kind),
+                        symlink_target,
+                        unix_mode: crate::file_index::decode_unix_mode_column(unix_mode),
+                        xattrs: crate::file_index::decode_xattrs_column(&xattrs_json)?,
+                    })
+                },
+            )
             .transpose()
         })
     }
@@ -357,6 +405,14 @@ impl SqliteSyncStore {
         self.group_has_block_provenance(&FolderGroupId(group_id.to_string()), block_hash)
     }
 
+    pub fn dag_group_has_block_provenance_batch(
+        &self,
+        group_id: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> Result<HashSet<Vec<u8>>, SyncSqliteError> {
+        self.group_has_block_provenance_batch(&FolderGroupId(group_id.to_string()), block_hashes)
+    }
+
     pub fn dag_parents_of(&self, hash: &ChangeHash) -> Result<Vec<ChangeHash>, SyncSqliteError> {
         self.parents_of(hash)
     }
@@ -384,6 +440,239 @@ impl SqliteSyncStore {
             .into_iter()
             .map(Into::into)
             .collect())
+    }
+
+    /// C4-12: the fail-closed read entry point for `(group_id, path)`'s
+    /// actual-state proof (`materialized_generation::
+    /// lookup_materialized_generation`'s own doc comment) -- `None` unless
+    /// `published_under_mutation_generation` still equals the path's live
+    /// mutation fence. A test-facing delegate (this crate's own tests
+    /// already exercise the free function directly; this is for callers
+    /// outside this crate, e.g. `yadorilink-peer-session`'s integration
+    /// tests asserting what Stage 3's publication boundary actually wrote).
+    pub fn dag_lookup_materialized_generation(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<crate::materialized_generation::DiskGenerationBasis>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::materialized_generation::lookup_materialized_generation(conn, group_id, path)
+        })
+    }
+
+    /// Test-facing delegate for the desired-side hash builder, for
+    /// callers outside this crate that need to cross-check it against
+    /// what the real publication path actually wrote (via
+    /// [`Self::dag_lookup_materialized_generation`]).
+    pub fn dag_desired_resolved_path_state_hash(
+        &self,
+        group_id: &str,
+        path: &str,
+        resolution: &yadorilink_replica_engine::conflict::PathResolution,
+        winner_version_hash: Option<&VersionHash>,
+    ) -> Result<[u8; 32], SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::desired_state::desired_resolved_path_state_hash(
+                conn,
+                group_id,
+                path,
+                resolution,
+                winner_version_hash,
+            )
+        })
+    }
+
+    /// Test-facing read-back of a causal basis's member change hashes by
+    /// its interned id, for asserting exactly which
+    /// frontier a publication's `causal_basis_id` was interned from.
+    pub fn dag_lookup_causal_basis_members(
+        &self,
+        causal_basis_id: &str,
+    ) -> Result<Option<Vec<ChangeHash>>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::dag_store::lookup_causal_basis_members(conn, causal_basis_id)
+        })
+    }
+
+    /// Test-facing read of one path's projection obligation, for callers
+    /// outside this crate that need to
+    /// assert an obligation was neither touched nor closed by an event at
+    /// another layer.
+    pub fn dag_lookup_projection_obligation(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<crate::projection_obligations::ProjectionObligation>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::projection_obligations::lookup_projection_obligation(conn, group_id, path)
+        })
+    }
+
+    /// Test-facing and scheduler-facing delegate for the
+    /// `projection_obligations` claim mechanism. A plain read, exactly like
+    /// [`crate::projection_obligations::claim_runnable_obligations`] itself
+    /// -- see that function's own doc comment for why no in-flight marking
+    /// is needed here.
+    pub fn dag_claim_runnable_obligations(
+        &self,
+        now_unix_nanos: i64,
+        per_group_limit: u32,
+        total_limit: u32,
+    ) -> Result<Vec<crate::projection_obligations::ClaimedObligation>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::projection_obligations::claim_runnable_obligations(
+                conn,
+                now_unix_nanos,
+                per_group_limit,
+                total_limit,
+            )
+        })
+    }
+
+    /// Delegate for [`crate::projection_obligations::mark_obligation_attempt_failed`].
+    pub fn dag_mark_obligation_attempt_failed(
+        &self,
+        group_id: &str,
+        path: &str,
+        claimed_invalidation_generation: i64,
+        claimed_obligation_incarnation: i64,
+        next_attempt_at: i64,
+        now_unix_nanos: i64,
+    ) -> Result<bool, SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            crate::projection_obligations::mark_obligation_attempt_failed(
+                conn,
+                group_id,
+                path,
+                claimed_invalidation_generation,
+                claimed_obligation_incarnation,
+                next_attempt_at,
+                now_unix_nanos,
+            )
+        })
+    }
+
+    /// Delegate for [`crate::projection_obligations::defer_obligation_without_penalty`].
+    pub fn dag_defer_obligation_without_penalty(
+        &self,
+        group_id: &str,
+        path: &str,
+        claimed_invalidation_generation: i64,
+        claimed_obligation_incarnation: i64,
+        next_attempt_at: i64,
+        now_unix_nanos: i64,
+    ) -> Result<bool, SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            crate::projection_obligations::defer_obligation_without_penalty(
+                conn,
+                group_id,
+                path,
+                claimed_invalidation_generation,
+                claimed_obligation_incarnation,
+                next_attempt_at,
+                now_unix_nanos,
+            )
+        })
+    }
+
+    /// Delegate for [`crate::projection_obligations::earliest_pending_next_attempt_at`].
+    pub fn dag_earliest_pending_next_attempt_at(
+        &self,
+        now_unix_nanos: i64,
+    ) -> Result<Option<i64>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::projection_obligations::earliest_pending_next_attempt_at(conn, now_unix_nanos)
+        })
+    }
+
+    /// Scheduler-facing delegate for the exact-outcome
+    /// compound completion. Runs inside `write_immediate`, never a plain
+    /// `write` -- see
+    /// [`crate::projection_obligations::complete_obligation_if_exact_proof_current`]'s
+    /// own doc comment for why this specific atomicity level is required.
+    pub fn dag_complete_obligation_if_exact_proof_current(
+        &self,
+        group_id: &str,
+        path: &str,
+        claimed_invalidation_generation: i64,
+        claimed_obligation_incarnation: i64,
+        desired_resolved_path_state_hash: &[u8],
+    ) -> Result<bool, SyncSqliteError> {
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            crate::projection_obligations::complete_obligation_if_exact_proof_current(
+                tx,
+                group_id,
+                path,
+                claimed_invalidation_generation,
+                claimed_obligation_incarnation,
+                desired_resolved_path_state_hash,
+            )
+        })
+    }
+
+    /// Scheduler-facing delegate for the non-exact-outcome
+    /// compound completion. Same `write_immediate` requirement as
+    /// [`Self::dag_complete_obligation_if_exact_proof_current`].
+    pub fn dag_complete_obligation_if_non_exact_proof_current(
+        &self,
+        group_id: &str,
+        path: &str,
+        claimed_invalidation_generation: i64,
+        claimed_obligation_incarnation: i64,
+        proof: crate::projection_obligations::NonExactProofKind,
+    ) -> Result<bool, SyncSqliteError> {
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            crate::projection_obligations::complete_obligation_if_non_exact_proof_current(
+                tx,
+                group_id,
+                path,
+                claimed_invalidation_generation,
+                claimed_obligation_incarnation,
+                proof,
+            )
+        })
+    }
+
+    /// Delegate for [`crate::projection_obligations::list_ignore_blocked_paths`].
+    pub fn dag_list_ignore_blocked_paths(&self, group_id: &str) -> Result<Vec<String>, SyncSqliteError> {
+        self.database.read::<_, SyncSqliteError>(|conn| {
+            crate::projection_obligations::list_ignore_blocked_paths(conn, group_id)
+        })
+    }
+
+    /// Delegate for [`crate::projection_obligations::rearm_ignore_blocked_obligation`].
+    pub fn dag_rearm_ignore_blocked_obligation(
+        &self,
+        group_id: &str,
+        path: &str,
+        now_unix_nanos: i64,
+    ) -> Result<bool, SyncSqliteError> {
+        self.database.write::<_, SyncSqliteError>(|conn| {
+            crate::projection_obligations::rearm_ignore_blocked_obligation(
+                conn,
+                group_id,
+                path,
+                now_unix_nanos,
+            )
+        })
+    }
+
+    /// Delegate for [`crate::projection_obligations::reconcile_compatibility_applied_flag_for_group`].
+    /// `write_immediate` (not the plain `write` the two delegates above
+    /// use) is load-bearing here, not incidental: the whole point of this
+    /// call is a race-safe check-and-update against a CONCURRENT
+    /// admission's own obligation-table insert, which is exactly the
+    /// atomicity `write_immediate`'s `BEGIN IMMEDIATE` transaction exists
+    /// to provide (see `database.rs`'s own doc comment).
+    pub fn dag_reconcile_compatibility_applied_flag_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<usize, SyncSqliteError> {
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            crate::projection_obligations::reconcile_compatibility_applied_flag_for_group(
+                tx, group_id,
+            )
+        })
     }
 
     /// Replaces `device`'s acknowledged frontier for `group` wholesale --
@@ -546,7 +835,8 @@ mod tests {
                  group_id TEXT NOT NULL, path TEXT NOT NULL, version_seq INTEGER NOT NULL,
                  size INTEGER NOT NULL, mtime_unix_nanos INTEGER NOT NULL, blocks_json TEXT NOT NULL,
                  deleted INTEGER NOT NULL, state TEXT NOT NULL, origin_device_id TEXT,
-                 record_kind TEXT NOT NULL, symlink_target BLOB, exec_bit INTEGER NOT NULL
+                 record_kind TEXT NOT NULL, symlink_target BLOB, unix_mode INTEGER NOT NULL,
+                 xattrs_json TEXT NOT NULL DEFAULT '[]'
              );",
         )?;
         Ok(())
@@ -560,6 +850,21 @@ mod tests {
 
     fn hash(byte: u8) -> ChangeHash {
         ChangeHash([byte; 32])
+    }
+
+    fn insert_block_provenance(store: &SqliteSyncStore, group: &FolderGroupId, block_hashes: &[Vec<u8>]) {
+        store
+            .database
+            .write::<_, SyncSqliteError>(|conn| {
+                for h in block_hashes {
+                    conn.execute(
+                        "INSERT INTO group_block_provenance (group_id, block_hash) VALUES (?1, ?2)",
+                        rusqlite::params![group.as_str(), h],
+                    )?;
+                }
+                Ok(())
+            })
+            .expect("insert block provenance");
     }
 
     fn insert_change(store: &SqliteSyncStore, group: &str, h: ChangeHash, encoded: &[u8]) {
@@ -748,13 +1053,13 @@ mod tests {
             .write::<_, SyncSqliteError>(|conn| {
                 conn.execute(
                     "INSERT INTO files (group_id, path, version_seq, size, mtime_unix_nanos, \
-                     blocks_json, deleted, state, origin_device_id, record_kind, symlink_target, exec_bit) \
+                     blocks_json, deleted, state, origin_device_id, record_kind, symlink_target, unix_mode) \
                      VALUES ('group-1', 'a.txt', 1, 10, 100, '[]', 0, 'superseded', 'device-a', 'file', NULL, 0)",
                     [],
                 )?;
                 conn.execute(
                     "INSERT INTO files (group_id, path, version_seq, size, mtime_unix_nanos, \
-                     blocks_json, deleted, state, origin_device_id, record_kind, symlink_target, exec_bit) \
+                     blocks_json, deleted, state, origin_device_id, record_kind, symlink_target, unix_mode) \
                      VALUES ('group-1', 'a.txt', 2, 20, 200, '[]', 0, 'current', 'device-b', 'file', NULL, 1)",
                     [],
                 )?;
@@ -768,7 +1073,7 @@ mod tests {
         assert_eq!(versions[0].version_seq, 2, "newest (highest version_seq) must come first");
         assert_eq!(versions[0].state, RetainedVersionState::Current);
         assert_eq!(versions[0].origin_device_id.as_deref(), Some("device-b"));
-        assert!(versions[0].exec_bit);
+        assert_eq!(versions[0].unix_mode, Some(1));
         assert_eq!(versions[1].version_seq, 1);
         assert_eq!(versions[1].state, RetainedVersionState::Superseded);
     }
@@ -787,7 +1092,7 @@ mod tests {
             .write::<_, SyncSqliteError>(|conn| {
                 conn.execute(
                     "INSERT INTO files (group_id, path, version_seq, size, mtime_unix_nanos, \
-                     blocks_json, deleted, state, origin_device_id, record_kind, symlink_target, exec_bit) \
+                     blocks_json, deleted, state, origin_device_id, record_kind, symlink_target, unix_mode) \
                      VALUES ('group-1', 'corrupt.txt', 1, 1, 1, 'not-json', 0, 'current', NULL, 'file', NULL, 0)",
                     [],
                 )?;
@@ -822,5 +1127,76 @@ mod tests {
 
         store.remove_device_frontier(&group, &device).expect("remove frontier");
         assert!(store.get_device_frontier(&group, &device).expect("read").is_empty());
+    }
+
+    /// M6-2B1.2: `group_has_block_provenance_batch` must return exactly the
+    /// subset of queried hashes that actually have a recorded row for this
+    /// group -- not every hash ever recorded (would falsely dedup blocks
+    /// this call wasn't even asked about) and not a hash recorded under a
+    /// DIFFERENT group (provenance is group-scoped by design: a block
+    /// physically present because a different sync group already holds it
+    /// must not be trusted as available for THIS group without this
+    /// group's own independent fetch).
+    #[test]
+    fn group_has_block_provenance_batch_returns_exactly_the_recorded_subset_for_this_group() {
+        let store = open_test_store();
+        let group = FolderGroupId("group-1".into());
+        let other_group = FolderGroupId("group-2".into());
+        let h1 = vec![1u8; 32];
+        let h2 = vec![2u8; 32];
+        let h3 = vec![3u8; 32];
+
+        insert_block_provenance(&store, &group, std::slice::from_ref(&h1));
+        insert_block_provenance(&store, &other_group, std::slice::from_ref(&h2));
+        // h3 is never recorded anywhere.
+
+        let found = store
+            .group_has_block_provenance_batch(&group, &[h1.clone(), h2.clone(), h3.clone()])
+            .expect("batch query");
+        assert_eq!(
+            found,
+            std::collections::HashSet::from([h1]),
+            "only h1 (recorded under THIS group) may come back -- h2's provenance is under a \
+             different group and must not leak across the group boundary, and h3 was never \
+             recorded at all"
+        );
+    }
+
+    /// An empty query must not touch the database at all (SQLite's own
+    /// `IN ()` is invalid syntax) and must return an empty set, not an
+    /// error -- the common case at the tail of a mostly-already-deduped
+    /// batch where every remaining hash's presence still needs checking.
+    #[test]
+    fn group_has_block_provenance_batch_with_empty_input_returns_empty_without_querying() {
+        let store = open_test_store();
+        let group = FolderGroupId("group-1".into());
+        let found = store.group_has_block_provenance_batch(&group, &[]).expect("empty batch query");
+        assert!(found.is_empty());
+    }
+
+    /// The batched form must agree with the single-hash form for every
+    /// hash it's asked about -- this is a narrow performance change, not a
+    /// semantic one, and this pins that equivalence directly rather than
+    /// trusting the two implementations to stay in sync by inspection.
+    #[test]
+    fn group_has_block_provenance_batch_agrees_with_the_single_hash_form() {
+        let store = open_test_store();
+        let group = FolderGroupId("group-1".into());
+        let recorded = vec![9u8; 32];
+        let not_recorded = vec![10u8; 32];
+        insert_block_provenance(&store, &group, std::slice::from_ref(&recorded));
+
+        let batch = store
+            .group_has_block_provenance_batch(&group, &[recorded.clone(), not_recorded.clone()])
+            .expect("batch query");
+
+        assert_eq!(
+            batch.contains(&recorded),
+            store.group_has_block_provenance(&group, &recorded).expect("single query")
+        );
+        assert_eq!(
+            batch.contains(&not_recorded),
+            store.group_has_block_provenance(&group, &not_recorded).expect("single query")
+        );
     }
 }

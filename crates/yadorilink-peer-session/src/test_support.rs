@@ -62,7 +62,8 @@ struct Row {
     record_kind: Option<RecordKind>,
     symlink_target: Option<Vec<u8>>,
     symlink_out_of_root: bool,
-    exec_bit: bool,
+    unix_mode: Option<u32>,
+    xattrs: Vec<(String, Vec<u8>)>,
     origin_device_id: Option<String>,
     authoring_change_hash: Option<ChangeHash>,
     materialization_state: Option<MaterializationState>,
@@ -130,6 +131,59 @@ struct Inner {
     /// (duplicates kept) -- lets a test assert which groups an admission or
     /// job-completion path actually marked dirty.
     notify_retirement_wake_calls: Vec<String>,
+    /// Same shape as `notify_retirement_wake_calls`, for `notify_hazard_
+    /// recheck_wake`.
+    notify_hazard_recheck_wake_calls: Vec<String>,
+    /// C4-6: forces `finalize_projected_mutations_batch` to fail -- for
+    /// asserting that a batch commit's own transaction failure never
+    /// leaves a caller believing any of its paths settled (see `try_
+    /// commit_ordinary_batch`'s own doc comment: the whole call errors
+    /// instead of returning a "some settled, some retry" result, so
+    /// nothing it touched can be read as done).
+    finalize_projected_mutations_batch_fails: bool,
+    /// M6PHASE cross-file provenance batching: forces `record_group_block_
+    /// provenance` to fail -- for asserting that a failed cross-file
+    /// provenance transaction never lets a dependent ordinary candidate
+    /// publish/settle (see `try_commit_ordinary_batch`'s own fail-closed
+    /// handling of this).
+    record_group_block_provenance_fails: bool,
+    /// C4-7 phase 2: counts of the two writer_gate-consuming calls a fully-
+    /// settled re-examination must make ZERO of -- lets a test assert that
+    /// precisely, rather than only inferring it from observed row state.
+    apply_incoming_metadata_atomic_calls: usize,
+    apply_projected_row_atomic_calls: usize,
+    /// C4-7 phase 3: counts `set_authoring_change_hash` calls -- an
+    /// already-fully-settled tombstone re-examination must make ZERO of
+    /// these too.
+    set_authoring_change_hash_calls: usize,
+    /// C4-12 decision 3d: per-`(group_id, path)` filesystem-side mutation
+    /// fence, bumped by `dag_bump_mutation_fence` and read (create-at-0 if
+    /// absent) by `dag_snapshot_mutation_fence` -- this fake's stand-in for
+    /// `path_actual_mutation_fences`.
+    mutation_fences: HashMap<(String, String), i64>,
+    /// C4-12 decision 3e: last-published materialized-generation evidence
+    /// per `(group_id, path)`, keyed by the mutation-fence value it was
+    /// published under -- this fake's stand-in for
+    /// `path_materialized_generations`. Deliberately doesn't model the
+    /// causal-frontier half of the real CAS (no DAG in this fake); only the
+    /// mutation-fence half is enforced, matching what this file's tests
+    /// actually need to exercise (the race the fence exists to catch).
+    materialized_generations: HashMap<
+        (String, String),
+        (i64, Vec<ChangeHash>, Option<RecordKind>, Option<VersionHash>),
+    >,
+    /// M6PHASE provenance-write-amplification investigation: one entry per
+    /// `record_group_block_provenance` CALL (not per hash), each holding
+    /// the exact hash slice that call was given -- a "counting fake" for
+    /// asserting one batched call for N blocks, not merely eventual
+    /// `block_provenance` table contents (which cannot distinguish "one
+    /// call with N hashes" from "N calls with one hash each").
+    record_group_block_provenance_batches: Vec<Vec<Vec<u8>>>,
+    /// Same counting-fake reasoning as `record_group_block_provenance_
+    /// batches` above, for asserting the pre-existing stale-refusal-clear
+    /// behavior (`(group_id, path, version_hash_hex, peer_device_id)` per
+    /// call) survives the provenance-batching change unaffected.
+    clear_block_fetch_refusal_calls: Vec<(String, String, String, String)>,
 }
 
 /// The fake itself. `Arc`-wrapped by callers exactly like a real
@@ -137,9 +191,25 @@ struct Inner {
 #[derive(Default)]
 pub struct FakeReplicaState {
     inner: Mutex<Inner>,
+    /// Call-graph regression counters:
+    /// `dag_list_unapplied_changes`/`dag_mark_applied` must
+    /// never be reached from the periodic materialization audit's
+    /// production call graph -- these count every call, from any caller,
+    /// so a test can assert zero rather than relying on comments.
+    unapplied_changes_call_count: std::sync::atomic::AtomicUsize,
+    mark_applied_call_count: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeReplicaState {
+    /// See the fields' own doc comment.
+    pub fn dag_list_unapplied_changes_call_count(&self) -> usize {
+        self.unapplied_changes_call_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// See the fields' own doc comment.
+    pub fn dag_mark_applied_call_count(&self) -> usize {
+        self.mark_applied_call_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
     /// Returns a bare, un-`Arc`-wrapped fake -- most of this file's tests
     /// call a free function taking `&dyn PeerReplicaStatePort` directly
     /// (unsize-coercing `&FakeReplicaState`), matching how they used to
@@ -190,14 +260,54 @@ impl FakeReplicaState {
         self.lock().record_acknowledged_frontier_fails = fails;
     }
 
+    /// See `Inner::finalize_projected_mutations_batch_fails`'s doc comment.
+    pub fn set_finalize_projected_mutations_batch_fails(&self, fails: bool) {
+        self.lock().finalize_projected_mutations_batch_fails = fails;
+    }
+
+    /// See `Inner::record_group_block_provenance_fails`'s doc comment.
+    pub fn set_record_group_block_provenance_fails(&self, fails: bool) {
+        self.lock().record_group_block_provenance_fails = fails;
+    }
+
     /// See `Inner::notify_materialization_wake_count`'s doc comment.
     pub fn notify_materialization_wake_count(&self) -> usize {
         self.lock().notify_materialization_wake_count
     }
 
+    /// See `Inner::apply_incoming_metadata_atomic_calls`'s doc comment.
+    pub fn apply_incoming_metadata_atomic_calls(&self) -> usize {
+        self.lock().apply_incoming_metadata_atomic_calls
+    }
+
+    /// See `Inner::apply_projected_row_atomic_calls`'s doc comment.
+    pub fn apply_projected_row_atomic_calls(&self) -> usize {
+        self.lock().apply_projected_row_atomic_calls
+    }
+
+    /// See `Inner::set_authoring_change_hash_calls`'s doc comment.
+    pub fn set_authoring_change_hash_calls(&self) -> usize {
+        self.lock().set_authoring_change_hash_calls
+    }
+
     /// See `Inner::notify_retirement_wake_calls`'s doc comment.
     pub fn notify_retirement_wake_calls(&self) -> Vec<String> {
         self.lock().notify_retirement_wake_calls.clone()
+    }
+
+    /// See `Inner::record_group_block_provenance_batches`'s doc comment.
+    pub fn record_group_block_provenance_batches(&self) -> Vec<Vec<Vec<u8>>> {
+        self.lock().record_group_block_provenance_batches.clone()
+    }
+
+    /// See `Inner::clear_block_fetch_refusal_calls`'s doc comment.
+    pub fn clear_block_fetch_refusal_calls(&self) -> Vec<(String, String, String, String)> {
+        self.lock().clear_block_fetch_refusal_calls.clone()
+    }
+
+    /// See `Inner::notify_hazard_recheck_wake_calls`'s doc comment.
+    pub fn notify_hazard_recheck_wake_calls(&self) -> Vec<String> {
+        self.lock().notify_hazard_recheck_wake_calls.clone()
     }
 
     pub fn set_link_gate(&self, group_id: &str, gate: LinkGate) {
@@ -292,7 +402,7 @@ impl FakeReplicaState {
         &self,
         group_id: &str,
         record: &FileRecord,
-        _permit: &RootCommitPermit<'_>,
+        _permit: &RootCommitPermit,
     ) -> Result<(), PeerSessionError> {
         self.seed_file(group_id, record);
         Ok(())
@@ -480,14 +590,27 @@ impl PeerReplicaStatePort for FakeReplicaState {
             .unwrap_or(false))
     }
 
-    fn get_exec_bit(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
+    fn get_xattrs(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, PeerSessionError> {
         Ok(self
             .lock()
             .groups
             .get(group_id)
             .and_then(|g| g.rows.get(path))
-            .map(|r| r.exec_bit)
-            .unwrap_or(false))
+            .map(|r| r.xattrs.clone())
+            .unwrap_or_default())
+    }
+
+    fn get_unix_mode(&self, group_id: &str, path: &str) -> Result<Option<u32>, PeerSessionError> {
+        Ok(self
+            .lock()
+            .groups
+            .get(group_id)
+            .and_then(|g| g.rows.get(path))
+            .and_then(|r| r.unix_mode))
     }
 
     fn get_origin_device_id(
@@ -522,7 +645,9 @@ impl PeerReplicaStatePort for FakeReplicaState {
         path: &str,
         hash: &ChangeHash,
     ) -> Result<(), PeerSessionError> {
-        self.lock()
+        let mut inner = self.lock();
+        inner.set_authoring_change_hash_calls += 1;
+        inner
             .groups
             .entry(group_id.to_string())
             .or_default()
@@ -551,7 +676,7 @@ impl PeerReplicaStatePort for FakeReplicaState {
         group_id: &str,
         path: &str,
         state: MaterializationState,
-        _permit: &RootCommitPermit<'_>,
+        _permit: &RootCommitPermit,
     ) -> Result<(), PeerSessionError> {
         self.lock()
             .groups
@@ -595,7 +720,7 @@ impl PeerReplicaStatePort for FakeReplicaState {
         _group_id: &str,
         _path: &str,
         _fingerprint: Option<MaterializedFingerprint>,
-        _permit: &RootCommitPermit<'_>,
+        _permit: &RootCommitPermit,
     ) -> Result<(), PeerSessionError> {
         // No fake-state consumer needs this yet -- mirrors this mock's
         // existing footprint for other write-only accessors.
@@ -608,7 +733,7 @@ impl PeerReplicaStatePort for FakeReplicaState {
         path: &str,
         identity: yadorilink_local_storage::PlaceholderDiskIdentity,
         _provider_kind: &str,
-        _permit: &RootCommitPermit<'_>,
+        _permit: &RootCommitPermit,
     ) -> Result<(), PeerSessionError> {
         self.lock()
             .groups
@@ -627,7 +752,7 @@ impl PeerReplicaStatePort for FakeReplicaState {
         path: &str,
         candidate: yadorilink_local_storage::PlaceholderDiskIdentity,
         _provider_kind: &str,
-        _permit: &RootCommitPermit<'_>,
+        _permit: &RootCommitPermit,
     ) -> Result<yadorilink_local_storage::PlaceholderDiskIdentity, PeerSessionError> {
         let mut guard = self.lock();
         let row = guard
@@ -648,7 +773,7 @@ impl PeerReplicaStatePort for FakeReplicaState {
         &self,
         group_id: &str,
         path: &str,
-        _permit: &RootCommitPermit<'_>,
+        _permit: &RootCommitPermit,
     ) -> Result<(), PeerSessionError> {
         self.lock()
             .groups
@@ -764,23 +889,16 @@ impl PeerReplicaStatePort for FakeReplicaState {
             .unwrap_or_default())
     }
 
-    fn materialization_enqueue_pending(
-        &self,
-        _group_id: &str,
-        _path: &str,
-        _version_hash: &[u8],
-        _trigger_lamport: u64,
-        _now: i64,
-    ) -> Result<(), PeerSessionError> {
-        Ok(())
-    }
-
     fn notify_materialization_wake(&self) {
         self.lock().notify_materialization_wake_count += 1;
     }
 
     fn notify_retirement_wake(&self, group_id: &str) {
         self.lock().notify_retirement_wake_calls.push(group_id.to_string());
+    }
+
+    fn notify_hazard_recheck_wake(&self, group_id: &str) {
+        self.lock().notify_hazard_recheck_wake_calls.push(group_id.to_string());
     }
 
     fn is_path_dirty(&self, group_id: &str, path: &str) -> Result<bool, PeerSessionError> {
@@ -812,7 +930,7 @@ impl PeerReplicaStatePort for FakeReplicaState {
         group_id: &str,
         record: &FileRecord,
         origin_device_id: &str,
-        _permit: &RootCommitPermit<'_>,
+        _permit: &RootCommitPermit,
     ) -> Result<(), PeerSessionError> {
         let mut inner = self.lock();
         let row = inner
@@ -833,7 +951,7 @@ impl PeerReplicaStatePort for FakeReplicaState {
         record: &FileRecord,
         origin_device_id: &str,
         authoring_change_hash: &ChangeHash,
-        _permit: &RootCommitPermit<'_>,
+        _permit: &RootCommitPermit,
     ) -> Result<(), PeerSessionError> {
         let mut inner = self.lock();
         let row = inner
@@ -862,12 +980,34 @@ impl PeerReplicaStatePort for FakeReplicaState {
             .unwrap_or(false))
     }
 
+    fn group_has_block_provenance_batch(
+        &self,
+        group_id: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> Result<std::collections::HashSet<Vec<u8>>, PeerSessionError> {
+        let inner = self.lock();
+        let Some(group) = inner.groups.get(group_id) else {
+            return Ok(std::collections::HashSet::new());
+        };
+        Ok(block_hashes
+            .iter()
+            .filter(|hash| group.block_provenance.contains(hash.as_slice()))
+            .cloned()
+            .collect())
+    }
+
     fn record_group_block_provenance(
         &self,
         group_id: &str,
         block_hashes: &[Vec<u8>],
     ) -> Result<(), PeerSessionError> {
         let mut inner = self.lock();
+        if inner.record_group_block_provenance_fails {
+            return Err(PeerSessionError::from(std::io::Error::other(
+                "simulated record_group_block_provenance failure (test-forced)",
+            )));
+        }
+        inner.record_group_block_provenance_batches.push(block_hashes.to_vec());
         let group = inner.groups.entry(group_id.to_string()).or_default();
         for hash in block_hashes {
             group.block_provenance.insert(hash.clone());
@@ -893,12 +1033,17 @@ impl PeerReplicaStatePort for FakeReplicaState {
 
     fn clear_block_fetch_refusal(
         &self,
-        _group_id: &str,
-        _path: &str,
-        _version_hash: &str,
-        _peer_device_id: &str,
+        group_id: &str,
+        path: &str,
+        version_hash: &str,
+        peer_device_id: &str,
     ) -> Result<(), PeerSessionError> {
-        // Same rationale as `record_block_fetch_refusal` above.
+        self.lock().clear_block_fetch_refusal_calls.push((
+            group_id.to_string(),
+            path.to_string(),
+            version_hash.to_string(),
+            peer_device_id.to_string(),
+        ));
         Ok(())
     }
 
@@ -911,6 +1056,7 @@ impl PeerReplicaStatePort for FakeReplicaState {
     }
 
     fn dag_list_unapplied_changes(&self, group_id: &str) -> Result<Vec<Change>, PeerSessionError> {
+        self.unapplied_changes_call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let inner = self.lock();
         Ok(inner
             .changes
@@ -962,8 +1108,23 @@ impl PeerReplicaStatePort for FakeReplicaState {
             if !seen.insert(hash) {
                 continue;
             }
-            match inner.changes.get(&hash) {
-                Some(change) => frontier.extend(change.parents.iter().copied()),
+            if let Some(change) = inner.changes.get(&hash) {
+                frontier.extend(change.parents.iter().copied());
+                continue;
+            }
+            // Not durably admitted yet, but this change's own bytes may
+            // already be sitting in the orphan buffer (received, held only
+            // because ITS parent hasn't arrived) -- matching real
+            // production's `missing_ancestor_frontier_on_conn`, walk
+            // through it to that parent instead of reporting the orphan
+            // hash itself as "missing". Without this, a batch of buffered
+            // orphans that excludes only the true root reports every
+            // orphan as its own missing parent, and re-requesting that
+            // set (instead of the true root) never converges -- exactly
+            // the DAG-paging livelock this whole fake exists to help
+            // catch, not reproduce as an artifact of its own simplicity.
+            match inner.orphans.iter().find(|c| c.compute_hash() == hash) {
+                Some(orphan) => frontier.extend(orphan.parents.iter().copied()),
                 None => missing.push(hash),
             }
         }
@@ -1045,8 +1206,62 @@ impl PeerReplicaStatePort for FakeReplicaState {
     }
 
     fn dag_mark_applied(&self, hash: &ChangeHash) -> Result<(), PeerSessionError> {
+        self.mark_applied_call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.lock().applied.insert(*hash);
         Ok(())
+    }
+
+    fn dag_bump_mutation_fence(
+        &self,
+        group_id: &str,
+        path: &str,
+        _mutation_kind: &str,
+    ) -> Result<i64, PeerSessionError> {
+        let mut inner = self.lock();
+        let entry = inner
+            .mutation_fences
+            .entry((group_id.to_string(), path.to_string()))
+            .or_insert(0);
+        *entry += 1;
+        Ok(*entry)
+    }
+
+    fn dag_snapshot_mutation_fence(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<i64, PeerSessionError> {
+        let mut inner = self.lock();
+        Ok(*inner
+            .mutation_fences
+            .entry((group_id.to_string(), path.to_string()))
+            .or_insert(0))
+    }
+
+    fn dag_publish_materialized_generation_if_fence_current(
+        &self,
+        group_id: &str,
+        path: &str,
+        causal_basis: &[ChangeHash],
+        state: crate::ports::ExactActualState,
+        expected_mutation_generation: i64,
+    ) -> Result<bool, PeerSessionError> {
+        let (object_kind, version) = match state {
+            crate::ports::ExactActualState::Object { kind, version, .. } => {
+                (Some(kind), Some(version))
+            }
+            crate::ports::ExactActualState::Absent => (None, None),
+        };
+        let mut inner = self.lock();
+        let key = (group_id.to_string(), path.to_string());
+        let current = *inner.mutation_fences.get(&key).unwrap_or(&0);
+        if current != expected_mutation_generation {
+            return Ok(false);
+        }
+        inner
+            .materialized_generations
+            .insert(key, (current, causal_basis.to_vec(), object_kind, version));
+        Ok(true)
     }
 
     fn dag_get_device_frontier(
@@ -1057,12 +1272,43 @@ impl PeerReplicaStatePort for FakeReplicaState {
         Ok(self.lock().groups.get(group_id).and_then(|g| g.device_frontier.get(device_id).copied()))
     }
 
+    /// This fake tracks no `resolved_path_state_hash`/filesystem identity
+    /// at all (its `materialized_generations` map exists only to support
+    /// `dag_publish_materialized_generation_if_fence_current`'s own CAS
+    /// bookkeeping) -- so it always reports "not confirmable," exactly the
+    /// safe, always-correct default this method's own contract describes
+    /// for every case it cannot conclusively confirm. No test in this
+    /// crate depends on the fake ever authorizing a zero-work close.
+    fn dag_zero_work_settlement_if_already_current(
+        &self,
+        _group_id: &str,
+        _path: &str,
+        _resolution: &yadorilink_replica_engine::conflict::PathResolution,
+        _winner_version_hash: Option<&yadorilink_replica_domain::ids::VersionHash>,
+    ) -> Result<Option<(crate::ports::ExactActualState, i64)>, PeerSessionError> {
+        Ok(None)
+    }
+
+    /// `true`, deliberately, even though this fake's settlement check above
+    /// always declines: this method exists purely to let a caller SKIP work,
+    /// so `true` ("don't skip") is its conservative answer, and it keeps
+    /// every test exercising the full resolve-then-check path exactly as it
+    /// did before this short-circuit existed. A fake that answered `false`
+    /// would silently stop tests from reaching the resolution logic at all.
+    fn dag_has_usable_materialized_generation(
+        &self,
+        _group_id: &str,
+        _path: &str,
+    ) -> Result<bool, PeerSessionError> {
+        Ok(true)
+    }
+
     fn open_materialization_intent_guard<'a>(
         &'a self,
         group_id: &'a str,
         path: &'a str,
         _target_version_hash: &[u8],
-        _permit: &'a RootCommitPermit<'a>,
+        _permit: &'a RootCommitPermit,
     ) -> Result<Box<dyn OpenMaterializationIntent + Send + 'a>, PeerSessionError> {
         self.lock()
             .groups
@@ -1092,6 +1338,79 @@ impl PeerReplicaStatePort for FakeReplicaState {
             }
         }
         Ok(Box::new(Guard { state: self, group_id, path }))
+    }
+
+    fn open_projected_upserts_batch(
+        &self,
+        group_id: &str,
+        upserts: &[crate::ports::PreparedProjectedUpsert],
+        _permit: &RootCommitPermit,
+    ) -> Result<(), PeerSessionError> {
+        let mut inner = self.lock();
+        for u in upserts {
+            let row = inner
+                .groups
+                .entry(group_id.to_string())
+                .or_default()
+                .rows
+                .entry(u.rel_path.clone())
+                .or_default();
+            row.current = Some(u.record.clone());
+            row.origin_device_id = Some(u.origin_device_id.clone());
+            row.authoring_change_hash = u.authoring_change_hash;
+            row.held = None;
+            row.materialization_intent_open = true;
+            // C4-7: applied here, in the same fake "transaction" as the
+            // row above, matching `ReplicaCoordinator::
+            // open_projected_upserts_batch`'s real behavior -- metadata is
+            // no longer applied per-candidate by `revalidate_ordinary_
+            // upsert`.
+            row.record_kind = Some(u.metadata.record_kind);
+            row.symlink_target = u.metadata.symlink_target.clone();
+            row.symlink_out_of_root = u.metadata.symlink_out_of_root;
+            row.unix_mode = u.metadata.unix_mode;
+            row.xattrs = u.metadata.xattrs.clone();
+        }
+        Ok(())
+    }
+
+    fn finalize_projected_mutations_batch(
+        &self,
+        group_id: &str,
+        finished_upserts: &[crate::ports::FinishedProjectedUpsert],
+        deletes: &[crate::ports::PreparedProjectedDelete],
+        _permit: &RootCommitPermit,
+    ) -> Result<(), PeerSessionError> {
+        let mut inner = self.lock();
+        if inner.finalize_projected_mutations_batch_fails {
+            return Err(PeerSessionError::InvalidInput(
+                "fake finalize_projected_mutations_batch forced to fail".to_string(),
+            ));
+        }
+        for u in finished_upserts {
+            inner
+                .groups
+                .entry(group_id.to_string())
+                .or_default()
+                .rows
+                .entry(u.rel_path.clone())
+                .or_default()
+                .materialization_intent_open = false;
+        }
+        for d in deletes {
+            let row = inner
+                .groups
+                .entry(group_id.to_string())
+                .or_default()
+                .rows
+                .entry(d.rel_path.clone())
+                .or_default();
+            row.current = Some(d.record.clone());
+            row.origin_device_id = Some(d.origin_device_id.clone());
+            row.authoring_change_hash = d.authoring_change_hash;
+            row.held = None;
+        }
+        Ok(())
     }
 
     fn verify_root(&self, root: &Path, _group_id: &str) -> Result<(), PeerSessionError> {
@@ -1176,7 +1495,8 @@ impl PeerReplicaStatePort for FakeReplicaState {
                 deleted: record.deleted,
                 record_kind: r.record_kind.unwrap_or(RecordKind::File),
                 symlink_target: r.symlink_target.clone(),
-                exec_bit: r.exec_bit,
+                unix_mode: r.unix_mode,
+                xattrs: r.xattrs.clone(),
             })
         }))
     }
@@ -1214,7 +1534,7 @@ impl PeerReplicaStatePort for FakeReplicaState {
         group_id: &str,
         path: &str,
         kind: RecordKind,
-        _permit: &RootCommitPermit<'_>,
+        _permit: &RootCommitPermit,
     ) -> Result<(), PeerSessionError> {
         self.lock()
             .groups
@@ -1261,12 +1581,12 @@ impl PeerReplicaStatePort for FakeReplicaState {
         Ok(())
     }
 
-    fn set_exec_bit(
+    fn set_unix_mode(
         &self,
         group_id: &str,
         path: &str,
-        exec_bit: bool,
-        _permit: &RootCommitPermit<'_>,
+        unix_mode: Option<u32>,
+        _permit: &RootCommitPermit,
     ) -> Result<(), PeerSessionError> {
         self.lock()
             .groups
@@ -1275,7 +1595,80 @@ impl PeerReplicaStatePort for FakeReplicaState {
             .rows
             .entry(path.to_string())
             .or_default()
-            .exec_bit = exec_bit;
+            .unix_mode = unix_mode;
+        Ok(())
+    }
+
+    fn set_xattrs(
+        &self,
+        group_id: &str,
+        path: &str,
+        xattrs: &[(String, Vec<u8>)],
+        _permit: &RootCommitPermit,
+    ) -> Result<(), PeerSessionError> {
+        self.lock()
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(path.to_string())
+            .or_default()
+            .xattrs = xattrs.to_vec();
+        Ok(())
+    }
+
+    fn apply_incoming_metadata_atomic(
+        &self,
+        group_id: &str,
+        path: &str,
+        meta: &yadorilink_replica_domain::session_state::LocalFileMetaColumns,
+        _permit: &RootCommitPermit,
+    ) -> Result<(), PeerSessionError> {
+        let mut inner = self.lock();
+        inner.apply_incoming_metadata_atomic_calls += 1;
+        let row = inner
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(path.to_string())
+            .or_default();
+        row.record_kind = Some(meta.record_kind);
+        row.symlink_target = meta.symlink_target.clone();
+        row.symlink_out_of_root = meta.symlink_out_of_root;
+        row.unix_mode = meta.unix_mode;
+        row.xattrs = meta.xattrs.clone();
+        Ok(())
+    }
+
+    fn apply_projected_row_atomic(
+        &self,
+        group_id: &str,
+        record: &FileRecord,
+        origin_device_id: &str,
+        authoring_change_hash: Option<&ChangeHash>,
+        meta: &yadorilink_replica_domain::session_state::LocalFileMetaColumns,
+        _permit: &RootCommitPermit,
+    ) -> Result<(), PeerSessionError> {
+        let mut inner = self.lock();
+        inner.apply_projected_row_atomic_calls += 1;
+        let row = inner
+            .groups
+            .entry(group_id.to_string())
+            .or_default()
+            .rows
+            .entry(record.path.clone())
+            .or_default();
+        row.current = Some(record.clone());
+        row.origin_device_id = Some(origin_device_id.to_string());
+        if let Some(hash) = authoring_change_hash {
+            row.authoring_change_hash = Some(*hash);
+        }
+        row.record_kind = Some(meta.record_kind);
+        row.symlink_target = meta.symlink_target.clone();
+        row.symlink_out_of_root = meta.symlink_out_of_root;
+        row.unix_mode = meta.unix_mode;
+        row.xattrs = meta.xattrs.clone();
         Ok(())
     }
 
@@ -1299,6 +1692,16 @@ impl PeerReplicaStatePort for FakeReplicaState {
                 .insert(device.as_str().to_string(), *latest);
         }
         Ok(())
+    }
+
+    fn diagnostic_projection_obligation(
+        &self,
+        _group_id: &str,
+        _path: &str,
+    ) -> Result<Option<String>, PeerSessionError> {
+        // This fake has no `projection_obligations` model of its own --
+        // diagnostic-only, never asserted on by any test.
+        Ok(None)
     }
 }
 

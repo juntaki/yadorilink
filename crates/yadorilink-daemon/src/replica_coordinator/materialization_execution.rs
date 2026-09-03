@@ -40,12 +40,20 @@ use yadorilink_sync_sqlite::materialization_state_port::MaterializationStatePort
 use super::ReplicaCoordinator;
 
 impl MaterializationExecutionPort for ReplicaCoordinator {
-    fn get_exec_bit(
+    fn get_unix_mode(
         &self,
         group_id: &str,
         path: &str,
-    ) -> Result<bool, MaterializationExecutionError> {
-        Ok(self.file_index_repository().get_exec_bit(group_id, path).map_err(SyncError::from)?)
+    ) -> Result<Option<u32>, MaterializationExecutionError> {
+        Ok(self.file_index_repository().get_unix_mode(group_id, path).map_err(SyncError::from)?)
+    }
+
+    fn get_xattrs(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, MaterializationExecutionError> {
+        Ok(self.file_index_repository().get_xattrs(group_id, path).map_err(SyncError::from)?)
     }
 
     fn get_file(
@@ -54,6 +62,27 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         path: &str,
     ) -> Result<Option<FileRecord>, MaterializationExecutionError> {
         Ok(self.file_index_repository().get_file(group_id, path).map_err(SyncError::from)?)
+    }
+
+    fn get_symlink_target(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, MaterializationExecutionError> {
+        Ok(self
+            .file_index_repository()
+            .get_symlink_target(group_id, path)
+            .map_err(SyncError::from)?)
+    }
+
+    fn windows_symlink_opt_in_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<bool, MaterializationExecutionError> {
+        Ok(self
+            .link_repository()
+            .windows_symlink_opt_in_for_group(group_id)
+            .map_err(SyncError::from)?)
     }
 
     fn list_evictable_files(
@@ -104,8 +133,18 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         path: &str,
     ) -> Result<bool, MaterializationExecutionError> {
         Ok(self
-            .materialization_job_repository()
+            .materialization_intent_repository()
             .has_materialization_intent(group_id, path)
+            .map_err(SyncError::from)?)
+    }
+
+    fn list_materialization_intent_paths(
+        &self,
+        group_id: &str,
+    ) -> Result<std::collections::HashSet<String>, MaterializationExecutionError> {
+        Ok(self
+            .materialization_intent_repository()
+            .list_materialization_intent_paths(group_id)
             .map_err(SyncError::from)?)
     }
 
@@ -116,7 +155,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), MaterializationExecutionError> {
         Ok(self
-            .materialization_job_repository()
+            .materialization_intent_repository()
             .clear_materialization_intent(group_id, path, permit)
             .map_err(SyncError::from)?)
     }
@@ -129,7 +168,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), MaterializationExecutionError> {
         Ok(self
-            .materialization_job_repository()
+            .materialization_intent_repository()
             .begin_materialization_intent(group_id, path, target_version_hash, permit)
             .map_err(SyncError::from)?)
     }
@@ -140,6 +179,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
         path: &str,
         device_id: &str,
         observed_at_unix_nanos: i64,
+        publish_absent_proof: bool,
         emitter: &ChangeEmitter,
         permit: &RootCommitPermit<'_>,
     ) -> Result<ChangeHash, MaterializationExecutionError> {
@@ -149,6 +189,7 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             path,
             device_id,
             observed_at_unix_nanos,
+            publish_absent_proof,
             emitter,
             permit,
         )?)
@@ -450,6 +491,30 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .reclaim_cached_blocks(deletion_guard, custody, self)
             .map_err(SyncError::from)?)
     }
+
+    fn dag_bump_mutation_fence(
+        &self,
+        group_id: &str,
+        path: &str,
+        mutation_kind: &str,
+    ) -> Result<i64, MaterializationExecutionError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        Ok(self
+            .database
+            .write_immediate::<_, yadorilink_sync_sqlite::SyncSqliteError>(|tx| {
+                yadorilink_sync_sqlite::materialized_generation::bump_mutation_fence(
+                    tx,
+                    group_id,
+                    path,
+                    mutation_kind,
+                    now,
+                )
+            })
+            .map_err(SyncError::from)?)
+    }
 }
 
 #[cfg(test)]
@@ -460,11 +525,14 @@ mod tests {
     use yadorilink_filesystem_sync::materialization_eviction::{
         evict_file, MaterializationContext,
     };
-    use yadorilink_filesystem_sync::materialization_repair::repair_interrupted_materializations;
+    use yadorilink_filesystem_sync::materialization_repair::{
+        repair_interrupted_materializations, RepairMode,
+    };
     use yadorilink_local_storage::{BlockStore as _, FsBlockStore};
-    use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
+    use yadorilink_peer_session::ports::{PeerReplicaStatePort, PreparedProjectedUpsert};
+    use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
     use yadorilink_replica_domain::ids::VersionHash;
-    use yadorilink_replica_domain::session_state::MaterializationState;
+    use yadorilink_replica_domain::session_state::{LocalFileMetaColumns, MaterializationState};
     use yadorilink_replica_engine::custody::{CustodyStamp, FullReplicaCustody};
     use yadorilink_root_authority::root_commit::RootCommitPermit;
     use yadorilink_root_authority::root_identity::VerifiedRoot;
@@ -1025,6 +1093,104 @@ mod tests {
         }
     }
 
+    /// The live repair sweep runs over EVERY materialization-state row in the
+    /// group on its own periodic cadence, and its "already fine" arm used to
+    /// issue an unconditional `clear_materialization_intent` for each such row
+    /// -- one fsync-backed write transaction, each taking the process-wide
+    /// writer gate, for a DELETE matching no row, since the intent journal is
+    /// empty in steady state. The sweep now reads the outstanding set once per
+    /// pass and writes only for a path actually in it.
+    ///
+    /// The cost reduction itself is not asserted here: the only instrument
+    /// that can see "did this take the writer gate at all" is `c4_diag`'s
+    /// process-global counter, and a global counter cannot be read soundly
+    /// from a parallel test runner -- another test writing to its own database
+    /// inflates it (confirmed: this assertion passed alone and failed in the
+    /// full suite). It is evidenced by measurement instead, at the scale where
+    /// it matters: a 20,050-row pass went from 35,491ms to 4,195ms with
+    /// `intent_clears=0`. What IS asserted deterministically is the primitive
+    /// the fix rests on -- that the set really is the outstanding set -- plus
+    /// the correctness half in the test below.
+    #[test]
+    fn the_outstanding_intent_set_is_exactly_the_paths_that_have_one() {
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let permit = RootCommitPermit::for_tests();
+        let intents = state.materialization_intent_repository();
+
+        assert!(
+            intents.list_materialization_intent_paths("group-1").unwrap().is_empty(),
+            "a group that has never materialized anything has no outstanding intents"
+        );
+
+        intents.begin_materialization_intent("group-1", "a.txt", &[0; 32], &permit).unwrap();
+        intents.begin_materialization_intent("group-1", "b.txt", &[1; 32], &permit).unwrap();
+        // A different group's intent must never leak into this group's set.
+        intents.begin_materialization_intent("group-2", "c.txt", &[2; 32], &permit).unwrap();
+
+        let outstanding = intents.list_materialization_intent_paths("group-1").unwrap();
+        assert_eq!(
+            outstanding,
+            ["a.txt".to_string(), "b.txt".to_string()].into_iter().collect(),
+            "exactly this group's open intents, and nothing else"
+        );
+
+        intents.clear_materialization_intent("group-1", "a.txt", &permit).unwrap();
+        assert_eq!(
+            intents.list_materialization_intent_paths("group-1").unwrap(),
+            ["b.txt".to_string()].into_iter().collect(),
+            "a cleared intent leaves the set"
+        );
+    }
+
+    /// Teeth for the assertion above: the sweep must still clear an intent that
+    /// genuinely exists. A crash between a completed rename and its own intent
+    /// clear leaves exactly this state, and leaving it would later make an
+    /// ordinary offline deletion of the same path read as a crash mid-write.
+    #[test]
+    fn a_sweep_still_clears_a_real_dangling_intent() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = FsBlockStore::new(store_dir.path()).unwrap();
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-1", root.path());
+        let permit = RootCommitPermit::for_tests();
+
+        let content = b"already written before the crash".to_vec();
+        let hash = hex::decode(store.put(&content).unwrap()).unwrap();
+        state
+            .file_index_repository()
+            .upsert_file("group-1", &record_with_blocks("doc.txt", &content, hash), &permit)
+            .unwrap();
+        // The rename completed; only the intent's own clear did not.
+        std::fs::write(root.path().join("doc.txt"), &content).unwrap();
+        state
+            .materialization_intent_repository()
+            .begin_materialization_intent("group-1", "doc.txt", &[0; 32], &permit)
+            .unwrap();
+        assert!(state
+            .materialization_intent_repository()
+            .has_materialization_intent("group-1", "doc.txt")
+            .unwrap());
+
+        repair_interrupted_materializations(
+            &state,
+            &store,
+            root.path(),
+            "group-1",
+            RepairMode::Live,
+            &permit,
+        )
+        .unwrap();
+
+        assert!(
+            !state
+                .materialization_intent_repository()
+                .has_materialization_intent("group-1", "doc.txt")
+                .unwrap(),
+            "a real dangling intent over a completed write must still be dropped"
+        );
+    }
+
     #[test]
     fn repair_reconstructs_locally_after_a_simulated_crash_before_rename() {
         let store_dir = tempfile::tempdir().unwrap();
@@ -1040,15 +1206,283 @@ mod tests {
             .upsert_file("group-1", &record_with_blocks("doc.txt", content, hash), &permit)
             .unwrap();
         state
-            .materialization_job_repository()
+            .materialization_intent_repository()
             .begin_materialization_intent("group-1", "doc.txt", &[0; 32], &permit)
             .unwrap();
 
-        let report =
-            repair_interrupted_materializations(&state, &store, root.path(), "group-1", &permit)
-                .unwrap();
+        let report = repair_interrupted_materializations(
+            &state,
+            &store,
+            root.path(),
+            "group-1",
+            RepairMode::Startup,
+            &permit,
+        )
+        .unwrap();
         assert_eq!(report.reconstructed, vec!["doc.txt"]);
         assert_eq!(std::fs::read(root.path().join("doc.txt")).unwrap(), content);
+    }
+
+    /// The exact crash cut-point an independent review found repair never
+    /// covered: a symlink row is committed durably, then the daemon
+    /// crashes before the physical symlink is ever written -- previously,
+    /// repair's own `RecordKind::File`-only filter meant this row was
+    /// simply never examined, leaving the symlink permanently missing
+    /// across restarts (and, before `materialize_symlink_at`'s matching
+    /// fix, no durable intent even existed to disambiguate this from an
+    /// offline deletion in the first place). Confirmed genuinely RED by
+    /// temporarily reverting the loop's symlink branch back to the bare
+    /// `RecordKind::File`-only filter: the row was skipped and the
+    /// symlink was never created.
+    #[cfg(unix)]
+    #[test]
+    fn repair_recreates_a_symlink_after_a_simulated_crash_before_the_write() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = FsBlockStore::new(store_dir.path()).unwrap();
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-1", root.path());
+        let permit = RootCommitPermit::for_tests();
+        let record = FileRecord {
+            path: "link.txt".to_string(),
+            size: 0,
+            mtime_unix_nanos: 0,
+            blocks: vec![],
+            deleted: false,
+        };
+        state.file_index_repository().upsert_file("group-1", &record, &permit).unwrap();
+        state
+            .file_index_repository()
+            .set_record_kind("group-1", "link.txt", RecordKind::Symlink, &permit)
+            .unwrap();
+        state.file_index_repository().set_symlink_target("group-1", "link.txt", Some(b"target.txt")).unwrap();
+        // Simulate the crash: a durable intent was opened (exactly what
+        // `materialize_symlink_at` now does before its own row commit),
+        // but the physical symlink write never happened.
+        state
+            .materialization_intent_repository()
+            .begin_materialization_intent("group-1", "link.txt", &[0; 32], &permit)
+            .unwrap();
+
+        let report = repair_interrupted_materializations(
+            &state,
+            &store,
+            root.path(),
+            "group-1",
+            RepairMode::Startup,
+            &permit,
+        )
+        .unwrap();
+
+        assert_eq!(report.reconstructed, vec!["link.txt"]);
+        let out_path = root.path().join("link.txt");
+        assert!(
+            std::fs::symlink_metadata(&out_path).unwrap().file_type().is_symlink(),
+            "must be a real symlink on disk after repair"
+        );
+        assert_eq!(std::fs::read_link(&out_path).unwrap(), std::path::Path::new("target.txt"));
+        assert!(
+            !MaterializationExecutionPort::has_materialization_intent(&state, "group-1", "link.txt")
+                .unwrap(),
+            "the intent must be cleared once repair completes the write"
+        );
+    }
+
+    /// The offline-deletion counterpart of the crash-recovery test above:
+    /// a symlink row says `Hydrated` with a recorded target, but there is
+    /// no on-disk symlink and no open intent -- the write had already
+    /// completed (intent cleared) and the symlink was deleted while the
+    /// daemon was stopped. Repair must classify this as an offline
+    /// deletion, never resurrect it.
+    #[test]
+    fn repair_does_not_resurrect_an_offline_deleted_symlink() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = FsBlockStore::new(store_dir.path()).unwrap();
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-1", root.path());
+        let permit = RootCommitPermit::for_tests();
+        let record = FileRecord {
+            path: "gone-link.txt".to_string(),
+            size: 0,
+            mtime_unix_nanos: 0,
+            blocks: vec![],
+            deleted: false,
+        };
+        state.file_index_repository().upsert_file("group-1", &record, &permit).unwrap();
+        state
+            .file_index_repository()
+            .set_record_kind("group-1", "gone-link.txt", RecordKind::Symlink, &permit)
+            .unwrap();
+        state
+            .file_index_repository()
+            .set_symlink_target("group-1", "gone-link.txt", Some(b"target.txt"))
+            .unwrap();
+        // No intent opened, and nothing on disk -- the write completed
+        // and was later deleted offline; never simulate a crash here.
+
+        let report = repair_interrupted_materializations(
+            &state,
+            &store,
+            root.path(),
+            "group-1",
+            RepairMode::Startup,
+            &permit,
+        )
+        .unwrap();
+
+        assert_eq!(report.offline_deleted, vec!["gone-link.txt"]);
+        assert_eq!(report.reconstructed, Vec::<String>::new());
+        assert!(!root.path().join("gone-link.txt").exists());
+    }
+
+    /// `RepairMode::Live`'s whole reason to exist: a `Hydrated` record
+    /// whose on-disk bytes are present but diverge from the index, with
+    /// NO open materialization intent, must NOT be treated the same way
+    /// `RepairMode::Startup` does (quarantine + heal from the index) --
+    /// it may be a live user edit still sitting in the debounce
+    /// accumulator, not an offline edit. Live mode must leave the file
+    /// completely untouched and instead hand it to the dirty-journal
+    /// backstop, which is what actually captures a real live edit.
+    #[test]
+    fn live_repair_does_not_quarantine_a_present_divergent_file_with_no_open_intent() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = FsBlockStore::new(store_dir.path()).unwrap();
+        let indexed_content = b"the synced, indexed content";
+        let hash = hex::decode(store.put(indexed_content).unwrap()).unwrap();
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-1", root.path());
+        let permit = RootCommitPermit::for_tests();
+        state
+            .file_index_repository()
+            .upsert_file("group-1", &record_with_blocks("doc.txt", indexed_content, hash), &permit)
+            .unwrap();
+        // No materialization intent opened -- and the on-disk bytes differ
+        // from what's indexed, simulating a live user edit that has not
+        // yet been captured (no crash, the "daemon" here never stopped).
+        let live_edit_content = b"a live user edit still in flight";
+        std::fs::write(root.path().join("doc.txt"), live_edit_content).unwrap();
+
+        let report = repair_interrupted_materializations(
+            &state,
+            &store,
+            root.path(),
+            "group-1",
+            RepairMode::Live,
+            &permit,
+        )
+        .unwrap();
+
+        assert!(
+            report.quarantined_dirty.is_empty(),
+            "live mode must never quarantine a possibly-in-flight local edit: {:?}",
+            report.quarantined_dirty
+        );
+        assert!(report.reconstructed.is_empty());
+        assert_eq!(
+            std::fs::read(root.path().join("doc.txt")).unwrap(),
+            live_edit_content,
+            "the canonical file must be left completely untouched by live repair"
+        );
+        let dirty = state.dirty_path_repository().list_dirty_paths("group-1").unwrap();
+        assert!(
+            dirty.iter().any(|d| d.path == "doc.txt"),
+            "the live edit must be handed to the dirty-journal backstop instead: {dirty:?}"
+        );
+    }
+
+    /// Regression pin: `RepairMode::Startup` keeps its original,
+    /// conservative behavior for the exact same present-but-divergent,
+    /// no-intent scenario `live_repair_does_not_quarantine_...` above
+    /// covers for `Live` -- at startup, before any watcher/live-capture
+    /// pipeline exists, this observation can only be an offline edit, so
+    /// quarantining and healing from the index is correct.
+    #[test]
+    fn startup_repair_still_quarantines_a_present_divergent_file_with_no_open_intent() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = FsBlockStore::new(store_dir.path()).unwrap();
+        let indexed_content = b"the synced, indexed content";
+        let hash = hex::decode(store.put(indexed_content).unwrap()).unwrap();
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-1", root.path());
+        let permit = RootCommitPermit::for_tests();
+        state
+            .file_index_repository()
+            .upsert_file("group-1", &record_with_blocks("doc.txt", indexed_content, hash), &permit)
+            .unwrap();
+        let offline_edit_content = b"an edit made while the daemon was stopped";
+        std::fs::write(root.path().join("doc.txt"), offline_edit_content).unwrap();
+
+        let report = repair_interrupted_materializations(
+            &state,
+            &store,
+            root.path(),
+            "group-1",
+            RepairMode::Startup,
+            &permit,
+        )
+        .unwrap();
+
+        assert_eq!(report.quarantined_dirty.len(), 1);
+        assert_eq!(report.quarantined_dirty[0].0, "doc.txt");
+        assert_eq!(
+            std::fs::read(root.path().join("doc.txt")).unwrap(),
+            indexed_content,
+            "startup mode must heal the canonical path back to the indexed content"
+        );
+        let quarantine_path = &report.quarantined_dirty[0].1;
+        assert_eq!(
+            std::fs::read(root.path().join(quarantine_path)).unwrap(),
+            offline_edit_content,
+            "the offline edit's own bytes must be preserved in the quarantine copy"
+        );
+    }
+
+    /// `RepairMode::Live`'s missing-file counterpart: a `Hydrated` record
+    /// whose file is missing, with no open intent, must not be classified
+    /// as an offline deletion the way `Startup` mode does -- it may be a
+    /// live delete in progress. Hand it to the dirty-journal backstop
+    /// instead of touching the index/emitting a tombstone directly.
+    #[test]
+    fn live_repair_records_a_dirty_removal_instead_of_classifying_an_offline_delete() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = FsBlockStore::new(store_dir.path()).unwrap();
+        let content = b"content that is about to look deleted";
+        let hash = hex::decode(store.put(content).unwrap()).unwrap();
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-1", root.path());
+        let permit = RootCommitPermit::for_tests();
+        state
+            .file_index_repository()
+            .upsert_file("group-1", &record_with_blocks("doc.txt", content, hash), &permit)
+            .unwrap();
+        // No intent, and the file simply never existed under `root` here --
+        // standing in for "missing right now," the same disk state a live
+        // in-progress delete produces.
+
+        let report = repair_interrupted_materializations(
+            &state,
+            &store,
+            root.path(),
+            "group-1",
+            RepairMode::Live,
+            &permit,
+        )
+        .unwrap();
+
+        assert!(
+            report.offline_deleted.is_empty(),
+            "live mode must not classify a missing file as an offline deletion: {:?}",
+            report.offline_deleted
+        );
+        let dirty = state.dirty_path_repository().list_dirty_paths("group-1").unwrap();
+        assert!(
+            dirty.iter().any(|d| d.path == "doc.txt" && d.change_kind == "removed"),
+            "the missing file must be handed to the dirty-journal backstop as a removal: {dirty:?}"
+        );
     }
 
     #[test]
@@ -1068,13 +1502,19 @@ mod tests {
             )
             .unwrap();
         state
-            .materialization_job_repository()
+            .materialization_intent_repository()
             .begin_materialization_intent("group-1", "missing.bin", &[0; 32], &permit)
             .unwrap();
 
-        let report =
-            repair_interrupted_materializations(&state, &store, root.path(), "group-1", &permit)
-                .unwrap();
+        let report = repair_interrupted_materializations(
+            &state,
+            &store,
+            root.path(),
+            "group-1",
+            RepairMode::Startup,
+            &permit,
+        )
+        .unwrap();
         assert_eq!(report.demoted_to_placeholder, vec!["missing.bin"]);
         assert_eq!(
             state
@@ -1083,6 +1523,148 @@ mod tests {
                 .unwrap(),
             Some(MaterializationState::Placeholder)
         );
+    }
+
+    /// C4-6: a bounded batch's `open_projected_upserts_batch` commits the
+    /// row+intent for every upsert in one transaction, before ANY of their
+    /// temp files publish to their final path (see that method's own doc
+    /// comment). A crash in exactly that window -- after this commits, but
+    /// before `try_commit_ordinary_batch`'s own per-path `persist_
+    /// reconstructed_file` call ever runs for this candidate -- must look
+    /// identical to an unbatched `materialize()`'s own crash-after-intent-
+    /// open window to the existing repair pass: reconstructed from the
+    /// still-locally-present blocks, not silently classified as an offline
+    /// deletion.
+    #[test]
+    fn a_crash_after_the_batch_commits_a_rows_intent_but_before_its_disk_publish_is_repaired_from_local_blocks(
+    ) {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = FsBlockStore::new(store_dir.path()).unwrap();
+        let content = b"C4-6 batched upsert content, never published before the simulated crash";
+        let record = store_and_record(&store, "batched.txt", content);
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-1", root.path());
+        let permit = RootCommitPermit::for_tests();
+
+        let prepared = PreparedProjectedUpsert {
+            rel_path: "batched.txt".to_string(),
+            tmp_path: root.path().join(".never-published.tmp"),
+            out_path: root.path().join("batched.txt"),
+            record: record.clone(),
+            origin_device_id: "device-b".to_string(),
+            authoring_change_hash: None,
+            target_version_hash: yadorilink_local_storage::intent_target_hash(&record.blocks),
+            metadata: LocalFileMetaColumns {
+                record_kind: RecordKind::File,
+                symlink_target: None,
+                symlink_out_of_root: false,
+                unix_mode: None,
+                xattrs: Vec::new(),
+            },
+            derived_head: None,
+            newly_fetched_block_hashes: Vec::new(),
+        };
+        state
+            .open_projected_upserts_batch("group-1", std::slice::from_ref(&prepared), &permit)
+            .unwrap();
+        assert!(
+            !root.path().join("batched.txt").exists(),
+            "sanity: this test's whole point is that the disk publish never happened"
+        );
+        assert!(state
+            .materialization_intent_repository()
+            .has_materialization_intent("group-1", "batched.txt")
+            .unwrap());
+
+        let report = repair_interrupted_materializations(
+            &state,
+            &store,
+            root.path(),
+            "group-1",
+            RepairMode::Startup,
+            &permit,
+        )
+        .unwrap();
+
+        assert_eq!(report.reconstructed, vec!["batched.txt".to_string()]);
+        assert!(report.offline_deleted.is_empty(), "must not be misread as an offline deletion");
+        assert_eq!(std::fs::read(root.path().join("batched.txt")).unwrap(), content);
+    }
+
+    /// C4-6's other crash window: `try_commit_ordinary_batch` has already
+    /// published this candidate's temp file to its final path, but crashes
+    /// before its own `finalize_projected_mutations_batch` call -- so the
+    /// row stays `Hydrated` with a dangling open intent and no recorded
+    /// fingerprint. The published bytes already match the index, so repair
+    /// must recognize this as already-complete and just drop the stale
+    /// intent (matching an unbatched `materialize()`'s identical crash-
+    /// after-rename-before-intent-clear window) -- never quarantine or
+    /// otherwise disturb the correct, already-durable file.
+    #[test]
+    fn a_crash_after_the_batchs_disk_publish_but_before_finalize_only_clears_the_stale_intent() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = FsBlockStore::new(store_dir.path()).unwrap();
+        let content = b"C4-6 batched upsert content, published to disk before the simulated crash";
+        let record = store_and_record(&store, "batched2.txt", content);
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-1", root.path());
+        let permit = RootCommitPermit::for_tests();
+
+        let prepared = PreparedProjectedUpsert {
+            rel_path: "batched2.txt".to_string(),
+            tmp_path: root.path().join(".pending.tmp"),
+            out_path: root.path().join("batched2.txt"),
+            record: record.clone(),
+            origin_device_id: "device-b".to_string(),
+            authoring_change_hash: None,
+            target_version_hash: yadorilink_local_storage::intent_target_hash(&record.blocks),
+            metadata: LocalFileMetaColumns {
+                record_kind: RecordKind::File,
+                symlink_target: None,
+                symlink_out_of_root: false,
+                unix_mode: None,
+                xattrs: Vec::new(),
+            },
+            derived_head: None,
+            newly_fetched_block_hashes: Vec::new(),
+        };
+        state
+            .open_projected_upserts_batch("group-1", std::slice::from_ref(&prepared), &permit)
+            .unwrap();
+        // Stands in for `try_commit_ordinary_batch`'s own `persist_
+        // reconstructed_file` publish, which this test does not need to
+        // exercise again (already covered by `yadorilink-local-storage`'s
+        // own tests) -- only the resulting on-disk state matters here.
+        std::fs::write(root.path().join("batched2.txt"), content).unwrap();
+        assert!(state
+            .materialization_intent_repository()
+            .has_materialization_intent("group-1", "batched2.txt")
+            .unwrap());
+
+        let report = repair_interrupted_materializations(
+            &state,
+            &store,
+            root.path(),
+            "group-1",
+            RepairMode::Startup,
+            &permit,
+        )
+        .unwrap();
+
+        assert!(report.reconstructed.is_empty());
+        assert!(report.quarantined_dirty.is_empty());
+        assert!(report.offline_deleted.is_empty());
+        assert!(
+            !state
+                .materialization_intent_repository()
+                .has_materialization_intent("group-1", "batched2.txt")
+                .unwrap(),
+            "repair must clear the stale intent once it confirms the published bytes already \
+             match the index"
+        );
+        assert_eq!(std::fs::read(root.path().join("batched2.txt")).unwrap(), content);
     }
 
     /// Sets up a file row already transitioned to `Placeholder` -- matching

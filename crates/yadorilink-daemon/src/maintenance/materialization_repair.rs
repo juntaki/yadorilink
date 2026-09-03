@@ -39,7 +39,7 @@ impl MaterializationRepairJob {
     }
 
     /// Read fresh on every call (mirrors `PeerSyncSession`'s own
-    /// `resync_handle` loop reading `full_index_resync_interval()` fresh
+    /// `resync_handle` loop reading `maintenance_reconcile_interval()` fresh
     /// each time) rather than a `tokio::time::interval` fixed once at
     /// spawn time, so `set_materialization_repair_sweep_interval` takes
     /// effect on the very next sleep -- see
@@ -69,6 +69,32 @@ impl MaterializationRepairJob {
         };
         for group_id in groups {
             state.backfill_missing_change_history(&group_id).await;
+            // `changes.applied` compatibility sweep: group-scoped,
+            // peer-independent by design -- deliberately BEFORE the
+            // live-candidate check below, since it must still run for a
+            // group with zero connected peers. It used to live inside
+            // `PeerSyncSession::reconcile_local_materialization_audit`,
+            // which every call site here only reaches once a live
+            // candidate is already found; a group whose obligations all
+            // drained while disconnected would then never run the sweep
+            // again until a peer reconnected, leaving stale `applied = 0`
+            // rows indefinitely -- a real violation of the invariant that
+            // this column must never permanently mislead external
+            // tooling, even though nothing scheduling-relevant depends on
+            // it.
+            if let Err(e) = state
+                .replica_coordinator
+                .sqlite()
+                .dag_reconcile_compatibility_applied_flag_for_group(&group_id)
+            {
+                tracing::warn!(
+                    local_device_id = %state.device_id,
+                    group_id,
+                    error = %e,
+                    "materialization repair: failed to reconcile the changes.applied \
+                     compatibility flag"
+                );
+            }
             let candidates = state.peers.sessions_for_group(&group_id);
             if candidates.is_empty() {
                 tracing::debug!(

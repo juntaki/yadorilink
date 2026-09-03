@@ -17,13 +17,12 @@
 //! `PeerSyncSession::new`/`new_with_forwarding` call sites, nearly all of
 //! them tests that have no reason to care about serve credit).
 //!
-//! There is no negotiated fallback for a session with no engine installed
-//! (unlike `protocol_version`'s own genuine peer-compatibility gate) --
-//! block serving is mandatory for `protocol_version >= MIN_SUPPORTED_
-//! PROTOCOL_VERSION`. A session that reaches `handle_block_request` with
-//! no engine set (a programming error in this codebase's own construction;
-//! see `set_block_serve_engine`'s own doc comment) fails closed with
-//! `Rejected` rather than falling back to some other reply shape.
+//! There is no negotiated fallback for a session with no engine installed:
+//! block serving is mandatory for every peer that reaches a session. A
+//! session that reaches `handle_block_request` with no engine set (a
+//! programming error in this codebase's own construction; see
+//! `set_block_serve_engine`'s own doc comment) fails closed with
+//! `Rejected` rather than falling back to some other response shape.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
@@ -31,21 +30,19 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use bytes::Bytes;
 use tokio::sync::OnceCell;
 
-/// This device's current serve-credit advertisement, piggybacked on
-/// `ClusterConfig`'s existing periodic re-announce -- the four hint fields
-/// `sync.proto`'s `ClusterConfig` doc comment describes.
+/// This device's current serve-budget bounds, carried on the handshake
+/// `ClusterConfig` -- the two fields `sync.proto`'s `ClusterConfig` doc
+/// comment describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServeCreditHints {
     pub max_inflight_requests: u32,
     pub max_inflight_bytes: u64,
-    pub available_worker_slots: u32,
-    pub estimated_queue_delay_ms: u32,
 }
 
 /// The result of `BlockServeCredit::try_admit` when service is not
-/// immediately possible under CONV-6's bounds. Carries the same two fields
-/// `BlockReplyBusy` puts on the wire, so the caller can build that reply
-/// directly rather than translating.
+/// immediately possible under this engine's bounds. Carries the same two
+/// fields `BlockBusy` puts on the wire, so the caller can build that
+/// response directly rather than translating.
 /// Held for the lifetime of one `BlockRequest`'s examination and service —
 /// see `BlockServeEngine::try_begin_examination`'s own doc. Opaque: the only
 /// operation is dropping it, which releases the slot back to the device-wide
@@ -114,18 +111,6 @@ struct BlockServeCredit {
 /// this as an exact schedule.
 const DEFAULT_RETRY_AFTER_MS: u32 = 150;
 
-/// Smoothing factor for `FairDispatchState::avg_service_ms`'s EWMA -- same
-/// role as `adaptive_window::RTT_EWMA_ALPHA`, moderate so one unusually
-/// slow (or fast) service duration doesn't itself swing the estimate wildly.
-const SERVICE_TIME_EWMA_ALPHA: f64 = 0.25;
-
-/// Upper bound on `FairDispatchQueue::estimated_queue_delay_ms`'s output --
-/// an advisory hint, not a promise, but still must not report an absurd
-/// number (a queue backlog behind one pathologically slow request
-/// shouldn't produce an hours-long estimate that's more misleading than
-/// useful to a peer's own source selection).
-const MAX_ESTIMATED_QUEUE_DELAY_MS: u32 = 30_000;
-
 impl BlockServeCredit {
     fn new(max_global_bytes: u64, max_per_peer_bytes: u64, max_per_group_bytes: u64) -> Self {
         Self {
@@ -193,14 +178,6 @@ impl BlockServeCredit {
         }
     }
 
-    /// `(global bytes in flight, global distinct requests in flight)`,
-    /// read together under one lock so `advertised_hints` never mixes a
-    /// byte snapshot from one instant with a request-count snapshot from
-    /// another.
-    fn global_usage(&self) -> (u64, u32) {
-        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        (state.global_bytes, state.per_peer.values().map(|u| u.requests).sum())
-    }
 }
 
 /// Releases its slice of all three budgets when dropped -- including on an
@@ -291,12 +268,6 @@ struct FairDispatchState {
     /// Monotonic id assigned to each queued waiter, so `WaiterCancelGuard`
     /// can find and remove exactly the one entry it owns.
     next_waiter_id: u64,
-    /// EWMA (see `SERVICE_TIME_EWMA_ALPHA`) of how long a granted
-    /// `FairDispatchGuard` stays held before being dropped, in
-    /// milliseconds -- `advertised_hints`'s basis for a real
-    /// `estimated_queue_delay_ms` instead of a fixed constant. `None`
-    /// until the first guard has ever been released.
-    avg_service_ms: Option<f64>,
 }
 
 struct FairDispatchQueue {
@@ -322,7 +293,6 @@ impl FairDispatchQueue {
                 active: 0,
                 waiting: 0,
                 next_waiter_id: 0,
-                avg_service_ms: None,
             }),
             max_active,
             max_waiting,
@@ -382,10 +352,7 @@ impl FairDispatchQueue {
                 // decision against it would be comparing against a
                 // baseline that silently ignored its biggest requests.
                 *state.bytes_granted.entry(key).or_insert(0) += cost_bytes.max(1);
-                return Ok(FairDispatchGuard {
-                    queue: self.clone(),
-                    granted_at: std::time::Instant::now(),
-                });
+                return Ok(FairDispatchGuard { queue: self.clone() });
             }
             if state.waiting >= self.max_waiting {
                 return Err(ServeBusy {
@@ -415,55 +382,16 @@ impl FairDispatchQueue {
         Ok(rx.await.expect("oneshot sender never dropped without sending a guard"))
     }
 
-    /// How many requests are actively being served right now -- the REAL
-    /// figure `advertised_hints` reports as `available_worker_slots`'s
-    /// basis (see that method's own doc comment for why this, not the
-    /// byte-credit-admitted count, is the right number).
-    fn active_count(&self) -> usize {
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).active
-    }
-
     /// How many requests are currently queued (granted no slot yet). Test-
-    /// only accessor -- `estimated_queue_delay_ms` reads `state.waiting`
-    /// directly since it already holds the lock for other fields too.
+    /// only accessor.
     #[cfg(test)]
     fn waiting_count(&self) -> usize {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).waiting
     }
 
-    /// A bounded estimate of how long a NEW request would wait for a
-    /// dispatch turn right now: `waiting / max_active` "rounds" of
-    /// rotation, each roughly `avg_service_ms` long (the EWMA of how long
-    /// a granted guard has recently stayed held) -- a real, load-
-    /// reflecting number instead of a fixed constant, though still only
-    /// advisory (the same caveat `ServeBusy::queue_depth`'s own doc
-    /// comment already states: an advertised slot can be contended by the
-    /// time a request actually arrives). `0` before any guard has ever
-    /// been released (`avg_service_ms` still `None` -- no data to
-    /// estimate from yet). Clamped to `MAX_ESTIMATED_QUEUE_DELAY_MS` so a
-    /// pathologically long-held guard or a very deep queue can't produce
-    /// an absurd hint.
-    fn estimated_queue_delay_ms(&self) -> u32 {
-        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(avg_service_ms) = state.avg_service_ms else { return 0 };
-        let rounds = state.waiting as f64 / self.max_active.max(1) as f64;
-        (rounds * avg_service_ms).round().clamp(0.0, MAX_ESTIMATED_QUEUE_DELAY_MS as f64) as u32
-    }
-
-    fn release_and_wake_next(self: &Arc<Self>, service_duration: std::time::Duration) {
+    fn release_and_wake_next(self: &Arc<Self>) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.active -= 1;
-        // EWMA update for `estimated_queue_delay_ms`'s basis -- same
-        // smoothing shape as `AdaptiveWindow`'s RTT EWMA (a fresh sample
-        // shouldn't wholesale replace the running average, but should
-        // still move it).
-        let sample_ms = service_duration.as_secs_f64() * 1000.0;
-        state.avg_service_ms = Some(match state.avg_service_ms {
-            None => sample_ms,
-            Some(prev) => {
-                prev * (1.0 - SERVICE_TIME_EWMA_ALPHA) + sample_ms * SERVICE_TIME_EWMA_ALPHA
-            }
-        });
         loop {
             let key = {
                 let bytes_granted = &state.bytes_granted;
@@ -482,8 +410,7 @@ impl FairDispatchQueue {
                 state.waiters.remove(&key);
             }
             state.active += 1;
-            let guard =
-                FairDispatchGuard { queue: self.clone(), granted_at: std::time::Instant::now() };
+            let guard = FairDispatchGuard { queue: self.clone() };
             match waiter.tx.send(guard) {
                 Ok(()) => {
                     // Only charged to `bytes_granted` NOW, after the guard
@@ -568,12 +495,11 @@ impl Drop for WaiterCancelGuard<'_> {
 
 pub struct FairDispatchGuard {
     queue: Arc<FairDispatchQueue>,
-    granted_at: std::time::Instant,
 }
 
 impl Drop for FairDispatchGuard {
     fn drop(&mut self) {
-        self.queue.release_and_wake_next(self.granted_at.elapsed());
+        self.queue.release_and_wake_next();
     }
 }
 
@@ -600,11 +526,10 @@ pub enum CoalesceFailure {
 pub type CoalescedBlock = Result<(Bytes, i32), CoalesceFailure>;
 
 type CoalesceCell = OnceCell<CoalescedBlock>;
-/// Keyed by `(group_id, hash, compression_negotiated, expected_size)` --
-/// see `coalesce_cell`'s own doc comment for why BOTH the compression flag
-/// and the expected size must be part of the key, not just inputs the
-/// first caller's initializer closure happens to check.
-type CoalesceMap = StdMutex<HashMap<(String, Vec<u8>, bool, Option<u64>), Weak<CoalesceCell>>>;
+/// Keyed by `(group_id, hash, expected_size)` -- see `coalesce_cell`'s own
+/// doc comment for why the expected size must be part of the key, not just
+/// an input the first caller's initializer closure happens to check.
+type CoalesceMap = StdMutex<HashMap<(String, Vec<u8>, Option<u64>), Weak<CoalesceCell>>>;
 
 /// Owns both the credit accounting and the read-coalescing map. One instance
 /// is shared across every `PeerSyncSession` on a daemon (see this module's
@@ -781,41 +706,13 @@ impl BlockServeEngine {
         self.dispatch.acquire(peer_id, group_id, cost_bytes).await
     }
 
-    /// The four `ClusterConfig` serve-credit hint fields this device
-    /// currently advertises -- all advisory (see the proto's own doc
-    /// comment), recomputed fresh on every call rather than cached, since
+    /// The two `ClusterConfig` serve-budget bounds this device currently
+    /// advertises, recomputed fresh on every call rather than cached, since
     /// `cluster_config_message` is itself only built fresh per send.
-    ///
-    /// `available_worker_slots` reflects the REAL dispatch queue's active
-    /// count (`FairDispatchQueue`'s own `active`, via
-    /// `dispatch_active_count`), not the byte-credit-admitted request
-    /// count `global_usage` returns -- these differ once queueing is
-    /// actually happening under load (a request can be byte-credit-admitted
-    /// while still waiting its dispatch turn), and advertising the wrong
-    /// one means a peer favoring this device as a low-load source is
-    /// reading a number that doesn't reflect whether a new request would
-    /// actually be served promptly.
-    ///
-    /// `estimated_queue_delay_ms` comes from `FairDispatchQueue`'s own real
-    /// waiting count and observed average service time (see that method's
-    /// own doc comment) -- not a fixed constant -- ORed against the same
-    /// fixed `DEFAULT_RETRY_AFTER_MS` floor whenever the byte budget alone
-    /// looks saturated, since a real dispatch-queue delay of `0` doesn't
-    /// mean "ask now succeeds" if the byte budget itself has no headroom.
     pub fn advertised_hints(&self) -> ServeCreditHints {
-        let (global_bytes, _global_requests) = self.credit.global_usage();
-        let active_dispatch = self.dispatch.active_count() as u32;
-        let queue_delay_ms = self.dispatch.estimated_queue_delay_ms();
-        let byte_budget_saturated = global_bytes >= self.credit.max_global_bytes;
         ServeCreditHints {
             max_inflight_requests: self.max_inflight_requests,
             max_inflight_bytes: self.credit.max_global_bytes,
-            available_worker_slots: self.max_inflight_requests.saturating_sub(active_dispatch),
-            estimated_queue_delay_ms: if byte_budget_saturated {
-                queue_delay_ms.max(DEFAULT_RETRY_AFTER_MS)
-            } else {
-                queue_delay_ms
-            },
         }
     }
 
@@ -840,61 +737,50 @@ impl BlockServeEngine {
         })
     }
 
-    /// Returns the `Arc<OnceCell>` for `(group_id, hash, compress_for_reply,
-    /// expected_size)`, creating one if none is currently live -- same
+    /// Returns the `Arc<OnceCell>` for `(group_id, hash, expected_size)`,
+    /// creating one if none is currently live -- same
     /// lazy-prune-on-insert shape as `SyncState::path_lock` (`index.rs`).
     /// The FIRST caller to actually run `.get_or_init(...)` on the
     /// returned cell does the real read/verify/compress/size-check
-    /// (encoding it however ITS OWN session decided via
-    /// `compress_for_reply`, and checked against ITS OWN `expected_size`);
+    /// (checked against ITS OWN `expected_size`);
     /// every concurrent caller for the SAME key gets the same `Arc` and
     /// therefore the same in-flight (or already-resolved) `OnceCell::
     /// get_or_init` future, which `tokio::sync::OnceCell` itself
     /// guarantees runs the initializer at most once and fans the result
     /// out to every awaiter.
     ///
-    /// `compress_for_reply` (a session's own `compression_negotiated()`)
-    /// and `expected_size` (the caller's own declared/reserved size for
-    /// this block -- see `handle_block_request_with_credit`'s doc
-    /// comment) are BOTH part of the KEY, not merely inputs the first
-    /// caller's initializer closure happens to use:
+    /// `expected_size` (the caller's own declared/reserved size for this
+    /// block -- see `handle_block_request_with_credit`'s doc comment) is
+    /// part of the KEY, not merely an input the first caller's initializer
+    /// closure happens to use. Two requesters can disagree on
+    /// `expected_size` for the identical hash if their own referencing
+    /// records are inconsistent (one correctly sized, one corrupted/
+    /// understated) -- coalescing across that boundary would let whichever
+    /// caller wins `get_or_init` have its own size check run, while every
+    /// other caller silently inherits that same "found" result WITHOUT its
+    /// own size ever being checked. A requester whose own declared size was
+    /// smaller than the real stored data would then be served more bytes
+    /// than it reserved credit for, from a source that assumed the check
+    /// already covered it (confirmed: this let a corrupted/understated
+    /// record's request bypass its own credit reservation whenever it
+    /// happened to coalesce behind a correctly-sized one).
     ///
-    /// - Two sessions requesting the identical `(group_id, hash)` can have
-    ///   negotiated compression differently with their OWN peers, and
-    ///   coalescing across that boundary would let whichever session's
-    ///   request arrived first dictate the encoding for every other
-    ///   concurrent requester too -- a peer that never negotiated
-    ///   compression support could receive a payload tagged
-    ///   `Compression::Zstd` it has no business decoding, or (for a peer
-    ///   whose build predates the `Zstd` variant entirely) silently treat
-    ///   still-compressed bytes as the raw block.
-    /// - Two requesters can also disagree on `expected_size` for the
-    ///   identical hash if their own referencing records are
-    ///   inconsistent (one correctly sized, one corrupted/understated) --
-    ///   coalescing across THAT boundary would let whichever caller wins
-    ///   `get_or_init` have its own size check run, while every other
-    ///   caller silently inherits that same "found" result WITHOUT its
-    ///   own size ever being checked. A requester whose own declared size
-    ///   was smaller than the real stored data would then be served
-    ///   more bytes than it reserved credit for, from a source that
-    ///   assumed the check already covered it (confirmed: this let a
-    ///   corrupted/understated record's request bypass its own credit
-    ///   reservation whenever it happened to coalesce behind a
-    ///   correctly-sized one).
-    ///
-    /// Splitting the key by both flags keeps coalescing's benefit exactly
-    /// where it's safe (every requester within one capability class AND
-    /// one expected size still shares one read), while giving each
-    /// distinct combination its own independently-encoded, independently-
-    /// checked cell.
+    /// A negotiated-compression flag used to be part of this key too, for
+    /// an analogous reason: two sessions could have negotiated compression
+    /// differently with their own peers, and whichever request arrived
+    /// first would otherwise have dictated the encoding for all of them.
+    /// Compression is no longer negotiated -- every peer that reaches a
+    /// session is the same protocol generation and understands both
+    /// encodings -- so there is no longer a capability boundary for the key
+    /// to keep apart, and every requester for one `(group, hash, size)`
+    /// shares one read again.
     pub fn coalesce_cell(
         &self,
         group_id: &str,
         hash: &[u8],
-        compress_for_reply: bool,
         expected_size: Option<u64>,
     ) -> Arc<CoalesceCell> {
-        let key = (group_id.to_string(), hash.to_vec(), compress_for_reply, expected_size);
+        let key = (group_id.to_string(), hash.to_vec(), expected_size);
         let mut cells = self.coalesce.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(cell) = cells.get(&key).and_then(Weak::upgrade) {
             return cell;
@@ -1002,7 +888,7 @@ mod tests {
         let init_count = Arc::new(AtomicU64::new(0));
         let mut handles = Vec::new();
         for _ in 0..8 {
-            let cell = engine.coalesce_cell("group-1", b"hash-a", false, None);
+            let cell = engine.coalesce_cell("group-1", b"hash-a", None);
             let init_count = init_count.clone();
             handles.push(tokio::spawn(async move {
                 cell.get_or_init(|| async {
@@ -1028,36 +914,15 @@ mod tests {
     #[test]
     fn different_keys_get_independent_coalesce_cells() {
         let engine = BlockServeEngine::new(u64::MAX, u64::MAX, u64::MAX, 100);
-        let a1 = engine.coalesce_cell("group-1", b"hash-a", false, None);
-        let a2 = engine.coalesce_cell("group-1", b"hash-a", false, None);
-        let b = engine.coalesce_cell("group-1", b"hash-b", false, None);
+        let a1 = engine.coalesce_cell("group-1", b"hash-a", None);
+        let a2 = engine.coalesce_cell("group-1", b"hash-a", None);
+        let b = engine.coalesce_cell("group-1", b"hash-b", None);
         assert!(Arc::ptr_eq(&a1, &a2), "same key must return the same cell while it's still live");
         assert!(!Arc::ptr_eq(&a1, &b), "different keys must get independent cells");
     }
 
-    /// Regression for a confirmed cross-session leak: coalescing keyed by
-    /// `(group_id, hash)` alone let a session that negotiated compression
-    /// and one that didn't share the SAME cached encoding -- whichever
-    /// session's request initialized the cell first dictated the wire
-    /// encoding for every other concurrent requester too, regardless of
-    /// its own negotiation. `compress_for_reply` must be part of the key:
-    /// the same `(group, hash)` under different compression flags must be
-    /// two independent cells.
-    #[test]
-    fn compression_negotiation_state_is_part_of_the_coalescing_key() {
-        let engine = BlockServeEngine::new(u64::MAX, u64::MAX, u64::MAX, 100);
-        let compressed = engine.coalesce_cell("group-1", b"hash-a", true, None);
-        let uncompressed = engine.coalesce_cell("group-1", b"hash-a", false, None);
-        assert!(
-            !Arc::ptr_eq(&compressed, &uncompressed),
-            "the same (group, hash) under different compression negotiation must never share a \
-             cell -- a non-negotiated peer could otherwise receive a compressed payload it never \
-             agreed to"
-        );
-    }
-
     /// Regression for a confirmed cross-requester credit bypass: coalescing
-    /// keyed by `(group_id, hash, compress_for_reply)` alone let two
+    /// keyed by `(group_id, hash)` alone let two
     /// requesters with DIFFERENT `expected_size` for the identical hash
     /// (e.g. one correctly-sized referencing record, one corrupted or
     /// understated) share the same cached result. Whichever requester's
@@ -1066,15 +931,14 @@ mod tests {
     /// "found" result without its OWN size ever being checked -- a
     /// requester whose own declared size understated the real stored data
     /// would be served more bytes than it ever reserved credit for.
-    /// `expected_size` must be part of the key: the same `(group, hash,
-    /// compression)` under different expected sizes must be two
-    /// independent cells.
+    /// `expected_size` must be part of the key: the same `(group, hash)`
+    /// under different expected sizes must be two independent cells.
     #[test]
     fn expected_size_is_part_of_the_coalescing_key() {
         let engine = BlockServeEngine::new(u64::MAX, u64::MAX, u64::MAX, 100);
-        let sized_100 = engine.coalesce_cell("group-1", b"hash-a", false, Some(100));
-        let sized_50 = engine.coalesce_cell("group-1", b"hash-a", false, Some(50));
-        let no_size = engine.coalesce_cell("group-1", b"hash-a", false, None);
+        let sized_100 = engine.coalesce_cell("group-1", b"hash-a", Some(100));
+        let sized_50 = engine.coalesce_cell("group-1", b"hash-a", Some(50));
+        let no_size = engine.coalesce_cell("group-1", b"hash-a", None);
         assert!(
             !Arc::ptr_eq(&sized_100, &sized_50),
             "the same (group, hash) under different expected sizes must never share a cell -- a \

@@ -62,9 +62,10 @@ fn fresh_version(counter: &mut i64) -> FileVersion {
         0,
         FileMeta {
             mtime_unix_nanos: *counter,
-            exec_bit: false,
+            unix_mode: None,
             symlink_target: None,
             record_kind: RecordKind::File,
+            xattrs: Vec::new(),
         },
     )
 }

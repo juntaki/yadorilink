@@ -80,11 +80,25 @@ fn routed_direct(state: &Arc<DaemonState>, peer_device_id: &str) -> bool {
 }
 
 async fn hydrate_with_retries(state: &Arc<DaemonState>, group_id: &str, path: &str) {
+    // 40 attempts, 500ms apart (~20s total): wide enough to ride out a
+    // relay session that's still genuinely renegotiating after one of
+    // this file's own repeated flap cycles. `hydration::hydrate`'s own
+    // "no reachable peer holds all required blocks" error returns fast
+    // (it doesn't wait out the stall-based deadline before reporting no
+    // candidate is currently reachable), so a narrow outer retry budget
+    // -- the previous 8 attempts, ~4s total -- can exhaust itself while
+    // the underlying session is still a few seconds from being ready,
+    // which is exactly the shape of flake
+    // `relay_anchor_restart_mid_session` hit once this session (a
+    // transient "routed via relay" reading racing actual session
+    // readiness). This file never restarts the relay anchor itself, so
+    // that specific failure mode hasn't reproduced here, but widening
+    // this budget is cheap insurance against the same class under load.
     let mut attempts = 0;
     loop {
         match yadorilink_daemon::hydration::hydrate(state, group_id, path).await {
             Ok(()) => return,
-            Err(error) if attempts < 8 => {
+            Err(error) if attempts < 40 => {
                 attempts += 1;
                 tracing::warn!(%error, attempts, path, "hydration attempt failed, retrying");
                 tokio::time::sleep(Duration::from_millis(500)).await;

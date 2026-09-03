@@ -40,8 +40,6 @@ pub fn pre_dag_schema(conn: &Connection) -> Result<(), yadorilink_sqlite_runtime
 pub fn post_dag_schema(conn: &Connection) -> Result<(), yadorilink_sqlite_runtime::DatabaseError> {
     yadorilink_sync_sqlite::rebootstrap_store::init_rebootstrap_schema(conn)
         .map_err(|e| schema_err(SyncError::from(e)))?;
-    yadorilink_sync_sqlite::init_materialization_jobs_schema(conn)
-        .map_err(|e| schema_err(SyncError::from(e)))?;
     Ok(())
 }
 

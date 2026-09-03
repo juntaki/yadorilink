@@ -114,6 +114,18 @@ pub struct UpdateManager {
     updates_dir: PathBuf,
     current_version: semver::Version,
     platform_info: PlatformInfo,
+    /// Substitutes the pinned production `manifest::TRUSTED_KEYS` trust
+    /// root for `check_now`'s verification step. Never set outside a test
+    /// binary: a real daemon must only ever trust the one pinned root.
+    /// Exists so an integration test can exercise the exact `check_now`
+    /// path (real HTTP fetch, real `manifest::verify_and_parse_with_keys`
+    /// call) against a manifest signed with a throwaway test key, instead
+    /// of stopping short at `manifest::verify_and_parse_with_keys` alone.
+    /// Only this crate's own `#[cfg(test)]` code uses it, so it is not
+    /// gated on `test-support` (unlike sibling overrides in this crate
+    /// that other crates' tests do need to reach).
+    #[cfg(test)]
+    trusted_keys_override: Option<Vec<manifest::TrustedKey>>,
 }
 
 /// Hard fallback cap used only when a manifest entry predates the
@@ -152,12 +164,16 @@ impl UpdateManager {
     /// `manifest_url` is overridable via `YADORILINK_UPDATE_MANIFEST_URL`
     /// (mirrors this crate's existing `YADORILINK_*` env-var override
     /// convention for socket/db paths in `main.rs`) so this is testable
-    /// against a local mock server without touching production config;
-    /// no manifest is served for this beta yet, so the built-in default is
-    /// a documented placeholder.
+    /// against a local mock server without touching production config.
+    /// The built-in default points at the coordination Worker's own
+    /// `/updates/:channel/manifest.json` route (R2-backed, see
+    /// `coordination-worker/src/routes/updates.ts`), served from this
+    /// Worker's one configured production route
+    /// (`coordination-worker/wrangler.jsonc`'s `routes` entry) -- not a
+    /// placeholder domain.
     pub fn new(config_dir: impl AsRef<Path>, current_version: semver::Version) -> Self {
         let manifest_url = std::env::var("YADORILINK_UPDATE_MANIFEST_URL").unwrap_or_else(|_| {
-            "https://updates.yadorilink.example/beta/manifest.json".to_string()
+            "https://yadorilink.juntaki.com/updates/beta/manifest.json".to_string()
         });
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
@@ -188,7 +204,18 @@ impl UpdateManager {
             updates_dir: config_dir.as_ref().join("updates"),
             current_version,
             platform_info: PlatformInfo::detect(),
+            #[cfg(test)]
+            trusted_keys_override: None,
         }
+    }
+
+    /// Test-only: `check_now` verifies against `keys` instead of the
+    /// pinned production `manifest::TRUSTED_KEYS`, so a test can exercise
+    /// the real `check_now` path against a manifest signed with a
+    /// throwaway key (see `manifest::test_support`).
+    #[cfg(test)]
+    pub fn set_trusted_keys_for_test(&mut self, keys: Vec<manifest::TrustedKey>) {
+        self.trusted_keys_override = Some(keys);
     }
 
     pub fn current_version(&self) -> &semver::Version {
@@ -249,6 +276,12 @@ impl UpdateManager {
         let response =
             response.error_for_status().map_err(|e| UpdateError::Fetch(e.to_string()))?;
         let body = response.text().await.map_err(|e| UpdateError::Fetch(e.to_string()))?;
+        #[cfg(test)]
+        let manifest = match &self.trusted_keys_override {
+            Some(keys) => manifest::verify_and_parse_with_keys(&body, keys)?,
+            None => manifest::verify_and_parse(&body)?,
+        };
+        #[cfg(not(test))]
         let manifest = manifest::verify_and_parse(&body)?;
         let ctx = self.local_context(&policy);
         Ok(manifest::select_applicable(&manifest, &ctx))
@@ -729,6 +762,144 @@ mod tests {
         );
 
         std::env::remove_var("YADORILINK_UPDATE_MANIFEST_URL");
+    }
+
+    /// Builds a `ReleaseEntry` that matches `mgr`'s own detected platform
+    /// context (channel/platform/arch/install_source), so `select_applicable`
+    /// actually considers it, with the given rollout/kill-switch knobs.
+    fn matching_entry(
+        mgr: &UpdateManager,
+        version: &str,
+        rollout: u8,
+        kill_switch: bool,
+    ) -> manifest::ReleaseEntry {
+        manifest::ReleaseEntry {
+            channel: "beta".into(),
+            platform: mgr.platform_info().platform.clone(),
+            arch: mgr.platform_info().arch.clone(),
+            install_source: mgr.platform_info().install_source.clone(),
+            version: version.into(),
+            minimum_supported_version: "0.1.0".into(),
+            rollout_percentage: rollout,
+            kill_switch,
+            mandatory: false,
+            artifact_url: "https://example.invalid/yadorilink-update".into(),
+            artifact_sha256: "0".repeat(64),
+            artifact_size: Some(1024),
+            artifact_publisher_identity: String::new(),
+            release_notes_url: "https://example.invalid/notes".into(),
+        }
+    }
+
+    async fn serve_envelope_and_check(
+        envelope_json: String,
+        config_dir: &Path,
+    ) -> Result<Applicability, UpdateError> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/manifest.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(envelope_json))
+            .mount(&server)
+            .await;
+        std::env::set_var(
+            "YADORILINK_UPDATE_MANIFEST_URL",
+            format!("{}/manifest.json", server.uri()),
+        );
+        let mut mgr = manager(config_dir);
+        mgr.set_trusted_keys_for_test(manifest::test_support::trusted_keys_hex(
+            &manifest::test_support::test_trusted_keys(),
+        ));
+        let result = mgr.check_now().await;
+        std::env::remove_var("YADORILINK_UPDATE_MANIFEST_URL");
+        result
+    }
+
+    /// End-to-end: a real `UpdateManager` fetches a real signed manifest
+    /// envelope from a real local HTTP server and reaches `Available` for
+    /// a fully-rolled-out release newer than its current version — the
+    /// same `manifest::verify_and_parse` path a production daemon runs,
+    /// exercised through `check_now`, not a unit-level call into
+    /// `select_applicable` alone.
+    #[tokio::test]
+    async fn a_running_daemon_discovers_verifies_and_applies_a_signed_manifest() {
+        let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = manager(dir.path());
+        let entry = matching_entry(&mgr, "9.9.9", 100, false);
+        let doc = manifest::UpdateManifest {
+            schema_version: manifest::MANIFEST_SCHEMA_VERSION,
+            generated_at: "2026-07-01T00:00:00Z".into(),
+            releases: vec![entry],
+        };
+        let envelope = manifest::test_support::sign_manifest(&doc);
+        let envelope_json = serde_json::to_string(&envelope).unwrap();
+
+        let result = serve_envelope_and_check(envelope_json, dir.path()).await;
+        match result {
+            Ok(Applicability::Available { version, .. }) => {
+                assert_eq!(version, semver::Version::parse("9.9.9").unwrap());
+            }
+            other => panic!("expected a verified Available update, got {other:?}"),
+        }
+    }
+
+    /// Same end-to-end path, but the entry's rollout hasn't selected this
+    /// install (0%): `check_now` must report `HeldBack`, not silently
+    /// install and not error out.
+    #[tokio::test]
+    async fn a_running_daemon_holds_back_an_update_outside_its_rollout_percentage() {
+        let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = manager(dir.path());
+        let entry = matching_entry(&mgr, "9.9.9", 0, false);
+        let doc = manifest::UpdateManifest {
+            schema_version: manifest::MANIFEST_SCHEMA_VERSION,
+            generated_at: "2026-07-01T00:00:00Z".into(),
+            releases: vec![entry],
+        };
+        let envelope = manifest::test_support::sign_manifest(&doc);
+        let envelope_json = serde_json::to_string(&envelope).unwrap();
+
+        let result = serve_envelope_and_check(envelope_json, dir.path()).await;
+        assert!(
+            matches!(result, Ok(Applicability::HeldBack { .. })),
+            "expected HeldBack for a 0% rollout, got {result:?}"
+        );
+    }
+
+    /// Same end-to-end path, but the served envelope's signature no
+    /// longer matches its body (simulating a tampered or corrupted
+    /// response, or an operator's `resign` step being skipped after an
+    /// edit): `check_now` must fail closed, never fall back to an
+    /// unverified manifest and never report an update as available.
+    #[tokio::test]
+    async fn a_running_daemon_rejects_a_tampered_manifest() {
+        let _guard = MANIFEST_URL_ENV_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = manager(dir.path());
+        let entry = matching_entry(&mgr, "9.9.9", 100, false);
+        let doc = manifest::UpdateManifest {
+            schema_version: manifest::MANIFEST_SCHEMA_VERSION,
+            generated_at: "2026-07-01T00:00:00Z".into(),
+            releases: vec![entry],
+        };
+        let mut envelope = manifest::test_support::sign_manifest(&doc);
+        // Mutate the signed body after signing without re-signing --
+        // the signature on the wire no longer matches these bytes.
+        envelope.manifest_json = envelope.manifest_json.replace("9.9.9", "9.9.8");
+        let envelope_json = serde_json::to_string(&envelope).unwrap();
+
+        let result = serve_envelope_and_check(envelope_json, dir.path()).await;
+        assert!(
+            matches!(
+                result,
+                Err(UpdateError::Manifest(manifest::ManifestError::SignatureVerificationFailed))
+            ),
+            "expected signature verification to fail (not some unrelated error), got {result:?}"
+        );
     }
 
     /// a policy left in `Downloading` with a stray
