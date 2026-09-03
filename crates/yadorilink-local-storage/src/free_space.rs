@@ -84,10 +84,31 @@ pub fn effective_headroom_bytes(total_bytes: u64, configured_override: Option<u6
 /// Queries the OS for free/total space on the volume hosting `path`
 /// (`path` must currently exist) and classifies it against the effective
 /// headroom.
+///
+/// Explicitly stats `path` itself first rather than leaving that to
+/// `fs2::available_space`/`total_space` — the two platforms resolve a
+/// missing `path` completely differently underneath those calls. On Unix,
+/// `fs2` shells out to `statvfs(2)` directly on `path`, which requires the
+/// exact directory to exist and fails with `NotFound` otherwise. On
+/// Windows, `fs2` first calls `GetVolumePathNameW(path, ..)` to find the
+/// containing volume/drive root, then queries THAT root with
+/// `GetDiskFreeSpaceW` — a purely syntactic walk up the path that never
+/// requires `path` (or any of its ancestors short of the drive itself) to
+/// actually exist on disk. A directory tree that was deleted out from
+/// under this call — e.g. a faulted or unmounted block-store root, which
+/// every caller of this function relies on being surfaced as a `NotFound`
+/// (see `is_source_path_vanished_error`'s doc comment in
+/// `yadorilink-local-capture`) — is therefore silently invisible on
+/// Windows without this guard: `fs2` would happily report the whole
+/// volume's free space instead of erroring, and every headroom preflight
+/// built on top of "stat the target root" would wrongly proceed as if
+/// nothing were wrong. Stating `path` ourselves first makes both platforms
+/// fail on the same input the same way.
 pub fn classify_volume(
     path: &Path,
     configured_override: Option<u64>,
 ) -> std::io::Result<VolumeFreeSpace> {
+    std::fs::metadata(path)?;
     let available_bytes = fs2::available_space(path)?;
     let total_bytes = fs2::total_space(path)?;
     let headroom_bytes = effective_headroom_bytes(total_bytes, configured_override);
@@ -160,5 +181,31 @@ mod tests {
         let space = classify_volume(dir.path(), None).unwrap();
         assert!(space.total_bytes > 0);
         assert!(space.headroom_bytes > 0);
+    }
+
+    /// A missing `path` must fail this query outright, never silently fall
+    /// back to reporting free space for whatever volume/drive happens to
+    /// contain it. Every caller of `classify_volume` relies on exactly
+    /// this to detect a vanished/unmounted block-store root as a real
+    /// fault (see `FsBlockStore::check_headroom`'s doc comment and
+    /// `is_source_path_vanished_error` in `yadorilink-local-capture`) --
+    /// without this guard, `fs2`'s underlying OS call is only path-exact
+    /// on Unix (`statvfs(2)` needs the exact directory) and is actually
+    /// volume-relative on Windows (`GetVolumePathNameW` +
+    /// `GetDiskFreeSpaceW` resolve up to the containing drive root
+    /// regardless of whether `path` itself exists), so a platform-specific
+    /// regression here would go undetected by every OTHER test in this
+    /// module, which only ever exercises a real, existing directory.
+    #[test]
+    fn classify_volume_on_a_missing_path_fails_rather_than_reporting_the_containing_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-created");
+        assert_eq!(
+            classify_volume(&missing, None).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+            "a path that was never created (or was removed out from under this call, e.g. a \
+             faulted block-store root) must surface as NotFound, not as a successful query of \
+             its containing volume"
+        );
     }
 }
