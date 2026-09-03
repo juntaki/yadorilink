@@ -42,7 +42,14 @@ jobs:
     # embedded Rust core links via `swiftc` directly, so this needs the
     # same manual build as that script, on a real Xcode-equipped runner.
     runs-on: macos-latest
-    timeout-minutes: 30
+    # The FinderSync extension link (Rust staticlib + bridging header) is
+    # the expensive step and finishes in ~10min; but the second, much
+    # simpler swiftc invocation for the trivial host-app main.swift has
+    # been observed hanging past 19min under CodeQL's DYLD_INSERT_LIBRARIES
+    # tracer specifically (no such issue building outside CodeQL). Generous
+    # timeout is a diagnostic, not a fix -- if this still doesn't complete,
+    # the tracer/swiftc interaction needs its own investigation.
+    timeout-minutes: 60
     permissions:
       security-events: write
     steps:

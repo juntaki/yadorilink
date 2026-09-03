@@ -263,23 +263,6 @@ IGNORED_RUNNER_EXEMPT: dict[str, str] = {
         "ad hoc diagnostic: requires DST_TARGET_SEED and panics without it, "
         "so an unattended sweep can only fail on it"
     ),
-    # Phase 7D-10's final sync-core deletion pass: all four read
-    # `crates/yadorilink-sync-core/src`/`tests`, deleted outright, so an
-    # unattended sweep would only panic on `std::fs::read_dir`/`read_dir`
-    # of a directory that no longer exists. See
-    # `dst_impact_map_lint.rs`'s own `#[ignore]` reasons and its module doc.
-    "every_source_module_is_in_the_impact_map": (
-        "reads deleted yadorilink-sync-core/src; Phase 7E's impact-map lint gap item"
-    ),
-    "impact_map_names_no_phantom_module": (
-        "reads deleted yadorilink-sync-core/src; Phase 7E's impact-map lint gap item"
-    ),
-    "every_dst_scenario_is_in_the_impact_map": (
-        "reads deleted yadorilink-sync-core/tests; Phase 7E's impact-map lint gap item"
-    ),
-    "impact_map_names_no_phantom_scenario": (
-        "reads deleted yadorilink-sync-core/tests; Phase 7E's impact-map lint gap item"
-    ),
 }
 
 

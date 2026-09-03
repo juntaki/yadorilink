@@ -27,9 +27,6 @@
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
-    #[error("not yet implemented: {0}")]
-    NotImplemented(&'static str),
-
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -269,49 +266,6 @@ pub enum SyncError {
          to (Windows silently strips a trailing '.' or ' ') and cannot be used here"
     )]
     NonPortablePath(String),
-
-    /// A filesystem transaction's `execution_generation` fence rejected a
-    /// caller whose `expected` generation no longer matches the transaction's
-    /// `current` one. Replanning, cancellation and startup adoption each
-    /// advance this counter, and every phase transition plus the check
-    /// immediately before a filesystem commit must verify it first — this is
-    /// what that check returns on a mismatch, so a superseded asynchronous
-    /// worker cannot commit a stale plan.
-    #[error(
-        "filesystem transaction {transaction_id} execution_generation is stale: expected \
-         {expected}, currently {current}"
-    )]
-    ExecutionGenerationFenced { transaction_id: String, expected: i64, current: i64 },
-
-    /// A requested hierarchical path reservation
-    /// (`filesystem_transaction_reservations`) overlaps a reservation
-    /// another transaction already holds, under this crate's scope-conflict
-    /// rules. Acquisition is all-or-none, so this aborts the *entire* batch a
-    /// caller requested together — a task must never end up holding a subset
-    /// of its requested namespace while waiting for the rest, since that is
-    /// exactly how two transactions deadlock against each other.
-    #[error(
-        "reservation for {path:?} (transaction {transaction_id}) conflicts with an existing \
-         reservation held by transaction {blocking_transaction_id}"
-    )]
-    ReservationConflict { transaction_id: String, path: String, blocking_transaction_id: String },
-
-    /// A filesystem-transaction-engine phase/state transition's
-    /// compare-and-swap `UPDATE` matched the row's id and its
-    /// `execution_generation`, but not the phase/state the caller's
-    /// legality check (`TransactionPhase::can_transition_to` /
-    /// `EpochState::can_transition_to`) actually validated against — a
-    /// sibling transition sharing the same `execution_generation` landed
-    /// first and moved the row out from under this one between the check
-    /// and the `UPDATE`. Distinct from `ExecutionGenerationFenced` (the
-    /// generation itself moved) and `NotFound` (the row is gone entirely):
-    /// this is the "the row is still here, on the generation we expected,
-    /// but not in the state we validated" case neither of those covers.
-    #[error(
-        "{subject}: expected phase/state {expected_state:?} but it is now {current_state:?} -- \
-         a concurrent transition raced this one to the same execution_generation"
-    )]
-    TransitionRaced { subject: String, expected_state: String, current_state: String },
 }
 
 impl From<yadorilink_replica_domain::change::PolicyUnavailable> for SyncError {
@@ -338,7 +292,6 @@ impl SyncError {
     /// that check happens, not through this method.
     pub fn category(&self) -> &'static str {
         match self {
-            SyncError::NotImplemented(_) => "not_implemented",
             // `Io`'s `Display` can embed a path (e.g. a `NotFound` for a
             // specific file) — only the stable `ErrorKind` is ever used
             // here, never the message text.
@@ -369,9 +322,6 @@ impl SyncError {
             SyncError::PolicyUnavailable => "policy",
             SyncError::ReservedNamespaceCollision(_) => "permission",
             SyncError::NonPortablePath(_) => "invalid_input",
-            SyncError::ExecutionGenerationFenced { .. } => "stale_generation",
-            SyncError::ReservationConflict { .. } => "conflict",
-            SyncError::TransitionRaced { .. } => "conflict",
         }
     }
 }
@@ -418,27 +368,6 @@ impl From<yadorilink_sync_sqlite::SyncSqliteError> for SyncError {
                 )
             }
             yadorilink_sync_sqlite::SyncSqliteError::Io(e) => SyncError::Io(e),
-            // `filesystem_transaction`'s execution gate and journal-schema
-            // errors (Phase 7D-7.2) -- see `SyncSqliteError`'s own doc
-            // comments on these variants.
-            yadorilink_sync_sqlite::SyncSqliteError::NotImplemented(s) => {
-                SyncError::NotImplemented(s)
-            }
-            yadorilink_sync_sqlite::SyncSqliteError::ExecutionGenerationFenced {
-                transaction_id,
-                expected,
-                current,
-            } => SyncError::ExecutionGenerationFenced { transaction_id, expected, current },
-            yadorilink_sync_sqlite::SyncSqliteError::ReservationConflict {
-                transaction_id,
-                path,
-                blocking_transaction_id,
-            } => SyncError::ReservationConflict { transaction_id, path, blocking_transaction_id },
-            yadorilink_sync_sqlite::SyncSqliteError::TransitionRaced {
-                subject,
-                expected_state,
-                current_state,
-            } => SyncError::TransitionRaced { subject, expected_state, current_state },
             // `dag_store`'s reserved-namespace/portable-path admission
             // checks (Phase 7D-7.3) -- see `SyncSqliteError`'s own doc
             // comments on these variants.

@@ -1,32 +1,35 @@
-//! The capability surface `evict_file`'s function family (and, once moved,
-//! `repair_interrupted_materializations`/`reconcile_restore_operations`/
-//! `quarantine_dirty_disk_file`) needs from `yadorilink-sync-core`'s
-//! `SyncState` -- a narrower trait than that crate's own
-//! `ports::MaterializationStatePort` (647 lines, 38 methods), which mixes
-//! this filesystem-lifecycle-flavored surface with SQL/DAG-flavored methods
+//! The capability surface `evict_file`'s function family
+//! (`materialization_eviction.rs`) and `repair_interrupted_materializations`/
+//! `reconcile_restore_operations`/`quarantine_dirty_disk_file`'s
+//! (`materialization_repair.rs`) need from whatever concrete state backs
+//! them -- a narrower trait than `yadorilink-sync-sqlite`'s own
+//! `MaterializationStatePort` (38 methods), which mixes this
+//! filesystem-lifecycle-flavored surface with SQL/DAG-flavored methods
 //! (`dag_get_change`/`mark_deleted`/`upsert_file`/...) that belong on
 //! `yadorilink-sync-sqlite`/`yadorilink-replica-engine` instead, and which
 //! leaks a `yadorilink-sync-sqlite` concrete type
 //! (`mark_deleted_emitting_change`'s `ChangeEmitter` parameter) that this
 //! crate must never depend on. Covers exactly the method surface a direct
-//! grep of every `state.<method>(` call in `materialization.rs`'s
-//! `evict_file`-through-`quarantine_dirty_disk_file` production code found
-//! (Phase 7D-9C's fourth-pass exit report, §10.3), plus one narrow delegate
-//! (`reclaim_cached_blocks`) added for the same "concrete type a trait
-//! object can't produce" reason as `open_materialization_intent_guard`
-//! below: `yadorilink-sync-core`'s own `BlockDeletionCoordinator::
-//! reclaim_cached_blocks` still needs `&dyn
-//! yadorilink_sync_core::ports::MaterializationStatePort` (the *wider*
-//! trait), which this crate cannot name without depending back on
-//! sync-core -- routing the call through a method on this port instead lets
-//! `impl MaterializationExecutionPort for SyncState` perform the concrete
-//! call internally, where `self` already satisfies the wider trait.
+//! grep of every `state.<method>(` call across those two files' production
+//! code finds (originally enumerated in Phase 7D-9C's fourth-pass exit
+//! report, §10.3, back when this code still lived in a single
+//! `materialization.rs`), plus one narrow delegate (`reclaim_cached_blocks`)
+//! added for the same "concrete type a trait object can't produce" reason
+//! as `open_materialization_intent_guard` below: `yadorilink-sync-sqlite`'s
+//! own `BlockDeletionCoordinator::reclaim_cached_blocks` still needs `&dyn
+//! yadorilink_sync_sqlite::MaterializationStatePort` (the *wider* trait),
+//! which this crate cannot name without depending on `yadorilink-sync-
+//! sqlite`, which itself already depends on this crate -- routing the call
+//! through a method on this port instead lets `impl
+//! MaterializationExecutionPort for ReplicaCoordinator` perform the
+//! concrete call internally, where `self` already satisfies the wider
+//! trait.
 //!
-//! `impl MaterializationExecutionPort for SyncState` stays in
-//! `yadorilink-sync-core` (orphan rule -- `SyncState` is sync-core-local),
-//! mirroring `PeerReplicaStatePort`/`LocalMutationStore`'s own precedent
-//! exactly: the trait *definition* crosses the crate line, the impl does
-//! not.
+//! `impl MaterializationExecutionPort for ReplicaCoordinator` stays in
+//! `yadorilink-daemon` (orphan rule -- `ReplicaCoordinator` is
+//! daemon-local), mirroring `PeerReplicaStatePort`/`LocalMutationStore`'s
+//! own precedent exactly: the trait *definition* crosses the crate line,
+//! the impl does not.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -44,16 +47,17 @@ use crate::materialization_types::{EvictableFile, RestoreCommitOutcome, RestoreO
 
 /// An open, durably-recorded materialization intent for one path, returned
 /// by [`MaterializationExecutionPort::open_materialization_intent_guard`].
-/// Opaque here (the concrete guard is `yadorilink-sync-core`'s own
-/// `MaterializationIntentGuard<'_>`, which borrows a concrete `&SyncState` a
-/// trait object can't name) -- the only operation any caller ever performs
-/// on one is clearing it once the write it guards is durable. Dropping
-/// without calling `clear` is itself meaningful: the intent stays recorded,
-/// so the next repair pass treats a missing file at this path as a crash to
-/// recover, not an offline delete. Mirrors
-/// `yadorilink-peer-session::ports::OpenMaterializationIntent` exactly --
-/// `MaterializationIntentGuard` implements both marker traits, one per
-/// consumer crate, since neither consumer can depend on the other.
+/// Opaque here (the concrete guard is `yadorilink-daemon`'s own
+/// `MaterializationIntentGuard<'_>`, which borrows a concrete
+/// `&ReplicaCoordinator` a trait object can't name) -- the only operation
+/// any caller ever performs on one is clearing it once the write it guards
+/// is durable. Dropping without calling `clear` is itself meaningful: the
+/// intent stays recorded, so the next repair pass treats a missing file at
+/// this path as a crash to recover, not an offline delete. Mirrors
+/// `yadorilink-peer-session::ports::OpenMaterializationIntent` and
+/// `yadorilink-sync-sqlite`'s own `OpenMaterializationIntent` exactly --
+/// `MaterializationIntentGuard` implements one marker trait per consumer
+/// crate, since none of the three can depend on either of the others.
 pub trait OpenMaterializationIntent: Send {
     fn clear(self: Box<Self>) -> Result<(), MaterializationExecutionError>;
 }
@@ -94,19 +98,21 @@ pub struct RepairRowSnapshot {
 }
 
 /// This crate's own error type for the materialization/eviction/repair
-/// filesystem-execution path -- `yadorilink-sync-core`'s `SyncError` cannot
-/// be reused here without a forbidden dependency edge back onto sync-core
-/// (this crate is a dependency OF sync-core, not the reverse). Every
-/// variant mirrors one `SyncError` variant `materialization.rs`'s
-/// `evict_file` family actually constructs or matches on, same message
-/// text, so error reporting stays byte-identical for anything wrapping the
-/// message string -- same shape as `yadorilink-peer-session`'s
-/// `PeerSessionError`. `yadorilink-sync-core`'s own
-/// `impl MaterializationExecutionPort for SyncState` bridges `SyncError` ->
-/// this type at the port boundary; `impl From<MaterializationExecutionError>
-/// for SyncError` (in sync-core, since `SyncError` is the foreign type from
-/// this crate's perspective) bridges the other direction for any sync-core
-/// caller of the moved functions that still needs `SyncError`.
+/// filesystem-execution path -- `yadorilink-daemon`'s `SyncError` cannot be
+/// reused here without a forbidden dependency edge back onto that crate
+/// (this crate is a dependency OF `yadorilink-daemon`, not the reverse).
+/// Every variant mirrors one `SyncError` variant the `evict_file` family
+/// (`materialization_eviction.rs`/`materialization_repair.rs`) actually
+/// constructs or matches on, same message text, so error reporting stays
+/// byte-identical for anything wrapping the message string -- same shape as
+/// `yadorilink-peer-session`'s `PeerSessionError`. `yadorilink-daemon`'s own
+/// `impl From<SyncError> for MaterializationExecutionError` bridges
+/// `SyncError` -> this type at the port boundary (used inside `impl
+/// MaterializationExecutionPort for ReplicaCoordinator`'s own `?`-sites);
+/// `impl From<MaterializationExecutionError> for SyncError` (in
+/// `yadorilink-daemon`, since `SyncError` is the foreign type from this
+/// crate's perspective) bridges the other direction for any caller of the
+/// `evict_file` family that still needs a plain `SyncError`.
 #[derive(Debug, thiserror::Error)]
 pub enum MaterializationExecutionError {
     #[error("io error: {0}")]
@@ -197,9 +203,9 @@ impl From<yadorilink_local_storage::StorageError> for MaterializationExecutionEr
 /// files to evict, tracking the durable materialization-write-in-progress
 /// intent journal that disambiguates a crash from an offline delete, and
 /// replaying the crash-safe restore journal -- the filesystem-lifecycle
-/// subset of `yadorilink-sync-core::ports::MaterializationStatePort`'s
+/// subset of `yadorilink-sync-sqlite`'s own `MaterializationStatePort`'s
 /// wider surface (see this module's own doc comment for why the wider trait
-/// itself does not move).
+/// itself does not move into this crate).
 /// Duplicated from `yadorilink_sync_sqlite::MaterializedFingerprint` rather
 /// than adding a dependency on that crate solely for this alias -- same
 /// "duplicate small leaf types rather than force an awkward dependency"
@@ -557,8 +563,10 @@ pub trait MaterializationExecutionPort: Send + Sync {
 
     /// Re-verifies an already-established root's identity, requiring the
     /// persisted root-identity token. Added as a narrow delegate because
-    /// `VerifiedRoot::verify` takes a concrete `&SyncState`, which a trait
-    /// object can't produce.
+    /// `VerifiedRoot::verify` needs `&dyn RootVerificationStatePort`, and a
+    /// caller holding only `&dyn MaterializationExecutionPort` cannot
+    /// produce one -- Rust does not let a trait object be treated as a
+    /// different trait object its own trait was never declared to imply.
     fn verify_root(
         &self,
         root: &Path,
@@ -576,10 +584,11 @@ pub trait MaterializationExecutionPort: Send + Sync {
 
     /// Opens the single sanctioned materialization-intent seam for
     /// `(group_id, path)`. Added as a narrow delegate (rather than exposing
-    /// `&SyncState` itself) because the concrete guard borrows a concrete
-    /// `&'a SyncState`, which a trait object can't produce; the
-    /// implementation runs inside `impl MaterializationExecutionPort for
-    /// SyncState`, where `self` already is that concrete `&SyncState`.
+    /// `&ReplicaCoordinator` itself) because the concrete guard borrows a
+    /// concrete `&'a ReplicaCoordinator`, which a trait object can't
+    /// produce; the implementation runs inside `impl
+    /// MaterializationExecutionPort for ReplicaCoordinator`, where `self`
+    /// already is that concrete `&ReplicaCoordinator`.
     fn open_materialization_intent_guard<'a>(
         &'a self,
         group_id: &'a str,
@@ -616,15 +625,16 @@ pub trait MaterializationExecutionPort: Send + Sync {
         path: &str,
     ) -> Result<RepairRowSnapshot, MaterializationExecutionError>;
 
-    /// Narrow delegate for `yadorilink-sync-core::block_deletion::
+    /// Narrow delegate for `yadorilink-sync-sqlite::block_deletion::
     /// BlockDeletionCoordinator::reclaim_cached_blocks`, which still needs
-    /// `&dyn yadorilink_sync_core::ports::MaterializationStatePort` (the
-    /// wider trait) -- this crate cannot name that trait without depending
-    /// back on sync-core, so the call is routed through this port method
+    /// `&dyn yadorilink_sync_sqlite::MaterializationStatePort` (the wider
+    /// trait) -- this crate cannot name that trait without depending on
+    /// `yadorilink-sync-sqlite`, which itself already depends on this crate
+    /// (a forbidden cycle), so the call is routed through this port method
     /// instead, exactly like `open_materialization_intent_guard` above.
-    /// `impl MaterializationExecutionPort for SyncState` performs the
-    /// concrete call internally, where `self` already satisfies the wider
-    /// trait.
+    /// `impl MaterializationExecutionPort for ReplicaCoordinator` performs
+    /// the concrete call internally, where `self` already satisfies the
+    /// wider trait.
     fn reclaim_verified_cached_blocks(
         &self,
         deletion_guard: &BlockPhysicalDeletionGuard<'_>,

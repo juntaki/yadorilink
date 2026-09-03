@@ -7,7 +7,6 @@ pub mod application;
 pub mod c4_diag;
 pub mod change_auth;
 pub mod change_policy;
-pub mod commit_orchestration;
 pub mod connection_trace;
 pub mod control_context;
 pub mod control_socket;
@@ -106,4 +105,3 @@ pub mod update;
 pub mod update_ipc;
 #[cfg(windows)]
 pub mod windows_pipe_security;
-pub mod work_class_queue;

@@ -1,56 +1,38 @@
-//! `impl LocalMutationStore for ReplicaCoordinator` -- Phase 7D-10.5's
-//! `LocalMutationStore` port investigation (the "fourth port"
-//! `docs/design/phase7d10-exit-report.md`'s earlier addenda named as the
-//! reason several `link_runtime` call sites had to stay pinned to
-//! `Arc<SyncState>`: `yadorilink-local-capture::LocalChangeProcessor` needs a
-//! concrete `Arc<dyn LocalMutationStore>`, and only `SyncState` implemented
-//! it, so any call site that needed to mutually exclude against local
-//! capture (via `path_lock`) could not move to `ReplicaCoordinator` without
-//! splitting that mutual exclusion across two non-cooperating registries).
+//! `impl LocalMutationStore for ReplicaCoordinator`.
 //!
-//! That blocker is now closed on two fronts, both prerequisites this impl
-//! relies on rather than re-derives:
-//!   - The shared-registry fix in `replica_coordinator.rs`'s own
-//!     `from_database` doc comment: `ReplicaCoordinator::path_lock_registry()`
-//!     is the SAME live `PathLockRegistry` `SyncState::path_lock_registry()`
-//!     is, not an independent instance.
-//!   - `ReplicaCoordinator` already implements `RootVerificationStatePort`
-//!     (Phase 7D-10.2), which `verify_root`/`open_root` below need to pass to
-//!     `VerifiedRoot::verify`/`VerifiedRoot::open`.
+//! `yadorilink-local-capture::LocalChangeProcessor` needs a concrete
+//! `Arc<dyn LocalMutationStore>` so it can mutually exclude local capture
+//! against anything else touching the same path (via `path_lock`), and
+//! `ReplicaCoordinator` is this trait's sole implementor.
+//! `ReplicaCoordinator::path_lock_registry()` (see its `from_database` doc
+//! comment) is the only per-path lock registry in the process, so
+//! `path_lock` below trivially serializes against every other caller
+//! reached through `ReplicaCoordinator`, local capture included.
 //!
-//! Every method below is a verbatim copy of `impl LocalMutationStore for
-//! SyncState`'s own body
-//! (`crates/yadorilink-local-capture/src/ports/local_mutation.rs`),
-//! substituting `ReplicaCoordinator::<accessor>(self)` for
-//! `SyncState::<accessor>(self)` against this struct's own already-existing
-//! accessors (all of them predate this pass -- no new accessor needed).
-//! Legal under the orphan rule the same way `MaterializationIntentJournal`'s
-//! impl in this same file's parent module is: the trait is foreign
-//! (`yadorilink-local-capture`), but `ReplicaCoordinator` is local to this
-//! crate.
+//! `ReplicaCoordinator` also already implements `RootVerificationStatePort`,
+//! which `verify_root`/`open_root` below need to pass to
+//! `VerifiedRoot::verify`/`VerifiedRoot::open`.
 //!
-//! `build_change_processor` (`link_runtime/startup.rs`) is now this port's
-//! one production call site (`LinkRuntimeDependencies::replica_coordinator`),
-//! since `DaemonState.sync_state`'s own removal.
+//! Every method below is a thin delegation to this struct's own existing
+//! accessors. Legal under the orphan rule the same way
+//! `MaterializationIntentJournal`'s impl in this same file's parent module
+//! is: the trait is foreign (`yadorilink-local-capture`), but
+//! `ReplicaCoordinator` is local to this crate.
 //!
-//! `LocalMutationStore`'s associated error surface narrowed from
-//! `yadorilink_sync_core::SyncError` to `yadorilink_sync_sqlite::
-//! SyncSqliteError` (Phase 7D-10): every method below either delegates
-//! directly to a `yadorilink-sync-sqlite` repository call (already native
-//! `SyncSqliteError`, no conversion needed) or, for the three
-//! `*_emitting_change` methods, inlines the `local_emission_auth`
-//! precondition check plus the repository write directly instead of
-//! delegating through the wider `ReplicaCoordinator::upsert_file_emitting_
-//! change`/etc. inherent methods (which still return `crate::sync_error::
-//! SyncError`, the daemon-wide catch-all) -- `SyncSqliteError` already has
-//! `From<yadorilink_replica_domain::change::PolicyUnavailable>` (added
-//! alongside `MaterializationStatePort`'s identical narrowing, see
-//! `docs/design/phase7d10-exit-report.md`'s "item 1" addendum), so
+//! `build_change_processor` (`link_runtime/startup.rs`) is this port's one
+//! production call site (`LinkRuntimeDependencies::replica_coordinator`).
+//!
+//! Every method below either delegates directly to a `yadorilink-sync-sqlite`
+//! repository call (already native `SyncSqliteError`, no conversion needed)
+//! or, for the three `*_emitting_change` methods, inlines the
+//! `local_emission_auth` precondition check plus the repository write
+//! directly instead of delegating through the wider `ReplicaCoordinator::
+//! upsert_file_emitting_change`/etc. inherent methods (which still return
+//! `crate::sync_error::SyncError`, the daemon-wide catch-all) --
+//! `SyncSqliteError` has
+//! `From<yadorilink_replica_domain::change::PolicyUnavailable>`, so
 //! `local_emission_auth`'s own `PolicyUnavailable` error converts losslessly
-//! without needing the wider `SyncError` type at all. `SyncState`'s own
-//! `impl LocalMutationStore for SyncState`
-//! (`yadorilink-local-capture/src/ports/local_mutation.rs`) narrowed the
-//! same way, so both implementations of this one trait still agree.
+//! without needing the wider `SyncError` type at all.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -519,7 +501,8 @@ mod tests {
 
     /// Proves a real `Arc<ReplicaCoordinator>` unsize-coerces to `Arc<dyn
     /// LocalMutationStore>` and dispatches correctly -- mirrors
-    /// `yadorilink-local-capture`'s own `arc_sync_state_coerces_to_port_trait`.
+    /// `yadorilink-local-capture`'s own
+    /// `arc_test_replica_coerces_to_port_trait`.
     #[test]
     fn arc_replica_coordinator_coerces_to_local_mutation_store() {
         let coordinator: Arc<ReplicaCoordinator> =
@@ -533,15 +516,12 @@ mod tests {
     /// A lock taken through `LocalMutationStore::path_lock` and a lock taken
     /// through the coordinator's own `path_lock_registry()` for the
     /// identical `(group_id, path)` must be the literal same `Arc`, or the
-    /// two do not actually serialize against each other. This used to be
-    /// checked cross-crate against a live `SyncState`'s registry (the
-    /// registries had to be the SAME `Arc` while `DaemonState` could still
-    /// hold both a `SyncState` and a `ReplicaCoordinator` simultaneously) --
-    /// `DaemonState` has not held a `SyncState` since Phase 7D-10.9, so
-    /// `ReplicaCoordinator` now owns its own independent
-    /// `crate::sync_runtime::path_locks::PathLockRegistry`
-    /// (`docs/design/phase7d10-exit-report.md`'s addendum on this), and the
-    /// only invariant left to prove is internal self-consistency.
+    /// two do not actually serialize against each other. `ReplicaCoordinator`
+    /// owns the only `PathLockRegistry` in the process
+    /// (`crate::sync_runtime::path_locks::PathLockRegistry` -- see
+    /// `ReplicaCoordinator::from_database`'s own doc comment), so this just
+    /// proves `LocalMutationStore::path_lock` actually resolves through that
+    /// registry rather than, say, a fresh one constructed per call.
     #[test]
     fn path_lock_is_shared_across_the_coordinators_own_accessors() {
         let coordinator = ReplicaCoordinator::open_in_memory().unwrap();

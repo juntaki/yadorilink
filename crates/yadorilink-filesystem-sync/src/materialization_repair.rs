@@ -1,31 +1,28 @@
 //! Crash-recovery startup repair, crash-safe restore-journal reconciliation,
 //! and offline-edit quarantine: `repair_interrupted_materializations[_emitting_deletes]`/
 //! `_inner`, `reconstruct_file_journaled`, `reconcile_restore_operations`, and
-//! `quarantine_dirty_disk_file`. Moved out of `yadorilink-sync-core`'s
-//! `materialization.rs` (Phase 7D-9C, sixth pass) alongside `evict_file`'s
-//! own earlier move in this sub-phase -- per that move's own exit-report
-//! addendum (§11.5), a method-by-method audit of every `state.<method>` call
-//! this group makes found `MaterializationExecutionPort` already covers the
-//! entire surface (`get_unix_mode`, `get_file`, `list_materialization_states`,
-//! `has_materialization_intent`, `clear_materialization_intent`,
-//! `mark_deleted_emitting_change`, `record_dirty_path`,
-//! `set_materialization_state`, `path_lock`, `repair_row_snapshot`,
-//! `open_root`, `open_materialization_intent_guard`, `list_restore_operations`,
-//! `commit_restore_operation`, `discard_restore_operation`) -- no port
-//! extension was needed, only this module split itself.
+//! `quarantine_dirty_disk_file`. This module depends only on
+//! `MaterializationExecutionPort` -- a method-by-method audit of every
+//! `state.<method>` call this group makes found the port already covers the
+//! entire surface it needs (`get_unix_mode`, `get_file`,
+//! `list_materialization_states`, `has_materialization_intent`,
+//! `clear_materialization_intent`, `mark_deleted_emitting_change`,
+//! `record_dirty_path`, `set_materialization_state`, `path_lock`,
+//! `repair_row_snapshot`, `open_root`, `open_materialization_intent_guard`,
+//! `list_restore_operations`, `commit_restore_operation`,
+//! `discard_restore_operation`), so nothing here ever names a concrete state
+//! type.
 //!
 //! `MaterializationIntentGuard` (the concrete struct this group's
 //! `reconstruct_file_journaled` and the live peer materialize path both
-//! bracket their writes with) stays in `yadorilink-sync-core`: it borrows a
-//! concrete `&'a SyncState`, the same reason `open_materialization_intent_guard`
+//! bracket their writes with) lives in `yadorilink-daemon`'s
+//! `materialization_intent` module, generic over a
+//! `MaterializationIntentJournal` implementor rather than tied to one
+//! concrete state type -- the same reason `open_materialization_intent_guard`
 //! itself is a narrow delegate rather than a trait object constructor (see
 //! `materialization_execution.rs`'s own doc comment). This module never names
 //! that struct -- it only ever sees the guard through the
 //! `Box<dyn OpenMaterializationIntent + Send + '_>` the port method returns.
-//!
-//! `yadorilink-sync-core::materialization` re-exports every `pub` item here
-//! at its original path, so this move needed no consumer repoint -- same
-//! shim shape as `evict_file`'s own earlier move in this sub-phase.
 
 use std::path::Path;
 
@@ -145,21 +142,21 @@ impl MaterializationRepairReport {
 /// partial materialization being mistaken for a valid synced file"
 /// invariant forbids.
 ///
-/// Originally intended to run once at daemon startup for every configured
-/// link, mirroring `SyncState::reset_stale_hydrating_to_placeholder`'s
-/// placement and rationale — the two together cover both
-/// materialization states (`Hydrating`, handled there; `Hydrated`,
-/// handled here) that a crash can leave in a state inconsistent with
-/// reality.
+/// Runs once at daemon startup for every configured link, mirroring the
+/// placement and rationale of the reset-stale-`Hydrating`-to-`Placeholder`
+/// pass `yadorilink-daemon`'s `app.rs` also runs once at startup (via
+/// `ReplicaCoordinator::materialization_state_repository`'s
+/// `reset_stale_hydrating_to_placeholder`) — the two together cover both
+/// materialization states (`Hydrating`, handled there; `Hydrated`, handled
+/// here) that a crash can leave in a state inconsistent with reality.
 ///
-/// This same check (a
-/// `Hydrated` record whose on-disk state doesn't match) can also arise
-/// during live operation, not just from a crash — see this function's
-/// caller in `yadorilink-daemon`'s `link_manager.rs`, which now also
-/// invokes it on a periodic background cadence for exactly this reason,
-/// as defense-in-depth alongside the direct fixes to
-/// `try_apply_metadata_only_update` and the debounce batch executor that
-/// address the actual root causes.
+/// This same check (a `Hydrated` record whose on-disk state doesn't match)
+/// can also arise during live operation, not just from a crash — this
+/// function's caller in `yadorilink-daemon`'s
+/// `adapters::runtime::link_runtime_controller` also invokes it on a
+/// periodic background cadence for exactly this reason, as defense-in-depth
+/// alongside the direct fixes to `try_apply_metadata_only_update` and the
+/// debounce batch executor that address the actual root causes.
 ///
 /// For every `Hydrated`, non-deleted, ordinary-`File`-kind record in
 /// `group_id` (symlinks/directories carry no block-based content to
@@ -209,8 +206,9 @@ pub fn repair_interrupted_materializations(
 /// either — it just does not itself emit the tombstone.
 ///
 /// Deliberately not yet wired into a production caller: the live sweep/startup
-/// path (`yadorilink-daemon`'s `link_manager`/`app`) runs the plain variant,
-/// which never resurrects an offline delete and defers the tombstone to the
+/// path (`yadorilink-daemon`'s `link_runtime::factory` at startup and
+/// `adapters::runtime::link_runtime_controller`'s periodic task) runs the
+/// plain variant, which never resurrects an offline delete and defers the tombstone to the
 /// disk reconcile scan that immediately follows in the same startup barrier —
 /// that scan owns the group's `ChangeEmitter` and emits the `Delete` through
 /// the identical seam. Routing repair itself through the emitting variant would
@@ -1211,8 +1209,9 @@ fn repair_one_interrupted_symlink(
 /// (through its own `yadorilink-peer-session::ports::OpenMaterializationIntent`
 /// marker) — so the intent is durable before the temp-write-then-rename begins
 /// and cleared only after it completes. This module never names the concrete
-/// guard type (`yadorilink-sync-core`'s `MaterializationIntentGuard`, which
-/// borrows a concrete `&SyncState`) — only the opaque
+/// guard type (`yadorilink-daemon`'s `MaterializationIntentGuard`, generic
+/// over a `MaterializationIntentJournal` implementor rather than tied to one
+/// concrete state type) — only the opaque
 /// `Box<dyn OpenMaterializationIntent + Send + '_>` the port method returns.
 ///
 /// `Ok(())` means the *whole* materialization sequence completed — bytes
@@ -1296,8 +1295,9 @@ pub struct RestoreRecoveryReport {
 /// The disk content, not the journal state alone, is authoritative because a
 /// process can die after the atomic rename but before persisting
 /// `DiskCommitted`. Publishing and deleting the journal is one SQLite
-/// transaction (`SyncState::commit_restore_operation`), so rerunning this
-/// function cannot append a second version.
+/// transaction (see `commit_restore_operation`'s own doc comment for the
+/// atomicity guarantee), so rerunning this function cannot append a second
+/// version.
 pub fn reconcile_restore_operations(
     state: &dyn MaterializationExecutionPort,
     root: &Path,

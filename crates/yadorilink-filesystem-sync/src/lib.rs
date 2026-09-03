@@ -19,15 +19,11 @@
 
 pub mod block_deletion;
 pub mod block_liveness;
-pub mod custody_transfer;
 pub mod debounce;
-pub mod fs_commit;
 pub mod materialization_eviction;
 pub mod materialization_execution;
 pub mod materialization_repair;
 pub mod materialization_types;
-pub mod optimistic_placement;
 pub mod placeholder_backend;
-pub mod single_pass_capture;
 pub mod stale_temp_files;
 pub mod watcher;

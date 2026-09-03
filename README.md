@@ -18,13 +18,16 @@ share membership only — it never sees, stores, or transits your file contents.
 ## Why YadoriLink?
 
 - **Peer-to-peer, with no operator data path** — file contents move directly
-  between devices, and only between devices. YadoriLink runs no relay and no
-  other server that forwards your data, so the project never carries — or pays
-  to carry — your file traffic. To make direct connections work across home and
-  mobile NATs, the transport tries LAN discovery, IPv6, STUN-based address
-  discovery, coordinated hole punching, and router port mapping. A peer that
-  still can't be reached is shown as "cannot connect" with the reason, instead
-  of being silently routed through a middlebox.
+  between devices. No YadoriLink-operated server or service ever forwards your
+  data, so the project never carries — or pays to carry — your file traffic. To
+  make direct connections work across home and mobile NATs, the transport
+  tries IPv6, STUN-based address discovery, and router port mapping. If
+  direct connectivity still isn't possible, an
+  explicitly opted-in device you already trust and share with can relay your
+  encrypted peer traffic for you (off by default; the relaying device forwards
+  encrypted bytes only, it does not decrypt them) — a peer with no such device
+  available is shown as "cannot connect" with the reason, instead of being
+  silently routed through a middlebox it never agreed to.
 - **Content-blind coordination** — the coordination plane's job is accounts,
   device identities, and share membership, nothing else. It is designed so
   that it never receives plaintext file contents.
@@ -47,10 +50,10 @@ storage. YadoriLink aims at the combination:
   store-and-forward through a server
 - an inspectable, open-source Rust implementation of the sync/transport/
   encryption stack
-- deliberately no relay or operator-run fallback path: when two devices can't
-  reach each other directly, any other device that already holds the data can
-  carry it between them over time (store-and-forward between authorized peers),
-  so a shared group still converges without anyone operating a data plane
+- deliberately no operator-run data plane: when two devices can't reach each
+  other directly, any other device that already holds the data can carry it
+  between them over time (store-and-forward between authorized peers), so a
+  shared group still converges without anyone operating a data plane
 
 ## Status
 

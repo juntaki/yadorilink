@@ -54,45 +54,6 @@ pub enum SyncSqliteError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// `filesystem_transaction`'s execution gate (`EXECUTION_ENABLED =
-    /// false` for the whole of this phase): every mutating function calls
-    /// `require_execution_enabled` first and fails closed with this rather
-    /// than performing any write. Mirrors
-    /// `yadorilink-sync-core::SyncError::NotImplemented`.
-    #[error("not yet implemented: {0}")]
-    NotImplemented(&'static str),
-
-    /// A filesystem transaction's `execution_generation` fence rejected a
-    /// caller whose `expected` generation no longer matches the
-    /// transaction's `current` one. Mirrors
-    /// `yadorilink-sync-core::SyncError::ExecutionGenerationFenced`.
-    #[error(
-        "filesystem transaction {transaction_id} execution_generation is stale: expected \
-         {expected}, currently {current}"
-    )]
-    ExecutionGenerationFenced { transaction_id: String, expected: i64, current: i64 },
-
-    /// A requested hierarchical path reservation
-    /// (`filesystem_transaction_reservations`) overlaps a reservation
-    /// another transaction already holds. Mirrors
-    /// `yadorilink-sync-core::SyncError::ReservationConflict`.
-    #[error(
-        "reservation for {path:?} (transaction {transaction_id}) conflicts with an existing \
-         reservation held by transaction {blocking_transaction_id}"
-    )]
-    ReservationConflict { transaction_id: String, path: String, blocking_transaction_id: String },
-
-    /// A filesystem-transaction-engine phase/state transition's
-    /// compare-and-swap `UPDATE` matched the row's id and its
-    /// `execution_generation`, but not the phase/state the caller's
-    /// legality check actually validated against -- a sibling transition
-    /// raced this one. Mirrors `yadorilink-sync-core::SyncError::TransitionRaced`.
-    #[error(
-        "{subject}: expected phase/state {expected_state:?} but it is now {current_state:?} -- \
-         a concurrent transition raced this one to the same execution_generation"
-    )]
-    TransitionRaced { subject: String, expected_state: String, current_state: String },
-
     /// A path names a component reserved for transaction artefacts somewhere
     /// it must not: a peer change naming one before DAG admission, a
     /// collision detected at artefact creation, or one found unexpectedly at

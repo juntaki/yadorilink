@@ -1,17 +1,13 @@
-//! `impl PeerReplicaStatePort for ReplicaCoordinator` -- Phase 7D-10.5,
-//! finally unblocked by 7D-10.4's `MaterializationIntentGuard`
-//! generalization (this trait's `open_materialization_intent_guard` is the
-//! one method that needed it). Every other method here is byte-identical in
-//! logic to `yadorilink-sync-core`'s own `impl PeerReplicaStatePort for
-//! SyncState` (`crates/yadorilink-sync-core/src/ports/peer_replica_state_impl.rs`)
-//! -- same delegate shape, same accessor calls, just against
-//! `ReplicaCoordinator`'s own accessors (all already present since
-//! 7D-10.2/10.3) instead of `SyncState`'s.
+//! `impl PeerReplicaStatePort for ReplicaCoordinator`.
 //!
-//! `SyncState`'s own impl is left completely unchanged (see
-//! `replica_coordinator.rs`'s own module doc for why `SyncState` stays alive
-//! and unmodified through this whole transitional period) -- this is a
-//! second, independent implementor of the same trait, not a replacement.
+//! Every method here is a thin delegate onto `ReplicaCoordinator`'s own
+//! repository accessors (`file_index_repository()`,
+//! `materialization_state_repository()`, `change_history_repository()`,
+//! `sqlite()`, etc.), translating each accessor's own error type into
+//! `PeerSessionError` via `SyncError`. `open_materialization_intent_guard`
+//! is the one method whose body is more than a straight accessor call: it
+//! constructs and boxes a
+//! [`crate::materialization_intent::MaterializationIntentGuard`].
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -1240,8 +1236,7 @@ mod tests {
 
     /// Proves the direct impl above lets a real `Arc<ReplicaCoordinator>`
     /// unsize-coerce to `Arc<dyn PeerReplicaStatePort>`, and that calls
-    /// through the coerced handle still dispatch correctly -- mirrors
-    /// `yadorilink-sync-core`'s own `arc_sync_state_coerces_to_port_trait`.
+    /// through the coerced handle still dispatch correctly.
     #[test]
     fn arc_replica_coordinator_coerces_to_port_trait() {
         let coordinator: Arc<ReplicaCoordinator> =
