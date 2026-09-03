@@ -176,9 +176,8 @@ impl LocalMutationStore for TestReplica {
         state: MaterializationState,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.materialization_state_repository().set_materialization_state(
-            group_id, path, state, permit,
-        )
+        self.materialization_state_repository()
+            .set_materialization_state(group_id, path, state, permit)
     }
 
     fn list_placeholder_generations(

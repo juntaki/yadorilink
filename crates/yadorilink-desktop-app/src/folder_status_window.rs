@@ -118,9 +118,7 @@ fn spawn_task<X, F>(
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {
-                sink.send(to_event(Err(format!(
-                    "could not start a background task runtime: {e}"
-                ))));
+                sink.send(to_event(Err(format!("could not start a background task runtime: {e}"))));
                 return;
             }
         };
@@ -280,7 +278,8 @@ impl eframe::App for FolderStatusApp {
                     // already-known, already-rendered conflict list must
                     // never re-force the panel open over a user's own
                     // manual collapse.
-                    let was_known_non_empty = self.conflicts.as_ref().is_some_and(|c| !c.is_empty());
+                    let was_known_non_empty =
+                        self.conflicts.as_ref().is_some_and(|c| !c.is_empty());
                     if !files.is_empty() && !was_known_non_empty {
                         self.conflicts_should_force_open_once = true;
                     }

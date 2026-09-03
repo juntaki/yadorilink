@@ -35,7 +35,9 @@ use yadorilink_local_storage::{
 use yadorilink_peer_session::peer_session::PeerSyncSession;
 use yadorilink_replica_domain::file::{BlockInfo, FileRecord};
 use yadorilink_replica_domain::session_state::MaterializationState;
-use yadorilink_transport::{ConnectRole, DeviceSigningKeyPair, QuicPeerChannel, QuicPeerEndpoint, TransportHub};
+use yadorilink_transport::{
+    ConnectRole, DeviceSigningKeyPair, QuicPeerChannel, QuicPeerEndpoint, TransportHub,
+};
 
 /// Wraps a real `FsBlockStore` and adds a fixed delay before every `get` --
 /// used to make one test device's block-serve responses arrive well past
@@ -228,7 +230,11 @@ fn seed_placeholder(
 /// actually-obtained verified bytes). Split out from `seed_placeholder` so
 /// a test can hand a device MORE blocks after its placeholder/link setup
 /// already ran, without redoing that setup.
-fn give_blocks(device: &TestDevice, owned_blocks: &[BlockInfo], data_by_hash: &HashMap<Vec<u8>, Vec<u8>>) {
+fn give_blocks(
+    device: &TestDevice,
+    owned_blocks: &[BlockInfo],
+    data_by_hash: &HashMap<Vec<u8>, Vec<u8>>,
+) {
     for block in owned_blocks {
         device.state.block_store.put(&data_by_hash[&block.hash]).unwrap();
         device
@@ -393,5 +399,8 @@ async fn partial_hydration_progress_survives_an_outer_timeout() {
     connect_as_peer_returning_channel(&target, &fast).await;
     hydration::hydrate(&target.state, GROUP, PATH).await.unwrap();
     let reconstructed = std::fs::read(target.root.path().join(PATH)).unwrap();
-    assert_eq!(reconstructed, content, "the retried hydrate's recovered content must be byte-exact");
+    assert_eq!(
+        reconstructed, content,
+        "the retried hydrate's recovered content must be byte-exact"
+    );
 }

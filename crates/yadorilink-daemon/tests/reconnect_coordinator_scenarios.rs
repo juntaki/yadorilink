@@ -66,11 +66,7 @@ fn new_test_daemon(device_id: &str) -> TestDaemon {
     let store = Arc::new(FsBlockStore::new(Box::leak(Box::new(store_dir)).path()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state = DaemonState::new(device_id.to_string(), sync_state, store);
-    TestDaemon {
-        device_id: device_id.to_string(),
-        state,
-        _root: tempfile::tempdir().unwrap(),
-    }
+    TestDaemon { device_id: device_id.to_string(), state, _root: tempfile::tempdir().unwrap() }
 }
 
 fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
@@ -130,13 +126,7 @@ async fn spawn_star_mesh(scenario: &str, n_leaves: usize) -> StarMesh {
     let leaf_groups: Vec<String> =
         (0..n_leaves).map(|i| format!("{scenario}-star-group-{i}")).collect();
     let hub_group_refs: Vec<&str> = leaf_groups.iter().map(String::as_str).collect();
-    register_with_fake(
-        &fake,
-        &hub.state,
-        &hub.device_id,
-        &hub_group_refs,
-    )
-    .await;
+    register_with_fake(&fake, &hub.state, &hub.device_id, &hub_group_refs).await;
 
     let mut hub_roots = Vec::with_capacity(n_leaves);
     for group in &leaf_groups {
@@ -148,24 +138,14 @@ async fn spawn_star_mesh(scenario: &str, n_leaves: usize) -> StarMesh {
     let mut leaves = Vec::with_capacity(n_leaves);
     for (i, group) in leaf_groups.iter().enumerate() {
         let leaf = new_test_daemon(&format!("{scenario}-leaf-{i}"));
-        register_with_fake(
-            &fake,
-            &leaf.state,
-            &leaf.device_id,
-            &[group.as_str()],
-        )
-        .await;
+        register_with_fake(&fake, &leaf.state, &leaf.device_id, &[group.as_str()]).await;
         link(&leaf.state, leaf._root.path(), group);
         leaves.push(leaf);
     }
 
     spawn_orchestrator(fake.addr(), hub.device_id.clone(), hub.state.clone());
     for leaf in &leaves {
-        spawn_orchestrator(
-            fake.addr(),
-            leaf.device_id.clone(),
-            leaf.state.clone(),
-        );
+        spawn_orchestrator(fake.addr(), leaf.device_id.clone(), leaf.state.clone());
     }
 
     StarMesh { fake, hub, leaves, leaf_groups, _hub_roots: hub_roots }
@@ -244,13 +224,7 @@ async fn simultaneous_flap_scenario(scenario: &str, n_leaves: usize, timeout: Du
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     for (leaf, group) in mesh.leaves.iter().zip(mesh.leaf_groups.iter()) {
-        register_with_fake(
-            &mesh.fake,
-            &leaf.state,
-            &leaf.device_id,
-            &[group.as_str()],
-        )
-        .await;
+        register_with_fake(&mesh.fake, &leaf.state, &leaf.device_id, &[group.as_str()]).await;
     }
 
     wait_for_star_connected(&mesh, timeout, "post-flap reconnect").await;
@@ -294,13 +268,7 @@ async fn reconnect_during_active_sync() {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    register_with_fake(
-        &mesh.fake,
-        &leaf.state,
-        &leaf.device_id,
-        &[group.as_str()],
-    )
-    .await;
+    register_with_fake(&mesh.fake, &leaf.state, &leaf.device_id, &[group.as_str()]).await;
 
     wait_until_with_context(
         || {
@@ -335,32 +303,17 @@ async fn reconnect_after_supervisor_restart() {
     // every scenario in this one test binary.
     let hub = new_test_daemon("restart-hub");
     let leaf = new_test_daemon("restart-leaf-0");
-    register_with_fake(&fake, &hub.state, &hub.device_id, &[group])
-        .await;
-    register_with_fake(&fake, &leaf.state, &leaf.device_id, &[group])
-        .await;
+    register_with_fake(&fake, &hub.state, &hub.device_id, &[group]).await;
+    register_with_fake(&fake, &leaf.state, &leaf.device_id, &[group]).await;
     let hub_root = tempfile::tempdir().unwrap();
     link(&hub.state, hub_root.path(), group);
     link(&leaf.state, leaf._root.path(), group);
 
-    let _hub_handle = spawn_orchestrator(
-        fake.addr(),
-        hub.device_id.clone(),
-        hub.state.clone(),
-    );
-    let leaf_handle = spawn_orchestrator(
-        fake.addr(),
-        leaf.device_id.clone(),
-        leaf.state.clone(),
-    );
+    let _hub_handle = spawn_orchestrator(fake.addr(), hub.device_id.clone(), hub.state.clone());
+    let leaf_handle = spawn_orchestrator(fake.addr(), leaf.device_id.clone(), leaf.state.clone());
 
     wait_until_with_context(
-        || {
-            hub.state
-                .peers
-                .session(&leaf.device_id)
-                .is_some_and(|s| s.peer_handshake_received())
-        },
+        || hub.state.peers.session(&leaf.device_id).is_some_and(|s| s.peer_handshake_received()),
         Duration::from_secs(60),
         || "initial pair did not connect".to_string(),
     )
@@ -388,21 +341,12 @@ async fn reconnect_after_supervisor_restart() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     leaf_handle.abort();
 
-    let _new_leaf_handle = spawn_orchestrator(
-        fake.addr(),
-        leaf.device_id.clone(),
-        leaf.state.clone(),
-    );
-    register_with_fake(&fake, &leaf.state, &leaf.device_id, &[group])
-        .await;
+    let _new_leaf_handle =
+        spawn_orchestrator(fake.addr(), leaf.device_id.clone(), leaf.state.clone());
+    register_with_fake(&fake, &leaf.state, &leaf.device_id, &[group]).await;
 
     wait_until_with_context(
-        || {
-            hub.state
-                .peers
-                .session(&leaf.device_id)
-                .is_some_and(|s| s.peer_handshake_received())
-        },
+        || hub.state.peers.session(&leaf.device_id).is_some_and(|s| s.peer_handshake_received()),
         Duration::from_secs(60),
         || {
             format!(
@@ -433,8 +377,7 @@ async fn pathological_peer_does_not_starve_healthy_peers() {
     let hub = new_test_daemon("pathological-hub");
     let mut hub_groups: Vec<&str> = healthy_groups.iter().map(String::as_str).collect();
     hub_groups.push(pathological_group);
-    register_with_fake(&fake, &hub.state, &hub.device_id, &hub_groups)
-        .await;
+    register_with_fake(&fake, &hub.state, &hub.device_id, &hub_groups).await;
 
     let mut hub_roots = Vec::with_capacity(N_HEALTHY + 1);
     for group in &healthy_groups {
@@ -449,13 +392,7 @@ async fn pathological_peer_does_not_starve_healthy_peers() {
     let mut healthy_leaves = Vec::with_capacity(N_HEALTHY);
     for (i, group) in healthy_groups.iter().enumerate() {
         let leaf = new_test_daemon(&format!("healthy-leaf-{i}"));
-        register_with_fake(
-            &fake,
-            &leaf.state,
-            &leaf.device_id,
-            &[group.as_str()],
-        )
-        .await;
+        register_with_fake(&fake, &leaf.state, &leaf.device_id, &[group.as_str()]).await;
         link(&leaf.state, leaf._root.path(), group);
         healthy_leaves.push(leaf);
     }
@@ -506,11 +443,7 @@ async fn pathological_peer_does_not_starve_healthy_peers() {
 
     spawn_orchestrator(fake.addr(), hub.device_id.clone(), hub.state.clone());
     for leaf in &healthy_leaves {
-        spawn_orchestrator(
-            fake.addr(),
-            leaf.device_id.clone(),
-            leaf.state.clone(),
-        );
+        spawn_orchestrator(fake.addr(), leaf.device_id.clone(), leaf.state.clone());
     }
 
     wait_until_with_context(

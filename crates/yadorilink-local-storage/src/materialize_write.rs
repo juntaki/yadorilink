@@ -381,7 +381,9 @@ pub fn persist_reconstructed_file(tmp_path: &Path, out_path: &Path) -> Result<()
         // no-op, so this line still fires there but measures nothing real
         // -- a phase-log reader on a non-Unix capture should read this
         // span as "step skipped," not "step free."
-        tracing::warn!("M6PHASE T_recv_dir_fsync_done: parent-directory fsync complete (or skipped, non-Unix)");
+        tracing::warn!(
+            "M6PHASE T_recv_dir_fsync_done: parent-directory fsync complete (or skipped, non-Unix)"
+        );
         Ok(())
     };
     if let Err(e) = publish() {
@@ -626,7 +628,10 @@ pub fn create_or_defer_placeholder(
     if test_force_deferred_placeholder_is_armed_for(out_path) {
         let _ = (out_path, size, mtime_unix_nanos);
         return Ok(PlaceholderIdentityToRecord::RecordIfAbsent {
-            identity: PlaceholderDiskIdentity { dev: 0, ino: mint_windows_placeholder_generation() },
+            identity: PlaceholderDiskIdentity {
+                dev: 0,
+                ino: mint_windows_placeholder_generation(),
+            },
             provider_kind: WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
         });
     }
@@ -704,8 +709,7 @@ fn test_force_deferred_placeholder_is_armed_for(path: &Path) -> bool {
 /// matters.
 #[cfg(any(test, feature = "test-support"))]
 pub fn set_test_force_deferred_placeholder_for_path(path: &Path, armed: bool) {
-    let mut guard =
-        TEST_FORCE_DEFERRED_PLACEHOLDER_PATHS.lock().unwrap_or_else(|p| p.into_inner());
+    let mut guard = TEST_FORCE_DEFERRED_PLACEHOLDER_PATHS.lock().unwrap_or_else(|p| p.into_inner());
     let paths = guard.get_or_insert_with(std::collections::HashSet::new);
     if armed {
         paths.insert(path.to_path_buf());
@@ -753,7 +757,10 @@ pub fn mint_windows_placeholder_generation() -> u64 {
 /// to bump at all, before committing to either `apply_unix_mode` or a
 /// fence bump.
 #[cfg(unix)]
-pub fn unix_mode_already_matches_disk(path: &Path, unix_mode: Option<u32>) -> Result<bool, StorageError> {
+pub fn unix_mode_already_matches_disk(
+    path: &Path,
+    unix_mode: Option<u32>,
+) -> Result<bool, StorageError> {
     use std::os::unix::fs::PermissionsExt;
     const PERMISSION_BITS: u32 = 0o777;
     let Some(unix_mode) = unix_mode else {
@@ -778,7 +785,10 @@ pub fn unix_mode_already_matches_disk(path: &Path, unix_mode: Option<u32>) -> Re
 /// alone, and does not need to: either way, this field never blocks
 /// `ExactObject` completion on this platform.
 #[cfg(not(unix))]
-pub fn unix_mode_already_matches_disk(_path: &Path, _unix_mode: Option<u32>) -> Result<bool, StorageError> {
+pub fn unix_mode_already_matches_disk(
+    _path: &Path,
+    _unix_mode: Option<u32>,
+) -> Result<bool, StorageError> {
     Ok(true)
 }
 
@@ -790,7 +800,10 @@ pub fn unix_mode_already_matches_disk(_path: &Path, _unix_mode: Option<u32>) -> 
 /// the two can never disagree about which names/values are "replicated"
 /// ones.
 #[cfg(target_os = "linux")]
-pub fn xattrs_already_match_disk(path: &Path, xattrs: &[(String, Vec<u8>)]) -> Result<bool, StorageError> {
+pub fn xattrs_already_match_disk(
+    path: &Path,
+    xattrs: &[(String, Vec<u8>)],
+) -> Result<bool, StorageError> {
     let file = fs::File::open(path)?;
     let mut current = crate::chunker::read_replicated_xattrs(&file);
     let mut desired = xattrs.to_vec();
@@ -803,7 +816,10 @@ pub fn xattrs_already_match_disk(path: &Path, xattrs: &[(String, Vec<u8>)]) -> R
 /// -- `apply_xattrs` is already a no-op off Linux, so it never needs a
 /// fence bump either.
 #[cfg(not(target_os = "linux"))]
-pub fn xattrs_already_match_disk(_path: &Path, _xattrs: &[(String, Vec<u8>)]) -> Result<bool, StorageError> {
+pub fn xattrs_already_match_disk(
+    _path: &Path,
+    _xattrs: &[(String, Vec<u8>)],
+) -> Result<bool, StorageError> {
     Ok(true)
 }
 
@@ -844,7 +860,10 @@ pub fn xattrs_already_match_disk(_path: &Path, _xattrs: &[(String, Vec<u8>)]) ->
 /// File`; skip it entirely for every other kind rather than passing an
 /// empty `desired` and relying on this function to no-op.
 #[cfg(target_os = "linux")]
-pub fn verify_replicated_xattrs_exact(path: &Path, desired: &[(String, Vec<u8>)]) -> Result<bool, StorageError> {
+pub fn verify_replicated_xattrs_exact(
+    path: &Path,
+    desired: &[(String, Vec<u8>)],
+) -> Result<bool, StorageError> {
     let file = fs::File::open(path)?;
     let mut current = crate::chunker::read_replicated_xattrs_strict(&file)?;
     let mut desired = desired.to_vec();
@@ -874,7 +893,10 @@ pub fn verify_replicated_xattrs_exact(path: &Path, desired: &[(String, Vec<u8>)]
 /// non-Linux target, for a field this target was never expected to
 /// physically reproduce in the first place.
 #[cfg(not(target_os = "linux"))]
-pub fn verify_replicated_xattrs_exact(_path: &Path, _desired: &[(String, Vec<u8>)]) -> Result<bool, StorageError> {
+pub fn verify_replicated_xattrs_exact(
+    _path: &Path,
+    _desired: &[(String, Vec<u8>)],
+) -> Result<bool, StorageError> {
     Ok(true)
 }
 
@@ -1528,7 +1550,8 @@ mod tests {
         apply_xattrs(&path, &[("user.a".to_string(), b"old".to_vec())]).unwrap();
 
         assert_eq!(
-            verify_replicated_xattrs_exact(&path, &[("user.a".to_string(), b"new".to_vec())]).unwrap(),
+            verify_replicated_xattrs_exact(&path, &[("user.a".to_string(), b"new".to_vec())])
+                .unwrap(),
             false
         );
     }

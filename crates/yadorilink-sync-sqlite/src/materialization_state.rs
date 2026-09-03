@@ -1421,8 +1421,9 @@ mod held_state_tests {
     fn open_full_test_db() -> Arc<SyncDatabase> {
         Arc::new(
             SyncDatabase::open_in_memory(|conn| {
-                crate::dag_store::init_dag_schema(conn)
-                    .map_err(|e| yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(e.to_string()))?;
+                crate::dag_store::init_dag_schema(conn).map_err(|e| {
+                    yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(e.to_string())
+                })?;
                 yadorilink_sqlite_runtime::init_schema(conn)
             })
             .expect("open in-memory db"),

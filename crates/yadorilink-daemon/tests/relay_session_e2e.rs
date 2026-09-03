@@ -45,11 +45,7 @@ fn new_test_daemon(device_id: &str) -> TestDaemon {
     let store = Arc::new(FsBlockStore::new(Box::leak(Box::new(store_dir)).path()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state = DaemonState::new(device_id.to_string(), sync_state, store);
-    TestDaemon {
-        device_id: device_id.to_string(),
-        state,
-        _root: tempfile::tempdir().unwrap(),
-    }
+    TestDaemon { device_id: device_id.to_string(), state, _root: tempfile::tempdir().unwrap() }
 }
 
 fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
@@ -58,11 +54,7 @@ fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
     LinkRuntimeController::new(state.clone()).start(local_path, group_id.to_string()).unwrap();
 }
 
-fn spawn_orchestrator(
-    coordination_addr: String,
-    device_id: String,
-    state: Arc<DaemonState>,
-) {
+fn spawn_orchestrator(coordination_addr: String, device_id: String, state: Arc<DaemonState>) {
     let log_device_id = device_id.clone();
     let config = peer_orchestrator::OrchestratorConfig {
         coordination_addr,
@@ -77,10 +69,7 @@ fn spawn_orchestrator(
 }
 
 fn fully_connected(state: &Arc<DaemonState>, peer_device_id: &str) -> bool {
-    state
-        .peers
-        .session(peer_device_id)
-        .is_some_and(|s| s.peer_handshake_received())
+    state.peers.session(peer_device_id).is_some_and(|s| s.peer_handshake_received())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -94,13 +83,7 @@ async fn opaque_bytes_flow_from_a_through_b_to_cs_real_address_over_the_real_wir
     let b = new_test_daemon("relay-e2e-b");
     let c = new_test_daemon("relay-e2e-c");
     for daemon in [&a, &b, &c] {
-        register_with_fake(
-            &fake,
-            &daemon.state,
-            &daemon.device_id,
-            &[group_id],
-        )
-        .await;
+        register_with_fake(&fake, &daemon.state, &daemon.device_id, &[group_id]).await;
         link(&daemon.state, daemon._root.path(), group_id);
     }
     // B is the only relay-capable device -- see `RelayCapability`'s own
@@ -257,13 +240,7 @@ async fn requester_relay_carrier_opens_a_session_and_forwards_via_a_real_relay()
     let b = new_test_daemon("relay-carrier-b");
     let c = new_test_daemon("relay-carrier-c");
     for daemon in [&a, &b, &c] {
-        register_with_fake(
-            &fake,
-            &daemon.state,
-            &daemon.device_id,
-            &[group_id],
-        )
-        .await;
+        register_with_fake(&fake, &daemon.state, &daemon.device_id, &[group_id]).await;
         link(&daemon.state, daemon._root.path(), group_id);
     }
     b.state.set_local_relay_capable(true);
@@ -394,13 +371,7 @@ async fn relay_session_closes_promptly_when_the_destination_route_is_lost() {
     let b = new_test_daemon("relay-e2e-loss-b");
     let c = new_test_daemon("relay-e2e-loss-c");
     for daemon in [&a, &b, &c] {
-        register_with_fake(
-            &fake,
-            &daemon.state,
-            &daemon.device_id,
-            &[group_id],
-        )
-        .await;
+        register_with_fake(&fake, &daemon.state, &daemon.device_id, &[group_id]).await;
         link(&daemon.state, daemon._root.path(), group_id);
     }
     b.state.set_local_relay_capable(true);
@@ -481,13 +452,7 @@ async fn relay_open_is_refused_when_the_relay_never_declared_capability() {
     let b = new_test_daemon("relay-e2e-refusal-b");
     let c = new_test_daemon("relay-e2e-refusal-c");
     for daemon in [&a, &b, &c] {
-        register_with_fake(
-            &fake,
-            &daemon.state,
-            &daemon.device_id,
-            &[group_id],
-        )
-        .await;
+        register_with_fake(&fake, &daemon.state, &daemon.device_id, &[group_id]).await;
         link(&daemon.state, daemon._root.path(), group_id);
     }
     // Deliberately NOT called: b.state.set_local_relay_capable(true) /

@@ -69,7 +69,10 @@ pub trait ChangeAdmissionPort: Send + Sync {
         &self,
         items: &[(&Change, &[FileVersion])],
     ) -> Vec<Result<AdmissionStoreResult, AdmissionStoreError>> {
-        items.iter().map(|(change, versions)| self.admit_unprojected_change(change, versions)).collect()
+        items
+            .iter()
+            .map(|(change, versions)| self.admit_unprojected_change(change, versions))
+            .collect()
     }
 }
 

@@ -186,9 +186,7 @@ async fn write_raw<W: AsyncWrite + Unpin>(
 
 /// Confirms the peer has finished sending: the next read must report
 /// end-of-stream rather than more bytes.
-async fn expect_end_of_stream<R: AsyncRead + Unpin>(
-    reader: &mut R,
-) -> Result<(), TransportError> {
+async fn expect_end_of_stream<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(), TransportError> {
     let mut extra = [0u8; 1];
     match reader.read(&mut extra).await {
         Ok(0) => Ok(()),

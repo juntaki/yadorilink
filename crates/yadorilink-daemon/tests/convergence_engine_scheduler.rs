@@ -33,7 +33,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use support::{connect_two_daemons, daemon_status_summary, ensure_device_signing_key, real_entry_names, wait_until_with_context};
+use support::{
+    connect_two_daemons, daemon_status_summary, ensure_device_signing_key, real_entry_names,
+    wait_until_with_context,
+};
 use yadorilink_daemon::adapters::runtime::link_runtime_controller::LinkRuntimeController;
 use yadorilink_daemon::convergence::engine::run_once_for_test;
 use yadorilink_daemon::daemon_state::DaemonState;
@@ -102,7 +105,11 @@ async fn zero_progress_never_reports_an_immediate_backlog() {
             ChangeAuth::PLACEHOLDER,
             DeviceId("sched-remote-ghost".to_string()),
             FolderGroupId(GROUP.to_string()),
-            vec![Op::Put { path: SyncPath(path), version: version.version_hash, origin: PutOrigin::Direct }],
+            vec![Op::Put {
+                path: SyncPath(path),
+                version: version.version_hash,
+                origin: PutOrigin::Direct,
+            }],
             &key,
         );
         state
@@ -165,8 +172,14 @@ async fn more_files_than_the_attempt_budget_converge_without_artificial_per_tick
         .unwrap();
 
     let started = Instant::now();
-    connect_two_daemons(&state_a, "sched-a", &state_b, "sched-b", std::slice::from_ref(&GROUP.to_string()))
-        .await;
+    connect_two_daemons(
+        &state_a,
+        "sched-a",
+        &state_b,
+        "sched-b",
+        std::slice::from_ref(&GROUP.to_string()),
+    )
+    .await;
 
     wait_until_with_context(
         || real_entry_names(root_b.path()).len() >= FILE_COUNT,

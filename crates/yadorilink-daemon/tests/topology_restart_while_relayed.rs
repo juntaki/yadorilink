@@ -145,14 +145,8 @@ async fn w_restart_while_relayed_gets_a_fresh_epoch_not_a_stale_one() {
     // plane has stopped advertising while it still works. When that
     // happened, W came back DIRECT and the scenario -- a restart while
     // relayed -- silently stopped being the scenario.
-    register_with_fake_at(
-        &fake,
-        &w.state,
-        &w.device_id,
-        &[group_id],
-        "127.0.0.1:1".to_string(),
-    )
-    .await;
+    register_with_fake_at(&fake, &w.state, &w.device_id, &[group_id], "127.0.0.1:1".to_string())
+        .await;
     let w_runtime = support::topology::spawn_orchestrator(fake.addr(), &w);
     handles.insert(w.device_id.clone(), w_runtime);
 

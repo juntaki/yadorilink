@@ -1207,8 +1207,9 @@ pub fn probe_birth_time_granularity(dir: &Path) -> TimestampGranularity {
 /// root the filesystem watcher is itself watching) in a single 120s, 2,000-
 /// file live-burst run. Falls back to an uncached probe (never a stale
 /// answer) if the volume identity itself cannot even be observed.
-static BIRTH_TIME_GRANULARITY_CACHE: std::sync::OnceLock<Mutex<HashMap<VolumeIdentity, TimestampGranularity>>> =
-    std::sync::OnceLock::new();
+static BIRTH_TIME_GRANULARITY_CACHE: std::sync::OnceLock<
+    Mutex<HashMap<VolumeIdentity, TimestampGranularity>>,
+> = std::sync::OnceLock::new();
 
 /// Cached wrapper for [`probe_birth_time_granularity`]. Prefer this over the
 /// raw probe for any caller invoked more than once per process lifetime for

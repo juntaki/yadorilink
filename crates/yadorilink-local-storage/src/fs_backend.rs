@@ -218,9 +218,8 @@ trait BlockCommitIo: Send + Sync {
 /// so behaviour is unchanged.
 fn fsync_diagnostically_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| {
-        std::env::var("YADORILINK_DIAGNOSTIC_DISABLE_FSYNC").as_deref() == Ok("1")
-    })
+    *DISABLED
+        .get_or_init(|| std::env::var("YADORILINK_DIAGNOSTIC_DISABLE_FSYNC").as_deref() == Ok("1"))
 }
 
 struct StdBlockCommitIo;
@@ -275,8 +274,7 @@ impl PendingShardTree {
             self.created_prefixes.push(prefix);
         }
         if let Some(shard) = publish.shard {
-            let prefix =
-                shard.parent().expect("shard directories have a parent").to_path_buf();
+            let prefix = shard.parent().expect("shard directories have a parent").to_path_buf();
             self.created_shards.entry(prefix).or_default().push(shard);
         }
     }
@@ -878,39 +876,40 @@ impl FsBlockStore {
         // instead of once per block that happened to need it.
         let pending_tree = Mutex::new(PendingShardTree::default());
 
-        let results: Vec<Result<(ContentHash, BlockCommitOutcome, Option<PathBuf>, u64), StorageError>> =
-            std::thread::scope(|scope| {
-                let mut out = Vec::with_capacity(batch.len());
-                for chunk in batch.chunks(BULK_INGEST_CONCURRENCY) {
-                    let handles: Vec<_> = chunk
-                        .iter()
-                        .map(|block| {
-                            let hash = block.hash().clone();
-                            let bytes = block.bytes();
-                            let byte_len = bytes.len() as u64;
-                            let pending_tree = &pending_tree;
-                            scope.spawn(move || {
-                                let path = self.path_for_hash(&hash)?;
-                                let _hash_guard = self
-                                    .hash_lock(&hash)
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                let (outcome, dirty) =
-                                    self.commit_block_staged(&hash, bytes, &path, pending_tree)?;
-                                Ok((hash, outcome, dirty, byte_len))
-                            })
+        let results: Vec<
+            Result<(ContentHash, BlockCommitOutcome, Option<PathBuf>, u64), StorageError>,
+        > = std::thread::scope(|scope| {
+            let mut out = Vec::with_capacity(batch.len());
+            for chunk in batch.chunks(BULK_INGEST_CONCURRENCY) {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|block| {
+                        let hash = block.hash().clone();
+                        let bytes = block.bytes();
+                        let byte_len = bytes.len() as u64;
+                        let pending_tree = &pending_tree;
+                        scope.spawn(move || {
+                            let path = self.path_for_hash(&hash)?;
+                            let _hash_guard = self
+                                .hash_lock(&hash)
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let (outcome, dirty) =
+                                self.commit_block_staged(&hash, bytes, &path, pending_tree)?;
+                            Ok((hash, outcome, dirty, byte_len))
                         })
-                        .collect();
-                    for handle in handles {
-                        out.push(handle.join().unwrap_or_else(|_| {
-                            Err(StorageError::Io(std::io::Error::other(
-                                "bulk ingest worker thread panicked",
-                            )))
-                        }));
-                    }
+                    })
+                    .collect();
+                for handle in handles {
+                    out.push(handle.join().unwrap_or_else(|_| {
+                        Err(StorageError::Io(std::io::Error::other(
+                            "bulk ingest worker thread panicked",
+                        )))
+                    }));
                 }
-                out
-            });
+            }
+            out
+        });
 
         let mut dirty_shards: HashSet<PathBuf> = HashSet::new();
         let mut committed_hashes = Vec::with_capacity(batch.len());
@@ -1056,7 +1055,6 @@ impl FsBlockStore {
         *self.bulk_ingest_barrier_hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(Arc::new(hook));
     }
-
 }
 
 impl<'s> BulkIngest<'s> {
@@ -1675,11 +1673,7 @@ mod tests {
             // is indistinguishable from never having been written.
             (
                 CommitStage::DirectoryDurable(DirSyncKind::StoreRoot),
-                vec![
-                    CommitStage::ShardCreated,
-                    CommitStage::TempDurable,
-                    CommitStage::Published,
-                ],
+                vec![CommitStage::ShardCreated, CommitStage::TempDurable, CommitStage::Published],
             ),
             (
                 CommitStage::DirectoryDurable(DirSyncKind::Prefix),
@@ -1759,8 +1753,7 @@ mod tests {
         // would still pass an assertion on the persisted file alone.
         let dir = tempfile::tempdir().unwrap();
         let store = FsBlockStore::new(dir.path()).unwrap();
-        let persisted_after_open =
-            fs::read_to_string(usage_counter_path(dir.path())).unwrap();
+        let persisted_after_open = fs::read_to_string(usage_counter_path(dir.path())).unwrap();
 
         store.put(b"one").unwrap();
         store.put(b"two-two").unwrap();
@@ -2187,7 +2180,11 @@ mod tests {
         // possibly-inconsistent code path.
         let usage_before = store2.usage().unwrap();
         store2.put_prepared(&prepared).unwrap();
-        assert_eq!(store2.usage().unwrap(), usage_before, "re-putting an identical prepared block must not double-count usage");
+        assert_eq!(
+            store2.usage().unwrap(),
+            usage_before,
+            "re-putting an identical prepared block must not double-count usage"
+        );
     }
 
     /// `LocallyHashedBlock::bytes_arc` hands out a cheap clone of the
@@ -2383,10 +2380,8 @@ mod tests {
 
         let expected_prefixes: HashSet<PathBuf> =
             shards_per_prefix.keys().map(|prefix| store.root.join(prefix)).collect();
-        let expected_shards: HashSet<PathBuf> = blocks
-            .iter()
-            .map(|block| store.shard_dir_for_hash(block.hash()))
-            .collect();
+        let expected_shards: HashSet<PathBuf> =
+            blocks.iter().map(|block| store.shard_dir_for_hash(block.hash())).collect();
 
         let mut ingest = store.begin_bulk_ingest();
         for block in blocks {
@@ -2465,11 +2460,7 @@ mod tests {
         // for this prefix -- that saving is the entire point, and it is
         // only correct on the far side of the fsync above.
         let third = store.reserve_shard_publish(&prefix.join("99"));
-        assert_eq!(
-            third.prefix, None,
-            "a published prefix must not cost another store-root fsync"
-        );
+        assert_eq!(third.prefix, None, "a published prefix must not cost another store-root fsync");
         assert_eq!(third.shard.as_deref(), Some(prefix.join("99").as_path()));
     }
-
 }

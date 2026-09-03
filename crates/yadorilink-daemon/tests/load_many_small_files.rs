@@ -37,10 +37,8 @@ async fn many_small_files_survive_initial_sync_and_incremental_update() {
     let _ = tracing_subscriber::fmt::try_init();
     let coordination_addr = support::start_coordination_server().await;
     let account = support::register_and_login(&coordination_addr, "load-test@example.com").await;
-    let device_a_id =
-        support::register_device(&account, "device-a", [0u8; 32]).await;
-    let device_b_id =
-        support::register_device(&account, "device-b", [0u8; 32]).await;
+    let device_a_id = support::register_device(&account, "device-a", [0u8; 32]).await;
+    let device_b_id = support::register_device(&account, "device-b", [0u8; 32]).await;
 
     let group_id = support::create_folder_group(&account, "load-test-group").await;
     support::grant_access(&account, &group_id, &device_a_id).await;

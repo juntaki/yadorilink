@@ -43,11 +43,7 @@ fn new_test_daemon(device_id: &str) -> TestDaemon {
     let store = Arc::new(FsBlockStore::new(Box::leak(Box::new(store_dir)).path()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state = DaemonState::new(device_id.to_string(), sync_state, store);
-    TestDaemon {
-        device_id: device_id.to_string(),
-        state,
-        _root: tempfile::tempdir().unwrap(),
-    }
+    TestDaemon { device_id: device_id.to_string(), state, _root: tempfile::tempdir().unwrap() }
 }
 
 fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
@@ -56,11 +52,7 @@ fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
     LinkRuntimeController::new(state.clone()).start(local_path, group_id.to_string()).unwrap();
 }
 
-fn spawn_orchestrator(
-    coordination_addr: String,
-    device_id: String,
-    state: Arc<DaemonState>,
-) {
+fn spawn_orchestrator(coordination_addr: String, device_id: String, state: Arc<DaemonState>) {
     let log_device_id = device_id.clone();
     let config = peer_orchestrator::OrchestratorConfig {
         coordination_addr,
@@ -75,10 +67,7 @@ fn spawn_orchestrator(
 }
 
 fn fully_connected(state: &Arc<DaemonState>, peer_device_id: &str) -> bool {
-    state
-        .peers
-        .session(peer_device_id)
-        .is_some_and(|s| s.peer_handshake_received())
+    state.peers.session(peer_device_id).is_some_and(|s| s.peer_handshake_received())
 }
 
 /// Same adapter as `relay_session_e2e.rs`'s own `TestGrantSource` --
@@ -132,13 +121,7 @@ async fn multi_peer_fan_in_through_one_relay() {
     ];
 
     for daemon in std::iter::once(&a).chain(std::iter::once(&b)).chain(destinations.iter()) {
-        register_with_fake(
-            &fake,
-            &daemon.state,
-            &daemon.device_id,
-            &[group_id],
-        )
-        .await;
+        register_with_fake(&fake, &daemon.state, &daemon.device_id, &[group_id]).await;
         link(&daemon.state, daemon._root.path(), group_id);
     }
     b.state.set_local_relay_capable(true);
@@ -192,8 +175,12 @@ async fn multi_peer_fan_in_through_one_relay() {
     let opens = destinations.iter().map(|c| {
         let a_state = a.state.clone();
         let device_id = c.device_id.clone();
-        let peer_public =
-            c.state.device_signing_key().expect("destination has a device key").verifying_key().to_bytes();
+        let peer_public = c
+            .state
+            .device_signing_key()
+            .expect("destination has a device key")
+            .verifying_key()
+            .to_bytes();
         async move {
             yadorilink_daemon::relay_carrier::open_relay_path_for_test(
                 &a_state,

@@ -251,11 +251,7 @@ pub(crate) async fn open_relay_path(
             session_id = opened.session_id,
             "opened a relay path to a peer with no direct route"
         );
-        return Some(OpenedRelayPath {
-            relay_device_id,
-            session_id: opened.session_id,
-            path,
-        });
+        return Some(OpenedRelayPath { relay_device_id, session_id: opened.session_id, path });
     }
 
     None

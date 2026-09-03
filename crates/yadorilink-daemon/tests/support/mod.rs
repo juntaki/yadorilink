@@ -25,7 +25,7 @@ use yadorilink_local_storage::{BlockStore, ContentHash, FsBlockStore, GcReport, 
 use yadorilink_peer_session::peer_session::{PeerSyncSession, PeerSyncSessionDeps};
 use yadorilink_transport::{
     connect_role, ConnectRole, DeviceSigningKeyPair, QuicPeerChannel, QuicPeerEndpoint,
-    TransportHub, TransportError,
+    TransportError, TransportHub,
 };
 
 pub mod control_socket_client;
@@ -746,8 +746,10 @@ pub async fn device_quic_endpoint(state: &Arc<DaemonState>) -> Arc<QuicPeerEndpo
     let signing = state
         .device_signing_key()
         .expect("a paired test device must have its signing key installed first");
-    let mut endpoints =
-        ENDPOINTS.get_or_init(|| StdMutex::new(HashMap::new())).lock().unwrap_or_else(|p| p.into_inner());
+    let mut endpoints = ENDPOINTS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     endpoints
         .entry(addr)
         .or_insert_with(|| {

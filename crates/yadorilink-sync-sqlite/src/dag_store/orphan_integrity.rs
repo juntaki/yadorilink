@@ -51,7 +51,8 @@ pub(crate) fn insert_orphan(
     // actually run; skipping that walk when it could not possibly find
     // anything to evict turns what would otherwise be a full-buffer cost
     // paid on every single insert into a cheap `COUNT(*)`.
-    let orphan_count: i64 = conn.query_row("SELECT COUNT(*) FROM orphan_changes", [], |r| r.get(0))?;
+    let orphan_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM orphan_changes", [], |r| r.get(0))?;
     if orphan_count as usize > ORPHAN_BOUND {
         // The `change_parents` edges recorded for an evicted orphan's
         // declared parents must go with it -- left behind, a ghost edge
@@ -332,7 +333,10 @@ fn drop_orphan_change(conn: &Connection, change_hash: &[u8]) -> Result<(), SyncS
 /// anti-entropy round for no reason that redelivery could ever fix.
 /// Dropping the whole dependent subtree now is what actually closes that
 /// loop.
-pub(crate) fn drop_orphan_subtree(conn: &Connection, change_hash: &[u8]) -> Result<(), SyncSqliteError> {
+pub(crate) fn drop_orphan_subtree(
+    conn: &Connection,
+    change_hash: &[u8],
+) -> Result<(), SyncSqliteError> {
     let mut queue: std::collections::VecDeque<Vec<u8>> = [change_hash.to_vec()].into();
     while let Some(hash) = queue.pop_front() {
         let children: Vec<Vec<u8>> = {

@@ -68,9 +68,12 @@ pub fn desired_resolved_path_state_hash(
     winner_version_hash: Option<&VersionHash>,
 ) -> Result<[u8; 32], SyncSqliteError> {
     match resolution {
-        PathResolution::Absent => {
-            Ok(compute_resolved_path_state_hash(group_id, path, MaterializedObjectKind::Absent, None))
-        }
+        PathResolution::Absent => Ok(compute_resolved_path_state_hash(
+            group_id,
+            path,
+            MaterializedObjectKind::Absent,
+            None,
+        )),
         PathResolution::Present { .. } => {
             let version_hash = winner_version_hash.ok_or_else(|| {
                 SyncSqliteError::NotFound(format!(

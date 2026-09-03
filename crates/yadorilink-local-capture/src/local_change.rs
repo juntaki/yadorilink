@@ -1844,7 +1844,10 @@ impl LocalChangeProcessor {
         // `Deferred` is only ever produced when a batch sink is supplied,
         // which only `process_flush_with_ignore`'s `DebounceFlush::Paths`
         // loop ever does.
-        match self.process_event_with_ignore_at(group_id, root, event, ignore_set, None, None).await? {
+        match self
+            .process_event_with_ignore_at(group_id, root, event, ignore_set, None, None)
+            .await?
+        {
             EventOutcome::Ready(outcome) => Ok(outcome),
             EventOutcome::Deferred => unreachable!(
                 "process_event_with_ignore_at only defers when given a pending_batch sink"
@@ -2069,13 +2072,14 @@ impl LocalChangeProcessor {
                         // from the current row) so the batched and
                         // immediate paths produce byte-identical rows.
                         if let Some(batch) = pending_batch {
-                            let mut record = existing_for_delete.clone().unwrap_or_else(|| FileRecord {
-                                path: rel_path.clone(),
-                                size: 0,
-                                mtime_unix_nanos: 0,
-                                blocks: vec![],
-                                deleted: false,
-                            });
+                            let mut record =
+                                existing_for_delete.clone().unwrap_or_else(|| FileRecord {
+                                    path: rel_path.clone(),
+                                    size: 0,
+                                    mtime_unix_nanos: 0,
+                                    blocks: vec![],
+                                    deleted: false,
+                                });
                             record.deleted = true;
                             record.mtime_unix_nanos = observed;
                             let op = Op::Delete { path: SyncPath(rel_path.clone()) };
@@ -2361,11 +2365,15 @@ impl LocalChangeProcessor {
         existing: Option<FileRecord>,
         materialization_state: Option<MaterializationState>,
         placeholder_generation: Option<yadorilink_sync_sqlite::RecordedPlaceholderGeneration>,
-    ) -> Result<(LocalChangeOutcome, Option<SymlinkClassification>, PendingUnixModeUpdate), LocalCaptureError>
-    {
+    ) -> Result<
+        (LocalChangeOutcome, Option<SymlinkClassification>, PendingUnixModeUpdate),
+        LocalCaptureError,
+    > {
         // M6-2 phase-timing diagnostic (temporary): see chunker.rs's
         // matching M6PHASE comment for why this exists.
-        tracing::warn!("M6PHASE T_capture_start: local capture entry (build_record_for_created_or_modified)");
+        tracing::warn!(
+            "M6PHASE T_capture_start: local capture entry (build_record_for_created_or_modified)"
+        );
         // classify via an lstat-equivalent check first —
         // `symlink_metadata` never follows the final path component,
         // unlike `Path::is_file`/`std::fs::metadata` (used further below,
@@ -2916,9 +2924,9 @@ impl LocalChangeProcessor {
                 let batch_entries: Vec<(String, String, i64)> = paths
                     .iter()
                     .filter_map(|(_, kind, observed_at, dirty_key)| {
-                        dirty_key
-                            .as_ref()
-                            .map(|key| (key.clone(), dirty_kind_str(*kind).to_string(), *observed_at))
+                        dirty_key.as_ref().map(|key| {
+                            (key.clone(), dirty_kind_str(*kind).to_string(), *observed_at)
+                        })
                     })
                     .collect();
                 if let Err(e) = self.state.record_dirty_paths_batch(
@@ -2969,7 +2977,11 @@ impl LocalChangeProcessor {
                     }
                     let result = self.begin_operation().and_then(|op| {
                         self.state
-                            .clear_dirty_paths_conditional_batch(group_id, pending_clears, &op.permit())
+                            .clear_dirty_paths_conditional_batch(
+                                group_id,
+                                pending_clears,
+                                &op.permit(),
+                            )
                             .map_err(LocalCaptureError::from)
                     });
                     if let Err(e) = result {
@@ -3293,9 +3305,7 @@ impl LocalChangeProcessor {
             // mutation was queued despite that gate, which is a logic
             // error in this module, not a runtime condition to recover
             // from.
-            unreachable!(
-                "a batched mutation was prepared without a change_emitter configured"
-            );
+            unreachable!("a batched mutation was prepared without a change_emitter configured");
         };
 
         // Acquire every member's path lock in lexicographic order --
@@ -3377,9 +3387,7 @@ impl LocalChangeProcessor {
         let mut resolved = Vec::with_capacity(batch.len());
         let mut valid_mutations = Vec::with_capacity(batch.len());
         let mut valid_evidence = Vec::with_capacity(batch.len());
-        for ((pending_commit, ok), evidence) in
-            batch.into_iter().zip(keep).zip(evidence_if_kept)
-        {
+        for ((pending_commit, ok), evidence) in batch.into_iter().zip(keep).zip(evidence_if_kept) {
             if ok {
                 resolved.push((
                     pending_commit.mutation.record().clone(),
@@ -4643,7 +4651,11 @@ mod tests {
              succeed"
         );
         assert!(
-            state.sqlite().dag_lookup_projection_obligation(TOCTOU_GROUP, TOCTOU_PATH).unwrap().is_none(),
+            state
+                .sqlite()
+                .dag_lookup_projection_obligation(TOCTOU_GROUP, TOCTOU_PATH)
+                .unwrap()
+                .is_none(),
             "sanity: the obligation must be gone once settled"
         );
         assert!(
@@ -4722,7 +4734,10 @@ mod tests {
         let materialize_content = content.clone();
         let materialize_task = tokio::task::spawn_blocking(move || {
             std::fs::write(materialize_root.join(TOCTOU_PATH), &materialize_content).unwrap();
-            materialize_state.materialization_state_repository().clear_held(TOCTOU_GROUP, TOCTOU_PATH).unwrap();
+            materialize_state
+                .materialization_state_repository()
+                .clear_held(TOCTOU_GROUP, TOCTOU_PATH)
+                .unwrap();
             materialize_state
                 .materialization_state_repository()
                 .set_materialization_state(
@@ -6431,7 +6446,12 @@ mod tests {
             .unwrap();
         state
             .materialization_state_repository()
-            .set_materialization_state("group-1", "CON.txt", MaterializationState::Placeholder, &permit)
+            .set_materialization_state(
+                "group-1",
+                "CON.txt",
+                MaterializationState::Placeholder,
+                &permit,
+            )
             .unwrap();
         state
             .materialization_state_repository()
@@ -6989,7 +7009,8 @@ mod tests {
     /// every path's dirty-journal row clears once its batch actually commits.
     #[tokio::test]
     async fn batched_authoritative_commit_produces_n_distinct_changes_in_sequential_causal_order() {
-        let (proc, state, _policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
+        let (proc, state, _policy_healthy, _store_dir, root_dir) =
+            processor_with_toggleable_policy();
         state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(ChangeAuth::PLACEHOLDER)));
         let root = canonical_root(&root_dir);
         let group = "group-1";
@@ -7004,7 +7025,11 @@ mod tests {
         }
         let flush = yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(paths);
         let outcome = proc.process_flush(group, &root, flush).await.unwrap();
-        assert_eq!(outcome.records.len(), N, "every path in the batch must be committed and reported");
+        assert_eq!(
+            outcome.records.len(),
+            N,
+            "every path in the batch must be committed and reported"
+        );
         assert!(
             state.dirty_path_repository().list_dirty_paths(group).unwrap().is_empty(),
             "every successfully batch-committed path's dirty-journal row must clear"
@@ -7018,7 +7043,10 @@ mod tests {
         for i in 0..N {
             let path = format!("f-{i:02}.txt");
             assert_eq!(
-                state.materialization_state_repository().get_materialization_state(group, &path).unwrap(),
+                state
+                    .materialization_state_repository()
+                    .get_materialization_state(group, &path)
+                    .unwrap(),
                 Some(MaterializationState::Hydrated),
                 "a batch-committed local edit must be stamped Hydrated, not left on the \
                  schema's own Placeholder default"
@@ -7047,7 +7075,10 @@ mod tests {
                 "each batched mutation must author its OWN single-op Change, never collapsed \
                  into one multi-op Change"
             );
-            assert!(seen.insert(hash.clone()), "every mutation in the batch must produce a distinct Change hash");
+            assert!(
+                seen.insert(hash.clone()),
+                "every mutation in the batch must produce a distinct Change hash"
+            );
             if step == N - 1 {
                 // The batch's very first mutation authors onto whatever
                 // the group's history already was -- empty here (a fresh
@@ -7122,7 +7153,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(matches!(outcome, EventOutcome::Deferred), "test precondition: must defer into the batch");
+            assert!(
+                matches!(outcome, EventOutcome::Deferred),
+                "test precondition: must defer into the batch"
+            );
         }
         assert_eq!(pending.len(), 3);
 
@@ -7133,7 +7167,10 @@ mod tests {
 
         let resolved = proc.flush_pending_batch(group, &mut pending).await;
         let resolved = resolved.unwrap_or_default();
-        assert!(resolved.is_empty(), "no mutation may resolve as committed once admission is revoked");
+        assert!(
+            resolved.is_empty(),
+            "no mutation may resolve as committed once admission is revoked"
+        );
 
         for i in 0..3 {
             let path = format!("f-{i}.txt");
@@ -7154,7 +7191,8 @@ mod tests {
     /// silently commit stale bytes over the peer's own update.
     #[tokio::test]
     async fn a_peer_mutation_between_preparation_and_validation_excludes_the_stale_mutation() {
-        let (proc, state, _policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
+        let (proc, state, _policy_healthy, _store_dir, root_dir) =
+            processor_with_toggleable_policy();
         state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(ChangeAuth::PLACEHOLDER)));
         let root = canonical_root(&root_dir);
         let group = "group-1";
@@ -7239,11 +7277,12 @@ mod tests {
     /// see this at all (every field matches); only comparing the row's
     /// authoring identity too catches it.
     #[tokio::test]
-    async fn a_peer_rewrite_with_byte_identical_file_record_fields_still_excludes_the_stale_mutation()
-    {
+    async fn a_peer_rewrite_with_byte_identical_file_record_fields_still_excludes_the_stale_mutation(
+    ) {
         use ed25519_dalek::SigningKey;
 
-        let (proc, state, _policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
+        let (proc, state, _policy_healthy, _store_dir, root_dir) =
+            processor_with_toggleable_policy();
         state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(ChangeAuth::PLACEHOLDER)));
         let root = canonical_root(&root_dir);
         let group = "group-1";
@@ -7257,7 +7296,8 @@ mod tests {
             0,
         )]);
         proc.process_flush(group, &root, setup_flush).await.unwrap();
-        let record_after_setup = state.file_index_repository().get_file(group, "doc.txt").unwrap().unwrap();
+        let record_after_setup =
+            state.file_index_repository().get_file(group, "doc.txt").unwrap().unwrap();
 
         // Prepare a local modification, deferring it into the batch.
         std::fs::write(&path, b"v2-local").unwrap();
@@ -7330,7 +7370,8 @@ mod tests {
     /// `disk_race_fingerprint` re-check before its physical write.
     #[tokio::test]
     async fn a_raw_disk_write_between_preparation_and_validation_excludes_the_stale_mutation() {
-        let (proc, state, _policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
+        let (proc, state, _policy_healthy, _store_dir, root_dir) =
+            processor_with_toggleable_policy();
         state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(ChangeAuth::PLACEHOLDER)));
         let root = canonical_root(&root_dir);
         let group = "group-1";
@@ -7384,11 +7425,7 @@ mod tests {
             "nothing may be indexed for content that was never durably authored"
         );
         assert!(
-            state
-                .sqlite()
-                .dag_lookup_materialized_generation(group, "doc.txt")
-                .unwrap()
-                .is_none(),
+            state.sqlite().dag_lookup_materialized_generation(group, "doc.txt").unwrap().is_none(),
             "mandatory race regression A: a path excluded by prepare-vs-commit \
              revalidation must publish no actual-state proof, not a proof for the \
              stale content it almost authored"
@@ -7404,7 +7441,8 @@ mod tests {
     /// acquisition order and can only ever wait in line, never cycle.
     #[tokio::test]
     async fn concurrent_overlapping_batches_never_deadlock_regardless_of_preparation_order() {
-        let (proc, state, _policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
+        let (proc, state, _policy_healthy, _store_dir, root_dir) =
+            processor_with_toggleable_policy();
         state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(ChangeAuth::PLACEHOLDER)));
         let root = canonical_root(&root_dir);
         let group = "group-1";
@@ -7461,7 +7499,8 @@ mod tests {
     /// duplicate a path.
     #[tokio::test]
     async fn more_than_one_authoritative_batch_worth_of_paths_all_commit_correctly() {
-        let (proc, state, _policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
+        let (proc, state, _policy_healthy, _store_dir, root_dir) =
+            processor_with_toggleable_policy();
         state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(ChangeAuth::PLACEHOLDER)));
         let root = canonical_root(&root_dir);
         let group = "group-1";
@@ -7498,7 +7537,8 @@ mod tests {
     /// tests, which are create/modify-only.
     #[tokio::test]
     async fn a_batch_mixing_creates_and_deletes_commits_both_variants_together() {
-        let (proc, state, _policy_healthy, _store_dir, root_dir) = processor_with_toggleable_policy();
+        let (proc, state, _policy_healthy, _store_dir, root_dir) =
+            processor_with_toggleable_policy();
         state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(ChangeAuth::PLACEHOLDER)));
         let root = canonical_root(&root_dir);
         let group = "group-1";
@@ -7530,11 +7570,20 @@ mod tests {
             (to_create, FsChangeKind::CreatedOrModified, 1),
         ]);
         let outcome = proc.process_flush(group, &root, flush).await.unwrap();
-        assert_eq!(outcome.records.len(), 3, "the create, the modify, and the delete must all commit");
+        assert_eq!(
+            outcome.records.len(),
+            3,
+            "the create, the modify, and the delete must all commit"
+        );
         assert!(state.dirty_path_repository().list_dirty_paths(group).unwrap().is_empty());
 
         assert!(
-            state.file_index_repository().get_file(group, "to-delete.txt").unwrap().unwrap().deleted,
+            state
+                .file_index_repository()
+                .get_file(group, "to-delete.txt")
+                .unwrap()
+                .unwrap()
+                .deleted,
             "the batched delete must tombstone the row"
         );
         let modified =

@@ -878,11 +878,13 @@ mod tests {
         let owner = SyncRootLock::acquire(&root).unwrap();
 
         owner.verify_still_owns().expect("first call must succeed");
-        let count_after_first = crate::fs_capabilities::probe_birth_time_granularity_call_count_for_test();
+        let count_after_first =
+            crate::fs_capabilities::probe_birth_time_granularity_call_count_for_test();
 
         owner.verify_still_owns().expect("second call must succeed");
         owner.verify_still_owns().expect("third call must succeed");
-        let count_after_more = crate::fs_capabilities::probe_birth_time_granularity_call_count_for_test();
+        let count_after_more =
+            crate::fs_capabilities::probe_birth_time_granularity_call_count_for_test();
 
         assert_eq!(
             count_after_more, count_after_first,

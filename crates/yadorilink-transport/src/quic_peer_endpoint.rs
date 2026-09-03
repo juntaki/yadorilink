@@ -490,10 +490,8 @@ impl QuicPeerEndpoint {
         &self,
         connection: &quinn::Connection,
     ) -> Result<(), TransportError> {
-        let mut stream = connection
-            .open_uni()
-            .await
-            .map_err(|err| TransportError::NoRoute(err.to_string()))?;
+        let mut stream =
+            connection.open_uni().await.map_err(|err| TransportError::NoRoute(err.to_string()))?;
         stream
             .write_all(&SELECTION_PREFACE)
             .await
@@ -575,7 +573,9 @@ impl QuicPeerEndpoint {
         peer_public_key: [u8; 32],
     ) -> Result<(quinn::Connection, SocketAddr), TransportError> {
         let Some((first, rest)) = candidates.split_first() else {
-            return Err(TransportError::NoRoute("no candidate addresses for this peer".to_string()));
+            return Err(TransportError::NoRoute(
+                "no candidate addresses for this peer".to_string(),
+            ));
         };
         // One candidate is the overwhelmingly common case and needs none of
         // the machinery below -- no task, no stagger, no losers to close.
@@ -643,9 +643,8 @@ impl QuicPeerEndpoint {
                 self.announce_selection(&connection).await?;
                 Ok((connection, candidate))
             }
-            None => Err(last_failure.unwrap_or_else(|| {
-                TransportError::NoRoute("no candidate answered".to_string())
-            })),
+            None => Err(last_failure
+                .unwrap_or_else(|| TransportError::NoRoute("no candidate answered".to_string()))),
         }
     }
 
@@ -677,8 +676,10 @@ impl QuicPeerEndpoint {
             // the queue.
             if !self.authorized.contains(&peer_public_key) {
                 connection.close(CONNECTION_NOT_WANTED.into(), b"peer authorization withdrawn");
-                tracing::debug!("discarding a queued connection from a peer revoked since it \
-                                 was accepted");
+                tracing::debug!(
+                    "discarding a queued connection from a peer revoked since it \
+                                 was accepted"
+                );
                 continue;
             }
             // The peer may have raced several candidates, so completing a
@@ -786,9 +787,8 @@ mod tests {
     use crate::transport_hub::TransportHub;
 
     async fn endpoint() -> (Arc<QuicPeerEndpoint>, SocketAddr, [u8; 32]) {
-        let hub = TransportHub::bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
-            .await
-            .expect("bind hub");
+        let hub =
+            TransportHub::bind((std::net::Ipv4Addr::LOCALHOST, 0).into()).await.expect("bind hub");
         let addr = hub.local_addr();
         let device = DeviceSigningKeyPair::generate();
         let public = device.public_bytes();
@@ -826,23 +826,19 @@ mod tests {
         // race resolving the other way round produces.
         dialler.announce_selection(&second).await.expect("announce the selection");
 
-        let claimed = tokio::time::timeout(
-            Duration::from_secs(20),
-            acceptor.accept(dialler_key),
-        )
-        .await
-        .expect("accept must resolve")
-        .expect("a selected connection must be handed over");
+        let claimed = tokio::time::timeout(Duration::from_secs(20), acceptor.accept(dialler_key))
+            .await
+            .expect("accept must resolve")
+            .expect("a selected connection must be handed over");
 
         // Prove it is `second` and not `first`: a stream opened on `second`
         // has to surface on the claimed connection.
         let (mut send, _recv) = second.open_bi().await.expect("open a stream on the selection");
         send.write_all(b"selected").await.expect("write on the selection");
-        let (_send, mut recv) =
-            tokio::time::timeout(Duration::from_secs(10), claimed.accept_bi())
-                .await
-                .expect("the claimed connection must carry the selection's traffic")
-                .expect("stream");
+        let (_send, mut recv) = tokio::time::timeout(Duration::from_secs(10), claimed.accept_bi())
+            .await
+            .expect("the claimed connection must carry the selection's traffic")
+            .expect("stream");
         let mut carried = [0u8; 8];
         recv.read_exact(&mut carried).await.expect("read the marker");
         assert_eq!(

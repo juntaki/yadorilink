@@ -498,13 +498,8 @@ pub fn adopt_observed_actual_generation_in_tx(
     filesystem_identity: Option<&FileIdentity>,
     now_unix_nanos: i64,
 ) -> Result<DiskGenerationBasis, SyncSqliteError> {
-    let adopted_epoch = bump_mutation_fence(
-        conn,
-        group_id,
-        path,
-        "external-actual-state-adopted",
-        now_unix_nanos,
-    )?;
+    let adopted_epoch =
+        bump_mutation_fence(conn, group_id, path, "external-actual-state-adopted", now_unix_nanos)?;
     write_generation_row(
         conn,
         group_id,
@@ -1222,7 +1217,9 @@ mod tests {
     fn a_path_with_no_admission_or_mutation_ever_has_no_usable_generation() {
         let conn = open();
         assert!(lookup_materialized_generation(&conn, "g", "never.txt").unwrap().is_none());
-        assert!(lookup_materialized_generation_diagnostic(&conn, "g", "never.txt").unwrap().is_none());
+        assert!(lookup_materialized_generation_diagnostic(&conn, "g", "never.txt")
+            .unwrap()
+            .is_none());
     }
 
     /// An invalidated `Absent` proof must be exactly as unusable as no
@@ -1263,7 +1260,8 @@ mod tests {
             lookup_materialized_generation(&conn, "g", "truly-never-recorded.txt").unwrap(),
             "invalidated-Absent must be indistinguishable from no-proof-at-all to a caller"
         );
-        let diag = lookup_materialized_generation_diagnostic(&conn, "g", "gone.txt").unwrap().unwrap();
+        let diag =
+            lookup_materialized_generation_diagnostic(&conn, "g", "gone.txt").unwrap().unwrap();
         assert_eq!(
             diag.object_kind,
             MaterializedObjectKind::Absent,
@@ -1352,11 +1350,13 @@ mod tests {
             1000,
         )
         .unwrap();
-        let before = lookup_materialized_generation_diagnostic(&conn, "g", "a.txt").unwrap().unwrap();
+        let before =
+            lookup_materialized_generation_diagnostic(&conn, "g", "a.txt").unwrap().unwrap();
 
         bump_mutation_fence(&conn, "g", "a.txt", "some-other-mutator", 2000).unwrap();
 
-        let after = lookup_materialized_generation_diagnostic(&conn, "g", "a.txt").unwrap().unwrap();
+        let after =
+            lookup_materialized_generation_diagnostic(&conn, "g", "a.txt").unwrap().unwrap();
         assert_eq!(before, after, "a fence bump must not mutate the proof row's own content");
         assert_eq!(after.object_kind, MaterializedObjectKind::RegularFile);
         assert_eq!(after.version, Some(version));
@@ -1395,7 +1395,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(published.is_none(), "a stale first publication must be rejected on the fence alone");
+        assert!(
+            published.is_none(),
+            "a stale first publication must be rejected on the fence alone"
+        );
         assert!(lookup_materialized_generation(&conn, "g", "c.txt").unwrap().is_none());
         assert!(
             lookup_materialized_generation_diagnostic(&conn, "g", "c.txt").unwrap().is_none(),

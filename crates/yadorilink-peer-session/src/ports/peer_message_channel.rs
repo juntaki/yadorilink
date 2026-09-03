@@ -157,9 +157,7 @@ impl PeerMessageChannel for QuicPeerChannel {
 mod tests {
     use std::sync::Arc;
 
-    use yadorilink_transport::{
-        ConnectRole, DeviceSigningKeyPair, QuicPeerEndpoint, TransportHub,
-    };
+    use yadorilink_transport::{ConnectRole, DeviceSigningKeyPair, QuicPeerEndpoint, TransportHub};
 
     use super::*;
 
@@ -184,8 +182,8 @@ mod tests {
         let dialer_public = dialer_key.public_bytes();
         let acceptor_public = acceptor_key.public_bytes();
 
-        let dialer = QuicPeerEndpoint::new(TransportHub::from_socket(dialer_socket), dialer_key)
-            .unwrap();
+        let dialer =
+            QuicPeerEndpoint::new(TransportHub::from_socket(dialer_socket), dialer_key).unwrap();
         let acceptor =
             QuicPeerEndpoint::new(TransportHub::from_socket(acceptor_socket), acceptor_key)
                 .unwrap();

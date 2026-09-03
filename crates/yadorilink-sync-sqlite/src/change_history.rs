@@ -558,7 +558,9 @@ impl ChangeHistoryRepository {
             let mut chunk_results = Vec::with_capacity(chunk.len());
             for item in chunk {
                 for version in item.versions {
-                    if let Err(e) = dag_store::put_file_version(tx, item.change.group_id.as_str(), version) {
+                    if let Err(e) =
+                        dag_store::put_file_version(tx, item.change.group_id.as_str(), version)
+                    {
                         item_failure.set(true);
                         return Err(e);
                     }
@@ -585,7 +587,11 @@ impl ChangeHistoryRepository {
                 chunk
                     .iter()
                     .map(|item| {
-                        self.dag_admit_change_with_versions(item.change, item.versions, item.applied)
+                        self.dag_admit_change_with_versions(
+                            item.change,
+                            item.versions,
+                            item.applied,
+                        )
                     })
                     .collect()
             }
@@ -718,7 +724,8 @@ mod tests {
     }
 
     fn open_test_repo() -> ChangeHistoryRepository {
-        let database = Arc::new(SyncDatabase::open_in_memory(schema_init).expect("open in-memory db"));
+        let database =
+            Arc::new(SyncDatabase::open_in_memory(schema_init).expect("open in-memory db"));
         ChangeHistoryRepository::new(database)
     }
 
@@ -758,9 +765,12 @@ mod tests {
                 .unwrap();
 
         let repo = open_test_repo();
-        assert!(repo.dag_admit_change(&root, true).unwrap().outcome == dag_store::AdmitOutcome::Applied);
         assert!(
-            repo.dag_admit_change(&leaf, true).unwrap().outcome == dag_store::AdmitOutcome::Orphaned
+            repo.dag_admit_change(&root, true).unwrap().outcome == dag_store::AdmitOutcome::Applied
+        );
+        assert!(
+            repo.dag_admit_change(&leaf, true).unwrap().outcome
+                == dag_store::AdmitOutcome::Orphaned
         );
 
         // mid's parent (root) is already live, so this goes through
@@ -868,13 +878,15 @@ mod tests {
         dag_store::init_dag_schema(&sender).unwrap();
         let em = ChangeEmitter::new("device-A", SigningKey::from_bytes(&[22u8; 32]));
 
-        let a = dag_store::emit_local_change(&sender, "g", vec![create_op("a")], real_auth(10, 2), &em)
-            .unwrap();
+        let a =
+            dag_store::emit_local_change(&sender, "g", vec![create_op("a")], real_auth(10, 2), &em)
+                .unwrap();
         // b pins an OLDER auth coordinate than its own parent (a) -- the
         // exact CausalAuthViolation shape the existing single-item test
         // above already establishes.
-        let b = dag_store::emit_local_change(&sender, "g", vec![create_op("b")], real_auth(3, 1), &em)
-            .unwrap();
+        let b =
+            dag_store::emit_local_change(&sender, "g", vec![create_op("b")], real_auth(3, 1), &em)
+                .unwrap();
         // c is a fully independent change (its own root, unrelated path),
         // sharing nothing causally with a/b -- a fresh sender/emitter pair,
         // since `emit_local_change` always chains onto ITS OWN emitter's
@@ -945,18 +957,26 @@ mod tests {
         let sender = Connection::open_in_memory().unwrap();
         dag_store::init_dag_schema(&sender).unwrap();
         let em = ChangeEmitter::new("device-A", SigningKey::from_bytes(&[66u8; 32]));
-        let root = dag_store::emit_local_change(&sender, "g", vec![create_op("root")], real_auth(10, 2), &em)
-            .unwrap();
+        let root = dag_store::emit_local_change(
+            &sender,
+            "g",
+            vec![create_op("root")],
+            real_auth(10, 2),
+            &em,
+        )
+        .unwrap();
         // b pins an OLDER auth coordinate than its own parent (root) --
         // CausalAuthViolation, exactly as the existing single-item test
         // establishes.
-        let b = dag_store::emit_local_change(&sender, "g", vec![create_op("b")], real_auth(3, 1), &em)
-            .unwrap();
+        let b =
+            dag_store::emit_local_change(&sender, "g", vec![create_op("b")], real_auth(3, 1), &em)
+                .unwrap();
         // c is b's OWN child (same emitter, chains onto b) -- the
         // scenario-defining detail: c's real causal parent is the change
         // that is about to be permanently rejected.
-        let c = dag_store::emit_local_change(&sender, "g", vec![create_op("c")], real_auth(3, 1), &em)
-            .unwrap();
+        let c =
+            dag_store::emit_local_change(&sender, "g", vec![create_op("c")], real_auth(3, 1), &em)
+                .unwrap();
 
         // Sequential reference: root admitted first (shared setup), then b
         // and c admitted one call each.
@@ -973,7 +993,8 @@ mod tests {
             PendingAdmission { change: &b, versions: &[], applied: true },
             PendingAdmission { change: &c, versions: &[], applied: true },
         ];
-        let mut batch_results = batched_repo.dag_admit_change_batch_with_versions(&items).into_iter();
+        let mut batch_results =
+            batched_repo.dag_admit_change_batch_with_versions(&items).into_iter();
         let batch_b = batch_results.next().unwrap();
         let batch_c = batch_results.next().unwrap().unwrap();
 
@@ -983,8 +1004,7 @@ mod tests {
             "b's own violation must surface identically whether admitted sequentially or batched"
         );
         assert_eq!(
-            seq_c.outcome,
-            batch_c.outcome,
+            seq_c.outcome, batch_c.outcome,
             "c's own outcome must match between sequential and batched admission"
         );
         assert_eq!(
@@ -1030,8 +1050,8 @@ mod tests {
     /// order, proving this test actually depends on order being preserved
     /// rather than passing vacuously regardless of it.
     #[test]
-    fn out_of_order_parent_child_inside_one_micro_batch_promotes_exactly_as_sequential_admission_would()
-    {
+    fn out_of_order_parent_child_inside_one_micro_batch_promotes_exactly_as_sequential_admission_would(
+    ) {
         let _guard = c4_diag_test_guard();
         let sender = Connection::open_in_memory().unwrap();
         dag_store::init_dag_schema(&sender).unwrap();
@@ -1133,9 +1153,10 @@ mod tests {
         repo.database
             .read::<_, SyncSqliteError>(|conn| {
                 for path in ["path-a", "path-b"] {
-                    let obligation =
-                        crate::projection_obligations::lookup_projection_obligation(conn, "g", path)
-                            .unwrap();
+                    let obligation = crate::projection_obligations::lookup_projection_obligation(
+                        conn, "g", path,
+                    )
+                    .unwrap();
                     assert!(
                         obligation.is_some(),
                         "{path} must have a projection obligation after batched admission"

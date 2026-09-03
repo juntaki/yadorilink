@@ -12,7 +12,9 @@ use std::time::Duration;
 use yadorilink_peer_session::peer_session::RetirementAttempt;
 use yadorilink_replica_domain::ids::ChangeHash;
 use yadorilink_replica_domain::session_state::RetroactiveRepairOutcome;
-use yadorilink_root_authority::ignore_patterns::{is_ignore_file_relative_path, EffectiveIgnoreSet};
+use yadorilink_root_authority::ignore_patterns::{
+    is_ignore_file_relative_path, EffectiveIgnoreSet,
+};
 use yadorilink_sync_sqlite::dag_store::ChangeEmitter;
 
 use crate::daemon_state::DaemonState;
@@ -97,7 +99,13 @@ pub async fn drive_obligations_once_for_test_with_hooks(
     total_limit: u32,
     hooks: &Arc<BeforeCompletionHook>,
 ) -> bool {
-    super::engine_impl::drive_obligations_once_for_test_with_hooks(state, per_group_limit, total_limit, hooks).await
+    super::engine_impl::drive_obligations_once_for_test_with_hooks(
+        state,
+        per_group_limit,
+        total_limit,
+        hooks,
+    )
+    .await
 }
 
 pub async fn run(state: Arc<DaemonState>) {
@@ -351,7 +359,9 @@ async fn run_hazard_recheck_pass(state: &Arc<DaemonState>, pending: BTreeMap<Str
         let replica_coordinator_for_list = state.replica_coordinator.clone();
         let list_group_id = group_id.clone();
         let held_paths = match tokio::task::spawn_blocking(move || {
-            replica_coordinator_for_list.materialization_state_repository().list_held_paths(&list_group_id)
+            replica_coordinator_for_list
+                .materialization_state_repository()
+                .list_held_paths(&list_group_id)
         })
         .await
         {
@@ -374,10 +384,7 @@ async fn run_hazard_recheck_pass(state: &Arc<DaemonState>, pending: BTreeMap<Str
             .min_by(|a, b| a.0.cmp(&b.0))
             .map(|(_, session)| session)
             .unwrap_or_else(|| state.local_retirement_session(&group_id));
-        match session
-            .reconcile_paths_directly(&group_id, held_paths.into_iter().collect())
-            .await
-        {
+        match session.reconcile_paths_directly(&group_id, held_paths.into_iter().collect()).await {
             Ok(Some(_)) => {
                 state.replica_coordinator.hazard_recheck_wake().complete(&group_id, generation);
             }
@@ -499,7 +506,8 @@ async fn run_ignore_recheck_pass(state: &Arc<DaemonState>, group_id: &str) {
         std::slice::from_ref(&group_id.to_string()),
     );
     let ignore_set = sync_roots.get(group_id).map(|root| {
-        EffectiveIgnoreSet::load_for_link_root(root).unwrap_or_else(|_| EffectiveIgnoreSet::defaults_only())
+        EffectiveIgnoreSet::load_for_link_root(root)
+            .unwrap_or_else(|_| EffectiveIgnoreSet::defaults_only())
     });
     let mut any_rearmed = false;
     for path in &ignore_blocked_paths {
@@ -856,14 +864,16 @@ mod hazard_recheck_tests {
         let root = root_dir.path().canonicalize().unwrap();
         let replica_coordinator =
             Arc::new(crate::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap());
-        let block_store = Arc::new(yadorilink_local_storage::FsBlockStore::new(store_dir.path()).unwrap());
+        let block_store =
+            Arc::new(yadorilink_local_storage::FsBlockStore::new(store_dir.path()).unwrap());
 
         replica_coordinator.link_repository().add_link(&root.to_string_lossy(), GROUP).unwrap();
         VerifiedRoot::open(&root, GROUP, replica_coordinator.as_ref()).unwrap();
         let generation = replica_coordinator.startup_readiness().begin_group_startup(GROUP);
         replica_coordinator.startup_readiness().mark_group_ready(GROUP, generation);
 
-        let build = DaemonState::build("device-local".to_string(), replica_coordinator, block_store);
+        let build =
+            DaemonState::build("device-local".to_string(), replica_coordinator, block_store);
         let state = build.state;
         state.test_root_commit_authorities.lock().unwrap().insert(
             GROUP.to_string(),
@@ -873,7 +883,13 @@ mod hazard_recheck_tests {
         (state, root_dir)
     }
 
-    fn admit_change(state: &DaemonState, device: &str, key: &SigningKey, path: &str, version: &FileVersion) -> Change {
+    fn admit_change(
+        state: &DaemonState,
+        device: &str,
+        key: &SigningKey,
+        path: &str,
+        version: &FileVersion,
+    ) -> Change {
         let change = Change::create_signed(
             vec![],
             0,
@@ -1053,7 +1069,9 @@ mod ignore_recheck_tests {
             "device-local".to_string(),
             "device-peer".to_string(),
             state.replica_coordinator.clone(),
-            Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(state.block_store.clone())),
+            Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                state.block_store.clone(),
+            )),
             vec![GROUP.to_string()],
             HashMap::from([(GROUP.to_string(), root.to_path_buf())]),
             Some(state.forward_tx.clone()),
@@ -1085,14 +1103,16 @@ mod ignore_recheck_tests {
         let root = root_dir.path().canonicalize().unwrap();
         let replica_coordinator =
             Arc::new(crate::replica_coordinator::ReplicaCoordinator::open_in_memory().unwrap());
-        let block_store = Arc::new(yadorilink_local_storage::FsBlockStore::new(store_dir.path()).unwrap());
+        let block_store =
+            Arc::new(yadorilink_local_storage::FsBlockStore::new(store_dir.path()).unwrap());
 
         replica_coordinator.link_repository().add_link(&root.to_string_lossy(), GROUP).unwrap();
         VerifiedRoot::open(&root, GROUP, replica_coordinator.as_ref()).unwrap();
         let generation = replica_coordinator.startup_readiness().begin_group_startup(GROUP);
         replica_coordinator.startup_readiness().mark_group_ready(GROUP, generation);
 
-        let build = DaemonState::build("device-local".to_string(), replica_coordinator, block_store);
+        let build =
+            DaemonState::build("device-local".to_string(), replica_coordinator, block_store);
         let state = build.state;
         state.test_root_commit_authorities.lock().unwrap().insert(
             GROUP.to_string(),
@@ -1102,7 +1122,13 @@ mod ignore_recheck_tests {
         (state, root_dir)
     }
 
-    fn admit_change(state: &DaemonState, device: &str, key: &SigningKey, path: &str, version: &FileVersion) -> Change {
+    fn admit_change(
+        state: &DaemonState,
+        device: &str,
+        key: &SigningKey,
+        path: &str,
+        version: &FileVersion,
+    ) -> Change {
         let change = Change::create_signed(
             vec![],
             0,
@@ -1200,7 +1226,9 @@ mod ignore_recheck_tests {
         // The re-arm alone doesn't materialize anything -- it just hands
         // the path back to the ordinary scheduler. Confirm that scheduler
         // actually converges it, end to end.
-        assert!(crate::convergence::engine::drive_obligations_once_for_test(&state, 128, 256).await);
+        assert!(
+            crate::convergence::engine::drive_obligations_once_for_test(&state, 128, 256).await
+        );
         assert!(
             root_dir.path().join("was-ignored.txt").exists(),
             "the ordinary obligation-driven scheduler must materialize the re-armed path to disk"
@@ -1287,6 +1315,11 @@ mod ignore_recheck_tests {
     async fn a_group_with_nothing_ignore_blocked_is_a_no_op() {
         let (state, _root_dir) = build_state_with_adopted_group().await;
         run_ignore_recheck_pass(&state, GROUP).await;
-        assert!(state.replica_coordinator.sqlite().dag_list_ignore_blocked_paths(GROUP).unwrap().is_empty());
+        assert!(state
+            .replica_coordinator
+            .sqlite()
+            .dag_list_ignore_blocked_paths(GROUP)
+            .unwrap()
+            .is_empty());
     }
 }

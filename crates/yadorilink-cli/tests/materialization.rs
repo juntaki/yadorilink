@@ -108,6 +108,21 @@ async fn evict_command_turns_a_hydrated_file_into_a_placeholder() {
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
+    // `upsert_file` no longer implies `Hydrated` (schema v25 changed the
+    // column default to `Placeholder` -- see `set_materialization_state_
+    // in_tx`'s doc comment): this fixture writes real matching content
+    // directly to disk to simulate an already-hydrated file, so it must
+    // say so explicitly now, same as every other caller of this pattern.
+    state
+        .replica_coordinator
+        .materialization_state_repository()
+        .set_materialization_state(
+            "group-1",
+            "notes.txt",
+            MaterializationState::Hydrated,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
 
     yadorilink_cli::commands::materialization::evict(
         folder.join("notes.txt").to_string_lossy().to_string(),
@@ -153,6 +168,18 @@ async fn evict_command_fails_for_a_pinned_file() {
                 blocks: vec![BlockInfo { hash: vec![0x11u8; 32], offset: 0, size: 500 }],
                 deleted: false,
             },
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    // See `evict_command_turns_a_hydrated_file_into_a_placeholder`'s
+    // identical comment: `upsert_file` no longer implies `Hydrated`.
+    state
+        .replica_coordinator
+        .materialization_state_repository()
+        .set_materialization_state(
+            "group-1",
+            "notes.txt",
+            MaterializationState::Hydrated,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
@@ -236,6 +263,18 @@ async fn unpin_then_evict_succeeds() {
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
+    // See `evict_command_turns_a_hydrated_file_into_a_placeholder`'s
+    // identical comment: `upsert_file` no longer implies `Hydrated`.
+    state
+        .replica_coordinator
+        .materialization_state_repository()
+        .set_materialization_state(
+            "group-1",
+            "notes.txt",
+            MaterializationState::Hydrated,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
     state
         .replica_coordinator
         .file_index_repository()
@@ -288,6 +327,23 @@ async fn pin_command_succeeds_for_an_already_hydrated_file() {
                 blocks: vec![],
                 deleted: false,
             },
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+    // See `evict_command_turns_a_hydrated_file_into_a_placeholder`'s
+    // identical comment: `upsert_file` no longer implies `Hydrated` --
+    // without this, `pin`'s own already_hydrated check
+    // (`hydration.rs::pin`) is false, so it falls through to a real
+    // `hydrate()` call, which needs peer/root-commit-authority setup this
+    // fixture never provides (it's testing the already-hydrated
+    // short-circuit specifically, per its own name).
+    state
+        .replica_coordinator
+        .materialization_state_repository()
+        .set_materialization_state(
+            "group-1",
+            "notes.txt",
+            MaterializationState::Hydrated,
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();

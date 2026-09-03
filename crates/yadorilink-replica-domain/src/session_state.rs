@@ -258,16 +258,8 @@ pub struct ChangeContent<'a> {
 /// granularity for what were N independent local edits).
 #[derive(Debug)]
 pub enum PreparedLocalMutation {
-    Upsert {
-        record: FileRecord,
-        op: Op,
-        version: FileVersion,
-        meta: Option<LocalFileMetaColumns>,
-    },
-    Delete {
-        record: FileRecord,
-        op: Op,
-    },
+    Upsert { record: FileRecord, op: Op, version: FileVersion, meta: Option<LocalFileMetaColumns> },
+    Delete { record: FileRecord, op: Op },
 }
 
 impl PreparedLocalMutation {

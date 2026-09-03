@@ -168,10 +168,8 @@ struct Inner {
     /// causal-frontier half of the real CAS (no DAG in this fake); only the
     /// mutation-fence half is enforced, matching what this file's tests
     /// actually need to exercise (the race the fence exists to catch).
-    materialized_generations: HashMap<
-        (String, String),
-        (i64, Vec<ChangeHash>, Option<RecordKind>, Option<VersionHash>),
-    >,
+    materialized_generations:
+        HashMap<(String, String), (i64, Vec<ChangeHash>, Option<RecordKind>, Option<VersionHash>)>,
     /// M6PHASE provenance-write-amplification investigation: one entry per
     /// `record_group_block_provenance` CALL (not per hash), each holding
     /// the exact hash slice that call was given -- a "counting fake" for
@@ -1218,10 +1216,8 @@ impl PeerReplicaStatePort for FakeReplicaState {
         _mutation_kind: &str,
     ) -> Result<i64, PeerSessionError> {
         let mut inner = self.lock();
-        let entry = inner
-            .mutation_fences
-            .entry((group_id.to_string(), path.to_string()))
-            .or_insert(0);
+        let entry =
+            inner.mutation_fences.entry((group_id.to_string(), path.to_string())).or_insert(0);
         *entry += 1;
         Ok(*entry)
     }
@@ -1232,10 +1228,7 @@ impl PeerReplicaStatePort for FakeReplicaState {
         path: &str,
     ) -> Result<i64, PeerSessionError> {
         let mut inner = self.lock();
-        Ok(*inner
-            .mutation_fences
-            .entry((group_id.to_string(), path.to_string()))
-            .or_insert(0))
+        Ok(*inner.mutation_fences.entry((group_id.to_string(), path.to_string())).or_insert(0))
     }
 
     fn dag_publish_materialized_generation_if_fence_current(

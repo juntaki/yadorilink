@@ -70,11 +70,7 @@ fn describe_index_state(state: &DaemonState, group_id: &str, path: &str) -> Stri
     )
 }
 
-fn spawn_orchestrator(
-    coordination_addr: String,
-    device_id: String,
-    state: Arc<DaemonState>,
-) {
+fn spawn_orchestrator(coordination_addr: String, device_id: String, state: Arc<DaemonState>) {
     let log_device_id = device_id.clone();
     let config = peer_orchestrator::OrchestratorConfig {
         coordination_addr,
@@ -104,10 +100,8 @@ async fn peers_keep_syncing_after_coordination_plane_goes_unreachable() {
     let root_a = tempfile::tempdir().unwrap();
     let root_b = tempfile::tempdir().unwrap();
 
-    register_with_fake(&fake, &daemon_a.state, device_a_id, &[group_id])
-        .await;
-    register_with_fake(&fake, &daemon_b.state, device_b_id, &[group_id])
-        .await;
+    register_with_fake(&fake, &daemon_a.state, device_a_id, &[group_id]).await;
+    register_with_fake(&fake, &daemon_b.state, device_b_id, &[group_id]).await;
 
     // Seed the healthy-sync probe before linking so the deterministic initial
     // scan captures it. Watcher behavior is exercised by the post-outage

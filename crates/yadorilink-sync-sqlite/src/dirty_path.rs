@@ -248,7 +248,8 @@ mod tests {
     }
 
     fn open_test_repo() -> DirtyPathRepository {
-        let database = Arc::new(SyncDatabase::open_in_memory(schema_init).expect("open in-memory db"));
+        let database =
+            Arc::new(SyncDatabase::open_in_memory(schema_init).expect("open in-memory db"));
         DirtyPathRepository::new(database)
     }
 

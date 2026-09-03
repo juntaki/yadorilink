@@ -248,8 +248,7 @@ impl AdaptiveWindow {
     /// backoff already accounted for.
     fn apply_debounced_backoff(&self, state: &mut WindowState) {
         let debounce_window = state.smoothed_rtt.unwrap_or(BACKOFF_DEBOUNCE_FALLBACK);
-        let debounced =
-            state.last_backoff.is_some_and(|last| last.elapsed() < debounce_window);
+        let debounced = state.last_backoff.is_some_and(|last| last.elapsed() < debounce_window);
         if debounced {
             return;
         }
@@ -388,7 +387,11 @@ mod tests {
         assert_eq!(w.current(), 2, "first timeout must apply its own halving");
         std::thread::sleep(BACKOFF_DEBOUNCE_FALLBACK + Duration::from_millis(50));
         w.on_timeout();
-        assert_eq!(w.current(), 1, "a timeout genuinely after the debounce window must back off again");
+        assert_eq!(
+            w.current(),
+            1,
+            "a timeout genuinely after the debounce window must back off again"
+        );
     }
 
     /// Regression: `Busy` (an explicit, fast congestion signal -- see

@@ -35,11 +35,7 @@ fn new_test_daemon(device_id: &str) -> TestDaemon {
     let store = Arc::new(FsBlockStore::new(Box::leak(Box::new(store_dir)).path()).unwrap());
     let sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
     let state = DaemonState::new(device_id.to_string(), sync_state, store);
-    TestDaemon {
-        device_id: device_id.to_string(),
-        state,
-        _root: tempfile::tempdir().unwrap(),
-    }
+    TestDaemon { device_id: device_id.to_string(), state, _root: tempfile::tempdir().unwrap() }
 }
 
 fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
@@ -48,11 +44,7 @@ fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
     LinkRuntimeController::new(state.clone()).start(local_path, group_id.to_string()).unwrap();
 }
 
-fn spawn_orchestrator(
-    coordination_addr: String,
-    device_id: String,
-    state: Arc<DaemonState>,
-) {
+fn spawn_orchestrator(coordination_addr: String, device_id: String, state: Arc<DaemonState>) {
     let log_device_id = device_id.clone();
     let config = peer_orchestrator::OrchestratorConfig {
         coordination_addr,
@@ -74,8 +66,7 @@ async fn relay_capable_propagates_over_the_real_netmap_wire_independent_of_full_
     let group_id = "route-model-group";
 
     let hub = new_test_daemon("route-model-hub");
-    register_with_fake(&fake, &hub.state, &hub.device_id, &[group_id])
-        .await;
+    register_with_fake(&fake, &hub.state, &hub.device_id, &[group_id]).await;
     let hub_root = tempfile::tempdir().unwrap();
     link(&hub.state, hub_root.path(), group_id);
 
@@ -83,31 +74,20 @@ async fn relay_capable_propagates_over_the_real_netmap_wire_independent_of_full_
     // not necessarily a storage anchor" case this pass's design explicitly
     // keeps separable.
     let nas = new_test_daemon("route-model-nas");
-    register_with_fake(&fake, &nas.state, &nas.device_id, &[group_id])
-        .await;
+    register_with_fake(&fake, &nas.state, &nas.device_id, &[group_id]).await;
     link(&nas.state, nas._root.path(), group_id);
     fake.set_relay_capable(&nas.device_id, true);
 
     // archivist: a full replica, NOT relay-capable -- the reverse
     // combination, so neither role can be silently coupled to the other.
     let archivist = new_test_daemon("route-model-archivist");
-    register_with_fake(
-        &fake,
-        &archivist.state,
-        &archivist.device_id,
-        &[group_id],
-    )
-    .await;
+    register_with_fake(&fake, &archivist.state, &archivist.device_id, &[group_id]).await;
     link(&archivist.state, archivist._root.path(), group_id);
     fake.set_full_replica(&archivist.device_id, group_id, true);
 
     spawn_orchestrator(fake.addr(), hub.device_id.clone(), hub.state.clone());
     spawn_orchestrator(fake.addr(), nas.device_id.clone(), nas.state.clone());
-    spawn_orchestrator(
-        fake.addr(),
-        archivist.device_id.clone(),
-        archivist.state.clone(),
-    );
+    spawn_orchestrator(fake.addr(), archivist.device_id.clone(), archivist.state.clone());
 
     // M3 Pass 4 (independent-review finding): both axes -- relay
     // capability AND full-replica status -- belong in the SAME wait

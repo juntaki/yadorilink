@@ -90,7 +90,9 @@ pub enum PeerSessionError {
     /// `SettlementEvidence::ExactObject` on this treats it exactly like
     /// `ReplicatedXattrsNotExact` -- leave the obligation outstanding for
     /// retry, never let it publish a false exactness proof.
-    #[error("physical object kind at {0:?} does not match the desired version's claimed record kind")]
+    #[error(
+        "physical object kind at {0:?} does not match the desired version's claimed record kind"
+    )]
     PhysicalKindMismatch(String),
 }
 

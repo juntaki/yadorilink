@@ -246,12 +246,7 @@ fn new_device(device_id: &str) -> Device {
     let sync_state = Arc::new(ReplicaCoordinator::open(&db_path).unwrap());
     let state = DaemonState::new(device_id.to_string(), sync_state, store);
     ensure_device_signing_key(&state);
-    Device {
-        state,
-        root: tempfile::tempdir().unwrap(),
-        _store_dir: store_dir,
-        _db_dir: db_dir,
-    }
+    Device { state, root: tempfile::tempdir().unwrap(), _store_dir: store_dir, _db_dir: db_dir }
 }
 
 #[derive(Debug)]
@@ -302,11 +297,8 @@ async fn run_arm(
     if wait_for_a_ready_first {
         let window = observation_window();
         let ready_wait_started = std::time::Instant::now();
-        match tokio::time::timeout(
-            window,
-            a.state.replica_coordinator.wait_group_ready(group_id),
-        )
-        .await
+        match tokio::time::timeout(window, a.state.replica_coordinator.wait_group_ready(group_id))
+            .await
         {
             Ok(Ok(())) => {
                 tracing::warn!(
@@ -463,10 +455,7 @@ async fn startup_scan_serving_race_two_arm_comparison() {
         ?arm_connect_immediately,
         "C4_DIAG: two-arm comparison result -- connect_immediately"
     );
-    tracing::warn!(
-        ?arm_wait_ready_first,
-        "C4_DIAG: two-arm comparison result -- wait_ready_first"
-    );
+    tracing::warn!(?arm_wait_ready_first, "C4_DIAG: two-arm comparison result -- wait_ready_first");
 }
 
 /// Just the `wait_ready_first` arm -- the one that stalled catastrophically
@@ -493,10 +482,7 @@ async fn startup_scan_serving_race_wait_ready_first_only() {
     let arm_wait_ready_first =
         run_arm("wait_ready_first", dir_count, medium_file_count, true).await;
 
-    tracing::warn!(
-        ?arm_wait_ready_first,
-        "C4_DIAG: wait_ready_first-only result (post-fix)"
-    );
+    tracing::warn!(?arm_wait_ready_first, "C4_DIAG: wait_ready_first-only result (post-fix)");
 }
 
 /// A deterministic per-role Ed25519 identity for [`startup_scan_serving_

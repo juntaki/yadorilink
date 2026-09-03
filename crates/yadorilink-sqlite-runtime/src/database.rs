@@ -98,8 +98,9 @@ pub mod c4_diag {
     // `writer_gate`, so this adds no additional lock contention beyond
     // what already exists.
     fn call_sites() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
-        static SITES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
-            std::sync::OnceLock::new();
+        static SITES: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, u64>>,
+        > = std::sync::OnceLock::new();
         SITES.get_or_init(Default::default)
     }
 

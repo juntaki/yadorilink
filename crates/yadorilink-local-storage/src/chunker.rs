@@ -410,7 +410,15 @@ pub fn chunk_file_content_defined_with_callback(
     let not_empty = std::sync::Condvar::new();
     let not_full = std::sync::Condvar::new();
     let commit_result = std::thread::scope(|scope| -> Result<(), StorageError> {
-        let committer = BackgroundBatchCommitter::spawn(scope, store, &queue_state, &not_empty, &not_full, &error, &stop);
+        let committer = BackgroundBatchCommitter::spawn(
+            scope,
+            store,
+            &queue_state,
+            &not_empty,
+            &not_full,
+            &error,
+            &stop,
+        );
         for result in chunker {
             if committer.should_stop() {
                 break;
@@ -440,7 +448,9 @@ pub fn chunk_file_content_defined_with_callback(
             pending.push(prepared);
             if pending.len() >= CDC_BULK_INGEST_BATCH_SIZE {
                 if !first_batch_logged {
-                    tracing::warn!("M6PHASE T_store_first: first bulk batch submitted for background commit");
+                    tracing::warn!(
+                        "M6PHASE T_store_first: first bulk batch submitted for background commit"
+                    );
                     first_batch_logged = true;
                 }
                 committer.submit(std::mem::replace(
@@ -452,7 +462,9 @@ pub fn chunk_file_content_defined_with_callback(
         tracing::warn!("M6PHASE T_chunking_eof: chunk producer reached EOF");
         if !pending.is_empty() {
             if !first_batch_logged {
-                tracing::warn!("M6PHASE T_store_first: first bulk batch submitted for background commit");
+                tracing::warn!(
+                    "M6PHASE T_store_first: first bulk batch submitted for background commit"
+                );
             }
             committer.submit(pending);
         }
@@ -529,7 +541,15 @@ pub fn chunk_file_fixed_with_callback(
     let not_empty = std::sync::Condvar::new();
     let not_full = std::sync::Condvar::new();
     let commit_result = std::thread::scope(|scope| -> Result<(), StorageError> {
-        let committer = BackgroundBatchCommitter::spawn(scope, store, &queue_state, &not_empty, &not_full, &error, &stop);
+        let committer = BackgroundBatchCommitter::spawn(
+            scope,
+            store,
+            &queue_state,
+            &not_empty,
+            &not_full,
+            &error,
+            &stop,
+        );
         loop {
             if committer.should_stop() {
                 break;
@@ -565,7 +585,9 @@ pub fn chunk_file_fixed_with_callback(
             pending.push(prepared);
             if pending.len() >= CDC_BULK_INGEST_BATCH_SIZE {
                 if !first_batch_logged {
-                    tracing::warn!("M6PHASE T_store_first: first bulk batch submitted for background commit");
+                    tracing::warn!(
+                        "M6PHASE T_store_first: first bulk batch submitted for background commit"
+                    );
                     first_batch_logged = true;
                 }
                 committer.submit(std::mem::replace(
@@ -581,7 +603,9 @@ pub fn chunk_file_fixed_with_callback(
         tracing::warn!("M6PHASE T_chunking_eof: chunk producer reached EOF");
         if !pending.is_empty() {
             if !first_batch_logged {
-                tracing::warn!("M6PHASE T_store_first: first bulk batch submitted for background commit");
+                tracing::warn!(
+                    "M6PHASE T_store_first: first bulk batch submitted for background commit"
+                );
             }
             committer.submit(pending);
         }
@@ -690,7 +714,9 @@ fn read_xattrs_filtered(file: &fs::File, allow: impl Fn(&str) -> bool) -> Vec<(S
 /// point in the file does -- the exactness proof must never mistake
 /// "could not check" for "matches."
 #[cfg(target_os = "linux")]
-pub(crate) fn read_replicated_xattrs_strict(file: &fs::File) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+pub(crate) fn read_replicated_xattrs_strict(
+    file: &fs::File,
+) -> std::io::Result<Vec<(String, Vec<u8>)>> {
     const LINUX_ALLOWED_PREFIX: &str = "user.";
     use std::os::unix::io::AsRawFd;
     let fd = file.as_raw_fd();
@@ -1200,10 +1226,11 @@ mod tests {
         assert!(plain_blocks.len() > 1, "test needs multiple blocks to be meaningful");
 
         let mut observed: Vec<(BlockInfo, Arc<[u8]>)> = Vec::new();
-        let callback_blocks = chunk_file_content_defined_with_callback(&store, &src_path, |block, data| {
-            observed.push((block.clone(), data));
-        })
-        .unwrap();
+        let callback_blocks =
+            chunk_file_content_defined_with_callback(&store, &src_path, |block, data| {
+                observed.push((block.clone(), data));
+            })
+            .unwrap();
 
         assert_eq!(
             callback_blocks, plain_blocks,
@@ -1224,8 +1251,8 @@ mod tests {
                 observed_block.size as usize,
                 "callback's data length must match its own block's declared size"
             );
-            let expected_content =
-                &content[observed_block.offset as usize..observed_block.offset as usize + observed_data.len()];
+            let expected_content = &content[observed_block.offset as usize
+                ..observed_block.offset as usize + observed_data.len()];
             assert_eq!(
                 observed_data.as_ref(),
                 expected_content,

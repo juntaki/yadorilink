@@ -131,9 +131,7 @@ impl Device {
 }
 
 async fn connect_pair(_addr: std::net::SocketAddr) -> (Arc<QuicPeerChannel>, Arc<QuicPeerChannel>) {
-    use yadorilink_transport::{
-        ConnectRole, DeviceSigningKeyPair, QuicPeerEndpoint, TransportHub,
-    };
+    use yadorilink_transport::{ConnectRole, DeviceSigningKeyPair, QuicPeerEndpoint, TransportHub};
     // Direct loopback: bind each side's UDP socket and dial the other's
     // address -- the same wiring the daemon's peer orchestrator uses, minus
     // the coordination-plane candidate discovery.

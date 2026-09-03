@@ -900,8 +900,8 @@ mod tests {
     /// history goes away, never the entry `list_trashed`/`trash restore`
     /// actually needs.
     #[tokio::test]
-    async fn run_retention_expiry_sweep_prunes_old_history_without_disturbing_a_trashed_paths_visibility()
-    {
+    async fn run_retention_expiry_sweep_prunes_old_history_without_disturbing_a_trashed_paths_visibility(
+    ) {
         let state = test_state();
         state.replica_coordinator.link_repository().add_link("/tmp/photos", "group-1").unwrap();
         let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
@@ -928,11 +928,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            state.replica_coordinator.sqlite().dag_list_versions("group-1", "gone.jpg").unwrap().len(),
+            state
+                .replica_coordinator
+                .sqlite()
+                .dag_list_versions("group-1", "gone.jpg")
+                .unwrap()
+                .len(),
             12,
             "11 upserts plus the delete-created tombstone"
         );
-        let trashed = state.replica_coordinator.file_index_repository().list_trashed("group-1").unwrap();
+        let trashed =
+            state.replica_coordinator.file_index_repository().list_trashed("group-1").unwrap();
         assert_eq!(trashed.len(), 1, "the deleted path must be visible in trash before the sweep");
         assert_eq!(trashed[0].path, "gone.jpg");
 
@@ -950,7 +956,8 @@ mod tests {
         // The still-relevant trash entry itself must be entirely
         // unaffected -- expiry prunes stale HISTORY, never the version
         // `list_trashed`/`trash restore` actually needs.
-        let trashed = state.replica_coordinator.file_index_repository().list_trashed("group-1").unwrap();
+        let trashed =
+            state.replica_coordinator.file_index_repository().list_trashed("group-1").unwrap();
         assert_eq!(trashed.len(), 1, "the trashed path must still be visible after the sweep");
         assert_eq!(trashed[0].path, "gone.jpg");
     }

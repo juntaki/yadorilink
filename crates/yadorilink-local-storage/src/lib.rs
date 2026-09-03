@@ -43,11 +43,11 @@ pub use materialize_write::materialize_symlink_windows;
 pub use materialize_write::{
     apply_unix_mode, apply_xattrs, create_or_defer_placeholder,
     mint_windows_placeholder_generation, mtime_already_matches_disk, persist_reconstructed_file,
-    reconstruct_file, reconstruct_file_to_temp, stamp_mtime_at_path, unix_mode_already_matches_disk,
-    verify_delete_target_within_canonical_root, verify_delete_target_within_root,
-    verify_replicated_xattrs_exact, verify_write_target_within_canonical_root,
-    verify_write_target_within_root, write_placeholder, xattrs_already_match_disk,
-    PlaceholderDiskIdentity, PlaceholderIdentityToRecord, INTERNAL_INODE_PROVIDER_KIND,
-    WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
+    reconstruct_file, reconstruct_file_to_temp, stamp_mtime_at_path,
+    unix_mode_already_matches_disk, verify_delete_target_within_canonical_root,
+    verify_delete_target_within_root, verify_replicated_xattrs_exact,
+    verify_write_target_within_canonical_root, verify_write_target_within_root, write_placeholder,
+    xattrs_already_match_disk, PlaceholderDiskIdentity, PlaceholderIdentityToRecord,
+    INTERNAL_INODE_PROVIDER_KIND, WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
 };
 pub use traits::{BlockStore, ContentHash, GcReport, LocallyHashedBlock, StorageUsage};

@@ -36,11 +36,11 @@ mod local_candidates;
 mod local_discovery;
 pub mod nat;
 mod peer_channel;
-pub mod relay_path;
 pub mod quic_identity;
 pub mod quic_peer_channel;
 pub mod quic_peer_endpoint;
 pub mod quic_socket;
+pub mod relay_path;
 mod supervise;
 mod transport_hub;
 mod udp_batching;
@@ -66,7 +66,6 @@ pub use peer_channel::{
     classify_endpoint, diff_netmap, NetmapDiff, NetmapSnapshot, PeerReachability,
     UnreachableCategory,
 };
-pub use relay_path::{is_synthetic_relay_addr, RelayControlEgress, RelayPathHandle};
 pub use quic_identity::{
     device_certified_key, quic_client_config, quic_server_config, AuthorizedPeerKeys,
     PinnedPeerKeys, PEER_SERVER_NAME, YADORILINK_P2P_ALPN,
@@ -76,4 +75,5 @@ pub use quic_peer_endpoint::{
     connect_role, ConnectRole, QuicPeerEndpoint, PEER_IDLE_TIMEOUT, RACED_DIAL_WORST_CASE,
 };
 pub use quic_socket::{HubQuinnRuntime, TransportHubQuicSocket};
+pub use relay_path::{is_synthetic_relay_addr, RelayControlEgress, RelayPathHandle};
 pub use transport_hub::{wrap_relay_envelope, HubStunSocket, TransportHub};

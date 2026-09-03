@@ -324,7 +324,9 @@ impl RelayPathRouter {
         path.last_active = now;
         match &path.kind {
             RelayPathKind::Control(_) => Some(RelayEgress::Control),
-            RelayPathKind::Envelope { relay_outer_addr } => Some(RelayEgress::Raw(*relay_outer_addr)),
+            RelayPathKind::Envelope { relay_outer_addr } => {
+                Some(RelayEgress::Raw(*relay_outer_addr))
+            }
         }
     }
 
@@ -485,7 +487,9 @@ fn evict_expired(state: &mut RouterState, now: Instant) {
     let expired: Vec<SocketAddr> = state
         .by_addr
         .iter()
-        .filter(|(_, path)| now.saturating_duration_since(path.last_active) >= RELAY_PATH_IDLE_EXPIRY)
+        .filter(|(_, path)| {
+            now.saturating_duration_since(path.last_active) >= RELAY_PATH_IDLE_EXPIRY
+        })
         .map(|(addr, _)| *addr)
         .collect();
     for addr in expired {
@@ -544,7 +548,9 @@ fn mint_addr(state: &mut RouterState, family_is_v4: bool) -> SocketAddr {
 pub fn is_synthetic_relay_addr(addr: SocketAddr) -> bool {
     match addr.ip() {
         IpAddr::V4(v4) => u32::from(v4) & !SYNTHETIC_V4_MASK == SYNTHETIC_V4_PREFIX,
-        IpAddr::V6(v6) => v6.segments()[0] == SYNTHETIC_V6_PREFIX && v6.segments()[1..4] == [0, 0, 0],
+        IpAddr::V6(v6) => {
+            v6.segments()[0] == SYNTHETIC_V6_PREFIX && v6.segments()[1..4] == [0, 0, 0]
+        }
     }
 }
 
@@ -693,7 +699,10 @@ mod tests {
             }
         }
         assert_eq!(minted, MAX_INBOUND_RELAY_PATHS);
-        assert!(router.inbound_dropped.load(Ordering::Relaxed) > 0, "refusals must be counted, not silent");
+        assert!(
+            router.inbound_dropped.load(Ordering::Relaxed) > 0,
+            "refusals must be counted, not silent"
+        );
     }
 
     /// A payload that cannot be a QUIC packet is refused before it can cost

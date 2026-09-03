@@ -76,7 +76,8 @@ static BIRTH_TIME_GRANULARITY_CACHE: std::sync::OnceLock<
 fn cached_birth_time_granularity(
     sync_root: &Path,
 ) -> yadorilink_root_authority::fs_identity::TimestampGranularity {
-    let Ok(volume_identity) = yadorilink_root_authority::fs_capabilities::observe_volume_identity(sync_root)
+    let Ok(volume_identity) =
+        yadorilink_root_authority::fs_capabilities::observe_volume_identity(sync_root)
     else {
         return yadorilink_root_authority::fs_capabilities::probe_birth_time_granularity(sync_root);
     };
@@ -740,7 +741,11 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
         let (sync_kind, version, filesystem_identity) = match state {
-            yadorilink_peer_session::ports::ExactActualState::Object { kind, version, identity } => {
+            yadorilink_peer_session::ports::ExactActualState::Object {
+                kind,
+                version,
+                identity,
+            } => {
                 let sync_kind = match kind {
                     RecordKind::File => {
                         yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::RegularFile
@@ -754,9 +759,11 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
                 };
                 (sync_kind, Some(version), identity)
             }
-            yadorilink_peer_session::ports::ExactActualState::Absent => {
-                (yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::Absent, None, None)
-            }
+            yadorilink_peer_session::ports::ExactActualState::Absent => (
+                yadorilink_sync_sqlite::materialized_generation::MaterializedObjectKind::Absent,
+                None,
+                None,
+            ),
         };
         let published = self
             .database
@@ -828,9 +835,12 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
         };
         let out_path = sync_root.join(path);
         let granularity = cached_birth_time_granularity(&sync_root);
-        let revalidation = yadorilink_sync_sqlite::materialized_generation::revalidate_identity_against_disk(
-            &basis, &out_path, granularity,
-        );
+        let revalidation =
+            yadorilink_sync_sqlite::materialized_generation::revalidate_identity_against_disk(
+                &basis,
+                &out_path,
+                granularity,
+            );
         if revalidation
             != yadorilink_sync_sqlite::materialized_generation::IdentityRevalidation::Confirmed
         {
@@ -1279,8 +1289,16 @@ mod tests {
             TimestampGranularity::Coarse
         });
         assert_eq!(first, TimestampGranularity::Fine);
-        assert_eq!(second, TimestampGranularity::Fine, "the same volume identity must reuse the cached probe");
-        assert_eq!(probes_for_a.load(std::sync::atomic::Ordering::SeqCst), 1, "must probe only once for the same identity");
+        assert_eq!(
+            second,
+            TimestampGranularity::Fine,
+            "the same volume identity must reuse the cached probe"
+        );
+        assert_eq!(
+            probes_for_a.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "must probe only once for the same identity"
+        );
 
         let probes_for_b = std::sync::atomic::AtomicU32::new(0);
         let third = cached_granularity_for_volume(volume_b, || {

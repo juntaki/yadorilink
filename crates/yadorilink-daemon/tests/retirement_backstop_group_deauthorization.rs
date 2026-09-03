@@ -83,7 +83,11 @@ const BACKSTOP_WAIT_MARGIN: Duration = Duration::from_secs(5);
 /// retirement backstop's one-shot authorization check has actually run for
 /// this group (see this file's own module doc comment), as opposed to just
 /// having waited long enough on the assumption that it would.
-async fn retirement_backstop_ticked(state: &DaemonState, group_id: &str, deadline: Duration) -> bool {
+async fn retirement_backstop_ticked(
+    state: &DaemonState,
+    group_id: &str,
+    deadline: Duration,
+) -> bool {
     let started = tokio::time::Instant::now();
     while started.elapsed() < deadline {
         if state.has_local_retirement_session(group_id) {
@@ -175,7 +179,10 @@ async fn manually_registered_session_survives_the_retirement_backstop() {
     let channel_dest = QuicPeerChannel::new(accepted, ConnectRole::Accept);
 
     let source_sync_state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
-    source_sync_state.link_repository().add_link(&source_dir.path().to_string_lossy(), GROUP).unwrap();
+    source_sync_state
+        .link_repository()
+        .add_link(&source_dir.path().to_string_lossy(), GROUP)
+        .unwrap();
     let source_record =
         dest_sync_state.file_index_repository().get_file(GROUP, "tiny.bin").unwrap().unwrap();
     source_sync_state

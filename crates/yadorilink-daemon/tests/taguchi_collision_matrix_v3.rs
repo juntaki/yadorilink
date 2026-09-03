@@ -84,11 +84,7 @@ struct TestDevice {
     _index_dir: tempfile::TempDir,
 }
 
-fn spawn_orchestrator(
-    coordination_addr: String,
-    device_id: String,
-    state: Arc<DaemonState>,
-) {
+fn spawn_orchestrator(coordination_addr: String, device_id: String, state: Arc<DaemonState>) {
     let config = peer_orchestrator::OrchestratorConfig {
         coordination_addr,
         access_token: "test".to_string(),

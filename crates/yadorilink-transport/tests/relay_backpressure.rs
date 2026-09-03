@@ -86,8 +86,7 @@ async fn a_full_relay_queue_parks_the_poller_even_though_the_socket_is_writable(
     // The physical socket is demonstrably writable, so the assertion below
     // is about which carrier readiness is reported for -- not about a socket
     // that happens to be full too.
-    hub.try_send_datagram(b"probe", hub.local_addr())
-        .expect("the physical socket is writable");
+    hub.try_send_datagram(b"probe", hub.local_addr()).expect("the physical socket is writable");
 
     let poller = TransportHub::next_send_poller_id();
     let waker = Arc::new(RecordingWaker::default());

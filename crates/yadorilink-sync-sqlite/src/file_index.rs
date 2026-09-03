@@ -44,8 +44,8 @@ use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
 use yadorilink_replica_domain::ids::{ChangeHash, SyncPath};
 use yadorilink_replica_domain::session_state::{
     ChangeContent, ConflictCopyFile, DurabilityRoot, DurabilityRoots, LocalFileMetaColumns,
-    MaterializationState, MaterializedGenerationBackfillReport, PreparedLocalMutation,
-    TrashedFile, VersionRecord, VersionState,
+    MaterializationState, MaterializedGenerationBackfillReport, PreparedLocalMutation, TrashedFile,
+    VersionRecord, VersionState,
 };
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_sqlite_runtime::SyncDatabase;
@@ -526,7 +526,13 @@ impl FileIndexRepository {
                         )?;
                         let change_hash = change.compute_hash();
                         dag_store::put_file_version(tx, group_id, version)?;
-                        upsert_file_in_tx(tx, group_id, record, origin_device_id, Some(&change_hash))?;
+                        upsert_file_in_tx(
+                            tx,
+                            group_id,
+                            record,
+                            origin_device_id,
+                            Some(&change_hash),
+                        )?;
                         if let Some(meta) = meta {
                             apply_local_meta_columns_in_tx(tx, group_id, &record.path, meta)?;
                         }
@@ -541,9 +547,10 @@ impl FileIndexRepository {
                         if !record.deleted {
                             stamp_hydrated_after_local_emission_in_tx(tx, group_id, &record.path)?;
                         }
-                        if let (Some(meta), Some(LocalCaptureActualStateEvidence::Present {
-                            filesystem_identity,
-                        })) = (meta, this_evidence)
+                        if let (
+                            Some(meta),
+                            Some(LocalCaptureActualStateEvidence::Present { filesystem_identity }),
+                        ) = (meta, this_evidence)
                         {
                             if !record.deleted {
                                 adopt_local_capture_actual_state(
@@ -567,7 +574,13 @@ impl FileIndexRepository {
                             emission.emitter,
                         )?;
                         let change_hash = change.compute_hash();
-                        upsert_file_in_tx(tx, group_id, record, origin_device_id, Some(&change_hash))?;
+                        upsert_file_in_tx(
+                            tx,
+                            group_id,
+                            record,
+                            origin_device_id,
+                            Some(&change_hash),
+                        )?;
                         if matches!(this_evidence, Some(LocalCaptureActualStateEvidence::Absent)) {
                             adopt_local_capture_absent_state(tx, group_id, &record.path)?;
                         }
@@ -1359,7 +1372,11 @@ impl FileIndexRepository {
     /// comment) and any row genuinely authored with no Unix mode (a
     /// Windows peer). Never a stand-in for "unknown collapses to zero
     /// permissions" — `Some(0)` is a real, distinct value (mode `0o000`).
-    pub fn get_unix_mode(&self, group_id: &str, path: &str) -> Result<Option<u32>, SyncSqliteError> {
+    pub fn get_unix_mode(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<Option<u32>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             let unix_mode: Option<i64> = conn
                 .query_row(

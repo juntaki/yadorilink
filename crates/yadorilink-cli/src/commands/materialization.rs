@@ -67,10 +67,11 @@ pub async fn evict(local_path: String) -> Result<(), CliError> {
 /// right now.
 pub async fn status(local_path: String) -> Result<(), CliError> {
     let absolute_path = absolute_path(&local_path)?;
-    let resp = control_client::send(ReqPayload::MaterializationStatus(
-        MaterializationStatusRequest { absolute_path },
-    ))
-    .await?;
+    let resp =
+        control_client::send(ReqPayload::MaterializationStatus(MaterializationStatusRequest {
+            absolute_path,
+        }))
+        .await?;
     match resp.payload {
         Some(RespPayload::MaterializationStatus(status)) if status.known => {
             let state = match status.state() {
@@ -84,7 +85,9 @@ pub async fn status(local_path: String) -> Result<(), CliError> {
             println!("{local_path}: {state}{pinned}");
         }
         Some(RespPayload::MaterializationStatus(_)) => {
-            println!("{local_path}: not currently tracked (not indexed, or not under a linked folder)");
+            println!(
+                "{local_path}: not currently tracked (not indexed, or not under a linked folder)"
+            );
         }
         _ => {
             return Err(CliError::Other("unexpected daemon response".into()));

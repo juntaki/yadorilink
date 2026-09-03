@@ -15,15 +15,15 @@ mod protobuf;
 pub use codec::PeerWireCodec;
 pub use error::WireError;
 pub use frame::{
-    BlockRequestHeaderFrame, BlockResponseHeaderFrame, BlockResponseOutcomeFrame,
-    ChangeBatchFrame, ChangeBatchOutboundFrame, ChangeRequestFrame,
-    ClusterConfigFrame, ClusterConfigOutboundFrame, HandoffLeaseGrantFrame,
-    HandoffLeaseReleaseFrame, HandoffLeaseReleaseOutboundFrame, HandoffLeaseRequestFrame,
-    HandoffTicketGrantFrame, HandoffTicketReleaseFrame, HandoffTicketReleaseOutboundFrame,
-    HandoffTicketRequestFrame, HeadsAnnounceFrame, HeadsAnnounceOutboundFrame, InboundFrame,
-    OutboundFrame, RebootstrapSnapshotRequestFrame, RebootstrapSnapshotResponseFrame,
-    RelayCloseFrame, RelayDataFrame, RelayOpenFrame, RelayOpenedFrame, VersionPresentAckFrame,
-    VersionPresentAckOutboundFrame, VersionPresentQueryFrame,
+    BlockRequestHeaderFrame, BlockResponseHeaderFrame, BlockResponseOutcomeFrame, ChangeBatchFrame,
+    ChangeBatchOutboundFrame, ChangeRequestFrame, ClusterConfigFrame, ClusterConfigOutboundFrame,
+    HandoffLeaseGrantFrame, HandoffLeaseReleaseFrame, HandoffLeaseReleaseOutboundFrame,
+    HandoffLeaseRequestFrame, HandoffTicketGrantFrame, HandoffTicketReleaseFrame,
+    HandoffTicketReleaseOutboundFrame, HandoffTicketRequestFrame, HeadsAnnounceFrame,
+    HeadsAnnounceOutboundFrame, InboundFrame, OutboundFrame, RebootstrapSnapshotRequestFrame,
+    RebootstrapSnapshotResponseFrame, RelayCloseFrame, RelayDataFrame, RelayOpenFrame,
+    RelayOpenedFrame, VersionPresentAckFrame, VersionPresentAckOutboundFrame,
+    VersionPresentQueryFrame,
 };
 pub use protobuf::ProtobufPeerWireCodec;
 
@@ -168,7 +168,6 @@ mod tests {
                 file_versions: vec![vec![4, 5, 6]],
                 more: true,
             }),
-
             OutboundFrame::VersionPresentQuery(VersionPresentQueryFrame {
                 request_id: 1,
                 folder_group_id: "g".to_string(),
@@ -242,10 +241,7 @@ mod tests {
                 session_id: 1,
             }),
             OutboundFrame::RelayData(RelayDataFrame { session_id: 1, payload: vec![1, 2, 3] }),
-            OutboundFrame::RelayClose(RelayCloseFrame {
-                session_id: 1,
-                reason: "r".to_string(),
-            }),
+            OutboundFrame::RelayClose(RelayCloseFrame { session_id: 1, reason: "r".to_string() }),
         ];
         assert_eq!(outbound.len(), 18);
     }

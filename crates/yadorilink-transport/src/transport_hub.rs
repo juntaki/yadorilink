@@ -601,7 +601,9 @@ impl TransportHub {
     /// which is about the hardest failure shape there is to diagnose from
     /// the outside. An already-dropped registration is not a conflict, so a
     /// hub whose endpoint has gone can be given a new one.
-    pub fn register_quic(&self) -> Result<mpsc::Receiver<(Vec<u8>, SocketAddr)>, crate::TransportError> {
+    pub fn register_quic(
+        &self,
+    ) -> Result<mpsc::Receiver<(Vec<u8>, SocketAddr)>, crate::TransportError> {
         let mut registered = self.registry.quic_tx.lock().unwrap_or_else(|p| p.into_inner());
         if registered.as_ref().is_some_and(|tx| !tx.is_closed()) {
             return Err(crate::TransportError::NoRoute(
@@ -1096,8 +1098,8 @@ mod tests {
         let batch = vec![b"batch-one".to_vec(), b"batch-two-longer".to_vec()];
         hub_a.send_batch(&batch, b_addr).await.expect("send_batch");
 
-        let expected_bytes = single.len() as u64
-            + batch.iter().map(|d| d.len() as u64).sum::<u64>();
+        let expected_bytes =
+            single.len() as u64 + batch.iter().map(|d| d.len() as u64).sum::<u64>();
         let expected_packets = 1 + batch.len() as u64;
 
         // `recv_loop` runs on a spawned task -- poll rather than assume
@@ -1130,5 +1132,4 @@ mod tests {
         );
         assert_eq!(hub_b.wire_packets_received(), expected_packets);
     }
-
 }
