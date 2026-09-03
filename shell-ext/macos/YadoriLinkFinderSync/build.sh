@@ -75,6 +75,10 @@ test -f "$CORE_LIB" || { echo "missing $CORE_LIB"; exit 1; }
 # dependency tree changes.
 echo "-- discovering native-static-libs for the final swiftc link step --"
 NATIVE_LIBS="$(cd "$CORE_DIR" && cargo rustc --release --target "$RUST_TARGET" --crate-type staticlib -- --print native-static-libs 2>&1 | grep 'native-static-libs:' | sed -E 's/.*native-static-libs: *//')"
+# Drop `-lm`: recent macOS SDKs ship no standalone libm (its symbols moved
+# into libSystem, which is always linked), so passing it explicitly fails
+# with "ld: library 'm' not found" even though nothing is actually missing.
+NATIVE_LIBS="$(echo "$NATIVE_LIBS" | sed -E 's/(^| )-lm( |$)/\1/g')"
 echo "native-static-libs: $NATIVE_LIBS"
 
 # --- 2. FinderSync extension binary -----------------
