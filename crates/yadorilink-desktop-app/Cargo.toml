@@ -67,7 +67,7 @@ yadorilink-local-storage = { path = "../yadorilink-local-storage" }
 # machine. `rfd` provides the cross-platform native folder picker/dialogs,
 # replacing the macOS-only `osascript` path.
 eframe = "0.29"
-rfd = "0.15"
+rfd = "0.17"
 
 [target.'cfg(unix)'.dependencies]
 # Advisory file locking (`flock` under the hood) to serialize the
