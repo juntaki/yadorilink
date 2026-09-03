@@ -2,7 +2,7 @@
 //! chunked `FileRecord`. Local changes are always
 //! indexed immediately regardless of the link's pause state — pausing
 //! only stops *propagating* changes to peers, so nothing is
-//! lost while paused; `SyncState` itself is the queued-change backlog.
+//! lost while paused; the local index itself is the queued-change backlog.
 //!
 //! The property that renaming a file doesn't re-transfer content falls out of this
 //! design for free: chunking is content-addressed, so renaming a file
@@ -74,7 +74,7 @@ fn disk_race_fingerprint(path: &Path) -> Option<(u64, Option<std::time::SystemTi
 /// (a fingerprint captured before this event's own content was read) --
 /// `None` for either a fingerprint mismatch (something touched this path
 /// during the read/prepare window) or a failed observation. Feeds
-/// `SyncState::upsert_file_emitting_change`'s `filesystem_identity`
+/// `LocalMutationStore::upsert_file_emitting_change`'s `filesystem_identity`
 /// parameter: `None` here always means "publish no actual-state proof for
 /// this commit," never a hard failure of the capture itself -- see that
 /// parameter's own doc comment. This is deliberately a SEPARATE, later
@@ -341,7 +341,7 @@ struct PendingBatchedCommit {
 /// determines a path is a symlink — carried
 /// alongside, not inside, the `FileRecord` it returns. Like
 /// `types::RecordKind` itself (see its doc comment), this is index-local
-/// metadata surfaced through dedicated `SyncState` columns
+/// metadata surfaced through dedicated `LocalMutationStore` columns
 /// (`set_record_kind`/`set_symlink_target`/`set_symlink_out_of_root`)
 /// rather than a `FileRecord` field, so every existing `FileRecord {.. }`
 /// construction site keeps compiling unchanged. The caller applies it via
@@ -590,7 +590,7 @@ impl LocalChangeProcessor {
     }
 
     /// Admits a fresh `LinkOperation` against this processor's lease --
-    /// called immediately before every `SyncState` mutation this processor
+    /// called immediately before every `LocalMutationStore` mutation this processor
     /// makes. The caller MUST hold the returned operation for at least the
     /// duration of the specific write/commit it is admitting (Rust's own
     /// temporary-lifetime rules do this automatically for the common
@@ -815,7 +815,7 @@ impl LocalChangeProcessor {
     /// corroborated root and does not check the in-process
     /// `sync_root_lock::HELD_ROOT_IDENTITIES` registry — appropriate ONLY for
     /// the one-time "initial full sync" (`scan_existing_files*`) that
-    /// `yadorilink-daemon::link_manager::start_link_watch` runs exactly once,
+    /// `yadorilink-daemon`'s `LinkRuntimeController::start` runs exactly once,
     /// after it has already acquired this root's `SyncRootLock`, before the
     /// live watch and the periodic backstop begin. A caller that runs
     /// repeatedly for the lifetime of an established watch must use
@@ -834,7 +834,7 @@ impl LocalChangeProcessor {
     /// repeatedly against an already-established, already-watched link —
     /// the live event handler (`process_event*`) and the periodic add-only
     /// backstop (`reconcile_added_files*`), both of which run for as long as
-    /// `yadorilink-daemon::link_manager::start_link_watch` holds this root's
+    /// `yadorilink-daemon`'s `LinkRuntimeController::start` holds this root's
     /// `SyncRootLock`.
     ///
     /// Uses [`VerifiedRoot::verify`], not `open`: `open` can silently ADOPT
@@ -1052,14 +1052,14 @@ impl LocalChangeProcessor {
         let mut records = Vec::new();
         let mut seen_paths = std::collections::HashSet::new();
         // Classification info for any symlink discovered this scan,
-        // applied via `SyncState` setters once the corresponding
+        // applied via `LocalMutationStore` setters once the corresponding
         // `FileRecord` rows are actually written below (those setters
         // require the row to already exist).
         let mut pending_symlinks: Vec<(String, SymlinkClassification)> = Vec::new();
         // exec-bit updates for paths
         // whose content (size) is unchanged this scan, applied after the
         // batch write below for the same reason `pending_symlinks` is —
-        // `SyncState::set_unix_mode` is `UPDATE`-only and requires the row
+        // `LocalMutationStore::set_unix_mode` is `UPDATE`-only and requires the row
         // to already exist.
         let mut pending_unix_modes: Vec<(String, Option<u32>)> = Vec::new();
         // C1.2a: same reasoning and lifecycle as `pending_unix_modes` --
@@ -1929,7 +1929,7 @@ impl LocalChangeProcessor {
         // read-compare-write below, so this local-change indexing can
         // never interleave with `PeerSyncSession::reconcile_one_file`
         // applying an incoming version for the same path concurrently —
-        // see `SyncState::path_lock`'s doc comment.
+        // see `LocalMutationStore::path_lock`'s doc comment.
         let path_lock = self.state.path_lock(group_id, &rel_path);
         let _guard = path_lock.lock().await;
 
@@ -2176,7 +2176,7 @@ impl LocalChangeProcessor {
                     // verified_root_of_established_link(group_id, &root)?`
                     // call here; that re-check is now folded into
                     // `self.begin_operation()?.permit()`'s own `verify` (called by each
-                    // `SyncState` mutation below, immediately before its
+                    // `LocalMutationStore` mutation below, immediately before its
                     // commit), alongside the daemon's lifecycle-fence check
                     // the standalone call never covered.
                     // A local edit's origin is this device itself.
@@ -2338,7 +2338,7 @@ impl LocalChangeProcessor {
     ///
     /// The third element of the returned tuple
     /// (see [`PendingUnixModeUpdate`]) is the Unix permission bits to
-    /// persist via `SyncState::set_unix_mode`, when this call determined a
+    /// persist via `LocalMutationStore::set_unix_mode`, when this call determined a
     /// value needs capturing. Returned rather
     /// than applied directly here, mirroring `SymlinkClassification`'s own
     /// "apply after write" shape: `set_unix_mode` is `UPDATE`-only and the
@@ -2805,7 +2805,7 @@ impl LocalChangeProcessor {
     }
 
     /// Applies a symlink's classification to its already-
-    /// written index row — `SyncState::set_record_kind`/
+    /// written index row — `LocalMutationStore::set_record_kind`/
     /// `set_symlink_target`/`set_symlink_out_of_root` all require the row
     /// to exist, so this must run strictly after the caller's
     /// `upsert_file`/`upsert_files_batch`.
@@ -4062,12 +4062,11 @@ mod untouched_placeholder_verdict_windows_tests {
 mod tests {
     use super::*;
     use yadorilink_replica_domain::change::ChangeAuth;
-    // Phase 7D-10 (sync-core deletion): this crate's own tests build a real
-    // fixture via this crate's own `TestReplica` (a thin wrapper around
-    // `yadorilink-daemon`'s `ReplicaCoordinator` -- see `test_support`'s own
-    // doc comment for why a bare `ReplicaCoordinator` does not compile in
-    // this crate's own internal `#[cfg(test)]` code), not
-    // `yadorilink_sync_core::index::SyncState`.
+    // This crate's own tests build a real fixture via this crate's own
+    // `TestReplica` (a thin wrapper around `yadorilink-daemon`'s
+    // `ReplicaCoordinator` -- see `test_support`'s own doc comment for why a
+    // bare `ReplicaCoordinator` does not compile in this crate's own
+    // internal `#[cfg(test)]` code).
     use crate::test_support::TestReplica;
     use std::sync::Mutex;
     use yadorilink_daemon::replica_coordinator::ReplicaCoordinator;
@@ -8063,7 +8062,8 @@ mod tests {
         }
 
         // Now drain everything and process each flush through the same
-        // executor logic `link_manager` uses. The gap between flushes is
+        // executor logic the daemon's flush-processing task (`link_runtime::tasks`)
+        // uses. The gap between flushes is
         // bounded by max_flush_interval (60ms) under normal scheduling,
         // but this per-recv timeout needs real headroom above that on a
         // slow/contended CI runner (observed needing more than 500ms on
@@ -9436,12 +9436,12 @@ mod tests {
     /// while the daemon isn't running is picked up by the startup disk-vs-
     /// index reconciliation scan (`scan_existing_files_with_ignore`), which
     /// updates the local index via the batched, non-DAG-emitting writer
-    /// (`SyncState::upsert_files_batch`) — never appending a change to the
+    /// (`LocalMutationStore::upsert_files_batch`) — never appending a change to the
     /// group's change-history DAG the way a live `process_event` call would.
     /// The restart sequence's other chance to backfill that change,
     /// re-running the idempotent initial import
     /// (`dag_import::ensure_initial_import`, exactly as
-    /// `yadorilink-daemon`'s `link_manager.rs` does right after the scan),
+    /// `yadorilink-daemon`'s startup wiring (`link_runtime::startup`) does right after the scan),
     /// is gated on the group's DAG still being empty (see `dag_import`'s
     /// module doc) and so is a no-op once real history already exists. The
     /// on-disk file and the local index both show the new content, but the

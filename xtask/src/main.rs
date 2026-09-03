@@ -336,26 +336,23 @@ fn load_case_seed(path: &Path, want_seed: Option<u64>) -> Result<u64, String> {
 
 fn cmd_lane0(_args: &[String]) -> Result<(), String> {
     // Lane 0: the cheapest, seconds-scale tier — harness unit tests and lints.
-    // The non-madsim lints (impact-map completeness, runbook freshness) run
-    // under a plain build; the `dst_support` unit tests are madsim-gated and
-    // run through the cheapest scenario binary.
-    // The non-madsim harness guards: the two completeness lints, the fidelity
-    // lint, and the watcher-event-decomposition conformance test (harden design
-    // ) — the last is `#![cfg(not(madsim))]`, so it belongs in this plain leg,
+    // The non-madsim lints (runbook freshness, fidelity) run under a plain
+    // build; the `dst_support` unit tests are madsim-gated and run through
+    // the cheapest scenario binary.
+    // The non-madsim harness guards: the runbook-freshness lint, the
+    // fidelity lint, and the watcher-event-decomposition conformance test —
+    // the last is `#![cfg(not(madsim))]`, so it belongs in this plain leg,
     // not the madsim one.
-    // `dst_support/` and its 3 completeness/fidelity lints, plus the
-    // watcher-decomposition conformance test, moved from `yadorilink-sync-core`
-    // to `yadorilink-daemon` in Phase 7D-10.4 (they co-locate with the
-    // majority of `dst_support/`'s scenario consumers -- the daemon
-    // workflow/E2E cluster).
+    // (`dst_impact_map_lint` used to run here too, but all four of its own
+    // tests were permanently `#[ignore]`d against a deleted `yadorilink-
+    // sync-core` crate — Track R, E0 cleanup removed the file entirely
+    // rather than keep running a target with zero real tests.)
     eprintln!("dst-lane0: harness lints + watcher conformance (non-madsim)");
     let mut lints = Command::new(cargo());
     lints
         .arg("test")
         .arg("-p")
         .arg(DAEMON)
-        .arg("--test")
-        .arg("dst_impact_map_lint")
         .arg("--test")
         .arg("dst_runbook_freshness_lint")
         .arg("--test")
@@ -808,9 +805,10 @@ fn coverage_dir() -> PathBuf {
 /// every scenario it still owned moved to `yadorilink-peer-session` or
 /// `yadorilink-daemon` before that deletion, so `yadorilink-daemon` is now
 /// the sole scenario home) so the lane never drifts from the actual
-/// scenario set (the impact-map lint used to guard the same set from the
-/// map side -- see `tests/dst_impact_map_lint.rs`'s own `#[ignore]` notes
-/// for why that guard is temporarily gapped, a Phase 7E item). A `dst_*.rs`
+/// scenario set (an impact-map lint used to guard the same set from the
+/// map side; it only ever ran against the now-deleted `yadorilink-sync-core`
+/// and was removed rather than kept as a permanently-`#[ignore]`d no-op --
+/// Track R, E0 cleanup). A `dst_*.rs`
 /// file only counts as a lane scenario if it actually declares
 /// `mod dst_support;` -- this excludes `yadorilink-daemon`'s own
 /// pre-existing, unrelated `dst_daemon_*.rs` integration tests (a

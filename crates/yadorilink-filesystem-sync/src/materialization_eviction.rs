@@ -1,19 +1,12 @@
 //! Manual/automatic eviction: reduces a hydrated file back to a placeholder
 //! and, on an on-demand device, reclaims its now-cached blocks once a full
-//! replica's custody is confirmed. Moved out of `yadorilink-sync-core`'s
-//! `materialization.rs` (Phase 7D-9C) now that `MaterializationExecutionPort`
-//! covers this function family's entire state-access surface -- every
-//! `state.<method>` call here was already going through `&dyn
-//! crate::ports::MaterializationStatePort` (sync-core's wider trait) before
-//! this move, never a concrete `SyncState`, so this module's own code was
-//! already policy/filesystem-lifecycle-flavored, not SQL-flavored; only the
-//! trait it depended on has changed, to this crate's own narrower one.
+//! replica's custody is confirmed.
 //!
-//! `yadorilink-sync-core::materialization` re-exports every `pub` item here
-//! at its original path (`crate::materialization::evict_file`/
-//! `MaterializationContext`/...), so this move needed no consumer repoint --
-//! same shape as `materialized_generation.rs`'s and `RestoreOperation`'s own
-//! earlier moves in this sub-phase.
+//! Every `state.<method>` call in this module goes through `&dyn
+//! MaterializationExecutionPort`, never a concrete storage type, so this
+//! module's own code is policy/filesystem-lifecycle-flavored, not
+//! SQL-flavored -- it has no idea how, or whether, the state behind the
+//! trait is persisted.
 
 use std::path::Path;
 
@@ -164,9 +157,9 @@ pub struct MaterializationContext<'a> {
     pub store: &'a dyn BlockReclamationStore,
     pub root: &'a Path,
     /// Minted from the caller's per-link root authority (the daemon's
-    /// operation fence + root-identity check); re-verified by every
-    /// `SyncState` mutation this module makes, immediately before its
-    /// commit. See `root_commit::RootCommitPermit`'s own doc.
+    /// operation fence + root-identity check); re-verified by every state
+    /// mutation this module makes, immediately before its commit. See
+    /// `root_commit::RootCommitPermit`'s own doc.
     pub permit: &'a RootCommitPermit<'a>,
 }
 
@@ -250,11 +243,11 @@ pub fn evict_file(
     verify_write_target_within_root(&out_path, root)?;
     let initial_disk_identity = disk_identity(&out_path)?;
     // `#[cfg(test)]` alone would only select this crate's OWN test build --
-    // a downstream crate's tests (e.g. yadorilink-sync-core's own
-    // materialization.rs test module, which exercises the confirmed-custody
-    // reclaim path directly) link this crate as an ordinary dependency,
-    // compiled without `--cfg test`, so `cfg(test)` here would silently fall
-    // through to the production verifier for every downstream caller's
+    // a downstream crate's tests (one that constructs a confirming custody
+    // double and expects eviction to reach physical block deletion) link
+    // this crate as an ordinary dependency, compiled without `--cfg test`,
+    // so `cfg(test)` here would silently fall through to the production
+    // verifier for every downstream caller's
     // tests. `feature = "evict-custody-test-bypass"` is what actually
     // crosses the crate boundary for the handful of callers that
     // deliberately want to exercise the confirmed-custody deletion path in

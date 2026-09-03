@@ -65,11 +65,6 @@ jobs:
           python3 scripts/check-phase7d5-sync-sqlite-boundary.py
           python3 scripts/check-phase7d6-peer-session-boundary.py
           python3 scripts/check-phase7d8-local-capture-boundary.py
-          python3 scripts/check-phase7d9-residual-ledger.py
-          python3 scripts/check-phase7d9f-syncstate-strangler.py
-          python3 scripts/check-sync-core-port-activation.py
-          python3 scripts/check-sync-repository-boundary.py
-          python3 scripts/check-syncstate-facade.py
           python3 scripts/check-stored-blocklist-fail-closed.py
           python3 scripts/check-pre-release-compatibility-debt.py
           bash scripts/check_removed_features.sh

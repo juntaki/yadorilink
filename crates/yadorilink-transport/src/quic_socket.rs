@@ -17,10 +17,11 @@
 //! because, as far as the operating system is concerned, nothing about the
 //! socket changed.
 //!
-//! It pays for itself twice. `bulk_quic`'s own comment records why it is
-//! excluded from simulation builds: *"quinn drives raw UDP sockets below
-//! `tokio::net::UdpSocket`, outside what madsim's shim can intercept"* --
-//! `quinn-udp` reaches past the runtime for GSO, GRO and `sendmmsg`. Driven
+//! It pays for itself twice. A prior bulk-transport module (since removed)
+//! was excluded from simulation builds for exactly this reason: quinn
+//! drives raw UDP sockets below `tokio::net::UdpSocket`, outside what
+//! madsim's shim can intercept -- `quinn-udp` reaches past the runtime for
+//! GSO, GRO and `sendmmsg`. Driven
 //! through the hub, quinn never touches those paths, so every datagram goes
 //! out through an ordinary `tokio::net::UdpSocket` the simulator *does*
 //! intercept. The same bridge that preserves the NAT-candidate invariant is

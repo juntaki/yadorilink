@@ -87,7 +87,6 @@ use retained_history_integrity::append_change;
 use yadorilink_replica_domain::file::FileVersion;
 
 use crate::error::SyncSqliteError;
-use crate::filesystem_transaction;
 use yadorilink_replica_domain::change::{
     encoded_op_len, Change, ChangeAuth, ChangePurpose, Op, RepairObligation, MAX_CHANGE_OP_BYTES,
 };
@@ -322,16 +321,6 @@ pub fn init_dag_schema(conn: &Connection) -> Result<(), SyncSqliteError> {
     )?;
     causal_basis::init_causal_basis_schema(conn)?;
     retention_roots::init_retention_roots_schema(conn)?;
-    // `admit_change`/`emit_change_with_derived_conflict_copies` (and this
-    // function's own self-heal promotion below) look up
-    // `filesystem_transaction_reservations` on every admission to decide
-    // whether to bump a live transaction's execution-generation fence (see
-    // `bump_execution_fence_for_change`) -- that table must exist before any
-    // of them run. `init_filesystem_transaction_schema` is pure `CREATE
-    // TABLE/INDEX IF NOT EXISTS`, so calling it again here is a harmless
-    // no-op for a caller that also separately initializes it (every
-    // production DB-open path already does, per `index.rs`).
-    filesystem_transaction::init_filesystem_transaction_schema(conn)?;
     // C4-12 Stage 2: this function's own self-heal promotion below (via
     // `bump_execution_fence_for_promoted`) also bumps the projection-
     // obligation fence, so that table must exist before it runs too --
@@ -507,52 +496,18 @@ pub(crate) fn op_touched_paths(op: &Op) -> Vec<&str> {
     }
 }
 
-/// Bumps the `execution_generation` fence (`filesystem_transaction::
-/// bump_transactions_for_touched_paths`) of every live filesystem
-/// transaction whose reservation covers a path `change`'s ops touch. Called
-/// at every point a change durably lands in `changes` -- see this
-/// function's call sites: [`admit_change`] (the change just applied, and
-/// any orphan it promoted) and `emit_change_with_derived_conflict_copies`
-/// (every local emission path, `captured_authoring::
-/// author_captured_change` included, since it emits through
-/// [`emit_local_change_onto`]).
-///
-/// A no-op, cheaply, for the overwhelmingly common case where nothing is
-/// held on any touched path -- see `bump_transactions_for_touched_paths`'s
-/// own doc for why that is also the ONLY reachable case while
-/// [`filesystem_transaction::EXECUTION_ENABLED`] is `false`.
-fn bump_execution_fence_for_change(
-    conn: &Connection,
-    change: &Change,
-) -> Result<(), SyncSqliteError> {
-    let touched: Vec<&str> = change.ops.iter().flat_map(op_touched_paths).collect();
-    if touched.is_empty() {
-        return Ok(());
-    }
-    filesystem_transaction::bump_transactions_for_touched_paths(
-        conn,
-        change.group_id.as_str(),
-        &touched,
-    )?;
-    Ok(())
-}
-
-/// [`bump_execution_fence_for_change`] for every hash in `promoted` --
+/// Bumps the projection-obligation fence for every hash in `promoted` --
 /// shared by [`admit_change`]'s own promotion step and [`init_dag_schema`]'s
 /// startup self-heal sweep, the two places a buffered orphan turns into a
-/// durably admitted change without an already-in-hand [`Change`] to pass
-/// straight to [`bump_execution_fence_for_change`]. Each hash is re-read via
+/// durably admitted change without an already-in-hand [`Change`] to read
+/// its touched paths from directly. Each hash is re-read via
 /// [`describe_hash`] (already admitted on this same connection by the time
 /// this runs) rather than trusting the caller to have kept the decoded
 /// `Change` around.
 ///
-/// C4-12 Stage 2: also bumps the projection-obligation fence
-/// (`crate::projection_obligations::bump_projection_obligations_for_
-/// touched_paths`) for the same touched paths, off the same decoded
-/// `Change` -- not a second `describe_hash` lookup per hash. The name is
-/// kept as-is (matching this design's own stated intent to add the new
-/// bump ALONGSIDE the existing fence-bump call sites, not invent a new
-/// seam); read this doc comment, not the name alone, for what it does.
+/// C4-12 Stage 2: bumps `crate::projection_obligations::bump_projection_
+/// obligations_for_touched_paths` for the touched paths of each promoted
+/// hash's decoded `Change`.
 fn bump_execution_fence_for_promoted(
     conn: &Connection,
     promoted: &[ChangeHash],
@@ -560,11 +515,8 @@ fn bump_execution_fence_for_promoted(
     for hash in promoted {
         match describe_hash(conn, hash)? {
             DagHashDisposition::Admitted { change, .. } => {
-                bump_execution_fence_for_change(conn, &change)?;
                 // C4-12 Stage 2 (PROJ-1/2/4): the promoted-orphan seam of the
-                // projection-obligation bump, decoded from the SAME
-                // `describe_hash` read `bump_execution_fence_for_change`
-                // above just used -- not a second lookup per hash.
+                // projection-obligation bump.
                 let touched: Vec<&str> = change.ops.iter().flat_map(op_touched_paths).collect();
                 if !touched.is_empty() {
                     crate::projection_obligations::bump_projection_obligations_for_touched_paths(
@@ -681,21 +633,14 @@ pub fn admit_change(
             // `dag_has_change` fast-path never calls this far for a hash it
             // already has). PROJ-1 ("a Change receipt is not a projection
             // event") must hold here too, not only at the upstream filter --
-            // both bumps below are therefore gated on genuine, first-time
+            // the bump below is therefore gated on genuine, first-time
             // appendment, not merely on reaching this arm.
             if newly_appended {
-                // This change just moved the desired state under every path its
-                // ops touch -- fence out any plan a live filesystem transaction
-                // already built against the pre-admission state on one of
-                // those paths.
-                bump_execution_fence_for_change(conn, change)?;
                 // C4-12 Stage 2 (PROJ-1/2/4): the primary-admission seam of the
-                // projection-obligation bump, alongside the execution fence
-                // above. Reuses the same `op_touched_paths` extraction, not a
-                // duplicate of it. Runs inside this call's own transaction (the
-                // caller's `write_immediate` for remote admission), so a crash
-                // here leaves neither the change nor its obligation bump
-                // committed.
+                // projection-obligation bump. Runs inside this call's own
+                // transaction (the caller's `write_immediate` for remote
+                // admission), so a crash here leaves neither the change nor
+                // its obligation bump committed.
                 let touched: Vec<&str> = change.ops.iter().flat_map(op_touched_paths).collect();
                 if !touched.is_empty() {
                     crate::projection_obligations::bump_projection_obligations_for_touched_paths(
@@ -1303,23 +1248,16 @@ pub fn admit_prepared_emission(
     }
     retained_history_integrity::append_change(conn, &change, applied)?;
     conflict_authoring::record_conflict_copy_ops_provenance(conn, group_id, &change)?;
-    // This locally authored change just moved the desired state under every
-    // path its ops (direct and derived conflict-copy) touch -- fence out any
-    // plan a live filesystem transaction already built against the
-    // pre-admission state on one of those paths. Covers every caller of this
-    // shared body (`emit_local_change`, `emit_local_change_onto`,
-    // `emit_retroactive_repair`) and, transitively, `captured_authoring`,
-    // which emits through this same split.
-    bump_execution_fence_for_change(conn, &change)?;
-    // The local-emission seam of the projection-obligation bump, alongside
-    // the execution fence above. Covers every path in `change.ops`, direct
-    // and derived alike (see `bump_execution_fence_for_change`'s own
-    // extraction) -- this is what makes it safe for this function to no
-    // longer also enqueue a separate `materialization_jobs` row for each
-    // derived conflict-copy path: the obligation-driven scheduler claims
-    // off this bump's target directly, so that redundant enqueue (which
-    // used to race the admission-side re-arm over which `version_hash`
-    // won the same `(group, path)` row) has nothing left to feed.
+    // The local-emission seam of the projection-obligation bump. Covers every
+    // path in `change.ops`, direct and derived alike -- this is what makes it
+    // safe for this function to no longer also enqueue a separate
+    // `materialization_jobs` row for each derived conflict-copy path: the
+    // obligation-driven scheduler claims off this bump's target directly, so
+    // that redundant enqueue (which used to race the admission-side re-arm
+    // over which `version_hash` won the same `(group, path)` row) has
+    // nothing left to feed. Covers every caller of this shared body
+    // (`emit_local_change`, `emit_local_change_onto`, `emit_retroactive_
+    // repair`).
     {
         let touched: Vec<&str> = change.ops.iter().flat_map(op_touched_paths).collect();
         if !touched.is_empty() {

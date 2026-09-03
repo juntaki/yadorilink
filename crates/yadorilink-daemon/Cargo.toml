@@ -191,11 +191,8 @@ tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }
 madsim = "0.2"
 
 [dev-dependencies]
-# The impact-map completeness lint (`tests/dst_impact_map_lint.rs`) and the
-# runbook freshness lint (`tests/dst_runbook_freshness_lint.rs`) parse
-# `dst_support/impact_map.toml` / the cargo aliases as TOML. Moved from
-# `yadorilink-sync-core/Cargo.toml`'s identical dev-dependency in Phase
-# 7D-10.4 along with `dst_support/` and its 3 lint guards.
+# The runbook freshness lint (`tests/dst_runbook_freshness_lint.rs`) parses
+# `.cargo/config.toml`'s cargo aliases as TOML.
 toml = "0.9"
 # This crate's own `tests/*.rs` integration binaries link against
 # `yadorilink-daemon` as an ordinary external library, so `#[cfg(test)]` is

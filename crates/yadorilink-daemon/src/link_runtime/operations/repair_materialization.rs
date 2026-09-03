@@ -1,13 +1,14 @@
 //! Interrupted-materialization/restore-operation repair for one link,
 //! admitted through its `RootLease`. Deduplicates a "begin a `LinkOperation`,
-//! mint a permit, call the sync-core repair function" ceremony that used to
-//! be written out three times: once for restore-operation reconciliation and
-//! once for materialization repair at link-startup
+//! mint a permit, call the filesystem-sync repair function" ceremony that
+//! would otherwise be written out three times: once for restore-operation
+//! reconciliation and once for materialization repair at link-startup
 //! (the daemon's own `LinkRuntimeController::start_inner`), and again for materialization
-//! repair on the periodic live-repair task. All three now share this module,
+//! repair on the periodic live-repair task. All three share this module,
 //! so a caller cannot forget to hold the operation across the repair call --
-//! there is no other way to reach `materialization::repair_interrupted_
-//! materializations`/`reconcile_restore_operations` from this crate.
+//! there is no other way to reach `materialization_repair::
+//! repair_interrupted_materializations`/`reconcile_restore_operations` from
+//! this crate.
 //!
 //! Deliberately does NOT bundle restore-operation reconciliation and
 //! materialization repair into a single call: the two callers need
@@ -32,11 +33,9 @@ use crate::replica_coordinator::ReplicaCoordinator;
 /// intent for. Admits its own `LinkOperation` from `root_lease`, held for
 /// the whole call.
 ///
-/// Phase 7D-10.5: repointed from `&Arc<SyncState>` to
-/// `&Arc<ReplicaCoordinator>` -- both free functions this delegates to take
-/// `&dyn MaterializationExecutionPort`, which `ReplicaCoordinator` now
-/// implements (this same pass), so a real `Arc<ReplicaCoordinator>`
-/// coerces here exactly the way `Arc<SyncState>` used to.
+/// Takes `&Arc<ReplicaCoordinator>`: both free functions this delegates to
+/// take `&dyn MaterializationExecutionPort`, which `ReplicaCoordinator`
+/// implements, so it coerces here without any adapter.
 pub(crate) fn reconcile_restore_operations(
     replica_coordinator: &Arc<ReplicaCoordinator>,
     root_lease: &Arc<RootLease>,
@@ -44,12 +43,10 @@ pub(crate) fn reconcile_restore_operations(
     group_id: &str,
 ) -> Result<RestoreRecoveryReport, SyncError> {
     let op = root_lease.begin_operation()?;
-    // `reconcile_restore_operations` now returns `yadorilink_filesystem_sync::
-    // materialization_execution::MaterializationExecutionError` (Phase 7D-9C,
-    // sixth pass -- it moved out of sync-core alongside `evict_file`'s own
-    // earlier move in this sub-phase) -- mapped at this one boundary via the
-    // same `impl From<MaterializationExecutionError> for SyncError` bridge
-    // `hydration.rs::evict` already uses.
+    // `reconcile_restore_operations` returns `yadorilink_filesystem_sync::
+    // materialization_execution::MaterializationExecutionError`, mapped at
+    // this one boundary via the same `impl From<MaterializationExecutionError>
+    // for SyncError` bridge `hydration.rs::evict` already uses.
     yadorilink_filesystem_sync::materialization_repair::reconcile_restore_operations(
         replica_coordinator.as_ref(),
         root,
@@ -60,33 +57,25 @@ pub(crate) fn reconcile_restore_operations(
 }
 
 /// Repairs any `Hydrated`-but-disk-inconsistent row this link's index has --
-/// see `yadorilink_sync_core::materialization::repair_interrupted_
-/// materializations`'s own doc for exactly what crash window this closes.
-/// Admits its own `LinkOperation` from `root_lease`, held across both the
-/// (potentially slow) disk walk/reconstruct work and the commits it makes.
+/// see `yadorilink_filesystem_sync::materialization_repair::
+/// repair_interrupted_materializations`'s own doc for exactly what crash
+/// window this closes. Admits its own `LinkOperation` from `root_lease`,
+/// held across both the (potentially slow) disk walk/reconstruct work and
+/// the commits it makes.
 ///
-/// A prior pass (7D-10.5's first attempt) found this one, unlike
-/// `reconcile_restore_operations` above, was NOT safe to repoint to
-/// `&Arc<ReplicaCoordinator>` even though it type-checked:
 /// `repair_interrupted_materializations_inner`
 /// (`yadorilink-filesystem-sync::materialization_repair`) calls
-/// `state.path_lock(group_id, path)`, and at the time `ReplicaCoordinator`
-/// constructed its OWN, separate `PathLockRegistry` instance
-/// (`ReplicaCoordinator::from_database`) rather than sharing `SyncState`'s
-/// -- so this call site and `yadorilink-local-capture::LocalChangeProcessor`
-/// (which still locks through `SyncState`'s own registry, via the fourth
-/// port, `LocalMutationStore`) would have locked through two non-cooperating
-/// `Mutex`es for the same logical path.
-///
-/// Phase 7D-10.5's shared-registry fix
-/// (`yadorilink_sync_core::index::SyncState::path_lock_registry_handle`/
-/// `startup_readiness_handle`, threaded through
-/// `ReplicaCoordinator::from_database`) closes that gap:
-/// `ReplicaCoordinator::path_lock_registry()` is now the SAME live registry
-/// `SyncState::path_lock_registry()` is, so this repoint no longer splits
-/// the per-path lock. Re-verified against the 5 tests the prior pass found
-/// hanging (`adapters::runtime::link_runtime_controller::tests::*`, symptom
-/// `"the initial scan must finish: Elapsed(())"`) -- all pass cleanly now.
+/// `state.path_lock(group_id, path)` against the same `&Arc<ReplicaCoordinator>`
+/// passed in here. That has to be the identical registry
+/// `yadorilink-local-capture::LocalChangeProcessor` locks the same path
+/// through (via the `LocalMutationStore` port, `replica_coordinator/
+/// local_mutation.rs`), or a repair walk and a concurrent local-capture
+/// mutation for the same path would not actually mutually exclude. They do:
+/// both call sites are handed the SAME `Arc<ReplicaCoordinator>` out of
+/// `LinkRuntimeDependencies` (`link_runtime/dependencies.rs`), and that one
+/// coordinator owns exactly one `PathLockRegistry`
+/// (`ReplicaCoordinator::path_lock_registry()`), so there is only ever one
+/// lock per path to take.
 pub(crate) fn repair_interrupted_materializations(
     replica_coordinator: &Arc<ReplicaCoordinator>,
     block_store: &Arc<dyn BlockStore + Send + Sync>,

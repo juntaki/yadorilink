@@ -17,18 +17,14 @@
 //! persists already-decided writes atomically.
 
 pub mod block_deletion;
-pub mod captured_authoring;
 pub mod change_history;
-pub mod commit_window;
 pub mod dag_store;
 pub mod desired_state;
 pub mod dirty_path;
-pub mod early_physical_recovery;
 pub mod enrollment;
 mod error;
 pub mod file_identity_codec;
 pub mod file_index;
-pub mod filesystem_transaction;
 mod frontier;
 pub mod handoff_lease;
 pub mod link;
@@ -41,9 +37,7 @@ pub mod policy_watermark;
 pub mod projection_obligations;
 pub mod rebootstrap_store;
 mod replica_history;
-pub mod resolution_planning;
 pub mod restore_operation;
-pub mod retained_obligation;
 pub mod retroactive_conflict;
 pub mod role_loss_operation;
 mod store;

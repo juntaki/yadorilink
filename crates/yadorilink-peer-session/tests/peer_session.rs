@@ -10106,9 +10106,7 @@ mod reconcile_group_paths_flush_tests {
     /// authenticator has for `change_authenticator()` -- for a session
     /// constructed with no emitter, and is `Some`, keyed to this device's
     /// own id and key, for one constructed with one wired in via
-    /// `PeerSyncSessionOneTimeDeps::change_emitter`. This is the capability
-    /// `captured_authoring::author_captured_change` will need at
-    /// materialize time; this session does not call it yet.
+    /// `PeerSyncSessionOneTimeDeps::change_emitter`.
     #[tokio::test]
     async fn change_emitter_defaults_to_none_and_is_wired_in_at_construction() {
         let h = setup().await;

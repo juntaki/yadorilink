@@ -1,70 +1,28 @@
-//! `ReplicaCoordinator` -- the daemon-owned composition-root type Phase
-//! 7D-10.2 introduces as the eventual replacement for
-//! `yadorilink_sync_core::index::SyncState`'s permanently-remaining 17
-//! production methods and five `ports/` trait impls, per
-//! `docs/design/phase7d10-elimination-plan.md` §2.3.
+//! `ReplicaCoordinator` is the daemon's composition-root type: it owns the
+//! per-table SQLite repositories, the shared connection pool, the path-lock
+//! and startup-readiness registries, and the wake channels that drive the
+//! materialization/retirement/hazard-recheck loops.
 //!
-//! # Why this exists, and why it does NOT wrap or get wrapped by `SyncState`
+//! # Field ownership
 //!
-//! The plan's own text describes the target shape as "`SyncState`'s methods
-//! become thin forwards to [a `ReplicaCoordinator`] it now holds" --
-//! evaluated fresh against this workspace's actual crate graph, that exact
-//! mechanism is not implementable: `yadorilink-daemon` already depends on
-//! `yadorilink-sync-core` (`Cargo.toml`), so `SyncState` (defined in
-//! `yadorilink-sync-core`) cannot hold a field of type `ReplicaCoordinator`
-//! (defined here, in `yadorilink-daemon`) without `yadorilink-sync-core`
-//! depending back on `yadorilink-daemon` -- an unresolvable dependency
-//! cycle. Reversing the wrapping direction (`ReplicaCoordinator` holds
-//! `Arc<SyncState>` and forwards into it) would compile, but would leave
-//! the real logic permanently in `yadorilink-sync-core`, defeating this
-//! whole phase's purpose (that crate must eventually be deletable).
+//! Every field here is built fresh in [`ReplicaCoordinator::from_database`]
+//! against one shared `Arc<SyncDatabase>` -- never open a second,
+//! independent `SyncDatabase` against the same on-disk file, which would
+//! split the in-process writer-serialization gate across two connection
+//! pools and defeat the mutual exclusion it exists to provide. Callers that
+//! need more than one `ReplicaCoordinator` over the same database (for
+//! example multiple test fixtures) must share one `Arc<SyncDatabase>` and
+//! pass it to `from_database` rather than opening the file twice.
 //!
-//! This struct instead holds its OWN fields, built fresh from the SAME
-//! underlying `Arc<SyncDatabase>` `SyncState` already opened (via
-//! `SyncState::database`, added alongside this struct) -- never a second,
-//! independently-opened `SyncDatabase` against the same file, which would
-//! split the in-process writer-serialization gate across two pools.
-//! `SyncState`'s own 17 methods and five port impls are left completely
-//! UNCHANGED in `yadorilink-sync-core` (not deleted, not turned into
-//! forwards) because every one of that crate's own remaining internal
-//! callers (`dag_import.rs`, `recovery.rs`, `materialization.rs`,
-//! `block_deletion.rs`, the ports/ impls' own trait objects) still needs a
-//! fully-functional concrete `SyncState`, and none of them are repointed to
-//! `ReplicaCoordinator` in this sub-phase (that is 7D-10.3's job). The
-//! result is real, tested, additive duplication for this transitional
-//! period, not forwarding -- see `docs/design/phase7d10-exit-report.md`'s
-//! 7D-10.2 addendum for the full reasoning and the one port-impl caveat
-//! below.
+//! # Port impls
 //!
-//! # Scope actually delivered this pass: 17 methods + 2 of 5 port impls
-//!
-//! All 17 of `SyncState`'s permanently-remaining production methods (per
-//! `phase7d9f-exit-report.md` §14.3) are reproduced verbatim below. Of the
-//! five `ports/` trait impls the plan names, only two -- `impl
-//! RootVerificationStatePort for ReplicaCoordinator` and `impl
-//! AuthenticatedHistorySource for ReplicaCoordinator` -- are included here.
-//!
-//! The other three (`PeerReplicaStatePort`, `MaterializationStatePort`,
-//! `MaterializationExecutionPort`) each have one method,
-//! `open_materialization_intent_guard`, whose trait signature returns (or,
-//! for `PeerReplicaStatePort`, boxes) `yadorilink_sync_core::materialization
-//! ::MaterializationIntentGuard<'a>` -- a `#[must_use]` safety-critical type
-//! (its own doc comment: "an intent guard that is neither cleared nor
-//! deliberately dropped leaves a durable materialization intent behind")
-//! whose constructor is `pub(crate)` to `yadorilink-sync-core` AND, by
-//! explicit documented design choice (not an oversight -- see that struct's
-//! own field doc comment), hardwired to hold a concrete `&'a SyncState`
-//! rather than `&'a dyn MaterializationStatePort`. Reproducing these three
-//! impls for `ReplicaCoordinator` therefore requires either genericizing
-//! that guard (reversing a deliberate prior design decision, and one shared
-//! by a trait -- `MaterializationExecutionPort`, from
-//! `yadorilink-filesystem-sync` -- whose own return type would need to
-//! change too) or duplicating the guard's own begin/clear journal logic a
-//! second time outside the one module
-//! `scripts/check-materialization-journal.py` polices as the sanctioned
-//! single seam for it. Both are real design decisions with data-loss-safety
-//! stakes, not mechanical relocation -- out of this pass's discretion, and
-//! flagged as this sub-phase's one open follow-up rather than rushed.
+//! `ReplicaCoordinator` implements all five storage ports the replica/peer
+//! session engine depends on. `RootVerificationStatePort` and
+//! `AuthenticatedHistorySource` are implemented directly below; the other
+//! three -- `PeerReplicaStatePort`, `MaterializationStatePort`, and
+//! `MaterializationExecutionPort` -- are each a large, mechanical set of
+//! delegate methods and live in their own submodules (`peer_replica_state`,
+//! `materialization_state`, `materialization_execution`, declared below).
 
 mod local_mutation;
 mod materialization_execution;
@@ -109,10 +67,9 @@ pub struct ReplicaChangeEmission<'a> {
     pub emitter: &'a ChangeEmitter,
     pub permit: &'a RootCommitPermit<'a>,
 }
-/// Local copy of what was `yadorilink_sync_core::index::RepairElectionProvider`
-/// -- a plain type alias with no logic of its own (see that module's
-/// definition), so Phase 7D-10's final deletion pass redefines it here
-/// rather than relocating anything.
+/// Policy hook that resolves the local repair-election context for a group
+/// and obligation set (see `repair_retroactive_conflict_copy_obligations`
+/// below). A plain function-pointer type alias with no logic of its own.
 pub type RepairElectionProvider = dyn Fn(
         &str,
         yadorilink_replica_engine::repair_election::RepairObligationId,
@@ -123,9 +80,10 @@ pub type RepairElectionProvider = dyn Fn(
     + Sync
     + 'static;
 
-/// See this module's own doc comment for why this struct's fields exactly
-/// mirror `SyncState`'s current field list (`phase7d10-elimination-plan.md`
-/// §2.2) rather than forwarding to it.
+/// The daemon's composition-root state: SQLite repositories, connection
+/// pool, and the registries/wake channels used to coordinate concurrent
+/// access to them. See the module doc comment above for field-ownership
+/// invariants.
 pub struct ReplicaCoordinator {
     database: Arc<SyncDatabase>,
     sqlite: Arc<yadorilink_sync_sqlite::SqliteSyncStore>,
@@ -143,16 +101,14 @@ pub struct ReplicaCoordinator {
     role_loss_operation_repository: yadorilink_sync_sqlite::RoleLossOperationRepository,
     membership_operation_repository: yadorilink_sync_sqlite::MembershipOperationRepository,
     recovery_snapshot_reader: RecoverySnapshotReader,
-    /// This crate's own independent `PathLockRegistry` (`crate::sync_runtime::
-    /// path_locks`), not `yadorilink-sync-core`'s copy: `SyncState` has no
-    /// remaining production callers workspace-wide (`DaemonState` no longer
-    /// holds a `SyncState` at all), so the two types never need to serialize
-    /// against each other in a live process any more -- see
-    /// `docs/design/phase7d10-exit-report.md`'s addendum on this for the
-    /// full invariant re-derivation.
+    /// Per-`(group_id, path)` locks serializing local-change indexing
+    /// against peer reconciliation for the same path (`crate::sync_runtime::
+    /// path_locks`).
     path_lock_registry: Arc<PathLockRegistry>,
-    /// This crate's own independent `StartupReadinessRegistry`, for the same
-    /// reason as `path_lock_registry` above.
+    /// Tracks per-group startup readiness so peer-apply (and other
+    /// post-startup mutators) can wait until the group's startup
+    /// reconciliation has published its results before touching that
+    /// group's paths (`crate::sync_runtime::startup_readiness`).
     startup_readiness: Arc<StartupReadinessRegistry>,
     local_change_auth_provider: Mutex<Option<Arc<LocalChangeAuthProvider>>>,
     repair_election_provider: Mutex<Option<Arc<RepairElectionProvider>>>,
@@ -171,13 +127,11 @@ pub struct ReplicaCoordinator {
     hazard_recheck_wake: RetirementWake,
 }
 
-/// Same schema-bootstrap sequencing as `yadorilink_sync_core::index`'s
-/// private `schema_init` (that crate is the composition root for the
-/// `pre_dag_schema` -> `yadorilink_sqlite_runtime::init_schema` ->
-/// `post_dag_schema` ordering; see its own doc comment for why). Used by
-/// [`ReplicaCoordinator::open_in_memory`] below, the one constructor that
-/// opens a database from scratch rather than sharing a live `SyncState`'s
-/// already-open one.
+/// Runs schema setup in the fixed order the DAG-store schema depends on:
+/// `pre_dag_schema`, then `yadorilink_sqlite_runtime::init_schema`, then
+/// `post_dag_schema`. Used by [`ReplicaCoordinator::open`] and
+/// [`ReplicaCoordinator::open_in_memory`] below, the two constructors that
+/// open a database from scratch.
 fn schema_init(conn: &Connection) -> Result<(), yadorilink_sqlite_runtime::DatabaseError> {
     pre_dag_schema(conn)?;
     yadorilink_sqlite_runtime::init_schema(conn)?;
@@ -186,31 +140,17 @@ fn schema_init(conn: &Connection) -> Result<(), yadorilink_sqlite_runtime::Datab
 }
 
 impl ReplicaCoordinator {
-    /// Builds every repository field fresh, against the SAME already-open
-    /// `database` a `SyncState` in the same process opened (via
-    /// [`yadorilink_sync_core::index::SyncState::database`]) -- reusing its
-    /// connection pool and in-process writer-serialization gate rather than
-    /// opening a second, independent one against the same file. Mirrors
-    /// `SyncState::open`/`open_in_memory`'s own field construction
-    /// verbatim, minus the `SyncDatabase::open(..)` call itself (the
-    /// database is received already-open, not opened here).
+    /// Builds every repository field fresh against the given already-open
+    /// `database`, reusing its connection pool and in-process
+    /// writer-serialization gate rather than opening a second, independent
+    /// `SyncDatabase` against the same file.
     ///
-    /// `path_lock_registry`/`startup_readiness` are still accepted as
-    /// caller-supplied `Arc`s (not constructed fresh inside this function)
-    /// so callers can still share one registry pair across multiple
-    /// `ReplicaCoordinator`s built against the same database within THIS
-    /// crate. Historically (Phase 7D-10.5) this parameter existed so a
-    /// `ReplicaCoordinator` could share the exact same registries a live
-    /// `SyncState` in the same process already owned -- `LocalChangeProcessor`
-    /// reached them through `SyncState`/`LocalMutationStore`, and anything
-    /// reached through `ReplicaCoordinator` had to serialize against that
-    /// SAME lock/generation state or the two would give no real mutual
-    /// exclusion against each other. That coupling no longer applies:
-    /// `DaemonState` has not held a `SyncState` since Phase 7D-10.9, so no
-    /// production path can observe a `SyncState`'s registries and a
-    /// `ReplicaCoordinator`'s diverge -- `path_lock_registry`/
-    /// `startup_readiness` here are this crate's own independent copies
-    /// (`crate::sync_runtime`), not `yadorilink-sync-core`'s.
+    /// `path_lock_registry`/`startup_readiness` are caller-supplied `Arc`s
+    /// (not constructed fresh here) so multiple `ReplicaCoordinator`s built
+    /// against the same database can share one registry pair -- sharing is
+    /// what gives them real mutual exclusion against each other; two
+    /// separate registries would each serialize only their own caller's
+    /// access and let concurrent access through the other one race.
     pub fn from_database(
         database: Arc<SyncDatabase>,
         path_lock_registry: Arc<PathLockRegistry>,
@@ -266,22 +206,10 @@ impl ReplicaCoordinator {
     }
 
     /// Opens a standalone, freshly-schema'd in-memory database and builds a
-    /// `ReplicaCoordinator` directly against it -- with its own fresh
-    /// `PathLockRegistry`/`StartupReadinessRegistry` (this crate's own
-    /// independent copies; there is no `SyncState` in this process at all).
-    /// For test fixtures ONLY: `app::run` (the one production caller)
-    /// instead goes through [`ReplicaCoordinator::open`], which likewise
-    /// builds its own fresh registries via [`ReplicaCoordinator::from_database`]
-    /// -- see that constructor's own doc comment for the registry-sharing
-    /// parameter's now-historical rationale. Added for
-    /// `yadorilink-peer-session`'s test fixtures (Phase 7D-10, correcting
-    /// that crate's tests off directly constructing
-    /// `yadorilink_sync_core::index::SyncState` -- see
-    /// `docs/design/phase7d10-exit-report.md`'s addendum on this fix for
-    /// why the earlier dev-dependency-cycle reasoning that blocked this was
-    /// wrong), mirroring `SyncState::open_in_memory`'s own field
-    /// construction (both ultimately call the same `schema_init` sequence
-    /// against a fresh `SyncDatabase::open_in_memory`).
+    /// `ReplicaCoordinator` directly against it, with its own fresh
+    /// `PathLockRegistry`/`StartupReadinessRegistry`. For test fixtures
+    /// only -- the one production caller (`app::run`) goes through
+    /// [`ReplicaCoordinator::open`] instead.
     #[cfg(any(test, feature = "test-support"))]
     pub fn open_in_memory() -> Result<Self, yadorilink_sqlite_runtime::DatabaseError> {
         let database = Arc::new(SyncDatabase::open_in_memory(schema_init)?);
@@ -295,13 +223,9 @@ impl ReplicaCoordinator {
     /// Opens (or creates) a real on-disk database at `path` and builds a
     /// `ReplicaCoordinator` directly against it, with its own fresh
     /// `PathLockRegistry`/`StartupReadinessRegistry` -- the production
-    /// counterpart to [`Self::open_in_memory`] above, mirroring
-    /// `yadorilink_sync_core::index::SyncState::open`'s own field
-    /// construction (both ultimately call the same `schema_init` sequence
-    /// against `SyncDatabase::open`). Phase 7D-10.9: added so
-    /// `yadorilink-daemon`'s own composition root (`app::run`) can build its
-    /// one `ReplicaCoordinator` without going through a `SyncState` it no
-    /// longer constructs.
+    /// counterpart to [`Self::open_in_memory`] above. This is how the
+    /// daemon's composition root (`app::run`) builds its one
+    /// `ReplicaCoordinator`.
     pub fn open(
         path: impl AsRef<std::path::Path>,
     ) -> Result<Self, yadorilink_sqlite_runtime::DatabaseError> {
@@ -313,10 +237,8 @@ impl ReplicaCoordinator {
         ))
     }
 
-    // --- Accessors needed by the port impls below (not part of the 17,
-    // but required so this struct's own field-owning shape can support
-    // them without exposing the fields directly -- same accessor pattern
-    // `SyncState` itself uses). ---
+    // --- Accessors needed by the port impls below, so callers can reach
+    // individual repositories without the fields themselves being public. ---
 
     pub fn link_repository(&self) -> &yadorilink_sync_sqlite::link::LinkRepository {
         &self.link_repository
@@ -344,12 +266,9 @@ impl ReplicaCoordinator {
         &self.rebootstrap_store_repository
     }
 
-    // --- Remaining repository/registry accessors (Phase 7D-10.3): mirror
-    // the five accessors above -- mechanical, no logic of their own -- so
-    // daemon callers whose only obstacle was "this field is private" can
-    // repoint from `SyncState` to `ReplicaCoordinator` for the same
-    // underlying database. See `docs/design/phase7d10-exit-report.md`'s
-    // 7D-10.3 addendum for which callers this actually unblocks. ---
+    // --- Remaining repository/registry accessors: mechanical, no logic of
+    // their own -- expose each field so callers outside this module can
+    // reach the repository for the same underlying database. ---
 
     pub fn database(&self) -> Arc<SyncDatabase> {
         self.database.clone()
@@ -407,12 +326,9 @@ impl ReplicaCoordinator {
         &self.recovery_snapshot_reader
     }
 
-    /// See `yadorilink_sync_core::index::SyncState::
-    /// plant_malformed_membership_operation_for_test`'s own doc comment --
-    /// verbatim copy against this struct's own
-    /// `membership_operation_repository` accessor, for
-    /// `yadorilink-daemon`'s own recovery-inventory tests now that they no
-    /// longer construct a `SyncState` fixture.
+    /// Test-only helper: plants a malformed membership-operation row so
+    /// recovery-inventory tests can exercise the "malformed operation
+    /// detected" path.
     #[cfg(any(test, feature = "test-support"))]
     pub fn plant_malformed_membership_operation_for_test(
         &self,
@@ -423,10 +339,9 @@ impl ReplicaCoordinator {
             .map_err(SyncError::from)
     }
 
-    /// See `yadorilink_sync_core::index::SyncState::
-    /// plant_malformed_role_loss_operation_for_test`'s own doc comment --
-    /// verbatim copy against this struct's own
-    /// `role_loss_operation_repository` accessor.
+    /// Test-only helper: plants a malformed role-loss-operation row so
+    /// recovery-inventory tests can exercise the "malformed operation
+    /// detected" path.
     #[cfg(any(test, feature = "test-support"))]
     pub fn plant_malformed_role_loss_operation_for_test(
         &self,
@@ -437,12 +352,9 @@ impl ReplicaCoordinator {
             .map_err(SyncError::from)
     }
 
-    /// See `yadorilink_sync_core::index::SyncState::
-    /// add_link_with_pending_enrollment_for_test`'s own doc comment --
-    /// verbatim copy against this struct's own `enrollment_repository`
-    /// accessor, for `tests/root_identity_verification.rs`
-    /// (`yadorilink-root-authority`) now that it constructs a
-    /// `ReplicaCoordinator` fixture instead of a `SyncState`.
+    /// Test-only helper: adds a link row with a pending "join" enrollment
+    /// marker attached, for tests that need a link in that intermediate
+    /// state without driving the real enrollment flow.
     #[cfg(any(test, feature = "test-support"))]
     pub fn add_link_with_pending_enrollment_for_test(
         &self,
@@ -483,10 +395,10 @@ impl ReplicaCoordinator {
         &self.hazard_recheck_wake
     }
 
-    // --- The 17 permanently-remaining `SyncState` production methods,
-    // reproduced verbatim (per `phase7d9f-exit-report.md` §14.3's
-    // authoritative list, re-verified fresh against `index.rs` for this
-    // pass). ---
+    // --- Group/change-history mutation methods: local-emission-authorized
+    // writes into the file index, change history, and restore-operation
+    // tables (see `local_emission_auth` below for the auth check they all
+    // share). ---
 
     pub fn set_local_change_auth_provider(&self, provider: Arc<LocalChangeAuthProvider>) {
         *self.local_change_auth_provider.lock().unwrap_or_else(|p| p.into_inner()) = Some(provider);
@@ -496,14 +408,14 @@ impl ReplicaCoordinator {
         *self.repair_election_provider.lock().unwrap_or_else(|p| p.into_inner()) = Some(provider);
     }
 
-    /// See `SyncState::local_emission_auth`'s own doc comment. `pub(crate)`,
-    /// not private: `replica_coordinator/materialization_state.rs`'s own
-    /// `impl MaterializationStatePort for ReplicaCoordinator::
-    /// mark_deleted_emitting_change` (Phase 7D-10, once the trait's return
-    /// type narrowed off the wide `SyncError`) inlines this same pre-check
-    /// directly instead of routing through `ReplicaCoordinator::
-    /// mark_deleted_emitting_change` below, so it needs to call this from
-    /// outside this module.
+    /// Checks whether local changes are currently authorized to emit for
+    /// `group_id`, returning the auth token to attach to the emitted
+    /// change. `pub(crate)`, not private: `replica_coordinator::
+    /// materialization_state`'s own `impl MaterializationStatePort for
+    /// ReplicaCoordinator` inlines this same pre-check directly (its trait
+    /// method's error type is narrower than `mark_deleted_emitting_change`
+    /// below can return), so it needs to call this from outside this
+    /// module.
     pub(crate) fn local_emission_auth(
         &self,
         group_id: &str,
@@ -514,7 +426,10 @@ impl ReplicaCoordinator {
         }
     }
 
-    /// See `SyncState::absent_gate_verdict`'s own doc comment.
+    /// Fallback when no startup-readiness gate has been registered yet for
+    /// `group_id`: succeeds only if the group has no live link at all (so
+    /// there is nothing to wait on), otherwise reports that startup is
+    /// owed but has not run.
     fn absent_gate_verdict(&self, group_id: &str) -> Result<(), StartupFailed> {
         match self.link_repository.has_live_link_for_group(group_id).map_err(SyncError::from) {
             Ok(false) => Ok(()),
@@ -534,7 +449,10 @@ impl ReplicaCoordinator {
         }
     }
 
-    /// See `SyncState::wait_group_ready`'s own doc comment.
+    /// Waits for `group_id`'s startup (initial import/backfill) to finish
+    /// before returning, so peer-applied changes are not processed before
+    /// local state is ready. Falls back to [`Self::absent_gate_verdict`]
+    /// if no readiness gate was ever registered for this group.
     pub async fn wait_group_ready(&self, group_id: &str) -> Result<(), StartupFailed> {
         match self.startup_readiness.wait_group_ready(group_id).await {
             Some(result) => result,
@@ -542,7 +460,8 @@ impl ReplicaCoordinator {
         }
     }
 
-    /// See `SyncState::upsert_file_emitting_change`'s own doc comment.
+    /// Upserts a single file record and emits the corresponding change,
+    /// after checking local-emission authorization for `group_id`.
     pub fn upsert_file_emitting_change(
         &self,
         group_id: &str,
@@ -569,8 +488,10 @@ impl ReplicaCoordinator {
         )?)
     }
 
-    /// See `SyncState::upsert_files_batch_emitting_change`'s own doc
-    /// comment.
+    /// Upserts a batch of file records, emitting one change that covers
+    /// the whole batch (or none, if nothing changed), after the same
+    /// local-emission authorization check as
+    /// [`Self::upsert_file_emitting_change`].
     pub fn upsert_files_batch_emitting_change(
         &self,
         group_id: &str,
@@ -595,7 +516,8 @@ impl ReplicaCoordinator {
         )?)
     }
 
-    /// See `SyncState::mark_deleted_emitting_change`'s own doc comment.
+    /// Marks `path` deleted and emits the corresponding change, after
+    /// checking local-emission authorization for `group_id`.
     pub fn mark_deleted_emitting_change(
         &self,
         group_id: &str,
@@ -617,7 +539,8 @@ impl ReplicaCoordinator {
         )?)
     }
 
-    /// See `SyncState::append_initial_import`'s own doc comment.
+    /// Appends a group's initial-import op batches to change history,
+    /// after checking local-emission authorization for `group_id`.
     pub fn append_initial_import(
         &self,
         group_id: &str,
@@ -631,7 +554,8 @@ impl ReplicaCoordinator {
             .map_err(SyncError::from)
     }
 
-    /// See `SyncState::append_history_backfill`'s own doc comment.
+    /// Appends a single backfilled change to history, after checking
+    /// local-emission authorization for `group_id`.
     pub fn append_history_backfill(
         &self,
         group_id: &str,
@@ -645,13 +569,17 @@ impl ReplicaCoordinator {
             .map_err(SyncError::from)
     }
 
-    /// See `SyncState::root_adoption_lock`'s own doc comment.
+    /// Serializes root-identity adoption for this replica: `open` and
+    /// `verify` in `yadorilink_root_authority::root_identity` both take
+    /// this lock so `verify` can never observe a torn marker/persisted-
+    /// token pair from a concurrent `open` still in flight.
     pub fn root_adoption_lock(&self) -> &Mutex<()> {
         &self.root_adoption_lock
     }
 
-    /// See `SyncState::record_restore_operation_emitting_change`'s own doc
-    /// comment.
+    /// Records a restore operation and emits the corresponding change,
+    /// after checking local-emission authorization for the operation's
+    /// group.
     pub fn record_restore_operation_emitting_change(
         &self,
         operation: &RestoreOperation,
@@ -664,8 +592,9 @@ impl ReplicaCoordinator {
             .map_err(SyncError::from)
     }
 
-    /// See `SyncState::expire_superseded_and_trashed_versions`'s own doc
-    /// comment.
+    /// Expires superseded/trashed file versions older than
+    /// `now_unix_nanos`, excluding any version keys currently pinned by a
+    /// handoff lease.
     pub fn expire_superseded_and_trashed_versions(
         &self,
         group_id: &str,
@@ -682,8 +611,10 @@ impl ReplicaCoordinator {
         )?)
     }
 
-    /// See `SyncState::install_rebootstrap_snapshot`'s own doc comment
-    /// (`index/rebootstrap_store/base.rs`).
+    /// Installs a rebootstrap snapshot from `manifest`/`snapshot_bytes`
+    /// inside one write transaction, optionally emitting a local change
+    /// through `local_emitter`
+    /// (`yadorilink_sync_sqlite::rebootstrap_store::install_rebootstrap_snapshot`).
     pub fn install_rebootstrap_snapshot(
         &self,
         manifest: &yadorilink_replica_engine::rebootstrap::SnapshotManifest,
@@ -707,8 +638,11 @@ impl ReplicaCoordinator {
             .map_err(SyncError::from)
     }
 
-    /// See `SyncState::repair_retroactive_conflict_copy_obligations`'s own
-    /// doc comment (`index/rebootstrap_store/retroactive_conflict_store.rs`).
+    /// Plans and applies retroactive conflict-copy repairs for `group_id`:
+    /// computes the merge plan, consults the repair-election provider (if
+    /// any) to decide whether this device is eligible to author the
+    /// repair, emits the resulting ops, and wakes materialization on
+    /// success (`yadorilink_sync_sqlite::retroactive_conflict::plan_retroactive_merge`).
     pub fn repair_retroactive_conflict_copy_obligations(
         &self,
         group_id: &str,
@@ -803,8 +737,9 @@ impl ReplicaCoordinator {
     }
 }
 
-// --- Port impls (2 of the plan's 5 -- see this module's own doc comment
-// for why the other three are deferred). ---
+// --- Port impls implemented directly in this file (the other three live
+// in the `peer_replica_state`, `materialization_state`, and
+// `materialization_execution` submodules -- see the module doc above). ---
 
 impl RootVerificationStatePort for ReplicaCoordinator {
     fn root_adoption_lock(&self) -> &Mutex<()> {
@@ -922,15 +857,10 @@ impl AuthenticatedHistorySource for ReplicaCoordinator {
     }
 }
 
-// --- History-compaction store wiring (Phase 7D-10.3): byte-identical to
-// `impl {CompactionDagStore,DeviceFrontierStore,CheckpointStore} for
-// SyncState` (`yadorilink-sync-core/src/index.rs`) -- these three traits are
-// storage-agnostic (`yadorilink_replica_engine::compaction`'s own doc
-// comment), so `ReplicaCoordinator` implements them the same way `SyncState`
-// does, delegating to the same `self.sqlite`/`self.database` this struct
-// already owns. Unlike the five `ports/` impls Phase 7D-10.2 could only move
-// two of, these three have no `MaterializationIntentGuard` dependency, so
-// nothing blocks reproducing all three here.
+// --- History-compaction store wiring: `CompactionDagStore`,
+// `DeviceFrontierStore`, and `CheckpointStore` (`yadorilink_replica_engine::
+// compaction`) delegate to `self.sqlite`/`self.database`, the same handles
+// the rest of this struct's methods use. ---
 impl CompactionDagStore for ReplicaCoordinator {
     fn heads(&self, group: &FolderGroupId) -> Result<Vec<ChangeHash>, ReplicaEngineError> {
         self.sqlite.group_heads(group).map_err(|e| ReplicaEngineError::Storage(e.to_string()))
@@ -1018,31 +948,11 @@ impl CheckpointStore for ReplicaCoordinator {
     }
 }
 
-// --- Materialization-intent journal (Phase 7D-10.4): proves
-// `crate::materialization_intent::MaterializationIntentGuard`'s
-// generalization away from a hardwired concrete `&SyncState` (per that
-// module's own doc comment) actually reaches `ReplicaCoordinator`, not just
-// `SyncState`. This impl is legal under Rust's orphan rule even though the
-// trait is foreign (defined in `yadorilink-sync-core`): `ReplicaCoordinator`
-// is local to this crate. Written here, not in `yadorilink-sync-core`,
-// because that crate cannot name `ReplicaCoordinator` (the reverse
-// dependency direction is forbidden by this whole initiative's boundary
-// rules -- see this module's own top doc comment). Only this one accessor is
-// exposed: `ReplicaCoordinator`'s own `MaterializationIntentRepository`
-// instance (`materialization_intent_repository`, added 7D-10.3), constructed
-// against the SAME underlying `Arc<SyncDatabase>` a live `SyncState` in the
-// same process already opened (`from_database`'s own doc comment) -- so the
-// journal table this seam writes to is identical to `SyncState`'s, not a
-// second, divergent one.
-//
-// Reproducing the three `ports/` trait impls
-// (`PeerReplicaStatePort`/`MaterializationStatePort`/
-// `MaterializationExecutionPort`) for `ReplicaCoordinator` in full is
-// deliberately NOT done in this pass -- each is ~30-50 delegate methods
-// mirroring the rest of this struct's existing accessors, a mechanical sweep
-// of the same size and shape as 7D-10.2/10.3's own dedicated passes, now
-// finally unblocked by this impl but still its own scoped unit of work. See
-// `docs/design/phase7d10-exit-report.md`'s 7D-10.4 addendum.
+// --- Materialization-intent journal: gives `MaterializationIntentGuard`
+// (generic over `T: MaterializationIntentJournal`, see
+// `crate::materialization_intent`) access to this struct's own
+// `MaterializationIntentRepository`, so callers can open/clear a durable
+// materialization intent against `ReplicaCoordinator`'s storage. ---
 impl crate::materialization_intent::MaterializationIntentJournal for ReplicaCoordinator {
     fn materialization_intent_repository(
         &self,
@@ -1051,9 +961,8 @@ impl crate::materialization_intent::MaterializationIntentJournal for ReplicaCoor
     }
 }
 
-// Phase 7D-10: `crate::recovery::RecoveryInventorySource` -- relocated here
-// from `yadorilink-sync-core::recovery` alongside its one real implementor,
-// this impl.
+// `ReplicaCoordinator` is `crate::recovery::RecoveryInventorySource`'s only
+// implementor.
 impl crate::recovery::RecoveryInventorySource for ReplicaCoordinator {
     fn enrollment_repository(&self) -> &yadorilink_sync_sqlite::enrollment::EnrollmentRepository {
         ReplicaCoordinator::enrollment_repository(self)
@@ -1072,13 +981,10 @@ impl crate::recovery::RecoveryInventorySource for ReplicaCoordinator {
     }
 }
 
-// Phase 7D-10.5: `dag_import.rs` itself has now physically relocated to
-// `crate::dag_import` -- the last two genuinely-blocked production
-// `&SyncState` dependencies (`link_runtime/startup.rs`'s
-// `ensure_initial_import` call and `daemon_state.rs`'s
-// `backfill_missing_history` call) already passed a `&ReplicaCoordinator`
-// exclusively in production, so moving the module itself changes only which
-// crate it compiles in, not any call site's behavior.
+// `ReplicaCoordinator` is `crate::dag_import::DagImportSource`'s only
+// implementor: `link_runtime::startup::ensure_initial_import` and
+// `daemon_state`'s `backfill_missing_history` call both go through a
+// `&ReplicaCoordinator`.
 impl crate::dag_import::DagImportSource for ReplicaCoordinator {
     fn sqlite(&self) -> &yadorilink_sync_sqlite::SqliteSyncStore {
         ReplicaCoordinator::sqlite(self)
@@ -1124,14 +1030,7 @@ mod dag_import_source_tests {
 
     /// End-to-end proof that `ensure_initial_import` converts a real index
     /// into signed history when called through a `ReplicaCoordinator` --
-    /// not merely that the trait bound type-checks. Previously built the
-    /// coordinator from a live `SyncState`'s own `Arc<SyncDatabase>` and
-    /// re-checked the result through that original handle, to prove the two
-    /// types shared one database during their transitional coexistence;
-    /// `SyncState` was deleted in Phase 7D-10's final elimination pass (the
-    /// coexistence invariant itself was independently re-verified moot
-    /// beforehand -- see this file's own history), so this test now builds
-    /// and reads back through a single `ReplicaCoordinator` directly.
+    /// not merely that the trait bound type-checks.
     #[test]
     fn ensure_initial_import_runs_against_a_replica_coordinator() {
         let coordinator = ReplicaCoordinator::open_in_memory().unwrap();
@@ -1166,14 +1065,10 @@ mod materialization_intent_journal_tests {
     use super::*;
     use crate::materialization_intent::MaterializationIntentGuard;
 
-    /// End-to-end proof that the generalized guard opens and clears a real,
-    /// durable intent against a `ReplicaCoordinator`-backed
+    /// End-to-end proof that `MaterializationIntentGuard` opens and clears
+    /// a real, durable intent against a `ReplicaCoordinator`-backed
     /// `MaterializationIntentRepository` -- not merely that the trait bound
-    /// type-checks. Previously built the coordinator against a live
-    /// `SyncState`'s already-open `Arc<SyncDatabase>` to mirror production's
-    /// then-transitional dual-wiring; `SyncState` was deleted in Phase
-    /// 7D-10's final elimination pass, so this now builds the coordinator
-    /// directly.
+    /// type-checks.
     #[test]
     fn guard_opens_and_clears_against_replica_coordinator() {
         let coordinator = ReplicaCoordinator::open_in_memory().unwrap();

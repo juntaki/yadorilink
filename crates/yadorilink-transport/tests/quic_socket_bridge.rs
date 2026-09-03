@@ -3,9 +3,10 @@
 //! deterministic simulation.
 //!
 //! This is the load-bearing check for sharing one UDP socket between QUIC,
-//! STUN and the relay envelope. `bulk_quic.rs` avoided the question by
-//! binding a second port, which the real mesh cannot do without asking every
-//! NAT in the path for a second mapping.
+//! STUN and the relay envelope. A prior bulk-transport module (since
+//! removed) avoided the question by binding a second port, which the real
+//! mesh cannot do without asking every NAT in the path for a second
+//! mapping.
 //!
 //! Deliberately one test body with two entry points rather than two tests.
 //! A simulation-only substitute for QUIC would make the deterministic build
