@@ -115,15 +115,18 @@ pub fn wrap_relay_envelope(relay_session_id: u64, opaque_peer_bytes: &[u8]) -> V
     wrapped
 }
 
+/// A demuxed datagram sink: the raw bytes plus who they came from.
+type DatagramSender = Mutex<Option<mpsc::Sender<(Vec<u8>, SocketAddr)>>>;
+
 pub(crate) struct DemuxRegistry {
-    stun_tx: Mutex<Option<mpsc::Sender<(Vec<u8>, SocketAddr)>>>,
+    stun_tx: DatagramSender,
     /// Where every datagram that is neither a relay envelope nor a STUN
     /// response goes: the QUIC endpoint sharing this socket, which
     /// authenticates the sender itself. `None` until
     /// [`TransportHub::register_quic`]; such datagrams are dropped until
     /// then, which is the correct behavior for a device with no endpoint
     /// yet rather than a gap.
-    quic_tx: Mutex<Option<mpsc::Sender<(Vec<u8>, SocketAddr)>>>,
+    quic_tx: DatagramSender,
     /// Inbound QUIC datagrams dropped because the queue above was full --
     /// see [`TransportHub::register_quic`] for why dropping is the right
     /// outcome, and why it must still be counted rather than silent.
