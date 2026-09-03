@@ -53,12 +53,7 @@ impl EntryStore {
     /// plain well-formed-id sanity check). A legitimate id is always the
     /// UUID `insert` generates, which satisfies all of this trivially.
     fn entry_path(&self, id: &str) -> ReportingResult<PathBuf> {
-        if id.is_empty()
-            || id == "."
-            || id == ".."
-            || id.contains('/')
-            || id.contains('\\')
-        {
+        if id.is_empty() || id == "." || id == ".." || id.contains('/') || id.contains('\\') {
             return Err(ReportingStorageError::InvalidEntryId(id.to_string()));
         }
         Ok(self.dir.join(format!("{id}.json")))
@@ -299,15 +294,9 @@ mod tests {
         let victim = root.path().join("victim.json");
         std::fs::write(&victim, "not a report, must survive").unwrap();
 
-        for malicious_id in [
-            "../victim",
-            "../../victim",
-            "some/../../victim",
-            "/etc/passwd",
-            ".",
-            "..",
-            "sub/dir",
-        ] {
+        for malicious_id in
+            ["../victim", "../../victim", "some/../../victim", "/etc/passwd", ".", "..", "sub/dir"]
+        {
             assert_eq!(
                 store.show(malicious_id).unwrap(),
                 None,

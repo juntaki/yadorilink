@@ -478,13 +478,7 @@ impl SoakWorld {
         }
         let spare = new_node("topology-x-spare");
         link_on_demand(&spare, &self.group_id);
-        register_with_fake(
-            &self.fake,
-            &spare.state,
-            &spare.device_id,
-            &[&self.group_id],
-        )
-        .await;
+        register_with_fake(&self.fake, &spare.state, &spare.device_id, &[&self.group_id]).await;
         wire_relay_grant_source(&self.fake, &spare.state, &spare.device_id);
         // Coordination-plane-declared full-replica, matching `restore_n_
         // canonical_role`'s own pattern -- WITHOUT this, N is

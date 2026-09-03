@@ -340,11 +340,10 @@ mod tests {
     async fn unauthorized_announcement_is_filtered_out() {
         let my_key = [5u8; 32];
         let authorized_key = [6u8; 32];
-        let (addr, mut rx) = start_local_discovery(my_key, 41641, 0, move |k: &PublicKeyBytes| {
-            *k == authorized_key
-        })
-        .await
-        .unwrap();
+        let (addr, mut rx) =
+            start_local_discovery(my_key, 41641, 0, move |k: &PublicKeyBytes| *k == authorized_key)
+                .await
+                .unwrap();
 
         send_raw(
             0,

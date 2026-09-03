@@ -2697,8 +2697,7 @@ impl DaemonState {
     pub fn set_local_relay_capable(&self, capable: bool) {
         self.local_relay_capable.store(capable, std::sync::atomic::Ordering::Relaxed);
         if !capable {
-            let mut sessions =
-                self.active_relay_sessions.lock().unwrap_or_else(|p| p.into_inner());
+            let mut sessions = self.active_relay_sessions.lock().unwrap_or_else(|p| p.into_inner());
             let affected: Vec<u64> = sessions.keys().copied().collect();
             sessions.clear();
             drop(sessions);
@@ -6176,17 +6175,13 @@ mod tests {
         }
 
         fn now_unix_seconds() -> i64 {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+                as i64
         }
 
         fn now_unix_millis() -> i64 {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+                as i64
         }
 
         /// The setter fix: open a session, confirm it is tracked, disable

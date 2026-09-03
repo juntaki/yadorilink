@@ -293,15 +293,16 @@ pub fn claim_runnable_obligations(
          ORDER BY updated_at ASC, path ASC \
          LIMIT ?3",
     )?;
-    let rows = stmt.query_map(rusqlite::params![now_unix_nanos, per_group_limit, total_limit], |r| {
-        Ok(ClaimedObligation {
-            group_id: r.get(0)?,
-            path: r.get(1)?,
-            invalidation_generation: r.get(2)?,
-            obligation_incarnation: r.get(3)?,
-            attempt_count: r.get(4)?,
-        })
-    })?;
+    let rows =
+        stmt.query_map(rusqlite::params![now_unix_nanos, per_group_limit, total_limit], |r| {
+            Ok(ClaimedObligation {
+                group_id: r.get(0)?,
+                path: r.get(1)?,
+                invalidation_generation: r.get(2)?,
+                obligation_incarnation: r.get(3)?,
+                attempt_count: r.get(4)?,
+            })
+        })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
@@ -722,8 +723,7 @@ pub fn bootstrap_obligations_from_legacy_unapplied_changes(
     let mut touched_paths: std::collections::BTreeSet<(String, String)> =
         std::collections::BTreeSet::new();
     {
-        let mut stmt =
-            conn.prepare("SELECT group_id, encoded FROM changes WHERE applied = 0")?;
+        let mut stmt = conn.prepare("SELECT group_id, encoded FROM changes WHERE applied = 0")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let group_id: String = row.get(0)?;
@@ -903,8 +903,9 @@ mod tests {
     fn an_empty_touched_set_is_a_no_op() {
         let conn = conn();
         bump_projection_obligations_for_touched_paths(&conn, "g", &[], 1000).unwrap();
-        let count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM projection_obligations", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM projection_obligations", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -917,7 +918,8 @@ mod tests {
     #[test]
     fn claim_returns_every_pending_obligation_with_its_current_generation() {
         let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt", "b.txt"], 1000).unwrap();
+        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt", "b.txt"], 1000)
+            .unwrap();
         bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 2000).unwrap();
         let claimed = claim_runnable_obligations(&conn, 10_000, 10, 10).unwrap();
         assert_eq!(claimed.len(), 2);
@@ -958,7 +960,8 @@ mod tests {
     #[test]
     fn claim_gives_every_group_a_share_rather_than_letting_one_group_crowd_out_another() {
         let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "heavy", &["1", "2", "3"], 1000).unwrap();
+        bump_projection_obligations_for_touched_paths(&conn, "heavy", &["1", "2", "3"], 1000)
+            .unwrap();
         bump_projection_obligations_for_touched_paths(&conn, "light", &["only"], 1000).unwrap();
         let claimed = claim_runnable_obligations(&conn, 10_000, 1, 10).unwrap();
         let groups: std::collections::BTreeSet<&str> =
@@ -986,10 +989,10 @@ mod tests {
         let claimed_g = claimed[0].invalidation_generation;
         let claimed_i = claimed[0].obligation_incarnation;
 
-        assert!(
-            mark_obligation_attempt_failed(&conn, "g", "a.txt", claimed_g, claimed_i, 5000, 1000)
-                .unwrap()
-        );
+        assert!(mark_obligation_attempt_failed(
+            &conn, "g", "a.txt", claimed_g, claimed_i, 5000, 1000
+        )
+        .unwrap());
 
         assert!(
             claim_runnable_obligations(&conn, 2000, 10, 10).unwrap().is_empty(),
@@ -997,7 +1000,10 @@ mod tests {
         );
         let reclaimed = claim_runnable_obligations(&conn, 5000, 10, 10).unwrap();
         assert_eq!(reclaimed.len(), 1, "must be reclaimable once the backoff deadline passes");
-        assert_eq!(reclaimed[0].attempt_count, 1, "the failed attempt must have incremented the count");
+        assert_eq!(
+            reclaimed[0].attempt_count, 1,
+            "the failed attempt must have incremented the count"
+        );
     }
 
     #[test]
@@ -1045,8 +1051,14 @@ mod tests {
              correct (unchanged) incarnation"
         );
         let row = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        assert_eq!(row.attempt_count, 0, "the fresh generation's reset must survive the stale report");
-        assert_eq!(row.next_attempt_at, 2000, "the fresh generation must stay immediately runnable");
+        assert_eq!(
+            row.attempt_count, 0,
+            "the fresh generation's reset must survive the stale report"
+        );
+        assert_eq!(
+            row.next_attempt_at, 2000,
+            "the fresh generation must stay immediately runnable"
+        );
     }
 
     /// **Phase E finding (obligation row-incarnation ABA), fix verification**:
@@ -1180,7 +1192,8 @@ mod tests {
     #[test]
     fn earliest_pending_next_attempt_at_ignores_already_runnable_rows() {
         let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt", "b.txt"], 1000).unwrap();
+        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt", "b.txt"], 1000)
+            .unwrap();
         let claimed = claim_runnable_obligations(&conn, 1000, 10, 10).unwrap();
         let a = claimed.iter().find(|c| c.path == "a.txt").unwrap();
         mark_obligation_attempt_failed(
@@ -1269,8 +1282,9 @@ mod tests {
 mod completion_tests {
     use super::*;
     use crate::materialized_generation::{
-        bump_mutation_fence, init_materialized_generation_schema, publish_materialized_generation_if_fence_current,
-        snapshot_mutation_fence, MaterializedObjectKind,
+        bump_mutation_fence, init_materialized_generation_schema,
+        publish_materialized_generation_if_fence_current, snapshot_mutation_fence,
+        MaterializedObjectKind,
     };
 
     /// Full schema this module's tests need: DAG + projection_obligations
@@ -1317,7 +1331,8 @@ mod completion_tests {
     fn exact_completion_closes_when_all_three_conditions_hold() {
         let conn = conn();
         bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let claimed_obligation = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
+        let claimed_obligation =
+            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
         let claimed_g = claimed_obligation.invalidation_generation;
         let claimed_i = claimed_obligation.obligation_incarnation;
 
@@ -1360,7 +1375,8 @@ mod completion_tests {
     fn exact_completion_fails_when_dag_side_generation_moved() {
         let conn = conn();
         bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let claimed_obligation = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
+        let claimed_obligation =
+            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
         let claimed_g = claimed_obligation.invalidation_generation;
         let claimed_i = claimed_obligation.obligation_incarnation;
 
@@ -1392,7 +1408,10 @@ mod completion_tests {
         )
         .unwrap());
         assert_eq!(
-            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap().invalidation_generation,
+            lookup_projection_obligation(&conn, "g", "a.txt")
+                .unwrap()
+                .unwrap()
+                .invalidation_generation,
             claimed_g + 1,
             "a failed completion must leave the re-armed obligation exactly as it was"
         );
@@ -1406,7 +1425,8 @@ mod completion_tests {
     fn exact_completion_fails_when_filesystem_side_fence_moved_even_though_dag_side_did_not() {
         let conn = conn();
         bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let claimed_obligation = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
+        let claimed_obligation =
+            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
         let claimed_g = claimed_obligation.invalidation_generation;
         let claimed_i = claimed_obligation.obligation_incarnation;
 
@@ -1444,7 +1464,10 @@ mod completion_tests {
              at has been invalidated by a mutator the DAG never saw"
         );
         assert_eq!(
-            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap().invalidation_generation,
+            lookup_projection_obligation(&conn, "g", "a.txt")
+                .unwrap()
+                .unwrap()
+                .invalidation_generation,
             claimed_g,
             "the obligation is left outstanding at the SAME generation, to be re-resolved -- it \
              was never invalidated on the DAG side, only the fs-side proof was"
@@ -1459,7 +1482,8 @@ mod completion_tests {
     fn exact_completion_fails_when_the_usable_proofs_content_does_not_match_the_desired_hash() {
         let conn = conn();
         bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let claimed_obligation = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
+        let claimed_obligation =
+            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
         let claimed_g = claimed_obligation.invalidation_generation;
         let claimed_i = claimed_obligation.obligation_incarnation;
 
@@ -1480,7 +1504,12 @@ mod completion_tests {
         // A completely different (wrong) desired hash -- not what the
         // usable, current proof actually says.
         assert!(!complete_obligation_if_exact_proof_current(
-            &conn, "g", "a.txt", claimed_g, claimed_i, &hash(99)
+            &conn,
+            "g",
+            "a.txt",
+            claimed_g,
+            claimed_i,
+            &hash(99)
         )
         .unwrap());
         assert!(lookup_projection_obligation(&conn, "g", "a.txt").unwrap().is_some());
@@ -1493,11 +1522,17 @@ mod completion_tests {
     fn exact_completion_fails_when_no_proof_was_ever_published() {
         let conn = conn();
         bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let claimed_obligation = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
+        let claimed_obligation =
+            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
         let claimed_g = claimed_obligation.invalidation_generation;
         let claimed_i = claimed_obligation.obligation_incarnation;
         assert!(!complete_obligation_if_exact_proof_current(
-            &conn, "g", "a.txt", claimed_g, claimed_i, &hash(1)
+            &conn,
+            "g",
+            "a.txt",
+            claimed_g,
+            claimed_i,
+            &hash(1)
         )
         .unwrap());
     }
@@ -1509,7 +1544,8 @@ mod completion_tests {
     fn non_exact_placeholder_completion_closes_while_still_a_placeholder() {
         let conn = conn();
         bump_projection_obligations_for_touched_paths(&conn, "g", &["p.txt"], 1000).unwrap();
-        let claimed_obligation = lookup_projection_obligation(&conn, "g", "p.txt").unwrap().unwrap();
+        let claimed_obligation =
+            lookup_projection_obligation(&conn, "g", "p.txt").unwrap().unwrap();
         let claimed_g = claimed_obligation.invalidation_generation;
         let claimed_i = claimed_obligation.obligation_incarnation;
         seed_file_row(&conn, "g", "p.txt", "placeholder", None);
@@ -1534,7 +1570,8 @@ mod completion_tests {
     fn non_exact_placeholder_completion_fails_once_hydrated_in_the_meantime() {
         let conn = conn();
         bump_projection_obligations_for_touched_paths(&conn, "g", &["p.txt"], 1000).unwrap();
-        let claimed_obligation = lookup_projection_obligation(&conn, "g", "p.txt").unwrap().unwrap();
+        let claimed_obligation =
+            lookup_projection_obligation(&conn, "g", "p.txt").unwrap().unwrap();
         let claimed_g = claimed_obligation.invalidation_generation;
         let claimed_i = claimed_obligation.obligation_incarnation;
         seed_file_row(&conn, "g", "p.txt", "hydrated", None);
@@ -1557,7 +1594,8 @@ mod completion_tests {
     fn non_exact_hazard_held_completion_closes_while_still_held() {
         let conn = conn();
         bump_projection_obligations_for_touched_paths(&conn, "g", &["h.txt"], 1000).unwrap();
-        let claimed_obligation = lookup_projection_obligation(&conn, "g", "h.txt").unwrap().unwrap();
+        let claimed_obligation =
+            lookup_projection_obligation(&conn, "g", "h.txt").unwrap().unwrap();
         let claimed_g = claimed_obligation.invalidation_generation;
         let claimed_i = claimed_obligation.obligation_incarnation;
         seed_file_row(&conn, "g", "h.txt", "hydrated", Some("case_collision"));
@@ -1581,7 +1619,8 @@ mod completion_tests {
     fn non_exact_hazard_held_completion_fails_once_the_hold_is_lifted() {
         let conn = conn();
         bump_projection_obligations_for_touched_paths(&conn, "g", &["h.txt"], 1000).unwrap();
-        let claimed_obligation = lookup_projection_obligation(&conn, "g", "h.txt").unwrap().unwrap();
+        let claimed_obligation =
+            lookup_projection_obligation(&conn, "g", "h.txt").unwrap().unwrap();
         let claimed_g = claimed_obligation.invalidation_generation;
         let claimed_i = claimed_obligation.obligation_incarnation;
         seed_file_row(&conn, "g", "h.txt", "hydrated", None);
@@ -1607,7 +1646,8 @@ mod completion_tests {
     fn non_exact_ignore_excluded_completion_parks_rather_than_deletes() {
         let conn = conn();
         bump_projection_obligations_for_touched_paths(&conn, "g", &["i.txt"], 1000).unwrap();
-        let claimed_obligation = lookup_projection_obligation(&conn, "g", "i.txt").unwrap().unwrap();
+        let claimed_obligation =
+            lookup_projection_obligation(&conn, "g", "i.txt").unwrap().unwrap();
         let claimed_g = claimed_obligation.invalidation_generation;
         let claimed_i = claimed_obligation.obligation_incarnation;
 
@@ -1637,7 +1677,8 @@ mod completion_tests {
     fn ignore_blocked_obligation_is_rearmed_and_becomes_claimable_again() {
         let conn = conn();
         bump_projection_obligations_for_touched_paths(&conn, "g", &["i.txt"], 1000).unwrap();
-        let claimed_obligation = lookup_projection_obligation(&conn, "g", "i.txt").unwrap().unwrap();
+        let claimed_obligation =
+            lookup_projection_obligation(&conn, "g", "i.txt").unwrap().unwrap();
         let claimed_g = claimed_obligation.invalidation_generation;
         let claimed_i = claimed_obligation.obligation_incarnation;
         complete_obligation_if_non_exact_proof_current(
@@ -1655,7 +1696,10 @@ mod completion_tests {
 
         let row = lookup_projection_obligation(&conn, "g", "i.txt").unwrap().unwrap();
         assert_eq!(row.state, "pending");
-        assert_eq!(row.invalidation_generation, claimed_g, "re-arming must not bump the generation");
+        assert_eq!(
+            row.invalidation_generation, claimed_g,
+            "re-arming must not bump the generation"
+        );
         assert_eq!(row.next_attempt_at, 5000, "must be immediately claimable again");
         assert!(list_ignore_blocked_paths(&conn, "g").unwrap().is_empty());
 
@@ -1668,7 +1712,8 @@ mod completion_tests {
     fn a_fresh_admission_rearms_an_ignore_blocked_path_too() {
         let conn = conn();
         bump_projection_obligations_for_touched_paths(&conn, "g", &["i.txt"], 1000).unwrap();
-        let claimed_obligation = lookup_projection_obligation(&conn, "g", "i.txt").unwrap().unwrap();
+        let claimed_obligation =
+            lookup_projection_obligation(&conn, "g", "i.txt").unwrap().unwrap();
         let claimed_g = claimed_obligation.invalidation_generation;
         let claimed_i = claimed_obligation.obligation_incarnation;
         complete_obligation_if_non_exact_proof_current(
@@ -1697,7 +1742,8 @@ mod completion_tests {
     fn non_exact_ignore_excluded_completion_fails_when_generation_moved() {
         let conn = conn();
         bump_projection_obligations_for_touched_paths(&conn, "g", &["i.txt"], 1000).unwrap();
-        let claimed_obligation = lookup_projection_obligation(&conn, "g", "i.txt").unwrap().unwrap();
+        let claimed_obligation =
+            lookup_projection_obligation(&conn, "g", "i.txt").unwrap().unwrap();
         let claimed_g = claimed_obligation.invalidation_generation;
         let claimed_i = claimed_obligation.obligation_incarnation;
         bump_projection_obligations_for_touched_paths(&conn, "g", &["i.txt"], 2000).unwrap();
@@ -1718,7 +1764,8 @@ mod completion_tests {
     #[test]
     fn completing_one_paths_obligation_never_touches_an_unrelated_path() {
         let conn = conn();
-        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt", "b.txt"], 1000).unwrap();
+        bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt", "b.txt"], 1000)
+            .unwrap();
         let obligation_a = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
         let g_a = obligation_a.invalidation_generation;
         let i_a = obligation_a.obligation_incarnation;
@@ -1772,7 +1819,8 @@ mod completion_tests {
     /// "still claimable at G+1" assertion failed together. Restored and
     /// reconfirmed GREEN.
     #[test]
-    fn a_concurrent_admissions_rearmed_obligation_is_independently_claimable_through_the_claim_api() {
+    fn a_concurrent_admissions_rearmed_obligation_is_independently_claimable_through_the_claim_api()
+    {
         let conn = conn();
         bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
         let claimed = claim_runnable_obligations(&conn, 10_000, 10, 10).unwrap();
@@ -1834,7 +1882,8 @@ mod completion_tests {
     fn exact_completion_closes_for_a_content_identical_verifications_snapshot_epoch() {
         let conn = conn();
         bump_projection_obligations_for_touched_paths(&conn, "g", &["a.txt"], 1000).unwrap();
-        let claimed_obligation = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
+        let claimed_obligation =
+            lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
         let claimed_g = claimed_obligation.invalidation_generation;
         let claimed_i = claimed_obligation.obligation_incarnation;
 
@@ -1931,9 +1980,14 @@ mod legacy_scheduler_cutover_tests {
     fn backfills_an_obligation_for_a_touched_path_with_none_existing() {
         let conn = conn();
         let em = dag_store::ChangeEmitter::new("device-a", SigningKey::from_bytes(&[1u8; 32]));
-        let change =
-            dag_store::emit_local_change(&conn, "g", vec![delete_op("a.txt")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
+        let change = dag_store::emit_local_change(
+            &conn,
+            "g",
+            vec![delete_op("a.txt")],
+            ChangeAuth::PLACEHOLDER,
+            &em,
+        )
+        .unwrap();
         force_unapplied(&conn, &change.compute_hash());
         strip_obligation(&conn, "g", "a.txt");
         assert!(lookup_projection_obligation(&conn, "g", "a.txt").unwrap().is_none());
@@ -1950,19 +2004,32 @@ mod legacy_scheduler_cutover_tests {
     fn never_bumps_or_replaces_an_existing_obligation() {
         let conn = conn();
         let em = dag_store::ChangeEmitter::new("device-a", SigningKey::from_bytes(&[2u8; 32]));
-        let first =
-            dag_store::emit_local_change(&conn, "g", vec![delete_op("a.txt")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
+        let first = dag_store::emit_local_change(
+            &conn,
+            "g",
+            vec![delete_op("a.txt")],
+            ChangeAuth::PLACEHOLDER,
+            &em,
+        )
+        .unwrap();
         // A second admission bumps the SAME path's obligation to G=2 --
         // this row must survive the migration completely untouched, since
         // `emit_local_change`'s own admission already created it correctly.
-        let second =
-            dag_store::emit_local_change(&conn, "g", vec![delete_op("a.txt")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
+        let second = dag_store::emit_local_change(
+            &conn,
+            "g",
+            vec![delete_op("a.txt")],
+            ChangeAuth::PLACEHOLDER,
+            &em,
+        )
+        .unwrap();
         force_unapplied(&conn, &first.compute_hash());
         force_unapplied(&conn, &second.compute_hash());
         let before = lookup_projection_obligation(&conn, "g", "a.txt").unwrap().unwrap();
-        assert_eq!(before.invalidation_generation, 2, "test precondition: two admissions bump to G=2");
+        assert_eq!(
+            before.invalidation_generation, 2,
+            "test precondition: two admissions bump to G=2"
+        );
         reset_migration_marker(&conn);
 
         bootstrap_obligations_from_legacy_unapplied_changes(&conn, 5_000).unwrap();
@@ -1981,8 +2048,14 @@ mod legacy_scheduler_cutover_tests {
         let em = dag_store::ChangeEmitter::new("device-a", SigningKey::from_bytes(&[3u8; 32]));
         // Never forced unapplied -- `emit_local_change` already leaves it
         // `applied = 1`, exactly the case this test needs.
-        dag_store::emit_local_change(&conn, "g", vec![delete_op("a.txt")], ChangeAuth::PLACEHOLDER, &em)
-            .unwrap();
+        dag_store::emit_local_change(
+            &conn,
+            "g",
+            vec![delete_op("a.txt")],
+            ChangeAuth::PLACEHOLDER,
+            &em,
+        )
+        .unwrap();
         strip_obligation(&conn, "g", "a.txt");
         reset_migration_marker(&conn);
 
@@ -2024,9 +2097,14 @@ mod legacy_scheduler_cutover_tests {
     fn a_second_invocation_performs_zero_work_and_never_re_arms_a_completed_path() {
         let conn = conn();
         let em = dag_store::ChangeEmitter::new("device-a", SigningKey::from_bytes(&[5u8; 32]));
-        let change =
-            dag_store::emit_local_change(&conn, "g", vec![delete_op("a.txt")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
+        let change = dag_store::emit_local_change(
+            &conn,
+            "g",
+            vec![delete_op("a.txt")],
+            ChangeAuth::PLACEHOLDER,
+            &em,
+        )
+        .unwrap();
         force_unapplied(&conn, &change.compute_hash());
         strip_obligation(&conn, "g", "a.txt");
         reset_migration_marker(&conn);
@@ -2065,9 +2143,14 @@ mod legacy_scheduler_cutover_tests {
     fn init_dag_schema_backfills_a_legacy_database_on_a_real_restart() {
         let conn = conn();
         let em = dag_store::ChangeEmitter::new("device-a", SigningKey::from_bytes(&[9u8; 32]));
-        let change =
-            dag_store::emit_local_change(&conn, "g", vec![delete_op("a.txt")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
+        let change = dag_store::emit_local_change(
+            &conn,
+            "g",
+            vec![delete_op("a.txt")],
+            ChangeAuth::PLACEHOLDER,
+            &em,
+        )
+        .unwrap();
         force_unapplied(&conn, &change.compute_hash());
         strip_obligation(&conn, "g", "a.txt");
         reset_migration_marker(&conn);
@@ -2096,9 +2179,14 @@ mod legacy_scheduler_cutover_tests {
     fn compatibility_sweep_marks_applied_once_the_group_has_no_pending_obligation_left() {
         let conn = conn();
         let em = dag_store::ChangeEmitter::new("device-a", SigningKey::from_bytes(&[6u8; 32]));
-        let change =
-            dag_store::emit_local_change(&conn, "g", vec![delete_op("a.txt")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
+        let change = dag_store::emit_local_change(
+            &conn,
+            "g",
+            vec![delete_op("a.txt")],
+            ChangeAuth::PLACEHOLDER,
+            &em,
+        )
+        .unwrap();
         force_unapplied(&conn, &change.compute_hash());
         strip_obligation(&conn, "g", "a.txt");
         let unapplied = dag_store::list_unapplied(&conn, "g").unwrap();
@@ -2116,12 +2204,22 @@ mod legacy_scheduler_cutover_tests {
         let em = dag_store::ChangeEmitter::new("device-a", SigningKey::from_bytes(&[7u8; 32]));
         // Two independent single-path changes in the same group -- only
         // "a.txt"'s own obligation completes; "b.txt"'s stays pending.
-        let a =
-            dag_store::emit_local_change(&conn, "g", vec![delete_op("a.txt")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let b =
-            dag_store::emit_local_change(&conn, "g", vec![delete_op("b.txt")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
+        let a = dag_store::emit_local_change(
+            &conn,
+            "g",
+            vec![delete_op("a.txt")],
+            ChangeAuth::PLACEHOLDER,
+            &em,
+        )
+        .unwrap();
+        let b = dag_store::emit_local_change(
+            &conn,
+            "g",
+            vec![delete_op("b.txt")],
+            ChangeAuth::PLACEHOLDER,
+            &em,
+        )
+        .unwrap();
         force_unapplied(&conn, &a.compute_hash());
         force_unapplied(&conn, &b.compute_hash());
         strip_obligation(&conn, "g", "a.txt");
@@ -2141,9 +2239,14 @@ mod legacy_scheduler_cutover_tests {
     fn compatibility_sweep_treats_ignore_blocked_as_settled_not_outstanding() {
         let conn = conn();
         let em = dag_store::ChangeEmitter::new("device-a", SigningKey::from_bytes(&[8u8; 32]));
-        let change =
-            dag_store::emit_local_change(&conn, "g", vec![delete_op("a.txt")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
+        let change = dag_store::emit_local_change(
+            &conn,
+            "g",
+            vec![delete_op("a.txt")],
+            ChangeAuth::PLACEHOLDER,
+            &em,
+        )
+        .unwrap();
         force_unapplied(&conn, &change.compute_hash());
         // Park at `ignore_blocked` rather than deleting -- policy-settled,
         // not outstanding work; must not block the sweep the way a genuine

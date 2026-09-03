@@ -108,7 +108,9 @@ pub fn reset() {
 /// only when this returns `true`.
 pub fn record_dont_have_not_referenced() -> bool {
     DONT_HAVE_NOT_REFERENCED.fetch_add(1, Ordering::Relaxed);
-    NOT_REFERENCED_DUMPED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+    NOT_REFERENCED_DUMPED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }
 
 /// TEMPORARY: records one `CoalesceFailure::ReadFailed` answer. Returns
@@ -136,7 +138,9 @@ pub fn record_rejected_no_provenance() {
 /// retrying" event. Returns `true` exactly once -- the call site dumps its
 /// one-shot requester-side diagnostic only when this returns `true`.
 pub fn record_retry_exhausted() -> bool {
-    RETRY_EXHAUSTED_DUMPED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+    RETRY_EXHAUSTED_DUMPED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }
 
 pub fn record_heads_announce_received() {

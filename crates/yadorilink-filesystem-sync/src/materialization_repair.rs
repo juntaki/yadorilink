@@ -529,7 +529,8 @@ fn repair_interrupted_materializations_inner(
         // Port::has_unsettled_projection_obligation`'s own doc comment for
         // why this is a SEPARATE, live, per-path signal from `has_intent`,
         // not a redundant one.
-        let has_unsettled_obligation = state.has_unsettled_projection_obligation(group_id, &path)?;
+        let has_unsettled_obligation =
+            state.has_unsettled_projection_obligation(group_id, &path)?;
         if on_disk_size.is_none() && !has_intent && has_unsettled_obligation {
             // Missing, no intent, but still-unsettled -- must NOT be
             // resolved either way here. Falling through to the reconstruct
@@ -1190,7 +1191,8 @@ fn repair_one_interrupted_symlink(
     verify_write_target_within_root(&out_path, root)?;
     state.dag_bump_mutation_fence(group_id, path, "repair_reconstruct_symlink")?;
     let target_hash = yadorilink_local_storage::intent_target_hash_for_bytes(&target);
-    let intent_guard = state.open_materialization_intent_guard(group_id, path, &target_hash, permit)?;
+    let intent_guard =
+        state.open_materialization_intent_guard(group_id, path, &target_hash, permit)?;
     #[cfg(unix)]
     yadorilink_local_storage::materialize_symlink(&out_path, &target)?;
     #[cfg(windows)]

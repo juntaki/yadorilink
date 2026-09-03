@@ -52,13 +52,21 @@ fn setup_device(name: &str) -> TestDevice {
     let (sync_state, index_dir) = open_file_backed_replica_coordinator();
     let state = DaemonState::new(device_id.clone(), Arc::new(sync_state), store);
     support::ensure_device_signing_key(&state);
-    TestDevice { device_id, state, root: tempfile::tempdir().unwrap(), _store_dir: store_dir, _index_dir: index_dir }
+    TestDevice {
+        device_id,
+        state,
+        root: tempfile::tempdir().unwrap(),
+        _store_dir: store_dir,
+        _index_dir: index_dir,
+    }
 }
 
 fn start_watching(device: &TestDevice, group_id: &str) {
     let local_path = device.root.path().to_string_lossy().to_string();
     device.state.replica_coordinator.link_repository().add_link(&local_path, group_id).unwrap();
-    LinkRuntimeController::new(device.state.clone()).start(local_path, group_id.to_string()).unwrap();
+    LinkRuntimeController::new(device.state.clone())
+        .start(local_path, group_id.to_string())
+        .unwrap();
 }
 
 fn snapshot(root: &std::path::Path) -> std::collections::HashMap<String, String> {
@@ -130,7 +138,10 @@ async fn a_restored_version_propagates_to_a_connected_peer() {
     wait_for_current_version(&a, group_id, "doc.txt", 2).await;
 
     wait_until_with_context(
-        || std::fs::read_to_string(b.root.path().join("doc.txt")).unwrap_or_default() == "version two",
+        || {
+            std::fs::read_to_string(b.root.path().join("doc.txt")).unwrap_or_default()
+                == "version two"
+        },
         Duration::from_secs(60),
         || format!("B never converged on A's second write: {:?}", real_entry_names(b.root.path())),
     )
@@ -141,14 +152,25 @@ async fn a_restored_version_propagates_to_a_connected_peer() {
     hydration::restore_to_version(&a.state, group_id, "doc.txt", 1).await.unwrap();
 
     wait_until_with_context(
-        || std::fs::read_to_string(a.root.path().join("doc.txt")).unwrap_or_default() == "version one",
+        || {
+            std::fs::read_to_string(a.root.path().join("doc.txt")).unwrap_or_default()
+                == "version one"
+        },
         Duration::from_secs(10),
-        || format!("A's own restore never materialized locally: {:?}", real_entry_names(a.root.path())),
+        || {
+            format!(
+                "A's own restore never materialized locally: {:?}",
+                real_entry_names(a.root.path())
+            )
+        },
     )
     .await;
 
     wait_until_with_context(
-        || std::fs::read_to_string(b.root.path().join("doc.txt")).unwrap_or_default() == "version one",
+        || {
+            std::fs::read_to_string(b.root.path().join("doc.txt")).unwrap_or_default()
+                == "version one"
+        },
         Duration::from_secs(60),
         || {
             format!(
@@ -199,7 +221,10 @@ async fn a_restore_racing_a_concurrent_edit_converges_deterministically() {
     std::fs::write(a.root.path().join("doc.txt"), "version two").unwrap();
     wait_for_current_version(&a, group_id, "doc.txt", 2).await;
     wait_until_with_context(
-        || std::fs::read_to_string(b.root.path().join("doc.txt")).unwrap_or_default() == "version two",
+        || {
+            std::fs::read_to_string(b.root.path().join("doc.txt")).unwrap_or_default()
+                == "version two"
+        },
         Duration::from_secs(60),
         || format!("B never converged on A's second write: {:?}", real_entry_names(b.root.path())),
     )

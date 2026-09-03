@@ -750,7 +750,8 @@ async fn complete_zero_work_obligation(
         }
         ExactActualState::Absent => (MaterializedObjectKind::Absent, None),
     };
-    let desired_hash = compute_resolved_path_state_hash(group_id, path, object_kind, version.as_ref());
+    let desired_hash =
+        compute_resolved_path_state_hash(group_id, path, object_kind, version.as_ref());
     if let Some(hook) = hooks {
         hook.pause().await;
     }
@@ -896,7 +897,8 @@ async fn process_group_via_obligations(
     };
     let budget_indices =
         rotation_indices(all_paths.len(), path_budget_start, MAX_PATHS_PER_RECONCILE_ATTEMPT);
-    let windowed_paths: Vec<String> = budget_indices.iter().map(|&i| all_paths[i].clone()).collect();
+    let windowed_paths: Vec<String> =
+        budget_indices.iter().map(|&i| all_paths[i].clone()).collect();
     {
         let mut cursors =
             state.obligation_engine_path_budget_cursors.lock().unwrap_or_else(|p| p.into_inner());
@@ -1071,11 +1073,20 @@ async fn process_group_via_obligations(
     // winner (see `origin_candidate_index_for_obligations`'s own doc
     // comment) rather than a stored triggering change — reuses
     // `zero_work_session` rather than constructing anything new.
-    let origin_index =
-        origin_candidate_index_for_obligations(&zero_work_session, &group_id, &windowed_budget, &candidates);
-    let rotation_window = rotation_indices(candidates.len(), peer_rotation_start, MAX_PEERS_PER_TICK);
-    let indices =
-        origin_first_indices(candidates.len(), peer_rotation_start, MAX_PEERS_PER_TICK, origin_index);
+    let origin_index = origin_candidate_index_for_obligations(
+        &zero_work_session,
+        &group_id,
+        &windowed_budget,
+        &candidates,
+    );
+    let rotation_window =
+        rotation_indices(candidates.len(), peer_rotation_start, MAX_PEERS_PER_TICK);
+    let indices = origin_first_indices(
+        candidates.len(),
+        peer_rotation_start,
+        MAX_PEERS_PER_TICK,
+        origin_index,
+    );
 
     let mut remaining: BTreeSet<String> = windowed_budget;
     let mut any_trustworthy_audit = false;
@@ -1274,7 +1285,11 @@ async fn drive_obligations_once_for_test_inner(
 ) -> bool {
     let now = now_unix_nanos();
     let claimed = match run_blocking_sweep_offloaded(|| {
-        state.replica_coordinator.sqlite().dag_claim_runnable_obligations(now, per_group_limit, total_limit)
+        state.replica_coordinator.sqlite().dag_claim_runnable_obligations(
+            now,
+            per_group_limit,
+            total_limit,
+        )
     }) {
         Ok(claimed) => claimed,
         Err(e) => {
@@ -1282,8 +1297,10 @@ async fn drive_obligations_once_for_test_inner(
             return false;
         }
     };
-    let mut by_group: HashMap<String, Vec<yadorilink_sync_sqlite::projection_obligations::ClaimedObligation>> =
-        HashMap::new();
+    let mut by_group: HashMap<
+        String,
+        Vec<yadorilink_sync_sqlite::projection_obligations::ClaimedObligation>,
+    > = HashMap::new();
     for obligation in claimed {
         by_group.entry(obligation.group_id.clone()).or_default().push(obligation);
     }
@@ -1308,7 +1325,11 @@ async fn drive_obligations_once_for_test_inner(
 /// `immediate_backlog` semantics (not meaningful here since nothing repeats
 /// this call automatically).
 #[cfg(any(test, feature = "test-support"))]
-pub async fn drive_obligations_once_for_test(state: &Arc<DaemonState>, per_group_limit: u32, total_limit: u32) -> bool {
+pub async fn drive_obligations_once_for_test(
+    state: &Arc<DaemonState>,
+    per_group_limit: u32,
+    total_limit: u32,
+) -> bool {
     drive_obligations_once_for_test_inner(state, per_group_limit, total_limit, None, None).await
 }
 
@@ -1326,7 +1347,8 @@ pub async fn drive_obligations_once_for_test_with_hooks(
     total_limit: u32,
     hooks: &Arc<BeforeCompletionHook>,
 ) -> bool {
-    drive_obligations_once_for_test_inner(state, per_group_limit, total_limit, Some(hooks), None).await
+    drive_obligations_once_for_test_inner(state, per_group_limit, total_limit, Some(hooks), None)
+        .await
 }
 
 /// Identical to [`drive_obligations_once_for_test`], except every
@@ -1343,12 +1365,21 @@ pub async fn drive_obligations_once_for_test_with_heads_hook(
     total_limit: u32,
     heads_hook: &Arc<BeforeHeadsAfterHook>,
 ) -> bool {
-    drive_obligations_once_for_test_inner(state, per_group_limit, total_limit, None, Some(heads_hook)).await
+    drive_obligations_once_for_test_inner(
+        state,
+        per_group_limit,
+        total_limit,
+        None,
+        Some(heads_hook),
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{majority_author, origin_first_indices, rotation_indices, MAX_PATHS_PER_RECONCILE_ATTEMPT};
+    use super::{
+        majority_author, origin_first_indices, rotation_indices, MAX_PATHS_PER_RECONCILE_ATTEMPT,
+    };
 
     #[test]
     fn no_candidates_yields_no_attempts() {
@@ -1526,7 +1557,9 @@ mod process_group_publication_tests {
     use std::sync::Arc;
     use yadorilink_local_storage::FsBlockStore;
     use yadorilink_peer_session::peer_session::PeerSyncSession;
-    use yadorilink_peer_session::ports::{PeerBlockStream, PeerMessageChannel, PeerReplicaStatePort};
+    use yadorilink_peer_session::ports::{
+        PeerBlockStream, PeerMessageChannel, PeerReplicaStatePort,
+    };
     use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
     use yadorilink_replica_domain::file::{FileMeta, FileVersion, RecordKind};
     use yadorilink_replica_domain::ids::{DeviceId, FolderGroupId, SyncPath};
@@ -1585,8 +1618,8 @@ mod process_group_publication_tests {
     /// for DaemonState` otherwise needs a live `LinkRuntime`, which nothing
     /// here starts), plus one registered candidate `PeerSyncSession` so
     /// `process_group` has somewhere to route its reconcile attempt.
-    async fn build_state_with_adopted_group() -> (Arc<DaemonState>, tempfile::TempDir, std::path::PathBuf)
-    {
+    async fn build_state_with_adopted_group(
+    ) -> (Arc<DaemonState>, tempfile::TempDir, std::path::PathBuf) {
         let root_dir = tempfile::tempdir().unwrap();
         let store_dir = tempfile::tempdir().unwrap();
         let root = root_dir.path().canonicalize().unwrap();
@@ -1599,7 +1632,8 @@ mod process_group_publication_tests {
         let generation = replica_coordinator.startup_readiness().begin_group_startup(GROUP);
         replica_coordinator.startup_readiness().mark_group_ready(GROUP, generation);
 
-        let build = DaemonState::build("device-local".to_string(), replica_coordinator, block_store);
+        let build =
+            DaemonState::build("device-local".to_string(), replica_coordinator, block_store);
         let state = build.state;
         state.test_root_commit_authorities.lock().unwrap().insert(
             GROUP.to_string(),
@@ -1625,7 +1659,13 @@ mod process_group_publication_tests {
         (state, root_dir, root)
     }
 
-    fn admit_change(state: &DaemonState, device: &str, key: &SigningKey, path: &str, version: &FileVersion) -> Change {
+    fn admit_change(
+        state: &DaemonState,
+        device: &str,
+        key: &SigningKey,
+        path: &str,
+        version: &FileVersion,
+    ) -> Change {
         let change = Change::create_signed(
             vec![],
             0,
@@ -1697,7 +1737,12 @@ mod process_group_publication_tests {
         let desired_hash = state
             .replica_coordinator
             .sqlite()
-            .dag_desired_resolved_path_state_hash(GROUP, "obligated.txt", &resolution, Some(&version.version_hash))
+            .dag_desired_resolved_path_state_hash(
+                GROUP,
+                "obligated.txt",
+                &resolution,
+                Some(&version.version_hash),
+            )
             .unwrap();
         assert_eq!(
             basis.resolved_path_state_hash, desired_hash,
@@ -2024,7 +2069,8 @@ mod process_group_publication_tests {
         let held = path_lock.lock().await;
 
         let state2 = state.clone();
-        let handle = tokio::spawn(async move { drive_obligations_once_for_test(&state2, 128, 256).await });
+        let handle =
+            tokio::spawn(async move { drive_obligations_once_for_test(&state2, 128, 256).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let version_b = empty_version(1_700_000_201);
@@ -2102,7 +2148,10 @@ mod process_group_publication_tests {
         // before this point: the very first claim of this obligation must
         // already find zero work to do.
         let out_path = root.join("already-correct-link");
+        #[cfg(unix)]
         std::os::unix::fs::symlink("target-content", &out_path).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file("target-content", &out_path).unwrap();
         let identity =
             yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path).unwrap();
         assert!(
@@ -2110,7 +2159,10 @@ mod process_group_publication_tests {
             "sanity: a symlink observation must populate its content-based discriminator"
         );
         let heads = state.replica_coordinator.sqlite().dag_group_heads(GROUP).unwrap();
-        let fence = state.replica_coordinator.dag_snapshot_mutation_fence(GROUP, "already-correct-link").unwrap();
+        let fence = state
+            .replica_coordinator
+            .dag_snapshot_mutation_fence(GROUP, "already-correct-link")
+            .unwrap();
         let published = state
             .replica_coordinator
             .dag_publish_materialized_generation_if_fence_current(
@@ -2184,7 +2236,10 @@ mod process_group_publication_tests {
         let out_path = root.join("unrevalidatable.txt");
         std::fs::write(&out_path, b"").unwrap();
         let heads = state.replica_coordinator.sqlite().dag_group_heads(GROUP).unwrap();
-        let fence = state.replica_coordinator.dag_snapshot_mutation_fence(GROUP, "unrevalidatable.txt").unwrap();
+        let fence = state
+            .replica_coordinator
+            .dag_snapshot_mutation_fence(GROUP, "unrevalidatable.txt")
+            .unwrap();
         let published = state
             .replica_coordinator
             .dag_publish_materialized_generation_if_fence_current(
@@ -2408,11 +2463,17 @@ mod process_group_publication_tests {
         // performs_no_physical_work` -- disk and the proof table already
         // agree, entirely independent of anything the worker itself does.
         let out_path = root.join("raced-zero-work-link");
+        #[cfg(unix)]
         std::os::unix::fs::symlink("original-target", &out_path).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file("original-target", &out_path).unwrap();
         let identity_at_seed =
             yadorilink_root_authority::fs_identity::FileIdentity::observe_path(&out_path).unwrap();
         let heads = state.replica_coordinator.sqlite().dag_group_heads(GROUP).unwrap();
-        let fence = state.replica_coordinator.dag_snapshot_mutation_fence(GROUP, "raced-zero-work-link").unwrap();
+        let fence = state
+            .replica_coordinator
+            .dag_snapshot_mutation_fence(GROUP, "raced-zero-work-link")
+            .unwrap();
         let published = state
             .replica_coordinator
             .dag_publish_materialized_generation_if_fence_current(
@@ -2452,7 +2513,10 @@ mod process_group_publication_tests {
         // rewrites the path out from under the revalidation that already
         // passed.
         std::fs::remove_file(&out_path).unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink("independent-mutator-target", &out_path).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file("independent-mutator-target", &out_path).unwrap();
         state
             .replica_coordinator
             .dag_bump_mutation_fence(GROUP, "raced-zero-work-link", "independent-mutator")
@@ -2573,8 +2637,16 @@ mod process_group_publication_tests {
                 .is_none(),
             "sanity: A must materialize and close normally"
         );
-        assert_eq!(std::fs::read_link(&out_path).unwrap().to_str().unwrap().as_bytes(), b"content-a");
-        let basis_a = state.replica_coordinator.sqlite().dag_lookup_materialized_generation(GROUP, path).unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_link(&out_path).unwrap().to_str().unwrap().as_bytes(),
+            b"content-a"
+        );
+        let basis_a = state
+            .replica_coordinator
+            .sqlite()
+            .dag_lookup_materialized_generation(GROUP, path)
+            .unwrap()
+            .unwrap();
 
         // A second admission, causally descending from the first, makes B
         // desired. Deliberately never ticked.
@@ -2585,7 +2657,11 @@ mod process_group_publication_tests {
             ChangeAuth::PLACEHOLDER,
             DeviceId("device-a".to_string()),
             FolderGroupId(GROUP.to_string()),
-            vec![Op::Put { path: SyncPath(path.to_string()), version: version_b.version_hash, origin: PutOrigin::Direct }],
+            vec![Op::Put {
+                path: SyncPath(path.to_string()),
+                version: version_b.version_hash,
+                origin: PutOrigin::Direct,
+            }],
             &key,
         );
         state
@@ -2600,8 +2676,14 @@ mod process_group_publication_tests {
         // physically rewritten to B, but the crash means neither the
         // publish nor the completion for B ever runs.
         std::fs::remove_file(&out_path).unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink("content-b", &out_path).unwrap();
-        state.replica_coordinator.dag_bump_mutation_fence(GROUP, path, "simulated-crash-write").unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file("content-b", &out_path).unwrap();
+        state
+            .replica_coordinator
+            .dag_bump_mutation_fence(GROUP, path, "simulated-crash-write")
+            .unwrap();
 
         // A third admission, causally descending from the second, cycles
         // the desired state back to A.
@@ -2611,7 +2693,11 @@ mod process_group_publication_tests {
             ChangeAuth::PLACEHOLDER,
             DeviceId("device-a".to_string()),
             FolderGroupId(GROUP.to_string()),
-            vec![Op::Put { path: SyncPath(path.to_string()), version: version_a.version_hash, origin: PutOrigin::Direct }],
+            vec![Op::Put {
+                path: SyncPath(path.to_string()),
+                version: version_a.version_hash,
+                origin: PutOrigin::Direct,
+            }],
             &key,
         );
         state
@@ -2623,7 +2709,11 @@ mod process_group_publication_tests {
         // Architectural proof that the fence check alone rejects the stale
         // A proof, before any identity revalidation could even run.
         assert_eq!(
-            state.replica_coordinator.sqlite().dag_lookup_materialized_generation(GROUP, path).unwrap(),
+            state
+                .replica_coordinator
+                .sqlite()
+                .dag_lookup_materialized_generation(GROUP, path)
+                .unwrap(),
             None,
             "the crash-orphaned A proof must already be unusable via the fence check alone, \
              even though its hash matches the freshly-restored desired state and disk still \
@@ -2648,7 +2738,12 @@ mod process_group_publication_tests {
             "disk must end holding A, not the crash-orphaned B a false zero-work close would \
              have silently left behind forever"
         );
-        let basis_final = state.replica_coordinator.sqlite().dag_lookup_materialized_generation(GROUP, path).unwrap().unwrap();
+        let basis_final = state
+            .replica_coordinator
+            .sqlite()
+            .dag_lookup_materialized_generation(GROUP, path)
+            .unwrap()
+            .unwrap();
         assert_ne!(
             basis_final.generation_id, basis_a.generation_id,
             "a fresh publish from the recovering real materialize, not the original A publish \
@@ -2746,7 +2841,9 @@ mod process_group_publication_tests {
             "device-local".to_string(),
             "device-peer-2".to_string(),
             state.replica_coordinator.clone(),
-            Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(state.block_store.clone())),
+            Arc::new(crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
+                state.block_store.clone(),
+            )),
             vec![GROUP.to_string()],
             HashMap::from([(GROUP.to_string(), root.to_path_buf())]),
             Some(state.forward_tx.clone()),
@@ -2819,14 +2916,27 @@ mod process_group_publication_tests {
         }
 
         let key = SigningKey::from_bytes(&[98u8; 32]);
-        admit_change(&state, "device-a", &key, "settles-on-first-candidate.txt", &empty_version(1_700_001_000));
-        admit_change(&state, "device-a", &key, "never-resolves.txt", &version_with_an_unfetchable_block(1_700_001_001));
+        admit_change(
+            &state,
+            "device-a",
+            &key,
+            "settles-on-first-candidate.txt",
+            &empty_version(1_700_001_000),
+        );
+        admit_change(
+            &state,
+            "device-a",
+            &key,
+            "never-resolves.txt",
+            &version_with_an_unfetchable_block(1_700_001_001),
+        );
 
         let hooks = BeforeCompletionHook::new();
         let state2 = state.clone();
         let hooks2 = hooks.clone();
-        let mut handle =
-            tokio::spawn(async move { drive_obligations_once_for_test_with_hooks(&state2, 128, 256, &hooks2).await });
+        let mut handle = tokio::spawn(async move {
+            drive_obligations_once_for_test_with_hooks(&state2, 128, 256, &hooks2).await
+        });
 
         let mut pause_count = 0usize;
         let healthy = loop {
@@ -3004,7 +3114,13 @@ mod process_group_publication_tests {
     async fn a_genuine_retry_required_outcome_backs_off_instead_of_spinning() {
         let (state, _root_dir, _root) = build_state_with_adopted_group().await;
         let key = SigningKey::from_bytes(&[97u8; 32]);
-        admit_change(&state, "device-a", &key, "unfetchable.bin", &version_with_an_unfetchable_block(1_700_002_000));
+        admit_change(
+            &state,
+            "device-a",
+            &key,
+            "unfetchable.bin",
+            &version_with_an_unfetchable_block(1_700_002_000),
+        );
 
         let healthy = drive_obligations_once_for_test(&state, 128, 256).await;
         assert!(healthy, "the one, unraced candidate attempt must itself be trustworthy");
@@ -3053,7 +3169,10 @@ mod process_group_publication_tests {
             .dag_lookup_projection_obligation(GROUP, "no-peer.txt")
             .unwrap()
             .expect("must remain outstanding with no peer to serve it");
-        assert_eq!(obligation.attempt_count, 1, "no-peer-connected must count as a real failed attempt");
+        assert_eq!(
+            obligation.attempt_count, 1,
+            "no-peer-connected must count as a real failed attempt"
+        );
         assert!(
             obligation.next_attempt_at > 1_700_004_000,
             "must be backed off into the future, not left immediately reclaimable"
@@ -3079,7 +3198,13 @@ mod process_group_publication_tests {
         // device ids -- realistic in that the authoring peer is exactly who
         // is most likely to actually hold this content.
         let key = SigningKey::from_bytes(&[95u8; 32]);
-        admit_change(&state, "device-peer-2", &key, "origin-test.txt", &empty_version(1_700_005_000));
+        admit_change(
+            &state,
+            "device-peer-2",
+            &key,
+            "origin-test.txt",
+            &empty_version(1_700_005_000),
+        );
 
         let candidates = crate::hydration::candidate_sessions(&state, GROUP);
         assert_eq!(candidates.len(), 2, "sanity: both candidates must be registered");
@@ -3091,7 +3216,8 @@ mod process_group_publication_tests {
             &budget,
             &candidates,
         );
-        let origin_index = origin_index.expect("a resolvable winner must produce an origin preference");
+        let origin_index =
+            origin_index.expect("a resolvable winner must produce an origin preference");
         assert_eq!(
             candidates[origin_index].0, "device-peer-2",
             "the origin preference must name the path's actual current-desired-state author"
@@ -3107,7 +3233,8 @@ mod process_group_publication_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_disk_headroom_failure_is_an_ordinary_retriable_outcome_not_a_false_close() {
         let (state, root_dir, _root) = build_state_with_adopted_group().await;
-        let session = state.peers.session("device-peer").expect("sanity: candidate must be registered");
+        let session =
+            state.peers.session("device-peer").expect("sanity: candidate must be registered");
         // An impossible headroom reserve guarantees `check_disk_headroom`
         // rejects every write, standing in for a genuinely full disk.
         session.set_headroom_enforced(true);
@@ -3125,7 +3252,10 @@ mod process_group_publication_tests {
             .dag_lookup_projection_obligation(GROUP, "no-space.txt")
             .unwrap()
             .expect("a disk-pressure failure must never falsely close the obligation");
-        assert_eq!(obligation.attempt_count, 1, "a real materialize failure must count as a failed attempt");
+        assert_eq!(
+            obligation.attempt_count, 1,
+            "a real materialize failure must count as a failed attempt"
+        );
         assert!(
             obligation.next_attempt_at > 1_700_006_000,
             "must be backed off, exactly like any other genuine RetryRequired outcome"
@@ -3155,7 +3285,12 @@ mod process_group_publication_tests {
         let healthy = drive_obligations_once_for_test(&state, 128, 256).await;
         assert!(healthy);
         assert!(
-            state.replica_coordinator.sqlite().dag_lookup_projection_obligation(GROUP, "wakes-siblings.txt").unwrap().is_none(),
+            state
+                .replica_coordinator
+                .sqlite()
+                .dag_lookup_projection_obligation(GROUP, "wakes-siblings.txt")
+                .unwrap()
+                .is_none(),
             "sanity: the obligation must have actually closed"
         );
 

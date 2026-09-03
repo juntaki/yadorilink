@@ -169,12 +169,8 @@ async fn run_mutual_discovery() -> Result<(), String> {
     // exercises the same one production does rather than a shortcut.
     let (dialer, dialer_key, acceptor, acceptor_key, acceptor_addr) =
         match connect_role("device-a", "device-b") {
-            ConnectRole::Dial => {
-                (&endpoint_a, key_a, &endpoint_b, key_b, surfaced_b.addr)
-            }
-            ConnectRole::Accept => {
-                (&endpoint_b, key_b, &endpoint_a, key_a, surfaced_a.addr)
-            }
+            ConnectRole::Dial => (&endpoint_a, key_a, &endpoint_b, key_b, surfaced_b.addr),
+            ConnectRole::Accept => (&endpoint_b, key_b, &endpoint_a, key_a, surfaced_a.addr),
         };
 
     let accepting = {

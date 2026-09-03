@@ -42,10 +42,8 @@ const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(180);
 async fn live_burst_of_many_small_files_converges_via_debounced_batching() {
     let coordination_addr = support::start_coordination_server().await;
     let account = support::register_and_login(&coordination_addr, "burst-test@example.com").await;
-    let device_a_id =
-        support::register_device(&account, "device-a", [0u8; 32]).await;
-    let device_b_id =
-        support::register_device(&account, "device-b", [0u8; 32]).await;
+    let device_a_id = support::register_device(&account, "device-a", [0u8; 32]).await;
+    let device_b_id = support::register_device(&account, "device-b", [0u8; 32]).await;
 
     let group_id = support::create_folder_group(&account, "burst-test-group").await;
     support::grant_access(&account, &group_id, &device_a_id).await;

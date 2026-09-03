@@ -34,8 +34,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use yadorilink_local_storage::{
-    BlockContentStore, BlockReclamationStore, BlockStore, ContentHash, GcReport, LocallyHashedBlock,
-    StorageError,
+    BlockContentStore, BlockReclamationStore, BlockStore, ContentHash, GcReport,
+    LocallyHashedBlock, StorageError,
 };
 
 /// Adapts an already-erased `Arc<dyn BlockStore + Send + Sync>` to

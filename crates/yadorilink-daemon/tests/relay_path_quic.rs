@@ -205,11 +205,8 @@ async fn promoting_back_to_direct_closes_the_relay_channel() {
     fake.update_endpoint(&w.device_id, "127.0.0.1:1".to_string());
     wait_for_relay_route(&m, &w).await;
 
-    let relayed_channel = m
-        .state
-        .peers
-        .session(&w.device_id)
-        .expect("M has a session with W over the relay path");
+    let relayed_channel =
+        m.state.peers.session(&w.device_id).expect("M has a session with W over the relay path");
 
     wait_until_with_context(
         || n.state.relay_forwarder.active_session_count() > 0,
@@ -237,11 +234,8 @@ async fn promoting_back_to_direct_closes_the_relay_channel() {
 
     // The superseded generation is a different session object, which is what
     // makes this a replacement rather than a migration of the old one.
-    let direct_session = m
-        .state
-        .peers
-        .session(&w.device_id)
-        .expect("M has a session with W over the direct path");
+    let direct_session =
+        m.state.peers.session(&w.device_id).expect("M has a session with W over the direct path");
     assert!(
         !Arc::ptr_eq(&relayed_channel, &direct_session),
         "promotion must publish a NEW connection, not re-point the relayed one -- quinn has no \

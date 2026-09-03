@@ -964,7 +964,12 @@ mod tests {
         state.file_index_repository().upsert_file(group_id, record, permit).unwrap();
         state
             .materialization_state_repository()
-            .set_materialization_state(group_id, &record.path, MaterializationState::Hydrated, permit)
+            .set_materialization_state(
+                group_id,
+                &record.path,
+                MaterializationState::Hydrated,
+                permit,
+            )
             .unwrap();
     }
 
@@ -1237,7 +1242,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         adopt_root(&state, "group-1", root.path());
         let permit = RootCommitPermit::for_tests();
-        upsert_hydrated_file(&state, "group-1", &record_with_blocks("doc.txt", content, hash), &permit);
+        upsert_hydrated_file(
+            &state,
+            "group-1",
+            &record_with_blocks("doc.txt", content, hash),
+            &permit,
+        );
         state
             .materialization_intent_repository()
             .begin_materialization_intent("group-1", "doc.txt", &[0; 32], &permit)
@@ -1288,7 +1298,10 @@ mod tests {
             .file_index_repository()
             .set_record_kind("group-1", "link.txt", RecordKind::Symlink, &permit)
             .unwrap();
-        state.file_index_repository().set_symlink_target("group-1", "link.txt", Some(b"target.txt")).unwrap();
+        state
+            .file_index_repository()
+            .set_symlink_target("group-1", "link.txt", Some(b"target.txt"))
+            .unwrap();
         // Simulate the crash: a durable intent was opened (exactly what
         // `materialize_symlink_at` now does before its own row commit),
         // but the physical symlink write never happened.
@@ -1315,8 +1328,10 @@ mod tests {
         );
         assert_eq!(std::fs::read_link(&out_path).unwrap(), std::path::Path::new("target.txt"));
         assert!(
-            !MaterializationExecutionPort::has_materialization_intent(&state, "group-1", "link.txt")
-                .unwrap(),
+            !MaterializationExecutionPort::has_materialization_intent(
+                &state, "group-1", "link.txt"
+            )
+            .unwrap(),
             "the intent must be cleared once repair completes the write"
         );
     }
@@ -1576,7 +1591,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         adopt_root(&state, "group-1", root.path());
         let permit = RootCommitPermit::for_tests();
-        upsert_hydrated_file(&state, "group-1", &record_with_blocks("doc.txt", content, hash), &permit);
+        upsert_hydrated_file(
+            &state,
+            "group-1",
+            &record_with_blocks("doc.txt", content, hash),
+            &permit,
+        );
         // No intent, and the file simply never existed under `root` here --
         // standing in for "missing right now," the same disk state a live
         // in-progress delete produces.

@@ -45,11 +45,7 @@ fn link(state: &Arc<DaemonState>, root: &std::path::Path, group_id: &str) {
     LinkRuntimeController::new(state.clone()).start(local_path, group_id.to_string()).unwrap();
 }
 
-fn spawn_orchestrator(
-    coordination_addr: String,
-    device_id: String,
-    state: Arc<DaemonState>,
-) {
+fn spawn_orchestrator(coordination_addr: String, device_id: String, state: Arc<DaemonState>) {
     let config = peer_orchestrator::OrchestratorConfig {
         coordination_addr,
         access_token: "test".to_string(),
@@ -87,20 +83,8 @@ async fn share_revoke_mid_session_stops_serving_the_revoked_group_but_not_others
     let root_b_revoked = tempfile::tempdir().unwrap();
     let root_b_control = tempfile::tempdir().unwrap();
 
-    register_with_fake(
-        &fake,
-        &daemon_a.state,
-        device_a_id,
-        &[group_revoked, group_control],
-    )
-    .await;
-    register_with_fake(
-        &fake,
-        &daemon_b.state,
-        device_b_id,
-        &[group_revoked, group_control],
-    )
-    .await;
+    register_with_fake(&fake, &daemon_a.state, device_a_id, &[group_revoked, group_control]).await;
+    register_with_fake(&fake, &daemon_b.state, device_b_id, &[group_revoked, group_control]).await;
 
     link(&daemon_a.state, root_a_revoked.path(), group_revoked);
     link(&daemon_a.state, root_a_control.path(), group_control);
@@ -200,18 +184,10 @@ async fn device_remove_while_peer_offline_is_reflected_on_its_next_subscribe() {
     let root_a = tempfile::tempdir().unwrap();
     let root_c = tempfile::tempdir().unwrap();
 
-    register_with_fake(&fake, &daemon_a.state, device_a_id, &[group_id])
-        .await;
-    register_with_fake(&fake, &daemon_c.state, device_c_id, &[group_id])
-        .await;
+    register_with_fake(&fake, &daemon_a.state, device_a_id, &[group_id]).await;
+    register_with_fake(&fake, &daemon_c.state, device_c_id, &[group_id]).await;
     // B is a member, then removed entirely before A's daemon ever subscribes.
-    fake.register_device(
-        device_b_id,
-        [9u8; 32],
-        [9u8; 32],
-        "127.0.0.1:1".to_string(),
-        &[group_id],
-    );
+    fake.register_device(device_b_id, [9u8; 32], [9u8; 32], "127.0.0.1:1".to_string(), &[group_id]);
     fake.remove_device(device_b_id);
 
     link(&daemon_a.state, root_a.path(), group_id);
@@ -257,10 +233,8 @@ async fn already_authorized_devices_keep_syncing_while_coordination_plane_is_unr
     let root_a = tempfile::tempdir().unwrap();
     let root_b = tempfile::tempdir().unwrap();
 
-    register_with_fake(&fake, &daemon_a.state, device_a_id, &[group_id])
-        .await;
-    register_with_fake(&fake, &daemon_b.state, device_b_id, &[group_id])
-        .await;
+    register_with_fake(&fake, &daemon_a.state, device_a_id, &[group_id]).await;
+    register_with_fake(&fake, &daemon_b.state, device_b_id, &[group_id]).await;
 
     link(&daemon_a.state, root_a.path(), group_id);
     link(&daemon_b.state, root_b.path(), group_id);

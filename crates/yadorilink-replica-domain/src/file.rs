@@ -586,7 +586,13 @@ mod record_kind_symlink_target_consistency_tests {
     use super::*;
 
     fn meta(record_kind: RecordKind, symlink_target: Option<Vec<u8>>) -> FileMeta {
-        FileMeta { mtime_unix_nanos: 0, unix_mode: None, symlink_target, record_kind, xattrs: Vec::new() }
+        FileMeta {
+            mtime_unix_nanos: 0,
+            unix_mode: None,
+            symlink_target,
+            record_kind,
+            xattrs: Vec::new(),
+        }
     }
 
     #[test]
@@ -613,7 +619,8 @@ mod record_kind_symlink_target_consistency_tests {
     /// version verified successfully instead of being rejected.
     #[test]
     fn a_symlink_with_no_recorded_target_is_rejected() {
-        let err = FileVersion::new(vec![], 0, meta(RecordKind::Symlink, None)).verify_hash().unwrap_err();
+        let err =
+            FileVersion::new(vec![], 0, meta(RecordKind::Symlink, None)).verify_hash().unwrap_err();
         assert!(matches!(err, ChangeError::Malformed(_)), "got {err:?}");
     }
 
@@ -623,10 +630,9 @@ mod record_kind_symlink_target_consistency_tests {
     /// no real capture path produces this today.
     #[test]
     fn a_file_or_directory_with_a_symlink_target_is_rejected() {
-        let err =
-            FileVersion::new(vec![], 0, meta(RecordKind::File, Some(b"target".to_vec())))
-                .verify_hash()
-                .unwrap_err();
+        let err = FileVersion::new(vec![], 0, meta(RecordKind::File, Some(b"target".to_vec())))
+            .verify_hash()
+            .unwrap_err();
         assert!(matches!(err, ChangeError::Malformed(_)), "got {err:?}");
 
         let err =

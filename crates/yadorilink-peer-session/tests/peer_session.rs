@@ -335,7 +335,10 @@ impl BlockAnswer {
     /// The response header and the body bytes that follow it. The body is
     /// empty for every outcome but `Found`, which is what makes each of
     /// them end the stream the same way.
-    fn into_wire(self, request: &proto::BlockRequestHeader) -> (proto::BlockResponseHeader, Vec<u8>) {
+    fn into_wire(
+        self,
+        request: &proto::BlockRequestHeader,
+    ) -> (proto::BlockResponseHeader, Vec<u8>) {
         let outcome = match self {
             BlockAnswer::Found { body, compression } => {
                 let found = proto::BlockFound {
@@ -343,11 +346,17 @@ impl BlockAnswer {
                     hash: request.block_hash.clone(),
                     compression,
                 };
-                return (proto::BlockResponseHeader { outcome: Some(BlockOutcome::Found(found)) }, body);
+                return (
+                    proto::BlockResponseHeader { outcome: Some(BlockOutcome::Found(found)) },
+                    body,
+                );
             }
             BlockAnswer::FoundExactly { size, hash, compression, body } => {
                 let found = proto::BlockFound { size, hash, compression };
-                return (proto::BlockResponseHeader { outcome: Some(BlockOutcome::Found(found)) }, body);
+                return (
+                    proto::BlockResponseHeader { outcome: Some(BlockOutcome::Found(found)) },
+                    body,
+                );
             }
             BlockAnswer::DontHave => BlockOutcome::DontHave(true),
             BlockAnswer::Busy { retry_after_ms, queue_depth } => {
@@ -461,7 +470,9 @@ async fn begin_block_request(
 /// that inspect a response's wire form need exactly that, and the ones that
 /// do not simply ignore it. A non-`Found` outcome has no body at all, which
 /// reads as an empty `Vec`.
-async fn read_block_response(stream: &mut QuicBlockStream) -> (proto::BlockResponseHeader, Vec<u8>) {
+async fn read_block_response(
+    stream: &mut QuicBlockStream,
+) -> (proto::BlockResponseHeader, Vec<u8>) {
     let header = stream
         .recv_message(MAX_BLOCK_STREAM_HEADER_BYTES)
         .await
@@ -2792,7 +2803,11 @@ async fn version_present_query_for_an_unauthorized_group_is_refused_not_answered
     device_b
         .state
         .file_index_repository()
-        .upsert_file(GROUP, &record, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests())
+        .upsert_file(
+            GROUP,
+            &record,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
         .unwrap();
     let retained = device_b.state.sqlite().dag_list_versions(GROUP, "a.bin").unwrap();
     assert_eq!(retained.len(), 1, "sanity: the single upsert retains exactly one version");
@@ -3958,8 +3973,10 @@ async fn hydration_rejects_block_bytes_that_do_not_hash_to_the_request() {
         // matters: the header declares this body's real length and echoes
         // the requested hash back, so nothing about the exchange itself
         // looks wrong -- only the bytes are someone else's.
-        serve_block_requests(&responder_channel_for_task, 1, |_, _| BlockAnswer::found(bad_data.clone()))
-            .await;
+        serve_block_requests(&responder_channel_for_task, 1, |_, _| {
+            BlockAnswer::found(bad_data.clone())
+        })
+        .await;
     });
 
     let result =
@@ -4076,15 +4093,17 @@ async fn hydration_rejects_a_found_header_declaring_more_than_the_maximum_block_
     let responder_channel_for_task = responder_channel.clone();
     let responder = tokio::spawn(async move {
         complete_raw_peer_handshake(&responder_channel_for_task, &handshake_session_b).await;
-        serve_block_requests(&responder_channel_for_task, 1, |_, request| BlockAnswer::FoundExactly {
-            // One byte past `MAX_BLOCK_SIZE` (16 MiB): large enough to be
-            // refused, and deliberately just barely so, since a bound that
-            // is off by one in the permissive direction is the only kind a
-            // round number would not catch.
-            size: 16 * 1024 * 1024 + 1,
-            hash: request.block_hash.clone(),
-            compression: proto::Compression::None as i32,
-            body: Vec::new(),
+        serve_block_requests(&responder_channel_for_task, 1, |_, request| {
+            BlockAnswer::FoundExactly {
+                // One byte past `MAX_BLOCK_SIZE` (16 MiB): large enough to be
+                // refused, and deliberately just barely so, since a bound that
+                // is off by one in the permissive direction is the only kind a
+                // round number would not catch.
+                size: 16 * 1024 * 1024 + 1,
+                hash: request.block_hash.clone(),
+                compression: proto::Compression::None as i32,
+                body: Vec::new(),
+            }
         })
         .await;
     });
@@ -4140,7 +4159,8 @@ async fn hydration_rejects_a_found_header_bound_to_a_different_hash() {
     link_with_completed_startup(&device_b.state, &root_b);
 
     let expected = vec![0x22u8; 4096];
-    let expected_hash = seed_placeholder_awaiting_hydration(&device_b, "mislabelled.bin", &expected);
+    let expected_hash =
+        seed_placeholder_awaiting_hydration(&device_b, "mislabelled.bin", &expected);
     let other_hash = sha256_bytes(b"some entirely different block");
     assert_ne!(other_hash, expected_hash);
 
@@ -4174,9 +4194,8 @@ async fn hydration_rejects_a_found_header_bound_to_a_different_hash() {
         .await;
     });
 
-    let result = session_b
-        .hydrate_file_with_timeout(GROUP, "mislabelled.bin", Duration::from_secs(3))
-        .await;
+    let result =
+        session_b.hydrate_file_with_timeout(GROUP, "mislabelled.bin", Duration::from_secs(3)).await;
     await_responder(responder).await;
 
     assert!(
@@ -4301,11 +4320,7 @@ async fn a_rejection_stops_the_requester_where_dont_have_does_not() {
         complete_raw_peer_handshake(&responder_channel_for_task, &handshake_session_b).await;
         loop {
             let (mut stream, request) = accept_block_request(&responder_channel_for_task).await;
-            *responder_counts
-                .lock()
-                .unwrap()
-                .entry(request.file_path.clone())
-                .or_insert(0) += 1;
+            *responder_counts.lock().unwrap().entry(request.file_path.clone()).or_insert(0) += 1;
             let answer = match request.file_path.as_str() {
                 "denied.bin" => BlockAnswer::Rejected {
                     reason: "requester is not authorized for this folder group".to_string(),
@@ -4317,7 +4332,8 @@ async fn a_rejection_stops_the_requester_where_dont_have_does_not() {
     });
 
     for path in ["racy.bin", "denied.bin"] {
-        let result = session_b.hydrate_file_with_timeout(GROUP, path, Duration::from_secs(10)).await;
+        let result =
+            session_b.hydrate_file_with_timeout(GROUP, path, Duration::from_secs(10)).await;
         assert!(
             matches!(result, Err(yadorilink_peer_session::PeerSessionError::HydrationFailed(_))),
             "no answer here supplies content, so hydrating {path} must fail; got {result:?}"
@@ -4575,8 +4591,7 @@ async fn block_request_is_refused_after_mid_session_group_revocation() {
     complete_raw_peer_handshake(&requester_channel, &session_a).await;
 
     // Baseline: while still authorized, the request succeeds.
-    let (first_response, first_body) =
-        request_block(&requester_channel, "public.bin", &hash).await;
+    let (first_response, first_body) = request_block(&requester_channel, "public.bin", &hash).await;
     let found = expect_found(&first_response);
     assert_eq!(found.hash, hash, "a Found response must echo the hash it answers");
     assert_eq!(first_body, data);
@@ -5212,12 +5227,21 @@ async fn credit_guard_is_released_only_after_the_reply_finishes_sending() {
     // on the wire -- which, for a block the responder can compress, is a
     // tiny fraction of `BLOCK_LEN` and no window at all.
     const BLOCK_LEN: usize = 6_000;
-    let block_a =
-        seed_referenced_block(&device_a, "credit-a.bin", &incompressible_bytes("credit-a", BLOCK_LEN));
-    let block_b =
-        seed_referenced_block(&device_a, "credit-b.bin", &incompressible_bytes("credit-b", BLOCK_LEN));
-    let block_c =
-        seed_referenced_block(&device_a, "credit-c.bin", &incompressible_bytes("credit-c", BLOCK_LEN));
+    let block_a = seed_referenced_block(
+        &device_a,
+        "credit-a.bin",
+        &incompressible_bytes("credit-a", BLOCK_LEN),
+    );
+    let block_b = seed_referenced_block(
+        &device_a,
+        "credit-b.bin",
+        &incompressible_bytes("credit-b", BLOCK_LEN),
+    );
+    let block_c = seed_referenced_block(
+        &device_a,
+        "credit-c.bin",
+        &incompressible_bytes("credit-c", BLOCK_LEN),
+    );
 
     let (channel_a, requester_channel) = connect_pair(addr).await;
     let session_a = spawn_session(channel_a, &device_a, "device-b");
@@ -8388,8 +8412,7 @@ async fn recv_loop_survives_a_catchup_batch_larger_than_the_permit_budget() {
             {
                 Some((hash, content)) => {
                     if answered.insert(hash.clone()) {
-                        responder_answered_count
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        responder_answered_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     BlockAnswer::found(content.clone())
                 }
@@ -8418,11 +8441,8 @@ async fn recv_loop_survives_a_catchup_batch_larger_than_the_permit_budget() {
     // start flowing as soon as the first tasks are admitted, so the
     // metric moves from the very beginning instead of sitting at zero
     // until the first materialization completes.
-    let landed = || {
-        files.iter().filter(|f| device_a.root_path().join(&f.path).exists()).count()
-    };
-    let progress =
-        || answered_count.load(std::sync::atomic::Ordering::Relaxed) + landed();
+    let landed = || files.iter().filter(|f| device_a.root_path().join(&f.path).exists()).count();
+    let progress = || answered_count.load(std::sync::atomic::Ordering::Relaxed) + landed();
 
     wait_while_progressing(
         || {
@@ -9357,7 +9377,11 @@ mod promoted_orphan_projection_tests {
                  mutate the projection obligation, at any point during repeated replay"
             );
             assert!(
-                state.sqlite().dag_lookup_materialized_generation(GROUP, "a.txt").unwrap().is_none(),
+                state
+                    .sqlite()
+                    .dag_lookup_materialized_generation(GROUP, "a.txt")
+                    .unwrap()
+                    .is_none(),
                 "replay {i}/{REPLAY_COUNT}: a duplicate delivery must never spuriously create a \
                  materialized-generation record"
             );
@@ -9622,7 +9646,6 @@ mod promoted_orphan_projection_tests {
             "a subsequent genuinely valid change from the real device must still admit normally"
         );
     }
-
 }
 
 #[cfg(test)]
@@ -10785,9 +10808,8 @@ mod exact_version_hash_tests {
                 else {
                     break; // no further traffic -- done observing
                 };
-                let Ok(header) = stream
-                    .recv_message(yadorilink_transport::MAX_BLOCK_STREAM_HEADER_BYTES)
-                    .await
+                let Ok(header) =
+                    stream.recv_message(yadorilink_transport::MAX_BLOCK_STREAM_HEADER_BYTES).await
                 else {
                     break;
                 };
@@ -10835,10 +10857,10 @@ mod exact_version_hash_tests {
             "the real content must have materialized once the delayed reply arrived"
         );
         assert_eq!(
-            state.materialization_state_repository().get_materialization_state(
-                GROUP,
-                "slow-arrival.bin"
-            ).unwrap(),
+            state
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, "slow-arrival.bin")
+                .unwrap(),
             Some(MaterializationState::Hydrated),
             "a reply that arrives within the bulk budget must produce a normal Hydrated row, \
              not a placeholder -- the old 5s FETCH_RESPONSE_TIMEOUT would have timed out first \
@@ -10847,8 +10869,7 @@ mod exact_version_hash_tests {
 
         let requests_seen = responder.await.unwrap();
         assert_eq!(
-            requests_seen,
-            1,
+            requests_seen, 1,
             "exactly one block request must have been sent for this hash -- a response that \
              arrives within BULK_FETCH_RESPONSE_TIMEOUT must never trigger a duplicate fetch \
              (FetchOutcome::TimedOut, the only outcome that could have raced a slow-but-\
@@ -11014,9 +11035,17 @@ mod exact_version_hash_tests {
             .unwrap();
         state
             .materialization_state_repository()
-            .set_materialization_state(GROUP, "was-held.bin", MaterializationState::Placeholder, &permit)
+            .set_materialization_state(
+                GROUP,
+                "was-held.bin",
+                MaterializationState::Placeholder,
+                &permit,
+            )
             .unwrap();
-        state.materialization_state_repository().set_held(GROUP, "was-held.bin", "case_collision", 0).unwrap();
+        state
+            .materialization_state_repository()
+            .set_held(GROUP, "was-held.bin", "case_collision", 0)
+            .unwrap();
         assert!(
             state
                 .materialization_state_repository()
@@ -11047,8 +11076,9 @@ mod exact_version_hash_tests {
         yadorilink_peer_session::peer_session_impl::set_test_force_hydration_failure_after_hold_cleared(
             true,
         );
-        let result =
-            session.hydrate_file_with_timeout(GROUP, "was-held.bin", std::time::Duration::from_secs(5)).await;
+        let result = session
+            .hydrate_file_with_timeout(GROUP, "was-held.bin", std::time::Duration::from_secs(5))
+            .await;
 
         assert!(result.is_err(), "expected the injected post-hold-clear failure, got {result:?}");
         assert!(
@@ -11123,7 +11153,12 @@ mod exact_version_hash_tests {
             .unwrap();
         state
             .materialization_state_repository()
-            .set_materialization_state(GROUP, "never-held.bin", MaterializationState::Placeholder, &permit)
+            .set_materialization_state(
+                GROUP,
+                "never-held.bin",
+                MaterializationState::Placeholder,
+                &permit,
+            )
             .unwrap();
         assert!(
             state
@@ -11157,10 +11192,14 @@ mod exact_version_hash_tests {
         yadorilink_peer_session::peer_session_impl::set_test_force_hydration_failure_after_hold_cleared(
             true,
         );
-        let result =
-            session.hydrate_file_with_timeout(GROUP, "never-held.bin", std::time::Duration::from_secs(5)).await;
+        let result = session
+            .hydrate_file_with_timeout(GROUP, "never-held.bin", std::time::Duration::from_secs(5))
+            .await;
 
-        assert!(result.is_err(), "expected the injected post-clear-held-call failure, got {result:?}");
+        assert!(
+            result.is_err(),
+            "expected the injected post-clear-held-call failure, got {result:?}"
+        );
         assert!(
             !state
                 .materialization_intent_repository()
@@ -12413,7 +12452,12 @@ mod exact_version_hash_tests {
         // above uses.
         state
             .materialization_state_repository()
-            .set_materialization_state(GROUP, "was-held-link", MaterializationState::Placeholder, &permit)
+            .set_materialization_state(
+                GROUP,
+                "was-held-link",
+                MaterializationState::Placeholder,
+                &permit,
+            )
             .unwrap();
         state
             .materialization_state_repository()
@@ -12633,8 +12677,9 @@ mod exact_version_hash_tests {
         yadorilink_local_storage::materialize_write::set_test_force_deferred_placeholder_for_path(
             &out_path, true,
         );
-        let result =
-            session.materialize(GROUP, &record, MaterializationPolicy::OnDemand, "device-a", None).await;
+        let result = session
+            .materialize(GROUP, &record, MaterializationPolicy::OnDemand, "device-a", None)
+            .await;
         yadorilink_local_storage::materialize_write::set_test_force_deferred_placeholder_for_path(
             &out_path, false,
         );
@@ -13720,8 +13765,11 @@ mod dag_convergence_authority_tests {
         // one, matching both real production writers that can leave a
         // `Placeholder` row in this exact shape.
 
-        let candidates =
-            h.state.materialization_state_repository().list_materialization_repair_candidates(GROUP).unwrap();
+        let candidates = h
+            .state
+            .materialization_state_repository()
+            .list_materialization_repair_candidates(GROUP)
+            .unwrap();
         assert_eq!(
             candidates,
             vec!["scaffold.txt".to_string()],
@@ -15014,7 +15062,11 @@ mod dag_convergence_authority_tests {
             .unwrap()
             .expect("audit guard must be free");
         assert!(
-            h.state.file_index_repository().get_file(GROUP, &copy_path).unwrap().is_some_and(|r| !r.deleted),
+            h.state
+                .file_index_repository()
+                .get_file(GROUP, &copy_path)
+                .unwrap()
+                .is_some_and(|r| !r.deleted),
             "precondition: the transient-frontier reconcile derived and indexed the loser's copy"
         );
 
@@ -15323,7 +15375,8 @@ mod dag_convergence_authority_tests {
             .unwrap()
             .expect("audit guard must be free");
 
-        let (kind, version_hash, identity, mutation_generation) = match attempt.evidence_for("plain.txt")
+        let (kind, version_hash, identity, mutation_generation) = match attempt
+            .evidence_for("plain.txt")
         {
             Some(yadorilink_peer_session::peer_session_impl::SettlementEvidence::ExactObject {
                 kind,
@@ -15501,7 +15554,10 @@ mod dag_convergence_authority_tests {
             mutation_generation, 1,
             "the real write must have bumped the fence past the prior publish's generation 0"
         );
-        assert!(h.root.join("crash-path.bin").exists(), "sanity: the physical write really happened");
+        assert!(
+            h.root.join("crash-path.bin").exists(),
+            "sanity: the physical write really happened"
+        );
 
         let obligation_after = h
             .state
@@ -15606,18 +15662,26 @@ mod dag_convergence_authority_tests {
             &loser_version.version_hash.0,
         );
         h.session
-            .reconcile_paths_directly(GROUP, std::collections::BTreeSet::from(["shared.bin".into()]))
+            .reconcile_paths_directly(
+                GROUP,
+                std::collections::BTreeSet::from(["shared.bin".into()]),
+            )
             .await
             .unwrap()
             .expect("audit guard must be free");
         assert!(
-            h.state.file_index_repository().get_file(GROUP, &copy_path).unwrap().is_some_and(|r| !r.deleted),
+            h.state
+                .file_index_repository()
+                .get_file(GROUP, &copy_path)
+                .unwrap()
+                .is_some_and(|r| !r.deleted),
             "precondition: the transient-frontier reconcile derived and indexed the loser's copy"
         );
 
         // M's real fence commitment for "writing copy_path to Present(L)" --
         // evidence computed, epoch captured, deliberately NOT yet published.
-        let stale_epoch = h.state.dag_bump_mutation_fence(GROUP, &copy_path, "materialize").unwrap();
+        let stale_epoch =
+            h.state.dag_bump_mutation_fence(GROUP, &copy_path, "materialize").unwrap();
 
         // The loser's own author supersedes it: the conflict window closes,
         // so the copy becomes unjustified.
@@ -15677,7 +15741,10 @@ mod dag_convergence_authority_tests {
             )
             .unwrap();
 
-        assert!(!late_published, "a stale publication must be rejected by the mutation-generation CAS");
+        assert!(
+            !late_published,
+            "a stale publication must be rejected by the mutation-generation CAS"
+        );
         assert!(
             matches!(
                 h.state.sqlite().dag_lookup_materialized_generation(GROUP, &copy_path).unwrap(),
@@ -15695,7 +15762,8 @@ mod dag_convergence_authority_tests {
     /// property -- no DAG admissions needed. Confirmed genuinely RED by
     /// the same fault as the primary test above.
     #[tokio::test]
-    async fn late_retirement_absent_publication_cannot_overwrite_a_path_materialization_recreated() {
+    async fn late_retirement_absent_publication_cannot_overwrite_a_path_materialization_recreated()
+    {
         use yadorilink_peer_session::ports::PeerReplicaStatePort;
 
         let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
@@ -15818,7 +15886,13 @@ mod dag_convergence_authority_tests {
                 .file_index_repository()
                 .upsert_file_with_origin_and_author(
                     GROUP,
-                    &FileRecord { path: p.clone(), size: 0, mtime_unix_nanos: 0, blocks: vec![], deleted: false },
+                    &FileRecord {
+                        path: p.clone(),
+                        size: 0,
+                        mtime_unix_nanos: 0,
+                        blocks: vec![],
+                        deleted: false,
+                    },
                     "device-local",
                     &change_w.compute_hash(),
                     &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
@@ -15848,7 +15922,10 @@ mod dag_convergence_authority_tests {
             )
             .unwrap());
         // B gets NO pre-existing publish -- must stay None throughout.
-        assert_eq!(h.state.sqlite().dag_lookup_materialized_generation(GROUP, &copy_path_b).unwrap(), None);
+        assert_eq!(
+            h.state.sqlite().dag_lookup_materialized_generation(GROUP, &copy_path_b).unwrap(),
+            None
+        );
 
         let outcome = h.session.clone().retire_conflict_copies_only(GROUP).await.unwrap();
         assert_eq!(
@@ -15861,7 +15938,12 @@ mod dag_convergence_authority_tests {
 
         // A really was deleted, both on disk and in the index.
         assert!(!h.root.join(&copy_path_a).exists());
-        assert!(h.state.file_index_repository().get_file(GROUP, &copy_path_a).unwrap().is_none_or(|r| r.deleted));
+        assert!(h
+            .state
+            .file_index_repository()
+            .get_file(GROUP, &copy_path_a)
+            .unwrap()
+            .is_none_or(|r| r.deleted));
 
         // A's actual-generation record was corrected: Present(L) -> Absent.
         assert!(matches!(
@@ -15873,8 +15955,16 @@ mod dag_convergence_authority_tests {
         // B is untouched: still a live directory, still a live index row,
         // still no published record at all.
         assert!(h.root.join(&copy_path_b).is_dir());
-        assert!(h.state.file_index_repository().get_file(GROUP, &copy_path_b).unwrap().is_some_and(|r| !r.deleted));
-        assert_eq!(h.state.sqlite().dag_lookup_materialized_generation(GROUP, &copy_path_b).unwrap(), None);
+        assert!(h
+            .state
+            .file_index_repository()
+            .get_file(GROUP, &copy_path_b)
+            .unwrap()
+            .is_some_and(|r| !r.deleted));
+        assert_eq!(
+            h.state.sqlite().dag_lookup_materialized_generation(GROUP, &copy_path_b).unwrap(),
+            None
+        );
     }
 
     /// A requested head whose own ancestor closure exceeds the batch cap
@@ -15968,7 +16058,10 @@ mod dag_convergence_authority_tests {
                 1000,
             )
             .unwrap();
-        assert_eq!(pages, pages_again, "an unchanged store and unchanged have_heads must recompute the identical delta");
+        assert_eq!(
+            pages, pages_again,
+            "an unchanged store and unchanged have_heads must recompute the identical delta"
+        );
     }
 
     // ---- CORE: DAG-decided winner is order-independent and the gate keeps the

@@ -40,8 +40,8 @@ async fn hub_socket() -> (Arc<TransportHub>, Arc<TransportHubQuicSocket>, Socket
     (hub, quic, addr)
 }
 
-fn tls_material() -> (rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>)
-{
+fn tls_material(
+) -> (rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>) {
     let certified = rcgen::generate_simple_self_signed(vec![TEST_SERVER_NAME.to_string()])
         .expect("generate self-signed certificate");
     let cert = certified.cert.der().clone();
@@ -69,9 +69,8 @@ fn client_config(cert: rustls::pki_types::CertificateDer<'static>) -> quinn::Cli
     // name, it is just anchored at the certificate under test.
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert).expect("trust the test certificate");
-    let mut crypto = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let mut crypto =
+        rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
     crypto.alpn_protocols = vec![ALPN.to_vec()];
     quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("client QUIC/TLS config"),
@@ -117,7 +116,8 @@ async fn stream_transfer_over_the_hub() {
         received.len()
     });
 
-    let connection = client.connect(server_addr, TEST_SERVER_NAME).expect("dial").await.expect("handshake");
+    let connection =
+        client.connect(server_addr, TEST_SERVER_NAME).expect("dial").await.expect("handshake");
     let (mut send, mut recv) = connection.open_bi().await.expect("open_bi");
     let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i % 251) as u8).collect();
     send.write_all(&payload).await.expect("write request");
@@ -365,11 +365,17 @@ async fn every_blocked_poller_is_woken_when_capacity_returns() {
     assert!(filled > 0, "the queue must accept something before it refuses");
 
     assert!(
-        matches!(poller_a.as_mut().poll_writable(&mut Context::from_waker(&waker_a)), Poll::Pending),
+        matches!(
+            poller_a.as_mut().poll_writable(&mut Context::from_waker(&waker_a)),
+            Poll::Pending
+        ),
         "a full queue must report not-writable"
     );
     assert!(
-        matches!(poller_b.as_mut().poll_writable(&mut Context::from_waker(&waker_b)), Poll::Pending),
+        matches!(
+            poller_b.as_mut().poll_writable(&mut Context::from_waker(&waker_b)),
+            Poll::Pending
+        ),
         "a full queue must report not-writable to a SECOND poller too"
     );
     assert!(!record_a.0.load(Ordering::SeqCst));

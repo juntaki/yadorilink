@@ -126,8 +126,7 @@ fn build_large_tree(root: &Path) -> Vec<String> {
         std::fs::create_dir(&dir_path).unwrap();
         for _ in 0..FILES_PER_DIR {
             let file_name = format!("f-{file_index:07}.txt");
-            std::fs::write(dir_path.join(&file_name), format!("small file {file_index}"))
-                .unwrap();
+            std::fs::write(dir_path.join(&file_name), format!("small file {file_index}")).unwrap();
             if file_index % 7_000 == 0 {
                 sampled.push(format!("{dir_name}/{file_name}"));
             }
@@ -371,7 +370,8 @@ async fn hundred_thousand_entry_folder_survives_import_sync_restart_and_storms()
                 );
             }
             let stalled = last_progress_change.0.elapsed() >= DEEP_DIAG_STALL_THRESHOLD;
-            let near_deadline = deadline.saturating_duration_since(now) <= DEEP_DIAG_STALL_THRESHOLD;
+            let near_deadline =
+                deadline.saturating_duration_since(now) <= DEEP_DIAG_STALL_THRESHOLD;
             let deep_diag_due = last_deep_diag.elapsed() >= DEEP_DIAG_INTERVAL
                 || ((stalled || near_deadline)
                     && last_deep_diag.elapsed() >= DEEP_DIAG_STALL_THRESHOLD);
@@ -632,8 +632,7 @@ async fn hundred_thousand_entry_folder_survives_import_sync_restart_and_storms()
     // the final wait below times out, its panic states which of these
     // boundaries was last proven.
     yadorilink_peer_session::c4_diag::reset();
-    let a_heads_before =
-        a.state.replica_coordinator.sqlite().dag_group_heads(group_id).unwrap();
+    let a_heads_before = a.state.replica_coordinator.sqlite().dag_group_heads(group_id).unwrap();
     let rel_path = sampled_paths[0].clone();
     let edited_path = a.root.path().join(&rel_path);
     let incremental_started = std::time::Instant::now();
@@ -792,9 +791,10 @@ async fn hundred_thousand_entry_folder_survives_import_sync_restart_and_storms()
         let deadline = tokio::time::Instant::now() + STORM_RECOVERY_TIMEOUT;
         let mut last_progress_log = tokio::time::Instant::now();
         loop {
-            let correct_on_b = renamed_paths.iter().filter(|p| b.root.path().join(p).exists()).count()
-                + old_renamed_paths.iter().filter(|p| !b.root.path().join(p).exists()).count()
-                + deleted_paths.iter().filter(|p| !b.root.path().join(p).exists()).count();
+            let correct_on_b =
+                renamed_paths.iter().filter(|p| b.root.path().join(p).exists()).count()
+                    + old_renamed_paths.iter().filter(|p| !b.root.path().join(p).exists()).count()
+                    + deleted_paths.iter().filter(|p| !b.root.path().join(p).exists()).count();
             if correct_on_b == total_checks {
                 break;
             }

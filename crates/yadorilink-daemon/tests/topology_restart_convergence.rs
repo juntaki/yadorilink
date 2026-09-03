@@ -381,15 +381,13 @@ async fn on_demand_node_restart_recovers_and_resyncs(restart_w: bool) {
     if restart_w {
         handles.take_and_shutdown(&w.device_id).await;
         w = restart_node(w).await;
-        register_with_fake(&fake, &w.state, &w.device_id, &[group_id])
-            .await;
+        register_with_fake(&fake, &w.state, &w.device_id, &[group_id]).await;
         let runtime = support::topology::spawn_orchestrator(fake.addr(), &w);
         handles.insert(w.device_id.clone(), runtime);
     } else {
         handles.take_and_shutdown(&m.device_id).await;
         m = restart_node(m).await;
-        register_with_fake(&fake, &m.state, &m.device_id, &[group_id])
-            .await;
+        register_with_fake(&fake, &m.state, &m.device_id, &[group_id]).await;
         let runtime = support::topology::spawn_orchestrator(fake.addr(), &m);
         handles.insert(m.device_id.clone(), runtime);
     }

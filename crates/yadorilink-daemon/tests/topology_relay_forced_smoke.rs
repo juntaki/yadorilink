@@ -29,14 +29,8 @@ async fn relay_forced_topology_converges_to_the_intended_routes() {
     // on the way out; re-asserting explicitly here is what makes a helper
     // regression surface as THIS test's own failure message, not just an
     // opaque timeout inside a helper three call frames away.
-    assert!(
-        support::topology::fully_connected(&n.state, &m.device_id),
-        "n<->m must be direct"
-    );
-    assert!(
-        support::topology::fully_connected(&n.state, &w.device_id),
-        "n<->w must be direct"
-    );
+    assert!(support::topology::fully_connected(&n.state, &m.device_id), "n<->m must be direct");
+    assert!(support::topology::fully_connected(&n.state, &w.device_id), "n<->w must be direct");
     assert!(
         support::topology::routed_via_relay(&m.state, &w.device_id),
         "m->w must be routed via relay"

@@ -314,21 +314,15 @@ async fn a_revoked_peer_cannot_reconnect_into_a_working_session() {
         let peer = b.public_key;
         tokio::spawn(async move { endpoint.accept(peer).await })
     };
-    if let Ok(Ok(connection)) = tokio::time::timeout(
-        STEP_TIMEOUT,
-        b.endpoint.connect(a.addr, a.public_key),
-    )
-    .await
+    if let Ok(Ok(connection)) =
+        tokio::time::timeout(STEP_TIMEOUT, b.endpoint.connect(a.addr, a.public_key)).await
     {
         let redialed = QuicPeerChannel::new(connection, ConnectRole::Dial);
         let _ = redialed.send(b"let me back in".to_vec()).await;
     }
 
     let queued = tokio::time::timeout(Duration::from_secs(2), accepting).await;
-    assert!(
-        queued.is_err(),
-        "a revoked peer's reconnection must never reach the accepting side"
-    );
+    assert!(queued.is_err(), "a revoked peer's reconnection must never reach the accepting side");
 }
 
 #[cfg(not(madsim))]

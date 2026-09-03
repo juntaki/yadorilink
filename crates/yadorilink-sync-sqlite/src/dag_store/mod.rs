@@ -596,7 +596,8 @@ pub fn admit_change(
         return Err(e);
     }
     serving_authorization_index::validate_referenced_versions(conn, change)?;
-    let structurally_complete = retained_history_integrity::validate_present_parent_shape(conn, change)?;
+    let structurally_complete =
+        retained_history_integrity::validate_present_parent_shape(conn, change)?;
     // Only worth checking once every parent is structurally present --
     // `check_causal_auth_monotonicity_at_promotion` needs each parent's own
     // coordinate, which is meaningless to look up for a parent that isn't
@@ -618,8 +619,7 @@ pub fn admit_change(
                 change.group_id.as_str(),
                 change,
             )?;
-            let newly_appended =
-                retained_history_integrity::append_change(conn, change, applied)?;
+            let newly_appended = retained_history_integrity::append_change(conn, change, applied)?;
             conflict_authoring::record_conflict_copy_ops_provenance(
                 conn,
                 change.group_id.as_str(),
@@ -1127,7 +1127,14 @@ pub fn prepare_emission(
         conn, group_id, &parents, &all_ops, &purpose,
     )?;
 
-    Ok(PreparedEmission { group_id: group_id.to_string(), parents, all_ops, purpose, max_parent_lamport, applied })
+    Ok(PreparedEmission {
+        group_id: group_id.to_string(),
+        parents,
+        all_ops,
+        purpose,
+        max_parent_lamport,
+        applied,
+    })
 }
 
 /// Signs `prepared` under `auth` and appends it with its companion rows.
@@ -1144,7 +1151,8 @@ pub fn admit_prepared_emission(
     auth: ChangeAuth,
     emitter: &ChangeEmitter,
 ) -> Result<Change, SyncSqliteError> {
-    let PreparedEmission { group_id, parents, all_ops, purpose, max_parent_lamport, applied } = prepared;
+    let PreparedEmission { group_id, parents, all_ops, purpose, max_parent_lamport, applied } =
+        prepared;
     let group_id = group_id.as_str();
 
     let change = match purpose {
@@ -2145,18 +2153,18 @@ mod tests {
         let sender = conn();
         let em = emitter();
         // root: a legitimate post-revoke commit under the new grant.
-        let root = emit_local_change(&sender, "g", vec![create_op("a")], real_auth(10, 2), &em)
-            .unwrap();
+        let root =
+            emit_local_change(&sender, "g", vec![create_op("a")], real_auth(10, 2), &em).unwrap();
         // mid: the revoked writer's replay -- pins the OLD, pre-revoke grant
         // (seq 3 < root's seq 10) despite descending from `root`.
-        let mid = emit_local_change(&sender, "g", vec![create_op("b")], real_auth(3, 1), &em)
-            .unwrap();
+        let mid =
+            emit_local_change(&sender, "g", vec![create_op("b")], real_auth(3, 1), &em).unwrap();
         // leaf: an innocent further commit built on top of the replay --
         // its OWN pin is internally consistent with `mid`'s (3 !< 3), so
         // nothing about leaf's own bytes is invalid; it only becomes
         // unpromotable because its parent (`mid`) is.
-        let leaf = emit_local_change(&sender, "g", vec![create_op("c")], real_auth(3, 1), &em)
-            .unwrap();
+        let leaf =
+            emit_local_change(&sender, "g", vec![create_op("c")], real_auth(3, 1), &em).unwrap();
 
         let recv = conn();
         seed_test_version(&recv, "g");
@@ -2546,9 +2554,14 @@ mod tests {
     fn primary_admission_bumps_the_projection_obligation_for_exactly_its_touched_paths() {
         let sender = conn();
         let em = emitter();
-        let root =
-            emit_local_change(&sender, "g", vec![create_op("a"), create_op("b")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
+        let root = emit_local_change(
+            &sender,
+            "g",
+            vec![create_op("a"), create_op("b")],
+            ChangeAuth::PLACEHOLDER,
+            &em,
+        )
+        .unwrap();
 
         let recv = conn();
         seed_test_version(&recv, "g");
@@ -2580,12 +2593,22 @@ mod tests {
     fn promoted_orphan_admission_bumps_the_projection_obligation_for_its_own_touched_paths() {
         let sender = conn();
         let em = emitter();
-        let root =
-            emit_local_change(&sender, "g", vec![create_op("root-path")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
-        let child =
-            emit_local_change(&sender, "g", vec![create_op("child-path")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
+        let root = emit_local_change(
+            &sender,
+            "g",
+            vec![create_op("root-path")],
+            ChangeAuth::PLACEHOLDER,
+            &em,
+        )
+        .unwrap();
+        let child = emit_local_change(
+            &sender,
+            "g",
+            vec![create_op("child-path")],
+            ChangeAuth::PLACEHOLDER,
+            &em,
+        )
+        .unwrap();
 
         let recv = conn();
         seed_test_version(&recv, "g");
@@ -2624,14 +2647,20 @@ mod tests {
         let conn = conn();
         let em = emitter();
         seed_test_version(&conn, "g");
-        let change =
-            emit_local_change(&conn, "g", vec![create_op("local-path")], ChangeAuth::PLACEHOLDER, &em)
-                .unwrap();
+        let change = emit_local_change(
+            &conn,
+            "g",
+            vec![create_op("local-path")],
+            ChangeAuth::PLACEHOLDER,
+            &em,
+        )
+        .unwrap();
         assert!(has_change(&conn, &change.compute_hash()).unwrap());
 
-        let ob = crate::projection_obligations::lookup_projection_obligation(&conn, "g", "local-path")
-            .unwrap()
-            .unwrap();
+        let ob =
+            crate::projection_obligations::lookup_projection_obligation(&conn, "g", "local-path")
+                .unwrap()
+                .unwrap();
         assert_eq!(ob.invalidation_generation, 1);
     }
 

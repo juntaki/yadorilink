@@ -207,7 +207,8 @@ async fn wait_for_new_relay_session_after_anchor_restart(
         let w_session = w.state.peers.session(&m.device_id);
         let fresh = m_session.as_ref().is_some_and(|s| !Arc::ptr_eq(s, m_session_with_w_before))
             && w_session.as_ref().is_some_and(|s| !Arc::ptr_eq(s, w_session_with_m_before));
-        let relayed = routed_via_relay(&m.state, &w.device_id) && routed_via_relay(&w.state, &m.device_id);
+        let relayed =
+            routed_via_relay(&m.state, &w.device_id) && routed_via_relay(&w.state, &m.device_id);
         let now = std::time::Instant::now();
         if fresh && relayed {
             let since = *stable_since.get_or_insert(now);

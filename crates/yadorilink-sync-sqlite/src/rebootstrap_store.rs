@@ -1455,8 +1455,7 @@ mod replace_group_files_from_snapshot_tests {
     #[test]
     fn a_held_and_pinned_path_survives_a_snapshot_install() {
         let db = open_full_test_db();
-        let repo =
-            crate::materialization_state::MaterializationStateRepository::new(db.clone());
+        let repo = crate::materialization_state::MaterializationStateRepository::new(db.clone());
         db.write::<_, SyncSqliteError>(|conn| {
             conn.execute(
                 "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json) \
@@ -1511,8 +1510,7 @@ mod replace_group_files_from_snapshot_tests {
     #[test]
     fn a_held_path_the_snapshot_no_longer_carries_as_current_does_not_resurrect_the_hold() {
         let db = open_full_test_db();
-        let repo =
-            crate::materialization_state::MaterializationStateRepository::new(db.clone());
+        let repo = crate::materialization_state::MaterializationStateRepository::new(db.clone());
         db.write::<_, SyncSqliteError>(|conn| {
             conn.execute(
                 "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json) \
@@ -1568,8 +1566,7 @@ mod replace_group_files_from_snapshot_tests {
     #[test]
     fn a_pin_survives_a_delete_then_resurrect_but_a_hold_does_not() {
         let db = open_full_test_db();
-        let repo =
-            crate::materialization_state::MaterializationStateRepository::new(db.clone());
+        let repo = crate::materialization_state::MaterializationStateRepository::new(db.clone());
         db.write::<_, SyncSqliteError>(|conn| {
             conn.execute(
                 "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted) \

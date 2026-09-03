@@ -219,10 +219,8 @@ fn all_hashes(pages: &[AntiEntropyPage]) -> Vec<ChangeHash> {
 #[test]
 fn long_delta_is_delivered_as_bounded_oldest_first_pages_ending_with_the_tip() {
     // c0 -> c1 -> c2 -> c3, cap = 3.
-    let history = FakeHistory::default()
-        .edge(h(1), &[h(0)])
-        .edge(h(2), &[h(1)])
-        .edge(h(3), &[h(2)]);
+    let history =
+        FakeHistory::default().edge(h(1), &[h(0)]).edge(h(2), &[h(1)]).edge(h(3), &[h(2)]);
     let engine = engine(history);
     let pages = engine.changes_for_request(&group(), &[h(3)], &[], 3).unwrap();
     assert_eq!(pages.len(), 2, "expected two pages for 4 changes at cap 3: {pages:?}");
@@ -296,10 +294,8 @@ fn one_change_over_the_whole_page_budget_is_still_delivered_alone() {
 /// already declared it holds.
 #[test]
 fn receiver_declaring_have_heads_receives_only_the_true_delta() {
-    let history = FakeHistory::default()
-        .edge(h(1), &[h(0)])
-        .edge(h(2), &[h(1)])
-        .edge(h(3), &[h(2)]);
+    let history =
+        FakeHistory::default().edge(h(1), &[h(0)]).edge(h(2), &[h(1)]).edge(h(3), &[h(2)]);
     let engine = engine(history);
     let pages = engine.changes_for_request(&group(), &[h(3)], &[h(2)], 3).unwrap();
     assert_eq!(pages.len(), 1);
@@ -335,10 +331,8 @@ fn diverging_branches_delta_excludes_only_the_true_shared_history() {
 /// low bytes with a genuine hash in the chain.
 #[test]
 fn unrecognized_have_head_never_narrows_the_delta() {
-    let history = FakeHistory::default()
-        .edge(h(1), &[h(0)])
-        .edge(h(2), &[h(1)])
-        .edge(h(3), &[h(2)]);
+    let history =
+        FakeHistory::default().edge(h(1), &[h(0)]).edge(h(2), &[h(1)]).edge(h(3), &[h(2)]);
     let engine = engine(history);
     let spoofed = ChangeHash([0xFF; 32]);
     let pages = engine.changes_for_request(&group(), &[h(3)], &[spoofed], 100).unwrap();
@@ -355,10 +349,7 @@ fn unrecognized_have_head_never_narrows_the_delta() {
 /// not merely by matching a `parents_of` key.
 #[test]
 fn a_recognized_root_have_head_is_excluded_even_with_no_parents_of_its_own() {
-    let history = FakeHistory::default()
-        .edge(h(1), &[h(0)])
-        .edge(h(2), &[h(1)])
-        .recognize(h(0));
+    let history = FakeHistory::default().edge(h(1), &[h(0)]).edge(h(2), &[h(1)]).recognize(h(0));
     let engine = engine(history);
     let pages = engine.changes_for_request(&group(), &[h(2)], &[h(0)], 100).unwrap();
     assert_eq!(pages.len(), 1);
@@ -464,9 +455,8 @@ fn already_matched_heads_ancestry_never_contaminates_a_diverging_heads_boundary_
     let b1 = ChangeHash([0xB1; 32]);
     let b2 = ChangeHash([0xB2; 32]);
 
-    let mut history = FakeHistory::default()
-        .edge(shared_tip, &[unrelated_parent])
-        .recognize(unrelated_parent);
+    let mut history =
+        FakeHistory::default().edge(shared_tip, &[unrelated_parent]).recognize(unrelated_parent);
     for i in 1..=DEPTH {
         history = history.edge(hn(i), &[hn(i - 1)]);
     }
@@ -578,8 +568,7 @@ fn small_divergence_over_deep_history_reads_are_bounded_by_the_delta() {
         durability: Arc::new(UnusedDurability),
     });
 
-    let pages =
-        engine.changes_for_request(&group(), &[hn(DEPTH)], &[hn(DEPTH - 2)], 100).unwrap();
+    let pages = engine.changes_for_request(&group(), &[hn(DEPTH)], &[hn(DEPTH - 2)], 100).unwrap();
     assert_eq!(all_hashes(&pages), vec![hn(DEPTH - 1), hn(DEPTH)]);
     assert!(
         counting.parents_of_call_count() < 20,

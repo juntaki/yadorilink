@@ -337,10 +337,7 @@ pub fn spawn_orchestrator(
 /// `state` and `peer_device_id` -- the same predicate `relay_chaos.rs`
 /// uses, kept identical rather than duplicated with drift.
 pub fn fully_connected(state: &Arc<DaemonState>, peer_device_id: &str) -> bool {
-    state
-        .peers
-        .session(peer_device_id)
-        .is_some_and(|s| s.peer_handshake_received())
+    state.peers.session(peer_device_id).is_some_and(|s| s.peer_handshake_received())
 }
 
 /// `state`'s current route to `peer_device_id` is `Connected(Relay)`
@@ -533,8 +530,11 @@ impl yadorilink_daemon::relay_carrier::RelayGrantSource for FakeGrantSource {
                 + 'a,
         >,
     > {
-        let grant =
-            self.fake.issue_relay_grant(&self.source_device_id, destination_device_id, self.ttl_seconds);
+        let grant = self.fake.issue_relay_grant(
+            &self.source_device_id,
+            destination_device_id,
+            self.ttl_seconds,
+        );
         Box::pin(async move { grant })
     }
 }
@@ -597,13 +597,7 @@ pub async fn stand_up_canonical_topology(
     let w = new_node("topology-w-windows");
 
     for node in [&n, &m, &w] {
-        register_with_fake(
-            fake,
-            &node.state,
-            &node.device_id,
-            &[group_id],
-        )
-        .await;
+        register_with_fake(fake, &node.state, &node.device_id, &[group_id]).await;
     }
     link_eager(&n, group_id);
     link_on_demand(&m, group_id);
@@ -745,13 +739,7 @@ pub async fn stand_up_topology_two_full_replicas_one_on_demand(
     let w = new_node("topology-w-windows");
 
     for node in [&n, &m, &w] {
-        register_with_fake(
-            fake,
-            &node.state,
-            &node.device_id,
-            &[group_id],
-        )
-        .await;
+        register_with_fake(fake, &node.state, &node.device_id, &[group_id]).await;
     }
     link_eager(&n, group_id);
     link_eager(&m, group_id);

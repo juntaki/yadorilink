@@ -26,10 +26,8 @@ async fn editing_yadorilinkignore_rescans_and_reconverges_without_daemon_restart
     let coordination_addr = support::start_coordination_server().await;
     let account =
         support::register_and_login(&coordination_addr, "ignore-rescan@example.com").await;
-    let device_a_id =
-        support::register_device(&account, "device-a", [0u8; 32]).await;
-    let device_b_id =
-        support::register_device(&account, "device-b", [0u8; 32]).await;
+    let device_a_id = support::register_device(&account, "device-a", [0u8; 32]).await;
+    let device_b_id = support::register_device(&account, "device-b", [0u8; 32]).await;
 
     let group_id = support::create_folder_group(&account, "ignore-rescan-group").await;
     support::grant_access(&account, &group_id, &device_a_id).await;

@@ -63,7 +63,10 @@ async fn many_peers_racing_at_once_stay_bounded_and_prompt() {
         dialler.authorize(key);
         let mut candidates: Vec<SocketAddr> = (0..DEAD_CANDIDATES)
             .map(|dead| {
-                SocketAddr::from((Ipv4Addr::new(127, 0, 0, (index % 250 + 2) as u8), dead as u16 + 1))
+                SocketAddr::from((
+                    Ipv4Addr::new(127, 0, 0, (index % 250 + 2) as u8),
+                    dead as u16 + 1,
+                ))
             })
             .collect();
         candidates.push(addr);

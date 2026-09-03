@@ -374,10 +374,7 @@ async fn connect_once(
 async fn quic_channel_pair(
     socket_l: tokio::net::UdpSocket,
     socket_a: tokio::net::UdpSocket,
-) -> (
-    Arc<yadorilink_transport::QuicPeerChannel>,
-    Arc<yadorilink_transport::QuicPeerChannel>,
-) {
+) -> (Arc<yadorilink_transport::QuicPeerChannel>, Arc<yadorilink_transport::QuicPeerChannel>) {
     use yadorilink_transport::{
         ConnectRole, DeviceSigningKeyPair, QuicPeerChannel, QuicPeerEndpoint, TransportHub,
     };

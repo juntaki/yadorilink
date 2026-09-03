@@ -267,8 +267,9 @@ mod tests {
     async fn a_panic_in_run_once_is_recovered_not_left_permanently_dead() {
         let _guard = crate::test_support::CONFIG_ENV_MUTEX.lock().await;
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(yadorilink_local_storage::FsBlockStore::new(dir.path().join("blocks")).unwrap());
+        let store = Arc::new(
+            yadorilink_local_storage::FsBlockStore::new(dir.path().join("blocks")).unwrap(),
+        );
         let sync_state = Arc::new(
             crate::replica_coordinator::ReplicaCoordinator::open(dir.path().join("sync.sqlite3"))
                 .unwrap(),

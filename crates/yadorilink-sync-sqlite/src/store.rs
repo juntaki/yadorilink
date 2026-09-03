@@ -180,7 +180,8 @@ impl SqliteSyncStore {
             return Ok(HashSet::new());
         }
         self.database.read::<_, SyncSqliteError>(|conn| {
-            let placeholders = std::iter::repeat("?").take(block_hashes.len()).collect::<Vec<_>>().join(",");
+            let placeholders =
+                std::iter::repeat("?").take(block_hashes.len()).collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT block_hash FROM group_block_provenance \
                  WHERE group_id = ? AND block_hash IN ({placeholders})"
@@ -656,7 +657,10 @@ impl SqliteSyncStore {
     }
 
     /// Delegate for [`crate::projection_obligations::list_ignore_blocked_paths`].
-    pub fn dag_list_ignore_blocked_paths(&self, group_id: &str) -> Result<Vec<String>, SyncSqliteError> {
+    pub fn dag_list_ignore_blocked_paths(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<String>, SyncSqliteError> {
         self.database.read::<_, SyncSqliteError>(|conn| {
             crate::projection_obligations::list_ignore_blocked_paths(conn, group_id)
         })
@@ -874,7 +878,11 @@ mod tests {
         ChangeHash([byte; 32])
     }
 
-    fn insert_block_provenance(store: &SqliteSyncStore, group: &FolderGroupId, block_hashes: &[Vec<u8>]) {
+    fn insert_block_provenance(
+        store: &SqliteSyncStore,
+        group: &FolderGroupId,
+        block_hashes: &[Vec<u8>],
+    ) {
         store
             .database
             .write::<_, SyncSqliteError>(|conn| {

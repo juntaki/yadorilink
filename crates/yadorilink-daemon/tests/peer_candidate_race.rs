@@ -90,10 +90,8 @@ async fn a_peer_is_reachable_when_its_first_advertised_endpoint_is_not() {
 
     // `shutdown_background`, not a plain drop: dropping a `Runtime` inside
     // an async context panics, and these outlive the assertions below.
-    let runtimes = [
-        spawn_orchestrator(fake.addr(), &dialer),
-        spawn_orchestrator(fake.addr(), &target),
-    ];
+    let runtimes =
+        [spawn_orchestrator(fake.addr(), &dialer), spawn_orchestrator(fake.addr(), &target)];
     let connecting_since = std::time::Instant::now();
 
     wait_until_with_context(
@@ -127,9 +125,7 @@ async fn a_peer_is_reachable_when_its_first_advertised_endpoint_is_not() {
         .unwrap();
     wait_until_with_context(
         || {
-            std::fs::read(target.root.path().join("over-the-second-candidate.txt"))
-                .ok()
-                .as_deref()
+            std::fs::read(target.root.path().join("over-the-second-candidate.txt")).ok().as_deref()
                 == Some(b"reached anyway" as &[u8])
         },
         Duration::from_secs(60),
@@ -171,10 +167,8 @@ async fn several_dead_endpoints_ahead_of_the_working_one_still_connect() {
 
     // `shutdown_background`, not a plain drop: dropping a `Runtime` inside
     // an async context panics, and these outlive the assertions below.
-    let runtimes = [
-        spawn_orchestrator(fake.addr(), &dialer),
-        spawn_orchestrator(fake.addr(), &target),
-    ];
+    let runtimes =
+        [spawn_orchestrator(fake.addr(), &dialer), spawn_orchestrator(fake.addr(), &target)];
     let connecting_since = std::time::Instant::now();
 
     wait_until_with_context(

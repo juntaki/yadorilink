@@ -113,7 +113,9 @@ async fn stand_up_post_recovery_relay_fixture() -> (
                 .file_index_repository()
                 .list_files(&group_id)
                 .map(|files| {
-                    files.iter().any(|f| f.path == "target.bin" && !f.deleted && !f.blocks.is_empty())
+                    files
+                        .iter()
+                        .any(|f| f.path == "target.bin" && !f.deleted && !f.blocks.is_empty())
                 })
                 .unwrap_or(false)
         },
@@ -166,9 +168,14 @@ async fn eight_concurrent_lanes_through_a_relay_session_all_succeed() {
 
     // Generous relative to the measured worst case (13.3-14.3s) without
     // being unbounded -- a regression here should fail loudly, not hang.
-    let results =
-        fetch_concurrently(&session_to_m, &group_id, "target.bin", &blocks, Duration::from_secs(45))
-            .await;
+    let results = fetch_concurrently(
+        &session_to_m,
+        &group_id,
+        "target.bin",
+        &blocks,
+        Duration::from_secs(45),
+    )
+    .await;
 
     let failures: Vec<_> = results.iter().filter(|(_, succeeded)| !succeeded).collect();
     assert!(
@@ -203,7 +210,9 @@ async fn eight_concurrent_lanes_direct_succeed_fast() {
                 .file_index_repository()
                 .list_files(&group_id)
                 .map(|files| {
-                    files.iter().any(|f| f.path == "n-owned.bin" && !f.deleted && !f.blocks.is_empty())
+                    files
+                        .iter()
+                        .any(|f| f.path == "n-owned.bin" && !f.deleted && !f.blocks.is_empty())
                 })
                 .unwrap_or(false)
         },
@@ -226,9 +235,14 @@ async fn eight_concurrent_lanes_direct_succeed_fast() {
 
     let session_to_n = w.state.peers.session(&n.device_id).expect("W must have a session to N");
     let started = std::time::Instant::now();
-    let results =
-        fetch_concurrently(&session_to_n, &group_id, "n-owned.bin", &n_blocks, Duration::from_secs(10))
-            .await;
+    let results = fetch_concurrently(
+        &session_to_n,
+        &group_id,
+        "n-owned.bin",
+        &n_blocks,
+        Duration::from_secs(10),
+    )
+    .await;
     let elapsed = started.elapsed();
 
     let failures: Vec<_> = results.iter().filter(|(_, succeeded)| !succeeded).collect();

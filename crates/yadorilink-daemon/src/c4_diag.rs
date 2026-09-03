@@ -193,13 +193,12 @@ pub fn stats() -> ObligationEngineStats {
         zero_work_closed: ZERO_WORK_CLOSED.load(Ordering::Relaxed),
         reconcile_attempts_started: RECONCILE_ATTEMPTS_STARTED.load(Ordering::Relaxed),
         reconcile_attempts_with_result: RECONCILE_ATTEMPTS_WITH_RESULT.load(Ordering::Relaxed),
-        reconcile_attempts_heads_stable: RECONCILE_ATTEMPTS_HEADS_STABLE
-            .load(Ordering::Relaxed),
+        reconcile_attempts_heads_stable: RECONCILE_ATTEMPTS_HEADS_STABLE.load(Ordering::Relaxed),
         reconcile_attempts_heads_changed_mid_attempt: RECONCILE_ATTEMPTS_HEADS_CHANGED_MID_ATTEMPT
             .load(Ordering::Relaxed),
         paths_settled_by_reconcile: PATHS_SETTLED_BY_RECONCILE.load(Ordering::Relaxed),
-        paths_settled_with_heads_changed_mid_attempt:
-            PATHS_SETTLED_WITH_HEADS_CHANGED_MID_ATTEMPT.load(Ordering::Relaxed),
+        paths_settled_with_heads_changed_mid_attempt: PATHS_SETTLED_WITH_HEADS_CHANGED_MID_ATTEMPT
+            .load(Ordering::Relaxed),
         completion_attempted: COMPLETION_ATTEMPTED.load(Ordering::Relaxed),
         completion_closed: COMPLETION_CLOSED.load(Ordering::Relaxed),
         completion_cas_lost: COMPLETION_CAS_LOST.load(Ordering::Relaxed),

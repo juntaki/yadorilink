@@ -667,7 +667,6 @@ impl ProjectionAttempt {
     pub fn path_fully_resolved(&self, path: &str) -> bool {
         self.is_settled(path) && !self.any_retry_path_is_conflict_copy_of(path)
     }
-
 }
 
 #[cfg(test)]
@@ -699,7 +698,10 @@ mod projection_attempt_tests {
             &[0x3c, 0x58, 0xcc, 0xc5],
         );
         let attempt = ProjectionAttempt {
-            settled: std::collections::BTreeMap::from([("shared.bin".to_string(), placeholder_evidence())]),
+            settled: std::collections::BTreeMap::from([(
+                "shared.bin".to_string(),
+                placeholder_evidence(),
+            )]),
             retry: std::collections::BTreeSet::from([copy_path]),
         };
         assert!(attempt.is_settled("shared.bin"), "sanity: the seed path itself did settle");
@@ -716,7 +718,10 @@ mod projection_attempt_tests {
     #[test]
     fn path_fully_resolved_is_true_when_settled_with_no_outstanding_conflict_copy() {
         let attempt = ProjectionAttempt {
-            settled: std::collections::BTreeMap::from([("shared.bin".to_string(), placeholder_evidence())]),
+            settled: std::collections::BTreeMap::from([(
+                "shared.bin".to_string(),
+                placeholder_evidence(),
+            )]),
             retry: std::collections::BTreeSet::new(),
         };
         assert!(attempt.path_fully_resolved("shared.bin"));
@@ -728,12 +733,14 @@ mod projection_attempt_tests {
     #[test]
     fn path_fully_resolved_ignores_an_unrelated_retry_path() {
         let attempt = ProjectionAttempt {
-            settled: std::collections::BTreeMap::from([("shared.bin".to_string(), placeholder_evidence())]),
+            settled: std::collections::BTreeMap::from([(
+                "shared.bin".to_string(),
+                placeholder_evidence(),
+            )]),
             retry: std::collections::BTreeSet::from(["unrelated.txt".to_string()]),
         };
         assert!(attempt.path_fully_resolved("shared.bin"));
     }
-
 }
 
 /// The exact `Rejected` reason `send_block_request_rejected` sends when a
@@ -1025,8 +1032,12 @@ fn materialize_symlink_at(
             state.dag_bump_mutation_fence(group_id, &record.path, "symlink_write")?;
         let target_hash =
             yadorilink_local_storage::intent_target_hash_for_bytes(target.as_deref().unwrap());
-        let intent_guard =
-            state.open_materialization_intent_guard(group_id, &record.path, &target_hash, permit)?;
+        let intent_guard = state.open_materialization_intent_guard(
+            group_id,
+            &record.path,
+            &target_hash,
+            permit,
+        )?;
         (Some(mutation_generation), Some(intent_guard))
     } else {
         (None, None)
@@ -1105,7 +1116,12 @@ fn materialize_symlink_at(
     // name -- explicit, not implicit via a column default (the row was
     // upserted earlier in this function, before this write; the schema's
     // own default is `Placeholder`, not `Hydrated`, as of v25).
-    state.set_materialization_state(group_id, &record.path, MaterializationState::Hydrated, permit)?;
+    state.set_materialization_state(
+        group_id,
+        &record.path,
+        MaterializationState::Hydrated,
+        permit,
+    )?;
     Ok(SymlinkMaterializeOutcome::WrittenExact {
         mutation_generation: mutation_generation
             .expect("write_eligible implies the fence was bumped above"),
@@ -1436,7 +1452,8 @@ mod require_physical_kind_matches_tests {
     fn rejects_a_missing_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nothing-here");
-        let err = require_physical_kind_matches("nothing-here", &path, RecordKind::File).unwrap_err();
+        let err =
+            require_physical_kind_matches("nothing-here", &path, RecordKind::File).unwrap_err();
         assert!(matches!(err, PeerSessionError::PhysicalKindMismatch(_)), "got {err:?}");
     }
 }
@@ -1564,8 +1581,10 @@ async fn reconstruct_file_off_runtime(
 ) -> Result<(), PeerSessionError> {
     let out_path = out_path.to_path_buf();
     let blocks = blocks.to_vec();
-    match spawn_blocking(move || reconstruct_file(store.as_ref(), &out_path, &blocks, mtime_unix_nanos))
-        .await
+    match spawn_blocking(move || {
+        reconstruct_file(store.as_ref(), &out_path, &blocks, mtime_unix_nanos)
+    })
+    .await
     {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e.into()),
@@ -2532,7 +2551,12 @@ fn hold_record(
     // materialize/PolicySkipped round trip needed first. Matches
     // `hydrate_file_with_timeout_locked`'s own hazard-hold outcome, which
     // reverts to `Placeholder` for the identical reason.
-    state.set_materialization_state(group_id, &record.path, MaterializationState::Placeholder, permit)?;
+    state.set_materialization_state(
+        group_id,
+        &record.path,
+        MaterializationState::Placeholder,
+        permit,
+    )?;
     state.set_held(group_id, &record.path, reason, now_unix_nanos())?;
     tracing::info!(
         path = %record.path,
@@ -2698,8 +2722,9 @@ pub const DEFAULT_MAINTENANCE_RECONCILE_INTERVAL: std::time::Duration =
 const MAINTENANCE_RECONCILE_JITTER_FRACTION: f64 = 0.25;
 
 fn jittered_maintenance_reconcile_interval(base: std::time::Duration) -> std::time::Duration {
-    let jitter =
-        rand::random_range(-MAINTENANCE_RECONCILE_JITTER_FRACTION..=MAINTENANCE_RECONCILE_JITTER_FRACTION);
+    let jitter = rand::random_range(
+        -MAINTENANCE_RECONCILE_JITTER_FRACTION..=MAINTENANCE_RECONCILE_JITTER_FRACTION,
+    );
     base.mul_f64(1.0 + jitter)
 }
 
@@ -3895,8 +3920,6 @@ impl PeerSyncSession {
         handle.flush_case_fold_sibling(group_id, rel_path).await
     }
 
-
-
     /// Installs this session's device-wide block-serve engine, set once by
     /// `DaemonState` after construction — see `block_serve::BlockServeEngine`'s
     /// own doc comment for why this is a post-construction setter rather
@@ -4172,8 +4195,7 @@ impl PeerSyncSession {
     /// outer preflight's duplicate inbound handling was meant to stop.
     async fn wait_for_and_process_peer_first_frame(&self) -> Result<(), PeerSessionError> {
         const EXACT_HANDSHAKE_ATTEMPTS: u32 = 4;
-        const EXACT_HANDSHAKE_BASE_TIMEOUT: std::time::Duration =
-            std::time::Duration::from_secs(1);
+        const EXACT_HANDSHAKE_BASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
         let preflight_started = std::time::Instant::now();
         for attempt in 0..EXACT_HANDSHAKE_ATTEMPTS {
             let multiplier = 1u32 << attempt.min(2);
@@ -5350,8 +5372,10 @@ impl PeerSyncSession {
             // pre-check only ever short-circuits a real, present write.
             return Ok(None);
         };
-        let Some(winner_version_hash) =
-            inputs[winner].content.as_ref().map(|c| yadorilink_replica_domain::ids::VersionHash(c.version_hash))
+        let Some(winner_version_hash) = inputs[winner]
+            .content
+            .as_ref()
+            .map(|c| yadorilink_replica_domain::ids::VersionHash(c.version_hash))
         else {
             return Ok(None);
         };
@@ -5361,9 +5385,9 @@ impl PeerSyncSession {
             &resolution,
             Some(&winner_version_hash),
         )? {
-            Some((exact_state, mutation_generation)) => {
-                Ok(Some(SettlementEvidence::from_exact_actual_state(exact_state, mutation_generation)))
-            }
+            Some((exact_state, mutation_generation)) => Ok(Some(
+                SettlementEvidence::from_exact_actual_state(exact_state, mutation_generation),
+            )),
             None => Ok(None),
         }
     }
@@ -5422,7 +5446,8 @@ impl PeerSyncSession {
         &self,
         group_id: &str,
         audit_attempt_id: u64,
-    ) -> Result<(RetirementAttempt, std::collections::BTreeMap<String, i64>), PeerSessionError> {
+    ) -> Result<(RetirementAttempt, std::collections::BTreeMap<String, i64>), PeerSessionError>
+    {
         let mut retired_generations = std::collections::BTreeMap::new();
         let LinkGate::Live { policy, .. } = self.state.link_gate_for_group(group_id)? else {
             return Ok((RetirementAttempt::Settled { retired: 0 }, retired_generations));
@@ -5803,7 +5828,9 @@ impl PeerSyncSession {
         // precedes this run's own first content byte, the same
         // backward-anchoring `phase_log.rs` already does for the source
         // side's own repeated `T_watch`/`T_capture_start` lines.
-        tracing::warn!("M6PHASE T_recv_change_batch: inbound ChangeBatch/FileRecord/DAG metadata decoded");
+        tracing::warn!(
+            "M6PHASE T_recv_change_batch: inbound ChangeBatch/FileRecord/DAG metadata decoded"
+        );
         if !self.shares_group(&group_id) {
             tracing::warn!(
                 group_id,
@@ -6117,8 +6144,10 @@ impl PeerSyncSession {
         if ready.is_empty() {
             return Ok(());
         }
-        let items: Vec<(&Change, ChangeHash, &[FileVersion])> =
-            ready.iter().map(|(change, hash, versions)| (change, *hash, versions.as_slice())).collect();
+        let items: Vec<(&Change, ChangeHash, &[FileVersion])> = ready
+            .iter()
+            .map(|(change, hash, versions)| (change, *hash, versions.as_slice()))
+            .collect();
         let outcomes = self.replica_engine.admit_authenticated_change_batch(&items)?;
         for ((change, _hash, _versions), outcome) in ready.iter().zip(outcomes) {
             match outcome {
@@ -6210,10 +6239,8 @@ impl PeerSyncSession {
         activity_provider: &'a dyn BlockWriteActivityProvider,
         reconcile_batch: &ReconcileProvenanceBatch,
         call_timer: &crate::c4_attr::ReconcileCallTimer,
-    ) -> Result<
-        Option<(Box<dyn Send + 'a>, crate::ports::PreparedProjectedUpsert)>,
-        PeerSessionError,
-    > {
+    ) -> Result<Option<(Box<dyn Send + 'a>, crate::ports::PreparedProjectedUpsert)>, PeerSessionError>
+    {
         let Some(content) = head.content.as_ref() else {
             return Ok(None);
         };
@@ -6330,9 +6357,7 @@ impl PeerSyncSession {
             record.mtime_unix_nanos,
         )
         .await?;
-        crate::c4_reconcile_timing::record_reconstruct_temp(
-            c4_diag_reconstruct_started.elapsed(),
-        );
+        crate::c4_reconcile_timing::record_reconstruct_temp(c4_diag_reconstruct_started.elapsed());
         let metadata = yadorilink_replica_domain::session_state::LocalFileMetaColumns {
             record_kind: version.meta.record_kind,
             symlink_target: version.meta.symlink_target.clone(),
@@ -6619,10 +6644,8 @@ impl PeerSyncSession {
                         // (already not live) -- a snapshot, never a bump.
                         let mutation_generation =
                             self.state.dag_snapshot_mutation_fence(group_id, &path)?;
-                        settled.insert(
-                            path,
-                            SettlementEvidence::ExactAbsent { mutation_generation },
-                        );
+                        settled
+                            .insert(path, SettlementEvidence::ExactAbsent { mutation_generation });
                     }
                 }
             }
@@ -6707,8 +6730,10 @@ impl PeerSyncSession {
                         rel_path: prepared.rel_path.clone(),
                         fingerprint,
                     });
-                    let kind =
-                        self.state.get_record_kind(group_id, &prepared.rel_path)?.unwrap_or_default();
+                    let kind = self
+                        .state
+                        .get_record_kind(group_id, &prepared.rel_path)?
+                        .unwrap_or_default();
                     settled.insert(
                         prepared.rel_path.clone(),
                         self.exact_object_evidence_after_write(
@@ -7326,8 +7351,7 @@ impl PeerSyncSession {
                     );
                     match c4_diag_prepare_result {
                         Ok(Some((write_activity, prepared))) => {
-                            pending_batch
-                                .push(OrdinaryBatchItem::Upsert(write_activity, prepared));
+                            pending_batch.push(OrdinaryBatchItem::Upsert(write_activity, prepared));
                             continue;
                         }
                         Ok(None) => {}
@@ -7787,7 +7811,11 @@ impl PeerSyncSession {
             if let Some(current) = self.state.get_current_version_record(group_id, target_path)? {
                 let blocks_match = !current.deleted
                     && current.blocks.len() == version.blocks.len()
-                    && current.blocks.iter().zip(&version.blocks).all(|(b, vb)| b.hash == vb.hash.0);
+                    && current
+                        .blocks
+                        .iter()
+                        .zip(&version.blocks)
+                        .all(|(b, vb)| b.hash == vb.hash.0);
                 // Codex review (C4-7 phase 2): unlike the symlink/directory
                 // branch below, a `RecordKind::File` with an empty block
                 // list is a genuinely verifiable on-disk state (an existing,
@@ -7938,10 +7966,11 @@ impl PeerSyncSession {
                     return Ok(MaterializeResult::Settled(SettlementEvidence::ExactObject {
                         kind: RecordKind::File,
                         version: version_hash,
-                        identity: yadorilink_root_authority::fs_identity::FileIdentity::observe_path(
-                            &out_path,
-                        )
-                        .ok(),
+                        identity:
+                            yadorilink_root_authority::fs_identity::FileIdentity::observe_path(
+                                &out_path,
+                            )
+                            .ok(),
                         mutation_generation,
                     }));
                 }
@@ -8008,10 +8037,11 @@ impl PeerSyncSession {
                     return Ok(MaterializeResult::Settled(SettlementEvidence::ExactObject {
                         kind: version.meta.record_kind,
                         version: version_hash,
-                        identity: yadorilink_root_authority::fs_identity::FileIdentity::observe_path(
-                            &out_path,
-                        )
-                        .ok(),
+                        identity:
+                            yadorilink_root_authority::fs_identity::FileIdentity::observe_path(
+                                &out_path,
+                            )
+                            .ok(),
                         mutation_generation,
                     }));
                 }
@@ -8384,18 +8414,20 @@ impl PeerSyncSession {
         mut stream: Box<dyn crate::ports::PeerBlockStream>,
         examination_permits: BlockExaminationPermits,
     ) {
-        let header =
-            match stream.recv_message(yadorilink_transport::MAX_BLOCK_STREAM_HEADER_BYTES).await {
-                Ok(header) => header,
-                Err(error) => {
-                    // A requester that opened a stream and then went away
-                    // before saying what it wanted. Nothing to answer, and
-                    // nothing to record: this is what an abandoned fetch
-                    // looks like from here.
-                    tracing::debug!(%error, peer = %self.peer_device_id, "block stream ended before its request header");
-                    return;
-                }
-            };
+        let header = match stream
+            .recv_message(yadorilink_transport::MAX_BLOCK_STREAM_HEADER_BYTES)
+            .await
+        {
+            Ok(header) => header,
+            Err(error) => {
+                // A requester that opened a stream and then went away
+                // before saying what it wanted. Nothing to answer, and
+                // nothing to record: this is what an abandoned fetch
+                // looks like from here.
+                tracing::debug!(%error, peer = %self.peer_device_id, "block stream ended before its request header");
+                return;
+            }
+        };
         let req = match self.codec.decode_block_request_header(&header) {
             Ok(req) => req,
             Err(error) => {
@@ -8826,7 +8858,8 @@ impl PeerSyncSession {
                 // compressing them would make them larger, which is a
                 // property of this payload, not of this peer.
                 let c4_attr_compression_started = std::time::Instant::now();
-                let c4_attr_compression_result = spawn_blocking(move || compress_block(&data)).await;
+                let c4_attr_compression_result =
+                    spawn_blocking(move || compress_block(&data)).await;
                 c4_attr_compression_ns_w.store(
                     c4_attr_compression_started.elapsed().as_nanos() as u64,
                     std::sync::atomic::Ordering::Relaxed,
@@ -8917,7 +8950,12 @@ impl PeerSyncSession {
         // has just been handed to the transport; see `c4_attr`'s own
         // "Pass 4" module doc for the 5-stage timeline this belongs to.
         let c4_attr_t3 = std::time::Instant::now();
-        crate::c4_attr::report_responder_stages(&req.folder_group_id, &c4_attr_block_hash, c4_attr_t2, c4_attr_t3);
+        crate::c4_attr::report_responder_stages(
+            &req.folder_group_id,
+            &c4_attr_block_hash,
+            c4_attr_t2,
+            c4_attr_t3,
+        );
         // C4_ATTR (temporary, remove after investigation): see `c4_attr`'s
         // own module doc. Covers every outcome that reached this point
         // (`Found`, a read-failure `DontHave`, and a size-mismatch
@@ -9072,9 +9110,16 @@ impl PeerSyncSession {
         req: &yadorilink_sync_wire::BlockRequestHeaderFrame,
         reason: &'static str,
     ) {
-        let (record_exists, record_references_hash, dag_references, retained_references, has_provenance) = {
+        let (
+            record_exists,
+            record_references_hash,
+            dag_references,
+            retained_references,
+            has_provenance,
+        ) = {
             let check = || {
-                let record = self.state.get_file(&req.folder_group_id, &req.file_path).ok().flatten();
+                let record =
+                    self.state.get_file(&req.folder_group_id, &req.file_path).ok().flatten();
                 let record_exists = record.is_some();
                 let record_references_hash = record
                     .as_ref()
@@ -9092,13 +9137,20 @@ impl PeerSyncSession {
                     .state
                     .group_has_block_provenance(&req.folder_group_id, &req.block_hash)
                     .map_err(|e| e.to_string());
-                (record_exists, record_references_hash, dag_references, retained_references, has_provenance)
+                (
+                    record_exists,
+                    record_references_hash,
+                    dag_references,
+                    retained_references,
+                    has_provenance,
+                )
             };
             #[cfg(not(madsim))]
             {
                 match tokio::runtime::Handle::try_current() {
                     Ok(handle)
-                        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+                        if handle.runtime_flavor()
+                            == tokio::runtime::RuntimeFlavor::MultiThread =>
                     {
                         tokio::task::block_in_place(check)
                     }
@@ -9185,7 +9237,8 @@ impl PeerSyncSession {
             {
                 match tokio::runtime::Handle::try_current() {
                     Ok(handle)
-                        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+                        if handle.runtime_flavor()
+                            == tokio::runtime::RuntimeFlavor::MultiThread =>
                     {
                         tokio::task::block_in_place(check)
                     }
@@ -9346,14 +9399,16 @@ impl PeerSyncSession {
         // it.
         stream.finish_send();
 
-        let response =
-            match stream.recv_message(yadorilink_transport::MAX_BLOCK_STREAM_HEADER_BYTES).await {
-                Ok(response) => response,
-                Err(error) => {
-                    tracing::debug!(%error, peer = %self.peer_device_id, "block stream ended before its response header");
-                    return FetchOutcome::NotFound;
-                }
-            };
+        let response = match stream
+            .recv_message(yadorilink_transport::MAX_BLOCK_STREAM_HEADER_BYTES)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::debug!(%error, peer = %self.peer_device_id, "block stream ended before its response header");
+                return FetchOutcome::NotFound;
+            }
+        };
         // C4_ATTR (temporary, remove after investigation): T4 -- the reply
         // header just arrived; see `c4_attr`'s own "Pass 4" module doc.
         let c4_attr_t4 = std::time::Instant::now();
@@ -9385,7 +9440,7 @@ impl PeerSyncSession {
                     c4_attr_t4,
                     std::time::Instant::now(),
                 );
-                return FetchOutcome::Busy { retry_after_ms }
+                return FetchOutcome::Busy { retry_after_ms };
             }
             Outcome::Rejected { reason } => {
                 tracing::warn!(
@@ -9507,8 +9562,13 @@ impl PeerSyncSession {
         file_path: &str,
         hash: &[u8],
     ) -> Result<Option<Bytes>, PeerSessionError> {
-        self.fetch_block_with_response_timeout(group_id, file_path, hash, Self::FETCH_RESPONSE_TIMEOUT)
-            .await
+        self.fetch_block_with_response_timeout(
+            group_id,
+            file_path,
+            hash,
+            Self::FETCH_RESPONSE_TIMEOUT,
+        )
+        .await
     }
 
     /// Like [`Self::fetch_block`], but sizes the per-attempt response
@@ -10340,9 +10400,8 @@ impl PeerSyncSession {
     /// inside the same 30s window than today, not more resilience -- a
     /// real regression for those two paths this constant's own scoping
     /// avoids by construction.
-    const BULK_FETCH_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
-        yadorilink_transport::PEER_IDLE_TIMEOUT.as_secs() + 10,
-    );
+    const BULK_FETCH_RESPONSE_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(yadorilink_transport::PEER_IDLE_TIMEOUT.as_secs() + 10);
 
     /// How many distinct blocks a single burst-loss event is assumed able
     /// to affect within one `materialize` attempt, for `BULK_MATERIALIZE_
@@ -10401,7 +10460,10 @@ impl PeerSyncSession {
     fn begin_block_fetch(&self) -> (InFlightBlockFetchGuard<'_>, usize) {
         let in_flight_after_registering =
             self.in_flight_block_fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        (InFlightBlockFetchGuard { counter: &self.in_flight_block_fetches }, in_flight_after_registering)
+        (
+            InFlightBlockFetchGuard { counter: &self.in_flight_block_fetches },
+            in_flight_after_registering,
+        )
     }
 
     async fn fetch_block_raw(
@@ -10450,9 +10512,9 @@ impl PeerSyncSession {
                 // anything about whether MORE concurrent requests would be
                 // sustainable, so none of them feed the window either way.
                 match &payload {
-                    FetchOutcome::Found(_) => self
-                        .adaptive_window
-                        .on_success(started_at.elapsed(), in_flight_at_send),
+                    FetchOutcome::Found(_) => {
+                        self.adaptive_window.on_success(started_at.elapsed(), in_flight_at_send)
+                    }
                     FetchOutcome::Busy { .. } => self.adaptive_window.on_congestion(),
                     FetchOutcome::NotFound
                     | FetchOutcome::Unusable
@@ -10691,9 +10753,8 @@ impl PeerSyncSession {
         .await;
         let c4_diag_provenance_elapsed = c4_diag_provenance_started.elapsed();
         if let Some(timer) = call_timer {
-            let gate_wait = yadorilink_sqlite_runtime::c4_diag::stats()
-                .1
-                .saturating_sub(c4_attr_gate_before);
+            let gate_wait =
+                yadorilink_sqlite_runtime::c4_diag::stats().1.saturating_sub(c4_attr_gate_before);
             timer.add_provenance_flush(c4_diag_provenance_elapsed);
             timer.add_sqlite_write(c4_diag_provenance_elapsed, gate_wait);
         }
@@ -10747,15 +10808,14 @@ impl PeerSyncSession {
         // this group; a block whose hash isn't in this set has none (same
         // meaning as the single-hash call returning `false`).
         let c4_diag_provenance_started = std::time::Instant::now();
-        let provenance_hashes: std::collections::HashSet<Vec<u8>> = match self
-            .state
-            .group_has_block_provenance_batch(
+        let provenance_hashes: std::collections::HashSet<Vec<u8>> =
+            match self.state.group_has_block_provenance_batch(
                 group_id,
                 &blocks.iter().map(|b| b.hash.clone()).collect::<Vec<_>>(),
             ) {
-            Ok(set) => set,
-            Err(e) => return (Vec::new(), Err(e)),
-        };
+                Ok(set) => set,
+                Err(e) => return (Vec::new(), Err(e)),
+            };
         crate::c4_reconcile_timing::record_preflight_provenance_batch(
             c4_diag_provenance_started.elapsed(),
         );
@@ -10823,7 +10883,11 @@ impl PeerSyncSession {
         // with no detached background work left behind.
         let mut in_flight: FuturesUnordered<
             std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<BlockFetchOutcome, PeerSessionError>> + Send + '_>,
+                Box<
+                    dyn std::future::Future<Output = Result<BlockFetchOutcome, PeerSessionError>>
+                        + Send
+                        + '_,
+                >,
             >,
         > = FuturesUnordered::new();
         // Set once a block is confirmed missing after its own bounded
@@ -10862,8 +10926,7 @@ impl PeerSyncSession {
             // `store.put`, provenance flush merely deferred to the batch
             // boundary): see `ReconcileProvenanceBatch`'s own doc comment
             // for why that is provenance-equivalent for this attempt.
-            let pending_provenance =
-                reconcile_batch.is_some_and(|b| b.already_known(&block.hash));
+            let pending_provenance = reconcile_batch.is_some_and(|b| b.already_known(&block.hash));
             if already_present && (provenance_hashes.contains(&block.hash) || pending_provenance) {
                 // C4_DIAG (temporary, remove after investigation).
                 crate::c4_reconcile_timing::record_blocks_already_local(1);
@@ -11034,7 +11097,9 @@ impl PeerSyncSession {
                 FetchOutcome::NotFound => crate::c4_reconcile_timing::FetchOutcomeTag::NotFound,
                 FetchOutcome::TimedOut => crate::c4_reconcile_timing::FetchOutcomeTag::TimedOut,
                 FetchOutcome::Busy { .. } => crate::c4_reconcile_timing::FetchOutcomeTag::Busy,
-                FetchOutcome::Rejected { .. } => crate::c4_reconcile_timing::FetchOutcomeTag::Rejected,
+                FetchOutcome::Rejected { .. } => {
+                    crate::c4_reconcile_timing::FetchOutcomeTag::Rejected
+                }
                 FetchOutcome::Unusable => crate::c4_reconcile_timing::FetchOutcomeTag::Unusable,
             });
             match outcome {
@@ -11058,9 +11123,7 @@ impl PeerSyncSession {
                 // peer-rotation (the Convergence Engine tries a
                 // different candidate session on its next attempt)
                 // handle it.
-                FetchOutcome::Busy { retry_after_ms }
-                    if attempt < Self::BUSY_RETRY_ATTEMPTS =>
-                {
+                FetchOutcome::Busy { retry_after_ms } if attempt < Self::BUSY_RETRY_ATTEMPTS => {
                     let delay = std::time::Duration::from_millis(retry_after_ms.into())
                         .min(Self::BUSY_RETRY_MAX_DELAY);
                     let c4_diag_sleep_started = std::time::Instant::now();
@@ -11133,9 +11196,7 @@ impl PeerSyncSession {
             Some(data) => {
                 let c4_diag_verify_started = std::time::Instant::now();
                 let c4_diag_verify_ok = block_data_matches(block, &data);
-                crate::c4_reconcile_timing::record_block_verify(
-                    c4_diag_verify_started.elapsed(),
-                );
+                crate::c4_reconcile_timing::record_block_verify(c4_diag_verify_started.elapsed());
                 if !c4_diag_verify_ok {
                     tracing::warn!(
                         file_path,
@@ -11291,9 +11352,9 @@ impl PeerSyncSession {
                         let cleared = match cleared {
                             Ok(cleared) => cleared,
                             Err(join_err) => {
-                                return Err(PeerSessionError::from(std::io::Error::other(
-                                    format!("block index write task panicked: {join_err}"),
-                                )))
+                                return Err(PeerSessionError::from(std::io::Error::other(format!(
+                                    "block index write task panicked: {join_err}"
+                                ))))
                             }
                         };
                         // Same disposition as before: a failed refusal
@@ -11546,7 +11607,9 @@ impl PeerSyncSession {
         // "drop without clearing" mechanism, so exercising one exercises
         // all of them). Compiled out entirely in production.
         #[cfg(any(test, feature = "test-support"))]
-        if TEST_FORCE_HYDRATION_FAILURE_AFTER_HOLD_CLEARED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        if TEST_FORCE_HYDRATION_FAILURE_AFTER_HOLD_CLEARED
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(PeerSessionError::HydrationFailed(path.to_string()));
         }
 
@@ -11680,7 +11743,9 @@ impl PeerSyncSession {
         // "nothing on disk but nothing protects it either" shape this
         // guard exists for.
         #[cfg(any(test, feature = "test-support"))]
-        if TEST_FORCE_HYDRATION_FAILURE_DURING_METADATA_APPLY.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        if TEST_FORCE_HYDRATION_FAILURE_DURING_METADATA_APPLY
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
             return Err(PeerSessionError::HydrationFailed(path.to_string()));
         }
         apply_unix_mode(&out_path, self.state.get_unix_mode(group_id, path)?)?;
@@ -11926,7 +11991,8 @@ impl PeerSyncSession {
                                     // A true zero-mutation verification --
                                     // no syscall below will change anything,
                                     // so this is a snapshot, never a bump.
-                                    self.state.dag_snapshot_mutation_fence(group_id, &local.path)?;
+                                    self.state
+                                        .dag_snapshot_mutation_fence(group_id, &local.path)?;
                                 } else {
                                     self.state.dag_bump_mutation_fence(
                                         group_id,
@@ -12976,16 +13042,20 @@ impl PeerSyncSession {
             // own success path clears the SAME underlying row via its own,
             // separately-opened guard (see this call's own comment above).
             let _pre_clear_hold_intent_guard = if was_held {
-                Some(self.state.open_materialization_intent_guard(
-                    group_id,
-                    &record.path,
-                    &self
-                        .state
-                        .get_symlink_target(group_id, &record.path)?
-                        .map(|target| yadorilink_local_storage::intent_target_hash_for_bytes(&target))
-                        .unwrap_or_else(|| yadorilink_local_storage::intent_target_hash(&[])),
-                    &root_commit_permit,
-                )?)
+                Some(
+                    self.state.open_materialization_intent_guard(
+                        group_id,
+                        &record.path,
+                        &self
+                            .state
+                            .get_symlink_target(group_id, &record.path)?
+                            .map(|target| {
+                                yadorilink_local_storage::intent_target_hash_for_bytes(&target)
+                            })
+                            .unwrap_or_else(|| yadorilink_local_storage::intent_target_hash(&[])),
+                        &root_commit_permit,
+                    )?,
+                )
             } else {
                 None
             };
@@ -13431,7 +13501,11 @@ impl PeerSyncSession {
                 // exact-object proof for this path is invalidated even
                 // though this attempt itself never publishes one (it
                 // returns `RetryRequired`, carrying no evidence).
-                self.state.dag_bump_mutation_fence(group_id, &record.path, "eager_placeholder_write")?;
+                self.state.dag_bump_mutation_fence(
+                    group_id,
+                    &record.path,
+                    "eager_placeholder_write",
+                )?;
                 let placeholder_outcome =
                     create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)?;
                 let placeholder_deferred = placeholder_outcome.is_deferred_to_a_separate_process();
@@ -13501,7 +13575,9 @@ impl PeerSyncSession {
             // path's own completeness check, the counterpart of
             // `hydration.rs`'s identically-tagged `T_recv_all_blocks_
             // available` on the on-demand-sync path.
-            tracing::warn!("M6PHASE T_recv_all_blocks_available: every block this file needs is now local");
+            tracing::warn!(
+                "M6PHASE T_recv_all_blocks_available: every block this file needs is now local"
+            );
             // Open the single sanctioned materialization-intent seam BEFORE
             // committing the brand-new row below. This branch deliberately
             // stamps the row `Hydrated` optimistically, before the temp-
@@ -13622,8 +13698,11 @@ impl PeerSyncSession {
             // specific write invalidated the path's prior proof under, not
             // a value re-read later that some other mutator could have
             // already advanced past.
-            let content_write_mutation_generation =
-                self.state.dag_bump_mutation_fence(group_id, &record.path, "eager_content_write")?;
+            let content_write_mutation_generation = self.state.dag_bump_mutation_fence(
+                group_id,
+                &record.path,
+                "eager_content_write",
+            )?;
             let mut recon = reconstruct_file_off_runtime(
                 self.store.clone(),
                 &out_path,
@@ -13779,7 +13858,9 @@ impl PeerSyncSession {
             // fully, durably materialized") despite the different
             // underlying commit order. See this task's own investigation
             // notes for why the two paths differ here.
-            tracing::warn!("M6PHASE T_recv_hydrated_commit: Hydrated state-machine commit completed");
+            tracing::warn!(
+                "M6PHASE T_recv_hydrated_commit: Hydrated state-machine commit completed"
+            );
             // Apply the owner-executable bit
             // currently recorded for this path (POSIX: real chmod;
             // no-op, no error, on Windows).
@@ -13852,7 +13933,11 @@ impl PeerSyncSession {
             // is never CAS-published), but the bump itself still must
             // land, to invalidate any stale exact-object proof this path
             // may already carry.
-            self.state.dag_bump_mutation_fence(group_id, &record.path, "ondemand_placeholder_write")?;
+            self.state.dag_bump_mutation_fence(
+                group_id,
+                &record.path,
+                "ondemand_placeholder_write",
+            )?;
             let placeholder_outcome =
                 create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)?;
             let placeholder_deferred = placeholder_outcome.is_deferred_to_a_separate_process();
@@ -14883,7 +14968,8 @@ mod symlink_and_metadata_only_update_tests {
         // ANY metadata field, mtime included (a Codex CLI review's
         // finding folded mtime into this same snapshot-vs-bump
         // decision).
-        yadorilink_local_storage::stamp_mtime_at_path(&out_path, incoming.mtime_unix_nanos).unwrap();
+        yadorilink_local_storage::stamp_mtime_at_path(&out_path, incoming.mtime_unix_nanos)
+            .unwrap();
 
         let applied = try_apply_metadata_only_update(
             &state,
@@ -15135,7 +15221,10 @@ mod symlink_and_metadata_only_update_tests {
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
-        assert!(applied.is_none(), "a genuinely different block list must not take the metadata-only path");
+        assert!(
+            applied.is_none(),
+            "a genuinely different block list must not take the metadata-only path"
+        );
     }
 
     #[test]
@@ -15158,7 +15247,10 @@ mod symlink_and_metadata_only_update_tests {
             &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
         )
         .unwrap();
-        assert!(applied.is_none(), "a tombstoned local record must fall through to ordinary handling");
+        assert!(
+            applied.is_none(),
+            "a tombstoned local record must fall through to ordinary handling"
+        );
     }
 }
 
@@ -15954,10 +16046,9 @@ mod handoff_lease_wire_tests {
     /// tests that use it are about what crosses a peer connection, so the
     /// connection has to be the one that ships. `device-a` sorts before
     /// `device-b`, so A is the dialer under the ordinary connect-role rule.
-    pub(super) async fn quic_channel_pair() -> (
-        Arc<yadorilink_transport::QuicPeerChannel>,
-        Arc<yadorilink_transport::QuicPeerChannel>,
-    ) {
+    pub(super) async fn quic_channel_pair(
+    ) -> (Arc<yadorilink_transport::QuicPeerChannel>, Arc<yadorilink_transport::QuicPeerChannel>)
+    {
         use yadorilink_transport::{
             ConnectRole, DeviceSigningKeyPair, QuicPeerChannel, QuicPeerEndpoint, TransportHub,
         };
@@ -17037,7 +17128,11 @@ mod ordinary_batch_tests {
     const GROUP: &str = "c4-6-ordinary-batch-group";
 
     fn create_op(path: &str, version: &FileVersion) -> Op {
-        Op::Put { path: SyncPath(path.into()), version: version.version_hash, origin: PutOrigin::Direct }
+        Op::Put {
+            path: SyncPath(path.into()),
+            version: version.version_hash,
+            origin: PutOrigin::Direct,
+        }
     }
 
     /// Puts `content` into `store` AND records this group's provenance for
@@ -17185,8 +17280,9 @@ mod ordinary_batch_tests {
     #[tokio::test]
     async fn a_batched_upserts_metadata_is_applied_atomically_with_its_row() {
         let h = Harness::new();
-        let hash = hex::decode(h.store.put(b"content with real metadata to carry through").unwrap())
-            .unwrap();
+        let hash =
+            hex::decode(h.store.put(b"content with real metadata to carry through").unwrap())
+                .unwrap();
         h.state.seed_block_provenance(GROUP, &hash);
         let version = FileVersion::new(
             vec![VersionBlock { hash: BlockHash(hash), size: 44 }],
@@ -17243,7 +17339,8 @@ mod ordinary_batch_tests {
     #[tokio::test]
     async fn periodic_maintenance_audit_never_reaches_the_legacy_unapplied_changes_api() {
         let h = Harness::new();
-        let version = version_for(&h.state, &h.store, b"content the audit must not chase via applied");
+        let version =
+            version_for(&h.state, &h.store, b"content the audit must not chase via applied");
         h.admit("legacy-shaped.txt", &version, &h.emitter);
         assert_eq!(h.state.dag_list_unapplied_changes_call_count(), 0, "sanity: none yet");
         assert_eq!(h.state.dag_mark_applied_call_count(), 0, "sanity: none yet");
@@ -17272,7 +17369,8 @@ mod ordinary_batch_tests {
     async fn a_local_edit_admitted_after_prepare_but_before_batch_commit_is_not_committed_as_stale()
     {
         let h = Harness::new();
-        let v1 = version_for(&h.state, &h.store, b"peer content, prepared but never safe to publish");
+        let v1 =
+            version_for(&h.state, &h.store, b"peer content, prepared but never safe to publish");
         h.admit("a.txt", &v1, &h.emitter);
         let head1 = h.winner_head("a.txt");
         let activity_provider = h.session.block_write_activity_provider();
@@ -17297,7 +17395,10 @@ mod ordinary_batch_tests {
             .await
             .unwrap();
 
-        assert!(retry.contains("a.txt"), "the stale prepared upsert must be retried, not committed");
+        assert!(
+            retry.contains("a.txt"),
+            "the stale prepared upsert must be retried, not committed"
+        );
         assert!(!settled.contains_key("a.txt"));
         assert!(
             !h.root.path().join("a.txt").exists(),
@@ -17320,7 +17421,8 @@ mod ordinary_batch_tests {
         let (guard, prepared) =
             h.prepare("b.txt", &head1, activity_provider.as_ref()).await.unwrap();
 
-        let other_peer = ChangeEmitter::new("device-other-peer", SigningKey::from_bytes(&[5u8; 32]));
+        let other_peer =
+            ChangeEmitter::new("device-other-peer", SigningKey::from_bytes(&[5u8; 32]));
         let v2 = version_for(&h.state, &h.store, b"a different peer's newer content");
         h.admit("b.txt", &v2, &other_peer);
 
@@ -17370,7 +17472,8 @@ mod ordinary_batch_tests {
         // this item was pushed into `pending_batch`) and the batch's lock
         // acquisition: a new `Put`, descending from the tombstone, revives
         // the path.
-        let recreate_emitter = ChangeEmitter::new("device-local", SigningKey::from_bytes(&[7u8; 32]));
+        let recreate_emitter =
+            ChangeEmitter::new("device-local", SigningKey::from_bytes(&[7u8; 32]));
         let v_recreate = version_for(&h.state, &h.store, b"recreated locally after the delete");
         h.admit("d.txt", &v_recreate, &recreate_emitter);
 
@@ -17386,7 +17489,8 @@ mod ordinary_batch_tests {
 
         assert!(retry.contains("d.txt"), "the stale tombstone must be retried, not committed");
         assert!(!settled.contains_key("d.txt"));
-        let row = h.state.get_file(GROUP, "d.txt").unwrap().expect("the recreated row must survive");
+        let row =
+            h.state.get_file(GROUP, "d.txt").unwrap().expect("the recreated row must survive");
         assert!(!row.deleted, "the recreated file must not be deleted by the stale tombstone");
     }
 
@@ -17512,7 +17616,8 @@ mod ordinary_batch_tests {
     async fn a_new_change_reaffirming_byte_identical_content_under_a_new_authoring_hash_is_detected_as_stale(
     ) {
         let h = Harness::new();
-        let v1 = version_for(&h.state, &h.store, b"same bytes, admitted under two different changes");
+        let v1 =
+            version_for(&h.state, &h.store, b"same bytes, admitted under two different changes");
         h.admit("c.txt", &v1, &h.emitter);
         let head1 = h.winner_head("c.txt");
         let activity_provider = h.session.block_write_activity_provider();
@@ -17559,7 +17664,8 @@ mod ordinary_batch_tests {
             .unwrap();
         std::fs::write(h.root.path().join("d.txt"), original).unwrap();
 
-        let v2 = version_for(&h.state, &h.store, b"incoming peer content, different from the original");
+        let v2 =
+            version_for(&h.state, &h.store, b"incoming peer content, different from the original");
         h.admit("d.txt", &v2, &h.emitter);
         let head2 = h.winner_head("d.txt");
         let activity_provider = h.session.block_write_activity_provider();
@@ -17613,7 +17719,11 @@ mod ordinary_batch_tests {
         }
         let stale_path = "f3.txt".to_string();
         // Every path above is already prepared; NOW make f3.txt stale.
-        h.admit(&stale_path, &version_for(&h.state, &h.store, b"a superseding change for f3"), &h.emitter);
+        h.admit(
+            &stale_path,
+            &version_for(&h.state, &h.store, b"a superseding change for f3"),
+            &h.emitter,
+        );
 
         let (settled, retry) = h
             .session
@@ -17622,7 +17732,11 @@ mod ordinary_batch_tests {
             .unwrap();
 
         assert_eq!(retry, std::collections::BTreeSet::from([stale_path.clone()]));
-        assert_eq!(settled.len(), 7, "every non-stale path in the batch must still commit: {settled:?}");
+        assert_eq!(
+            settled.len(),
+            7,
+            "every non-stale path in the batch must still commit: {settled:?}"
+        );
         for (path, content) in &paths_and_contents {
             if *path == stale_path {
                 assert!(
@@ -17646,7 +17760,8 @@ mod ordinary_batch_tests {
     #[tokio::test]
     async fn a_finalize_transaction_failure_never_reports_a_path_as_settled() {
         let h = Harness::new();
-        let v1 = version_for(&h.state, &h.store, b"content whose finalize is about to be made to fail");
+        let v1 =
+            version_for(&h.state, &h.store, b"content whose finalize is about to be made to fail");
         h.admit("e.txt", &v1, &h.emitter);
         let head1 = h.winner_head("e.txt");
         let activity_provider = h.session.block_write_activity_provider();
@@ -17796,7 +17911,9 @@ mod ordinary_batch_tests {
                 mutation_generation,
                 ..
             }) => mutation_generation,
-            other => panic!("expected the content-identical fast path to settle as ExactObject, got {other:?}"),
+            other => panic!(
+                "expected the content-identical fast path to settle as ExactObject, got {other:?}"
+            ),
         };
         assert_eq!(
             second_generation, first_generation,
@@ -17834,10 +17951,7 @@ mod ordinary_batch_tests {
             .await
             .unwrap();
         assert!(
-            matches!(
-                result,
-                MaterializeResult::Settled(SettlementEvidence::PolicyPlaceholder)
-            ),
+            matches!(result, MaterializeResult::Settled(SettlementEvidence::PolicyPlaceholder)),
             "an on-demand placeholder settlement must carry PolicyPlaceholder evidence, \
              never ExactObject/ExactAbsent -- got {result:?}"
         );
@@ -17922,7 +18036,10 @@ mod ordinary_batch_tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o644, "the disk-only drift must be repaired back to the recorded mode");
+            assert_eq!(
+                mode, 0o644,
+                "the disk-only drift must be repaired back to the recorded mode"
+            );
         }
     }
 
@@ -18224,7 +18341,9 @@ mod block_provenance_batching_tests {
     use crate::ports::PeerReplicaStatePort;
     use crate::test_support::FakeReplicaState;
     use ed25519_dalek::SigningKey;
-    use yadorilink_local_storage::{BlockStore, ContentHash, FsBlockStore, LocallyHashedBlock, StorageError};
+    use yadorilink_local_storage::{
+        BlockStore, ContentHash, FsBlockStore, LocallyHashedBlock, StorageError,
+    };
     use yadorilink_replica_domain::change::{ChangeAuth, Op, PutOrigin};
     use yadorilink_replica_domain::file::FileMeta;
     use yadorilink_replica_domain::ids::{BlockHash, SyncPath};
@@ -18293,8 +18412,13 @@ mod block_provenance_batching_tests {
     /// in `FailingBlockStore`; every other test passes a plain real store.
     async fn connected_pair(
         store_b: Arc<dyn crate::ports::BlockContentStore>,
-    ) -> (Arc<PeerSyncSession>, Arc<FakeReplicaState>, Arc<FsBlockStore>, Arc<PeerSyncSession>, Arc<FakeReplicaState>)
-    {
+    ) -> (
+        Arc<PeerSyncSession>,
+        Arc<FakeReplicaState>,
+        Arc<FsBlockStore>,
+        Arc<PeerSyncSession>,
+        Arc<FakeReplicaState>,
+    ) {
         let (channel_a, channel_b) = crate::ports::InMemoryPeerChannel::connected_pair();
         let state_a = FakeReplicaState::new_arc();
         let state_b = FakeReplicaState::new_arc();
@@ -18438,7 +18562,8 @@ mod block_provenance_batching_tests {
         seed_servable_record(&state_a, path, &blocks);
 
         let record = record_for(path, &blocks);
-        let all_present = session_b.ensure_blocks_present(GROUP, path, &record, TIMEOUT).await.unwrap();
+        let all_present =
+            session_b.ensure_blocks_present(GROUP, path, &record, TIMEOUT).await.unwrap();
         assert!(all_present, "every block was genuinely servable by A");
 
         let batches = state_b.record_group_block_provenance_batches();
@@ -18452,7 +18577,10 @@ mod block_provenance_batching_tests {
         recorded.sort();
         let mut expected: Vec<Vec<u8>> = blocks.iter().map(|(h, _)| h.clone()).collect();
         expected.sort();
-        assert_eq!(recorded, expected, "the one batch must contain every successfully-fetched hash");
+        assert_eq!(
+            recorded, expected,
+            "the one batch must contain every successfully-fetched hash"
+        );
     }
 
     /// Requirement 2: a partially successful fetch (one block never
@@ -18474,17 +18602,14 @@ mod block_provenance_batching_tests {
         // not_found, exhausting `NOT_FOUND_RETRY_ATTEMPTS` and yielding
         // `BlockFetchOutcome::Missing`.
         let missing_hash: Vec<u8> = vec![0xEE; 32];
-        seed_servable_record(
-            &state_a,
-            path,
-            &[(good_hash.clone(), b"servable-block".len())],
-        );
+        seed_servable_record(&state_a, path, &[(good_hash.clone(), b"servable-block".len())]);
 
         let record = record_for(
             path,
             &[(good_hash.clone(), b"servable-block".len()), (missing_hash.clone(), 9)],
         );
-        let all_present = session_b.ensure_blocks_present(GROUP, path, &record, TIMEOUT).await.unwrap();
+        let all_present =
+            session_b.ensure_blocks_present(GROUP, path, &record, TIMEOUT).await.unwrap();
         assert!(!all_present, "the never-served block must leave all_present false");
 
         let batches = state_b.record_group_block_provenance_batches();
@@ -18560,7 +18685,8 @@ mod block_provenance_batching_tests {
     async fn already_local_and_provenanced_blocks_cause_no_provenance_write() {
         let store_b: Arc<dyn crate::ports::BlockContentStore> =
             Arc::new(FsBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap());
-        let (_session_a, _state_a, _store_a, session_b, state_b) = connected_pair(store_b.clone()).await;
+        let (_session_a, _state_a, _store_a, session_b, state_b) =
+            connected_pair(store_b.clone()).await;
 
         let path = "already-local.bin";
         let content: &[u8] = b"already-here-on-b";
@@ -18568,7 +18694,8 @@ mod block_provenance_batching_tests {
         state_b.seed_block_provenance(GROUP, &hash);
 
         let record = record_for(path, &[(hash, content.len())]);
-        let all_present = session_b.ensure_blocks_present(GROUP, path, &record, TIMEOUT).await.unwrap();
+        let all_present =
+            session_b.ensure_blocks_present(GROUP, path, &record, TIMEOUT).await.unwrap();
         assert!(all_present, "an already-local, already-provenanced block must report present");
 
         assert!(
@@ -18595,7 +18722,8 @@ mod block_provenance_batching_tests {
         seed_servable_record(&state_a, path, &[(hash.clone(), content.len())]);
 
         let record = record_for(path, &[(hash, content.len())]);
-        let all_present = session_b.ensure_blocks_present(GROUP, path, &record, TIMEOUT).await.unwrap();
+        let all_present =
+            session_b.ensure_blocks_present(GROUP, path, &record, TIMEOUT).await.unwrap();
         assert!(all_present);
 
         let calls = state_b.clear_block_fetch_refusal_calls();
@@ -18669,7 +18797,9 @@ mod block_provenance_batching_tests {
         let heads = session_b.combined_heads(GROUP, path, None).unwrap();
         match resolve_path_heads(path, &heads) {
             PathResolution::Present { winner, .. } => heads[winner].clone(),
-            PathResolution::Absent => panic!("{path}: expected a live content head after admission"),
+            PathResolution::Absent => {
+                panic!("{path}: expected a live content head after admission")
+            }
         }
     }
 
@@ -18700,7 +18830,13 @@ mod block_provenance_batching_tests {
             seed_servable_record(&state_a, &path, &[(hash.clone(), content.len())]);
             expected_hashes.push(hash.clone());
             let head = admit_and_resolve_head(
-                &session_b, &state_b, &sender_db, &emitter, &path, hash, content.len(),
+                &session_b,
+                &state_b,
+                &sender_db,
+                &emitter,
+                &path,
+                hash,
+                content.len(),
             )
             .await;
             let (guard, prepared) = session_b
@@ -18716,7 +18852,9 @@ mod block_provenance_batching_tests {
                 )
                 .await
                 .unwrap()
-                .expect("a fresh single-block ordinary content upsert must classify as batch-eligible");
+                .expect(
+                    "a fresh single-block ordinary content upsert must classify as batch-eligible",
+                );
             items.push(OrdinaryBatchItem::Upsert(guard, prepared));
         }
 
@@ -18765,7 +18903,13 @@ mod block_provenance_batching_tests {
             let hash = seed_servable_block(&state_a, &store_a, &content);
             seed_servable_record(&state_a, &path, &[(hash.clone(), content.len())]);
             let head = admit_and_resolve_head(
-                &session_b, &state_b, &sender_db, &emitter, &path, hash, content.len(),
+                &session_b,
+                &state_b,
+                &sender_db,
+                &emitter,
+                &path,
+                hash,
+                content.len(),
             )
             .await;
             let (guard, prepared) = session_b
@@ -18781,7 +18925,9 @@ mod block_provenance_batching_tests {
                 )
                 .await
                 .unwrap()
-                .expect("a fresh single-block ordinary content upsert must classify as batch-eligible");
+                .expect(
+                    "a fresh single-block ordinary content upsert must classify as batch-eligible",
+                );
             items.push(OrdinaryBatchItem::Upsert(guard, prepared));
         }
         assert_eq!(items.len(), 9);
@@ -18792,7 +18938,8 @@ mod block_provenance_batching_tests {
         let mut settled_total = 0usize;
         let mut item_iter = items.into_iter();
         loop {
-            let chunk: Vec<_> = (&mut item_iter).take(PeerSyncSession::ORDINARY_BATCH_MAX_PATHS).collect();
+            let chunk: Vec<_> =
+                (&mut item_iter).take(PeerSyncSession::ORDINARY_BATCH_MAX_PATHS).collect();
             if chunk.is_empty() {
                 break;
             }
@@ -18815,7 +18962,11 @@ mod block_provenance_batching_tests {
         let sizes: Vec<usize> = batches.iter().map(|b| b.len()).collect();
         let mut sorted_sizes = sizes.clone();
         sorted_sizes.sort_unstable();
-        assert_eq!(sorted_sizes, vec![1, 8], "the two transactions must be sized 8 and 1: {sizes:?}");
+        assert_eq!(
+            sorted_sizes,
+            vec![1, 8],
+            "the two transactions must be sized 8 and 1: {sizes:?}"
+        );
     }
 
     /// Requirement C (shared-content dedup): two files in the same window
@@ -18868,7 +19019,9 @@ mod block_provenance_batching_tests {
                 )
                 .await
                 .unwrap()
-                .expect("a fresh single-block ordinary content upsert must classify as batch-eligible");
+                .expect(
+                    "a fresh single-block ordinary content upsert must classify as batch-eligible",
+                );
             items.push(OrdinaryBatchItem::Upsert(guard, prepared));
         }
 
@@ -18918,7 +19071,13 @@ mod block_provenance_batching_tests {
         let hash_a = seed_servable_block(&state_a, &store_a, content_a);
         seed_servable_record(&state_a, "sibling-a.bin", &[(hash_a.clone(), content_a.len())]);
         let head_a = admit_and_resolve_head(
-            &session_b, &state_b, &sender_db, &emitter, "sibling-a.bin", hash_a.clone(), content_a.len(),
+            &session_b,
+            &state_b,
+            &sender_db,
+            &emitter,
+            "sibling-a.bin",
+            hash_a.clone(),
+            content_a.len(),
         )
         .await;
         let (guard_a, prepared_a) = session_b
@@ -18944,7 +19103,13 @@ mod block_provenance_batching_tests {
         // other unfetchable candidate, unrelated to A.
         let missing_hash: Vec<u8> = vec![0xCC; 32];
         let head_b = admit_and_resolve_head(
-            &session_b, &state_b, &sender_db, &emitter, "sibling-b.bin", missing_hash, 9,
+            &session_b,
+            &state_b,
+            &sender_db,
+            &emitter,
+            "sibling-b.bin",
+            missing_hash,
+            9,
         )
         .await;
         let prepared_b = session_b
@@ -18960,7 +19125,10 @@ mod block_provenance_batching_tests {
             )
             .await
             .unwrap();
-        assert!(prepared_b.is_none(), "B's own unfetchable block must fall through to the unbatched path");
+        assert!(
+            prepared_b.is_none(),
+            "B's own unfetchable block must fall through to the unbatched path"
+        );
 
         // Only A ever reaches the commit chunk.
         let (settled, retry) = session_b
@@ -18990,8 +19158,9 @@ mod block_provenance_batching_tests {
     /// ANY provenance batch; the sibling's hash must still be flushed.
     #[tokio::test]
     async fn a_store_put_failure_in_one_file_never_pollutes_the_cross_file_batch() {
-        let failing_store =
-            FailingBlockStore::new(Arc::new(FsBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap()));
+        let failing_store = FailingBlockStore::new(Arc::new(
+            FsBlockStore::new(tempfile::tempdir().unwrap().keep()).unwrap(),
+        ));
         let good_content: &[u8] = b"cross-file-good-block";
         let bad_content: &[u8] = b"cross-file-block-that-fails-to-store";
         failing_store.fail_next_put_of(bad_content);
@@ -19008,7 +19177,13 @@ mod block_provenance_batching_tests {
         let good_hash = seed_servable_block(&state_a, &store_a, good_content);
         seed_servable_record(&state_a, "put-ok.bin", &[(good_hash.clone(), good_content.len())]);
         let head_good = admit_and_resolve_head(
-            &session_b, &state_b, &sender_db, &emitter, "put-ok.bin", good_hash.clone(), good_content.len(),
+            &session_b,
+            &state_b,
+            &sender_db,
+            &emitter,
+            "put-ok.bin",
+            good_hash.clone(),
+            good_content.len(),
         )
         .await;
         let (guard_good, prepared_good) = session_b
@@ -19029,7 +19204,13 @@ mod block_provenance_batching_tests {
         let bad_hash = seed_servable_block(&state_a, &store_a, bad_content);
         seed_servable_record(&state_a, "put-fails.bin", &[(bad_hash.clone(), bad_content.len())]);
         let head_bad = admit_and_resolve_head(
-            &session_b, &state_b, &sender_db, &emitter, "put-fails.bin", bad_hash.clone(), bad_content.len(),
+            &session_b,
+            &state_b,
+            &sender_db,
+            &emitter,
+            "put-fails.bin",
+            bad_hash.clone(),
+            bad_content.len(),
         )
         .await;
         let bad_result = session_b
@@ -19093,7 +19274,13 @@ mod block_provenance_batching_tests {
             let hash = seed_servable_block(&state_a, &store_a, &content);
             seed_servable_record(&state_a, &path, &[(hash.clone(), content.len())]);
             let head = admit_and_resolve_head(
-                &session_b, &state_b, &sender_db, &emitter, &path, hash, content.len(),
+                &session_b,
+                &state_b,
+                &sender_db,
+                &emitter,
+                &path,
+                hash,
+                content.len(),
             )
             .await;
             let (guard, prepared) = session_b
@@ -19109,7 +19296,9 @@ mod block_provenance_batching_tests {
                 )
                 .await
                 .unwrap()
-                .expect("a fresh single-block ordinary content upsert must classify as batch-eligible");
+                .expect(
+                    "a fresh single-block ordinary content upsert must classify as batch-eligible",
+                );
             items.push(OrdinaryBatchItem::Upsert(guard, prepared));
         }
 
@@ -19128,7 +19317,11 @@ mod block_provenance_batching_tests {
             "no candidate may settle when the batch's own provenance transaction failed: \
              {settled:?}"
         );
-        assert_eq!(retry.len(), 3, "every candidate in the failed chunk must be retried: {retry:?}");
+        assert_eq!(
+            retry.len(),
+            3,
+            "every candidate in the failed chunk must be retried: {retry:?}"
+        );
     }
 }
 

@@ -14,15 +14,15 @@ use super::error::WireError;
 // inner type's name in scope.
 #[allow(unused_imports)]
 use super::frame::{
-    BlockRequestHeaderFrame, BlockResponseHeaderFrame, BlockResponseOutcomeFrame,
-    ChangeBatchFrame, ChangeBatchOutboundFrame, ChangeRequestFrame,
-    ClusterConfigFrame, ClusterConfigOutboundFrame, HandoffLeaseGrantFrame,
-    HandoffLeaseReleaseFrame, HandoffLeaseReleaseOutboundFrame, HandoffLeaseRequestFrame,
-    HandoffTicketGrantFrame, HandoffTicketReleaseFrame, HandoffTicketReleaseOutboundFrame,
-    HandoffTicketRequestFrame, HeadsAnnounceFrame, HeadsAnnounceOutboundFrame, InboundFrame,
-    OutboundFrame, RebootstrapSnapshotRequestFrame, RebootstrapSnapshotResponseFrame,
-    RelayCloseFrame, RelayDataFrame, RelayOpenFrame, RelayOpenedFrame, VersionPresentAckFrame,
-    VersionPresentAckOutboundFrame, VersionPresentQueryFrame,
+    BlockRequestHeaderFrame, BlockResponseHeaderFrame, BlockResponseOutcomeFrame, ChangeBatchFrame,
+    ChangeBatchOutboundFrame, ChangeRequestFrame, ClusterConfigFrame, ClusterConfigOutboundFrame,
+    HandoffLeaseGrantFrame, HandoffLeaseReleaseFrame, HandoffLeaseReleaseOutboundFrame,
+    HandoffLeaseRequestFrame, HandoffTicketGrantFrame, HandoffTicketReleaseFrame,
+    HandoffTicketReleaseOutboundFrame, HandoffTicketRequestFrame, HeadsAnnounceFrame,
+    HeadsAnnounceOutboundFrame, InboundFrame, OutboundFrame, RebootstrapSnapshotRequestFrame,
+    RebootstrapSnapshotResponseFrame, RelayCloseFrame, RelayDataFrame, RelayOpenFrame,
+    RelayOpenedFrame, VersionPresentAckFrame, VersionPresentAckOutboundFrame,
+    VersionPresentQueryFrame,
 };
 
 impl TryFrom<proto::VersionPresentQuery> for VersionPresentQueryFrame {
@@ -189,8 +189,7 @@ impl TryFrom<proto::BlockResponseHeader> for BlockResponseHeaderFrame {
         use proto::block_response_header::Outcome;
         let Some(outcome) = value.outcome else {
             return Err(WireError::Decode(
-                "BlockResponseHeader with no outcome is malformed for this generation"
-                    .to_string(),
+                "BlockResponseHeader with no outcome is malformed for this generation".to_string(),
             ));
         };
         let outcome = match outcome {
@@ -699,12 +698,8 @@ mod outbound_parity_tests {
         ];
         for outcome in outcomes {
             let frame = BlockResponseHeaderFrame { outcome };
-            let bytes =
-                ProtobufPeerWireCodec.encode_block_response_header(frame.clone()).unwrap();
-            assert_eq!(
-                ProtobufPeerWireCodec.decode_block_response_header(&bytes).unwrap(),
-                frame
-            );
+            let bytes = ProtobufPeerWireCodec.encode_block_response_header(frame.clone()).unwrap();
+            assert_eq!(ProtobufPeerWireCodec.decode_block_response_header(&bytes).unwrap(), frame);
         }
     }
 

@@ -39,7 +39,7 @@ use std::sync::Mutex as StdMutex;
 use std::task::{Context, Poll};
 
 use quinn::udp::{RecvMeta, Transmit};
-use quinn::{AsyncUdpSocket, AsyncTimer, Runtime, UdpPoller};
+use quinn::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller};
 use tokio::sync::mpsc;
 
 use crate::transport_hub::TransportHub;
@@ -217,10 +217,7 @@ impl SimulatedSendQueue {
         // Registered BEFORE the capacity check, so a dequeue landing between
         // the two wakes this poller rather than being missed -- the reverse
         // order loses exactly the wakeup that would have unstuck it.
-        self.wakers
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(poller_id, cx.waker().clone());
+        self.wakers.lock().unwrap_or_else(|p| p.into_inner()).insert(poller_id, cx.waker().clone());
         if self.tx.capacity() > 0 {
             Poll::Ready(Ok(()))
         } else {

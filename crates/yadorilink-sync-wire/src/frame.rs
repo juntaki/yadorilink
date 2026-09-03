@@ -206,10 +206,19 @@ pub enum BlockResponseOutcomeFrame {
     /// decompressing. `hash` is echoed from the request so the requester can
     /// refuse a response bound to a different block than the one it asked
     /// for.
-    Found { size: u64, hash: Vec<u8>, compression: i32 },
+    Found {
+        size: u64,
+        hash: Vec<u8>,
+        compression: i32,
+    },
     DontHave,
-    Busy { retry_after_ms: u32, queue_depth: u32 },
-    Rejected { reason: String },
+    Busy {
+        retry_after_ms: u32,
+        queue_depth: u32,
+    },
+    Rejected {
+        reason: String,
+    },
 }
 
 /// A peer's answer to a block request: the second message on a block

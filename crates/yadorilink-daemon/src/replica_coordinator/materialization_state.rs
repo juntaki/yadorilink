@@ -158,7 +158,8 @@ impl MaterializationStatePort for ReplicaCoordinator {
         path: &str,
         permit: &RootCommitPermit<'_>,
     ) -> Result<(), SyncSqliteError> {
-        self.materialization_intent_repository().clear_materialization_intent(group_id, path, permit)
+        self.materialization_intent_repository()
+            .clear_materialization_intent(group_id, path, permit)
     }
 
     fn begin_materialization_intent(

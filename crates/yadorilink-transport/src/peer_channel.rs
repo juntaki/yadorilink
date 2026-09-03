@@ -170,7 +170,6 @@ mod tests {
 
     // --- Candidate class ---------------------------------------------
 
-
     #[test]
     fn classify_endpoint_maps_address_scopes() {
         assert_eq!(classify_endpoint("192.168.1.5:41641".parse().unwrap()), CandidateClass::Lan);

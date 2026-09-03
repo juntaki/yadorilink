@@ -1264,8 +1264,7 @@ mod startup_config_validation_tests {
     /// work locally and is rejected by every peer.
     #[tokio::test]
     async fn a_registered_devices_key_is_validated_before_persistent_startup() {
-        let attempt =
-            start_daemon_with_device_json_and_keys(&current_device_json(), false).await;
+        let attempt = start_daemon_with_device_json_and_keys(&current_device_json(), false).await;
         assert!(
             !attempt.sync_db_path.exists(),
             "a missing device key must abort before SQLite creation"

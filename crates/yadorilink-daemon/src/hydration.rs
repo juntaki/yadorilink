@@ -1563,7 +1563,9 @@ async fn hydrate_inner(
             state
                 .replica_coordinator
                 .dag_bump_mutation_fence(group_id, path, "hydration_write")
-                .map_err(|e| SyncError::CorruptState(format!("{path}: mutation fence bump failed: {e}")))?;
+                .map_err(|e| {
+                    SyncError::CorruptState(format!("{path}: mutation fence bump failed: {e}"))
+                })?;
             run_blocking_sweep_offloaded(|| {
                 reconstruct_file(
                     &crate::adapters::block_store_ports::BlockStorePortsAdapter::new(
@@ -1633,7 +1635,9 @@ async fn hydrate_inner(
             // completed. The measured window this investigation cares about
             // ends here; everything after this arm is bookkeeping
             // (clearing a degraded-link flag, single-flight completion).
-            tracing::warn!("M6PHASE T_recv_hydrated_commit: Hydrated state-machine commit completed");
+            tracing::warn!(
+                "M6PHASE T_recv_hydrated_commit: Hydrated state-machine commit completed"
+            );
         }
         HydrationCommitDecision::AlreadyComplete => {}
         HydrationCommitDecision::Stale => {
@@ -1820,10 +1824,10 @@ pub fn materialization_status(
     group_id: &str,
     path: &str,
 ) -> Result<Option<MaterializationStatusInfo>, SyncError> {
-    let Some(materialization_state) =
-        state.replica_coordinator.materialization_state_repository().get_materialization_state(
-            group_id, path,
-        )?
+    let Some(materialization_state) = state
+        .replica_coordinator
+        .materialization_state_repository()
+        .get_materialization_state(group_id, path)?
     else {
         return Ok(None);
     };
@@ -2371,7 +2375,8 @@ async fn resolve_blocks_local_first(
     if let Some(stall) = stall {
         if let Some(&max_missing_size) = missing.iter().map(|b| b.size as u64).max().as_ref() {
             stall.raise_budget(
-                PeerSyncSession::fetch_response_timeout_for(max_missing_size) * 2 + STALL_BUDGET_MARGIN,
+                PeerSyncSession::fetch_response_timeout_for(max_missing_size) * 2
+                    + STALL_BUDGET_MARGIN,
             );
         }
     }
@@ -2678,10 +2683,12 @@ mod tests {
 
         let state_a = state.clone();
         let state_b = state.clone();
-        let task_a =
-            tokio::spawn(async move { hydrate_inner(&state_a, "group-1", "doc.txt", Some(&test_stall())).await });
-        let task_b =
-            tokio::spawn(async move { hydrate_inner(&state_b, "group-1", "doc.txt", Some(&test_stall())).await });
+        let task_a = tokio::spawn(async move {
+            hydrate_inner(&state_a, "group-1", "doc.txt", Some(&test_stall())).await
+        });
+        let task_b = tokio::spawn(async move {
+            hydrate_inner(&state_b, "group-1", "doc.txt", Some(&test_stall())).await
+        });
 
         let (result_a, result_b) = tokio::join!(task_a, task_b);
 
@@ -3236,7 +3243,8 @@ mod tests {
         .unwrap();
 
         let state = DaemonState::new("device-a".into(), sync_state.clone(), store);
-        let result = hydrate_inner(&state, "group-1", "sub/nested/doc.txt", Some(&test_stall())).await;
+        let result =
+            hydrate_inner(&state, "group-1", "sub/nested/doc.txt", Some(&test_stall())).await;
 
         assert!(
             result.is_err(),
@@ -4205,11 +4213,13 @@ mod tests {
             .upsert_file_with_origin(GROUP, &v2, "device-a", &permit)
             .unwrap();
 
-        let fence_before = state.replica_coordinator.dag_snapshot_mutation_fence(GROUP, PATH).unwrap();
+        let fence_before =
+            state.replica_coordinator.dag_snapshot_mutation_fence(GROUP, PATH).unwrap();
 
         restore_to_version(&state, GROUP, PATH, 1).await.unwrap();
 
-        let fence_after = state.replica_coordinator.dag_snapshot_mutation_fence(GROUP, PATH).unwrap();
+        let fence_after =
+            state.replica_coordinator.dag_snapshot_mutation_fence(GROUP, PATH).unwrap();
         assert!(
             fence_after > fence_before,
             "restore's physical write must bump the mutation fence like every other physical \

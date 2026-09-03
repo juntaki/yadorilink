@@ -319,8 +319,7 @@ fn handle_lan_announcement(
         return;
     }
     let now = Instant::now();
-    let mut lan_discovered =
-        diff_state.lan_discovered.lock().unwrap_or_else(|p| p.into_inner());
+    let mut lan_discovered = diff_state.lan_discovered.lock().unwrap_or_else(|p| p.into_inner());
     let entry = lan_discovered.entry(device_id).or_default();
     entry.retain(|(_, seen_at)| now.duration_since(*seen_at) <= LAN_DISCOVERED_CANDIDATE_TTL);
 
@@ -783,10 +782,7 @@ async fn start_lan_discovery(
 /// stops is the task running it being cancelled from outside (e.g.
 /// `main.rs`'s graceful shutdown aborting it) — cleanly, since there is
 /// no detached child task left behind to leak.
-pub async fn run(
-    config: OrchestratorConfig,
-    state: Arc<DaemonState>,
-) -> Result<(), DaemonError> {
+pub async fn run(config: OrchestratorConfig, state: Arc<DaemonState>) -> Result<(), DaemonError> {
     let session_index = Arc::new(AtomicU32::new(0));
     // Created once here (not per-attempt) so it survives a
     // coordination-stream reconnect — see `NetmapDiffState`'s doc
@@ -2028,10 +2024,7 @@ async fn ensure_quic_endpoint(
             // already distributes to peers through the netmap, and TLS 1.3
             // domain-separates its own signatures by construction, so a
             // transcript signature can never be replayed as authorship.
-            let device = DeviceSigningKeyPair {
-                verifying: signing.verifying_key(),
-                signing,
-            };
+            let device = DeviceSigningKeyPair { verifying: signing.verifying_key(), signing };
             // Starts authorizing nobody. The netmap loop opens it to exactly
             // the peers the current netmap names; until then there is no
             // device this daemon should accept a connection from.
@@ -2561,7 +2554,9 @@ async fn run_one_generation(
         state,
         peer_device_id,
         reachability,
-        established.dialed_candidate.map(|addr| candidate_class_to_address(classify_endpoint(addr))),
+        established
+            .dialed_candidate
+            .map(|addr| candidate_class_to_address(classify_endpoint(addr))),
     );
 
     // Registered so the relay layer can find this device's own direct route
@@ -2632,11 +2627,7 @@ async fn run_one_generation(
 /// moment, so dropping this scope's handle is not necessarily dropping the
 /// last one, and two live connections to one peer is the state the
 /// connect-role rule exists to prevent.
-fn discard_generation(
-    state: &Arc<DaemonState>,
-    peer_device_id: &str,
-    established: Established,
-) {
+fn discard_generation(state: &Arc<DaemonState>, peer_device_id: &str, established: Established) {
     // Guarded by identity: a newer generation may already have registered
     // its own route under this key, and a key-only removal would delete the
     // live one -- leaving the relay layer believing this device has no
@@ -2840,11 +2831,8 @@ async fn connect_via_relay(
     let opened =
         crate::relay_carrier::open_relay_path(state, peer_device_id, &peer_public_key).await?;
     let synthetic = opened.path.synthetic_addr();
-    match tokio::time::timeout(
-        PATH_PROBE_TIMEOUT,
-        endpoint.connect(synthetic, peer_public_key),
-    )
-    .await
+    match tokio::time::timeout(PATH_PROBE_TIMEOUT, endpoint.connect(synthetic, peer_public_key))
+        .await
     {
         Ok(Ok(connection)) => Some(Established::from_connection(
             QuicPeerChannel::new(connection, ConnectRole::Dial),
@@ -3053,8 +3041,7 @@ const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(
 /// a literal that happened to equal the handshake timeout, and nothing said
 /// so; this fails the build instead.
 const _: () = assert!(
-    CONNECT_ATTEMPT_TIMEOUT.as_millis()
-        > yadorilink_transport::RACED_DIAL_WORST_CASE.as_millis(),
+    CONNECT_ATTEMPT_TIMEOUT.as_millis() > yadorilink_transport::RACED_DIAL_WORST_CASE.as_millis(),
     "a connection attempt must outlast the candidate race it contains, or the race's own \
      failure -- and everything the attempt does after it -- is unreachable"
 );
@@ -3885,11 +3872,10 @@ mod tests {
     /// deliberately dropped, so nothing is ever read off the other end.
     async fn fake_channel() -> Arc<QuicPeerChannel> {
         async fn device() -> (Arc<QuicPeerEndpoint>, [u8; 32], StdSocketAddr) {
-            let hub = yadorilink_transport::TransportHub::bind(
-                (std::net::Ipv4Addr::LOCALHOST, 0).into(),
-            )
-            .await
-            .unwrap();
+            let hub =
+                yadorilink_transport::TransportHub::bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+                    .await
+                    .unwrap();
             let addr = hub.local_addr();
             let signing = DeviceSigningKeyPair::generate();
             let public = signing.public_bytes();
@@ -3928,11 +3914,10 @@ mod tests {
     async fn accept_side_claims_a_fresh_selected_connection_without_waiting_for_the_old_one_to_end()
     {
         async fn device() -> (Arc<QuicPeerEndpoint>, [u8; 32], StdSocketAddr) {
-            let hub = yadorilink_transport::TransportHub::bind(
-                (std::net::Ipv4Addr::LOCALHOST, 0).into(),
-            )
-            .await
-            .unwrap();
+            let hub =
+                yadorilink_transport::TransportHub::bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+                    .await
+                    .unwrap();
             let addr = hub.local_addr();
             let signing = DeviceSigningKeyPair::generate();
             let public = signing.public_bytes();
@@ -3952,13 +3937,11 @@ mod tests {
         .await
         .expect("the first dial must resolve")
         .expect("the first dial must succeed");
-        let first_accepted = tokio::time::timeout(
-            Duration::from_secs(10),
-            acceptor.accept(dialer_key),
-        )
-        .await
-        .expect("the acceptor must claim the first connection")
-        .expect("the acceptor's endpoint must still be alive");
+        let first_accepted =
+            tokio::time::timeout(Duration::from_secs(10), acceptor.accept(dialer_key))
+                .await
+                .expect("the acceptor must claim the first connection")
+                .expect("the acceptor's endpoint must still be alive");
         let old_channel = QuicPeerChannel::new(first_accepted, ConnectRole::Accept);
         // Held for the rest of this test -- nothing here ever closes it,
         // matching "an earlier connection is still live" exactly.
@@ -3967,9 +3950,10 @@ mod tests {
         // The peer's own reconnect: a second, independent dial to the
         // same acceptor while the first is still held above.
         let dialer_for_second = dialer.clone();
-        let second_dial = tokio::spawn(async move {
-            dialer_for_second.connect(acceptor_addr, acceptor_key).await
-        });
+        let second_dial =
+            tokio::spawn(
+                async move { dialer_for_second.connect(acceptor_addr, acceptor_key).await },
+            );
 
         let started = tokio::time::Instant::now();
         let replacement = tokio::time::timeout(
@@ -4001,11 +3985,10 @@ mod tests {
     /// `ensure_quic_endpoint` would, so teardown tests can observe the
     /// authorized set revocation actually acts on.
     async fn install_test_quic_endpoint(diff_state: &NetmapDiffState) -> Arc<QuicPeerEndpoint> {
-        let hub = yadorilink_transport::TransportHub::bind(
-            (std::net::Ipv4Addr::LOCALHOST, 0).into(),
-        )
-        .await
-        .unwrap();
+        let hub =
+            yadorilink_transport::TransportHub::bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+                .await
+                .unwrap();
         let endpoint = QuicPeerEndpoint::new(hub, DeviceSigningKeyPair::generate()).unwrap();
         diff_state
             .quic_endpoint
@@ -4802,8 +4785,7 @@ mod tests {
     /// peer key pinned, to prove the authorization check is genuinely
     /// live rather than a startup-time snapshot.
     #[tokio::test]
-    async fn lan_discovery_started_before_any_peer_is_pinned_still_authorizes_one_pinned_later()
-    {
+    async fn lan_discovery_started_before_any_peer_is_pinned_still_authorizes_one_pinned_later() {
         use prost::Message as _;
 
         let state = test_state();

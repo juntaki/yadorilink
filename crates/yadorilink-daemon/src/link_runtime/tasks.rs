@@ -633,8 +633,9 @@ pub(crate) fn spawn_executor_task(
                 // fixes this without changing what gets committed, in what
                 // order, or when: only when each already-durable chunk
                 // becomes peer-visible.
-                let (chunk_tx, mut chunk_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<Vec<yadorilink_replica_domain::file::FileRecord>>();
+                let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<
+                    Vec<yadorilink_replica_domain::file::FileRecord>,
+                >();
                 let announce_deps = executor_deps.clone();
                 let announce_local_path = executor_local_path.clone();
                 let announce_group_id = executor_group_id.clone();

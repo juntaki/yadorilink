@@ -440,10 +440,7 @@ async fn connect(a: &Device, b: &Device) -> Result<(), String> {
 async fn quic_channel_pair(
     socket_a: tokio::net::UdpSocket,
     socket_b: tokio::net::UdpSocket,
-) -> (
-    Arc<yadorilink_transport::QuicPeerChannel>,
-    Arc<yadorilink_transport::QuicPeerChannel>,
-) {
+) -> (Arc<yadorilink_transport::QuicPeerChannel>, Arc<yadorilink_transport::QuicPeerChannel>) {
     use yadorilink_transport::{
         ConnectRole, DeviceSigningKeyPair, QuicPeerChannel, QuicPeerEndpoint, TransportHub,
     };

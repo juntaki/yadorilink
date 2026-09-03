@@ -75,13 +75,7 @@ async fn rapid_restart(
         tracing::info!(i, device_id = %w.device_id, "repro: restarting w");
         handles.take_and_shutdown(&w.device_id).await;
         let restarted = restart_node(w).await;
-        register_with_fake(
-            fake,
-            &restarted.state,
-            &restarted.device_id,
-            &[group_id],
-        )
-        .await;
+        register_with_fake(fake, &restarted.state, &restarted.device_id, &[group_id]).await;
         let runtime = spawn_orchestrator(fake.addr(), &restarted);
         handles.insert(restarted.device_id.clone(), runtime);
         w = restarted;
