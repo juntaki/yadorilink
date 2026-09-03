@@ -587,6 +587,36 @@ pub(crate) fn spawn_executor_task(
             // across the whole `block_in_place`/`block_on` call so an
             // update install never starts mid-flush.
             let _write_activity = executor_deps.begin_write_activity();
+            // Freshly read for THIS flush, not reused from
+            // `executor_emit_tombstones` (frozen once, at link-start,
+            // before this link's startup scan even ran): the two-live-
+            // roots recovery flag can be armed or cleared at any point
+            // during an established link's live lifetime, and a value
+            // captured before that would silently defeat this exact
+            // protection the instant it goes stale in the dangerous
+            // direction (armed after capture, cleared only at the next
+            // daemon restart). `executor_emit_tombstones` itself is still
+            // ANDed in as a lower bound -- this boot's startup materialization-
+            // repair failure (if any) must keep suppressing this link's
+            // tombstones for the rest of the boot, same as the startup
+            // scan itself was gated. Computed unconditionally but only
+            // actually consulted for `RescanRequired` -- see
+            // `scan_existing_files_with_ignore_gated_for_established_link`'s
+            // own doc comment for why a `Paths` flush never needs this.
+            let live_emit_tombstones = executor_emit_tombstones
+                && !executor_deps
+                    .replica_coordinator
+                    .link_repository()
+                    .suppress_tombstones_for_group(&executor_group_id)
+                    .unwrap_or_else(|e| {
+                        tracing::error!(
+                            group_id = %executor_group_id,
+                            error = %e,
+                            "cannot tell whether this group's live rescan must be additive; \
+                             suppressing its deletions for this pass"
+                        );
+                        true
+                    });
             if burst_fallback {
                 // A `RescanRequired` full-reconciliation scan already commits
                 // its detected changes to the DAG in durable, bounded chunks
@@ -628,6 +658,7 @@ pub(crate) fn spawn_executor_task(
                             &executor_root,
                             flush,
                             executor_ignore_set.as_ref(),
+                            live_emit_tombstones,
                             &mut |chunk_records| {
                                 let _ = chunk_tx.send(chunk_records.to_vec());
                             },
@@ -643,6 +674,7 @@ pub(crate) fn spawn_executor_task(
                         &executor_root,
                         flush,
                         executor_ignore_set.as_ref(),
+                        live_emit_tombstones,
                         &mut |chunk_records| {
                             let _ = chunk_tx.send(chunk_records.to_vec());
                         },
@@ -685,6 +717,7 @@ pub(crate) fn spawn_executor_task(
                             &executor_root,
                             flush,
                             executor_ignore_set.as_ref(),
+                            live_emit_tombstones,
                         ),
                     )
                 });
@@ -703,6 +736,7 @@ pub(crate) fn spawn_executor_task(
                         &executor_root,
                         flush,
                         executor_ignore_set.as_ref(),
+                        live_emit_tombstones,
                     )
                     .await;
                 c4_attr_flushes_completed += 1;

@@ -96,6 +96,12 @@ rand = "0.10.2"
 # `verify_reclaim_custody_for_test` -- same override this workspace's other
 # consumers of it (yadorilink-sync-core) already carry, for the same reason.
 yadorilink-replica-engine = { path = "../yadorilink-replica-engine", features = ["test-support"] }
+# `materialization_repair.rs`'s own `#[cfg(test)]` module needs `create_
+# or_defer_placeholder`'s Windows-deferred-outcome failure-injection seam
+# (`set_test_force_deferred_placeholder`) to exercise its two placeholder
+# arms' Windows-only handling on any host. Same override shape as the
+# `yadorilink-replica-engine` entry just above.
+yadorilink-local-storage = { path = "../yadorilink-local-storage", features = ["test-support"] }
 # `debounce.rs`'s own moved `#[cfg(test)]` module (7D-9E) needs this for its
 # fallback-trigger log-content assertions -- same dependency sync-core's
 # tests carried before this move.

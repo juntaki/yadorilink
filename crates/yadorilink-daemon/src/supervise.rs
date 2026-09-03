@@ -124,6 +124,14 @@ impl BackoffConfig {
     pub const CONVERGENCE_ENGINE: BackoffConfig =
         BackoffConfig { initial: Duration::from_secs(1), max: Duration::from_secs(30) };
 
+    /// Materialization repair job restart backoff — the same shape as
+    /// `CONVERGENCE_ENGINE`'s (a panicking scheduler-class task should
+    /// recover on roughly the same timescale as an ordinary job retry),
+    /// kept as its own named constant rather than reused so each
+    /// restarting task's backoff can be tuned independently later.
+    pub const MATERIALIZATION_REPAIR: BackoffConfig =
+        BackoffConfig { initial: Duration::from_secs(1), max: Duration::from_secs(30) };
+
     /// A Degraded (disk-pressure) link's periodic free-space re-check
     /// schedule — starts at 5s (disk pressure can resolve quickly, e.g. a
     /// user manually deleting a large file) and caps at 5 minutes (a

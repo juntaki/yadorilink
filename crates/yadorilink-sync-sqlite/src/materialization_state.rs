@@ -94,6 +94,34 @@ impl MaterializationStateRepository {
         Ok(())
     }
 
+    /// `_in_tx` counterpart of [`Self::set_materialization_state`], for a
+    /// caller that already holds an open transaction spanning more writes
+    /// than just this one (C4-6: bounded batching of receiver-side
+    /// materialization commits) -- see `open_projected_upserts_batch`'s own
+    /// call site for why it needs this: the row it just upserted no longer
+    /// gets `Hydrated` from the schema's own column default (v25 changed
+    /// that default to `Placeholder` -- see `SCHEMA_VERSION`'s doc comment),
+    /// so a caller that deliberately wants `Hydrated`-with-an-open-intent
+    /// (the established crash-recoverable shape for a batched candidate
+    /// whose disk publish has not landed yet) must say so explicitly now,
+    /// same as every other caller of this pattern. Does not error on zero
+    /// rows affected the way the non-`_in_tx` version above does -- the
+    /// row was just upserted by this same transaction, so a miss here would
+    /// indicate a logic error in the caller, not a legitimate "not found."
+    pub fn set_materialization_state_in_tx(
+        tx: &rusqlite::Transaction,
+        group_id: &str,
+        path: &str,
+        state: MaterializationState,
+    ) -> Result<(), SyncSqliteError> {
+        tx.execute(
+            "UPDATE files SET materialization_state = ?1 \
+             WHERE group_id = ?2 AND path = ?3 AND state = 'current'",
+            rusqlite::params![state.as_db_str(), group_id, path],
+        )?;
+        Ok(())
+    }
+
     /// Atomically changes a current file's materialization state only when
     /// it still matches `expected`. Cleanup guards use this to avoid rolling
     /// back a newer transition performed by another operation.

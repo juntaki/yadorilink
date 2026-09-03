@@ -27,13 +27,14 @@ use rusqlite::OptionalExtension;
 use crate::dag_store::{self, ChangeEmitter};
 use crate::error::SyncSqliteError;
 use crate::file_index::{apply_local_meta_columns_in_tx, upsert_file_in_tx};
+use crate::materialization_state::MaterializationStateRepository;
 use yadorilink_filesystem_sync::materialization_types::{
     RestoreCommitOutcome, RestoreOperation, RestoreOperationState,
 };
 use yadorilink_replica_domain::change::{Change, ChangeAuth, Op, PutOrigin};
 use yadorilink_replica_domain::file::{FileRecord, FileVersion, RecordKind};
 use yadorilink_replica_domain::ids::{ChangeHash, SyncPath};
-use yadorilink_replica_domain::session_state::LocalFileMetaColumns;
+use yadorilink_replica_domain::session_state::{LocalFileMetaColumns, MaterializationState};
 use yadorilink_sqlite_runtime::SyncDatabase;
 
 // Deliberately a private, module-local duplicate rather than a shared helper
@@ -253,6 +254,59 @@ impl RestoreOperationRepository {
                 &operation.group_id,
                 &operation.path,
                 &operation.meta,
+            )?;
+            // Explicit, not implicit via the schema's own column default
+            // (`Placeholder` as of v25). `reconcile_restore_operations`'s
+            // crash-recovery caller only ever reaches this commit after
+            // confirming `disk_bytes_match_indexed_blocks`, so it is always
+            // safe there. `restore_to_version_inner`'s own direct caller is
+            // NOT always safe by that same argument: its record-kind
+            // dispatch writes real bytes/a real symlink for every kind
+            // EXCEPT one write-nothing symlink case -- Windows-not-opted-in
+            // -- yet this still stamps `Hydrated` for that row too, and
+            // nothing in `restore_to_version_inner` demotes it back
+            // afterward (unlike `materialize_symlink_at`'s identical
+            // policy-skip shape, which does). That is not a live gap: this
+            // restore's own emit -- `record_restore_operation_emitting_
+            // change`, which runs earlier in the SAME `restore_to_version_
+            // inner` call -- durably bumps a `projection_obligations` row
+            // for this exact path in the SAME transaction as the change it
+            // journals, and nothing in this restore path (or the ordinary
+            // materialize pipeline, for a row whose disk genuinely doesn't
+            // match what `Hydrated` claims) ever completes that obligation
+            // without either confirming real content or demoting the row
+            // itself first. A path with an unsettled obligation is never
+            // read as an offline deletion by `reconcile_disk_with_ignore`'s
+            // tombstone loop (`yadorilink-local-capture`) or by the
+            // periodic repair sweep's own `has_unsettled_projection_
+            // obligation` guard -- and separately, `repair_one_interrupted_
+            // symlink` (the periodic repair sweep's own symlink arm)
+            // returns unconditionally on `!policy_permits_write`, before
+            // ever reaching a reconstruct decision for this row at all.
+            // Both mechanisms are already established elsewhere in this
+            // codebase, not something this restore path adds.
+            //
+            // A targetless symlink version (`symlink_target == None`) is
+            // NOT a second instance of this same write-nothing shape: it
+            // can never reach this function at all. `record_restore_
+            // operation_emitting_change` (the only live writer of a
+            // `restore_operations` row -- the crate's other, unvalidated
+            // `record_restore_operation` has no caller anywhere in this
+            // codebase) always calls `FileVersion::verify_hash`, which
+            // runs full `validate_structure` and rejects `RecordKind::
+            // Symlink` with no target, BEFORE this row is ever inserted;
+            // `restore_to_version_inner` dispatches its disk write from
+            // that identical `symlink_target` field, so whenever that
+            // dispatch's own targetless arm would fire, this same
+            // validation already failed the operation earlier and this
+            // function is never reached. Verified empirically, not just
+            // reasoned about: attempting to restore to such a version
+            // returns an error before any disk write or `Hydrated` stamp.
+            MaterializationStateRepository::set_materialization_state_in_tx(
+                tx,
+                &operation.group_id,
+                &operation.path,
+                MaterializationState::Hydrated,
             )?;
             if let Some(author) = operation.authoring_change_hash.as_ref() {
                 let encoded: Option<Vec<u8>> = tx

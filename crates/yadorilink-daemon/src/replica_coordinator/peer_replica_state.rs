@@ -945,6 +945,23 @@ impl PeerReplicaStatePort for ReplicaCoordinator {
                         &u.origin_device_id,
                         u.authoring_change_hash.as_ref(),
                     )?;
+                    // The schema's own column default no longer supplies
+                    // this (v25 changed it to `Placeholder` -- see
+                    // `SCHEMA_VERSION`'s doc comment): this batch's whole
+                    // crash-recovery design depends on the row reading
+                    // `Hydrated` with the intent above still open, so a
+                    // crash before the disk publish below is disambiguated
+                    // from a genuine offline deletion by the intent, exactly
+                    // as an unbatched `materialize()`'s equivalent write
+                    // already is. Must say so explicitly now.
+                    if !u.record.deleted {
+                        yadorilink_sync_sqlite::MaterializationStateRepository::set_materialization_state_in_tx(
+                            tx,
+                            group_id,
+                            &u.rel_path,
+                            yadorilink_replica_domain::session_state::MaterializationState::Hydrated,
+                        )?;
+                    }
                     // C4-7: applied here, in the SAME transaction as the
                     // row/intent above, instead of `revalidate_ordinary_
                     // upsert` calling `apply_incoming_wire_metadata`

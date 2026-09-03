@@ -248,6 +248,12 @@ impl SyncDatabase {
             // in the pool's own per-connection init below), since this
             // bootstrap connection is also the one `schema_init` runs on.
             conn.pragma_update(None, "synchronous", "FULL")?;
+            // Defense-in-depth, ahead of `schema_init` even reaching
+            // `crate::schema::init_schema`'s own identical check: see
+            // `check_schema_version_supported`'s own doc comment for why
+            // this crate calls it directly here too, rather than trusting
+            // every current and future `schema_init` closure to reach it.
+            crate::schema::check_schema_version_supported(&conn)?;
             schema_init(&conn)?;
         }
         let manager = SqliteConnectionManager::file(path).with_init(|conn| {
@@ -295,6 +301,9 @@ impl SyncDatabase {
     ) -> Result<Self, DatabaseError> {
         let pool = madsim_or_default_pool(manager)?;
         let conn = checkout::<DatabaseError>(&pool)?;
+        // Defense-in-depth -- see `Self::open`'s identical call and
+        // `check_schema_version_supported`'s own doc comment for why.
+        crate::schema::check_schema_version_supported(&conn)?;
         schema_init(&conn)?;
         drop(conn);
         Ok(Self { pool, writer_gate: Mutex::new(()) })

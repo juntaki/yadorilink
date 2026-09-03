@@ -232,6 +232,38 @@ fn path_is_within_failed_subtree(rel_path: &str, failed_prefixes: &[String]) -> 
     failed_prefixes.iter().any(|prefix| candidate.starts_with(Path::new(prefix)))
 }
 
+/// Whether `path` (root-relative) exists on disk RIGHT NOW as a regular
+/// file or symlink, under its OWN exact spelling -- checked by directory-
+/// listing the parent and matching the leaf name byte-for-byte, never by
+/// resolving the full path directly (`std::fs::symlink_metadata`/
+/// `exists`). A direct resolution succeeds on a case- or Unicode-
+/// normalization-insensitive filesystem (macOS, Windows) for ANY sibling
+/// that happens to fold to the same name, wrongly reporting "still
+/// exists" for a path that, under its own exact name, is genuinely gone
+/// -- the same case-fold hazard this whole investigation is about, just
+/// surfacing in a disk check instead of an index one. Mirrors the main
+/// reconciliation walk's own `entry.file_type()` admission predicate too
+/// (`is_file() || is_symlink()`, from `lstat`, never following a
+/// symlink): a directory (or fifo/socket/device) now occupying this exact
+/// name is not "the file still exists" any more than it was during the
+/// walk itself, which would have skipped it the same way -- an indexed
+/// file silently replaced offline by one of those must still be
+/// tombstoned, not permanently spared because *something* now answers to
+/// its name.
+fn exact_leaf_exists_as_file_or_symlink(root: &Path, path: &str) -> bool {
+    let full = root.join(path);
+    let (Some(leaf), Some(parent)) =
+        (full.file_name().map(|n| n.to_os_string()), full.parent().map(|p| p.to_path_buf()))
+    else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(&parent) else { return false };
+    entries.filter_map(|e| e.ok()).any(|entry| {
+        entry.file_name() == leaf
+            && entry.file_type().is_ok_and(|ft| ft.is_file() || ft.is_symlink())
+    })
+}
+
 /// [`build_record_for_created_or_modified`]'s Unix-mode-to-persist output:
 /// the outer `None` means nothing to persist (a symlink, or nothing
 /// changed); the inner `Option<u32>` is `unix_mode_from_metadata`'s own
@@ -719,6 +751,58 @@ impl LocalChangeProcessor {
         )
     }
 
+    /// The full reconciliation scan `DebounceFlush::RescanRequired` drives
+    /// from the LIVE flush loop -- a watcher-channel/OS overflow, or
+    /// simply editing this link's own `.yadorilinkignore`, both ordinary
+    /// triggers requiring no crash -- once this link's startup barrier has
+    /// already resolved. Unlike `scan_existing_files_with_ignore[_gated/
+    /// _streaming]` above (the one-time initial scan
+    /// `yadorilink-daemon::link_manager::start_link_watch` runs exactly
+    /// once, before the live watch begins), this runs repeatedly for the
+    /// rest of an established link's lifetime, concurrently with peer
+    /// apply, on-demand hydration, and the periodic repair sweep.
+    ///
+    /// Two independent things the three functions above get structurally
+    /// right for the one-time initial scan, and this one must get right
+    /// for the live, repeating case instead:
+    ///
+    /// - `verified_root_of_established_link`, not `verified_root`: `open`
+    ///   (what `verified_root` uses) can silently ADOPT an unmarked-but-
+    ///   corroborated root and does not check `sync_root_lock`'s live
+    ///   ownership registry -- correct ONLY for the one-time scan that
+    ///   runs before the watch starts. See that method's own doc comment
+    ///   for the sidecar-unlink-and-recreate race this closes for every
+    ///   OTHER already-established-link caller; this one used to be the
+    ///   sole exception.
+    /// - `emit_tombstones` is a caller-supplied parameter here, not
+    ///   hardcoded `true`: a live rescan must respect the identical
+    ///   fail-closed gates the startup scan itself was gated on (this
+    ///   boot's materialization-repair success, ANDed with the two-live-
+    ///   roots recovery flag) -- omitting them here silently defeated
+    ///   both for the entire live lifetime of every link, deterministically,
+    ///   no race required. The caller is responsible for re-reading the
+    ///   live recovery flag fresh for each call (not reusing a value
+    ///   frozen at link-start), since that flag can be armed or cleared at
+    ///   any point during an established link's life -- see
+    ///   `yadorilink-daemon`'s executor task for how it combines the two.
+    pub fn scan_existing_files_with_ignore_gated_for_established_link(
+        &self,
+        group_id: &str,
+        root: &Path,
+        ignore_set: &EffectiveIgnoreSet,
+        emit_tombstones: bool,
+        on_chunk_committed: Option<&mut dyn FnMut(&[FileRecord])>,
+    ) -> Result<Vec<FileRecord>, LocalCaptureError> {
+        let root = self.verified_root_of_established_link(group_id, root)?;
+        self.reconcile_disk_with_ignore(
+            group_id,
+            &root,
+            ignore_set,
+            ReconcileMode::Full { emit_tombstones },
+            on_chunk_committed,
+        )
+    }
+
     /// Establishes this link's root identity for a caller that has only a path.
     ///
     /// Every public reconcile entry point funnels through here, so verification
@@ -856,6 +940,60 @@ impl LocalChangeProcessor {
     /// scan, that withheld peer visibility for the whole scan's length
     /// (tens of seconds) even though most of the work was already durable
     /// far earlier.
+    /// A `try_lock_owned` + fresh disk/veto re-check for ONE tombstone
+    /// candidate, immediately before it is trusted -- shared by both the
+    /// candidacy filter in `reconcile_disk_with_ignore`'s main loop and
+    /// the final pre-commit re-verification right before each chunk
+    /// actually writes. `Ok(Some(guard))` means safe to tombstone THIS
+    /// instant, with the guard that must stay held until the write this
+    /// check is protecting actually lands (a caller that drops it
+    /// immediately closes nothing -- see both call sites' own comments).
+    /// `Ok(None)` means not safe right now (contended, protected, or the
+    /// path exists again) -- skip this candidate for this pass.
+    fn recheck_tombstone_candidate(
+        &self,
+        group_id: &str,
+        root: &Path,
+        path: &str,
+    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, LocalCaptureError> {
+        // `try_lock`, never a blocking `lock`: mirrors
+        // `materialization_repair.rs`'s own established pattern for the
+        // identical shape of problem (a synchronous sweep racing an async
+        // mutator that holds this same lock) -- contention itself is the
+        // answer, not something to wait out. If a real mutator is
+        // actively working on this exact path right now, that alone
+        // proves the "genuinely missing, nothing in progress"
+        // precondition for a tombstone does not hold.
+        let Ok(guard) = self.state.path_lock(group_id, path).try_lock_owned() else {
+            return Ok(None);
+        };
+        // Exact-name, not `std::fs::symlink_metadata(...).is_ok()`: on a
+        // case- or Unicode-normalization-insensitive filesystem (macOS,
+        // Windows), a direct path lookup resolves to whatever sibling
+        // happens to case/normalization-fold to the same name, wrongly
+        // reporting "still exists" for a path that is, under its OWN
+        // exact spelling, genuinely gone -- the identical case-fold
+        // hazard this whole investigation is about, just in the disk
+        // check instead of the index. Also mirrors the walk's own
+        // `is_file() || is_symlink()` admission predicate, not a bare
+        // existence check: a directory (or fifo/socket/device) now
+        // occupying this exact name is not "the file still exists" any
+        // more than it was during the walk itself, which would have
+        // skipped it the same way.
+        if exact_leaf_exists_as_file_or_symlink(root, path) {
+            return Ok(None);
+        }
+        if self.state.has_materialization_intent(group_id, path)?
+            || self.state.has_unsettled_projection_obligation(group_id, path)?
+            || (self.state.is_held(group_id, path)?
+                && self.state.get_materialization_state(group_id, path)?
+                    != Some(MaterializationState::Hydrated))
+        {
+            return Ok(None);
+        }
+        Ok(Some(guard))
+    }
+
     fn reconcile_disk_with_ignore(
         &self,
         group_id: &str,
@@ -1212,6 +1350,16 @@ impl LocalChangeProcessor {
                 if path_is_within_failed_subtree(path, &failed_prefixes) {
                     continue;
                 }
+                // Test-only seam: fires here, right at this path's
+                // candidacy check, before any of the (potentially stale --
+                // `seen_paths` was captured earlier, by the walk) checks
+                // below run. Lets a test pause the scan for one targeted
+                // path, inject a concurrent mutator's completed
+                // transition, then resume and confirm neither the checks
+                // below nor the fresh re-check further down are fooled by
+                // it. Compiled out entirely in non-test builds.
+                #[cfg(test)]
+                scan_test_hooks::fire_pre_tombstone_recheck(group_id, path);
                 // Never tombstone a path with an open materialization intent: a
                 // crash interrupted its write (the file is missing precisely
                 // because the rename never completed), and the durable intent
@@ -1240,6 +1388,75 @@ impl LocalChangeProcessor {
                 // receiving once. Same fail-closed contract as the intent
                 // check above: an errored lookup propagates via `?`.
                 if self.state.has_unsettled_projection_obligation(group_id, path)? {
+                    continue;
+                }
+                // A hazard-held path is not deleted: `hold_record` demotes
+                // it to `Placeholder`, writes nothing under this exact
+                // name, and opens no materialization intent, ALL by
+                // design (see that fix's own doc comment) -- so neither
+                // check above protects it. `HazardHeld` settlement also
+                // deletes the path's projection-obligation row, so the
+                // check just above stops protecting it too, the instant
+                // the hazard engine settles. Without this, a case-fold
+                // collision or reserved-name hazard on this device alone
+                // would look, to this scan, exactly like every peer having
+                // deleted a file that is perfectly valid on all of them --
+                // and this scan would propagate a real, signed, group-wide
+                // `Delete` for it. Fail-closed, same contract as the two
+                // checks above: an errored lookup propagates via `?`.
+                //
+                // Narrowed to `is_held && state != Hydrated`, not
+                // `is_held` alone: `held_reason` and `materialization_
+                // state` are independently-cleared columns
+                // (`clear_held`/`set_materialization_state`/`transition_
+                // materialization_state_if_same_authoring` are all
+                // separate calls, not one atomic operation), so a stale
+                // `held_reason` left behind on a row that a LATER,
+                // successful materialize genuinely wrote real content for
+                // and stamped `Hydrated` must not suppress its real
+                // deletion forever -- that row's own actual, current
+                // state already proves it is not the "nothing on disk
+                // under this name" shape this whole check exists to
+                // protect.
+                if self.state.is_held(group_id, path)?
+                    && self.state.get_materialization_state(group_id, path)?
+                        != Some(MaterializationState::Hydrated)
+                {
+                    continue;
+                }
+                // Closes a real TOCTOU window, not a theoretical one: this
+                // scan is a plain synchronous `fn`, so it structurally
+                // cannot hold the async per-path lock every real mutator
+                // (hydrate, materialize, materialization_repair) takes for
+                // its whole operation -- and the four checks above (this
+                // one plus the three vetoes) are four independent,
+                // non-atomic reads on a pooled connection, each reading
+                // whatever happens to be true at that instant. A
+                // completed held-to-materialize transition (open intent,
+                // write the real content, clear the intent/held state) can
+                // land entirely between `seen_paths`' capture (the walk,
+                // already finished by this point in the loop) and this
+                // path reaching its candidacy check here -- every one of
+                // the checks above would then read exactly the "genuinely
+                // missing, fully unprotected" shape a real offline
+                // deletion has, even though the file now genuinely exists.
+                //
+                // A cheap PRE-filter, not the authoritative check: this
+                // guard is dropped at the end of this loop iteration, long
+                // before the actual DAG write for this candidate happens
+                // (the chunked commit loop further down, potentially many
+                // paths and real elapsed time later, itself unlocked). A
+                // mutator that completes a held-to-materialize transition
+                // (or any other legitimate materialization) AFTER this
+                // check but BEFORE this exact candidate's own chunk
+                // commits would still get tombstoned if this were the only
+                // check -- see the chunked commit loop's own final,
+                // guard-held-through-commit re-verification for the
+                // ACTUAL protection. Kept here anyway (not merely a
+                // 3-veto check with no lock) so an already-doomed
+                // candidate is discarded early rather than carried all the
+                // way to the commit loop only to be filtered there.
+                if self.recheck_tombstone_candidate(group_id, root, path)?.is_none() {
                     continue;
                 }
                 tracing::info!(
@@ -1352,11 +1569,76 @@ impl LocalChangeProcessor {
                     chunk_bytes += op_bytes;
                     end += 1;
                 }
-                let chunk_records = &records[start..end];
-                let chunk_ops: Vec<Op> = ops[start..end].to_vec();
+                // The FINAL, load-bearing re-verification -- not the
+                // candidacy-time one further up, which drops its guard as
+                // soon as that loop iteration ends, long before this
+                // point. Held through the commit call just below: for
+                // each tombstone candidate in THIS chunk, re-take its lock
+                // and re-run every check one more time, right here,
+                // immediately before the write that actually deletes it.
+                // A mutator that completes a legitimate materialization
+                // after the candidacy-time check but before this exact
+                // moment -- the window the candidacy-time check alone
+                // cannot close, since nothing serializes between the two
+                // -- is caught here instead. Non-tombstone entries (new/
+                // changed content) need no re-verification; only
+                // `record.deleted` candidates ever reach a delete.
+                let mut kept_indices: Vec<usize> = Vec::with_capacity(end - start);
+                let mut kept_guards: Vec<tokio::sync::OwnedMutexGuard<()>> = Vec::new();
+                for i in start..end {
+                    if !records[i].deleted {
+                        kept_indices.push(i);
+                        continue;
+                    }
+                    // Test-only seam: fires once per tombstone candidate,
+                    // right before this final re-verification -- distinct
+                    // from the candidacy-time hook above, so a test can
+                    // inject a race specifically in THIS window (after
+                    // candidacy, before commit) without also needing to
+                    // race the earlier one. Compiled out entirely in
+                    // non-test builds.
+                    #[cfg(test)]
+                    scan_test_hooks::fire_pre_chunk_commit_recheck(group_id, &records[i].path);
+                    match self.recheck_tombstone_candidate(group_id, root, &records[i].path)? {
+                        Some(guard) => {
+                            kept_indices.push(i);
+                            kept_guards.push(guard);
+                        }
+                        None => {
+                            tracing::info!(
+                                group_id,
+                                path = %records[i].path,
+                                "live reconciliation scan's final pre-commit re-check found \
+                                 this path no longer eligible for an offline-deletion \
+                                 tombstone; withholding it from this chunk's commit"
+                            );
+                        }
+                    }
+                }
+                let chunk_records: Vec<FileRecord> =
+                    kept_indices.iter().map(|&i| records[i].clone()).collect();
+                let chunk_ops: Vec<Op> = kept_indices.iter().map(|&i| ops[i].clone()).collect();
+                // Unaffected by `kept_indices` filtering above: a
+                // tombstone candidate never contributes a `Some` entry to
+                // `versions` in the first place (`Op::Delete` pairs with
+                // `None`, see the loop that built `versions` above), so
+                // excluding one here changes nothing this `.flatten()`
+                // would have kept anyway. Still built from the FULL
+                // `start..end` range, not `kept_indices` -- narrowing it
+                // to the filtered range would be redundant, not incorrect.
                 let chunk_versions: Vec<FileVersion> =
                     versions[start..end].iter().flatten().cloned().collect();
-                let chunk_metas = &metas[start..end];
+                let chunk_metas: Vec<Option<LocalFileMetaColumns>> =
+                    kept_indices.iter().map(|&i| metas[i].clone()).collect();
+                if chunk_records.is_empty() {
+                    // Every candidate in this chunk was withheld by the
+                    // re-check above (or the chunk was entirely
+                    // tombstones, all now stale) -- nothing left to
+                    // commit. `kept_guards` drops here, releasing every
+                    // lock this iteration took.
+                    start = end;
+                    continue;
+                }
                 // `RootCommitPermit::verify` is called by `upsert_files_
                 // batch_emitting_change` itself, immediately before its own
                 // commit -- not just once at this whole scan's entry
@@ -1369,21 +1651,29 @@ impl LocalChangeProcessor {
                 // ownership(root)?` call here; that check is now folded
                 // into the permit's own `verify`, alongside the daemon's
                 // lifecycle-fence check the standalone call never covered.
-                match self.state.upsert_files_batch_emitting_change(
+                let commit_result = self.state.upsert_files_batch_emitting_change(
                     group_id,
-                    chunk_records,
+                    &chunk_records,
                     &self.device_id,
                     ChangeContent { ops: chunk_ops, versions: &chunk_versions },
-                    chunk_metas,
+                    &chunk_metas,
                     crate::ports::LocalChangeEmission {
                         emitter,
                         permit: &self.begin_operation()?.permit(),
                     },
-                ) {
+                );
+                // Every re-verified tombstone candidate's lock is held all
+                // the way through the commit call above -- dropped only
+                // now, after it durably lands (or fails). This is what
+                // actually closes the window: nothing else can complete a
+                // materialization for any of these exact paths while this
+                // commit is in flight.
+                drop(kept_guards);
+                match commit_result {
                     Ok(_) => {
-                        committed.extend_from_slice(chunk_records);
+                        committed.extend_from_slice(&chunk_records);
                         if let Some(ref mut cb) = on_chunk_committed {
-                            cb(chunk_records);
+                            cb(&chunk_records);
                         }
                     }
                     // The group's policy is stale or has not loaded yet this
@@ -1437,8 +1727,14 @@ impl LocalChangeProcessor {
                 // withheld tail re-emits via the dirty journal.
                 return Ok(committed);
             }
-            self.record_local_commit_fingerprints(group_id, root, &records);
-            Ok(records)
+            // `committed`, not the original `records`: the final pre-
+            // commit re-check inside the chunking loop above can withhold
+            // a tombstone candidate from its own chunk even when every
+            // chunk otherwise committed successfully (`withheld_from`
+            // stays `None`) -- `records` would then still list a path
+            // that was correctly never actually deleted.
+            self.record_local_commit_fingerprints(group_id, root, &committed);
+            Ok(committed)
         } else {
             // The group has no change DAG yet (a first link's whole index is
             // seeded into history by the chunked initial import that runs right
@@ -1985,6 +2281,24 @@ impl LocalChangeProcessor {
                                 &self.device_id,
                                 &self.begin_operation()?.permit(),
                             )?;
+                            // `upsert_file_with_origin` is a generic primitive
+                            // shared with peer-driven callers, so it cannot
+                            // stamp `Hydrated` unconditionally the way the
+                            // local-emission-only upsert functions do -- this
+                            // call site must do it itself. Just as safe to do
+                            // so here as in the `Some` arm's `upsert_file_
+                            // emitting_change` above: `record`'s bytes were
+                            // read from this device's own disk to build it,
+                            // same precondition, only the DAG-emission step is
+                            // skipped (no signing key provisioned yet).
+                            if !record.deleted {
+                                self.state.set_materialization_state(
+                                    group_id,
+                                    &record.path,
+                                    MaterializationState::Hydrated,
+                                    &self.begin_operation()?.permit(),
+                                )?;
+                            }
                             tracing::warn!("M6PHASE T_author_done: authoritative FileRecord/DAG commit completes");
                             // No DAG emission here (no signing key provisioned),
                             // so there is no DAG/index divergence hazard: apply
@@ -2543,15 +2857,29 @@ impl LocalChangeProcessor {
         flush: DebounceFlush,
     ) -> Result<FlushOutcome, LocalCaptureError> {
         let ignore_set = EffectiveIgnoreSet::load_for_link_root(root)?;
-        self.process_flush_with_ignore(group_id, root, flush, &ignore_set).await
+        // `true`: this convenience entry point has no caller-supplied
+        // fail-closed gate to respect, so it reproduces the historical
+        // (pre-gating) behavior exactly -- every real production caller
+        // goes through `process_flush_with_ignore` directly instead (see
+        // `yadorilink-daemon`'s executor task), passing its own freshly-
+        // computed gate.
+        self.process_flush_with_ignore(group_id, root, flush, &ignore_set, true).await
     }
 
+    /// `emit_tombstones` governs ONLY the `DebounceFlush::RescanRequired`
+    /// case (`DebounceFlush::Paths` never emits a missing-file tombstone
+    /// at all -- see `process_event`'s own per-path handling) -- see
+    /// `scan_existing_files_with_ignore_gated_for_established_link`'s own
+    /// doc comment for what this must be for a live caller (this link's
+    /// startup-repair success ANDed with a FRESH read of the two-live-
+    /// roots recovery flag, not a value frozen at link-start).
     pub async fn process_flush_with_ignore(
         &self,
         group_id: &str,
         root: &Path,
         flush: DebounceFlush,
         ignore_set: &EffectiveIgnoreSet,
+        emit_tombstones: bool,
     ) -> Result<FlushOutcome, LocalCaptureError> {
         match flush {
             DebounceFlush::Paths(paths) => {
@@ -2849,7 +3177,13 @@ impl LocalChangeProcessor {
                 Ok(FlushOutcome { records })
             }
             DebounceFlush::RescanRequired => {
-                let records = self.scan_existing_files_with_ignore(group_id, root, ignore_set)?;
+                let records = self.scan_existing_files_with_ignore_gated_for_established_link(
+                    group_id,
+                    root,
+                    ignore_set,
+                    emit_tombstones,
+                    None,
+                )?;
                 Ok(FlushOutcome { records })
             }
         }
@@ -2872,18 +3206,21 @@ impl LocalChangeProcessor {
         root: &Path,
         flush: DebounceFlush,
         ignore_set: &EffectiveIgnoreSet,
+        emit_tombstones: bool,
         on_chunk_committed: &mut dyn FnMut(&[FileRecord]),
     ) -> Result<FlushOutcome, LocalCaptureError> {
         match flush {
             DebounceFlush::Paths(_) => {
-                self.process_flush_with_ignore(group_id, root, flush, ignore_set).await
+                self.process_flush_with_ignore(group_id, root, flush, ignore_set, emit_tombstones)
+                    .await
             }
             DebounceFlush::RescanRequired => {
-                let records = self.scan_existing_files_with_ignore_streaming(
+                let records = self.scan_existing_files_with_ignore_gated_for_established_link(
                     group_id,
                     root,
                     ignore_set,
-                    on_chunk_committed,
+                    emit_tombstones,
+                    Some(on_chunk_committed),
                 )?;
                 Ok(FlushOutcome { records })
             }
@@ -3499,6 +3836,43 @@ pub(crate) mod scan_test_hooks {
         let hook = POST_SNAPSHOT.lock().unwrap_or_else(|p| p.into_inner()).clone();
         if let Some(hook) = hook {
             hook(group_id);
+        }
+    }
+
+    type PathHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
+    static PRE_TOMBSTONE_RECHECK: Mutex<Option<PathHook>> = Mutex::new(None);
+
+    pub(crate) fn set_pre_tombstone_recheck_hook(hook: Option<PathHook>) {
+        *PRE_TOMBSTONE_RECHECK.lock().unwrap_or_else(|p| p.into_inner()) = hook;
+    }
+
+    pub(crate) fn fire_pre_tombstone_recheck(group_id: &str, path: &str) {
+        // Same release-before-invoke discipline as `fire_post_snapshot`
+        // above, for the same reason.
+        let hook = PRE_TOMBSTONE_RECHECK.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(hook) = hook {
+            hook(group_id, path);
+        }
+    }
+
+    static PRE_CHUNK_COMMIT_RECHECK: Mutex<Option<PathHook>> = Mutex::new(None);
+
+    pub(crate) fn set_pre_chunk_commit_recheck_hook(hook: Option<PathHook>) {
+        *PRE_CHUNK_COMMIT_RECHECK.lock().unwrap_or_else(|p| p.into_inner()) = hook;
+    }
+
+    /// Fires once per tombstone candidate immediately before the FINAL,
+    /// guard-held-through-commit re-verification that runs right before a
+    /// chunk actually writes -- distinct from `fire_pre_tombstone_recheck`
+    /// above, which fires earlier, at candidacy-decision time. A test that
+    /// only sets this hook (leaving the other one unset) can inject a race
+    /// specifically in the window the candidacy-time re-check alone cannot
+    /// close: after a candidate legitimately passed that first check and
+    /// was added to the batch, but before its own chunk's actual commit.
+    pub(crate) fn fire_pre_chunk_commit_recheck(group_id: &str, path: &str) {
+        let hook = PRE_CHUNK_COMMIT_RECHECK.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(hook) = hook {
+            hook(group_id, path);
         }
     }
 }
@@ -4132,6 +4506,356 @@ mod tests {
             "without the startup barrier the scan's stale-snapshot commit overwrites the \
              concurrent peer change — the race the barrier closes"
         );
+    }
+
+    // --- Live-rescan TOCTOU: a completed held-to-materialize transition
+    // racing the tombstone-candidate loop's own checks ---
+    //
+    // Unlike the group-startup-barrier tests above (which close a race
+    // between the STARTUP scan and a peer apply, using the barrier itself
+    // as the fix), this exercises the fresh, lock-covered re-check
+    // `reconcile_disk_with_ignore` now does immediately before committing
+    // any tombstone -- reproducing exactly the shape a LIVE rescan
+    // (`DebounceFlush::RescanRequired`, reachable at any point during an
+    // established link's life, not confined to any barrier) is exposed to.
+
+    const TOCTOU_GROUP: &str = "toctou-group";
+    const TOCTOU_PATH: &str = "held-then-materialized.bin";
+
+    async fn build_toctou_fixture() -> (
+        LocalChangeProcessor,
+        Arc<TestReplica>,
+        std::path::PathBuf,
+        EffectiveIgnoreSet,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Vec<u8>,
+    ) {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let state = Arc::new(TestReplica::open_in_memory().unwrap());
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+
+        state.link_repository().add_link(&root.to_string_lossy(), TOCTOU_GROUP).unwrap();
+        state.set_local_change_auth_provider(Arc::new(|_group_id| Ok(ChangeAuth::PLACEHOLDER)));
+        let emitter = Arc::new(ChangeEmitter::new(
+            "device-a",
+            ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]),
+        ));
+        let processor = LocalChangeProcessor::new(
+            state.clone(),
+            store.clone(),
+            "device-a".into(),
+            std::sync::Arc::new(yadorilink_root_authority::root_commit::RootLease::for_tests()),
+        )
+        .with_change_emitter(emitter);
+        adopt_root(&state, TOCTOU_GROUP, &root);
+        // A real, DAG-admitted edit for TOCTOU_PATH itself -- both tests
+        // using this fixture exercise a LIVE rescan
+        // (`scan_existing_files_with_ignore`, the same entry point
+        // `DebounceFlush::RescanRequired` reaches once a link is
+        // established), and a live rescan is only ever reachable once the
+        // group's startup scan has already run, which always establishes
+        // DAG history first (`ensure_initial_change_history`) -- so
+        // `has_dag_history` must be `true` here to match production, not
+        // an artifact of an otherwise-empty test fixture. Without this,
+        // `reconcile_disk_with_ignore` takes its OTHER, non-chunked commit
+        // path (`upsert_files_batch`, the true first-scan-of-a-brand-new-
+        // link case), which has no per-chunk pre-commit re-verification
+        // to exercise at all. Going through `process_event` (rather than
+        // a direct `upsert_file`) is also what gives this row a real,
+        // schema-required `authoring_change_hash` -- a DAG-backed current
+        // row with none is rejected outright once the group has any
+        // history at all (`files_require_authoring_identity_on_insert`).
+        let content = b"real content, written only after the hold clears".to_vec();
+        std::fs::write(root.join(TOCTOU_PATH), &content).unwrap();
+        processor
+            .process_event(
+                TOCTOU_GROUP,
+                &root,
+                &FsChangeEvent {
+                    path: root.join(TOCTOU_PATH),
+                    kind: FsChangeKind::CreatedOrModified,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            state.sqlite().dag_group_heads(TOCTOU_GROUP).unwrap().len(),
+            1,
+            "sanity: TOCTOU_PATH's own creation must have established exactly one DAG head"
+        );
+        // Now remove the just-indexed content -- everything below mutates
+        // ONLY `materialization_state`/`held_reason`/`held_since_unix_
+        // nanos` (never `state`/`version_seq`/`authoring_change_hash`, the
+        // columns the trigger above actually watches), so the row's valid
+        // authoring identity from the real edit just above survives
+        // untouched.
+        std::fs::remove_file(root.join(TOCTOU_PATH)).unwrap();
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        // `hold_record`'s own established shape: `Placeholder`, held, and
+        // (deliberately) nothing written under this exact name yet, no
+        // intent, no obligation -- the row this whole investigation's bug
+        // family is about.
+        state
+            .materialization_state_repository()
+            .set_materialization_state(
+                TOCTOU_GROUP,
+                TOCTOU_PATH,
+                MaterializationState::Placeholder,
+                &permit,
+            )
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_held(TOCTOU_GROUP, TOCTOU_PATH, "case_collision", 0)
+            .unwrap();
+        // `process_event`'s own real local emission (above) bumped a
+        // projection obligation for this exact path, same as any other
+        // local emission -- see `bump_projection_obligations_for_touched_
+        // paths`'s own callers. Left unsettled, `has_unsettled_projection_
+        // obligation` alone would already exclude every candidate this
+        // whole fixture exists to test, for a reason unrelated to what
+        // each test actually means to exercise (held vs. cleared).
+        // `hold_record` itself settles this as part of its own real
+        // operation (see `HazardHeld` settlement's own doc elsewhere in
+        // this codebase); this fixture reproduces that same end state
+        // directly, matching `NonExactProofKind::Placeholder`'s own
+        // precondition (this row's `materialization_state` genuinely is
+        // `Placeholder` at this point).
+        let obligation = state
+            .sqlite()
+            .dag_lookup_projection_obligation(TOCTOU_GROUP, TOCTOU_PATH)
+            .unwrap()
+            .expect("sanity: the real local emission above must have bumped an obligation");
+        assert!(
+            state
+                .sqlite()
+                .dag_complete_obligation_if_non_exact_proof_current(
+                    TOCTOU_GROUP,
+                    TOCTOU_PATH,
+                    obligation.invalidation_generation,
+                    obligation.obligation_incarnation,
+                    yadorilink_sync_sqlite::projection_obligations::NonExactProofKind::Placeholder,
+                )
+                .unwrap(),
+            "sanity: settling the obligation against this row's genuine Placeholder state must \
+             succeed"
+        );
+        assert!(
+            state.sqlite().dag_lookup_projection_obligation(TOCTOU_GROUP, TOCTOU_PATH).unwrap().is_none(),
+            "sanity: the obligation must be gone once settled"
+        );
+        assert!(
+            !root.join(TOCTOU_PATH).exists(),
+            "sanity: nothing must be on disk under this exact name while held"
+        );
+
+        let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+        (processor, state, root, ignore_set, store_dir, root_dir, content)
+    }
+
+    /// FIX ASSERTED (the CANDIDACY-time half -- see the sibling test
+    /// below for the SEPARATE pre-commit-window half): the reviewer's own
+    /// probe scenario. A path starts hazard-held (matching `hold_record`'s
+    /// shape exactly: `Placeholder`, `held_reason` set, nothing on disk,
+    /// no intent, no obligation). A live rescan's tombstone-candidate loop
+    /// reaches this path; the scan is paused right at LOOP ENTRY for this
+    /// path -- BEFORE `recheck_tombstone_candidate` runs at all (this
+    /// test's stand-in for the loop simply not having gotten to this path
+    /// yet, on a real multi-second walk) -- via `fire_pre_tombstone_
+    /// recheck`. While paused, a concurrent task completes the held-to-
+    /// materialize transition exactly the way a real `materialize`/
+    /// `hydrate_file_with_timeout` success does: `clear_held`, write the
+    /// real content under this exact name, stamp `Hydrated`. Resuming the
+    /// scan must NOT tombstone this path: `recheck_tombstone_candidate`
+    /// only ever runs AFTER the hook releases it, so it reads the
+    /// already-fresh, post-transition state directly -- proving the
+    /// candidacy-time check itself is correct, not that a candidate which
+    /// legitimately passed it earlier stays protected all the way to its
+    /// own chunk's commit (that is what the sibling test below proves).
+    #[tokio::test]
+    async fn live_rescan_does_not_tombstone_a_path_that_completed_materializing_during_the_walk() {
+        let (processor, state, root, ignore_set, _store_dir, _root_dir, content) =
+            build_toctou_fixture().await;
+
+        let snapshot_read = Arc::new(Latch::new());
+        let release_scan = Arc::new(Latch::new());
+        {
+            let snapshot_read = snapshot_read.clone();
+            let release_scan = release_scan.clone();
+            scan_test_hooks::set_pre_tombstone_recheck_hook(Some(Arc::new(
+                move |gid: &str, path: &str| {
+                    if gid != TOCTOU_GROUP || path != TOCTOU_PATH {
+                        return;
+                    }
+                    snapshot_read.raise();
+                    release_scan.wait();
+                },
+            )));
+        }
+
+        let scan_root = root.clone();
+        let scan_handle = std::thread::spawn(move || {
+            processor.scan_existing_files_with_ignore(TOCTOU_GROUP, &scan_root, &ignore_set)
+        });
+
+        if !snapshot_read.wait_timeout(std::time::Duration::from_secs(10)) {
+            let outcome = if scan_handle.is_finished() {
+                format!("scan thread already finished: {:?}", scan_handle.join())
+            } else {
+                "scan thread is still running".to_string()
+            };
+            panic!("scan never reached its pre-tombstone-recheck hook within 10s: {outcome}");
+        }
+
+        // Complete the held-to-materialize transition while the scan is
+        // paused exactly at this path's candidacy check -- the identical
+        // end state `materialize`'s on-demand-receive branch or
+        // `hydrate_file_with_timeout_locked`'s own success path leaves,
+        // driven directly here (rather than through the real production
+        // function, which lives in a different crate this one cannot
+        // depend on) since only the END STATE matters for this scan's own
+        // re-check, not which caller produced it.
+        let materialize_root = root.clone();
+        let materialize_state = state.clone();
+        let materialize_content = content.clone();
+        let materialize_task = tokio::task::spawn_blocking(move || {
+            std::fs::write(materialize_root.join(TOCTOU_PATH), &materialize_content).unwrap();
+            materialize_state.materialization_state_repository().clear_held(TOCTOU_GROUP, TOCTOU_PATH).unwrap();
+            materialize_state
+                .materialization_state_repository()
+                .set_materialization_state(
+                    TOCTOU_GROUP,
+                    TOCTOU_PATH,
+                    MaterializationState::Hydrated,
+                    &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+                )
+                .unwrap();
+        });
+        materialize_task.await.unwrap();
+        assert!(
+            state
+                .materialization_state_repository()
+                .get_held_state(TOCTOU_GROUP, TOCTOU_PATH)
+                .unwrap()
+                .is_none(),
+            "sanity: the transition must have genuinely cleared the hold before the scan resumes"
+        );
+
+        release_scan.raise();
+        let records = scan_handle.join().unwrap().unwrap();
+
+        assert!(
+            !records.iter().any(|r| r.path == TOCTOU_PATH && r.deleted),
+            "a path that finished materializing DURING the scan's walk must never be \
+             tombstoned, even though every check read at this path's loop-entry time (before \
+             the transition completed) would have said 'genuinely missing, fully unprotected': \
+             {records:?}"
+        );
+        let indexed =
+            state.file_index_repository().get_file(TOCTOU_GROUP, TOCTOU_PATH).unwrap().unwrap();
+        assert!(!indexed.deleted, "the index row itself must not have been tombstoned either");
+    }
+
+    /// FIX ASSERTED (the PRE-COMMIT-WINDOW half -- the sibling test above
+    /// proves the candidacy-time check itself is correct; this proves the
+    /// window a review found the candidacy-time check ALONE could not
+    /// close is closed too). The hold is cleared BEFORE the scan even
+    /// starts, so this path legitimately passes its candidacy-time
+    /// `recheck_tombstone_candidate` call (nothing protects it, and
+    /// nothing is on disk yet) and is added to `records` as a genuine
+    /// tombstone candidate -- the candidacy-time guard from that check is
+    /// dropped at the end of that loop iteration, long before this exact
+    /// path's own chunk actually commits. The scan is then paused a
+    /// SECOND time, at the FINAL pre-commit re-check
+    /// (`fire_pre_chunk_commit_recheck`, distinct from the candidacy-time
+    /// hook the sibling test uses) -- exactly the window between
+    /// "candidate accepted" and "chunk committed" that used to have no
+    /// re-verification, and no lock held across it, at all. While paused
+    /// there, a concurrent task completes a legitimate materialization
+    /// (real content lands under this exact name). Resuming must not
+    /// tombstone the path: the final re-check's own guard is held all the
+    /// way through this chunk's actual commit, so nothing can race it a
+    /// second time.
+    #[tokio::test]
+    async fn live_rescan_does_not_tombstone_a_path_materialized_between_its_candidacy_check_and_its_own_chunk_commit(
+    ) {
+        let (processor, state, root, ignore_set, _store_dir, _root_dir, content) =
+            build_toctou_fixture().await;
+        // Cleared before the scan even starts: this path must legitimately
+        // pass its candidacy-time check (nothing protects it, nothing on
+        // disk) rather than being excluded there the way the sibling
+        // test's still-held row is -- the whole point of this test is the
+        // window AFTER that acceptance, not a race with the acceptance
+        // itself.
+        state.materialization_state_repository().clear_held(TOCTOU_GROUP, TOCTOU_PATH).unwrap();
+
+        let snapshot_read = Arc::new(Latch::new());
+        let release_scan = Arc::new(Latch::new());
+        {
+            let snapshot_read = snapshot_read.clone();
+            let release_scan = release_scan.clone();
+            scan_test_hooks::set_pre_chunk_commit_recheck_hook(Some(Arc::new(
+                move |gid: &str, path: &str| {
+                    if gid != TOCTOU_GROUP || path != TOCTOU_PATH {
+                        return;
+                    }
+                    snapshot_read.raise();
+                    release_scan.wait();
+                },
+            )));
+        }
+
+        let scan_root = root.clone();
+        let scan_handle = std::thread::spawn(move || {
+            processor.scan_existing_files_with_ignore(TOCTOU_GROUP, &scan_root, &ignore_set)
+        });
+
+        if !snapshot_read.wait_timeout(std::time::Duration::from_secs(10)) {
+            let outcome = if scan_handle.is_finished() {
+                format!("scan thread already finished: {:?}", scan_handle.join())
+            } else {
+                "scan thread is still running".to_string()
+            };
+            panic!("scan never reached its pre-chunk-commit-recheck hook within 10s: {outcome}");
+        }
+
+        // Complete a legitimate materialization while the scan is paused
+        // exactly between this path's candidacy acceptance and its own
+        // chunk's actual commit -- the window that has no lock held
+        // across it without this round's fix.
+        let materialize_root = root.clone();
+        let materialize_state = state.clone();
+        let materialize_content = content.clone();
+        let materialize_task = tokio::task::spawn_blocking(move || {
+            std::fs::write(materialize_root.join(TOCTOU_PATH), &materialize_content).unwrap();
+            materialize_state
+                .materialization_state_repository()
+                .set_materialization_state(
+                    TOCTOU_GROUP,
+                    TOCTOU_PATH,
+                    MaterializationState::Hydrated,
+                    &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+                )
+                .unwrap();
+        });
+        materialize_task.await.unwrap();
+
+        release_scan.raise();
+        let records = scan_handle.join().unwrap().unwrap();
+        scan_test_hooks::set_pre_chunk_commit_recheck_hook(None);
+
+        assert!(
+            !records.iter().any(|r| r.path == TOCTOU_PATH && r.deleted),
+            "a path materialized between its own candidacy acceptance and its chunk's actual \
+             commit must never be tombstoned -- the candidacy-time check alone already passed \
+             it (correctly, at the time): {records:?}"
+        );
+        let indexed =
+            state.file_index_repository().get_file(TOCTOU_GROUP, TOCTOU_PATH).unwrap().unwrap();
+        assert!(!indexed.deleted, "the index row itself must not have been tombstoned either");
     }
 
     /// `process_event` canonicalizes `root` internally (see its doc
@@ -5675,6 +6399,98 @@ mod tests {
         assert!(!indexed.deleted, "the index row must be left intact for repair to reconstruct");
     }
 
+    /// A hazard-held path -- `hold_record`'s established shape: `Placeholder`,
+    /// `held_reason` set, nothing written under this exact name, no
+    /// materialization intent ever opened, and (simulating the settled state
+    /// `HazardHeld` completion leaves behind) no projection obligation either
+    /// -- must never be tombstoned by a Full rescan just because it is absent
+    /// from disk under that name. It is this device's own deliberate,
+    /// per-device refusal to materialize a name that collides with something
+    /// else, not a deletion, and the file stays valid and present on every
+    /// other peer. Before the `is_held` check, this scenario had NEITHER of
+    /// the two existing veto signals (no intent, no obligation) and would
+    /// have been silently tombstoned.
+    #[test]
+    fn a_hazard_held_path_is_not_tombstoned_by_a_full_rescan() {
+        let (proc, state, _store_dir, root_dir) = processor();
+        let root = canonical_root(&root_dir);
+        adopt_root(&state, "group-1", &root);
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        state
+            .file_index_repository()
+            .upsert_file(
+                "group-1",
+                &FileRecord {
+                    path: "CON.txt".into(),
+                    size: 0,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![],
+                    deleted: false,
+                },
+                &permit,
+            )
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state("group-1", "CON.txt", MaterializationState::Placeholder, &permit)
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_held("group-1", "CON.txt", "invalid_name", 0)
+            .unwrap();
+        // Deliberately no intent and no seeded projection obligation --
+        // exactly the state a settled `HazardHeld` completion (which deletes
+        // the obligation row) leaves a held path in.
+
+        let records = proc.scan_existing_files("group-1", &root).unwrap();
+
+        assert!(
+            !records.iter().any(|r| r.path == "CON.txt" && r.deleted),
+            "a hazard-held path must never be tombstoned by a full rescan: {records:?}"
+        );
+        let indexed =
+            state.file_index_repository().get_file("group-1", "CON.txt").unwrap().unwrap();
+        assert!(!indexed.deleted, "the held row's index must be left intact");
+    }
+
+    /// The inverse of the test above, in the missed-delete direction: a
+    /// row that is genuinely, currently `Hydrated` (a later, successful
+    /// materialize really did write real content and stamp it) but still
+    /// carries a STALE `held_reason` -- `clear_held`/`set_materialization_
+    /// state` are separate calls, not one atomic operation, so a crash (or
+    /// simply an as-yet-unrun hazard recheck) between them can leave this
+    /// exact combination -- must still be tombstoned like any other
+    /// genuine offline deletion. `is_held` alone would suppress this
+    /// forever; the row's own current, real `materialization_state` is
+    /// what actually decides whether it needs this scan's protection.
+    #[test]
+    fn a_stale_held_reason_on_a_genuinely_hydrated_row_does_not_suppress_a_real_delete() {
+        let (proc, state, _store_dir, root_dir) = processor();
+        let root = canonical_root(&root_dir);
+        adopt_root(&state, "group-1", &root);
+        index_hydrated_missing_file(&state, "group-1", "stale-hold.txt");
+        state
+            .materialization_state_repository()
+            .set_held("group-1", "stale-hold.txt", "invalid_name", 0)
+            .unwrap();
+        // No intent, no obligation -- same as the genuine-offline-deletion
+        // sibling test below; the only difference from the "must NOT
+        // tombstone" test above is that this row is `Hydrated`, not
+        // `Placeholder` (via `index_hydrated_missing_file`), with a stale
+        // `held_reason` left over from some earlier, now-irrelevant hold.
+
+        let records = proc.scan_existing_files("group-1", &root).unwrap();
+
+        assert!(
+            records.iter().any(|r| r.path == "stale-hold.txt" && r.deleted),
+            "a genuinely Hydrated row's real deletion must not be suppressed forever by a \
+             stale held_reason left over from an earlier, now-irrelevant hold: {records:?}"
+        );
+        let indexed =
+            state.file_index_repository().get_file("group-1", "stale-hold.txt").unwrap().unwrap();
+        assert!(indexed.deleted, "the genuine offline deletion must be recorded as a tombstone");
+    }
+
     /// The behavior that MUST be preserved alongside the fix: a file that was
     /// cleanly materialized (no lingering intent) and then deleted or renamed
     /// away while the daemon was stopped is a genuine offline deletion. The
@@ -6194,6 +7010,21 @@ mod tests {
             state.dirty_path_repository().list_dirty_paths(group).unwrap().is_empty(),
             "every successfully batch-committed path's dirty-journal row must clear"
         );
+        // `commit_local_mutations_batch`'s Upsert arm is the production hot
+        // path for exactly this shape of local edit -- an ordinary,
+        // non-symlink create/modify flush. Its `stamp_hydrated_after_local_
+        // emission_in_tx` call is what earns `Hydrated` here; deleting that
+        // call would leave every one of these rows on the schema's own
+        // `Placeholder` default despite genuinely matching disk.
+        for i in 0..N {
+            let path = format!("f-{i:02}.txt");
+            assert_eq!(
+                state.materialization_state_repository().get_materialization_state(group, &path).unwrap(),
+                Some(MaterializationState::Hydrated),
+                "a batch-committed local edit must be stamped Hydrated, not left on the \
+                 schema's own Placeholder default"
+            );
+        }
 
         let heads = state.sqlite().dag_group_heads(group).unwrap();
         assert_eq!(
@@ -6734,8 +7565,10 @@ mod tests {
             (root.join("scratch.tmp"), FsChangeKind::CreatedOrModified, 0),
             (root.join(".yadorilinkignore"), FsChangeKind::CreatedOrModified, 0),
         ]);
-        let outcome =
-            proc.process_flush_with_ignore("group-1", &root, flush, &ignore_set).await.unwrap();
+        let outcome = proc
+            .process_flush_with_ignore("group-1", &root, flush, &ignore_set, true)
+            .await
+            .unwrap();
 
         assert_eq!(outcome.records.len(), 1);
         assert_eq!(outcome.records[0].path, "keep.txt");
@@ -6757,6 +7590,13 @@ mod tests {
     async fn process_flush_burst_fallback_runs_full_scan() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
+        // `RescanRequired` now goes through `verified_root_of_established_
+        // link` (`VerifiedRoot::verify`), not the one-time-scan `verified_
+        // root` (`VerifiedRoot::open`, which could adopt lazily) -- a real
+        // link always adopts its root during the initial scan, before any
+        // live flush (including a `RescanRequired` one) can ever reach this
+        // path, so this fixture must model that ordering too.
+        adopt_root(&state, "group-1", &root);
         std::fs::write(root.join("a.txt"), b"aaa").unwrap();
         std::fs::write(root.join("b.txt"), b"bbb").unwrap();
         std::fs::write(root.join("c.txt"), b"ccc").unwrap();
@@ -6774,6 +7614,61 @@ mod tests {
         paths.sort();
         assert_eq!(paths, vec!["a.txt", "b.txt", "c.txt"]);
         assert_eq!(state.file_index_repository().list_files("group-1").unwrap().len(), 3);
+    }
+
+    /// `process_flush_with_ignore`'s `RescanRequired` arm must forward its
+    /// caller-supplied `emit_tombstones` gate to the scan, not silently
+    /// re-harden it to `true`. Every other test exercising the gate goes
+    /// through `scan_existing_files_with_ignore_gated[_for_established_link]`
+    /// directly; this is the only one that drives it through the actual
+    /// public entry point real callers use (see `yadorilink-daemon`'s
+    /// executor task), so nothing else would catch a future refactor that
+    /// re-hardcodes `emit_tombstones: true` at this arm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_flush_rescan_required_forwards_a_false_emit_tombstones_gate() {
+        let (proc, state, _store_dir, root_dir) = processor();
+        let root = canonical_root(&root_dir);
+        adopt_root(&state, "group-1", &root);
+        let file_path = root.join("report.txt");
+        std::fs::write(&file_path, b"version one").unwrap();
+        proc.process_flush(
+            "group-1",
+            &root,
+            yadorilink_filesystem_sync::debounce::DebounceFlush::Paths(vec![(
+                file_path.clone(),
+                FsChangeKind::CreatedOrModified,
+                0,
+            )]),
+        )
+        .await
+        .unwrap();
+        assert!(state.file_index_repository().get_file("group-1", "report.txt").unwrap().is_some());
+
+        // Removed "offline" (no daemon in between); a plain RescanRequired
+        // scan with the gate left on would tombstone this immediately.
+        std::fs::remove_file(&file_path).unwrap();
+        let ignore_set = EffectiveIgnoreSet::load_for_link_root(&root).unwrap();
+        let outcome = proc
+            .process_flush_with_ignore(
+                "group-1",
+                &root,
+                yadorilink_filesystem_sync::debounce::DebounceFlush::RescanRequired,
+                &ignore_set,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !outcome.records.iter().any(|r| r.path == "report.txt" && r.deleted),
+            "a false emit_tombstones gate must suppress the RescanRequired scan's missing-file \
+             tombstone -- if this ever fails, the RescanRequired arm has stopped forwarding its \
+             caller-supplied gate: {:?}",
+            outcome.records
+        );
+        let indexed =
+            state.file_index_repository().get_file("group-1", "report.txt").unwrap().unwrap();
+        assert!(!indexed.deleted, "the index row itself must not have been tombstoned either");
     }
 
     /// self-echo
@@ -6881,6 +7776,10 @@ mod tests {
     async fn watcher_overflow_recovers_to_a_fully_correct_index_via_full_rescan() {
         let (proc, state, _store_dir, root_dir) = processor();
         let root = canonical_root(&root_dir);
+        // See `process_flush_burst_fallback_runs_full_scan`'s identical
+        // comment: `RescanRequired` now re-verifies an already-adopted
+        // root rather than adopting lazily.
+        adopt_root(&state, "group-1", &root);
         let proc = Arc::new(proc);
 
         // These files exist on disk, but no event for any of them is

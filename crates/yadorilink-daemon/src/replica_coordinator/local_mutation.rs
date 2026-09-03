@@ -100,6 +100,18 @@ impl LocalMutationStore for ReplicaCoordinator {
         self.materialization_state_repository().get_materialization_state(group_id, path)
     }
 
+    fn set_materialization_state(
+        &self,
+        group_id: &str,
+        path: &str,
+        state: MaterializationState,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), SyncSqliteError> {
+        self.materialization_state_repository().set_materialization_state(
+            group_id, path, state, permit,
+        )
+    }
+
     fn list_placeholder_generations(
         &self,
         group_id: &str,
@@ -165,6 +177,10 @@ impl LocalMutationStore for ReplicaCoordinator {
         // deletion -- any row at all (pending or the parked
         // `ignore_blocked`) means the path is still being placed locally.
         Ok(self.sqlite().dag_lookup_projection_obligation(group_id, path)?.is_some())
+    }
+
+    fn is_held(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError> {
+        Ok(self.materialization_state_repository().get_held_state(group_id, path)?.is_some())
     }
 
     fn get_record_kind(

@@ -11,7 +11,12 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
 [features]
 # Exposes test-only helpers to OTHER crates' test builds -- mirrors
 # yadorilink-sync-core's own identical test-support feature.
-test-support = ["yadorilink-root-authority/test-support"]
+# `yadorilink-local-storage/test-support` forward: this crate's own
+# tests need `create_or_defer_placeholder`'s Windows-deferred-outcome
+# failure-injection seam (`set_test_force_deferred_placeholder`) to
+# exercise the Windows-only branch of its own placeholder-arm callers on
+# any host.
+test-support = ["yadorilink-root-authority/test-support", "yadorilink-local-storage/test-support"]
 
 [dependencies]
 yadorilink-transport = { path = "../yadorilink-transport" }

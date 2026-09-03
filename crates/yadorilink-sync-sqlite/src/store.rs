@@ -508,6 +508,28 @@ impl SqliteSyncStore {
         })
     }
 
+    /// Test-facing delegate for
+    /// [`crate::projection_obligations::bump_projection_obligations_for_touched_paths`]
+    /// -- production admission reaches that free function directly (this
+    /// wrapper is for callers outside this crate, e.g. an integration test
+    /// that needs a path to have an outstanding, "not yet settled"
+    /// obligation without driving a full signed `Change` admission).
+    pub fn dag_bump_projection_obligations_for_touched_paths(
+        &self,
+        group_id: &str,
+        touched_paths: &[&str],
+        now_unix_nanos: i64,
+    ) -> Result<(), SyncSqliteError> {
+        self.database.write_immediate::<_, SyncSqliteError>(|tx| {
+            crate::projection_obligations::bump_projection_obligations_for_touched_paths(
+                tx,
+                group_id,
+                touched_paths,
+                now_unix_nanos,
+            )
+        })
+    }
+
     /// Test-facing and scheduler-facing delegate for the
     /// `projection_obligations` claim mechanism. A plain read, exactly like
     /// [`crate::projection_obligations::claim_runnable_obligations`] itself

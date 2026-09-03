@@ -11,6 +11,18 @@ license.workspace = true
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
 
+[features]
+# Exposes `materialize_write::set_test_force_deferred_placeholder`
+# (normally `#[cfg(test)]`-only) to OTHER crates' test builds --
+# `create_or_defer_placeholder`'s Windows-deferred branch is otherwise
+# unreachable in a test built on a non-Windows host, so any consumer
+# whose own tests need to exercise that branch's caller-side handling
+# (e.g. `yadorilink-peer-session`, `yadorilink-filesystem-sync`) needs
+# this, since `cfg(test)` alone is not active for an ordinary dependency
+# of another crate's own test build. Same shape as every other
+# test-support feature in this workspace.
+test-support = []
+
 [dependencies]
 yadorilink-replica-domain = { path = "../yadorilink-replica-domain" }
 # `fs_identity::bytes_to_target` for symlink-target byte<->OS-path

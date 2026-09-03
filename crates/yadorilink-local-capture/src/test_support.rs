@@ -169,6 +169,18 @@ impl LocalMutationStore for TestReplica {
         self.materialization_state_repository().get_materialization_state(group_id, path)
     }
 
+    fn set_materialization_state(
+        &self,
+        group_id: &str,
+        path: &str,
+        state: MaterializationState,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), SyncSqliteError> {
+        self.materialization_state_repository().set_materialization_state(
+            group_id, path, state, permit,
+        )
+    }
+
     fn list_placeholder_generations(
         &self,
         group_id: &str,
@@ -212,6 +224,11 @@ impl LocalMutationStore for TestReplica {
     ) -> Result<bool, SyncSqliteError> {
         // Kept a verbatim copy of `ReplicaCoordinator`'s own impl.
         Ok(self.sqlite().dag_lookup_projection_obligation(group_id, path)?.is_some())
+    }
+
+    fn is_held(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError> {
+        // Kept a verbatim copy of `ReplicaCoordinator`'s own impl.
+        Ok(self.materialization_state_repository().get_held_state(group_id, path)?.is_some())
     }
 
     fn get_record_kind(

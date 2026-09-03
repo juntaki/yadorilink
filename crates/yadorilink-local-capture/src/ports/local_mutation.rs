@@ -79,6 +79,21 @@ pub trait LocalMutationStore: Send + Sync {
         path: &str,
     ) -> Result<Option<MaterializationState>, SyncSqliteError>;
 
+    /// Explicitly stamps `path`'s materialization state -- needed by
+    /// `process_event`'s no-signing-key-provisioned local capture path,
+    /// which upserts through the generic (non-DAG-emitting)
+    /// `upsert_file_with_origin` below rather than a local-emission-only
+    /// upsert function, so it cannot rely on either the schema's own safe
+    /// default or an emission-scoped helper to record that this device's
+    /// own freshly-read disk content is genuinely `Hydrated`.
+    fn set_materialization_state(
+        &self,
+        group_id: &str,
+        path: &str,
+        state: MaterializationState,
+        permit: &RootCommitPermit<'_>,
+    ) -> Result<(), SyncSqliteError>;
+
     fn has_materialization_intent(
         &self,
         group_id: &str,
@@ -105,6 +120,20 @@ pub trait LocalMutationStore: Send + Sync {
         group_id: &str,
         path: &str,
     ) -> Result<bool, SyncSqliteError>;
+
+    /// Whether `(group_id, path)`'s current row is hazard-held right now
+    /// (`held_reason` set -- a case-fold/reserved-name/other on-disk-name
+    /// collision `hold_record` recorded, per that function's own doc
+    /// comment). A held row is `Placeholder`, has nothing written under
+    /// this exact name, and opens no materialization intent -- by design,
+    /// per `hold_record`'s own fix -- so neither `has_materialization_
+    /// intent` nor (once `HazardHeld` settlement deletes the path's
+    /// projection-obligation row) `has_unsettled_projection_obligation`
+    /// protects it from being misread as an offline deletion. A held path
+    /// is emphatically not deleted: it is this device's own, deliberate,
+    /// per-device refusal to materialize under a name that collides with
+    /// something else, and it stays valid and present on every other peer.
+    fn is_held(&self, group_id: &str, path: &str) -> Result<bool, SyncSqliteError>;
 
     /// Bulk placeholder-identity lookup for a whole group -- used by
     /// `scan_existing_files` for the same reason as

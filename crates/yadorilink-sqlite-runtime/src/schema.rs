@@ -178,7 +178,52 @@ use crate::error::DatabaseError;
 /// from a v23 database, but this codebase's own stated no-compat-path
 /// policy (see this function's own doc comment) applies uniformly to
 /// every version bump, not case-by-case.
-pub const SCHEMA_VERSION: i32 = 24;
+/// Version 25 changes `files.materialization_state`'s default from
+/// `'hydrated'` to `'placeholder'`. `'hydrated'` claims "this path's
+/// exact desired content is genuinely present on disk" -- the strongest,
+/// most trusted state in the system, read by hydration/eviction/repair as
+/// license to skip re-verifying content that is assumed already correct.
+/// A schema-level column default fires on any `INSERT` that omits the
+/// column, silently manufacturing that trusted claim with zero evidence
+/// backing it. Across three review rounds this was the single structural
+/// root cause of a whole family of routes that each independently could
+/// leave a row `Hydrated` with nothing physically on disk (`hold_record`,
+/// `apply_locked_record`'s Equal-arm symlink branch, `restore_to_
+/// version_inner`, the `apply_incoming_wire_metadata` bootstrap scaffold,
+/// `quarantine_dirty_disk_file`) -- each is a different code path hitting
+/// the same dangerous default, not a family of unrelated bugs. `'placeholder'`
+/// is already this system's ordinary "needs materialization, nothing
+/// promised about disk yet" state throughout hydration/eviction/repair,
+/// so an `INSERT` that forgets to set this column now fails safe into a
+/// state every reader already expects to re-verify or (re)materialize,
+/// instead of one every reader trusts outright.
+///
+/// This closes the class for every FUTURE row this build creates, but a
+/// changed column default has no retroactive effect on rows an older
+/// binary already wrote -- an existing on-disk database can already hold
+/// `Hydrated` rows with no real backing content, written by exactly the
+/// routes above before their own direct fixes landed. There is no honest
+/// query-level backfill for those: distinguishing a already-dangerous row
+/// from a genuinely, correctly `Hydrated` one requires walking the real
+/// filesystem against each group's `VerifiedRoot`, which this connection-
+/// only migration function has no access to and must not attempt blind.
+/// Same no-compat-path policy as every version above closes that gap
+/// instead: an older database is refused at open, and a fresh re-import
+/// rebuilds every row from scratch through the ordinary materialize/
+/// hydrate pipeline, which only ever sets `Hydrated` after real content
+/// is confirmed on disk -- never through this column default.
+///
+/// "A fresh re-import is lossless" does not fully hold for an On-Demand-
+/// policy link: not every file's real content is guaranteed to still be
+/// present on THIS device (that is the whole point of On-Demand), so a
+/// disk-only re-walk cannot, by itself, recover a `Placeholder` row's
+/// desired content the way it can for an Eager link that has everything
+/// locally. This is a pre-existing limitation of the no-compat-path
+/// refuse-and-reimport recovery this version relies on, shared by every
+/// prior version bump that also documents refusing an old database as its
+/// own recovery story -- not something v25 introduces or worsens -- and is
+/// not otherwise fixed by anything in this commit.
+pub const SCHEMA_VERSION: i32 = 25;
 
 /// Reads `PRAGMA user_version` and
 /// errors if it's newer than this binary's [`SCHEMA_VERSION`] — an older
@@ -197,7 +242,19 @@ pub const SCHEMA_VERSION: i32 = 24;
 /// version stamp reports `0` — `interrupted_migration_recovers_on_restart`
 /// pins that recovery path — and the idempotent schema statements complete
 /// it safely.
-fn check_schema_version_supported(conn: &Connection) -> Result<(), DatabaseError> {
+///
+/// `pub(crate)`, not just called from `init_schema`: `crate::database::
+/// SyncDatabase::open`/`open_in_memory` also call this directly, before
+/// ever invoking the caller-supplied `schema_init` closure. `init_schema`
+/// is only ever reached THROUGH that closure (every real caller's closure
+/// calls it as one of potentially several steps this crate never inspects
+/// or sequences -- see `SyncDatabase::open`'s own doc comment), so a
+/// hypothetical future closure that omits the call to `init_schema`
+/// entirely would otherwise open a stale or too-new database with zero
+/// version protection. Calling this a second time, from `init_schema`
+/// itself once the closure does reach it, is a harmless, cheap re-read of
+/// the same pragma — not a behavior change for any existing caller.
+pub(crate) fn check_schema_version_supported(conn: &Connection) -> Result<(), DatabaseError> {
     let on_disk_version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if on_disk_version > SCHEMA_VERSION {
         return Err(DatabaseError::UnsupportedSchemaDowngrade {
@@ -569,11 +626,17 @@ pub fn init_schema(conn: &Connection) -> Result<(), DatabaseError> {
     // EXISTS` above is a no-op against a database from before these
     // columns existed, so add them explicitly, ignoring the
     // "duplicate column" error on a database that already has them.
-    // Existing rows default to `hydrated`/`eager` — every file and
-    // link already on disk before this change keeps behaving exactly
-    // as it did — no rollback concerns for this migration.
+    // `materialization_policy` defaults to `eager` — every link already
+    // on disk before this change keeps behaving exactly as it did, no
+    // rollback concerns for this migration. `materialization_state`
+    // defaults to `placeholder`, not `hydrated` -- see [`SCHEMA_VERSION`]
+    // v25's own doc comment for why; this statement only ever actually
+    // runs against a brand-new database or a v0 one that crashed before
+    // completing its first-ever schema init (the no-compat-path version
+    // gate above refuses every other pre-v25 database at open), so there
+    // is no "existing row's behavior" to preserve here regardless.
     for stmt in [
-        "ALTER TABLE files ADD COLUMN materialization_state TEXT NOT NULL DEFAULT 'hydrated'",
+        "ALTER TABLE files ADD COLUMN materialization_state TEXT NOT NULL DEFAULT 'placeholder'",
         "ALTER TABLE files ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE files ADD COLUMN last_accessed_unix INTEGER",
         "ALTER TABLE role_loss_operations ADD COLUMN lease_id TEXT",
@@ -972,7 +1035,7 @@ pub(crate) fn migrate_files_table_widen_primary_key(
     // have, so its rows still get the exact same default value they'd get
     // from the ordinary `ALTER TABLE` loop having run instead.
     const OPTIONAL_COLUMNS: &[(&str, &str)] = &[
-        ("materialization_state", "'hydrated'"),
+        ("materialization_state", "'placeholder'"),
         ("pinned", "0"),
         ("last_accessed_unix", "NULL"),
         ("record_kind", "'file'"),
@@ -1018,7 +1081,7 @@ pub(crate) fn migrate_files_table_widen_primary_key(
             state                   TEXT NOT NULL DEFAULT 'current',
             origin_device_id        TEXT,
             authoring_change_hash   BLOB,
-            materialization_state   TEXT NOT NULL DEFAULT 'hydrated',
+            materialization_state   TEXT NOT NULL DEFAULT 'placeholder',
             pinned                  INTEGER NOT NULL DEFAULT 0,
             last_accessed_unix      INTEGER,
             record_kind             TEXT NOT NULL DEFAULT 'file',
@@ -1109,5 +1172,35 @@ mod tests {
         stub_dag_tables(&conn).expect("stub dag tables");
         init_schema(&conn).expect("first init_schema");
         init_schema(&conn).expect("second init_schema");
+    }
+
+    /// [`SCHEMA_VERSION`] v25's own doc comment: a changed column default
+    /// (`materialization_state`, `'hydrated'` -> `'placeholder'`) has no
+    /// retroactive effect on rows an older binary already wrote, and there
+    /// is no honest query-level backfill for them -- the no-compat-path
+    /// version gate is what actually closes that gap, by refusing to
+    /// reopen (and therefore never trusting) a database stamped by any
+    /// pre-v25 binary. This is the generic mechanism every prior version
+    /// bump in this file already relies on for the identical reason, but
+    /// it had no direct test of its own -- add one now, since this
+    /// specific version bump's whole legacy-row story depends on it
+    /// actually refusing, not just being documented to.
+    #[test]
+    fn a_database_stamped_by_an_older_binary_is_refused_not_silently_reopened() {
+        let conn = Connection::open_in_memory().expect("open");
+        stub_dag_tables(&conn).expect("stub dag tables");
+        init_schema(&conn).expect("init_schema establishes the current version");
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+            .expect("simulate a database an older binary stamped");
+
+        let result = init_schema(&conn);
+
+        assert!(
+            result.is_err(),
+            "a database stamped by an older binary (and therefore possibly holding legacy \
+             `Hydrated`-with-no-content rows this version's new column default cannot \
+             retroactively fix) must be refused at open, not silently reopened and migrated in \
+             place"
+        );
     }
 }
