@@ -20,6 +20,10 @@ use crate::outcomes::{
 use crate::ports::{AdmissionStoreOutcome, DurabilityRoot, ReplicaRetentionPolicy};
 use crate::ReplicaEngineDependencies;
 
+/// `(encoded file versions, their hashes)`, parallel by index -- see
+/// `new_file_versions_for_change`'s own doc comment.
+type NewFileVersions = (Vec<Vec<u8>>, Vec<[u8; 32]>);
+
 /// Domain-level equivalent of `proto::VersionPresentQuery`, holding only the
 /// fields `PeerReplicaEngine::holds_version_durably` actually needs.
 /// `request_id` stays on the caller's side (needed only to build the wire
@@ -108,7 +112,7 @@ impl PeerReplicaEngine {
         group_id: &FolderGroupId,
         encoded_change: &[u8],
         already_carried: &HashSet<[u8; 32]>,
-    ) -> Result<(Vec<Vec<u8>>, Vec<[u8; 32]>), ReplicaEngineError> {
+    ) -> Result<NewFileVersions, ReplicaEngineError> {
         let Ok(change) = Change::from_wire_bytes(encoded_change) else {
             return Ok((Vec::new(), Vec::new()));
         };
