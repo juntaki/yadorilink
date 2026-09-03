@@ -148,6 +148,18 @@ impl MaterializationExecutionPort for ReplicaCoordinator {
             .map_err(SyncError::from)?)
     }
 
+    fn has_unsettled_projection_obligation(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, MaterializationExecutionError> {
+        Ok(self
+            .sqlite()
+            .dag_lookup_projection_obligation(group_id, path)
+            .map_err(SyncError::from)?
+            .is_some())
+    }
+
     fn clear_materialization_intent(
         &self,
         group_id: &str,
@@ -603,7 +615,7 @@ mod tests {
         let content = b"pinned content must never be evicted";
         let record = store_and_record(&store, "a.bin", content);
         let permit = RootCommitPermit::for_tests();
-        state.file_index_repository().upsert_file("group-a", &record, &permit).unwrap();
+        upsert_hydrated_file(&state, "group-a", &record, &permit);
         state.file_index_repository().set_pinned("group-a", "a.bin", true).unwrap();
         std::fs::write(root.path().join("a.bin"), content).unwrap();
 
@@ -661,7 +673,7 @@ mod tests {
         let record = store_and_record(&store, "a.bin", content);
         let hash = hex::encode(&record.blocks[0].hash);
         let permit = RootCommitPermit::for_tests();
-        state.file_index_repository().upsert_file("group-a", &record, &permit).unwrap();
+        upsert_hydrated_file(&state, "group-a", &record, &permit);
         std::fs::write(root.path().join("a.bin"), content).unwrap();
 
         let outcome = evict_file(
@@ -727,7 +739,7 @@ mod tests {
         let record = store_and_record(&store, "a.bin", indexed_content);
         let hash = hex::encode(&record.blocks[0].hash);
         let permit = RootCommitPermit::for_tests();
-        state.file_index_repository().upsert_file("group-a", &record, &permit).unwrap();
+        upsert_hydrated_file(&state, "group-a", &record, &permit);
         // A local edit landed on disk that the index does not know about
         // yet, before this call even begins.
         std::fs::write(root.path().join("a.bin"), b"a locally edited, unindexed replacement")
@@ -932,6 +944,28 @@ mod tests {
     fn adopt_root(state: &ReplicaCoordinator, group_id: &str, root: &Path) {
         state.link_repository().add_link(&root.to_string_lossy(), group_id).unwrap();
         VerifiedRoot::open(root, group_id, state).unwrap();
+    }
+
+    /// Test-only convenience: `upsert_file` alone no longer leaves a fresh
+    /// row `Hydrated` (schema v25 defaults `materialization_state` to
+    /// `Placeholder` instead -- see `SCHEMA_VERSION`'s own doc comment).
+    /// Every test in this module that upserts a record to simulate an
+    /// already-fully-materialized row (the overwhelming majority here --
+    /// this module is about repair/eviction over already-hydrated content)
+    /// must say so explicitly now, the same way production local-emission
+    /// callers do, rather than relying on a column default a genuinely
+    /// unhydrated row must NOT get.
+    fn upsert_hydrated_file(
+        state: &ReplicaCoordinator,
+        group_id: &str,
+        record: &FileRecord,
+        permit: &RootCommitPermit,
+    ) {
+        state.file_index_repository().upsert_file(group_id, record, permit).unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(group_id, &record.path, MaterializationState::Hydrated, permit)
+            .unwrap();
     }
 
     fn store_and_record(store: &FsBlockStore, path: &str, content: &[u8]) -> FileRecord {
@@ -1157,10 +1191,12 @@ mod tests {
 
         let content = b"already written before the crash".to_vec();
         let hash = hex::decode(store.put(&content).unwrap()).unwrap();
-        state
-            .file_index_repository()
-            .upsert_file("group-1", &record_with_blocks("doc.txt", &content, hash), &permit)
-            .unwrap();
+        upsert_hydrated_file(
+            &state,
+            "group-1",
+            &record_with_blocks("doc.txt", &content, hash),
+            &permit,
+        );
         // The rename completed; only the intent's own clear did not.
         std::fs::write(root.path().join("doc.txt"), &content).unwrap();
         state
@@ -1201,10 +1237,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         adopt_root(&state, "group-1", root.path());
         let permit = RootCommitPermit::for_tests();
-        state
-            .file_index_repository()
-            .upsert_file("group-1", &record_with_blocks("doc.txt", content, hash), &permit)
-            .unwrap();
+        upsert_hydrated_file(&state, "group-1", &record_with_blocks("doc.txt", content, hash), &permit);
         state
             .materialization_intent_repository()
             .begin_materialization_intent("group-1", "doc.txt", &[0; 32], &permit)
@@ -1250,7 +1283,7 @@ mod tests {
             blocks: vec![],
             deleted: false,
         };
-        state.file_index_repository().upsert_file("group-1", &record, &permit).unwrap();
+        upsert_hydrated_file(&state, "group-1", &record, &permit);
         state
             .file_index_repository()
             .set_record_kind("group-1", "link.txt", RecordKind::Symlink, &permit)
@@ -1309,7 +1342,7 @@ mod tests {
             blocks: vec![],
             deleted: false,
         };
-        state.file_index_repository().upsert_file("group-1", &record, &permit).unwrap();
+        upsert_hydrated_file(&state, "group-1", &record, &permit);
         state
             .file_index_repository()
             .set_record_kind("group-1", "gone-link.txt", RecordKind::Symlink, &permit)
@@ -1336,6 +1369,90 @@ mod tests {
         assert!(!root.path().join("gone-link.txt").exists());
     }
 
+    /// The generic defense-in-depth fix: a `Hydrated` row that is missing
+    /// on disk, has no open intent, but still has an OUTSTANDING projection
+    /// obligation must not be classified as an offline deletion either --
+    /// the Convergence Engine has not finished deciding this path's fate
+    /// yet (this is the shape of a freshly-admitted row a repair sweep
+    /// happens to run before the first materialize attempt, a hazard-hold
+    /// route that never demoted `materialization_state` itself, or any
+    /// future route with the same gap -- covered generically instead of
+    /// patched per route). Same setup as
+    /// `repair_does_not_resurrect_an_offline_deleted_symlink` immediately
+    /// above, with one addition: a projection-obligation row for the path.
+    #[test]
+    fn repair_does_not_classify_as_offline_deleted_while_a_projection_obligation_is_still_unsettled(
+    ) {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = FsBlockStore::new(store_dir.path()).unwrap();
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-1", root.path());
+        let permit = RootCommitPermit::for_tests();
+        let record = FileRecord {
+            path: "not-yet-placed-link.txt".to_string(),
+            size: 0,
+            mtime_unix_nanos: 0,
+            blocks: vec![],
+            deleted: false,
+        };
+        state.file_index_repository().upsert_file("group-1", &record, &permit).unwrap();
+        state
+            .file_index_repository()
+            .set_record_kind("group-1", "not-yet-placed-link.txt", RecordKind::Symlink, &permit)
+            .unwrap();
+        state
+            .file_index_repository()
+            .set_symlink_target("group-1", "not-yet-placed-link.txt", Some(b"target.txt"))
+            .unwrap();
+        // No intent opened, nothing on disk -- same as the offline-deleted
+        // test above, EXCEPT this path still has an outstanding projection
+        // obligation, simulating "admitted but never yet materialized"
+        // rather than "materialized, then offline-deleted".
+        state
+            .sqlite()
+            .dag_bump_projection_obligations_for_touched_paths(
+                "group-1",
+                &["not-yet-placed-link.txt"],
+                1,
+            )
+            .unwrap();
+
+        let report = repair_interrupted_materializations(
+            &state,
+            &store,
+            root.path(),
+            "group-1",
+            RepairMode::Startup,
+            &permit,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.offline_deleted,
+            Vec::<String>::new(),
+            "a path with an unsettled projection obligation must never be classified as an \
+             offline deletion, even at startup"
+        );
+        // Not just "no tombstone" -- also "not silently resurrected". A
+        // still-unsettled path must be deferred entirely, not reconstructed
+        // either: falling through to reconstruction here would recreate a
+        // symlink that might describe a genuine, still-fresh offline
+        // deletion racing this unrelated obligation. `report.reconstructed`
+        // being empty proves repair took neither side of that decision.
+        assert_eq!(report.reconstructed, Vec::<String>::new());
+        // `Path::exists()` follows symlinks and reports `false` for a
+        // dangling one (this test's `record` names a `symlink_target` that
+        // is never actually created on disk) -- it would read as "doesn't
+        // exist" whether or not repair wrote a symlink here, so it cannot
+        // tell "left alone" apart from "reconstructed". `symlink_metadata`
+        // does not follow the link, so it distinguishes them correctly.
+        assert!(
+            std::fs::symlink_metadata(root.path().join("not-yet-placed-link.txt")).is_err(),
+            "repair must not have written anything at all for a still-unsettled path"
+        );
+    }
+
     /// `RepairMode::Live`'s whole reason to exist: a `Hydrated` record
     /// whose on-disk bytes are present but diverge from the index, with
     /// NO open materialization intent, must NOT be treated the same way
@@ -1354,10 +1471,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         adopt_root(&state, "group-1", root.path());
         let permit = RootCommitPermit::for_tests();
-        state
-            .file_index_repository()
-            .upsert_file("group-1", &record_with_blocks("doc.txt", indexed_content, hash), &permit)
-            .unwrap();
+        upsert_hydrated_file(
+            &state,
+            "group-1",
+            &record_with_blocks("doc.txt", indexed_content, hash),
+            &permit,
+        );
         // No materialization intent opened -- and the on-disk bytes differ
         // from what's indexed, simulating a live user edit that has not
         // yet been captured (no crash, the "daemon" here never stopped).
@@ -1408,10 +1527,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         adopt_root(&state, "group-1", root.path());
         let permit = RootCommitPermit::for_tests();
-        state
-            .file_index_repository()
-            .upsert_file("group-1", &record_with_blocks("doc.txt", indexed_content, hash), &permit)
-            .unwrap();
+        upsert_hydrated_file(
+            &state,
+            "group-1",
+            &record_with_blocks("doc.txt", indexed_content, hash),
+            &permit,
+        );
         let offline_edit_content = b"an edit made while the daemon was stopped";
         std::fs::write(root.path().join("doc.txt"), offline_edit_content).unwrap();
 
@@ -1455,10 +1576,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         adopt_root(&state, "group-1", root.path());
         let permit = RootCommitPermit::for_tests();
-        state
-            .file_index_repository()
-            .upsert_file("group-1", &record_with_blocks("doc.txt", content, hash), &permit)
-            .unwrap();
+        upsert_hydrated_file(&state, "group-1", &record_with_blocks("doc.txt", content, hash), &permit);
         // No intent, and the file simply never existed under `root` here --
         // standing in for "missing right now," the same disk state a live
         // in-progress delete produces.
@@ -1493,14 +1611,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         adopt_root(&state, "group-1", root.path());
         let permit = RootCommitPermit::for_tests();
-        state
-            .file_index_repository()
-            .upsert_file(
-                "group-1",
-                &record_with_blocks("missing.bin", b"not present", vec![0xcd; 32]),
-                &permit,
-            )
-            .unwrap();
+        upsert_hydrated_file(
+            &state,
+            "group-1",
+            &record_with_blocks("missing.bin", b"not present", vec![0xcd; 32]),
+            &permit,
+        );
         state
             .materialization_intent_repository()
             .begin_materialization_intent("group-1", "missing.bin", &[0; 32], &permit)
@@ -1522,6 +1638,70 @@ mod tests {
                 .get_materialization_state("group-1", "missing.bin")
                 .unwrap(),
             Some(MaterializationState::Placeholder)
+        );
+    }
+
+    /// The tenth route in the "current, non-deleted row with nothing on
+    /// disk under its own name and no protecting intent/obligation/hold"
+    /// bug family, at this repair sweep's own missing-blocks placeholder-
+    /// demotion arm: `create_or_defer_placeholder` writes nothing on
+    /// Windows (real creation deferred to `cfapi-host.exe`'s own poll),
+    /// but this arm used to clear the row's protecting intent
+    /// unconditionally, exactly as if a real placeholder write had
+    /// happened. This sweep runs on a live ~90s periodic cadence, so the
+    /// window is not a rare crash race. Uses `create_or_defer_
+    /// placeholder`'s own test-only failure-injection seam (real Windows
+    /// behavior is not exercisable on this host) to force the deferred
+    /// outcome regardless of platform.
+    #[test]
+    fn repair_leaves_the_intent_open_when_the_windows_placeholder_write_is_deferred() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = FsBlockStore::new(store_dir.path()).unwrap();
+        let state = ReplicaCoordinator::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        adopt_root(&state, "group-1", root.path());
+        let permit = RootCommitPermit::for_tests();
+        upsert_hydrated_file(
+            &state,
+            "group-1",
+            &record_with_blocks("missing-deferred.bin", b"not present either", vec![0xce; 32]),
+            &permit,
+        );
+        state
+            .materialization_intent_repository()
+            .begin_materialization_intent("group-1", "missing-deferred.bin", &[0; 32], &permit)
+            .unwrap();
+
+        let out_path = root.path().join("missing-deferred.bin");
+        yadorilink_local_storage::materialize_write::set_test_force_deferred_placeholder_for_path(
+            &out_path, true,
+        );
+        let report = repair_interrupted_materializations(
+            &state,
+            &store,
+            root.path(),
+            "group-1",
+            RepairMode::Startup,
+            &permit,
+        );
+        yadorilink_local_storage::materialize_write::set_test_force_deferred_placeholder_for_path(
+            &out_path, false,
+        );
+        let report = report.unwrap();
+
+        assert_eq!(report.demoted_to_placeholder, vec!["missing-deferred.bin"]);
+        assert!(
+            !root.path().join("missing-deferred.bin").exists(),
+            "sanity: the deferred placeholder write must genuinely be absent"
+        );
+        assert!(
+            state
+                .materialization_intent_repository()
+                .has_materialization_intent("group-1", "missing-deferred.bin")
+                .unwrap(),
+            "a materialization intent must protect this path while its real placeholder \
+             creation is deferred to cfapi-host.exe -- clearing it here removes the only \
+             thing telling the tombstone loop this is not a genuine offline deletion"
         );
     }
 

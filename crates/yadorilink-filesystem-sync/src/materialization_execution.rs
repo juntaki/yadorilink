@@ -287,6 +287,42 @@ pub trait MaterializationExecutionPort: Send + Sync {
         path: &str,
     ) -> Result<bool, MaterializationExecutionError>;
 
+    /// Whether `path` currently has ANY row at all in the projection-
+    /// obligation worklist (any state, including the parked
+    /// `ignore_blocked` state) -- a live, per-path, always-authoritative
+    /// read; never cached or snapshotted.
+    ///
+    /// While a projection obligation exists for a path, an absent local
+    /// file must not yet be interpreted as an offline user deletion: the
+    /// Convergence Engine still considers this path's desired state
+    /// unsettled (freshly admitted, mid-materialize-retry, or otherwise
+    /// not yet placed -- see this method's own callers for the "not yet
+    /// settled, not settled-but-wrong" scope this signal covers, and does
+    /// not). This is a SEPARATE signal from `has_materialization_intent`/
+    /// `list_materialization_intent_paths`: an intent exists only for the
+    /// narrow window of one in-flight physical write, while an obligation
+    /// can be outstanding long before any write is ever attempted (or
+    /// after one that keeps retrying) -- repair must check both, not
+    /// either alone, before concluding a missing-with-no-intent path was
+    /// genuinely deleted.
+    ///
+    /// Deliberately per-path, not a whole-pass snapshot the way
+    /// `list_materialization_intent_paths` is: that shape trades staleness
+    /// risk for cost on the (very common) `outstanding_intents` case,
+    /// which is fine there -- see that method's own doc comment -- because
+    /// its worst case is merely deferring a moot cleanup by one pass. This
+    /// method instead gates the tombstone-vs-reconstruct DECISION itself, on
+    /// only the rare rows that are already `Hydrated`-but-disk-mismatched,
+    /// where a stale miss could let a real, still-unsettled path fall
+    /// through to be wrongly resolved. On that small a candidate set, one
+    /// extra authoritative read per row costs nothing worth trading
+    /// correctness for.
+    fn has_unsettled_projection_obligation(
+        &self,
+        group_id: &str,
+        path: &str,
+    ) -> Result<bool, MaterializationExecutionError>;
+
     /// Every path in `group_id` that currently carries a materialization
     /// intent, as one read.
     ///

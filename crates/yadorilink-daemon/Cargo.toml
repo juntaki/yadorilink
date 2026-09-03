@@ -216,6 +216,13 @@ yadorilink-daemon = { path = ".", features = ["test-support"] }
 # remote lease must NOT authorize physical block deletion, so they need the
 # real `verify_reclaim_custody`, not the bypass.
 yadorilink-filesystem-sync = { path = "../yadorilink-filesystem-sync", features = ["test-support"] }
+# `materialization_execution.rs`'s own tests need `create_or_defer_
+# placeholder`'s Windows-deferred-outcome failure-injection seam
+# (`set_test_force_deferred_placeholder`) to exercise
+# `repair_interrupted_materializations`'s two placeholder-demotion arms'
+# Windows-only handling on any host. Same override shape as the two
+# entries above.
+yadorilink-local-storage = { path = "../yadorilink-local-storage", features = ["test-support"] }
 tempfile = "3"
 rand = "0.10.2"
 # The in-process fake coordination service the full-stack E2E tests point the

@@ -44,8 +44,8 @@ use yadorilink_replica_domain::file::{BlockInfo, FileRecord, RecordKind};
 use yadorilink_replica_domain::ids::{ChangeHash, SyncPath};
 use yadorilink_replica_domain::session_state::{
     ChangeContent, ConflictCopyFile, DurabilityRoot, DurabilityRoots, LocalFileMetaColumns,
-    MaterializedGenerationBackfillReport, PreparedLocalMutation, TrashedFile, VersionRecord,
-    VersionState,
+    MaterializationState, MaterializedGenerationBackfillReport, PreparedLocalMutation,
+    TrashedFile, VersionRecord, VersionState,
 };
 use yadorilink_root_authority::root_commit::RootCommitPermit;
 use yadorilink_sqlite_runtime::SyncDatabase;
@@ -158,6 +158,9 @@ impl FileIndexRepository {
         self.database.write_immediate::<_, SyncSqliteError>(|tx| {
             for record in records {
                 upsert_file_in_tx(tx, group_id, record, origin_device_id, None)?;
+                if !record.deleted {
+                    stamp_hydrated_after_local_emission_in_tx(tx, group_id, &record.path)?;
+                }
             }
             permit.verify()?;
             Ok(())
@@ -228,6 +231,9 @@ impl FileIndexRepository {
             upsert_file_in_tx(tx, group_id, record, origin_device_id, Some(&change_hash))?;
             if let Some(meta) = meta {
                 apply_local_meta_columns_in_tx(tx, group_id, &record.path, meta)?;
+            }
+            if !record.deleted {
+                stamp_hydrated_after_local_emission_in_tx(tx, group_id, &record.path)?;
             }
             if let (Some(meta), Some(identity)) = (meta, filesystem_identity) {
                 if !record.deleted {
@@ -320,6 +326,9 @@ impl FileIndexRepository {
                 upsert_file_in_tx(tx, group_id, record, origin_device_id, Some(&change_hash))?;
                 if let Some(Some(meta)) = metas.get(idx) {
                     apply_local_meta_columns_in_tx(tx, group_id, &record.path, meta)?;
+                }
+                if !record.deleted {
+                    stamp_hydrated_after_local_emission_in_tx(tx, group_id, &record.path)?;
                 }
             }
             emission.permit.verify()?;
@@ -520,6 +529,17 @@ impl FileIndexRepository {
                         upsert_file_in_tx(tx, group_id, record, origin_device_id, Some(&change_hash))?;
                         if let Some(meta) = meta {
                             apply_local_meta_columns_in_tx(tx, group_id, &record.path, meta)?;
+                        }
+                        // THE production hot path for an ordinary live local
+                        // edit -- `process_event` defers every non-symlink
+                        // create/modify into a pending batch flushed through
+                        // here, so `upsert_file_emitting_change` alone (also
+                        // stamped) is not the whole story. Same local-emission
+                        // precondition as that sibling: `record`'s bytes were
+                        // this device's own disk content when the batch was
+                        // prepared.
+                        if !record.deleted {
+                            stamp_hydrated_after_local_emission_in_tx(tx, group_id, &record.path)?;
                         }
                         if let (Some(meta), Some(LocalCaptureActualStateEvidence::Present {
                             filesystem_identity,
@@ -1943,6 +1963,33 @@ pub fn upsert_file_in_tx(
             // defaults. Which new `state` the old row ended up as
             // (`trashed` vs `superseded`) was already decided by the `CASE`
             // in the `UPDATE` above.
+            //
+            // `materialization_state` specifically is an explicit CARRY-
+            // FORWARD, not a missing-column case -- the schema's own
+            // default (`'placeholder'` as of v25, see `SCHEMA_VERSION`'s
+            // doc comment) never applies here, so it cannot protect this
+            // branch the way it protects a genuinely brand-new path's
+            // first-ever row below. Carrying `Hydrated` forward onto a
+            // version bump whose NEW content is not yet confirmed on disk
+            // reintroduces the identical "claims Hydrated with nothing to
+            // back it up" bug this whole file's callers exist to avoid --
+            // it is the caller's job, not this function's, to correct this
+            // afterward (in the SAME transaction, same as `stamp_hydrated_
+            // after_local_emission_in_tx` does for local emission) whenever
+            // the new content is not already known-present. Every current
+            // production caller either IS local emission (does correct it,
+            // via that stamp), or is `materialize`/`materialize_symlink_at`
+            // in `yadorilink-peer-session`, each of which already performs
+            // its own explicit, targeted correction (a hazard hold or a
+            // policy-skipped symlink demotes to `Placeholder`; the
+            // content-identical fast path only reaches this branch after
+            // verifying the disk bytes already match, so the carried-
+            // forward value is factually correct, not a guess) -- verified
+            // by enumerating every non-test caller of this function's own
+            // wrappers, not assumed. A FUTURE caller that upserts an
+            // existing row for content it has not itself verified is
+            // already on disk MUST perform the same explicit correction;
+            // this carry-forward alone is not a safe default for it.
             tx.execute(
                 "INSERT INTO files (
                     group_id, path, size, mtime_unix_nanos, blocks_json, deleted,
@@ -2006,6 +2053,36 @@ pub fn apply_local_meta_columns_in_tx(
             group_id,
             path,
         ],
+    )?;
+    Ok(())
+}
+
+/// Stamps `Hydrated` on a just-locally-authored, non-deleted row, in the
+/// SAME transaction as its index/change commit -- the explicit counterpart
+/// to `files.materialization_state`'s schema-level default (`'placeholder'`
+/// as of schema v25; see that column's own migration comment for the full
+/// reasoning). A schema default fires for ANY insert that omits the
+/// column, including ones this device has no evidence about (a peer's
+/// incoming record, a hazard hold, a policy skip) -- those must default to
+/// `Placeholder` and earn `Hydrated` only once real content is confirmed.
+/// Local emission is the one class of caller that already, unconditionally,
+/// has that confirmation built in: `upsert_file_emitting_change`/
+/// `upsert_files_batch_emitting_change` exist specifically for a change
+/// THIS device is authoring about content it just read from its own disk to
+/// build the very `FileRecord`/`FileVersion` being committed (see
+/// `LocalChangeProcessor::record_local_commit_fingerprints`'s identical
+/// precondition for the sibling fingerprint it stamps alongside this).
+/// Called only for `!record.deleted` -- a tombstone has no materialized
+/// content to claim, and its own row's `materialization_state` is moot.
+pub fn stamp_hydrated_after_local_emission_in_tx(
+    tx: &rusqlite::Transaction,
+    group_id: &str,
+    path: &str,
+) -> Result<(), SyncSqliteError> {
+    tx.execute(
+        "UPDATE files SET materialization_state = ?1 \
+         WHERE group_id = ?2 AND path = ?3 AND state = 'current'",
+        rusqlite::params![MaterializationState::Hydrated.as_db_str(), group_id, path],
     )?;
     Ok(())
 }

@@ -562,6 +562,28 @@ pub enum PlaceholderIdentityToRecord {
     Clear,
 }
 
+impl PlaceholderIdentityToRecord {
+    /// Whether the real placeholder object this outcome describes is
+    /// deferred to a separate, out-of-process step (Windows's
+    /// `cfapi-host.exe`, on its own ~30s poll -- see `create_or_defer_
+    /// placeholder`'s own doc comment) rather than already, durably on
+    /// disk right now. `RecordOverwrite` and `Clear` both mean the real
+    /// write already happened synchronously (Unix's `write_placeholder`
+    /// either minted an identity or could not, but the rename onto
+    /// `out_path` itself already succeeded either way) -- only
+    /// `RecordIfAbsent` means nothing has actually landed on disk yet.
+    ///
+    /// A caller must not clear a materialization intent that is
+    /// protecting this exact path, or settle an outcome that completes
+    /// this path's projection obligation, while this is `true`: doing so
+    /// removes every one of the tombstone loop's three vetoes for a path
+    /// that genuinely has nothing under its own name yet, before
+    /// `cfapi-host.exe` has had a chance to create it.
+    pub fn is_deferred_to_a_separate_process(&self) -> bool {
+        matches!(self, Self::RecordIfAbsent { .. })
+    }
+}
+
 /// The one sanctioned entry point every production placeholder-creation
 /// call site (repair, eviction, peer materialize) must use INSTEAD OF
 /// calling [`write_placeholder`] directly (M2-3a).
@@ -600,6 +622,14 @@ pub fn create_or_defer_placeholder(
     size: u64,
     mtime_unix_nanos: i64,
 ) -> Result<PlaceholderIdentityToRecord, StorageError> {
+    #[cfg(any(test, feature = "test-support"))]
+    if test_force_deferred_placeholder_is_armed_for(out_path) {
+        let _ = (out_path, size, mtime_unix_nanos);
+        return Ok(PlaceholderIdentityToRecord::RecordIfAbsent {
+            identity: PlaceholderDiskIdentity { dev: 0, ino: mint_windows_placeholder_generation() },
+            provider_kind: WINDOWS_CFAPI_GENERATION_PROVIDER_KIND,
+        });
+    }
     #[cfg(windows)]
     {
         let _ = (out_path, size, mtime_unix_nanos);
@@ -620,6 +650,67 @@ pub fn create_or_defer_placeholder(
             },
             None => PlaceholderIdentityToRecord::Clear,
         })
+    }
+}
+
+/// Test-only failure-injection flag, consumed by `create_or_defer_
+/// placeholder` itself: when armed, forces the Windows-deferred
+/// (`RecordIfAbsent`) outcome regardless of the actual host platform.
+/// Every production caller's Windows-deferred handling is otherwise
+/// exercisable only on a real Windows host -- this lets a test on any
+/// platform drive that exact caller-side branch (does it skip clearing
+/// the protecting intent / settling the projection obligation the way it
+/// must?) without needing one. `test-support`, not just `test`: the
+/// regression tests that need this live in OTHER crates' test builds
+/// (`yadorilink-peer-session`, `yadorilink-filesystem-sync`), which link
+/// against a normal (non-`#[cfg(test)]`) build of this crate -- see this
+/// crate's own `test-support` feature. Compiled out entirely in a
+/// production build.
+///
+/// Path-keyed, deliberately NOT a single process-wide flag: this same
+/// process (a single `cargo test` binary runs every `#[test]`/
+/// `#[tokio::test]` function in a crate concurrently, on separate
+/// threads, by default) can be running an UNRELATED test at the exact
+/// same moment that also reaches `create_or_defer_placeholder` -- for
+/// example, an eviction test's own `#[cfg(not(windows))]` call site,
+/// which must always take the real, synchronous `write_placeholder` path
+/// regardless of what any OTHER concurrently-running test has armed. A
+/// blanket global flag armed by one test's `RecordIfAbsent` scenario
+/// would silently hijack that unrelated call too -- confirmed by a real,
+/// intermittent (measured ~10%) test corruption this exact shape caused
+/// before this fix, not a theoretical concern. Scoping the seam to the
+/// exact path each test already uses (every test using this seam already
+/// picks a path unique to itself) means concurrently-running tests need
+/// no serialization against each other at all -- unlike a lock, this
+/// requires no caller elsewhere in the workspace to remember to opt in in
+/// order to stay safe.
+#[cfg(any(test, feature = "test-support"))]
+static TEST_FORCE_DEFERRED_PLACEHOLDER_PATHS: std::sync::Mutex<
+    Option<std::collections::HashSet<std::path::PathBuf>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(any(test, feature = "test-support"))]
+fn test_force_deferred_placeholder_is_armed_for(path: &Path) -> bool {
+    TEST_FORCE_DEFERRED_PLACEHOLDER_PATHS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .is_some_and(|paths| paths.contains(path))
+}
+
+/// Test-only: arms (or disarms) the failure-injection flag above for one
+/// exact path. Only ever affects calls to `create_or_defer_placeholder`
+/// for THIS path -- see the static's own doc comment for why that
+/// matters.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_test_force_deferred_placeholder_for_path(path: &Path, armed: bool) {
+    let mut guard =
+        TEST_FORCE_DEFERRED_PLACEHOLDER_PATHS.lock().unwrap_or_else(|p| p.into_inner());
+    let paths = guard.get_or_insert_with(std::collections::HashSet::new);
+    if armed {
+        paths.insert(path.to_path_buf());
+    } else {
+        paths.remove(path);
     }
 }
 

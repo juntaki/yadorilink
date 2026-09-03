@@ -2750,6 +2750,106 @@ async fn unauthorized_group_id_in_incoming_message_is_ignored() {
         .is_none());
 }
 
+/// Security regression test: unlike every other group-scoped inbound
+/// handler in this file (`handle_change_request`, `handle_change_batch`,
+/// `handle_heads_announce`, `handle_block_request`, the handoff/rebootstrap
+/// handlers), `handle_version_present_query` used to skip the
+/// `shares_group` re-check entirely and answer straight from
+/// `holds_version_durably` -- which performs no caller authorization of
+/// its own. A peer no longer (or never) authorized for a group could
+/// therefore learn, from a truthful `present`/absent ack, whether specific
+/// content is durably held there. This drives the real wire path (a live
+/// `request_version_present` call against a live, connected peer session),
+/// not a bare predicate call, and uses the SAME durable-version setup for
+/// both an unauthorized and an authorized responder so the `false` result
+/// is provably caused by the missing authorization check, not by some
+/// unrelated setup mistake making the version look absent either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn version_present_query_for_an_unauthorized_group_is_refused_not_answered_truthfully() {
+    use yadorilink_replica_domain::file::VersionBlock;
+    use yadorilink_replica_domain::ids::BlockHash;
+
+    let device_a = Device::new("device-a");
+    let device_b = Device::new("device-b");
+
+    // Device B durably holds this exact version, group provenance
+    // included -- the precondition `holds_version_durably` requires before
+    // it will ever answer `present: true` for anyone.
+    let content = b"device-b's own durably held content";
+    let hash_hex = device_b.store.put(content).unwrap();
+    let hash_bytes = hex::decode(hash_hex.as_str()).unwrap();
+    let record = yadorilink_replica_domain::file::FileRecord {
+        path: "a.bin".to_string(),
+        size: content.len() as u64,
+        mtime_unix_nanos: 1,
+        blocks: vec![yadorilink_replica_domain::file::BlockInfo {
+            hash: hash_bytes.clone(),
+            offset: 0,
+            size: content.len() as u32,
+        }],
+        deleted: false,
+    };
+    device_b
+        .state
+        .file_index_repository()
+        .upsert_file(GROUP, &record, &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests())
+        .unwrap();
+    let retained = device_b.state.sqlite().dag_list_versions(GROUP, "a.bin").unwrap();
+    assert_eq!(retained.len(), 1, "sanity: the single upsert retains exactly one version");
+    let version_hash = yadorilink_replica_domain::ids::VersionHash(retained[0].version_hash.0);
+    device_b
+        .state
+        .change_history_repository()
+        .record_group_block_provenance(GROUP, std::slice::from_ref(&hash_bytes))
+        .unwrap();
+    let blocks = vec![VersionBlock { hash: BlockHash(hash_bytes), size: content.len() as u32 }];
+
+    // Authorized control FIRST, same durable-version setup: proves the
+    // `false` in the unauthorized scenario below is caused by the
+    // authorization gate, not by the version somehow looking absent
+    // regardless of who asks.
+    {
+        let addr = bind_unused_addr().await;
+        let (channel_a, channel_b) = connect_pair(addr).await;
+        let session_a =
+            spawn_session_with_groups(channel_a, &device_a, "device-b", vec![GROUP.to_string()]);
+        let _session_b =
+            spawn_session_with_groups(channel_b, &device_b, "device-a", vec![GROUP.to_string()]);
+        wait_until(|| session_a.peer_handshake_received(), Duration::from_secs(10)).await;
+
+        let present = session_a
+            .request_version_present(GROUP, "a.bin", version_hash.clone(), &blocks, true)
+            .await;
+        assert!(
+            present,
+            "sanity: an authorized peer querying the identical durably-held version must get \
+             present:true -- otherwise the false below wouldn't be proving what this test claims"
+        );
+    }
+
+    // Unauthorized: B's own session was constructed with an *empty*
+    // shared-group list for GROUP, simulating "the coordination plane's
+    // ACL does not actually authorize this pairing" -- the exact scenario
+    // `unauthorized_group_id_in_incoming_message_is_ignored` above uses for
+    // every other message type.
+    {
+        let addr = bind_unused_addr().await;
+        let (channel_a, channel_b) = connect_pair(addr).await;
+        let session_a =
+            spawn_session_with_groups(channel_a, &device_a, "device-b", vec![GROUP.to_string()]);
+        let _session_b = spawn_session_with_groups(channel_b, &device_b, "device-a", vec![]);
+        wait_until(|| session_a.peer_handshake_received(), Duration::from_secs(10)).await;
+
+        let present =
+            session_a.request_version_present(GROUP, "a.bin", version_hash, &blocks, true).await;
+        assert!(
+            !present,
+            "an unauthorized/unshared peer must never receive a truthful present:true for \
+             content it has no authorization to even ask about"
+        );
+    }
+}
+
 /// spec "OnDemand folder creates placeholders
 /// instead of full content": adopting a file into an `OnDemand`-policy
 /// folder must index it and write a correctly-sized placeholder — without
@@ -10861,6 +10961,338 @@ mod exact_version_hash_tests {
         );
     }
 
+    /// The regular-file counterpart of `a_symlink_whose_hold_clears_into_
+    /// a_policy_skip_still_has_intent_protection` above, for `hydrate_
+    /// file_with_timeout_locked`'s own held-to-materialize transition
+    /// (the hazard-recheck loop's OTHER re-driver, alongside `materialize`'s
+    /// symlink branch). That function clears `held_reason` and then runs
+    /// several fallible steps (authoring-hash CAS, disk-race re-check,
+    /// root/containment verification, disk-headroom preflight, the
+    /// reconstruct itself, fingerprint recording, exec-bit/xattr apply)
+    /// with -- before this fix -- no materialization intent open anywhere
+    /// in the whole function. A failure at ANY of those steps left the row
+    /// `Placeholder`, `held_reason` NULL, no intent, and (hazard settlement
+    /// already deleted the obligation) no obligation either -- the exact
+    /// same "none of the tombstone loop's three vetoes" shape. Uses the
+    /// injected failure seam rather than a specific real failure (e.g. the
+    /// symlink-escape refusal the sibling test above exercises) precisely
+    /// because the fix must survive ALL of them uniformly, not just one.
+    #[tokio::test]
+    async fn a_file_whose_hold_clears_into_a_failed_hydration_still_has_intent_protection() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn yadorilink_local_storage::BlockContentStore> =
+            Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let root_dir = tempfile::tempdir().unwrap();
+        let sync_root = root_dir.path().canonicalize().unwrap();
+        state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
+
+        let content = b"content this device already has locally";
+        let hash = hex::decode(store.put(content).unwrap()).unwrap();
+        state
+            .change_history_repository()
+            .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
+            .unwrap();
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        state
+            .file_index_repository()
+            .upsert_file(
+                GROUP,
+                &FileRecord {
+                    path: "was-held.bin".into(),
+                    size: content.len() as u64,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![BlockInfo { hash, offset: 0, size: content.len() as u32 }],
+                    deleted: false,
+                },
+                &permit,
+            )
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(GROUP, "was-held.bin", MaterializationState::Placeholder, &permit)
+            .unwrap();
+        state.materialization_state_repository().set_held(GROUP, "was-held.bin", "case_collision", 0).unwrap();
+        assert!(
+            state
+                .materialization_state_repository()
+                .get_held_state(GROUP, "was-held.bin")
+                .unwrap()
+                .is_some(),
+            "sanity: the row must genuinely start held for this test to exercise the \
+             transition-out-of-held window, not something else"
+        );
+        // "was-held.bin" collides with nothing else in the group, so
+        // `hazard_reason_for` genuinely reports no hazard for it -- this is
+        // what drives the hazard-recheck to actually clear the hold and
+        // retry, rather than re-holding it.
+
+        let generation = state.startup_readiness().begin_group_startup(GROUP);
+        state.startup_readiness().mark_group_ready(GROUP, generation);
+        let sync_roots = HashMap::from([(GROUP.to_string(), sync_root.clone())]);
+        let session = PeerSyncSession::new(
+            unreachable_channel().await,
+            "device-b".to_string(),
+            "device-a".to_string(),
+            state.clone(),
+            store.clone(),
+            vec![GROUP.to_string()],
+            sync_roots,
+        );
+
+        yadorilink_peer_session::peer_session_impl::set_test_force_hydration_failure_after_hold_cleared(
+            true,
+        );
+        let result =
+            session.hydrate_file_with_timeout(GROUP, "was-held.bin", std::time::Duration::from_secs(5)).await;
+
+        assert!(result.is_err(), "expected the injected post-hold-clear failure, got {result:?}");
+        assert!(
+            state
+                .materialization_state_repository()
+                .get_held_state(GROUP, "was-held.bin")
+                .unwrap()
+                .is_none(),
+            "sanity: the hold must genuinely have been cleared for this test to have exercised \
+             the transition window"
+        );
+        assert!(
+            state
+                .materialization_intent_repository()
+                .has_materialization_intent(GROUP, "was-held.bin")
+                .unwrap(),
+            "a materialization intent must protect this path through the held-to-failed-\
+             hydration transition -- without one, the row is left Placeholder, held_reason \
+             NULL, no intent, and no projection obligation, which is indistinguishable from a \
+             genuine offline deletion to the startup/live reconciliation scan's tombstone loop"
+        );
+    }
+
+    /// The counterpart of the sibling test above, in the opposite
+    /// direction: this path was NEVER held, so `hydrate_file_with_timeout_
+    /// locked` must never open the transition-protecting intent guard for
+    /// it in the first place -- that guard exists specifically for the
+    /// held-to-materialize transition window, and opening it
+    /// unconditionally on every ordinary hydration (the overwhelmingly
+    /// common case) would be a real, avoidable write on the hot path for
+    /// no protective benefit: an unheld path was never relying on
+    /// `held_reason` for tombstone-loop protection to begin with. Uses the
+    /// identical injected failure seam as the sibling test, at the
+    /// identical point in the function, so the only variable between the
+    /// two tests is whether the path started held.
+    #[tokio::test]
+    async fn an_unheld_file_never_opens_the_transition_intent_guard_on_a_failed_hydration() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn yadorilink_local_storage::BlockContentStore> =
+            Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let root_dir = tempfile::tempdir().unwrap();
+        let sync_root = root_dir.path().canonicalize().unwrap();
+        state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
+
+        let content = b"content this device already has locally, never held";
+        let hash = hex::decode(store.put(content).unwrap()).unwrap();
+        state
+            .change_history_repository()
+            .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
+            .unwrap();
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        state
+            .file_index_repository()
+            .upsert_file(
+                GROUP,
+                &FileRecord {
+                    path: "never-held.bin".into(),
+                    size: content.len() as u64,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![BlockInfo { hash, offset: 0, size: content.len() as u32 }],
+                    deleted: false,
+                },
+                &permit,
+            )
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(GROUP, "never-held.bin", MaterializationState::Placeholder, &permit)
+            .unwrap();
+        assert!(
+            state
+                .materialization_state_repository()
+                .get_held_state(GROUP, "never-held.bin")
+                .unwrap()
+                .is_none(),
+            "sanity: this test's whole point is that the row was never held"
+        );
+        assert!(
+            !state
+                .materialization_intent_repository()
+                .has_materialization_intent(GROUP, "never-held.bin")
+                .unwrap(),
+            "sanity: no intent before the attempt either"
+        );
+
+        let generation = state.startup_readiness().begin_group_startup(GROUP);
+        state.startup_readiness().mark_group_ready(GROUP, generation);
+        let sync_roots = HashMap::from([(GROUP.to_string(), sync_root.clone())]);
+        let session = PeerSyncSession::new(
+            unreachable_channel().await,
+            "device-b".to_string(),
+            "device-a".to_string(),
+            state.clone(),
+            store.clone(),
+            vec![GROUP.to_string()],
+            sync_roots,
+        );
+
+        yadorilink_peer_session::peer_session_impl::set_test_force_hydration_failure_after_hold_cleared(
+            true,
+        );
+        let result =
+            session.hydrate_file_with_timeout(GROUP, "never-held.bin", std::time::Duration::from_secs(5)).await;
+
+        assert!(result.is_err(), "expected the injected post-clear-held-call failure, got {result:?}");
+        assert!(
+            !state
+                .materialization_intent_repository()
+                .has_materialization_intent(GROUP, "never-held.bin")
+                .unwrap(),
+            "an unheld path must never have the transition-protecting intent guard opened for \
+             it at all -- a dangling intent here would be pure waste, not a real protection gap, \
+             but it is still a real per-call write cost this fix exists to avoid"
+        );
+    }
+
+    /// `apply_unix_mode`/`apply_xattrs` are real, fallible syscalls (a
+    /// repeatable chmod `EPERM` or xattr `EOPNOTSUPP` is not
+    /// hypothetical) -- a review's finding: they used to run BEFORE the
+    /// CAS-to-`Hydrated` commit and the transition intent guard's clear,
+    /// so a failure there left the row reverted to `Placeholder` (via
+    /// `HydratingStateGuard`'s own revert-on-drop) with the intent guard
+    /// permanently dangling, even though real, matching content was
+    /// already durably on disk. Unlike the crash-window dangling-intent
+    /// cases this same guard is otherwise built to tolerate, this one was
+    /// a REACHABLE STEADY STATE: nothing ever re-drives materialization
+    /// for a path whose content already matches disk, so nothing would
+    /// ever clear it -- and if that path were later genuinely recreated,
+    /// re-hydrated (picking up the stale intent), and then genuinely
+    /// offline-deleted, the repair sweep's has-intent branch would wrongly
+    /// resurrect a file the user actually deleted. Fixed by moving the
+    /// commit before the metadata apply, matching `materialize`'s own
+    /// on-demand-receive branch's identical ordering.
+    #[tokio::test]
+    async fn a_failed_metadata_apply_after_a_held_transition_still_commits_hydrated_and_clears_the_intent(
+    ) {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn yadorilink_local_storage::BlockContentStore> =
+            Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let root_dir = tempfile::tempdir().unwrap();
+        let sync_root = root_dir.path().canonicalize().unwrap();
+        state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
+
+        let content = b"content this device already has locally, metadata apply fails";
+        let hash = hex::decode(store.put(content).unwrap()).unwrap();
+        state
+            .change_history_repository()
+            .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
+            .unwrap();
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        state
+            .file_index_repository()
+            .upsert_file(
+                GROUP,
+                &FileRecord {
+                    path: "was-held-meta-fail.bin".into(),
+                    size: content.len() as u64,
+                    mtime_unix_nanos: 0,
+                    blocks: vec![BlockInfo { hash, offset: 0, size: content.len() as u32 }],
+                    deleted: false,
+                },
+                &permit,
+            )
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_materialization_state(
+                GROUP,
+                "was-held-meta-fail.bin",
+                MaterializationState::Placeholder,
+                &permit,
+            )
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_held(GROUP, "was-held-meta-fail.bin", "case_collision", 0)
+            .unwrap();
+
+        let generation = state.startup_readiness().begin_group_startup(GROUP);
+        state.startup_readiness().mark_group_ready(GROUP, generation);
+        let sync_roots = HashMap::from([(GROUP.to_string(), sync_root.clone())]);
+        let session = PeerSyncSession::new(
+            unreachable_channel().await,
+            "device-b".to_string(),
+            "device-a".to_string(),
+            state.clone(),
+            store.clone(),
+            vec![GROUP.to_string()],
+            sync_roots,
+        );
+
+        yadorilink_peer_session::peer_session_impl::set_test_force_hydration_failure_during_metadata_apply(
+            true,
+        );
+        let result = session
+            .hydrate_file_with_timeout(
+                GROUP,
+                "was-held-meta-fail.bin",
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+
+        assert!(result.is_err(), "expected the injected metadata-apply failure, got {result:?}");
+        assert_eq!(
+            std::fs::read(sync_root.join("was-held-meta-fail.bin")).unwrap(),
+            content,
+            "sanity: the real content write must have completed before the injected failure"
+        );
+        assert_eq!(
+            state
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, "was-held-meta-fail.bin")
+                .unwrap(),
+            Some(MaterializationState::Hydrated),
+            "the row must stay Hydrated -- content genuinely matches disk -- rather than \
+             reverting to Placeholder just because a LATER, best-effort metadata step failed"
+        );
+        assert!(
+            !state
+                .materialization_intent_repository()
+                .has_materialization_intent(GROUP, "was-held-meta-fail.bin")
+                .unwrap(),
+            "the transition intent guard must already be cleared by the time a metadata-apply \
+             failure happens -- a dangling intent here would be a PERMANENT leak, since nothing \
+             re-drives materialization for a path whose content already matches disk"
+        );
+    }
+
     /// `hydrate_file`/`hydrate_file_with_timeout` must serialize on
     /// `ReplicaCoordinator::path_lock` for the whole attempt -- the root fix for
     /// the class of races the authoring-bound identity checks above only
@@ -11825,6 +12257,498 @@ mod exact_version_hash_tests {
         assert!(!sync_root.join(&lock_path).exists());
     }
 
+    /// `materialize`'s `PolicySkipped`
+    /// outcome for a symlink used to leave `materialization_state` at its
+    /// schema default of `Hydrated`, even though nothing was ever written
+    /// to disk. A `Hydrated` row with no physical object and no
+    /// materialization intent is exactly what the periodic repair sweep
+    /// (`repair_interrupted_materializations`) reads as an offline
+    /// deletion -- which it journals dirty, and the always-running
+    /// dirty-journal redrive then turns into a real, signed, GROUP-WIDE
+    /// PROPAGATING tombstone `Change`, deleting the path from every peer
+    /// even though the skip was meant to be a benign, local-only policy
+    /// decision. The concrete real-world trigger is a Windows peer without
+    /// `windows_symlink_opt_in`; "no target recorded" reaches the exact
+    /// same caller-side `PolicySkipped` match arm and is reachable on
+    /// every platform, which is what this test exercises.
+    #[tokio::test]
+    async fn a_policy_skipped_symlink_is_demoted_to_placeholder_not_left_looking_hydrated() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn yadorilink_local_storage::BlockContentStore> =
+            Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let root_dir = tempfile::tempdir().unwrap();
+        let sync_root = root_dir.path().canonicalize().unwrap();
+        state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
+        let sync_roots = HashMap::from([(GROUP.to_string(), sync_root.clone())]);
+        let session = PeerSyncSession::new(
+            unreachable_channel().await,
+            "device-b".to_string(),
+            "device-a".to_string(),
+            state.clone(),
+            store.clone(),
+            vec![GROUP.to_string()],
+            sync_roots,
+        );
+
+        let record = FileRecord {
+            path: "mystery-link".to_string(),
+            size: 0,
+            mtime_unix_nanos: 1,
+            blocks: Vec::new(),
+            deleted: false,
+        };
+        state
+            .file_index_repository()
+            .upsert_file(
+                GROUP,
+                &record,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        state
+            .file_index_repository()
+            .set_record_kind(
+                GROUP,
+                "mystery-link",
+                yadorilink_replica_domain::file::RecordKind::Symlink,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        // Deliberately no `set_symlink_target` call -- this is the "no
+        // target recorded" trigger for `PolicySkipped`, which reaches the
+        // exact same caller-side match arm as the Windows-not-opted-in
+        // trigger does.
+
+        let result = session
+            .materialize(GROUP, &record, MaterializationPolicy::Eager, "device-a", None)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Ok(yadorilink_peer_session::peer_session_impl::MaterializeResult::RetryRequired)
+            ),
+            "expected a retriable PolicySkipped outcome, got {result:?}"
+        );
+
+        let materialization_state = state
+            .materialization_state_repository()
+            .get_materialization_state(GROUP, "mystery-link")
+            .unwrap();
+        assert_eq!(
+            materialization_state,
+            Some(MaterializationState::Placeholder),
+            "a policy-skipped symlink row must be demoted away from the schema-default Hydrated \
+             state -- left at Hydrated, the periodic repair sweep would misread it as an \
+             offline deletion and the dirty-journal redrive would turn that into a real, \
+             propagating tombstone Change for a path this device never actually deleted"
+        );
+    }
+
+    /// The transition-out-of-held window: a path that WAS hazard-held
+    /// (`held_reason` set, protecting it from the offline-deletion
+    /// tombstone loop on its own) is re-attempted once the hazard is
+    /// gone. `materialize`'s symlink branch clears `held_reason` before
+    /// calling `materialize_symlink_at` -- if that call then hits
+    /// `PolicySkipped` (no target recorded, exercised here the same
+    /// platform-independent way as the sibling test above), the row is
+    /// left `Placeholder`, `held_reason` now NULL, and (nothing in this
+    /// codebase re-arms a projection obligation once hazard settlement
+    /// deleted it) no obligation either. Without a materialization intent
+    /// protecting this exact window, that leaves ZERO of the tombstone
+    /// loop's three vetoes (intent / obligation / `is_held`) covering a
+    /// row that is genuinely still valid -- this device just could not
+    /// materialize the symlink under this exact name, the same as any
+    /// other policy skip.
+    #[tokio::test]
+    async fn a_symlink_whose_hold_clears_into_a_policy_skip_still_has_intent_protection() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn yadorilink_local_storage::BlockContentStore> =
+            Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let root_dir = tempfile::tempdir().unwrap();
+        let sync_root = root_dir.path().canonicalize().unwrap();
+        state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
+        let sync_roots = HashMap::from([(GROUP.to_string(), sync_root.clone())]);
+        let session = PeerSyncSession::new(
+            unreachable_channel().await,
+            "device-b".to_string(),
+            "device-a".to_string(),
+            state.clone(),
+            store.clone(),
+            vec![GROUP.to_string()],
+            sync_roots,
+        );
+
+        let record = FileRecord {
+            path: "was-held-link".to_string(),
+            size: 0,
+            mtime_unix_nanos: 1,
+            blocks: Vec::new(),
+            deleted: false,
+        };
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        state.file_index_repository().upsert_file(GROUP, &record, &permit).unwrap();
+        state
+            .file_index_repository()
+            .set_record_kind(
+                GROUP,
+                "was-held-link",
+                yadorilink_replica_domain::file::RecordKind::Symlink,
+                &permit,
+            )
+            .unwrap();
+        // Deliberately no `set_symlink_target` call -- the same
+        // platform-independent `PolicySkipped` trigger the sibling test
+        // above uses.
+        state
+            .materialization_state_repository()
+            .set_materialization_state(GROUP, "was-held-link", MaterializationState::Placeholder, &permit)
+            .unwrap();
+        state
+            .materialization_state_repository()
+            .set_held(GROUP, "was-held-link", "case_collision", 0)
+            .unwrap();
+        assert!(
+            state
+                .materialization_state_repository()
+                .get_held_state(GROUP, "was-held-link")
+                .unwrap()
+                .is_some(),
+            "sanity: the row must genuinely start held for this test to exercise the \
+             transition-out-of-held window, not something else"
+        );
+        // "was-held-link" collides with nothing else in the group, so
+        // `hazard_reason_for` genuinely reports no hazard for it -- this
+        // is what drives `materialize`'s symlink branch to actually clear
+        // the hold and retry, rather than re-holding it.
+
+        let result = session
+            .materialize(GROUP, &record, MaterializationPolicy::Eager, "device-a", None)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Ok(yadorilink_peer_session::peer_session_impl::MaterializeResult::RetryRequired)
+            ),
+            "expected the hold to clear and the retry to hit the same retriable PolicySkipped \
+             outcome as the sibling test, got {result:?}"
+        );
+        assert!(
+            state
+                .materialization_state_repository()
+                .get_held_state(GROUP, "was-held-link")
+                .unwrap()
+                .is_none(),
+            "sanity: the hold must genuinely have been cleared for this test to have exercised \
+             the transition window, not left the row still protected by held_reason alone"
+        );
+        assert!(
+            state
+                .materialization_intent_repository()
+                .has_materialization_intent(GROUP, "was-held-link")
+                .unwrap(),
+            "a materialization intent must protect this path through the held-to-policy-skip \
+             transition -- without one, the row is left Placeholder, held_reason NULL, no \
+             intent, and no projection obligation, which is indistinguishable from a genuine \
+             offline deletion to the startup/live reconciliation scan's tombstone loop"
+        );
+    }
+
+    /// The counterpart of the test above, in the opposite direction: this
+    /// symlink was NEVER held, so `materialize`'s symlink branch must
+    /// never open the transition-protecting intent guard for it at all.
+    /// Every symlink materialize runs through this exact branch (not just
+    /// a held-transition one), and on Windows-without-symlink-opt-in this
+    /// same `PolicySkipped` outcome is the ordinary, permanent steady
+    /// state for that path -- retried forever on capped backoff. Opening
+    /// (and idempotently re-upserting) the extra intent unconditionally on
+    /// every one of those retries would be a real, avoidable write with no
+    /// protective benefit for a path that was never relying on
+    /// `held_reason` in the first place.
+    #[tokio::test]
+    async fn an_unheld_symlink_never_opens_the_transition_intent_guard_on_a_policy_skip() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn yadorilink_local_storage::BlockContentStore> =
+            Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let root_dir = tempfile::tempdir().unwrap();
+        let sync_root = root_dir.path().canonicalize().unwrap();
+        state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
+        let sync_roots = HashMap::from([(GROUP.to_string(), sync_root.clone())]);
+        let session = PeerSyncSession::new(
+            unreachable_channel().await,
+            "device-b".to_string(),
+            "device-a".to_string(),
+            state.clone(),
+            store.clone(),
+            vec![GROUP.to_string()],
+            sync_roots,
+        );
+
+        let record = FileRecord {
+            path: "never-held-link".to_string(),
+            size: 0,
+            mtime_unix_nanos: 1,
+            blocks: Vec::new(),
+            deleted: false,
+        };
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        state.file_index_repository().upsert_file(GROUP, &record, &permit).unwrap();
+        state
+            .file_index_repository()
+            .set_record_kind(
+                GROUP,
+                "never-held-link",
+                yadorilink_replica_domain::file::RecordKind::Symlink,
+                &permit,
+            )
+            .unwrap();
+        // Deliberately no `set_symlink_target` call -- the same
+        // platform-independent `PolicySkipped` trigger the sibling tests
+        // above use. Deliberately no `set_held` call either -- this
+        // path's whole point is that it was never held.
+        state
+            .materialization_state_repository()
+            .set_materialization_state(
+                GROUP,
+                "never-held-link",
+                MaterializationState::Placeholder,
+                &permit,
+            )
+            .unwrap();
+        assert!(
+            state
+                .materialization_state_repository()
+                .get_held_state(GROUP, "never-held-link")
+                .unwrap()
+                .is_none(),
+            "sanity: this test's whole point is that the row was never held"
+        );
+
+        let result = session
+            .materialize(GROUP, &record, MaterializationPolicy::Eager, "device-a", None)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Ok(yadorilink_peer_session::peer_session_impl::MaterializeResult::RetryRequired)
+            ),
+            "expected the same retriable PolicySkipped outcome as the held sibling test, got \
+             {result:?}"
+        );
+        assert!(
+            !state
+                .materialization_intent_repository()
+                .has_materialization_intent(GROUP, "never-held-link")
+                .unwrap(),
+            "an unheld symlink must never have the transition-protecting intent guard opened \
+             for it at all -- a dangling intent here would be pure waste on a permanent, \
+             capped-backoff-retried steady state, not just a crash window"
+        );
+    }
+
+    /// The tenth route in this same bug family, LIVE on Windows via the
+    /// ordinary path -- not dormant like the rebootstrap-snapshot route.
+    /// `create_or_defer_placeholder` writes nothing on Windows (real
+    /// creation is deferred to `cfapi-host.exe`'s own poll), but this is
+    /// the ordinary On-Demand receive path every Windows OnDemand-policy
+    /// device takes for every normal incoming file -- and it used to
+    /// settle `PolicyPlaceholder` (completing this path's projection
+    /// obligation) and clear the protecting intent unconditionally,
+    /// exactly as if a real write had happened. That leaves a current,
+    /// non-deleted row with nothing on disk under its own name and NONE
+    /// of the tombstone loop's three vetoes -- reachable on the very
+    /// first file any Windows OnDemand device ever receives, not a rare
+    /// crash window. Uses `create_or_defer_placeholder`'s own test-only
+    /// failure-injection seam (real Windows behavior is not exercisable
+    /// on this host) to force the deferred outcome regardless of
+    /// platform -- path-keyed, so this test's own distinct path cannot
+    /// collide with any other concurrently-running test using the same
+    /// seam for a different one.
+    #[tokio::test]
+    async fn a_deferred_windows_placeholder_never_settles_or_clears_its_intent() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn yadorilink_local_storage::BlockContentStore> =
+            Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let root_dir = tempfile::tempdir().unwrap();
+        let sync_root = root_dir.path().canonicalize().unwrap();
+        state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
+        state
+            .link_repository()
+            .set_materialization_policy(
+                &sync_root.to_string_lossy(),
+                MaterializationPolicy::OnDemand,
+            )
+            .unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
+        let sync_roots = HashMap::from([(GROUP.to_string(), sync_root.clone())]);
+        let session = PeerSyncSession::new(
+            unreachable_channel().await,
+            "device-b".to_string(),
+            "device-a".to_string(),
+            state.clone(),
+            store.clone(),
+            vec![GROUP.to_string()],
+            sync_roots,
+        );
+
+        let content = b"content this device never fetches -- OnDemand defers it";
+        let hash = hex::decode(store.put(content).unwrap()).unwrap();
+        state
+            .change_history_repository()
+            .record_group_block_provenance(GROUP, std::slice::from_ref(&hash))
+            .unwrap();
+        let record = FileRecord {
+            path: "windows-ondemand-receive.bin".to_string(),
+            size: content.len() as u64,
+            mtime_unix_nanos: 0,
+            blocks: vec![BlockInfo { hash, offset: 0, size: content.len() as u32 }],
+            deleted: false,
+        };
+
+        let out_path = sync_root.join("windows-ondemand-receive.bin");
+        yadorilink_local_storage::materialize_write::set_test_force_deferred_placeholder_for_path(
+            &out_path, true,
+        );
+        let result =
+            session.materialize(GROUP, &record, MaterializationPolicy::OnDemand, "device-a", None).await;
+        yadorilink_local_storage::materialize_write::set_test_force_deferred_placeholder_for_path(
+            &out_path, false,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Ok(yadorilink_peer_session::peer_session_impl::MaterializeResult::RetryRequired)
+            ),
+            "a deferred Windows placeholder must NOT settle as PolicyPlaceholder -- nothing is \
+             actually on disk yet to justify completing this path's projection obligation, got \
+             {result:?}"
+        );
+        assert!(
+            !sync_root.join("windows-ondemand-receive.bin").exists(),
+            "sanity: create_or_defer_placeholder's test seam must genuinely have written \
+             nothing, matching real Windows behavior"
+        );
+        assert!(
+            state
+                .materialization_intent_repository()
+                .has_materialization_intent(GROUP, "windows-ondemand-receive.bin")
+                .unwrap(),
+            "a materialization intent must protect this path while its real placeholder \
+             creation is deferred to cfapi-host.exe -- without one, the row is current, \
+             non-deleted, nothing on disk under its own name, no intent, no obligation \
+             (settlement would have completed it), no hold: exactly what the startup/live \
+             reconciliation scan's tombstone loop reads as an offline deletion"
+        );
+    }
+
+    /// The same deferred-Windows-placeholder danger as the sibling test
+    /// above, at the eager/pinned "not every block present locally"
+    /// branch instead of the OnDemand-receive one -- this branch already
+    /// always returns `RetryRequired` (never settles), but it used to
+    /// unconditionally clear the protecting intent right after the
+    /// deferred write anyway, the same mistake as the OnDemand branch,
+    /// just without the extra settlement half of the bug.
+    #[tokio::test]
+    async fn a_deferred_windows_placeholder_never_clears_its_intent_on_the_eager_not_all_present_branch(
+    ) {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn yadorilink_local_storage::BlockContentStore> =
+            Arc::new(FsBlockStore::new(store_dir.path()).unwrap());
+        let state = Arc::new(ReplicaCoordinator::open_in_memory().unwrap());
+        let root_dir = tempfile::tempdir().unwrap();
+        let sync_root = root_dir.path().canonicalize().unwrap();
+        state.link_repository().add_link(&sync_root.to_string_lossy(), GROUP).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            &sync_root,
+            GROUP,
+            state.as_ref(),
+        )
+        .unwrap();
+        let sync_roots = HashMap::from([(GROUP.to_string(), sync_root.clone())]);
+        let session = PeerSyncSession::new(
+            unreachable_channel().await,
+            "device-b".to_string(),
+            "device-a".to_string(),
+            state.clone(),
+            store.clone(),
+            vec![GROUP.to_string()],
+            sync_roots,
+        );
+
+        // A block this device does not have locally and cannot fetch --
+        // `SilentPeerChannel::open_block_stream` fails fast (`Err(
+        // ChannelClosed)`, not a hang), so the eager fetch below reliably
+        // lands in the "not all present" branch rather than timing out.
+        let missing_hash = vec![0x99u8; 32];
+        let record = FileRecord {
+            path: "windows-eager-not-all-present.bin".to_string(),
+            size: 5,
+            mtime_unix_nanos: 0,
+            blocks: vec![BlockInfo { hash: missing_hash, offset: 0, size: 5 }],
+            deleted: false,
+        };
+
+        let out_path = sync_root.join("windows-eager-not-all-present.bin");
+        yadorilink_local_storage::materialize_write::set_test_force_deferred_placeholder_for_path(
+            &out_path, true,
+        );
+        let result = session
+            .materialize(GROUP, &record, MaterializationPolicy::Eager, "device-a", None)
+            .await;
+        yadorilink_local_storage::materialize_write::set_test_force_deferred_placeholder_for_path(
+            &out_path, false,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Ok(yadorilink_peer_session::peer_session_impl::MaterializeResult::RetryRequired)
+            ),
+            "expected the ordinary retriable placeholder outcome for a not-fully-fetched \
+             eager file, got {result:?}"
+        );
+        assert!(
+            !sync_root.join("windows-eager-not-all-present.bin").exists(),
+            "sanity: the deferred placeholder write must genuinely be absent"
+        );
+        assert!(
+            state
+                .materialization_intent_repository()
+                .has_materialization_intent(GROUP, "windows-eager-not-all-present.bin")
+                .unwrap(),
+            "a materialization intent must protect this path while its real placeholder \
+             creation is deferred to cfapi-host.exe, same reasoning as the OnDemand sibling \
+             test"
+        );
+    }
+
     /// Windows drops trailing `.`/` ` in most Win32 path APIs, so a peer
     /// that spells the reserved name with a trailing dot or space types a
     /// path that is not literally the reserved name, but would land on
@@ -12617,6 +13541,7 @@ mod dag_convergence_authority_tests {
     use yadorilink_peer_session::peer_session_impl::{
         ChangeAuthenticator, PeerSyncSession, PeerSyncSessionOneTimeDeps,
     };
+    use yadorilink_peer_session::ports::PeerReplicaStatePort;
 
     use ed25519_dalek::SigningKey;
     use std::collections::HashMap;
@@ -12760,6 +13685,62 @@ mod dag_convergence_authority_tests {
         );
     }
 
+    /// A `Placeholder` row with no authoring identity yet -- the shape a
+    /// bootstrap scaffold or a rebootstrap-from-snapshot import can
+    /// legitimately leave behind before it is paired with real content --
+    /// must not abort the whole materialization audit attempt. Before the
+    /// fix this pins, `list_materialization_repair_candidates` selecting
+    /// this row (correct: it does need materializing eventually) fed
+    /// straight into `file_info_for_record`'s `CorruptState` on the
+    /// missing identity, failing the entire audit call -- for every OTHER
+    /// candidate path in the same group, not just this one.
+    #[tokio::test]
+    async fn audit_skips_a_not_yet_paired_candidate_instead_of_erroring() {
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
+        h.state
+            .link_repository()
+            .set_materialization_policy(
+                &h.root.to_string_lossy(),
+                yadorilink_replica_domain::session_state::MaterializationPolicy::Eager,
+            )
+            .unwrap();
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        h.state
+            .file_index_repository()
+            .upsert_file(GROUP, &empty_record("scaffold.txt", OLD_MTIME), &permit)
+            .unwrap();
+        h.state
+            .materialization_state_repository()
+            .set_materialization_state(
+                GROUP,
+                "scaffold.txt",
+                yadorilink_replica_domain::session_state::MaterializationState::Placeholder,
+                &permit,
+            )
+            .unwrap();
+        // Deliberately no authoring_change_hash -- `upsert_file` never sets
+        // one, matching both real production writers that can leave a
+        // `Placeholder` row in this exact shape.
+
+        let candidates =
+            h.state.materialization_state_repository().list_materialization_repair_candidates(GROUP).unwrap();
+        assert_eq!(
+            candidates,
+            vec!["scaffold.txt".to_string()],
+            "sanity: the row must actually be a repair candidate for this test to exercise the \
+             skip path, not something else entirely"
+        );
+
+        let result = h.session.clone().reconcile_local_materialization_audit(GROUP).await;
+
+        assert!(
+            matches!(result, Ok(true)),
+            "a not-yet-paired candidate must be skipped, not abort the whole audit attempt: {result:?}"
+        );
+        let row = h.state.file_index_repository().get_file(GROUP, "scaffold.txt").unwrap().unwrap();
+        assert!(!row.deleted, "the scaffold row itself must be left untouched by the skip");
+    }
+
     /// An independent review's finding: `apply_locked_record`'s own
     /// `Equal`-authoring branch (and `authoring_proves_redundant`'s own
     /// batched fast path, `rematerialize_local_records`'s only skip
@@ -12879,6 +13860,234 @@ mod dag_convergence_authority_tests {
             let mode = std::fs::metadata(&out_path).unwrap().permissions().mode();
             assert_ne!(mode & 0o100, 0, "the real on-disk file's exec bit must be repaired too");
         }
+    }
+
+    /// `apply_locked_record`'s `Equal`-arm
+    /// metadata repair (the sibling of the test above, same drift shape --
+    /// see that test's own setup) used to `apply_unix_mode`/`apply_xattrs`
+    /// with no preceding mutation-fence bump, unlike every other
+    /// `apply_unix_mode`/`apply_xattrs` call site in this crate. A real
+    /// mutating syscall that runs without first bumping the fence leaves
+    /// any ALREADY-PUBLISHED proof for this path wrongly current -- a
+    /// later consumer that trusts `path_materialized_generations` for this
+    /// path would be told disk matches evidence published before this
+    /// repair ever touched it. This proves the fence value genuinely
+    /// advances across the repair, using the exact same diverged-unix-mode
+    /// setup the sibling test already exercises.
+    #[tokio::test]
+    async fn equal_authoring_metadata_repair_bumps_the_mutation_fence_before_writing() {
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
+        let out_path = h.root.join("run.sh");
+        std::fs::write(&out_path, b"").unwrap();
+
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let version = FileVersion::from_index_row(
+            vec![],
+            0,
+            OLD_MTIME,
+            RecordKind::File,
+            Some(0o755),
+            None,
+            Vec::new(),
+        );
+        let change = Change::create_signed(
+            vec![],
+            0,
+            ChangeAuth::PLACEHOLDER,
+            yadorilink_replica_domain::ids::DeviceId("device-p".into()),
+            yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+            vec![Op::Put {
+                path: SyncPath("run.sh".into()),
+                version: version.version_hash,
+                origin: PutOrigin::Direct,
+            }],
+            &key,
+        );
+        h.state
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change, std::slice::from_ref(&version), true)
+            .unwrap();
+        let author = yadorilink_replica_domain::ids::ChangeHash(change.compute_hash().0);
+
+        h.state
+            .file_index_repository()
+            .upsert_file_with_origin_and_author(
+                GROUP,
+                &FileRecord {
+                    path: "run.sh".into(),
+                    size: 0,
+                    mtime_unix_nanos: OLD_MTIME,
+                    blocks: vec![],
+                    deleted: false,
+                },
+                "device-p",
+                &author,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        h.state
+            .file_index_repository()
+            .set_unix_mode(
+                GROUP,
+                "run.sh",
+                Some(0o644),
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+
+        // `dag_snapshot_mutation_fence` never bumps -- calling it here
+        // reads (and, on the very first call for this path, durably seeds)
+        // the CURRENT live fence value without itself being a mutation.
+        let fence_before = h.state.dag_snapshot_mutation_fence(GROUP, "run.sh").unwrap();
+
+        let incoming = FileRecord {
+            path: "run.sh".into(),
+            size: 0,
+            mtime_unix_nanos: OLD_MTIME,
+            blocks: vec![],
+            deleted: false,
+        };
+        let meta = yadorilink_peer_session::peer_session_impl::IncomingWireMeta {
+            xattrs: Vec::new(),
+            record_kind: RecordKind::File,
+            symlink_target: None,
+            symlink_out_of_root: false,
+            unix_mode: Some(0o755),
+            origin_device_id: None,
+            authoring_change_hash: Some(author),
+        };
+        let yadorilink_replica_domain::session_state::LinkGate::Live { policy, .. } =
+            h.state.link_repository().link_gate_for_group(GROUP).unwrap()
+        else {
+            panic!("link must be live");
+        };
+        let outcome = h.session.apply_locked_record(GROUP, incoming, meta, policy).await.unwrap();
+        assert!(
+            matches!(
+                outcome,
+                yadorilink_peer_session::peer_session_impl::LockedRecordOutcome::Settled
+            ),
+            "an equal-authoring repair must settle, not error or defer: {outcome:?}"
+        );
+
+        let fence_after = h.state.dag_snapshot_mutation_fence(GROUP, "run.sh").unwrap();
+        assert!(
+            fence_after > fence_before,
+            "a real fsetxattr/chmod-class repair syscall must bump the mutation fence BEFORE it \
+             runs -- fence_before={fence_before}, fence_after={fence_after}. Left unbumped, an \
+             already-published proof for this path stays wrongly current across a real physical \
+             mutation, which is exactly the class of bug complete_obligation_if_exact_proof_\
+             current's own defense-in-depth clause (c) exists to catch."
+        );
+    }
+
+    /// A permanently policy-skipped symlink (here: no target recorded --
+    /// the same platform-independent `PolicySkipped` trigger the Windows-
+    /// opt-in case shares) retries `materialize` on a capped backoff that
+    /// is never dead-lettered. Each retry used to unconditionally re-
+    /// upsert the record even when the authored version had not changed
+    /// since the previous attempt -- `upsert_file_in_tx`'s own INSERT is
+    /// unconditional, so a long-lived policy skip accumulated an unbounded
+    /// number of no-op `version_seq` rows purely from retrying. Calling
+    /// `materialize` twice for the identical authored version must not
+    /// create a second version row.
+    #[tokio::test]
+    async fn a_repeated_policy_skipped_symlink_retry_does_not_grow_the_version_history() {
+        let h = harness("device-local", "device-p", /*peer handshake received*/ true).await;
+
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        // Admitted as `RecordKind::File` at the DAG/version-history layer
+        // (matching the version-admission shape the sibling fence-bump
+        // test above already exercises successfully) -- what actually
+        // drives `materialize`'s dispatch to the symlink branch and
+        // `materialize_symlink_at`'s own target lookup is the INDEX's
+        // current `record_kind`/`symlink_target`, set separately below via
+        // `set_record_kind`, not this admitted version's own kind field.
+        let version = FileVersion::from_index_row(
+            vec![],
+            0,
+            OLD_MTIME,
+            RecordKind::File,
+            None,
+            None,
+            Vec::new(),
+        );
+        let change = Change::create_signed(
+            vec![],
+            0,
+            ChangeAuth::PLACEHOLDER,
+            yadorilink_replica_domain::ids::DeviceId("device-p".into()),
+            yadorilink_replica_domain::ids::FolderGroupId(GROUP.into()),
+            vec![Op::Put {
+                path: SyncPath("mystery-link".into()),
+                version: version.version_hash,
+                origin: PutOrigin::Direct,
+            }],
+            &key,
+        );
+        h.state
+            .change_history_repository()
+            .dag_admit_change_with_versions(&change, std::slice::from_ref(&version), true)
+            .unwrap();
+        let author = yadorilink_replica_domain::ids::ChangeHash(change.compute_hash().0);
+
+        let record = FileRecord {
+            path: "mystery-link".into(),
+            size: 0,
+            mtime_unix_nanos: OLD_MTIME,
+            blocks: vec![],
+            deleted: false,
+        };
+        h.state
+            .file_index_repository()
+            .upsert_file_with_origin_and_author(
+                GROUP,
+                &record,
+                "device-p",
+                &author,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        h.state
+            .file_index_repository()
+            .set_record_kind(
+                GROUP,
+                "mystery-link",
+                RecordKind::Symlink,
+                &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+            )
+            .unwrap();
+        // Deliberately no `set_symlink_target` call -- the platform-
+        // independent `PolicySkipped` trigger.
+
+        for _ in 0..3 {
+            let outcome = h
+                .session
+                .materialize(
+                    GROUP,
+                    &record,
+                    yadorilink_replica_domain::session_state::MaterializationPolicy::Eager,
+                    "device-p",
+                    Some(&author),
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    yadorilink_peer_session::peer_session_impl::MaterializeResult::RetryRequired
+                ),
+                "expected a retriable PolicySkipped outcome on every retry, got {outcome:?}"
+            );
+        }
+
+        let versions = h.state.sqlite().dag_list_versions(GROUP, "mystery-link").unwrap();
+        assert_eq!(
+            versions.len(),
+            1,
+            "three retries of the identical already-authored version must never create more \
+             than the one real version row -- got {versions:?}"
+        );
     }
 
     /// The materialization-audit backstop must keep repairing missing on-disk

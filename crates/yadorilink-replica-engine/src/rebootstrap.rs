@@ -169,9 +169,37 @@ where
     installer.install_snapshot_and_switch_history_base(&required.manifest, snapshot_bytes)
 }
 
-/// Explicit release gate. The protocol core exists, but compaction scheduling
-/// must remain disabled until a production `AtomicRebootstrapInstaller`, wire
-/// transport, and deterministic partition/restart coverage are wired.
+/// Explicit release gate for the PRODUCER half of history compaction only
+/// (`compaction::execute_prune`'s own check) -- the protocol core exists,
+/// but scheduled pruning must remain disabled until a production
+/// `AtomicRebootstrapInstaller`, wire transport, and deterministic
+/// partition/restart coverage are wired.
+///
+/// Does NOT gate the CONSUMER/installer half at all -- flipping this to
+/// `true` changes nothing about whether an incoming rebootstrap snapshot
+/// can be installed. `yadorilink-daemon`'s `DaemonRebootstrapHandler` (the
+/// real `RebootstrapHandler` impl wired into `peer_orchestrator.rs`'s
+/// production construction) already reaches `install_rebootstrap_snapshot`
+/// unconditionally today; what actually keeps this whole pipeline dormant
+/// is that nothing in this codebase yet calls `PeerSyncSession::request_
+/// rebootstrap_snapshot_from_peer` (see that function's own doc comment)
+/// to solicit one in the first place -- a fact this constant cannot
+/// express or enforce, since it lives in a different crate with no
+/// dependency relationship to the requester.
+///
+/// The installer's real, code-enforced protection instead lives at the
+/// actual risky operation: `yadorilink_sync_sqlite::rebootstrap_store::
+/// replace_group_files_from_snapshot`'s own post-insert `debug_assert!`
+/// re-checks, on EVERY exercise of the installer in any debug build (not
+/// gated behind this flag, or any flag), that its DELETE+re-INSERT of
+/// `files` correctly carries forward a surviving path's local-only
+/// `held_reason`/`held_since_unix_nanos`/`pinned` columns (never part of
+/// the wire-derived snapshot) -- dropping them silently strips a
+/// hazard-held path's only remaining tombstone protection. If that
+/// `debug_assert!` (or its own `replace_group_files_from_snapshot_tests`
+/// module) ever regresses, treat it as a release blocker for wiring up
+/// the requester, not a follow-up -- independently of this constant's own
+/// value.
 pub const COMPACTION_SCHEDULING_READY: bool = false;
 
 #[cfg(test)]

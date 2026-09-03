@@ -2178,6 +2178,10 @@ async fn restore_to_version_inner(
                 }
                 #[cfg(windows)]
                 {
+                    // Not opted in: writes nothing, same as `materialize_
+                    // symlink_at`'s own policy skip -- see the `None` arm's
+                    // own comment just below for why this row's own
+                    // `materialization_state` is still safe despite that.
                     if state
                         .replica_coordinator
                         .link_repository()
@@ -2194,7 +2198,17 @@ async fn restore_to_version_inner(
             None => {
                 // No target recorded for this version -- nothing safe to
                 // create on disk, matching `materialize_symlink_at`'s own
-                // defensive handling of the same case.
+                // defensive handling of the same case. Unreachable in
+                // practice, not just unlikely: `record_restore_operation_
+                // emitting_change` above (line ~2043) validates this exact
+                // `version.symlink_target` via `FileVersion::verify_hash`
+                // before this dispatch ever runs, and that validation
+                // rejects a targetless symlink outright -- so whenever this
+                // arm would fire, the restore already failed earlier and
+                // never reaches here. See `commit_restore_operation`'s own
+                // doc comment for the full argument. Kept as explicit
+                // defensive handling (not `unreachable!()`) rather than
+                // leaning on that ordering never changing.
             }
         },
         yadorilink_replica_domain::file::RecordKind::Directory => {
@@ -4126,6 +4140,18 @@ mod tests {
         // Version 1 itself is completely untouched.
         let original_v1 = versions.iter().find(|v| v.version_seq == 1).unwrap();
         assert_eq!(original_v1.size, 19);
+        // `commit_restore_operation`'s explicit `Hydrated` stamp is what
+        // earns this -- the restored content genuinely matches disk, but
+        // nothing marks that automatically; the schema's own default is
+        // `Placeholder`.
+        assert_eq!(
+            state
+                .replica_coordinator
+                .materialization_state_repository()
+                .get_materialization_state(GROUP, PATH)
+                .unwrap(),
+            Some(MaterializationState::Hydrated)
+        );
     }
 
     /// **Phase E finding**: `restore_to_version_inner`'s physical write
@@ -4311,6 +4337,104 @@ mod tests {
                 "v1-target"
             ))),
             "the current row's symlink_target must be updated to match the restored version"
+        );
+    }
+
+    /// A targetless symlink version (`symlink_target == None` on a
+    /// `RecordKind::Symlink` row) looks, at first glance, like it would hit
+    /// `restore_to_version_inner`'s write-nothing `None` dispatch arm and
+    /// still get stamped `Hydrated` by `commit_restore_operation` -- an
+    /// all-platform twin of the Windows-not-opted-in write-nothing case.
+    /// It is not reachable: `record_restore_operation_emitting_change`,
+    /// which runs earlier in the same restore, validates the identical
+    /// `symlink_target` field via `FileVersion::verify_hash` and rejects a
+    /// targetless symlink before either the disk-write dispatch or the
+    /// `Hydrated` stamp is ever reached. This test proves that directly
+    /// (a version constructed by directly manipulating the file index, the
+    /// only way to get a targetless symlink row queryable at all, since
+    /// every validated construction path refuses one) rather than trusting
+    /// that reasoning alone -- a regression here would mean an unstamped,
+    /// unwritten row silently starts claiming `Hydrated`.
+    #[tokio::test]
+    async fn restoring_a_targetless_symlink_version_fails_before_any_write_or_stamp() {
+        let (state, _store_dir) = test_state();
+        state.set_device_signing_key(ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]));
+        state.replica_coordinator.set_local_change_auth_provider(Arc::new(|_| {
+            Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER)
+        }));
+        // Local edits route through `replica_coordinator`
+        // (`LocalChangeProcessor` is built from it, not `sync_state`, since
+        // 7D-10.7) -- mirror the override there too, or this test's real
+        // provider (wired by `DaemonState::new`/`build`) fires instead and
+        // requires actual group-policy setup this fixture doesn't have.
+        state.replica_coordinator.set_local_change_auth_provider(Arc::new(|_| {
+            Ok(yadorilink_replica_domain::change::ChangeAuth::PLACEHOLDER)
+        }));
+        let root = tempfile::tempdir().unwrap();
+        let local_path = root.path().to_string_lossy().to_string();
+        state.replica_coordinator.link_repository().add_link(&local_path, GROUP).unwrap();
+        yadorilink_root_authority::root_identity::VerifiedRoot::open(
+            root.path(),
+            GROUP,
+            state.replica_coordinator.as_ref(),
+        )
+        .unwrap();
+
+        let permit = yadorilink_root_authority::root_commit::RootCommitPermit::for_tests();
+        // Version 1: a symlink record with no `symlink_target` at all --
+        // the low-reachability shape `commit_restore_operation`'s doc
+        // comment describes (`FileVersion::validate_structure` normally
+        // rejects one, but `get_version` reads the raw stored row, not a
+        // re-validated `FileVersion`).
+        let v1 = record_with_blocks(PATH, vec![], 0);
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &v1, "device-a", &permit)
+            .unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .set_record_kind(
+                GROUP,
+                PATH,
+                yadorilink_replica_domain::file::RecordKind::Symlink,
+                &permit,
+            )
+            .unwrap();
+
+        // Version 2: an ordinary file, to supersede version 1 so restoring
+        // back to it is a genuine restore, not a same-version no-op.
+        let v2_block = put_block(&state, GROUP, b"version two content");
+        let v2 = record_with_blocks(PATH, vec![v2_block], 20);
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .upsert_file_with_origin(GROUP, &v2, "device-a", &permit)
+            .unwrap();
+        state
+            .replica_coordinator
+            .file_index_repository()
+            .set_record_kind(
+                GROUP,
+                PATH,
+                yadorilink_replica_domain::file::RecordKind::File,
+                &permit,
+            )
+            .unwrap();
+
+        let result = restore_to_version(&state, GROUP, PATH, 1).await;
+        assert!(
+            result.is_err(),
+            "a targetless symlink version must be rejected by domain validation before any \
+             disk write or index stamp, not silently accepted as a write-nothing restore"
+        );
+
+        let out_path = root.path().join(PATH);
+        assert!(
+            !out_path.exists(),
+            "the rejected restore must leave the path untouched -- no content was ever safe \
+             to write for a targetless symlink"
         );
     }
 

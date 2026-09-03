@@ -1032,15 +1032,44 @@ fn materialize_symlink_at(
         (None, None)
     };
 
-    match authoring_change_hash {
-        Some(hash) => state.upsert_file_with_origin_and_author(
-            group_id,
-            record,
-            origin_device_id,
-            hash,
-            permit,
-        )?,
-        None => state.upsert_file_with_origin(group_id, record, origin_device_id, permit)?,
+    // A permanently policy-skipped symlink (no target recorded, or a
+    // Windows peer that has not opted in) retries this whole function on
+    // a capped backoff that is never dead-lettered -- every retry used to
+    // unconditionally re-upsert `record` even when nothing had changed
+    // since the previous attempt. `upsert_file_in_tx`'s own `INSERT` is
+    // unconditional too: it flips the current row to `superseded`/
+    // `trashed` and inserts a fresh `version_seq` row every single call,
+    // so a long-lived policy skip accumulated an unbounded number of
+    // these no-op version rows over the process's lifetime -- purely from
+    // retrying, with the actual desired state never once changing. Skip
+    // the upsert when this exact authored version is already the current
+    // one; `write_eligible`'s own classification below is unaffected
+    // either way; it depends only on `target`/`windows_opt_in`, not on
+    // whether this call happens to also upsert.
+    // `is_some_and` means a `None` `authoring_change_hash` always yields
+    // `false` here -- a caller with no authoring hash to compare against
+    // gets no dedup at all, and still accumulates a version row on every
+    // retry exactly as before this fix. `materialize`'s own
+    // `authoring_change_hash` parameter is `Option`, and at least one
+    // caller does pass `None` (the tombstone-materialize call in the
+    // deletion path) -- not confirmed reachable for a retry-prone
+    // policy-skipped SYMLINK specifically (a tombstone is `record.deleted`,
+    // a different dispatch branch), but not proven unreachable either.
+    let already_current = authoring_change_hash.is_some_and(|hash| {
+        state.get_authoring_change_hash(group_id, &record.path).ok().flatten().as_ref()
+            == Some(hash)
+    });
+    if !already_current {
+        match authoring_change_hash {
+            Some(hash) => state.upsert_file_with_origin_and_author(
+                group_id,
+                record,
+                origin_device_id,
+                hash,
+                permit,
+            )?,
+            None => state.upsert_file_with_origin(group_id, record, origin_device_id, permit)?,
+        }
     }
 
     if !write_eligible {
@@ -1072,6 +1101,11 @@ fn materialize_symlink_at(
     yadorilink_local_storage::materialize_symlink_windows(&out_path, &target)?;
 
     intent_guard.expect("write_eligible implies an intent was opened above").clear()?;
+    // The symlink now genuinely, verifiably exists on disk under this exact
+    // name -- explicit, not implicit via a column default (the row was
+    // upserted earlier in this function, before this write; the schema's
+    // own default is `Placeholder`, not `Hydrated`, as of v25).
+    state.set_materialization_state(group_id, &record.path, MaterializationState::Hydrated, permit)?;
     Ok(SymlinkMaterializeOutcome::WrittenExact {
         mutation_generation: mutation_generation
             .expect("write_eligible implies the fence was bumped above"),
@@ -2485,6 +2519,20 @@ fn hold_record(
         )?,
         None => state.upsert_file_with_origin(group_id, record, origin_device_id, permit)?,
     }
+    // A held row is, by definition, "not materialized under any name on
+    // this device" -- the upsert above leaves `materialization_state` at
+    // its schema default of `Hydrated`, which is wrong the instant the row
+    // becomes held, not just eventually. Left at `Hydrated`, the periodic
+    // repair sweep reads this row (nothing on disk, no materialization
+    // intent) as an offline deletion and journals it dirty; the
+    // always-running dirty-journal redrive then emits a real, propagating
+    // tombstone Change for a path this device never actually deleted. This
+    // is reachable on every platform (unlike the Windows-symlink-policy
+    // case): a brand-new hazard hold hits it immediately, with no
+    // materialize/PolicySkipped round trip needed first. Matches
+    // `hydrate_file_with_timeout_locked`'s own hazard-hold outcome, which
+    // reverts to `Placeholder` for the identical reason.
+    state.set_materialization_state(group_id, &record.path, MaterializationState::Placeholder, permit)?;
     state.set_held(group_id, &record.path, reason, now_unix_nanos())?;
     tracing::info!(
         path = %record.path,
@@ -2668,6 +2716,50 @@ static NEXT_AUDIT_ATTEMPT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::
 
 fn next_audit_attempt_id() -> u64 {
     NEXT_AUDIT_ATTEMPT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only failure-injection flag, consumed (swapped back to `false`) by
+/// `hydrate_file_with_timeout_locked`'s own check right after it clears a
+/// hazard hold -- proves the materialization intent that call opens before
+/// clearing the hold genuinely survives an arbitrary failure anywhere in
+/// the rest of that function, not just the specific failure this test
+/// happens to construct. `test-support`, not just `test`: the regression
+/// test lives in this crate's own integration test binary, which links
+/// against a normal (non-`#[cfg(test)]`) build -- see this crate's
+/// `test-support` feature and `RootLease::for_tests`'s identical gating.
+/// Compiled out entirely in a production build.
+#[cfg(any(test, feature = "test-support"))]
+static TEST_FORCE_HYDRATION_FAILURE_AFTER_HOLD_CLEARED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only: arms (or disarms) the failure-injection flag above. Public,
+/// same reasoning and gating as `set_test_clock_override` just above.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_test_force_hydration_failure_after_hold_cleared(armed: bool) {
+    TEST_FORCE_HYDRATION_FAILURE_AFTER_HOLD_CLEARED
+        .store(armed, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Test-only failure-injection flag, consumed by `hydrate_file_with_
+/// timeout_locked` right where `apply_unix_mode`/`apply_xattrs` would run
+/// -- simulates a real, repeatable failure there (a chmod `EPERM`, an
+/// xattr `EOPNOTSUPP`) that a permission trick or filesystem capability
+/// gap isn't reliably reproducible for in a portable test. Proves the
+/// commit (CAS-to-`Hydrated` and the transition intent guard's clear) that
+/// now runs BEFORE this point survives such a failure intact: the row
+/// stays `Hydrated` with its already-durable content, and the intent
+/// guard is already cleared, rather than the whole attempt reverting to
+/// `Placeholder` with a permanently dangling intent the way it would if
+/// this failure fired before that commit.
+#[cfg(any(test, feature = "test-support"))]
+static TEST_FORCE_HYDRATION_FAILURE_DURING_METADATA_APPLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only: arms (or disarms) the failure-injection flag above.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_test_force_hydration_failure_during_metadata_apply(armed: bool) {
+    TEST_FORCE_HYDRATION_FAILURE_DURING_METADATA_APPLY
+        .store(armed, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// `retire_conflict_copies_only`'s whole-pass frontier freshness check --
@@ -5052,12 +5144,62 @@ impl PeerSyncSession {
         let fetched_count = files.len();
         let mut file_infos = Vec::with_capacity(files.len());
         let mut dropped_as_deleted = Vec::new();
+        let mut dropped_as_not_yet_paired = Vec::new();
         for record in files.into_values() {
             if record.deleted {
                 dropped_as_deleted.push(record.path.clone());
                 continue;
             }
+            // A row can legitimately have no authoring identity yet.
+            // Deliberately checked broadly (any missing identity), not
+            // narrowed to a specific route like "version_seq == 0": at
+            // least two real production writers produce this shape, with
+            // different `version_seq` values. The bootstrap scaffold
+            // `apply_incoming_wire_metadata` creates before a change's
+            // real content lands starts at `version_seq == 0`. A device
+            // rebootstrapping from a checkpoint snapshot
+            // (`replace_group_files_from_snapshot`) is the other: it
+            // deliberately never trusts a snapshot's claim that a
+            // `Current`, non-deleted file's content is actually present
+            // locally (stamping `Placeholder`, correctly conservative) but
+            // also never carries an authoring identity across the
+            // snapshot boundary at all, at whatever `version_seq` the
+            // snapshot itself recorded -- almost never `0`. Narrowing this
+            // check to `version_seq == 0` would silently stop protecting
+            // that second, ordinary (not an edge case) route. Either way,
+            // the row is genuinely `Placeholder` with nothing to eagerly
+            // rehydrate FROM until it is paired with real content --
+            // `list_materialization_repair_candidates` selecting it is
+            // correct (it does need materializing eventually), but
+            // `file_info_for_record`'s own `CorruptState` on a missing
+            // identity is the right contract for a row that SHOULD
+            // already have one, not for this legitimate, transient case.
+            // Skip it rather than aborting the whole audit attempt: the
+            // ordinary DAG-driven obligation pipeline (not this
+            // eager-rehydrate audit) is what actually resolves this row
+            // once it is paired with real content.
+            if self.state.get_authoring_change_hash(group_id, &record.path)?.is_none() {
+                dropped_as_not_yet_paired.push(record.path.clone());
+                continue;
+            }
             file_infos.push(self.file_info_for_record(group_id, record)?);
+        }
+        if !dropped_as_not_yet_paired.is_empty() {
+            // A visible (not just debug-level) signal: any occurrence is
+            // uncommon in steady state, and if the same path keeps
+            // reappearing here across repeated audit passes, that is
+            // exactly the "authoring identity never arrives" case worth an
+            // operator's attention -- this audit itself has no durable
+            // per-path retry counter to distinguish a fleeting, expected
+            // instance from a genuinely stuck one, so it surfaces every
+            // occurrence rather than silently downgrading them all.
+            tracing::warn!(
+                local_device_id = %self.local_device_id,
+                group_id,
+                audit_attempt_id,
+                ?dropped_as_not_yet_paired,
+                "materialization audit: skipped candidate path(s) with no authoring identity yet"
+            );
         }
         tracing::debug!(
             local_device_id = %self.local_device_id,
@@ -5067,6 +5209,7 @@ impl PeerSyncSession {
             fetched_count,
             file_infos_count = file_infos.len(),
             ?dropped_as_deleted,
+            ?dropped_as_not_yet_paired,
             "materialization audit: candidate paths resolved to files"
         );
         if file_infos.is_empty() {
@@ -9510,6 +9653,41 @@ impl PeerSyncSession {
         &self,
         query: yadorilink_sync_wire::VersionPresentQueryFrame,
     ) -> Result<(), PeerSessionError> {
+        // Every other group-scoped inbound
+        // handler in this file re-checks `shares_group` fresh on every
+        // request (live session membership can narrow mid-session via
+        // `revoke_group`, so it must never be trusted from construction
+        // time) -- this one was the sole exception, going straight to
+        // `holds_version_durably` for whatever `folder_group_id` the wire
+        // message names. `holds_version_durably` itself performs zero
+        // caller/peer authorization; it was never designed to be the
+        // authorization boundary. Left unchecked, a peer no longer (or
+        // never) authorized for a group could probe it and learn, from a
+        // truthful `present`/absent ack, whether specific content is
+        // durably held there. Every OTHER sibling handler in this file
+        // just drops an unauthorized request silently -- this one instead
+        // replies with an explicit `present: false`, since this is a
+        // correlated request/response exchange with a waiting caller
+        // (`request_version_present`'s own 10s timeout): a silent drop
+        // would make an unauthorized peer wait out the full timeout for a
+        // negative answer it could have gotten immediately, and the delay
+        // difference between "unauthorized" and "genuinely absent" is
+        // itself a timing side-channel worth closing.
+        if !self.shares_group(&query.folder_group_id) {
+            tracing::warn!(
+                group_id = %query.folder_group_id,
+                peer = %self.peer_device_id,
+                "refusing version-present query for unauthorized/unshared folder group"
+            );
+            return self
+                .send_frame(yadorilink_sync_wire::OutboundFrame::VersionPresentAck(
+                    yadorilink_sync_wire::VersionPresentAckOutboundFrame {
+                        request_id: query.request_id,
+                        present: false,
+                    },
+                ))
+                .await;
+        }
         // `PeerReplicaEngine` has no protobuf dependency, so the wire query
         // is converted to its domain equivalent here rather than passed
         // through directly.
@@ -9683,6 +9861,18 @@ impl PeerSyncSession {
     /// Sends a `RebootstrapSnapshotRequest` to this peer and awaits the
     /// `RebootstrapSnapshotResponse` reply, bounded by the same timeout
     /// `request_handoff_lease_from_peer` uses.
+    ///
+    /// Has no production caller anywhere in this codebase today (only
+    /// this crate's own tests call it directly) -- this, not `yadorilink_
+    /// replica_engine::rebootstrap::COMPACTION_SCHEDULING_READY` (which
+    /// gates only the unrelated compaction-execution producer side), is
+    /// the actual reason the install side of this whole pipeline is
+    /// dormant in production despite `yadorilink-daemon`'s
+    /// `DaemonRebootstrapHandler` already being fully wired to install
+    /// whatever a `RebootstrapSnapshotResponse` carries. Wiring a real
+    /// caller for this function is therefore the point at which that
+    /// pipeline goes live -- see `COMPACTION_SCHEDULING_READY`'s own doc
+    /// comment for what must already be true by then.
     ///
     /// Returns `None` on any failure to obtain a genuinely granted snapshot:
     /// send failure, timeout (this also covers a peer running a build that
@@ -11308,7 +11498,57 @@ impl PeerSyncSession {
             // something that failed.
             return Ok(HydrationOutcome::Held { reason });
         }
+        // A read, not itself a writer-gate write -- decides whether the
+        // guard just below is worth opening at all. Only an actual
+        // transition OUT of a hold needs it; for the overwhelmingly common
+        // case (this path was never held), `clear_held` just below is
+        // already a documented safe no-op, and opening the extra intent
+        // guard unconditionally on every ordinary hydration would add a
+        // real per-call write to the hot path for zero protective benefit
+        // -- an unheld path was never relying on `held_reason` for
+        // tombstone-loop protection in the first place. Same reasoning as
+        // `materialize`'s own symlink branch's identical gating.
+        let was_held = self.state.get_held_state(group_id, path)?.is_some();
+        // Opened BEFORE `clear_held`, not after -- same reasoning as
+        // `materialize`'s own symlink branch (see that call site's own
+        // comment for the full argument). `held_reason` being set is
+        // itself what protects a held row from the tombstone loop; the
+        // instant `clear_held` clears it, the row looks like an ordinary,
+        // unprotected `Placeholder`/`Hydrating` row until this function
+        // either commits a genuine `Hydrated` write or fails. Every exit
+        // between here and that commit (`?`-propagated or an explicit
+        // early `return Err`) drops this guard without clearing it,
+        // automatically, via Rust's own scope-exit semantics -- no
+        // separate handling needed at each of the several fallible steps
+        // below (authoring-hash CAS, disk-race re-check, root/containment
+        // verification, disk-headroom preflight, the reconstruct itself,
+        // the fingerprint recording). A dangling intent left by any of
+        // those failures is exactly the fail-safe outcome this guard
+        // exists to guarantee, matching this whole file's established "an
+        // intent left dangling is fail-safe" discipline -- explicitly
+        // cleared only at the one point below where the row is confirmed
+        // to have actually transitioned to `Hydrated`.
+        let hold_transition_intent_guard = if was_held {
+            Some(self.state.open_materialization_intent_guard(
+                group_id,
+                path,
+                &yadorilink_local_storage::intent_target_hash(&record.blocks),
+                &root_commit_permit,
+            )?)
+        } else {
+            None
+        };
         self.state.clear_held(group_id, path)?;
+        // Test-only failure-injection seam, proving the guard just opened
+        // above genuinely survives an arbitrary failure anywhere in the
+        // remainder of this function (representative of any of the several
+        // real fallible steps below -- they all rely on the identical
+        // "drop without clearing" mechanism, so exercising one exercises
+        // all of them). Compiled out entirely in production.
+        #[cfg(any(test, feature = "test-support"))]
+        if TEST_FORCE_HYDRATION_FAILURE_AFTER_HOLD_CLEARED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(PeerSessionError::HydrationFailed(path.to_string()));
+        }
 
         // Re-validate this attempt's captured authoring identity BEFORE
         // the physical write below -- an independent review's own deeper
@@ -11389,12 +11629,6 @@ impl PeerSyncSession {
             &root_commit_permit,
         )
         .await?;
-        // Apply the owner-executable bit
-        // currently recorded for this path (POSIX: real chmod; no-op,
-        // no error, on Windows) — hydration is a materialization path
-        // just like `materialize` below, so it gets the same treatment.
-        apply_unix_mode(&out_path, self.state.get_unix_mode(group_id, path)?)?;
-        apply_xattrs(&out_path, &self.state.get_xattrs(group_id, path)?)?;
         // Author-bound, not a blind `set_materialization_state`, for the
         // identical reason `HydratingStateGuard`'s own revert-on-drop is:
         // a concurrent update could still have superseded this row in the
@@ -11412,7 +11646,45 @@ impl PeerSyncSession {
         )? {
             return Err(PeerSessionError::HydrationFailed(path.to_string()));
         }
+        // The row is now durably `Hydrated` under this exact path -- clear
+        // only now, after that CAS confirmed it, matching every other
+        // physical mutator's "clear right after the durable step, never
+        // before" ordering. Deliberately BEFORE `apply_unix_mode`/
+        // `apply_xattrs` below, not after: those are real, fallible
+        // syscalls (a repeatable chmod EPERM or xattr EOPNOTSUPP is not
+        // hypothetical), and clearing only after them would leak this
+        // guard permanently on a REACHABLE steady state, not just a crash
+        // window -- content really is durably on disk and `Hydrated` at
+        // this point, and nothing else would ever re-drive materialization
+        // for this exact path again to clean the intent up, unlike a crash
+        // (which startup reconciliation revisits). `materialize`'s own
+        // on-demand-receive branch needed the identical fix for the
+        // identical reason -- see that call site's own comment -- so
+        // treat any future edit that reorders one of the two without the
+        // other as a regression in both, not a divergence to reconcile
+        // by matching whichever ordering happens to be there.
+        if let Some(guard) = hold_transition_intent_guard {
+            guard.clear()?;
+        }
         hydrating_guard.committed = true;
+        // Apply the owner-executable bit
+        // currently recorded for this path (POSIX: real chmod; no-op,
+        // no error, on Windows) — hydration is a materialization path
+        // just like `materialize` below, so it gets the same treatment.
+        // Best-effort relative to the commit above, not a precondition of
+        // it: a failure here still returns `Err` to the caller (so the
+        // caller still sees this hydration attempt as failed), but the
+        // row itself is already correctly `Hydrated` with real, matching
+        // content on disk -- only the exec-bit/xattrs may be stale, a
+        // separate, lower-severity gap, not the tombstone-safety
+        // "nothing on disk but nothing protects it either" shape this
+        // guard exists for.
+        #[cfg(any(test, feature = "test-support"))]
+        if TEST_FORCE_HYDRATION_FAILURE_DURING_METADATA_APPLY.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(PeerSessionError::HydrationFailed(path.to_string()));
+        }
+        apply_unix_mode(&out_path, self.state.get_unix_mode(group_id, path)?)?;
+        apply_xattrs(&out_path, &self.state.get_xattrs(group_id, path)?)?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -11621,24 +11893,96 @@ impl PeerSyncSession {
                                 let root = self.sync_root(group_id)?;
                                 let out_path = root.join(&local.path);
                                 self.verify_write_target(group_id, &out_path)?;
-                                apply_unix_mode(&out_path, meta.unix_mode)?;
-                                apply_xattrs(&out_path, &meta.xattrs)?;
+                                // This was the one metadata-repair call site
+                                // in this module that skipped the "bump before the
+                                // first mutating syscall, no exceptions"
+                                // fence discipline every other
+                                // `apply_unix_mode`/`apply_xattrs` call site
+                                // follows (see `try_apply_metadata_only_
+                                // update`'s and the equivalent-content
+                                // `Equal`-arm's own doc comments for the
+                                // identical fix, mirrored here exactly).
+                                // `apply_xattrs` unconditionally issues a
+                                // real `fsetxattr`/`fremovexattr` for every
+                                // desired name and silently swallows a
+                                // syscall failure by its own documented
+                                // contract -- without a preceding fence
+                                // bump, a real write failure here leaves the
+                                // live mutation fence unchanged, so an
+                                // already-published stale proof for this
+                                // path (published under the OLD fence
+                                // value) stays wrongly "current" and a later
+                                // consumer is told disk matches evidence it
+                                // does not.
+                                let metadata_already_matches_disk =
+                                    yadorilink_local_storage::unix_mode_already_matches_disk(
+                                        &out_path,
+                                        meta.unix_mode,
+                                    )? && yadorilink_local_storage::xattrs_already_match_disk(
+                                        &out_path,
+                                        &meta.xattrs,
+                                    )?;
+                                if metadata_already_matches_disk {
+                                    // A true zero-mutation verification --
+                                    // no syscall below will change anything,
+                                    // so this is a snapshot, never a bump.
+                                    self.state.dag_snapshot_mutation_fence(group_id, &local.path)?;
+                                } else {
+                                    self.state.dag_bump_mutation_fence(
+                                        group_id,
+                                        &local.path,
+                                        "equal_authoring_metadata_repair",
+                                    )?;
+                                    apply_unix_mode(&out_path, meta.unix_mode)?;
+                                    apply_xattrs(&out_path, &meta.xattrs)?;
+                                    // Surfaces a real `fsetxattr`/`fremovexattr`
+                                    // failure as a retriable error instead of
+                                    // letting `apply_xattrs`'s own
+                                    // silently-swallowed-failure contract
+                                    // fold it into a false settle.
+                                    require_replicated_xattrs_exact(
+                                        &local.path,
+                                        &out_path,
+                                        &meta.xattrs,
+                                    )?;
+                                }
                             }
                             RecordKind::Symlink => {
                                 let windows_opt_in =
                                     self.state.windows_symlink_opt_in_for_group(group_id)?;
-                                materialize_symlink_at(
-                                    SymlinkMaterialization {
-                                        state: self.state.as_ref(),
-                                        root: &self.sync_root(group_id)?,
+                                // This call site used to discard
+                                // `materialize_symlink_at`'s
+                                // returned outcome entirely, unlike the
+                                // ordinary `materialize()` symlink dispatch
+                                // (see this crate's own `SymlinkMaterializeOutcome::
+                                // PolicySkipped` handling there). A
+                                // `PolicySkipped` outcome here left the row
+                                // at whatever `materialization_state` it
+                                // already had -- reachable via this Equal-
+                                // authoring repair path independent of that
+                                // other call site's own fix.
+                                if matches!(
+                                    materialize_symlink_at(
+                                        SymlinkMaterialization {
+                                            state: self.state.as_ref(),
+                                            root: &self.sync_root(group_id)?,
+                                            group_id,
+                                            windows_opt_in,
+                                            origin_device_id: &incoming_origin,
+                                            authoring_change_hash: Some(incoming_author),
+                                            permit: &root_commit_permit,
+                                        },
+                                        &local,
+                                    )?,
+                                    SymlinkMaterializeOutcome::PolicySkipped
+                                ) {
+                                    self.state.set_materialization_state(
                                         group_id,
-                                        windows_opt_in,
-                                        origin_device_id: &incoming_origin,
-                                        authoring_change_hash: Some(incoming_author),
-                                        permit: &root_commit_permit,
-                                    },
-                                    &local,
-                                )?;
+                                        &local.path,
+                                        MaterializationState::Placeholder,
+                                        &root_commit_permit,
+                                    )?;
+                                }
                             }
                             // Nothing physical to reapply for a
                             // directory beyond the index columns
@@ -12474,6 +12818,42 @@ impl PeerSyncSession {
             // `create`/`rename` do. See `verify_delete_target`'s doc
             // comment.
             self.verify_delete_target(group_id, &out_path)?;
+            // Opened before the delete syscall below, not after -- same
+            // "before the bytes are written" contract every OTHER physical
+            // mutator in this codebase already follows
+            // (`MaterializationIntentGuard::open`'s own doc comment), just
+            // applied to a removal instead of a write. Without this, a
+            // crash between the `remove_file` below and `persist_
+            // materialized_record`'s own index commit leaves this row at
+            // whatever `materialization_state` it had BEFORE this
+            // tombstone (typically `Hydrated`, from being genuinely
+            // materialized until a moment ago) with the file now
+            // genuinely missing and `record.deleted` still `false` in the
+            // index -- exactly the "Hydrated + missing + no intent" shape
+            // every repair/reconcile scan disambiguates via this same
+            // intent journal. This path's projection obligation (bumped at
+            // this Delete `Change`'s own admission, before `materialize`
+            // was ever called for it) already covers most of that window,
+            // but only reliably for `reconcile_disk_with_ignore`'s live
+            // per-path read -- `materialization_repair.rs`'s own sweep
+            // reads a whole-pass SNAPSHOT of outstanding obligations, taken
+            // once per pass, so a sweep that started before this exact
+            // admission would miss it and could still emit a second,
+            // redundant tombstone for a path that is (accurately, just not
+            // yet index-confirmed) already gone -- harmless in outcome
+            // (the file really is deleted) but not something worth relying
+            // on when a real intent closes the gap outright. No target
+            // hash to record for a deletion's own intent (there is no
+            // content to name); `intent_target_hash(&[])` is a stable,
+            // deterministic sentinel nothing downstream compares against
+            // for this disambiguation -- only the intent's PRESENCE is
+            // ever read here, never its target.
+            let delete_intent_guard = self.state.open_materialization_intent_guard(
+                group_id,
+                &record.path,
+                &yadorilink_local_storage::intent_target_hash(&[]),
+                &root_commit_permit,
+            )?;
             // The fence is bumped, inside this path's lock (held by every
             // caller of `materialize` for
             // its whole call), before the first mutating syscall below --
@@ -12515,6 +12895,16 @@ impl PeerSyncSession {
                 origin_device_id,
                 authoring_change_hash,
             )?;
+            // Cleared only now, after the index durably reflects the
+            // deletion -- matching every other write branch's "clear right
+            // after the durable step, never before" ordering. An early `?`
+            // return above (a `remove_file` failure that isn't `NotFound`,
+            // or `persist_materialized_record` itself failing) drops this
+            // guard unconsumed instead, which is the correct fail-safe
+            // outcome: leave the intent open so the next pass treats this
+            // path as still mid-operation, never as a fresh offline
+            // deletion to (redundantly, but harmlessly) re-tombstone.
+            delete_intent_guard.clear()?;
             return Ok(MaterializeResult::Settled(SettlementEvidence::ExactAbsent {
                 mutation_generation,
             }));
@@ -12539,6 +12929,66 @@ impl PeerSyncSession {
             // colliding sibling was itself renamed/removed since the last
             // time this path was reconciled) must not keep a stale held
             // entry once it actually materializes normally again.
+            //
+            // A read, not itself a writer-gate write -- decides whether
+            // the guard just below is worth opening at all. Only an
+            // actual transition OUT of a hold needs it; this whole branch
+            // runs on EVERY symlink materialize (the ordinary case, not
+            // just a held one), and on Windows-without-symlink-opt-in
+            // every one of those retries forever on the same capped
+            // backoff -- opening (and idempotently re-upserting) this
+            // extra intent unconditionally on every single retry, for a
+            // path that was never actually held, is a real, avoidable
+            // write on a path this codebase already measures the cost of
+            // seriously elsewhere (see the writer-gate cost discussion
+            // near this crate's no-op-write instrumentation), and breaks
+            // the intent repository's own documented "empty in steady
+            // state" invariant for good. Same reasoning and gating as
+            // `hydrate_file_with_timeout_locked`'s identical `was_held`
+            // check.
+            let was_held = self.state.get_held_state(group_id, &record.path)?.is_some();
+            // Opened BEFORE `clear_held`, not after: a held row is
+            // `Placeholder` with `held_reason` set -- the SET `held_reason`
+            // is itself what protects it from the tombstone loop while
+            // held. The instant `clear_held` clears that column, the row
+            // looks like an ordinary, unprotected `Placeholder` row until
+            // `materialize_symlink_at` either writes the symlink and opens
+            // its own intent, or (a `PolicySkipped` outcome -- no recorded
+            // target, or Windows-without-opt-in) opens no intent at all and
+            // just returns. Without this guard, a `PolicySkipped` exit --
+            // or any transient failure `materialize_symlink_at` itself
+            // could raise before reaching its own intent-guard open --
+            // lands the row at `Placeholder`, `held_reason` NULL, no intent,
+            // and (this row never carries a projection obligation once
+            // hazard settlement deleted it) no obligation either: none of
+            // the tombstone loop's three vetoes. Idempotent with whatever
+            // `materialize_symlink_at` opens next for the same target (see
+            // `MaterializationIntentRepository::begin_materialization_
+            // intent`'s own upsert semantics) -- this is not a race with
+            // it, just closing the gap before it. `intent_target_hash(&[])`
+            // mirrors the tombstone-delete path's own sentinel for "no
+            // content to name yet" when no target is recorded at all.
+            // Intentionally never consumed explicitly (no `.clear()` call):
+            // held until this whole match arm returns, at which point it
+            // drops without clearing -- exactly the fail-safe "leave the
+            // intent dangling" outcome this guard exists to guarantee for
+            // a `PolicySkipped`/failure exit. `materialize_symlink_at`'s
+            // own success path clears the SAME underlying row via its own,
+            // separately-opened guard (see this call's own comment above).
+            let _pre_clear_hold_intent_guard = if was_held {
+                Some(self.state.open_materialization_intent_guard(
+                    group_id,
+                    &record.path,
+                    &self
+                        .state
+                        .get_symlink_target(group_id, &record.path)?
+                        .map(|target| yadorilink_local_storage::intent_target_hash_for_bytes(&target))
+                        .unwrap_or_else(|| yadorilink_local_storage::intent_target_hash(&[])),
+                    &root_commit_permit,
+                )?)
+            } else {
+                None
+            };
             self.state.clear_held(group_id, &record.path)?;
             let windows_opt_in = self.state.windows_symlink_opt_in_for_group(group_id)?;
             // `materialize_symlink_at` itself bumps the mutation fence,
@@ -12582,7 +13032,39 @@ impl PeerSyncSession {
                         mutation_generation,
                     )?))
                 }
-                SymlinkMaterializeOutcome::PolicySkipped => Ok(MaterializeResult::RetryRequired),
+                SymlinkMaterializeOutcome::PolicySkipped => {
+                    // A policy-skipped
+                    // symlink row was left at `materialization_state`'s
+                    // schema default of `Hydrated` (the row commit inside
+                    // `materialize_symlink_at` never demotes it, unlike
+                    // the analogous Placeholder pattern used for a
+                    // not-fully-fetched regular file just below). A
+                    // `Hydrated` row with nothing physically on disk and
+                    // no materialization intent is exactly what the
+                    // periodic repair sweep (`repair_interrupted_
+                    // materializations`) reads as an offline deletion --
+                    // which it then journals dirty and the always-running
+                    // dirty-journal redrive turns into a real, signed,
+                    // GROUP-WIDE PROPAGATING tombstone `Change`, deleting
+                    // this path from every peer even though the policy
+                    // skip was meant to be a benign, local-only decision.
+                    // Demoting to `Placeholder` here (mirroring the
+                    // regular-file "not really materialized yet" pattern)
+                    // keeps the repair sweep's own `materialization_state
+                    // != Hydrated` pre-filter from ever examining this row
+                    // in the first place. See `repair_one_interrupted_
+                    // symlink`'s matching policy check for the
+                    // defense-in-depth half of this fix, covering a
+                    // legacy row already stuck at `Hydrated` before this
+                    // retry has a chance to correct it.
+                    self.state.set_materialization_state(
+                        group_id,
+                        &record.path,
+                        MaterializationState::Placeholder,
+                        &root_commit_permit,
+                    )?;
+                    Ok(MaterializeResult::RetryRequired)
+                }
             };
         }
 
@@ -12950,8 +13432,10 @@ impl PeerSyncSession {
                 // though this attempt itself never publishes one (it
                 // returns `RetryRequired`, carrying no evidence).
                 self.state.dag_bump_mutation_fence(group_id, &record.path, "eager_placeholder_write")?;
-                match create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)?
-                {
+                let placeholder_outcome =
+                    create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)?;
+                let placeholder_deferred = placeholder_outcome.is_deferred_to_a_separate_process();
+                match placeholder_outcome {
                     PlaceholderIdentityToRecord::RecordOverwrite { identity, provider_kind } => {
                         self.state.record_placeholder_generation(
                             group_id,
@@ -12976,14 +13460,34 @@ impl PeerSyncSession {
                         &root_commit_permit,
                     )?,
                 }
-                apply_unix_mode(&out_path, self.state.get_unix_mode(group_id, &record.path)?)?;
-                apply_xattrs(&out_path, &self.state.get_xattrs(group_id, &record.path)?)?;
-                // Clear the intent only now, after the placeholder is
-                // durably on disk (M5-A Pass 11 finding, correcting an
-                // earlier version of this fix that cleared BEFORE `create_
-                // or_defer_placeholder` -- see the OnDemand branch below
-                // for the full reasoning, identical here).
-                intent_guard.clear()?;
+                // Clear the intent right after the placeholder write is
+                // confirmed, BEFORE `apply_unix_mode`/`apply_xattrs` below
+                // -- correcting an earlier version of this fix that
+                // cleared BEFORE `create_or_defer_placeholder` instead
+                // (see the OnDemand branch below for the fuller
+                // reasoning). Those are real, fallible syscalls (a
+                // repeatable chmod EPERM or xattr EOPNOTSUPP is not
+                // hypothetical), and clearing only after them would leak
+                // this guard permanently were a failure to hit there: the
+                // placeholder is already durably on disk (this device's
+                // own write, not a peer's content), so nothing would ever
+                // re-drive materialization for this exact path again to
+                // clean the intent up. Also skipped entirely when Windows
+                // deferred the write to `cfapi-host.exe`: nothing is
+                // actually on disk yet in that case, so the intent must
+                // stay open -- this call already returns `RetryRequired`
+                // below regardless, so a later retry naturally
+                // re-examines this path.
+                if !placeholder_deferred {
+                    intent_guard.clear()?;
+                    // Also skipped when deferred: nothing was actually
+                    // written under `out_path` yet on Windows, so there is
+                    // no real file to apply the exec bit/xattrs to -- both
+                    // are real syscalls against a path that does not exist
+                    // in that case.
+                    apply_unix_mode(&out_path, self.state.get_unix_mode(group_id, &record.path)?)?;
+                    apply_xattrs(&out_path, &self.state.get_xattrs(group_id, &record.path)?)?;
+                }
                 // Eager/pinned wanted real content but not every block was
                 // available -- this is a retriable Placeholder, not a
                 // settled outcome (the confirmed bug this type exists to
@@ -12999,9 +13503,14 @@ impl PeerSyncSession {
             // available` on the on-demand-sync path.
             tracing::warn!("M6PHASE T_recv_all_blocks_available: every block this file needs is now local");
             // Open the single sanctioned materialization-intent seam BEFORE
-            // committing the brand-new row below. `upsert_file_with_origin`
-            // INSERTs a fresh row that defaults to `Hydrated`, and that commit
-            // is durable (`PRAGMA synchronous = FULL`) — so a crash *after* it
+            // committing the brand-new row below. This branch deliberately
+            // stamps the row `Hydrated` optimistically, before the temp-
+            // write-then-rename even begins (see the explicit stamp right
+            // after `persist_materialized_record` below -- `upsert_file_
+            // with_origin` itself no longer defaults a fresh row to
+            // `Hydrated`; the schema's own default is `Placeholder` as of
+            // v25, see `SCHEMA_VERSION`'s doc comment), and that commit is
+            // durable (`PRAGMA synchronous = FULL`) — so a crash *after* it
             // but before the temp-write-then-rename lands would otherwise leave
             // a `Hydrated` row with no file on disk, its blocks present, and no
             // intent. Startup/periodic repair reads exactly that state as an
@@ -13026,6 +13535,19 @@ impl PeerSyncSession {
                 record,
                 origin_device_id,
                 authoring_change_hash,
+            )?;
+            // Explicit now, not implicit via a column default (see this
+            // block's own opening comment): the row is deliberately marked
+            // `Hydrated` here, before the physical write below, matching
+            // this whole branch's established optimistic-commit design --
+            // the intent guard just opened is what makes that safe across a
+            // crash, same as `open_projected_upserts_batch`'s identical
+            // batched-receive shape.
+            self.state.set_materialization_state(
+                group_id,
+                &record.path,
+                MaterializationState::Hydrated,
+                &root_commit_permit,
             )?;
             // Invariant (the whole point of the seam): a brand-new `Hydrated`
             // content row is never committed for a not-yet-written file without
@@ -13158,8 +13680,10 @@ impl PeerSyncSession {
                     &record.path,
                     "eager_reconstruct_failed_placeholder_write",
                 )?;
-                match create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)?
-                {
+                let placeholder_outcome =
+                    create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)?;
+                let placeholder_deferred = placeholder_outcome.is_deferred_to_a_separate_process();
+                match placeholder_outcome {
                     PlaceholderIdentityToRecord::RecordOverwrite { identity, provider_kind } => {
                         self.state.record_placeholder_generation(
                             group_id,
@@ -13184,14 +13708,29 @@ impl PeerSyncSession {
                         &root_commit_permit,
                     )?,
                 }
-                apply_unix_mode(&out_path, self.state.get_unix_mode(group_id, &record.path)?)?;
-                apply_xattrs(&out_path, &self.state.get_xattrs(group_id, &record.path)?)?;
-                // Clear the intent only now, after the placeholder is
-                // durably on disk (M5-A Pass 11 finding, correcting an
-                // earlier version of this fix that cleared BEFORE `create_
-                // or_defer_placeholder` -- see the OnDemand branch below
-                // for the full reasoning, identical here).
-                intent_guard.clear()?;
+                // Clear the intent right after the placeholder write is
+                // confirmed, BEFORE `apply_unix_mode`/`apply_xattrs` below
+                // -- those are real, fallible syscalls (a repeatable chmod
+                // EPERM or xattr EOPNOTSUPP is not hypothetical), and
+                // clearing only after them would leak this guard
+                // permanently on a REACHABLE steady state were a failure
+                // to hit there: the placeholder is already durably on
+                // disk (this device's own write, not a peer's content),
+                // so nothing would ever re-drive materialization for this
+                // exact path again to clean the intent up. Also skipped
+                // entirely when Windows deferred the write to
+                // `cfapi-host.exe`: nothing is actually on disk yet in
+                // that case, so the intent must stay open (see the
+                // OnDemand branch below for the fuller reasoning, identical
+                // here).
+                if !placeholder_deferred {
+                    intent_guard.clear()?;
+                    // Also skipped when deferred: nothing was actually
+                    // written under `out_path` yet on Windows, so there is
+                    // no real file to apply the exec bit/xattrs to.
+                    apply_unix_mode(&out_path, self.state.get_unix_mode(group_id, &record.path)?)?;
+                    apply_xattrs(&out_path, &self.state.get_xattrs(group_id, &record.path)?)?;
+                }
                 // Reconstruct never actually succeeded despite the blocks
                 // being fetched -- demoted to a retriable Placeholder, not
                 // a settled outcome (same reasoning as the `!all_present`
@@ -13229,8 +13768,9 @@ impl PeerSyncSession {
             // M6-2 receiver-phase-decomposition: on this (eager-
             // materialize) path the index row was already committed
             // `Hydrated` earlier, optimistically, before the file write
-            // even began (see `persist_materialized_record`'s own doc
-            // comment above) -- unlike `hydration.rs`'s on-demand path,
+            // even began (see the explicit `set_materialization_state`
+            // call right after `persist_materialized_record` above) --
+            // unlike `hydration.rs`'s on-demand path,
             // where the `Hydrated` transition is the LAST step. The
             // intent-guard clear just above is what actually makes this
             // materialization durably crash-safe/complete on this path,
@@ -13313,7 +13853,10 @@ impl PeerSyncSession {
             // land, to invalidate any stale exact-object proof this path
             // may already carry.
             self.state.dag_bump_mutation_fence(group_id, &record.path, "ondemand_placeholder_write")?;
-            match create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)? {
+            let placeholder_outcome =
+                create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)?;
+            let placeholder_deferred = placeholder_outcome.is_deferred_to_a_separate_process();
+            match placeholder_outcome {
                 PlaceholderIdentityToRecord::RecordOverwrite { identity, provider_kind } => {
                     self.state.record_placeholder_generation(
                         group_id,
@@ -13338,34 +13881,74 @@ impl PeerSyncSession {
                     &root_commit_permit,
                 )?,
             }
+            if placeholder_deferred {
+                // Windows: `create_or_defer_placeholder` wrote nothing --
+                // the real reparse-point placeholder is created later by
+                // `cfapi-host.exe`'s own poll, not by this call. This is
+                // NOT a settled outcome the way the non-deferred case
+                // below is: settling `PolicyPlaceholder` completes this
+                // path's projection obligation, and clearing the intent
+                // removes the last thing protecting a path that genuinely
+                // has nothing under its own name yet. Both would leave
+                // this row with none of the tombstone loop's three
+                // vetoes, on the ordinary on-demand-receive path every
+                // Windows OnDemand-policy device takes for every normal
+                // incoming file -- not a rare or dormant shape. Left open
+                // deliberately (no mechanism in this codebase yet
+                // observes `cfapi-host.exe`'s own confirmation), and
+                // retried: a fresh `materialize` call for this path is
+                // idempotent here (`RecordIfAbsent`'s own persist
+                // discipline never overwrites a generation already
+                // in use). Deliberately returns BEFORE `apply_unix_mode`/
+                // `apply_xattrs` below too: those are real syscalls
+                // against a path nothing has actually created yet.
+                return Ok(MaterializeResult::RetryRequired);
+            }
+            // This IS a settled outcome (unlike the eager/pinned
+            // placeholder above, and unlike the deferred case just
+            // above): on-demand policy deliberately defers content until
+            // access, it did not want the blocks now and fail to get
+            // them, and the real placeholder write above just durably
+            // completed synchronously.
+            //
+            // Clear the intent right after that write is confirmed,
+            // BEFORE `apply_unix_mode`/`apply_xattrs` below -- correcting
+            // an earlier version of this fix that cleared BEFORE `create_
+            // or_defer_placeholder` instead, trading a benign outcome (a
+            // stale intent left open past a later failure --
+            // `materialization_repair.rs`'s own doc says repair treats an
+            // open intent as safe, deferring rather than tombstoning) for
+            // a harmful one (row committed as non-deleted Placeholder, no
+            // file on disk, no intent -- exactly what the startup
+            // reconciliation scan reads as an offline deletion). Clearing
+            // only AFTER `apply_unix_mode`/`apply_xattrs` has the same
+            // harmful shape from the other direction: a repeatable chmod
+            // EPERM or xattr EOPNOTSUPP there would leak this guard
+            // permanently -- the placeholder is already durably on disk
+            // by this point (this device's own write, not a peer's
+            // content), so nothing would ever re-drive materialization
+            // for this exact path again to clean the intent up. This is
+            // the ordinary on-demand-receive path, so the window's
+            // frequency is far higher than on the eager/pinned branches
+            // this pattern was copied from. An early `?` return on any
+            // step above still drops the guard without clearing, which is
+            // the safe (defer-the-delete) failure mode, matching the
+            // eager/pinned `Hydrated` branch's own established ordering.
+            intent_guard.clear()?;
+            let settled = MaterializeResult::Settled(SettlementEvidence::PolicyPlaceholder);
             // A placeholder still gets the recorded exec bit
             // applied now — `hydrate_file_with_timeout` re-applies it
             // again once real content lands, so this is never lost
-            // across the placeholder → hydrated transition either. This
-            // IS a settled outcome (unlike the eager/pinned placeholder
-            // above): on-demand policy deliberately defers content until
-            // access, it did not want the blocks now and fail to get
-            // them.
+            // across the placeholder → hydrated transition either. Best-
+            // effort relative to the settlement above, not a precondition
+            // of it: a failure here still returns `Err` to the caller,
+            // but the row and intent are already correctly settled --
+            // only the exec-bit/xattrs may be stale, a separate, lower-
+            // severity gap, not the tombstone-safety shape this ordering
+            // exists to close.
             apply_unix_mode(&out_path, self.state.get_unix_mode(group_id, &record.path)?)?;
             apply_xattrs(&out_path, &self.state.get_xattrs(group_id, &record.path)?)?;
-            // Clear the intent only now, after the placeholder is
-            // durably on disk (M5-A Pass 11 finding, correcting an
-            // earlier version of this fix): clearing BEFORE `create_or_
-            // defer_placeholder` traded a benign outcome (a stale intent
-            // left open past a later failure -- `materialization_repair.
-            // rs`'s own doc says repair treats an open intent as safe,
-            // deferring rather than tombstoning) for a harmful one
-            // (row committed as non-deleted Placeholder, no file on
-            // disk, no intent -- exactly what the startup reconciliation
-            // scan reads as an offline deletion). This is the ordinary
-            // on-demand-receive path, so the window's frequency was far
-            // higher than on the eager/pinned branches this pattern was
-            // copied from. An early `?` return on any step above still
-            // drops the guard without clearing, which is the safe
-            // (defer-the-delete) failure mode, matching the eager/pinned
-            // `Hydrated` branch's own established ordering.
-            intent_guard.clear()?;
-            Ok(MaterializeResult::Settled(SettlementEvidence::PolicyPlaceholder))
+            Ok(settled)
         }
     }
 
@@ -13938,8 +14521,8 @@ mod eager_admission_tests {
 #[cfg(test)]
 mod symlink_and_metadata_only_update_tests {
     use super::{
-        materialize_symlink_at, try_apply_metadata_only_update, BlockInfo, FileRecord, RecordKind,
-        SymlinkMaterialization, SymlinkMaterializeOutcome,
+        materialize_symlink_at, try_apply_metadata_only_update, BlockInfo, FileRecord,
+        MaterializationState, RecordKind, SymlinkMaterialization, SymlinkMaterializeOutcome,
     };
     use crate::ports::PeerReplicaStatePort;
     use crate::test_support::FakeReplicaState;
@@ -14011,6 +14594,14 @@ mod symlink_and_metadata_only_update_tests {
         );
         assert_eq!(std::fs::read_link(&out_path).unwrap(), std::path::Path::new("target.txt"));
         assert!(!state.get_file("group-1", "link.txt").unwrap().unwrap().deleted);
+        // The symlink genuinely exists on disk under its exact name now --
+        // `materialize_symlink_at`'s own stamp on this `WrittenExact`
+        // branch is what earns `Hydrated` here, not the schema's own
+        // `Placeholder` default.
+        assert_eq!(
+            state.get_materialization_state("group-1", "link.txt").unwrap(),
+            Some(MaterializationState::Hydrated),
+        );
     }
 
     /// A free function, not a `PeerSyncSession` method, so it cannot go
@@ -14761,6 +15352,40 @@ mod hazard_reason_tests {
         assert!(
             !root.path().join("CON.txt").exists(),
             "a held record must never be written to disk"
+        );
+    }
+
+    /// Reachable on every platform (not
+    /// just via Windows symlink policy): a brand-new held row is left at
+    /// `materialization_state`'s schema default of `Hydrated`, even though
+    /// nothing is ever written to disk for it (the assertion just above --
+    /// `!root.path().join("CON.txt").exists()` -- is unconditionally true
+    /// for every held record, by this function's own contract). A
+    /// `Hydrated` row with nothing on disk and no materialization intent is
+    /// exactly what the periodic repair sweep reads as an offline deletion,
+    /// and the always-running dirty-journal redrive turns that into a real,
+    /// signed, group-wide propagating tombstone Change for a path that was
+    /// only ever held, never deleted.
+    #[test]
+    fn hold_record_demotes_to_placeholder_so_repair_never_reads_it_as_an_offline_deletion() {
+        let state = FakeReplicaState::new();
+        let incoming = record("CON.txt");
+
+        hold_record(
+            &state,
+            "group-1",
+            &incoming,
+            "invalid_name: reserved device name 'CON'",
+            "device-a",
+            None,
+            &yadorilink_root_authority::root_commit::RootCommitPermit::for_tests(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.get_materialization_state("group-1", "CON.txt").unwrap(),
+            Some(yadorilink_replica_domain::session_state::MaterializationState::Placeholder),
+            "a held row must never be left at the schema-default Hydrated state"
         );
     }
 

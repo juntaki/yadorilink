@@ -843,26 +843,103 @@ fn persist_history_base_and_boundary(
     Ok(())
 }
 
+/// A rebootstrap-from-peer-snapshot install (currently unreachable in
+/// production -- gated behind `yadorilink_replica_engine::rebootstrap::
+/// COMPACTION_SCHEDULING_READY == false`, see that constant's own doc
+/// comment) that nonetheless deletes and re-inserts every `files` row for
+/// the group. `SnapshotFile` (peer-shared, wire-derived) has no
+/// `held_reason`/`held_since_unix_nanos`/`pinned` fields at all -- these
+/// are purely local, device-specific state, never sent over the wire (see
+/// `MaterializationStateRepository::set_held`'s own doc comment) -- so a
+/// plain DELETE+re-INSERT would silently wipe them for every path,
+/// regardless of whether this device still has a live, unresolved reason
+/// to protect that exact path.
+///
+/// For a hazard-held path this is the SAME "Hydrated-with-nothing-on-disk
+/// looks like an offline deletion" bug class via a ninth mechanism:
+/// `hold_record` opens no materialization intent (by design), and
+/// `HazardHeld` settlement deliberately deletes that path's projection
+/// obligation, on the theory that `held_reason` alone is what protects it
+/// from then on. Losing `held_reason` here removes that last protection
+/// with nothing compensating -- and the row becomes invisible to the
+/// hazard-recheck sweep too (`list_held_paths` reads `held_reason IS NOT
+/// NULL`). `pinned` is simpler but the same shape of bug: silently
+/// unpinning a file makes it evictable without any user action.
+///
+/// Captured here, before the DELETE, and reapplied below for any path
+/// this snapshot still carries as a live (`state == Current`, not
+/// deleted) row -- the same condition that already decides
+/// `materialization_state` just below, since a path this snapshot itself
+/// says is now deleted, or superseded, has no live row to protect. See
+/// this function's own post-insert `debug_assert!` for the enforced
+/// half of this invariant.
+///
+/// `pinned` and `held_reason`/`held_since_unix_nanos` are captured
+/// together but carried forward under DIFFERENT conditions below --
+/// deliberately, not an oversight. A pin is path-keyed user intent ("I
+/// always want this path's content locally"), not content-keyed, so it
+/// must survive a delete-then-resurrect at this path exactly the way
+/// `upsert_file_in_tx`'s own ordinary carry-forward already does
+/// unconditionally (it reads whatever the current row was, deleted or
+/// not, when superseding it -- see that function's own doc comment): the
+/// captured `deleted` flag is NOT consulted for `pinned` below. A hold is
+/// the opposite: it exists to protect a specific NAME from being
+/// misclassified as offline-deleted while nothing is on disk under it,
+/// which is meaningless for a row this device itself already believes is
+/// deleted -- so `held_reason`/`held_since_unix_nanos` are only carried
+/// forward when the captured row was NOT deleted, same as before.
 fn replace_group_files_from_snapshot(
     conn: &Connection,
     group_id: &str,
     files: &[SnapshotFile],
 ) -> Result<(), SyncSqliteError> {
+    let local_only_state: HashMap<String, (Option<String>, Option<i64>, bool, bool)> = {
+        let mut stmt = conn.prepare(
+            "SELECT path, held_reason, held_since_unix_nanos, pinned, deleted FROM files \
+             WHERE group_id = ?1 AND state = 'current'",
+        )?;
+        let rows = stmt.query_map([group_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, i64>(4)? != 0,
+            ))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (path, held_reason, held_since_unix_nanos, pinned, deleted) = row?;
+            map.insert(path, (held_reason, held_since_unix_nanos, pinned, deleted));
+        }
+        map
+    };
+
     conn.execute("DELETE FROM files WHERE group_id = ?1", [group_id])?;
     for file in files {
         let blocks_json = serde_json::to_string(&file.record.blocks)?;
-        let materialization_state =
-            if file.state == SnapshotVersionState::Current && !file.record.deleted {
-                "placeholder"
-            } else {
-                "hydrated"
-            };
+        let is_live_current = file.state == SnapshotVersionState::Current && !file.record.deleted;
+        let materialization_state = if is_live_current { "placeholder" } else { "hydrated" };
+        let captured = is_live_current.then(|| local_only_state.get(&file.record.path)).flatten();
+        // Unconditional on the captured row's own `deleted` flag -- see
+        // this function's own doc comment for why a pin must survive a
+        // delete-then-resurrect at this path.
+        let pinned = captured.map(|(_, _, pinned, _)| *pinned).unwrap_or(false);
+        // Gated on the captured row's `deleted` flag too, unlike `pinned`
+        // just above -- see this function's own doc comment for why.
+        let (held_reason, held_since_unix_nanos) = captured
+            .filter(|(_, _, _, deleted)| !deleted)
+            .map(|(held_reason, held_since_unix_nanos, _, _)| {
+                (held_reason.clone(), *held_since_unix_nanos)
+            })
+            .unwrap_or((None, None));
         conn.execute(
             "INSERT INTO files \
              (group_id, path, size, mtime_unix_nanos, blocks_json, deleted, \
               version_seq, state, origin_device_id, materialization_state, pinned, \
-              record_kind, symlink_target, unix_mode, symlink_out_of_root) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12, ?13, ?14)",
+              record_kind, symlink_target, unix_mode, symlink_out_of_root, \
+              held_reason, held_since_unix_nanos) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 group_id,
                 &file.record.path,
@@ -874,13 +951,105 @@ fn replace_group_files_from_snapshot(
                 file.state.as_db_str(),
                 file.origin_device_id.as_deref(),
                 materialization_state,
+                pinned as i64,
                 file.record_kind.as_db_str(),
                 file.symlink_target.as_deref(),
                 crate::file_index::encode_unix_mode_column(file.unix_mode),
                 file.symlink_out_of_root as i64,
+                held_reason,
+                held_since_unix_nanos,
             ],
         )?;
     }
+    // Separate, non-blocking data-fidelity gap in this same INSERT, not
+    // part of the held/pinned fix above: `file.xattrs` is decoded off the
+    // wire (`SnapshotFile::xattrs`) but never written to `xattrs_json`
+    // here, and `authoring_change_hash`/the placeholder-identity columns
+    // are dropped the same way -- none of these are read anywhere this
+    // function's own callers depend on today, so this is not part of the
+    // P0 tombstone-safety chain, just an accuracy gap worth a follow-up.
+
+    // Hard, code-enforced half of this fix, not just the apply logic
+    // above: re-reads the ACTUAL persisted state (a fresh SELECT, not the
+    // in-memory bookkeeping the loop above already trusted) and checks it
+    // against what was captured before the DELETE. `COMPACTION_SCHEDULING_
+    // READY` must not flip true while this invariant can silently break --
+    // a future edit to this function that drops the held/pinned carry-
+    // forward trips this in any debug build that exercises a rebootstrap
+    // install, not just in the one production scenario that would
+    // otherwise be the only thing to ever notice.
+    #[cfg(debug_assertions)]
+    {
+        let mut stmt = conn.prepare(
+            "SELECT path, held_reason, held_since_unix_nanos, pinned FROM files \
+             WHERE group_id = ?1 AND state = 'current'",
+        )?;
+        let persisted: HashMap<String, (Option<String>, Option<i64>, bool)> = stmt
+            .query_map([group_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, i64>(3)? != 0,
+                    ),
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        for (path, (held_reason, held_since_unix_nanos, pinned, captured_deleted)) in
+            &local_only_state
+        {
+            let still_live_current = files.iter().any(|f| {
+                &f.record.path == path
+                    && f.state == SnapshotVersionState::Current
+                    && !f.record.deleted
+            });
+            if !still_live_current {
+                continue;
+            }
+            let (persisted_held, persisted_since, persisted_pinned) =
+                persisted.get(path).cloned().unwrap_or((None, None, false));
+            // `pinned` is checked unconditionally here -- NOT gated on
+            // `captured_deleted` -- matching the apply logic above: a pin
+            // must survive even when the captured row was itself already
+            // deleted (see this function's own doc comment).
+            debug_assert_eq!(
+                persisted_pinned, *pinned,
+                "rebootstrap-snapshot install dropped pinned for a path that survives as a live \
+                 current row: {path}"
+            );
+            if *captured_deleted {
+                // The captured row was itself already deleted -- held_reason/
+                // held_since_unix_nanos are deliberately NOT carried forward
+                // in that case (see this function's own doc comment), so
+                // nothing further to check for this path.
+                continue;
+            }
+            debug_assert_eq!(
+                persisted_held.is_some(),
+                held_reason.is_some(),
+                "rebootstrap-snapshot install dropped held_reason for a path that survives as a \
+                 live current row: {path}"
+            );
+            // Checked separately from `held_reason` above, not folded into
+            // one tuple comparison: `get_held_state`'s own doc comment
+            // notes the two columns are only ever written/cleared
+            // together, but a regression that kept `held_reason` while
+            // dropping `held_since_unix_nanos` would produce the exact
+            // same "row still looks held" outcome the check above alone
+            // cannot see -- `HeldState`'s `since_unix_nanos` field is
+            // still read by callers (e.g. hazard-recheck age-based
+            // policy), so a silently zeroed timestamp is its own bug even
+            // though it doesn't change whether the tombstone loop's
+            // `is_held` veto fires.
+            debug_assert_eq!(
+                persisted_since, *held_since_unix_nanos,
+                "rebootstrap-snapshot install dropped held_since_unix_nanos for a path that \
+                 survives as a live current row: {path}"
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -1231,5 +1400,223 @@ fn op_version_hash(op: &Op) -> Option<VersionHash> {
     match op {
         Op::Put { version, .. } | Op::Move { version, .. } => Some(*version),
         Op::Delete { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod replace_group_files_from_snapshot_tests {
+    use super::*;
+    use yadorilink_replica_domain::file::{FileRecord, RecordKind};
+
+    /// Full schema: DAG tables first (`yadorilink_sqlite_runtime::
+    /// init_schema` assumes `changes`/`pruned_changes` already exist, per
+    /// its own doc comment), then the real `files` table -- mirrors
+    /// `materialization_state.rs`'s own `held_state_tests::
+    /// open_full_test_db`.
+    fn open_full_test_db() -> Arc<SyncDatabase> {
+        Arc::new(
+            SyncDatabase::open_in_memory(|conn| {
+                crate::dag_store::init_dag_schema(conn).map_err(|e| {
+                    yadorilink_sqlite_runtime::DatabaseError::CorruptSchema(e.to_string())
+                })?;
+                yadorilink_sqlite_runtime::init_schema(conn)
+            })
+            .expect("open in-memory db"),
+        )
+    }
+
+    fn snapshot_file(path: &str) -> SnapshotFile {
+        SnapshotFile {
+            record: FileRecord {
+                path: path.to_string(),
+                size: 0,
+                mtime_unix_nanos: 0,
+                blocks: vec![],
+                deleted: false,
+            },
+            version_seq: 1,
+            state: SnapshotVersionState::Current,
+            origin_device_id: Some("device-a".to_string()),
+            record_kind: RecordKind::File,
+            symlink_target: None,
+            symlink_out_of_root: false,
+            unix_mode: None,
+            xattrs: Vec::new(),
+        }
+    }
+
+    /// The ninth route in the "row claims content is really on disk (or
+    /// genuinely needs protecting) but nothing protects it" bug family:
+    /// `SnapshotFile` (wire-derived, peer-shared) carries no held/pinned
+    /// fields at all, so a rebootstrap-snapshot install's DELETE+re-INSERT
+    /// of `files` must explicitly carry these purely-local columns
+    /// forward itself for a path that survives the install as a live
+    /// current row -- nothing else ever will.
+    #[test]
+    fn a_held_and_pinned_path_survives_a_snapshot_install() {
+        let db = open_full_test_db();
+        let repo =
+            crate::materialization_state::MaterializationStateRepository::new(db.clone());
+        db.write::<_, SyncSqliteError>(|conn| {
+            conn.execute(
+                "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json) \
+                 VALUES ('group-1', 'held.txt', 0, 0, '[]')",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE files SET pinned = 1 WHERE group_id = 'group-1' AND path = 'held.txt'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        repo.set_held("group-1", "held.txt", "case_collision", 1000).unwrap();
+
+        let files = vec![snapshot_file("held.txt")];
+        db.write::<_, SyncSqliteError>(|conn| {
+            replace_group_files_from_snapshot(conn, "group-1", &files)
+        })
+        .unwrap();
+
+        assert_eq!(
+            repo.get_held_state("group-1", "held.txt").unwrap().map(|h| h.reason),
+            Some("case_collision".to_string()),
+            "a hazard hold must survive a rebootstrap-snapshot install for a path the snapshot \
+             still carries as a live current row"
+        );
+        let pinned: bool = db
+            .read::<_, SyncSqliteError>(|conn| {
+                Ok(conn.query_row(
+                    "SELECT pinned FROM files WHERE group_id = 'group-1' AND path = 'held.txt' \
+                     AND state = 'current'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )? != 0)
+            })
+            .unwrap();
+        assert!(pinned, "pinned must survive a rebootstrap-snapshot install the same way");
+    }
+
+    /// The inverse: a path the snapshot no longer carries as a live
+    /// current row must NOT resurrect a stale hold or pin -- there is no
+    /// live row left to protect, and the row is about to be classified
+    /// `hydrated`, not `placeholder`, by this same function's own
+    /// materialization_state branch just above. Covers both shapes of
+    /// "no longer live-current": entirely absent from the snapshot, and
+    /// present but as a `Current`-but-deleted tombstone -- the latter is
+    /// the one that actually exercises `is_live_current`'s own
+    /// `!file.record.deleted` half; the former never reaches that check
+    /// at all (the path is simply never visited by the insert loop),
+    /// which alone would not have caught a regression in that condition.
+    #[test]
+    fn a_held_path_the_snapshot_no_longer_carries_as_current_does_not_resurrect_the_hold() {
+        let db = open_full_test_db();
+        let repo =
+            crate::materialization_state::MaterializationStateRepository::new(db.clone());
+        db.write::<_, SyncSqliteError>(|conn| {
+            conn.execute(
+                "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json) \
+                 VALUES ('group-1', 'gone.txt', 0, 0, '[]')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json) \
+                 VALUES ('group-1', 'deleted-upstream.txt', 0, 0, '[]')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        repo.set_held("group-1", "gone.txt", "case_collision", 1000).unwrap();
+        repo.set_held("group-1", "deleted-upstream.txt", "case_collision", 1000).unwrap();
+
+        // "gone.txt" is entirely absent from the incoming snapshot;
+        // "deleted-upstream.txt" IS present, but as a Current-but-deleted
+        // tombstone, not a live row -- the shape `is_live_current` itself
+        // must refuse to treat as still needing hold/pin protection.
+        let mut deleted_file = snapshot_file("deleted-upstream.txt");
+        deleted_file.record.deleted = true;
+        let files = vec![deleted_file];
+        db.write::<_, SyncSqliteError>(|conn| {
+            replace_group_files_from_snapshot(conn, "group-1", &files)
+        })
+        .unwrap();
+
+        assert!(
+            repo.get_held_state("group-1", "gone.txt").unwrap().is_none(),
+            "a path the snapshot no longer mentions at all must not still read as held \
+             afterward"
+        );
+        assert!(
+            repo.get_held_state("group-1", "deleted-upstream.txt").unwrap().is_none(),
+            "a path the snapshot now carries as a deleted tombstone must not still read as \
+             held afterward"
+        );
+    }
+
+    /// `pinned` and `held_reason` are captured under the same condition
+    /// but carried forward differently: a pin is path-keyed user intent,
+    /// not content-keyed, so it must survive a delete-then-resurrect at
+    /// this exact path the same way `upsert_file_in_tx`'s own ordinary
+    /// carry-forward already does unconditionally -- unlike a hold, which
+    /// is meaningless for a row this device itself already believes is
+    /// deleted, and so does NOT survive. This device had "gone-but-
+    /// pinned.txt" pinned and then (per its own local index) deleted it;
+    /// the incoming snapshot now resurrects that exact path as live
+    /// current content. The resurrected row must come back pinned; it
+    /// must NOT come back held.
+    #[test]
+    fn a_pin_survives_a_delete_then_resurrect_but_a_hold_does_not() {
+        let db = open_full_test_db();
+        let repo =
+            crate::materialization_state::MaterializationStateRepository::new(db.clone());
+        db.write::<_, SyncSqliteError>(|conn| {
+            conn.execute(
+                "INSERT INTO files (group_id, path, size, mtime_unix_nanos, blocks_json, deleted) \
+                 VALUES ('group-1', 'gone-but-pinned.txt', 0, 0, '[]', 1)",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE files SET pinned = 1 WHERE group_id = 'group-1' AND path = \
+                 'gone-but-pinned.txt'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        // `set_held` requires no genuine live-row precondition of its own
+        // -- setting it here on an already-`deleted = 1` row directly
+        // models "this device held it, then later (independently) came to
+        // believe it was deleted," the exact stale-combination this test
+        // exists to refuse resurrecting.
+        repo.set_held("group-1", "gone-but-pinned.txt", "case_collision", 1000).unwrap();
+
+        let files = vec![snapshot_file("gone-but-pinned.txt")];
+        db.write::<_, SyncSqliteError>(|conn| {
+            replace_group_files_from_snapshot(conn, "group-1", &files)
+        })
+        .unwrap();
+
+        let pinned: bool = db
+            .read::<_, SyncSqliteError>(|conn| {
+                Ok(conn.query_row(
+                    "SELECT pinned FROM files WHERE group_id = 'group-1' AND \
+                     path = 'gone-but-pinned.txt' AND state = 'current'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )? != 0)
+            })
+            .unwrap();
+        assert!(
+            pinned,
+            "a pin must survive a delete-then-resurrect at this path, matching upsert_file_in_tx's \
+             own unconditional carry-forward for the ordinary (non-rebootstrap) case"
+        );
+        assert!(
+            repo.get_held_state("group-1", "gone-but-pinned.txt").unwrap().is_none(),
+            "a hold must NOT survive a delete-then-resurrect -- it protected a row this device \
+             itself already believed was deleted, which is not the same claim as the resurrected \
+             row"
+        );
     }
 }

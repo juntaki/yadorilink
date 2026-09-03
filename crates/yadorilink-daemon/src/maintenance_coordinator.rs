@@ -54,7 +54,6 @@ use crate::maintenance::degraded_link_recheck::DegradedLinkRecheckJob;
 use crate::maintenance::disk_reconcile_backstop::DiskReconcileBackstopJob;
 use crate::maintenance::durability_confirmation::DurabilityConfirmationJob;
 use crate::maintenance::gc_idle::GcIdleJob;
-use crate::maintenance::materialization_repair::MaterializationRepairJob;
 use crate::maintenance::membership_recovery::MembershipRecoveryJob;
 use crate::maintenance::retention_expiry::RetentionExpiryJob;
 #[cfg(not(any(madsim, test)))]
@@ -140,15 +139,27 @@ pub(crate) fn start(
     // `set_materialization_repair_sweep_interval` still takes effect on
     // the very next sleep, exactly as before this task moved the sweep
     // body into `MaterializationRepairJob::run_once`.
-    {
-        let materialization_repair_job = MaterializationRepairJob::new(state.clone());
-        supervise::spawn_logged("daemon-state-materialization-repair", async move {
-            loop {
-                tokio::time::sleep(materialization_repair_job.sweep_interval()).await;
-                materialization_repair_job.run_once(MaintenanceTrigger::Interval).await;
-            }
-        });
-    }
+    // `spawn_restarting`, not `spawn_logged` -- this closes the same
+    // structurally-identical asymmetry the Convergence Engine scheduler
+    // loop just below is deliberately protected against: this job is the
+    // SOLE mechanism that re-arms an OnDemand->Eager materialization-
+    // policy promotion (and the hazard/ignore-recheck-adjacent
+    // repair-candidate class of work) -- an unhandled panic anywhere in
+    // `run_once`'s own synchronous call path (`list_links`,
+    // `backfill_missing_change_history`,
+    // `dag_reconcile_compatibility_applied_flag_for_group`,
+    // `retire_unjustified_ephemeral_conflict_copies`,
+    // `list_materialization_repair_candidates`, `get_files_by_paths`,
+    // `file_info_for_record` -- none of which run inside the per-record
+    // `tokio::spawn` in `rematerialize_local_records` that already
+    // isolates individual-record panics from the caller) would otherwise
+    // silently and permanently kill this one shared task for the rest of
+    // the process's life, with only a single log line as evidence, until
+    // an operator restarts the whole daemon. Extracted into
+    // `materialization_repair::spawn_materialization_repair_task` so this
+    // exact wiring (the panic recovers, not just "spawn_restarting works
+    // in general") is directly testable -- see that function's own test.
+    crate::maintenance::materialization_repair::spawn_materialization_repair_task(state.clone());
     // M4: durability confirmation sweep -- interval-only, same
     // fresh-read-each-tick shape as materialization repair above, so
     // `set_custody_confirmation_sweep_interval` takes effect on the very
@@ -167,8 +178,9 @@ pub(crate) fn start(
     }
     // The Convergence Engine's own scheduler loop: drives
     // `materialization_jobs` rows `handle_change_batch` enqueues, on its
-    // own schedule, never under a `message_slots` permit. Unlike the
-    // other background tasks here (`spawn_logged`, no restart), a silent
+    // own schedule, never under a `message_slots` permit. Like
+    // materialization repair above (and unlike the still-`spawn_logged`
+    // durability-confirmation/pending-broadcast-retry tasks), a silent
     // stop of this one loop halts all materialization for every group
     // for the rest of the daemon's life — `spawn_restarting` is used
     // deliberately so a panic/error here recovers instead of silently

@@ -380,6 +380,15 @@ fn repair_interrupted_materializations_inner(
     // exist, and the loop additionally holds the path's own lock (which every
     // materialize also holds while opening an intent) for the whole decision.
     let outstanding_intents = state.list_materialization_intent_paths(group_id)?;
+    // Unlike `outstanding_intents` just above, the projection-obligation
+    // signal below is deliberately NOT a whole-pass snapshot -- see
+    // `MaterializationExecutionPort::has_unsettled_projection_obligation`'s
+    // own doc comment for why a live, per-path read is used instead, and
+    // for the full "not yet settled, not settled-but-wrong" scope of what
+    // this signal covers (does not, for example, cover a hazard hold --
+    // `HazardHeld` settlement deletes the obligation row; that route is
+    // safe only because `hold_record` demotes `materialization_state`
+    // directly itself).
     let sweep_started = std::time::Instant::now();
     let mut diag_rows_scanned = 0usize;
     let mut diag_hydrated = 0usize;
@@ -515,6 +524,27 @@ fn repair_interrupted_materializations_inner(
         // through to the reconstruct path below, as does any present-but-
         // divergent file.)
         let has_intent = state.has_materialization_intent(group_id, &path)?;
+        // A missing file with an outstanding projection obligation is not
+        // yet known to be an offline deletion either, same reasoning as the
+        // intent check just above -- the Convergence Engine has not
+        // finished deciding this path's fate. See `MaterializationExecution
+        // Port::has_unsettled_projection_obligation`'s own doc comment for
+        // why this is a SEPARATE, live, per-path signal from `has_intent`,
+        // not a redundant one.
+        let has_unsettled_obligation = state.has_unsettled_projection_obligation(group_id, &path)?;
+        if on_disk_size.is_none() && !has_intent && has_unsettled_obligation {
+            // Missing, no intent, but still-unsettled -- must NOT be
+            // resolved either way here. Falling through to the reconstruct
+            // arms below would silently RESURRECT a genuine offline
+            // deletion that happens to race an unrelated pending
+            // obligation on this same path (and once resurrected, nothing
+            // else in this sweep will ever tombstone it again);
+            // classifying it as offline-deleted here would be just as
+            // wrong for a path the Convergence Engine has not finished
+            // placing yet. Defer entirely -- the next pass re-evaluates
+            // once the obligation settles one way or the other.
+            continue;
+        }
         if on_disk_size.is_none() && !has_intent && mode == RepairMode::Live {
             // See `RepairMode::Live`'s own doc comment: on the live cadence
             // this "missing, no intent" observation may be a delete the
@@ -585,6 +615,19 @@ fn repair_interrupted_materializations_inner(
         // also catches same-size offline edits that the old size-only fast
         // path silently missed.
         //
+        // Deliberately asymmetric with the missing-file arm above: nothing
+        // from here down ever consults `has_unsettled_projection_
+        // obligation` (an unsettled obligation earlier caused a MISSING
+        // path to defer entirely, never resolving either way). That guard
+        // exists specifically to stop a genuine offline DELETION from
+        // being silently resurrected -- a risk that only exists when the
+        // file is actually gone. Here it is not: something is physically
+        // present, and quarantining it (below) before reconstructing
+        // already preserves whatever it was, unconditionally, regardless
+        // of what the obligation table says. There is no deletion to
+        // protect against in this arm, so there is nothing for that guard
+        // to add.
+        //
         // On the live cadence, `!has_intent` here is the exact race
         // `RepairMode::Live`'s own doc comment describes: a present intent
         // still means a genuine interrupted materialization (safe to
@@ -602,6 +645,41 @@ fn repair_interrupted_materializations_inner(
             )?;
             continue;
         }
+        // Computed unconditionally, and reused below by the reconstruct
+        // arm too, rather than declared twice: the quarantine-window
+        // guard just below and `reconstruct_file_journaled`'s own guard
+        // (opened separately, further down) target the same eventual
+        // content, and `open_materialization_intent_guard`'s underlying
+        // write is an `INSERT ... ON CONFLICT DO UPDATE` upsert keyed on
+        // `(group_id, path)` -- opening it twice with the same hash for
+        // the same row is idempotent, not a conflict.
+        let target_hash = intent_target_hash(&record.blocks);
+        // Opened BEFORE the quarantine rename below, not after -- matching
+        // `MaterializationIntentGuard::open`'s own "before the bytes are
+        // written" contract. Without this, a crash after
+        // `quarantine_dirty_disk_file`'s rename succeeds (which makes the
+        // canonical path go missing) but before `reconstruct_file_
+        // journaled` gets a chance to open ITS OWN intent leaves the row
+        // `Hydrated`, the path missing, no intent, and -- this being a
+        // purely local repair-sweep action, not driven by any DAG
+        // admission or local emission -- no projection obligation either:
+        // the next pass would misread repair's own in-progress recovery
+        // as an offline deletion and tombstone a file repair itself just
+        // moved aside. Intentionally left unconsumed (no `.clear()` call)
+        // if this iteration never reaches reconstruction below (e.g. not
+        // all blocks turn out to be present locally): both placeholder
+        // arms clear whatever intent is on this row THEMSELVES once the
+        // real placeholder write is confirmed (never on Windows, where
+        // `create_or_defer_placeholder` defers that write to
+        // `cfapi-host.exe` -- see their own `placeholder_deferred`
+        // branches), and a plain drop without `.clear()` is inert (no
+        // query) either way, matching this whole module's established
+        // "an intent left dangling is fail-safe" discipline.
+        let quarantine_intent_guard = if on_disk_size.is_some() {
+            Some(state.open_materialization_intent_guard(group_id, &path, &target_hash, permit)?)
+        } else {
+            None
+        };
         if on_disk_size.is_some() {
             // This whole function has no DAG-frontier proof to publish
             // under, so every physical mutation below only ever
@@ -645,6 +723,16 @@ fn repair_interrupted_materializations_inner(
                 }
             }
         }
+        // Explicit, not just an implicit end-of-scope drop: `path` is
+        // borrowed by this guard, and every remaining branch below (the
+        // reconstruct arms and the placeholder arms) eventually moves
+        // `path` into `report`. From this point on the row is protected
+        // either by `reconstruct_file_journaled`'s own freshly-opened
+        // guard (targeting the identical hash, an idempotent re-upsert of
+        // the same row -- see this guard's own opening comment) or by a
+        // placeholder arm's unconditional `clear_materialization_intent`
+        // call, so holding this one any longer buys nothing.
+        drop(quarantine_intent_guard);
 
         let hashes: Vec<String> = record.blocks.iter().map(|b| hex::encode(&b.hash)).collect();
         let present = store.present_blocks(&hashes)?;
@@ -662,10 +750,10 @@ fn repair_interrupted_materializations_inner(
             // later reconcile re-drives the assembly from those same blocks on
             // a non-faulting read. Only a genuinely-missing block (the `else`
             // arm) is an unavoidable placeholder.
-            let target_hash = intent_target_hash(&record.blocks);
-            // This is a DIFFERENT physical write than the quarantine above
-            // (real content, not a divergent-bytes relocation) -- its own
-            // bump.
+            // `target_hash` was already computed above, before the
+            // quarantine step -- reused here, not recomputed. This is a
+            // DIFFERENT physical write than the quarantine above (real
+            // content, not a divergent-bytes relocation) -- its own bump.
             state.dag_bump_mutation_fence(group_id, &path, "repair_reconstruct")?;
             match reconstruct_file_journaled(JournaledReconstruction {
                 state,
@@ -704,6 +792,29 @@ fn repair_interrupted_materializations_inner(
                     report.reconstructed.push(path)
                 }
                 Err(e) => {
+                    // The `placeholder_deferred` skip-the-clear branch just
+                    // below is NOT uniformly load-bearing across every way
+                    // `reconstruct_file_journaled` can fail here -- its own
+                    // intent guard clears right after the rename durably
+                    // lands, BEFORE its `apply_unix_mode`/`apply_xattrs`
+                    // calls, so a failure from one of THOSE (a DB error
+                    // reading the recorded mode/xattrs, or a real EPERM/
+                    // xattr-support gap applying them) reaches here with
+                    // the intent already gone -- the skip is then a no-op,
+                    // not a protection. Only a failure from `reconstruct_
+                    // file` itself (the real content assembly/write, before
+                    // that guard ever clears) reaches here with the intent
+                    // still genuinely open, which is what the skip below
+                    // actually protects. Not a live gap in practice:
+                    // `get_unix_mode`/`get_xattrs` are the same calls
+                    // `apply_unix_mode`/`apply_xattrs` already are no-ops
+                    // for on Windows (the only platform where
+                    // `placeholder_deferred` is ever true), so the sub-case
+                    // where this distinction would matter cannot actually
+                    // occur there today -- a platform coincidence, not
+                    // something this fix arranges on purpose. Worth keeping
+                    // in mind if either of those calls ever grows a real
+                    // Windows-side implementation.
                     tracing::warn!(
                         group_id,
                         path = %path,
@@ -725,11 +836,14 @@ fn repair_interrupted_materializations_inner(
                         &path,
                         "repair_reconstruct_failed_placeholder",
                     )?;
-                    match create_or_defer_placeholder(
+                    let placeholder_outcome = create_or_defer_placeholder(
                         &out_path,
                         record.size,
                         record.mtime_unix_nanos,
-                    )? {
+                    )?;
+                    let placeholder_deferred =
+                        placeholder_outcome.is_deferred_to_a_separate_process();
+                    match placeholder_outcome {
                         PlaceholderIdentityToRecord::RecordOverwrite {
                             identity,
                             provider_kind,
@@ -753,13 +867,32 @@ fn repair_interrupted_materializations_inner(
                             state.clear_placeholder_generation(group_id, &path, permit)?
                         }
                     }
-                    apply_unix_mode(&out_path, state.get_unix_mode(group_id, &path)?)?;
-                    apply_xattrs(&out_path, &state.get_xattrs(group_id, &path)?)?;
-                    // A Placeholder is not an in-progress write; drop any intent
-                    // (`reconstruct_file_journaled` only clears on success) so a
-                    // later offline delete of this path is not misread as a
-                    // crash to reconstruct.
-                    state.clear_materialization_intent(group_id, &path, permit)?;
+                    if placeholder_deferred {
+                        // Windows: `create_or_defer_placeholder` wrote
+                        // nothing -- the real reparse-point placeholder is
+                        // created later by `cfapi-host.exe`'s own poll.
+                        // Clearing the intent here, before that happens,
+                        // removes the only thing protecting this path from
+                        // being misread as an offline deletion by a scan
+                        // that runs before `cfapi-host.exe` catches up --
+                        // the identical bug this whole repair function
+                        // exists to close, just via a different write path
+                        // than the ones already covered. Left open
+                        // deliberately, not cleared automatically once
+                        // confirmed: no mechanism in this codebase yet
+                        // observes that confirmation from this process.
+                        // `apply_unix_mode`/`apply_xattrs` skipped too --
+                        // both are real syscalls against a path nothing
+                        // has actually created yet in this case.
+                    } else {
+                        apply_unix_mode(&out_path, state.get_unix_mode(group_id, &path)?)?;
+                        apply_xattrs(&out_path, &state.get_xattrs(group_id, &path)?)?;
+                        // A Placeholder is not an in-progress write; drop any intent
+                        // (`reconstruct_file_journaled` only clears on success) so a
+                        // later offline delete of this path is not misread as a
+                        // crash to reconstruct.
+                        state.clear_materialization_intent(group_id, &path, permit)?;
+                    }
                     report.demoted_to_placeholder.push(path);
                 }
             }
@@ -774,7 +907,10 @@ fn repair_interrupted_materializations_inner(
             // No blocks were even present locally -- this is its own,
             // independent physical write, its own bump.
             state.dag_bump_mutation_fence(group_id, &path, "repair_missing_blocks_placeholder")?;
-            match create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)? {
+            let placeholder_outcome =
+                create_or_defer_placeholder(&out_path, record.size, record.mtime_unix_nanos)?;
+            let placeholder_deferred = placeholder_outcome.is_deferred_to_a_separate_process();
+            match placeholder_outcome {
                 PlaceholderIdentityToRecord::RecordOverwrite { identity, provider_kind } => state
                     .record_placeholder_generation(
                     group_id,
@@ -796,16 +932,24 @@ fn repair_interrupted_materializations_inner(
                     state.clear_placeholder_generation(group_id, &path, permit)?
                 }
             }
-            // A placeholder is a fresh file too, so it needs the recorded exec
-            // bit applied for the same reason the reconstruct path does — the
-            // live peer materialize path stamps its own placeholders
-            // identically, and hydration re-applies the bit once real content
-            // lands, so it survives the placeholder → hydrated transition.
-            apply_unix_mode(&out_path, state.get_unix_mode(group_id, &path)?)?;
-            apply_xattrs(&out_path, &state.get_xattrs(group_id, &path)?)?;
-            // See the reconstruct-failure arm above: a Placeholder carries no
-            // in-progress intent.
-            state.clear_materialization_intent(group_id, &path, permit)?;
+            if placeholder_deferred {
+                // See the reconstruct-failure arm above's matching branch:
+                // Windows defers the real write to `cfapi-host.exe`, so
+                // nothing is on disk yet -- the intent must stay open, and
+                // `apply_unix_mode`/`apply_xattrs` are skipped too (real
+                // syscalls against a path nothing has actually created).
+            } else {
+                // A placeholder is a fresh file too, so it needs the recorded exec
+                // bit applied for the same reason the reconstruct path does — the
+                // live peer materialize path stamps its own placeholders
+                // identically, and hydration re-applies the bit once real content
+                // lands, so it survives the placeholder → hydrated transition.
+                apply_unix_mode(&out_path, state.get_unix_mode(group_id, &path)?)?;
+                apply_xattrs(&out_path, &state.get_xattrs(group_id, &path)?)?;
+                // See the reconstruct-failure arm above: a Placeholder carries no
+                // in-progress intent.
+                state.clear_materialization_intent(group_id, &path, permit)?;
+            }
             report.demoted_to_placeholder.push(path);
         }
     }
@@ -863,6 +1007,62 @@ fn repair_one_interrupted_symlink(
         return Ok(());
     };
 
+    // The OTHER `PolicySkipped` case: a Windows peer that has not opted
+    // into real symlink materialization. `target` above is genuinely
+    // `Some` here (this device recorded it, it just declines to write
+    // it), so unlike the branch above this does not early-out on its own
+    // -- and without this check, it falls straight through to the
+    // `on_disk_exists`/`has_intent` classification below, which cannot
+    // tell "on-disk-missing because policy correctly declined to write
+    // it" apart from "on-disk-missing because it was actually deleted".
+    // That misclassification journals
+    // the path dirty as "removed", and the always-running dirty-journal
+    // redrive then emits a real, signed, GROUP-WIDE PROPAGATING tombstone
+    // `Change` for a path this device never actually deleted -- turning a
+    // benign, per-device policy choice into silent, unrecoverable data
+    // loss for every OTHER peer in the group. Mirrors `materialize_
+    // symlink_at`'s own `write_eligible` computation exactly, so the
+    // write path and the repair path agree on what "policy declines to
+    // write this" means. See that function's matching `materialization_
+    // state` demotion for the other half of this fix (closes the window
+    // for a fresh row; this closes it for a legacy row already stuck at
+    // `Hydrated` from before that fix shipped).
+    #[cfg(unix)]
+    let policy_permits_write = true;
+    #[cfg(windows)]
+    let policy_permits_write = state.windows_symlink_opt_in_for_group(group_id)?;
+    #[cfg(not(any(unix, windows)))]
+    let policy_permits_write = false;
+    // Unconditional on `policy_permits_write` alone -- NOT combined with
+    // `has_unsettled_obligation`. A combined version of this check
+    // (`!policy_permits_write && has_unsettled_obligation`) was tried and
+    // reverted: a LEGACY row that predates `materialize_symlink_at`'s own
+    // demote-to-`Placeholder` fix has no obligation row at all --
+    // `bootstrap_obligations_from_legacy_unapplied_changes` only backfills
+    // rows behind an unapplied `changes` entry, and the repair-candidate
+    // scan only ever selects `placeholder`/`hydrating` rows, never
+    // `Hydrated` ones -- so combining this check with `has_unsettled_
+    // obligation` silently reopened the exact bug this function exists to
+    // prevent, for every such legacy row: the check no longer fired, so
+    // repair fell through to the offline-deletion classification below and
+    // emitted the same real, signed, group-wide propagating tombstone the
+    // unconditional check was written to prevent. Invisible on
+    // non-Windows CI, since this whole branch is `#[cfg(windows)]`-gated.
+    //
+    // The accepted cost of staying unconditional instead: a symlink that
+    // genuinely WAS written while opt-in was on, then legitimately deleted
+    // offline AFTER opt-in was later turned off, has its repair-side
+    // convergence suppressed too (current policy says nothing about
+    // whether THIS row was ever actually materialized) -- bounded, not
+    // unbounded: the startup full scan still reconciles it, so this is
+    // lost redundancy, not lost data, and `reconcile_disk_with_ignore`
+    // already applies the identical "any obligation row, including
+    // `ignore_blocked`" suppression semantics elsewhere in this codebase,
+    // so accepting this kind of over-suppression here isn't a new pattern.
+    if !policy_permits_write {
+        return Ok(());
+    }
+
     let out_path = root.join(path);
     let on_disk_target = std::fs::symlink_metadata(&out_path)
         .ok()
@@ -882,7 +1082,35 @@ fn repair_one_interrupted_symlink(
 
     let has_intent = state.has_materialization_intent(group_id, path)?;
     let on_disk_exists = std::fs::symlink_metadata(&out_path).is_ok();
-
+    // A live, per-path read (see `MaterializationExecutionPort::has_
+    // unsettled_projection_obligation`'s own doc comment) -- covers any
+    // OTHER route that can leave a row `Hydrated` with nothing on disk and
+    // no intent, on every platform, not just the Windows policy-skip case
+    // above -- a freshly-admitted row this pass runs before the first
+    // materialize attempt, `restore_to_version`'s own symlink dispatch
+    // mid-write, a bootstrap-scaffold row created by incoming metadata
+    // before the paired content write lands, and any future such route,
+    // PROVIDED it is still genuinely unsettled: this guard covers "not yet
+    // settled", not "settled but left in the wrong state". It does NOT
+    // cover a hazard hold: `HazardHeld` settlement deletes the obligation
+    // row (`complete_obligation_if_non_exact_proof_current`), so this
+    // guard goes inert for that class the moment the engine settles it.
+    // The hazard-hold route is safe only because of the separate, direct
+    // `materialization_state` demotion `hold_record` performs itself, not
+    // because of this generic mechanism.
+    let has_unsettled_obligation = state.has_unsettled_projection_obligation(group_id, path)?;
+    if !on_disk_exists && !has_intent && has_unsettled_obligation {
+        // Missing, no intent, but still-unsettled -- must NOT be resolved
+        // either way here. Falling through to the reconstruct below would
+        // silently RESURRECT a genuine offline deletion that happens to
+        // race an unrelated pending obligation on this same path (and once
+        // resurrected, nothing else in this sweep will ever tombstone it
+        // again); classifying it as offline-deleted here would be just as
+        // wrong for a path the Convergence Engine has not finished placing
+        // yet. Defer entirely -- the next pass re-evaluates once the
+        // obligation settles one way or the other.
+        return Ok(());
+    }
     if !on_disk_exists && !has_intent && mode == RepairMode::Live {
         // See `RepairMode::Live`'s own doc comment: this "missing, no
         // intent" observation may be a delete the user is making RIGHT
