@@ -15,6 +15,11 @@ use crate::free_space::{self, VolumeFreeSpace};
 use crate::io_diag::{self, Op};
 use crate::traits::{BlockStore, ContentHash, GcReport, LocallyHashedBlock, StorageUsage};
 
+/// One bulk-ingest block's outcome: its hash, the commit outcome, an
+/// optional dirty-path to fsync, and its byte length -- see
+/// `FsBlockStore::commit_batch`'s own `results` binding.
+type BulkIngestBlockResult = Result<(ContentHash, BlockCommitOutcome, Option<PathBuf>, u64), StorageError>;
+
 /// Single crate-wide boundary for removing a filesystem object. Block-store
 /// deletion and materialization cleanup both pass through here so audits see
 /// every physical removal at one capability seam.
@@ -876,9 +881,7 @@ impl FsBlockStore {
         // instead of once per block that happened to need it.
         let pending_tree = Mutex::new(PendingShardTree::default());
 
-        let results: Vec<
-            Result<(ContentHash, BlockCommitOutcome, Option<PathBuf>, u64), StorageError>,
-        > = std::thread::scope(|scope| {
+        let results: Vec<BulkIngestBlockResult> = std::thread::scope(|scope| {
             let mut out = Vec::with_capacity(batch.len());
             for chunk in batch.chunks(BULK_INGEST_CONCURRENCY) {
                 let handles: Vec<_> = chunk

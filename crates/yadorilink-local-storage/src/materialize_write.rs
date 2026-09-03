@@ -1496,7 +1496,7 @@ mod tests {
 
         apply_xattrs(&path, &desired).unwrap();
 
-        assert_eq!(verify_replicated_xattrs_exact(&path, &desired).unwrap(), true);
+        assert!(verify_replicated_xattrs_exact(&path, &desired).unwrap());
     }
 
     /// Regression for the exact gap an independent review caught: a
@@ -1517,7 +1517,7 @@ mod tests {
         // desired, exactly what a silently-swallowed `fsetxattr` failure
         // would also leave behind.
 
-        assert_eq!(verify_replicated_xattrs_exact(&path, &desired).unwrap(), false);
+        assert!(!verify_replicated_xattrs_exact(&path, &desired).unwrap());
     }
 
     /// The mirror case: a stale attribute still on disk that the desired
@@ -1535,7 +1535,7 @@ mod tests {
         // attributes at all -- as if `apply_xattrs(&path, &[])`'s own
         // `fremovexattr` call for "user.stale" had silently failed.
 
-        assert_eq!(verify_replicated_xattrs_exact(&path, &[]).unwrap(), false);
+        assert!(!verify_replicated_xattrs_exact(&path, &[]).unwrap());
     }
 
     /// A same-name attribute whose VALUE differs must also fail exactness
@@ -1549,10 +1549,9 @@ mod tests {
 
         apply_xattrs(&path, &[("user.a".to_string(), b"old".to_vec())]).unwrap();
 
-        assert_eq!(
-            verify_replicated_xattrs_exact(&path, &[("user.a".to_string(), b"new".to_vec())])
-                .unwrap(),
-            false
+        assert!(
+            !verify_replicated_xattrs_exact(&path, &[("user.a".to_string(), b"new".to_vec())])
+                .unwrap()
         );
     }
 

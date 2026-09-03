@@ -145,7 +145,7 @@ pub mod c4_diag {
         let sites = hold_sites().lock().unwrap_or_else(|p| p.into_inner());
         let mut v: Vec<(String, u64, u128)> =
             sites.iter().map(|(k, (n, micros))| (k.clone(), *n, *micros)).collect();
-        v.sort_by(|a, b| b.2.cmp(&a.2));
+        v.sort_by_key(|a| std::cmp::Reverse(a.2));
         v
     }
 
@@ -157,7 +157,7 @@ pub mod c4_diag {
     pub fn call_site_stats() -> Vec<(String, u64)> {
         let sites = call_sites().lock().unwrap_or_else(|p| p.into_inner());
         let mut v: Vec<(String, u64)> = sites.iter().map(|(k, n)| (k.clone(), *n)).collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|a| std::cmp::Reverse(a.1));
         v
     }
 }
